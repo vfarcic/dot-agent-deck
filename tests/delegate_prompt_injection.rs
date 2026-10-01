@@ -3974,6 +3974,25 @@ struct SilenceHarness {
 #[cfg(unix)]
 impl SilenceHarness {
     async fn new(channel_capacity: usize) -> Self {
+        Self::with_worker(channel_capacity, false).await
+    }
+
+    /// A harness whose worker discards what it reads, so the worker's
+    /// snapshot is the line discipline's echo alone: the PTY's input bytes,
+    /// in the order the PTY received them.
+    ///
+    /// The plain `cat` worker writes each submitted line back, and that
+    /// write is scheduled independently of the echo. On a starved machine
+    /// `cat` writes the user's line back in the middle of the echo of the
+    /// pointer that followed it, so the snapshot reads
+    /// `…[delivery d-…]draft…\r\n\r\n…` even though the PTY received the
+    /// two lines whole and in order. A test that asserts on line boundaries
+    /// therefore needs the echo without `cat`'s copy.
+    async fn with_echo_only_worker(channel_capacity: usize) -> Self {
+        Self::with_worker(channel_capacity, true).await
+    }
+
+    async fn with_worker(channel_capacity: usize, echo_only: bool) -> Self {
         common::init_test_env();
         let cwd = common::race_safe_tempdir();
         let observer = cwd.path().join("silence-test-orchestrator");
@@ -4003,9 +4022,16 @@ impl SilenceHarness {
             "silence-test orchestrator never became observable; snapshot = {:?}",
             String::from_utf8_lossy(&ready)
         );
+        let echo_only_worker = cwd.path().join("silence-test-echo-only-worker");
+        let worker_command = if echo_only {
+            write_executable(&echo_only_worker, "#!/bin/sh\nexec cat >/dev/null\n");
+            echo_only_worker.to_string_lossy().into_owned()
+        } else {
+            "cat".to_string()
+        };
         let worker_agent_id = registry
             .spawn_agent(SpawnOptions {
-                command: Some("cat"),
+                command: Some(&worker_command),
                 cwd: Some(&cwd_str),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
                 ..SpawnOptions::default()
@@ -4459,7 +4485,9 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
         .expect("build draft-deferral runtime")
         .block_on(async {
             const DRAFT: &str = "draft-544-sentinel";
-            let harness = SilenceHarness::new(64).await;
+            // Echo only: the assertions below are about line boundaries in
+            // the PTY's input, which `cat`'s write-back can interleave with.
+            let harness = SilenceHarness::with_echo_only_worker(64).await;
             harness.type_unsent_worker_draft(DRAFT).await;
 
             harness.start_draft_delegate(false).await;
@@ -4475,18 +4503,29 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
                 String::from_utf8_lossy(&waiting)
             );
 
-            harness.send_worker_user_bytes(b"-still-typing").await;
+            // The waiting delegate must not hold the worker's writer, so the
+            // user's write completes rather than queueing behind it. Bounded
+            // so a held writer fails here instead of at the 60 s cap; how
+            // soon the echo then shows up is the scheduler's business, not
+            // this property's, so its wait is generous.
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                harness.send_worker_user_bytes(b"-still-typing"),
+            )
+            .await
+            .expect("user keystrokes were blocked by the waiting automatic writer");
             let typed = wait_for_snapshot_needle(
                 &harness.registry,
                 &harness.worker_agent_id,
                 b"draft-544-sentinel-still-typing",
-                Duration::from_millis(700),
+                Duration::from_secs(10),
             )
             .await;
             assert!(
                 snapshot_contains(&typed, b"draft-544-sentinel-still-typing")
                     && !snapshot_contains(&typed, POINTER),
-                "user keystrokes were blocked by the waiting automatic writer: {:?}",
+                "user keystrokes never reached the worker's PTY, or the pointer arrived \
+                 with them: {:?}",
                 String::from_utf8_lossy(&typed)
             );
 
@@ -4497,7 +4536,7 @@ fn dispatch_023_delegate_waits_for_unsent_worker_draft() {
                 &harness.registry,
                 &harness.worker_agent_id,
                 b"]\r\n",
-                Duration::from_secs(5),
+                Duration::from_secs(10),
             )
             .await;
             let text = String::from_utf8_lossy(&delivered);
