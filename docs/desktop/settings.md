@@ -77,7 +77,7 @@ The agent's prompt answers to your platform's usual text-editing shortcuts, in e
 | Delete the next word | `⌥⌦` (`fn+⌥⌫` on a laptop keyboard) | `Ctrl+Delete` | `Ctrl+Delete` |
 | Paste | `⌘V` | `Ctrl+V` or `Ctrl+Shift+V` | `Ctrl+Shift+V` |
 
-The app follows the computer you are typing on, not the machine the agent runs on: on a Mac connected to a Linux daemon, `⌘←` still goes to the start of the line. "Line" means the line the cursor is on, so in a message of several lines these keys stay on that line.
+The TUI does the same for every key your terminal passes on to it; [Editing an agent's prompt](../keyboard-shortcuts.md#editing-an-agents-prompt) says how to set your terminal up. The app follows the computer you are typing on, not the machine the agent runs on: on a Mac connected to a Linux daemon, `⌘←` still goes to the start of the line. "Line" means the line the cursor is on, so in a message of several lines these keys stay on that line.
 
 Agents differ in small ways. Moving a word right in OpenCode lands on the start of the next word, where the other agents stop at the end of the current one, and deleting the next word in OpenCode and Devin also removes the space after it.
 

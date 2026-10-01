@@ -379,13 +379,11 @@ If Shift+Enter still sends the message in the TUI:
 
 ### An editing shortcut does nothing in an agent's prompt
 
-*Applies to the desktop app.*
+In an agent's prompt, in the TUI or in the desktop app, your platform's usual editing shortcuts work: `⌘←`, `⌘→`, `⌥←`, `⌥→`, `⌘⌫`, `⌥⌫`, `⌥⌦` and `⌘V` on macOS, and `Home`, `End`, `Ctrl+←`, `Ctrl+→`, `Ctrl+Backspace`, `Ctrl+Delete` and the paste key on Windows and Linux. [Editing an agent's prompt](keyboard-shortcuts.md#editing-an-agents-prompt) (TUI) and [Editing and pasting in an agent's prompt](desktop/settings.md#editing-and-pasting-in-an-agents-prompt) (desktop app) have the full tables. If one of them does nothing, or deletes or moves by a single character instead of a word or a line:
 
-In the desktop app, an agent's prompt answers to your platform's usual editing shortcuts: `⌘←`, `⌘→`, `⌥←`, `⌥→`, `⌘⌫`, `⌥⌫`, `⌥⌦` and `⌘V` on macOS, and `Home`, `End`, `Ctrl+←`, `Ctrl+→`, `Ctrl+Backspace`, `Ctrl+Delete` and the paste key (`Ctrl+V` on Windows, `Ctrl+Shift+V` on Linux) on Windows and Linux. [Editing and pasting in an agent's prompt](desktop/settings.md#editing-and-pasting-in-an-agents-prompt) has the full table. If one of them does nothing, or deletes a single character instead of a word:
-
-- **Your desktop app is older than this behaviour.** Earlier versions sent nothing for `⌘←` and `⌘→`, deleted one character for `⌘⌫` and `Ctrl+Backspace`, and typed `Ctrl+V` into the agent on Windows instead of pasting. Upgrade.
-- **The shortcut is another platform's.** The app uses the shortcuts of the computer you are typing on, so `Ctrl+Backspace` on a Mac, or `⌘←` on Linux, keeps its ordinary meaning rather than becoming the other platform's shortcut.
-- **You are in the TUI.** In the TUI, your terminal decides what these keys send; set them up in your terminal's own settings.
+- **Your deck or desktop app is older than this behaviour.** Earlier desktop apps sent nothing for `⌘←` and `⌘→`, deleted one character for `⌘⌫` and `Ctrl+Backspace`, and typed `Ctrl+V` into the agent on Windows instead of pasting. Earlier TUIs deleted one character for `Ctrl+Backspace`, `Ctrl+Delete` and `⌘⌫`, and in some agents `⌥⌦` deleted one character and `Alt+←` / `Alt+→` moved one, while others typed `[3~`, `[D` or `[C` into the prompt. Upgrade.
+- **In the TUI: your terminal keeps the key or sends a plainer one.** The TUI acts only on what your terminal passes on. iTerm2 switches tabs on `⌘←` / `⌘→`, and a terminal without the enhanced keyboard protocol (GNOME Terminal, Konsole, or any terminal inside tmux) sends `Ctrl+Backspace` as a one-character backspace. [Editing an agent's prompt](keyboard-shortcuts.md#editing-an-agents-prompt) says what to set in each.
+- **In the desktop app: the shortcut is another platform's.** The app uses the shortcuts of the computer you are typing on, so `Ctrl+Backspace` on a Mac, or `⌘←` on Linux, keeps its ordinary meaning rather than becoming the other platform's shortcut.
 
 **Check it worked:** type a few words into the agent's prompt, without sending them, and press the platform's "delete the previous word" shortcut. The last word disappears.
 

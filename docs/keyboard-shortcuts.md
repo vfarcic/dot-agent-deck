@@ -109,6 +109,32 @@ What there is to scroll depends on what the program in the pane writes:
 
 A pane the deck starts is empty at first, so there is nothing above the agent's first output to scroll back to.
 
+## Editing an agent's prompt
+
+While you type in a pane, the agent's prompt answers to your platform's usual text-editing shortcuts, in every supported agent, and they do what they do in the [desktop app](desktop/settings.md#editing-and-pasting-in-an-agents-prompt):
+
+| To | macOS | Linux, and Windows through WSL |
+| --- | --- | --- |
+| Go to the start / end of the line | `⌘←` / `⌘→` | `Home` / `End` |
+| Move one word left / right | `⌥←` / `⌥→` | `Ctrl+←` / `Ctrl+→` |
+| Delete to the start of the line | `⌘⌫` | |
+| Delete the previous word | `⌥⌫` | `Ctrl+Backspace` |
+| Delete the next word | `⌥⌦` (`fn+⌥⌫` on a laptop keyboard) | `Ctrl+Delete` |
+| Paste | `⌘V` | `Ctrl+Shift+V` (`Ctrl+V` too, in Windows Terminal) |
+
+None of these is a deck shortcut, so the deck never takes them while you type. The TUI acts on a key only if your terminal passes it on, and some terminals keep these keys for themselves or send them as a plainer key. Where one does nothing, or deletes or moves by a single character, set your terminal up as below.
+
+- **`⌘←`, `⌘→` and `⌘⌫` on macOS.** Ghostty sends them as start of line, end of line and delete to the start of the line with no setup. iTerm2 uses `⌘←` and `⌘→` to switch tabs: choose **Settings → Profiles → Keys → Key Mappings → Presets → Natural Text Editing**, which also sets up `⌥←`, `⌥→`, `⌥⌫` and `⌥⌦`. In any other terminal, bind `⌘←` to send `Ctrl+A` (hex `0x01`), `⌘→` to send `Ctrl+E` (`0x05`) and `⌘⌫` to send `Ctrl+U` (`0x15`).
+- **`⌥←`, `⌥→` and `⌥⌫` on macOS.** These need the terminal to treat Option as Alt (Meta). If `⌥←` types a character instead, turn that on: in iTerm2, set **Left Option key** to **Esc+** or use the Natural Text Editing preset above; in Terminal.app, **Use Option as Meta key** in the profile's Keyboard settings.
+- **`Ctrl+Backspace`.** Terminals send it as a one-character backspace unless the enhanced ("kitty") keyboard protocol is on. The TUI turns that protocol on in a terminal that supports it, such as kitty, Ghostty, foot, Alacritty 0.13 or later, iTerm2, Windows Terminal 1.25 or later, and WezTerm with `enable_kitty_keyboard = true`. GNOME Terminal and Konsole do not support it, and inside tmux the TUI does not turn it on. There, bind `Ctrl+Backspace` to send `Ctrl+W` (`0x17`), or press `Ctrl+W` or `Alt+Backspace` instead:
+  - Windows Terminal (`settings.json`, `actions`): `{ "command": { "action": "sendInput", "input": "\u0017" }, "keys": "ctrl+backspace" }`
+  - Alacritty: `[keyboard]` `bindings = [{ key = "Back", mods = "Control", chars = "\u0017" }]`
+  - foot: under `[text-bindings]`, `\x17 = Control+BackSpace`
+  - Konsole: in a copy of the profile's keyboard layout, `key Backspace +Control : "\x17"`
+- **Paste** is your terminal's: its paste key puts the text into the agent's prompt. `Ctrl+V` goes to the agent wherever the terminal does not keep it, as it does in the desktop app on macOS and Linux; Claude Code, for one, pastes an image with it.
+
+**Check it worked:** type a few words into the agent's prompt, without sending them, and press your platform's "delete the previous word" shortcut. The last word disappears.
+
 ## Directory Picker
 
 Opened by `Ctrl+N` and by schedule authoring.
