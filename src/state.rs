@@ -19220,9 +19220,12 @@ mod tests {
             let cwd = tempfile::tempdir().expect("tempdir");
             // The BASENAME gives the pane its launch identity (fact S).
             let stub = cwd.path().join("claude");
-            crate::test_isolation::write_script(
-                &stub,
-                r#"#!/usr/bin/env python3
+            // Written by a child process and waited on, so off the runtime.
+            let script_path = stub.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::test_isolation::write_script(
+                    &script_path,
+                    r#"#!/usr/bin/env python3
 import os, sys, termios
 fd = sys.stdin.fileno()
 new = termios.tcgetattr(fd)
@@ -19250,7 +19253,10 @@ while True:
             buf.append(byte)
             os.write(1, bytes([byte]))
 "#,
-            )
+                )
+            })
+            .await
+            .expect("join the stub write")
             .expect("write stub");
             tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
                 .await

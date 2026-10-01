@@ -233,7 +233,9 @@ pub fn write_script(
             .expect("stdin is piped")
             .write_all(contents.as_ref());
         let output = child.wait_with_output()?;
-        written?;
+        // The child's own failure first: when `cat` could not open the file
+        // it exits without reading, and the write above then fails with a
+        // broken pipe that says nothing about why.
         if !output.status.success() {
             return Err(std::io::Error::other(format!(
                 "writing {} through /bin/cat failed ({}): {}",
@@ -242,7 +244,7 @@ pub fn write_script(
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        Ok(())
+        written
     }
     #[cfg(not(unix))]
     {
@@ -482,20 +484,31 @@ mod tests {
     }
 
     /// Scenario: Read every `.rs` file under `src/` and fail if any line that
-    /// is not a comment installs a thread subscriber with
-    /// `tracing::subscriber::set_default` outside this module — every capture
+    /// is not a comment names `set_default` or `with_default` from
+    /// `tracing::subscriber` or `tracing::dispatcher` outside this module — a
+    /// call or an import alike — since every capture
     /// has to go through [`capture_tracing_on_this_thread`] or it can lose
     /// events under plain `cargo test`.
     #[test]
     fn every_unit_test_capture_goes_through_the_seam() {
-        let needle = ["tracing::subscriber::", "set_default("].concat();
+        // The path segments, not the full call, so an imported
+        // `use tracing::subscriber::set_default;` and a `subscriber::set_default(`
+        // reached through `use tracing::subscriber;` are caught as well, and the
+        // callback form `with_default` beside it. A glob import followed by a
+        // bare `set_default(` still walks past.
+        let needles: Vec<String> = ["subscriber::", "dispatcher::"]
+            .iter()
+            .flat_map(|module| ["set_default", "with_default"].map(|verb| [module, verb].concat()))
+            .collect();
         let mut offenders = Vec::new();
         for (file, text) in src_files() {
             if file.ends_with("test_isolation.rs") {
                 continue;
             }
             for (n, line) in text.lines().enumerate() {
-                if !line.trim_start().starts_with("//") && line.contains(&needle) {
+                if !line.trim_start().starts_with("//")
+                    && needles.iter().any(|needle| line.contains(needle.as_str()))
+                {
                     offenders.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
@@ -530,7 +543,7 @@ mod tests {
         assert!(out.status.success(), "{out:?}");
         assert_eq!(out.stdout, b"ran\n");
 
-        let err = write_script(root.path().join("missing").join("x"), b"")
+        let err = write_script(root.path().join("missing").join("x"), &body)
             .expect_err("a directory that does not exist must be reported");
         assert!(err.to_string().contains("/bin/cat"), "{err}");
     }
