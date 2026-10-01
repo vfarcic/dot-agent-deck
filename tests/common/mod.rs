@@ -7408,8 +7408,8 @@ const DECK_ENDPOINT_VARS: [&str; 5] = [
 /// `${TMPDIR:-/tmp}/dot-agent-deck-<uid>/` and the legacy `/tmp` spellings.
 /// `orchestration/delegate/039` called this function and its wrapped Codex worker
 /// still posted a `SessionStart` there: the ghost "Codex" card. So
-/// [`detach_before_main`] also points `XDG_RUNTIME_DIR` at a per-process path
-/// nothing creates ([`unreachable_runtime_dir`]); with it set, the resolvers
+/// [`detach_before_main`] also points `XDG_RUNTIME_DIR` beneath `/dev/null`,
+/// where nothing can exist ([`unreachable_runtime_dir`]); with it set, the resolvers
 /// never reach the `TMPDIR` or legacy rungs, so one write closes all three — for
 /// this process and every child that inherits its environment.
 ///
@@ -7459,19 +7459,15 @@ fn detach_from_any_live_deck() {
     });
 }
 
-/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a per-process path
-/// under the OS temp dir that nothing creates, so a connect to an endpoint
-/// inside it fails unless the test itself bound one there — no live deck can
-/// be behind it. Mirrors
-/// `src/test_isolation.rs`'s function of the same name; the two cannot share it
-/// because that one is `#[cfg(test)]` in the library.
-///
-/// Named `dad-tests-<pid>-…` so that something a test does create beneath it is
-/// reaped by `cargo xtask clean-e2e-tmp` once this pid is dead, the same rule as
-/// a harness root.
+/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a path beneath
+/// `/dev/null`, so every lookup through it fails with `ENOTDIR` and no entry
+/// can ever exist there — nothing another user could plant as a symlink back to
+/// the live runtime dir, and nothing left behind. Mirrors
+/// `src/test_isolation.rs`'s function of the same name, which has the reasoning;
+/// the two cannot share it because that one is `#[cfg(test)]` in the library.
 #[cfg(unix)]
 fn unreachable_runtime_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("dad-tests-{}-no-live-deck", std::process::id()))
+    PathBuf::from("/dev/null/dot-agent-deck-test-no-live-deck")
 }
 
 /// The identity variables [`detach_before_main`] found set, so the note in

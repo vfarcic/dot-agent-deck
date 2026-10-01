@@ -30,8 +30,8 @@
 //!
 //! **So the guard now also closes the fallback, and does it before `main`.**
 //! [`detach_before_main`] runs as a constructor in every unit-test process:
-//! it scrubs the variables above and points `XDG_RUNTIME_DIR` at a per-process
-//! directory nobody creates ([`unreachable_runtime_dir`]). With
+//! it scrubs the variables above and points `XDG_RUNTIME_DIR` beneath
+//! `/dev/null`, where nothing can exist ([`unreachable_runtime_dir`]). With
 //! `XDG_RUNTIME_DIR` set, the resolvers take its arm and never consult the
 //! `TMPDIR` or legacy `/tmp` rungs, so all three are closed at once — for this
 //! process's own resolution and for every child that inherits its environment,
@@ -88,19 +88,20 @@ pub const DECK_ENDPOINT_VARS: [&str; 5] = [
     "DOT_AGENT_DECK_PANE_CAPABILITY",
 ];
 
-/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a per-process path
-/// under the OS temp dir that nothing creates, so a connect to an endpoint
-/// inside it fails unless the test itself bound one there — no live deck can
-/// be behind it.
+/// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a path beneath
+/// `/dev/null`, which is a character device, so every lookup through it fails
+/// with `ENOTDIR` — a connect, a bind, and a `create_dir_all` alike.
 ///
-/// Never created here. A test that does create something beneath it — a lock
-/// root under `lock_root_default`, say — gets a directory private to this pid
-/// instead of the developer's real runtime dir, and the `dad-unit-` prefix is
-/// on `cargo xtask clean-e2e-tmp`'s owned list, so a leftover is reapable. The
-/// pid keeps two concurrent test processes from sharing one.
+/// Not a directory under the temp dir, which is what the first cut of this fix
+/// used (PR #1475 review). A predictable name there can be planted by another
+/// local user as a symlink to the developer's real runtime dir, and an endpoint
+/// trust check `lstat`s the socket, not the directories above it, so the test
+/// would follow that link straight back to the live deck. Nobody can create an
+/// entry beneath `/dev/null`, so there is nothing to plant, nothing to create
+/// and nothing left behind. A test that needs a real runtime dir sets its own.
 #[cfg(unix)]
 fn unreachable_runtime_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("dad-unit-no-live-deck-{}", std::process::id()))
+    std::path::PathBuf::from("/dev/null/dot-agent-deck-test-no-live-deck")
 }
 
 /// The identity variables [`detach_before_main`] found set, so the note in

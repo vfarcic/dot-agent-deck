@@ -95,15 +95,23 @@ mod live_deck_fallback {
     const LEAK_PANE: &str = "live-deck-probe-leak";
     const CONTROL_PANE: &str = "live-deck-probe-control";
 
-    /// How long the control spawn's wrapper may take to post its fork-time
-    /// `SessionStart`. Generous: under a loaded tier the deck binary's cold start
-    /// is the slow part, and a miss fails loudly as a control failure.
-    const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
+    /// Set only on the re-executed child; the file it creates once both
+    /// workers are past their fork-time post.
+    const PROBE_READY_ENV: &str = "DAD_TEST_LIVE_DECK_PROBE_READY";
 
-    /// After the control event lands, how much longer the leak spawn — started
-    /// FIRST, with the same command — gets to post before the listeners are
-    /// drained.
-    const GRACE_AFTER_CONTROL: Duration = Duration::from_secs(2);
+    /// What the stand-in `codex` prints before it becomes a byte sink. The
+    /// wrapper starts relaying the inner command's output only AFTER its
+    /// fork-time `SessionStart` send has returned (`run_wrap_pty`: the send is
+    /// synchronous and the output pump is spawned after it), so this showing up
+    /// in a worker's PTY means that worker's post has already been attempted —
+    /// for the unpinned worker too, whose post has no other observable trace
+    /// once the guard works.
+    const STUB_SENTINEL: &str = "live-deck-probe-stub-up";
+
+    /// How long the child may take to see both workers past their post, and
+    /// the parent to see the child report it. Generous: under a loaded tier the
+    /// deck binary's cold start is the slow part, and a miss fails loudly.
+    const PROBE_DEADLINE: Duration = Duration::from_secs(90);
 
     /// A listening Unix socket standing in for a daemon, made the way the
     /// daemon makes its own: owner-only, in an owner-only directory, so a
@@ -177,11 +185,13 @@ mod live_deck_fallback {
         let attach = stand_in(&live_attach);
         let control_path = root.path().join("control").join("hook.sock");
         let control = stand_in(&control_path);
+        let ready_path = root.path().join("probe-ready");
 
         let mut child = Command::new(std::env::current_exe().expect("test binary path"));
         child
             .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
             .env(PROBE_CONTROL_ENV, &control_path)
+            .env(PROBE_READY_ENV, &ready_path)
             // What the existing detach already clears — #1473 is the half that
             // is left once these are gone, so start from there.
             .env_remove("DOT_AGENT_DECK_SOCKET")
@@ -202,16 +212,15 @@ mod live_deck_fallback {
         }
         let mut child = child.spawn().expect("re-execute the probe child");
 
-        let deadline = Instant::now() + CONTROL_DEADLINE;
-        let mut control_seen = Vec::new();
-        while control_seen.is_empty() && Instant::now() < deadline {
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!("the probe child exited early with {status}");
+        // Wait for the child to report both workers past their fork-time post
+        // (or to exit, which it does early only by failing).
+        let deadline = Instant::now() + PROBE_DEADLINE;
+        while !ready_path.exists() && Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
             }
-            control_seen = drain(&control);
             std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(GRACE_AFTER_CONTROL);
         // Closing the child's stdin is its signal to shut its agents down.
         drop(child.stdin.take());
         let output = child.wait_with_output().expect("wait for the probe child");
@@ -221,17 +230,22 @@ mod live_deck_fallback {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        control_seen.extend(drain(&control));
+        let control_seen = drain(&control);
 
         assert!(
             output.status.success(),
             "the probe child failed\n{child_log}"
         );
         assert!(
+            ready_path.exists(),
+            "the probe child never saw both wrapped workers past their fork-time post within \
+             {PROBE_DEADLINE:?}, so an empty live-deck listener would prove nothing\n{child_log}"
+        );
+        assert!(
             control_seen.iter().any(|line| line.contains(CONTROL_PANE)),
-            "control: the wrapped worker pinned at an explicit endpoint never posted its \
-             fork-time SessionStart within {CONTROL_DEADLINE:?}, so the absence below would \
-             prove nothing; control saw {control_seen:?}\n{child_log}"
+            "control: the wrapped worker pinned at an explicit endpoint got past its fork-time \
+             post without anything reaching its endpoint, so the wrapper is not posting and the \
+             absence below would prove nothing; control saw {control_seen:?}\n{child_log}"
         );
 
         let leaked_hook = drain(&hook);
@@ -254,7 +268,8 @@ mod live_deck_fallback {
     /// `orchestration/delegate/039` and `dashboard/selection/016` did — resolve
     /// and connect to the deck endpoints in-process, and spawn a wrapped Codex
     /// worker from a bare registry. A second worker pinned at a control socket
-    /// proves the wrapper does post; nothing may arrive at the fake live deck.
+    /// proves the wrapper does post, and both workers are seen past their post
+    /// before anything is checked; nothing may arrive at the fake live deck.
     /// Then the same with `XDG_RUNTIME_DIR` unset and the fake deck under
     /// `$TMPDIR/dot-agent-deck-<uid>/`.
     #[test]
@@ -271,14 +286,16 @@ mod live_deck_fallback {
     /// setup hook as `orchestration/delegate/039` does, connect to the hook and
     /// attach endpoints the client resolvers return as `dashboard/selection/016`
     /// does, spawn a wrapped Codex worker from a registry with no hook socket and
-    /// a second one pinned at the parent's control endpoint, and hold them until
-    /// the parent closes stdin.
+    /// a second one pinned at the parent's control endpoint, wait until each
+    /// worker's stub output has come through its wrapper (proof its fork-time
+    /// post was attempted), tell the parent, and hold them until it closes stdin.
     #[test]
     fn reexec_child_probes_for_a_live_deck() {
         let Some(control) = std::env::var_os(PROBE_CONTROL_ENV) else {
             return;
         };
         let control = PathBuf::from(control);
+        let ready = PathBuf::from(std::env::var_os(PROBE_READY_ENV).expect("ready path is set"));
         common::init_test_env();
 
         // `dashboard/selection/016`'s shape: this process resolves the deck
@@ -300,7 +317,9 @@ mod live_deck_fallback {
         let codex = bin_dir.join("codex");
         std::fs::write(
             &codex,
-            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nexec cat\n",
+            format!(
+                "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\necho {STUB_SENTINEL}\nexec cat\n"
+            ),
         )
         .expect("write probe codex");
         std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755))
@@ -316,6 +335,7 @@ mod live_deck_fallback {
         );
         let cwd_str = cwd.path().to_string_lossy().into_owned();
         let registry = Arc::new(AgentPtyRegistry::new());
+        let mut agents = Vec::new();
         for (pane, pin) in [
             (LEAK_PANE, None),
             (CONTROL_PANE, Some(control.to_string_lossy().into_owned())),
@@ -327,7 +347,7 @@ mod live_deck_fallback {
             if let Some(pin) = pin {
                 env.push(("DOT_AGENT_DECK_SOCKET".to_string(), pin));
             }
-            registry
+            let agent = registry
                 .spawn_agent(SpawnOptions {
                     command: Some("codex"),
                     cwd: Some(&cwd_str),
@@ -335,7 +355,27 @@ mod live_deck_fallback {
                     ..SpawnOptions::default()
                 })
                 .unwrap_or_else(|e| panic!("spawn the {pane} worker: {e}"));
+            agents.push((pane, agent));
         }
+
+        // Each worker past its fork-time post — see `STUB_SENTINEL`.
+        let deadline = Instant::now() + PROBE_DEADLINE;
+        for (pane, agent) in &agents {
+            loop {
+                let snapshot = registry.snapshot(agent).unwrap_or_default();
+                if String::from_utf8_lossy(&snapshot).contains(STUB_SENTINEL) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the {pane} worker's stub never printed through its wrapper; PTY so far: {:?}",
+                    String::from_utf8_lossy(&snapshot)
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        std::fs::write(&ready, b"both workers past their fork-time post\n")
+            .expect("report readiness to the parent");
 
         let _ = std::io::stdin().read_to_end(&mut Vec::new());
         registry.shutdown_all();
