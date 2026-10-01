@@ -195,6 +195,61 @@ where
     tracing::subscriber::set_default(subscriber)
 }
 
+/// Write `contents` to `path` — a script or stand-in binary a test is about to
+/// execute — without THIS process ever holding a write descriptor on it.
+///
+/// **Why `std::fs::write` is not enough under plain `cargo test`.** `execve`
+/// refuses a file that any process has open for writing, with `ETXTBSY` ("Text
+/// file busy"). `std::fs::write` holds such a descriptor for a moment, and if
+/// another test's thread forks in that moment, the child inherits a copy. It
+/// is close-on-exec, but the child keeps it until it gets to its own `exec`,
+/// so an `exec` of the script that lands in between fails although this
+/// process closed its descriptor long before. Measured on 2026-10-01: two
+/// `remote_tunnel` tests failed that way in 15 runs, each with its own `ssh`
+/// stand-in. nextest makes it rare rather than impossible, since a test that
+/// spawns threads of its own can fork in that window too.
+///
+/// So the bytes go through a `/bin/cat` child, and the only descriptor ever
+/// open for writing on the file is that child's own, gone when it exits.
+/// Sets no mode: chmod the result as before. Elsewhere than Unix there is no
+/// such refusal, and this is `std::fs::write`.
+pub fn write_script(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec /bin/cat > \"$1\"", "sh"])
+            .arg(path.as_ref())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let written = child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(contents.as_ref());
+        let output = child.wait_with_output()?;
+        written?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "writing {} through /bin/cat failed ({}): {}",
+                path.as_ref().display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +451,36 @@ mod tests {
         );
     }
 
+    /// Every `.rs` file under this crate's `src/`, with its text.
+    fn src_files() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut paths,
+        );
+        assert!(
+            paths.len() > 50,
+            "the sweep found too few files to mean anything"
+        );
+        paths
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                (path, text)
+            })
+            .collect()
+    }
+
     /// Scenario: Read every `.rs` file under `src/` and fail if any line that
     /// is not a comment installs a thread subscriber with
     /// `tracing::subscriber::set_default` outside this module — every capture
@@ -403,31 +488,12 @@ mod tests {
     /// events under plain `cargo test`.
     #[test]
     fn every_unit_test_capture_goes_through_the_seam() {
-        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("read src dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rust_files(&src, &mut files);
-        assert!(
-            files.len() > 50,
-            "the sweep found too few files to mean anything"
-        );
-
         let needle = ["tracing::subscriber::", "set_default("].concat();
         let mut offenders = Vec::new();
-        for file in files {
+        for (file, text) in src_files() {
             if file.ends_with("test_isolation.rs") {
                 continue;
             }
-            let text = std::fs::read_to_string(&file).expect("read source");
             for (n, line) in text.lines().enumerate() {
                 if !line.trim_start().starts_with("//") && line.contains(&needle) {
                     offenders.push(format!("{}:{}", file.display(), n + 1));
@@ -438,6 +504,110 @@ mod tests {
             offenders.is_empty(),
             "install a capture with crate::test_isolation::capture_tracing_on_this_thread, \
              not a bare set_default: {offenders:#?}"
+        );
+    }
+
+    /// Scenario: Write a script through the helper — more bytes than a pipe
+    /// buffer holds at once, with a NUL and invalid UTF-8 in a trailing
+    /// comment — make it executable, run it, and assert it ran and the file
+    /// holds exactly those bytes; then point it at a directory that does not
+    /// exist and assert the failure is reported.
+    #[cfg(unix)]
+    #[test]
+    fn write_script_writes_exactly_the_bytes_and_the_result_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("tempdir");
+        let script = root.path().join("stand-in");
+        let mut body = b"#!/bin/sh\necho ran\nexit 0\n# ".to_vec();
+        body.extend(std::iter::repeat_n(b'x', 200_000));
+        body.extend_from_slice(b"\0\xff\n");
+        write_script(&script, &body).expect("write the script");
+        assert_eq!(std::fs::read(&script).expect("read back"), body);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = std::process::Command::new(&script)
+            .output()
+            .expect("run it");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stdout, b"ran\n");
+
+        let err = write_script(root.path().join("missing").join("x"), b"")
+            .expect_err("a directory that does not exist must be reported");
+        assert!(err.to_string().contains("/bin/cat"), "{err}");
+    }
+
+    /// Scenario: Read every `.rs` file under `src/` and fail where a
+    /// `std::fs::write` / `tokio::fs::write` of a path is followed, within the
+    /// next 40 lines, by a `set_permissions` that gives the same path an
+    /// owner-execute bit — a file written in this process and then executed,
+    /// which is the `ETXTBSY` shape [`write_script`] exists for.
+    ///
+    /// It reads the first argument as written, so a path reached through a
+    /// different variable, a mode set through `PermissionsExt::set_mode`, or a
+    /// write further away walks past it: a tripwire for the common shape, not
+    /// a proof that no other exists.
+    #[test]
+    fn scripts_a_test_executes_are_written_through_the_seam() {
+        fn first_arg(rest: &str) -> String {
+            rest.split([',', ')'])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches('&')
+                .to_string()
+        }
+        let writes = [
+            ["std::fs::", "write("].concat(),
+            ["tokio::fs::", "write("].concat(),
+        ];
+        let chmod = ["fs::", "set_permissions("].concat();
+        let mut offenders = Vec::new();
+        for (file, text) in src_files() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let Some(rest) = writes
+                    .iter()
+                    .find_map(|w| line.find(w.as_str()).map(|at| &line[at + w.len()..]))
+                else {
+                    continue;
+                };
+                let target = if rest.trim().is_empty() {
+                    first_arg(lines.get(i + 1).copied().unwrap_or(""))
+                } else {
+                    first_arg(rest)
+                };
+                if target.is_empty() {
+                    continue;
+                }
+                let window = &lines[i + 1..lines.len().min(i + 41)];
+                for (j, later) in window.iter().enumerate() {
+                    if later.contains(&format!("create_dir(&{target})")) {
+                        break;
+                    }
+                    if !later.contains(&chmod) {
+                        continue;
+                    }
+                    let joined = window[j..window.len().min(j + 3)].join(" ");
+                    let after = &joined[joined.find(&chmod).expect("present") + chmod.len()..];
+                    let owner_exec = after
+                        .split("from_mode(0o")
+                        .nth(1)
+                        .and_then(|mode| mode.chars().next())
+                        .and_then(|digit| digit.to_digit(8))
+                        .is_some_and(|digit| digit & 1 == 1);
+                    if first_arg(after) == target && owner_exec {
+                        offenders.push(format!("{}:{}", file.display(), i + 1));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "write a file this process will execute with \
+             crate::test_isolation::write_script, not an in-process write: {offenders:#?}"
         );
     }
 }

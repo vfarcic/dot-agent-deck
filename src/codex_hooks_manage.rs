@@ -1938,7 +1938,8 @@ mod tests {
     /// return its path as a string — a pin `pin_is_repairable` will call alive.
     fn seed_executable(path: &Path) -> String {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write seeded binary");
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n")
+            .expect("write seeded binary");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

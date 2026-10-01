@@ -4645,7 +4645,7 @@ mod tunnel_tests {
              local_sock=${{spec%%:*}}\n\
              {body}\n"
         );
-        std::fs::write(&script, text).expect("write the stand-in");
+        crate::test_isolation::write_script(&script, text).expect("write the stand-in");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .expect("make it executable");
@@ -5743,7 +5743,7 @@ mod tunnel_tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).expect("create the stand-in directory");
         let bin = dir.join("dot-agent-deck");
-        std::fs::write(&bin, script).expect("write the stand-in");
+        crate::test_isolation::write_script(&bin, script).expect("write the stand-in");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("make the stand-in executable");
         dir.to_path_buf()

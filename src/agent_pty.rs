@@ -16878,7 +16878,8 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         fn script(dir: &std::path::Path, name: &str, marker: &str) {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho x > {marker}\n")).expect("script");
+            crate::test_isolation::write_script(&path, format!("#!/bin/sh\necho x > {marker}\n"))
+                .expect("script");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
@@ -16977,7 +16978,8 @@ mod spawn_tests {
                         .expect("move the verified directory away");
                     std::fs::create_dir(&dir).expect("put a replacement at the verified path");
                     let decoy = dir.join(name);
-                    std::fs::write(&decoy, b"#!/bin/sh\necho x > wrong\n").expect("decoy");
+                    crate::test_isolation::write_script(&decoy, b"#!/bin/sh\necho x > wrong\n")
+                        .expect("decoy");
                     std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))
                         .expect("chmod");
                 }
@@ -17027,7 +17029,8 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("bad-interp");
-        std::fs::write(&script, b"#!/nonexistent/dad-1233-interpreter\n").expect("script");
+        crate::test_isolation::write_script(&script, b"#!/nonexistent/dad-1233-interpreter\n")
+            .expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let verified =
             crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
@@ -17099,7 +17102,7 @@ mod spawn_tests {
         let dir = root.path().join("d");
         std::fs::create_dir(&dir).expect("create the project dir");
         let script = dir.join("no-interp");
-        std::fs::write(&script, b"echo x > marker\n").expect("script");
+        crate::test_isolation::write_script(&script, b"echo x > marker\n").expect("script");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let path = dir.to_str().expect("utf-8 tempdir");
         let marker = dir.join("marker");
@@ -17149,7 +17152,7 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("create tempdir");
         let here = dir.path().join("here");
-        std::fs::write(&here, b"").expect("a program in the cwd");
+        crate::test_isolation::write_script(&here, b"").expect("a program in the cwd");
         // Executable, so the probe in front of the rewrite lets it through.
         std::fs::set_permissions(&here, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let cwd = dir.path().as_os_str();

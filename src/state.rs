@@ -19220,7 +19220,7 @@ mod tests {
             let cwd = tempfile::tempdir().expect("tempdir");
             // The BASENAME gives the pane its launch identity (fact S).
             let stub = cwd.path().join("claude");
-            tokio::fs::write(
+            crate::test_isolation::write_script(
                 &stub,
                 r#"#!/usr/bin/env python3
 import os, sys, termios
@@ -19251,7 +19251,6 @@ while True:
             os.write(1, bytes([byte]))
 "#,
             )
-            .await
             .expect("write stub");
             tokio::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
                 .await
