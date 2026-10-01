@@ -559,7 +559,7 @@ type VoiceContext = {
 type Touches = { answer?: true; pane?: AgentAddress; agent?: string };
 
 /** Why {@link contextLost} refused: a code the caller picks its sentence by, and the reason in words. */
-type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "deck" | "agent" | "gone"; why: string };
+type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
 
 /**
  * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
@@ -605,6 +605,11 @@ export function contextLost(was: VoiceContext, now: VoiceContext, touches: Touch
     if (!shows(was.pane, aim) || !shows(now.pane, aim)) return { code: "pane", why: now.pane === undefined ? "the pane closed" : "the pane on screen changed" };
     if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };
     if (now.pane.inputBlocked !== undefined && was.pane.inputBlocked === undefined) return { code: "blocked", why: `the pane stopped taking input: ${now.pane.inputBlocked}` };
+    /* PR #1451 (Qodo) — a pane showing another tab refuses whether or not it
+       already did when the utterance was declared, unlike a read-only one
+       above: its terminal still accepts the bytes, so nothing downstream
+       would refuse words or an Enter aimed at a prompt nobody can see. */
+    if (now.pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   }
   if ((aim || touches.agent !== undefined) && now.deck !== was.deck) return { code: "deck", why: "the deck changed" };
   if (touches.agent !== undefined && touches.agent in was.incarnations && !(touches.agent in now.incarnations)) return { code: "gone", why: "the agent is gone" };
@@ -666,7 +671,8 @@ function choiceRefusal(lost: Lost): string {
  * daemon can replace an agent under the same deck and agent id, and the mode
  * ends then too, even when no snapshot ever showed the pane without an agent.
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number };
+/** `terminalHidden`: the pane is showing another tab (Diff, Checks, …), so its prompt is not on screen (PR #1451). */
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean };
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -1467,12 +1473,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneAgentId = pane?.agentId;
   const paneBlocked = pane?.inputBlocked;
   const paneSpawnedAtMs = pane?.spawnedAtMs;
+  const paneHidden = pane?.terminalHidden;
   useEffect(() => {
     const mode = panelStateRef.current;
     const lost = mode.kind === "dictating" ? contextLost(mode.declared, current(), { pane: mode.target }) : undefined;
     if (lost) endDictation(lost.why);
     callOffLostSend();
-  }, [callOffLostSend, confirmationOpen, current, endDictation, paneAgentId, paneBlocked, paneDeckId, paneSpawnedAtMs, panelState, pending, selectedDeckId]);
+  }, [callOffLostSend, confirmationOpen, current, endDictation, paneAgentId, paneBlocked, paneDeckId, paneHidden, paneSpawnedAtMs, panelState, pending, selectedDeckId]);
 
   /* The host marks the pane it is typing into; a panel going away takes the
      mode with it, so it must not leave the mark behind. */

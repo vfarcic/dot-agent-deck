@@ -2219,6 +2219,33 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
+  /** Scenario: Qodo on PR #1451 — with typing mode on and words unsent, the
+   * user switches coder's pane to its Diff tab, so the prompt is no longer on
+   * screen. Typing mode ends and says why; nothing further is typed, and a
+   * spoken "send it" cannot press Enter on a prompt nobody can see. Back on
+   * the Terminal tab, "type on" works again. */
+  it("ends dictation when the pane stops showing its terminal", async () => {
+    const { voice, deck } = start({ "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent.", "send it") });
+    await enter(voice);
+    voice.deliver("unsent words");
+    await completeUtterance();
+    const pane = screen.getByTestId("agent-pane-overlay");
+    await act(async () => { fireEvent.click(within(pane).getByRole("tab", { name: "Diff" })); });
+    await flush();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/typing mode off.*terminal is not shown.*nothing was sent to coder/i);
+    voice.deliver("more words");
+    await completeUtterance();
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+    await act(async () => { fireEvent.click(within(pane).getByRole("tab", { name: "Terminal" })); });
+    voice.deliver("type on");
+    await completeUtterance();
+    expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+  });
+
   /** Scenario: the daemon replaces Coder without an empty fleet snapshot and
    * reuses its deck and agent ids. Dictation ends before words reach that new terminal. */
   it("ends dictation when the same-id pane agent has a new spawn time", async () => {

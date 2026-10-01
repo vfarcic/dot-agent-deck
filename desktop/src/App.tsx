@@ -583,6 +583,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * (`terminalInputState`: its lease, its status, the last delivery verdict),
    * plus the deck having a live link at all; nothing is sent to find out.
    */
+  /**
+   * PR #1451 (Qodo) — the tab the open pane is showing, reported by whichever
+   * screen draws it, the way `confirmationOpen` is. A pane that is not showing
+   * its terminal is one whose prompt the user cannot see, so the voice panel
+   * types and sends nothing into it: typing mode ends, and does not start.
+   */
+  // voice-registry-exempt: a mirror of the open pane's own tab, written only by the screen's report so the voice panel can see it; it switches nothing
+  const [paneTab, setPaneTab] = useState<PanelTab>("terminal");
   const paneShownAgent = base === "overview" ? (paneDeck ? paneAgentShown : undefined) : paneAgent;
   const paneInput = agentView && paneShownAgent ? terminalInputState(paneShownAgent, runtime.terminalInputResults?.[agentKey(agentView.deckId, agentView.agentId)]) : undefined;
   const voicePane = useMemo<VoicePane | undefined>(() => (agentView && paneShownAgent && paneInput
@@ -596,8 +604,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       inputBlocked: paneInput.readOnly
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
+      terminalHidden: paneTab !== "terminal" || undefined,
     }
-    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent]);
+    : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
   /**
    * PRD #1260 — a D5 confirmation open on whichever screen is mounted, which
    * outranks dictation. Both the overview and the deck report theirs here
@@ -607,6 +616,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   // voice-registry-exempt: a mirror of the mounted screen's own confirmation state, written only by its report so the voice panel can see it; it opens nothing
   const [confirmationOpen, setConfirmationOpen] = useState(false);
+
   /** PRD #1260 — whom the voice panel's dictation mode is typing to, for the pane's mark. */
   // voice-registry-exempt: a mirror of the voice panel's own mode, written only by its report so the pane can mark it; the mode itself is entered through `VOICE_ACTIONS.startDictation`
   const [dictating, setDictating] = useState<{ deckId: string; agentId: string; label: string }>();
@@ -813,7 +823,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} />}
+        {agentView && paneDeck && paneAgentShown && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -834,7 +844,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -935,8 +945,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
+  /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
+  const tabShown = useRef(onTabShown);
+  tabShown.current = onTabShown;
+  useEffect(() => { tabShown.current?.(tab); }, [tab]);
+  useEffect(() => () => { tabShown.current?.("terminal"); }, []);
   return (
     <AgentPaneFrame
       open
@@ -1098,7 +1113,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
   );
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
   const { mode, setShownTerminals } = runtime;
   // #1083: this screen cannot merge across decks, so under All Decks it shows
   // "Select a deck" and renders nothing of the local deck the selection
@@ -1166,6 +1181,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
   /* A deck unmounted with a confirmation up takes the confirmation with it. */
   useEffect(() => () => { confirmationChanged.current?.(false); }, []);
+  /* PR #1451 — the open pane's tab, reported for the voice panel the same way
+     (see `paneTab` in `DeckShell`). */
+  const paneTabChanged = useRef(onPaneTabChange);
+  paneTabChanged.current = onPaneTabChange;
+  const shownPaneTab = paneAgentId === undefined ? "terminal" : (tabs[paneAgentId] ?? "terminal");
+  useEffect(() => { paneTabChanged.current?.(shownPaneTab); }, [shownPaneTab]);
+  useEffect(() => () => { paneTabChanged.current?.("terminal"); }, []);
   const { profiles, updateProfile, resetProfiles } = useAgentProfiles(snapshot.profiles);
   /*
    * PRD #819 M6: the projects come from the daemon and nothing is remembered.
