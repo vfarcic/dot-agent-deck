@@ -251,6 +251,7 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
     let decks = [VoiceDeck {
         id: "deck-1".to_string(),
         label: "ops@build-box".to_string(),
+        address: None,
         local: false,
         unavailable: None,
     }];

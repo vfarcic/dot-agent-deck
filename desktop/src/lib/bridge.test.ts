@@ -2927,6 +2927,31 @@ describe("desktop settings (PRD 803)", () => {
     await bridge.dispose();
   });
 
+  /// Scenario: A rename sends the row this window saw, and a stale-row refusal carries the current disk list back to the window.
+  it("passes the whole deck to rename and converts a partial refusal", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const { PartialSettingsSaveError } = await import("./settingsError");
+    const deck = { id: "deck0000000000aa", host: "build-box", port: 22, name: "build" };
+    const disk = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: { remote: [{ ...deck, host: "replacement-box" }], selection: deck.id },
+    };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_rename_deck") {
+        throw { message: "That deck changed since this window loaded it.", written: disk };
+      }
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+
+    const cause = await bridge.renameDeck(deck, "production").catch((error: unknown) => error);
+    expect(invoke).toHaveBeenCalledWith("desktop_rename_deck", { deck, name: "production" });
+    expect(cause).toBeInstanceOf(PartialSettingsSaveError);
+    expect((cause as InstanceType<typeof PartialSettingsSaveError>).message).toBe("That deck changed since this window loaded it.");
+    expect((cause as InstanceType<typeof PartialSettingsSaveError>).written.endpoints?.remote).toEqual(disk.endpoints.remote);
+    await bridge.dispose();
+  });
+
   it("keeps fixture settings in unscoped localStorage and never invokes Tauri", async () => {
     const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, modeScopedKey } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
@@ -2992,6 +3017,7 @@ describe("desktop settings (PRD 803)", () => {
    *
    * So absence stays absence, and presence round-trips.
    */
+  /// Scenario: A settings round trip keeps deck names, including a null legacy name, while preserving section absence.
   it("round-trips the endpoints section and never fabricates one", async () => {
     const { normalizeDesktopSettings } = await import("./bridge");
 
@@ -3005,8 +3031,8 @@ describe("desktop settings (PRD 803)", () => {
       appearance: { mode: "dark" },
       endpoints: {
         remote: [
-          { host: "build-box", id: "deck0000000000aa", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
-          { host: "ci-box", id: "deck0000000000bb", port: 22 },
+          { host: "build-box", id: "deck0000000000aa", name: "build", port: 2222, user: "deploy", identity: "~/.ssh/id_ed25519", jump: "bastion", socket: "/run/user/1000/dot-agent-deck-attach.sock" },
+          { host: "ci-box", id: "deck0000000000bb", name: null, port: 22 },
         ],
         selection: "deck0000000000aa",
       },

@@ -80,14 +80,17 @@ desktopScenario("settings-daemons", async (page) => {
       version: 1,
       appearance: { mode: "dark" },
       zoom: { level: 1 },
-      endpoints: { remote: [{ host: "build-box", id: "deck0000000000aa", port: 22 }], selection: "deck0000000000aa" },
+      // Issue #1426: a named deck, so the chooser shows the name with the
+      // address beside it and the Deck name field is filled in.
+      endpoints: { remote: [{ host: "build-box", id: "deck0000000000aa", name: "build", port: 22 }], selection: "deck0000000000aa" },
     }));
   });
   await page.goto("/?fixture=1&state=docs");
   await page.getByTestId("open-settings").click();
   await page.getByTestId("settings-section-decks").click();
   await expect(page.getByTestId("settings-panel-decks")).toBeVisible();
-  await expect(page.getByTestId("settings-panel-decks").getByText("build-box")).toBeVisible();
+  await expect(page.getByTestId("deck-choice-deck0000000000aa")).toContainText("build-box");
+  await expect(page.getByLabel("Deck name")).toHaveValue("build");
 });
 
 desktopScenario("settings-voice", async (page) => {

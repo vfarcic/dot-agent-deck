@@ -23,9 +23,11 @@ import {
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
 	DECK_BIN,
+	DECK_EXE_ENV,
 	execFailureMessage,
 	isAgentState,
 	piEventToAgentState,
+	resolveDeckBin,
 	SEED_DELIVER_AS,
 	seedToDeliver,
 	spawnFailureMessage,
@@ -115,6 +117,37 @@ describe("row 8: agent-event argv", () => {
 		assert.throws(() => buildAgentEventArgv("idle"), /unknown state "idle".*running, waiting, finished/s);
 		assert.throws(() => buildAgentEventArgv("Running"), /unknown state "Running"/);
 		assert.throws(() => buildAgentEventArgv(""), /unknown state ""/);
+	});
+});
+
+describe("issue #1385: which deck binary the extension shells", () => {
+	test("uses the absolute path the spawning deck exported, verbatim", () => {
+		assert.equal(DECK_EXE_ENV, "DOT_AGENT_DECK_EXE");
+		assert.equal(
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/home/me/.local/bin/dot-agent-deck" }),
+			"/home/me/.local/bin/dot-agent-deck",
+		);
+		// argv exec, no shell: a path with spaces is passed unquoted.
+		assert.equal(
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/opt/my tools/dot-agent-deck" }),
+			"/opt/my tools/dot-agent-deck",
+		);
+	});
+
+	test("falls back to the bare name when an older deck sets nothing", () => {
+		assert.equal(resolveDeckBin({}), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }), DECK_BIN);
+		assert.equal(DECK_BIN, "dot-agent-deck");
+	});
+
+	test("failure messages name the binary actually shelled", () => {
+		const bin = "/home/me/.local/bin/dot-agent-deck";
+		const msg = execFailureMessage(["work-done", "--task", "x"], { code: 1, stderr: "nope" }, bin);
+		assert.match(msg ?? "", /`\/home\/me\/\.local\/bin\/dot-agent-deck work-done --task x`/);
+		const spawn = spawnFailureMessage(["get-seed"], new Error(`spawn ${bin} ENOENT`), bin);
+		assert.doesNotMatch(spawn, /on PATH\?/, "a supplied path that is missing is not a PATH miss");
+		assert.match(spawn, /still exist\?/);
 	});
 });
 

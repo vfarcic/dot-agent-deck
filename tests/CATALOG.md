@@ -572,7 +572,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/badge/002 — A quota-blocked card visibly names its depleted credits and uses the error colour (issue #714).
 - **Layer:** L1 (ratatui buffer with an insta snapshot).
 - **Agent:** none (a fixed structured `CreditsDepleted` session fixture).
-- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card.
+- **Asserts:** Blocked badge, credits reason line, and red border on the rendered card; a full Blocked card keeps its last tool line visible at Compact, Normal, and Spacious densities. When the card is also orphaned, both status rows and the newest tool remain visible at every density, and the first surviving prompt line carries `Prmt:` (two prompts survive at Spacious density).
 - **Does not assert:** the daemon's quota classifier or a live agent.
 - **Platform coverage:** mac+linux+windows.
 
@@ -3305,6 +3305,7 @@ without depending on the config struct API.
 - **Asserts:** the precondition that the FIRST worker is up before the refusal is armed; then that a notice naming the worker's pane appears in the ORCHESTRATOR's own pane, within a budget of **5 s** — so the assertion covers both halves of the fix, the report and the promptness. Also that nothing was written into the dead pane, and that the notice interpolates no role name (PRD #249 finding B3's precedent for this notice family). Verified load-bearing: reverting either the EOF-driven end to the readiness wait or the liveness gate turns it red. Issue #708: the notice is SUBMITTED — the single byte following its stable final clause (`daemon log names the role.`) is CR, not LF — and names the remediation options (notify the user, re-delegate, reassign). This test alone runs its orchestrator as a raw `cat -u` behind `stty -echo -icanon -icrnl -opost` (chained with `&&` before a readiness marker it waits for), because under the cooked `cat` the file's other tests use, a submit CR and a notice LF both come back as the same echoed CRLF. Verified red on the pre-fix build (`terminator = Some(10)`), and red again with only the dead-replacement arm's call reverted to `write_notice_guarded`. **Second-failure arm** (Greptile P2 on PR #1338): with the `die` marker still in place, the user types into the orchestrator (`note_user_input`, the clock that arms the repeat-payload refusal) and the same delegate is sent again; the byte-identical second report must also arrive CR-terminated within the same budget. Verified red with only that arm's `settle_one_shot_payload_record` call removed (`terminators so far = [Some(13)]`).
 - **Budget re-derived in issue #243, from a measurement instead of from the alternative.** It was 20 s, justified as "well under the `SESSION_START_WAIT_TIMEOUT` + readiness buffer (31 s) the pre-fix path burned" — a ceiling picked to sit under the thing it replaced. That reasoning expired twice: #584 itself ended the readiness wait on the replacement's PTY reaching EOF, and #243 then removed the dead wait outright for declared-no-signal agents, so 31 s is nobody's behaviour and a 20 s ceiling on a ~0.1 s operation asserted approximately nothing. Measured on this branch at **103.1-104.1 ms** idle and **54.4-108.4 ms** across eight runs with all 16 cores saturated and a concurrent full fast tier — the figure is set by the fixture's own 50 ms poll and barely moves under load, because the notice is driven by the child's exit and not by a timer. 5 s is ~46x the slowest measurement (room for a CI runner an order of magnitude slower) and still 6x under the 30 s a reverted EOF-driven wait would cost. Deliberately not tighter: this is an upper bound on a fast event, so unlike `orchestration/delegate/010`'s lower bound it IS the load-sensitive direction.
 - **Also asserts, since issue #1243's review:** the daemon log carries the dead-replacement WARN (a control, so the capture is known to work) and does NOT carry the unidentified-agent readiness-timeout WARN. The stand-in is a command the deck cannot identify, which is exactly the worker that WARN addresses, but its wait ended on the replacement's EOF, not on the deadline. **Verified load-bearing:** dropping the `replacement_died` guard from the timeout branch turns this red. The log half installs a process-global `tracing` subscriber, so it runs only under nextest's process-per-test mode (`NEXTEST_EXECUTION_MODE`), where the process is this test's alone; under plain `cargo test` it prints `SKIP:` for itself rather than capture its siblings' warnings.
+- **Also asserts, since issue #1423:** once the notice is submitted, the delegation's PRD #126 idle-worker record is retired within the same 5 s budget — the worker was given nothing, so the orchestrator must not later be told it went idle on this task. Read through the read-only `AgentPtyRegistry::outstanding_delegation_seq`, so the check cannot itself retire the record. **Verified load-bearing:** removing the dead-replacement exit's `retire_undelivered_idle_worker_record` call turns this red; the respawn-error and identity-gate exits are pinned by the unit tests `dispatch_one_owned_drops_its_noted_delivery_when_the_respawn_fails` and `dispatch_one_owned_cancels_silence_watch_when_worker_identity_is_unresolved` (the latter also asserts a newer delegation's record survives an older one's undelivered exit). Does not wait out the idle timeout itself (two hours by default).
 - **Does not assert:** WHY a real replacement dies — #584's own trigger was environment-side and is not reproduced here (see `orchestration/dispatch/003` for the parity control that rules out the reported hypothesis); any retry of the delegate, which this fix deliberately does not add; the daemon-log `warn!`, which carries the role and command the notice omits.
 - **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
 
@@ -3512,7 +3513,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
 - **Layer:** fast integration (real `handle_work_done` against daemon-owned PTYs; `cat` stand-ins, no LLM and no `e2e` feature gate).
 - **Agent:** none (a raw no-echo `cat` orchestrator observer, so one daemon submission appears exactly once in its snapshot, plus a `cat` worker).
-- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` produces feedback carrying the daemon's unsolicited label (`you have no outstanding delegation to that worker`); the happy-path pointer (`Read .dot-agent-deck/work-done-coder.md for their full report.`) is ABSENT; the worker's own report still reaches the orchestrator inline, framed as `[UNTRUSTED-WORKER-REPORT: … :END-UNTRUSTED-WORKER-REPORT]`; and the earlier report is still on disk byte-for-byte.
+- **Asserts:** with an earlier delegation's report already parked at `.dot-agent-deck/work-done-coder.md` and nothing delegated, the worker's `work-done` produces feedback carrying the daemon's unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded from `you have no outstanding delegation to that worker` by issue #505); the happy-path pointer (`Read .dot-agent-deck/work-done-coder.md for their full report.`) is ABSENT; the worker's own report still reaches the orchestrator inline, framed as `[UNTRUSTED-WORKER-REPORT: … :END-UNTRUSTED-WORKER-REPORT]`; and the earlier report is still on disk byte-for-byte.
 - **Does not assert:** what the orchestrator then DOES with the label (an LLM decision); the commonest sibling trace — a worker redirected by a human mid-delegation, which produces a well-formed completion for a diverged task and involves no defect (#445/#369); the ledger's own arithmetic (unit-tested on `AgentPtyRegistry::retire_delegation_commission`).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
@@ -3533,7 +3534,7 @@ without depending on the config struct API.
 ##### orchestration/work-done/004 — On the REAL binary, an unsolicited `work-done` renders its label and the worker's framed report in the attached TUI's orchestration surface, with no pointer to a file that was never written (issues #448 + #433).
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon; the completion is issued by running the REAL `dot-agent-deck work-done` CLI against the deck's own hook socket, so the spawned-binary → hook-socket → daemon → rendered-pane boundary is covered end to end). Synthetic (`cat` roles, no LLM), so deliberately NOT demo-reel-marked.
 - **Agent:** none (the `orch-deck` fixture's two `cat` roles: `orchestrator` start + `worker`). Both delegation watches are switched off via the millisecond seams so no detector competes for the surface under assertion.
-- **Asserts:** with the orchestration opened through the production new-pane flow and NOTHING delegated, the real `work-done` CLI exits 0 and the rendered orchestration surface visibly carries the daemon's unsolicited label (`you have no outstanding delegation to that worker`) plus its provenance clause, and the worker's own report inside `[UNTRUSTED-WORKER-REPORT: … ]` (sentinel `e2e-unsolicited-report-4b7d`); the happy-path pointer (`Read .dot-agent-deck/work-done-worker.md …`) is ABSENT; and no `work-done-worker.md` exists on disk. Needles are matched with whitespace squeezed out of both sides, because a long daemon-injected line wraps at whatever column a role pane happens to be — the failure mode `scheduler/idle-worker/011` demonstrates.
+- **Asserts:** with the orchestration opened through the production new-pane flow and NOTHING delegated, the real `work-done` CLI exits 0 and the rendered orchestration surface visibly carries the daemon's unsolicited label (`the deck has no outstanding delegation to that worker on record`, reworded from `you have no outstanding delegation to that worker` by issue #505) plus its provenance clause, and the worker's own report inside `[UNTRUSTED-WORKER-REPORT: … ]` (sentinel `e2e-unsolicited-report-4b7d`); the happy-path pointer (`Read .dot-agent-deck/work-done-worker.md …`) is ABSENT; and no `work-done-worker.md` exists on disk. Needles are matched with whitespace squeezed out of both sides, because a long daemon-injected line wraps at whatever column a role pane happens to be — the failure mode `scheduler/idle-worker/011` demonstrates.
 - **Does not assert:** the failed-summary-write branch (deterministic only by sabotaging the coordination path, so it stays fast-tier as `orchestration/work-done/003`); the commission ledger's arithmetic (unit-tested); a real agent reading and acting on the label (an LLM decision, not a rendering fact).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS).
 
@@ -3583,6 +3584,14 @@ without depending on the config struct API.
 - **Asserts:** work-done feedback remains absent while an orchestrator draft is pending; a worker event requiring the daemon's state write lock is broadcast and daemon status completes promptly during the wait; Ctrl+U releases feedback without joining it to the cleared draft. A sibling sends two completions in arrival order during the same draft wait and checks that Ctrl+U releases both as separate, ordered turns.
 - **Does not assert:** the exact feedback prose, real-agent handling, or other hook callers' lock behavior.
 - **Platform coverage:** mac+linux.
+
+##### orchestration/work-done/011 — A delegated worker's completion after an ABANDONED pane close is not reported to the orchestrator as work it never commissioned (issue #505).
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done` against daemon-owned PTYs, with the registry's own `begin_pane_close` / `finish_pane_close(_, false)` pair — the calls `StopAgent` makes when `close_agent` fails; `cat` stand-ins, no LLM and no `e2e` feature gate).
+- **Agent:** none (raw no-echo `cat` orchestrator observer plus a `cat` worker). Both delegation watches are off (`worker_response_timeout_minutes = 0`) and `roles = []` keeps `clear` unresolved, so the delegate reaches the live worker without a respawn — `002`'s shape, which that test pins as reporting the ordinary pointer.
+- **Asserts:** two arms, each on a fresh harness: the abandoned close is of the WORKER's pane, then of the ORCHESTRATOR's pane. Control first: after the delegate the ledger owes a commission for the worker. After the abandoned close, the worker's `work-done` still reaches the orchestrator with its report framed as untrusted (control: delivered at all); the delivered text carries NONE of `You did not commission this work`, `most likely tasked directly by a person` or `you have no outstanding delegation` — the three claims the old label made that are false for a delegation the orchestrator really sent; it carries the reworded label (`the deck has no outstanding delegation to that worker on record`); and the happy-path pointer is ABSENT. Confirmed red on `main` at `15c514ff` with the first of those claims, in the worker arm.
+- **Why it exists:** a pane close sweeps the commission ledger when it starts and restores nothing when it fails, so a still-delegated completion arrives with no commission on record. Restoring on failure was rejected (a failed close is usually a `NotFound` for an agent that is already gone, and a restored commission would be credited to the pane's successor — `finish_pane_close`'s doc comment); the fix is that the label asserts only what the deck knows.
+- **Does not assert:** a genuinely failed `StopAgent` round trip through the attach socket (the registry pair is the seam it calls, and `close_agent` failing is not reachable deterministically from a test); the #448 arm-refused-mid-close path, which reaches the same label by a different route; what an orchestrator then does with the reworded label (an LLM decision).
+- **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
 #### orchestration/provenance
 
@@ -3890,6 +3899,20 @@ without depending on the config struct API.
 - **Asserts:** after the spawn-time remit pointer delivers once, a `## Your task` section carrying a sentinel is seeded into the opened tab's unique `orchestrator-context-<32hex>.md`. Injecting `Compacting` for the start role causes a task-carrying pointer to be delivered and a new unique context file to carry the sentinel. This guards against a compaction re-arm that silently loses the task.
 - **Does not assert:** the daemon dispatch path (`src/spawn.rs`) itself producing that seeded shape at spawn (covered by unit tests in `src/orchestrator_context.rs`: `reassert_preserves_an_existing_dispatched_task`, `reassert_with_no_prior_task_reproduces_no_task_behavior`, `reassert_with_no_existing_file_falls_back_to_no_task`); the equivalent guard on the `/clear` re-arm site, which shares the same `reassert_orchestrator_prompt` helper and is therefore covered by the same unit tests rather than a second, near-identical L2 case.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`004`/`005`/`006`).
+
+##### orchestration/remit/008 — A hydrated start-role tab re-arms from its own unique context file.
+- **Layer:** L2 lane 1 (real-binary PTY TUI attached after a headless daemon starts a prepared orchestration).
+- **Agent:** synthetic shell start role and `cat` worker; no credential.
+- **Asserts:** two preparations in one project leave the fixed-path mirror holding the later brief. After the earlier start-role pane is hydrated into a fresh TUI, its compaction publishes a new context containing only the earlier brief.
+- **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
+##### orchestration/remit/009 — A live-surfaced start-role tab re-arms from its own unique context file.
+- **Layer:** L2 lane 1 (real-binary PTY TUI attached before a headless daemon starts a prepared orchestration).
+- **Agent:** synthetic shell start role and `cat` worker; no credential.
+- **Asserts:** the already-attached TUI receives the first orchestration as a live surface. A later preparation in the same project overwrites the compatibility mirror; compaction of the first tab publishes a new context containing only its own brief.
+- **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
 #### orchestration/layout
 
@@ -5228,6 +5251,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one short Haiku turn through pi (orchestrator delegates) + one short Haiku turn through claude (worker creates a file + work-done) — well under Decision 23's <$0.05/run bound.
 
+##### pi/live/003 — The Pi extension shells the deck that spawned it, named by `DOT_AGENT_DECK_EXE`, not whatever `dot-agent-deck` is first on Pi's own `PATH` (issue #1385, following #549).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, plus a `SubscribeEvents` stream on its daemon). The deck's `PATH` starts with a DECOY `dot-agent-deck` — a script that only appends its arguments to a log and exits 0 — and deliberately does NOT carry the built binary's directory, unlike `pi/live/001`, which prepends it and so cannot tell a `PATH` lookup from the absolute path. The bundled extension reaches the per-test HOME through the daemon-startup auto-materialize. Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+- **Agent:** REAL `pi` as one restored pane with NO prompt, so it makes no model call and needs no credential: its `session_start` fires at boot whether or not it is authenticated, and that is what makes the extension shell `agent-event` and `get-seed`. Runtime-skipped (Decision 26) only when `pi` is absent. Lane 2 because it spawns a real agent CLI.
+- **Asserts:** the decoy log is empty — the extension ran nothing through `PATH`; the daemon broadcast carries a Pi frame with the injected agent id under the `agent-event` CLI's `<pane>-session` key, which only the extension's call through the real deck can produce (the card-surfacing `SessionStart` is also typed Pi but keys on the bare pane id and has no agent id); and the card shows the `Pi ·` identity. Checked by mutation: with the spawn-time `DOT_AGENT_DECK_EXE` export replaced by a removal, the extension falls back to the bare name and the test fails with the decoy having received `agent-event --type finished`.
+- **Does not assert:** a model turn, delegation or `work-done` through the path (`pi/live/002`, `chain-smoke/pi/002`); the fallback to the bare name when the variable is absent, which the extension's TS unit tests cover.
+- **Platform coverage:** mac+linux (unix-only: the decoy is a `#!/bin/sh` script).
+- **Cost note:** no model call.
+
 ### Mouse Parity (PRD #80)
 
 These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-only TUI action gains a clickable affordance carrying its shortcut inline, funneled through the single `dispatch_action` action layer.
@@ -5967,6 +5998,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a real agent's interpretation of the seed or its hook timing.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/026 — An ambiguous FIRST write of a scheduled delivery keeps its payload record only while its bytes are still in the input box; erased back out, a later delivery of the same prompt goes through (issue #547).
+- **Layer:** L1 (the production scheduled `deliver` path via `run_delivery`, no event bus, against three `/bin/cat` byte targets whose PTY writers are swapped for `HealingFaultyWriter`s so the `Ambiguous` outcome, issue #876's drain and the payload record are all produced by the production code, plus the delivery-notice sink).
+- **Agent:** none (`cat` targets).
+- **Asserts:** three panes each receive a scheduled delivery whose first write goes a different way, checked on the writer's byte log: accepted and then erased again (one erase per payload byte), accepted with its erase declined because the prompt carries a non-ASCII byte (payload only, and a "stopped part-way" `DeliveryNotice` on that pane alone), and a clean `Applied` control (payload plus CR). After a user-input stamp on every pane (clock only, so issue #544's draft wait stays out of it), a later delivery of the same bytes through the same path writes the full payload plus CR into the erased pane and the control, and writes nothing into the stranded pane. The stranded pane's refusal publishes the user-input `DeliveryNotice` on that pane and on no other. Measured red both ways: releasing the record in `deliver`'s first-write `Refused` arm (issue #547's suggested direction 1) lets the later delivery land 61 bytes on top of the fragment, and recording the drained write as the code did before #876 refuses the erased pane's later delivery, which is #547's symptom as filed.
+- **Does not assert:** the stranded cause where the PTY's slave has gone (a writer that never recovers accepts no later write either way, so the byte log could not tell a kept record from a released one); the confirmation loop's ambiguous REPLACEMENT write, which likewise takes no `PayloadRecordRelease`; `PAYLOAD_RECORD_TTL` lapsing; that a real agent's editor honours the erases (`prompt/pane-input/038`).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/pi
 
 ##### scheduler/pi/001 — A SCHEDULED, UNATTENDED real `pi` job (no TUI client attached) boots and its bundled extension reports the Pi pane's status via `agent-event`, re-broadcast on the daemon's event stream (PRD #201 M4.2).
@@ -6447,7 +6485,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### project/launch/006 — A later preparation cannot replace an already started launch's coordinator context.
 - **Layer:** L2 lane 1 (headless daemon over its attach socket).
 - **Agent:** two synthetic `cat` roles for launch A; no credential.
-- **Asserts:** after preparing and starting every role of A, preparation B in the same project gets a different unique context path. The file named by A's returned coordinator prompt still contains ALPHA and excludes BRAVO.
+- **Asserts:** after preparing and starting every role of A, preparation B in the same project gets a different unique context path. The file named by A's returned coordinator prompt still contains ALPHA and excludes BRAVO. The daemon's ListAgents record for A's start role carries A's unique path, while its worker record omits that field.
 - **Does not assert:** a real coordinator reading the file or TUI rendering.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
 
@@ -6456,6 +6494,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none. No credential.
 - **Asserts:** after `ResolveProject` observes one `loop`, adding a second role-bearing `loop` makes revisionless `PrepareWorkflow` return `ambiguous-orchestration` with no binding and no `orchestrator-context*` file. Supplying the old revision returns `stale-revision`, also without publication.
 - **Does not assert:** desktop preflight behavior or selection of either duplicate.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
+
+##### project/launch/008 — Ending one orchestration removes only its unique context file.
+- **Layer:** L2 lane 1 (headless daemon over its attach socket).
+- **Agent:** two synthetic `cat` start roles in separate live instances of the same project; no credential.
+- **Asserts:** after both prepared instances start, stopping the first instance's only pane removes its unique context file within a bounded wait. The second instance remains live with its file intact, and the fixed-path compatibility mirror remains.
+- **Does not assert:** TUI rendering or cleanup of a preparation that never started.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
 
 

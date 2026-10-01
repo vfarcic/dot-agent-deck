@@ -962,7 +962,7 @@ fn new_binary(
     let (cmp, changes) = {
         let notes = std::cell::RefCell::new(Vec::new());
         let metadata = |dir: &Path, args: &[String]| -> Result<Vec<u8>, String> {
-            let plan = buildns::metadata_plan(&host, &tc, dir, buildns::host_sockets()?);
+            let plan = buildns::metadata_plan(&host, &tc, dir, buildns::host_sockets()?)?;
             let mut cmd = vec![tc.cargo.display().to_string()];
             cmd.extend(args.iter().cloned());
             let run = buildns::run(&plan, &host.harness, &cmd)?;
@@ -1315,7 +1315,8 @@ fn run_one(
                     input acquisition on the host) — \
                     private mount, PID, network, IPC, UTS and user namespaces; BOTH endpoint \
                     roots masked (`/tmp` and `/run/user/<uid>` are sandbox directories), \
-                    `/var/tmp` masked, the operator's home an empty tmpfs, the rest of `/` \
+                    `/var/tmp` masked, `/var/lib/docker` an empty tmpfs when the host has one, \
+                    the operator's home an empty tmpfs, the rest of `/` \
                     bound read-only; see the Isolation section for what was measured"
             .into(),
         xdg_runtime_dir: if opts.unset_xdg_runtime_dir {
@@ -1429,6 +1430,8 @@ fn run_one(
         for m in &matrices {
             sandbox::check_socket_path_lengths(m)?;
         }
+        let masks = isolation::masks_for(&sb, uid)?;
+        let masked_home = isolation::home_to_mask();
         let plan = isolation::Plan {
             root: sb.root.clone(),
             uid,
@@ -1448,8 +1451,16 @@ fn run_one(
                 .old_binary
                 .is_none()
                 .then(|| format!("dot-agent-deck {}", previous.tag.trim_start_matches('v'))),
-            masks: isolation::masks_for(&sb, uid)?,
-            masked_home: isolation::home_to_mask(),
+            tmpfs: isolation::host_only_dirs_to_mask(
+                &masks
+                    .iter()
+                    .map(|m| m.target.as_path())
+                    .chain(masked_home.as_deref())
+                    .collect::<Vec<_>>(),
+                &[sb.root.as_path()],
+            ),
+            masks,
+            masked_home,
             outer_mnt_ns: outer_mnt.clone(),
         };
         write_private(

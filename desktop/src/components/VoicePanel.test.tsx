@@ -209,7 +209,9 @@ describe("VoicePanel", () => {
     const disclosure = screen.getByTestId("voice-intent-disclosure");
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
-    expect(disclosure).toHaveTextContent("SSH user, host and any non-default port");
+    // Issue #1426: a remote daemon is called by its name, and by its address
+    // only when it has none.
+    expect(disclosure).toHaveTextContent("every daemon's name, and for a remote daemon with no name its SSH user, host and any non-default port instead");
     expect(disclosure).toHaveTextContent("up to 200 directory names");
     // PRD #1223, closing audit F3: the always-sent components are named, and
     // the narrow fact Shared keeps is stated as exactly that.

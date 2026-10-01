@@ -490,7 +490,7 @@ const FLEET_IS_NOT_A_DECK: &str =
 /// same thing whichever deck is selected, and because it is the one arm of this
 /// function a developer can run with nothing configured.
 async fn test_local(tunnels: &EndpointTunnels) -> EndpointTestReport {
-    let endpoint = Endpoint::local();
+    let endpoint = crate::local_deck::local_endpoint();
     let deck = safe_display_text(endpoint.describe());
     let mut report = EndpointTestReport::new(
         LOCAL_SELECTION_TOKEN,
@@ -1249,22 +1249,6 @@ mod tests {
     // the required `build` job.
     // -----------------------------------------------------------------------
 
-    /// The attach-socket override is process-global, so every test that points
-    /// `Endpoint::local()` at a scripted socket takes this first. Under nextest
-    /// each test owns its process and the lock is free; under a plain
-    /// `cargo test` the module shares one.
-    ///
-    /// An **async** mutex, and not for contention: the guard is deliberately
-    /// held across the `await`s that run the probe, which is exactly what a
-    /// `std::sync::Mutex` must not do (`clippy::await_holding_lock`). Narrowing
-    /// it to the two `set_var` calls would not serialise anything — the whole
-    /// point is that the override stays in force for the probe.
-    #[cfg(unix)]
-    static ATTACH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[cfg(unix)]
-    const ATTACH_SOCKET_ENV: &str = "DOT_AGENT_DECK_ATTACH_SOCKET";
-
     /// A private directory plus a socket path inside it, short enough for
     /// `sun_path`.
     #[cfg(unix)]
@@ -1315,25 +1299,18 @@ mod tests {
         }
     }
 
-    /// Point `Endpoint::local()` at `socket`, run `body`, restore the
-    /// environment, and hand back the report.
+    /// Point this test's local deck at `socket`, probe it, and hand back the
+    /// report.
+    ///
+    /// Through [`crate::local_deck`]'s per-thread seam rather than
+    /// `DOT_AGENT_DECK_ATTACH_SOCKET`: the variable is process-global, so under a
+    /// plain `cargo test` every sibling test resolving the local deck while it
+    /// was moved saw this scratch socket instead (issue #1078).
     #[cfg(unix)]
     async fn against_local_socket(socket: &std::path::Path) -> EndpointTestReport {
-        let guard = ATTACH_ENV_LOCK.lock().await;
-        // SAFETY: the whole mutation happens under ATTACH_ENV_LOCK and the
-        // prior value is restored before it is released.
-        let prior = std::env::var(ATTACH_SOCKET_ENV).ok();
-        unsafe { std::env::set_var(ATTACH_SOCKET_ENV, socket) };
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(socket);
         let tunnels = EndpointTunnels::default();
-        let report = test_endpoint(&DesktopSettings::default(), "local", &tunnels).await;
-        unsafe {
-            match prior {
-                Some(value) => std::env::set_var(ATTACH_SOCKET_ENV, value),
-                None => std::env::remove_var(ATTACH_SOCKET_ENV),
-            }
-        }
-        drop(guard);
-        report
+        test_endpoint(&DesktopSettings::default(), "local", &tunnels).await
     }
 
     /// A deck that answers with this build's own stamp: the one green state.
@@ -1453,18 +1430,11 @@ mod tests {
         let matching = || hello_with_build(Some(&dot_agent_deck::build_id::local_build_id()));
         let daemon = tokio::spawn(scripted_daemon(listener, vec![matching(), matching()]));
 
-        let guard = ATTACH_ENV_LOCK.lock().await;
-        // And the selection is a process-global too, so the writes below are
-        // under its own lock (issue #1078). Taken INSIDE `ATTACH_ENV_LOCK`
-        // rather than before it: it is the only site that holds both, so a
-        // consistent order is a free deadlock-freedom argument.
+        // The applied selection is a process-global (issue #1078), so the writes
+        // below are under its lock. The local deck is moved through the
+        // per-thread seam, which needs none.
         let _selection = crate::dto::SELECTION_LOCK.lock().await;
-        // SAFETY: as in `against_local_socket` — the mutation is under
-        // `ATTACH_ENV_LOCK` and the prior value is restored before it is
-        // released. That lock covers this variable only; the selection has its
-        // own, taken above.
-        let prior = std::env::var(ATTACH_SOCKET_ENV).ok();
-        unsafe { std::env::set_var(ATTACH_SOCKET_ENV, &socket) };
+        let local_deck = crate::local_deck::test_override::point_local_deck_at(&socket);
 
         // A document whose selection resolves to a REMOTE deck, so the local
         // deck this test probes is genuinely not the one in use.
@@ -1479,13 +1449,7 @@ mod tests {
         let selected = test_endpoint(&DesktopSettings::default(), "local", &tunnels).await;
         let held_after_selected = tunnels.held().await;
 
-        unsafe {
-            match prior {
-                Some(value) => std::env::set_var(ATTACH_SOCKET_ENV, value),
-                None => std::env::remove_var(ATTACH_SOCKET_ENV),
-            }
-        }
-        drop(guard);
+        drop(local_deck);
         daemon.await.expect("no panic");
 
         assert_eq!(unselected.state, EndpointTestState::Reachable);

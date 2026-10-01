@@ -97,6 +97,10 @@
 #                    row's `heard_as` entries, so a context only narrows.
 #                    At most ONE context per row (closing audit I2): with two,
 #                    nothing would decide which grounds the row where both hold.
+#                    Keyed only on `new_agent_dialog`, `new_agent_dialog_closed`
+#                    or `new_agent_form` (issue #1248): those are what the
+#                    webview re-checks before a pending answer dispatches, so
+#                    a directory context is refused.
 #                    Two rows use it, `open_deck` and `close`, both over the New
 #                    agent dialog, which each would unmount with its form
 #                    (`voice_table_context_grounded_rows_are_the_deliberate_set`).

@@ -185,7 +185,7 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 ///
 /// It was, beside the instructions. `directory_listing` deliberately admits
 /// ordinary printable prose in a directory name, a project config names its
-/// orchestrations and a remote deck is labelled with its own host, so a cloned
+/// orchestrations and a remote deck is labelled with its name or its host, so a cloned
 /// repository could put a sentence addressed to the model in the most trusted
 /// role a request has. The command table stays there ([`commands_state`]); this
 /// moved out.
@@ -689,12 +689,14 @@ pub(crate) mod tests {
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000001".to_string(),
                 label: "Local deck".to_string(),
+                address: None,
                 local: true,
                 unavailable: None,
             },
             crate::voice::VoiceDeck {
                 id: "deck-0000000000000002".to_string(),
                 label: "deploy@build-box".to_string(),
+                address: None,
                 local: false,
                 unavailable: None,
             },

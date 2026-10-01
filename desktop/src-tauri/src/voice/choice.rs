@@ -472,7 +472,12 @@ fn names_something(
             .agents
             .iter()
             .any(|agent| spoken_names(agent).iter().any(|name| is(name))),
-        ParamKind::DeckRef => live.decks.iter().any(|deck| is(&deck.label)),
+        // A named deck (issue #1426) is still said by its address, which is
+        // what its label was before it had a name.
+        ParamKind::DeckRef => live
+            .decks
+            .iter()
+            .any(|deck| is(&deck.label) || deck.address.as_deref().is_some_and(is)),
         ParamKind::DirRef => live
             .directories
             .is_some_and(|listing| listing.entries.iter().any(|entry| is(&entry.name))),

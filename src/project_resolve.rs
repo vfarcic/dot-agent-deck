@@ -2446,6 +2446,7 @@ command = "cat"
             spawned_at_ms,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         }
     }
 

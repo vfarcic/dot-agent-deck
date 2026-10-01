@@ -182,6 +182,13 @@ export const DIALOG_MOVED_ON = "The New agent dialog changed while that was bein
  * `close`'s and `open_deck`'s `heard_as_whole_while` lists) and whether its
  * form is (`new_agent_form`, which gates the fill rows).
  *
+ * **The Rust table parser holds contextual grounding to exactly these two
+ * presences** (issue #1248): `Requirement::rechecked_before_dispatch` in
+ * `desktop/src-tauri/src/voice/table.rs` refuses a `heard_as_whole_while`
+ * keyed on any requirement answered from something else — the directory
+ * listing today — because this check would not notice it change. Comparing a
+ * new dimension here is what lets that method say `true` for it.
+ *
  * **Which deck and directory the form is for is deliberately not compared
  * here.** A move between two live forms changes no requirement, so the answer
  * was grounded under the rules that still hold; and every row that resolved

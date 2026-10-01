@@ -428,18 +428,21 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
             label: "Local deck".to_string(),
+            address: None,
             local: true,
             unavailable: None,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-build-box".to_string(),
             label: "deploy@build-box".to_string(),
+            address: None,
             local: false,
             unavailable: None,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-stale-box".to_string(),
             label: "ci@stale-box".to_string(),
+            address: None,
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
         },

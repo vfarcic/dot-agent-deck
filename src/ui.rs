@@ -109,7 +109,10 @@ impl CardDensity {
     /// `Tools` counters onto the bottom border, deleting the card-width axis
     /// that used to add a stats row (and a sixth height) to narrow cards. Any
     /// future line `render_session_card` gains must be added here in the same
-    /// change, or cards overlap / leave a blank tail row.
+    /// change, or cards overlap / leave a blank tail row. The one exception is
+    /// a CONDITIONAL status row (`Orphaned`, the Blocked reason): those are
+    /// fitted inside this height by `fit_card_rows` (issue #1368), because
+    /// every card in a grid row shares one height.
     fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
@@ -556,7 +559,7 @@ impl DirPickerState {
 /// PRD #127 M3.2: display name of the built-in "schedule" authoring option in
 /// the new-deck dialog's Mode cycler. It is appended to the end of the cycle
 /// and spawns a throwaway authoring agent pre-seeded with
-/// [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT).
+/// [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt).
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
 /// PRD #120: display name of the flag-gated issue-dispatch authoring option in
@@ -564,7 +567,7 @@ const SCHEDULE_MODE_NAME: &str = "schedule";
 /// appended AFTER `schedule` and shown only when
 /// [`crate::features::show_issue_dispatch_authoring`] is true. Selecting it
 /// spawns a throwaway authoring agent seeded with
-/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::ISSUE_DISPATCH_AUTHORING_SEED_PROMPT), which calls `schedule add --repo …`.
+/// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt), which calls `schedule add --repo …`.
 const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 
 /// PRD #170 round 2 (reviewer finding 1): the fallback agent command for a
@@ -632,7 +635,7 @@ impl BuiltinOption {
 }
 
 /// PRD #220: build the dispatcher seed — the prompt that teaches the agent the
-/// `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`](crate::authoring_seeds::DISPATCHER_SEED_PROMPT)).
+/// `dispatch` verb (see [`dispatcher_seed_prompt`](crate::authoring_seeds::dispatcher_seed_prompt)).
 ///
 /// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
 /// layout is relative to it and the agent otherwise has to infer it.
@@ -676,7 +679,7 @@ fn schedule_next_fire_display(task: &crate::config::ScheduledTask) -> String {
 
 /// Build the "schedule" authoring seed for the manager's add/edit
 /// actions (PRD #127 M3.3). Both reuse the 3B-i seeded authoring agent. For
-/// **add**, the seed is the base [`SCHEDULE_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::SCHEDULE_AUTHORING_SEED_PROMPT). For
+/// **add**, the seed is the base [`schedule_authoring_seed_prompt`](crate::authoring_seeds::schedule_authoring_seed_prompt). For
 /// **edit**, the existing entry's current values are injected so the agent
 /// starts from them and calls `schedule update` (NOT `add`); renaming is
 /// forbidden (the `name` is the reuse-registry key — to rename, remove + add).
@@ -699,7 +702,7 @@ fn build_schedule_authoring_seed(
 }
 
 /// PRD #120: build the issue-dispatch authoring seed (base
-/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`](crate::authoring_seeds::ISSUE_DISPATCH_AUTHORING_SEED_PROMPT) + the picked dir as the workspace
+/// [`issue_dispatch_authoring_seed_prompt`](crate::authoring_seeds::issue_dispatch_authoring_seed_prompt) + the picked dir as the workspace
 /// `working_dir` DEFAULT). Like the plain-schedule seed, the picked directory is
 /// appended so the agent's `schedule add --repo …` naturally targets it unless
 /// the user names another. There is no Edit variant — the manager's Add/Edit is
@@ -3070,6 +3073,14 @@ pub struct OrchestrationHydrationBucket {
     /// [`Self::identity`].
     pub orchestration_id: Option<String>,
     pub role_slots: Vec<OrchestrationRoleSlot>,
+    /// Issue #1395 item 1: the per-publish context file the daemon recorded for
+    /// this orchestration, read off its start-role pane's record or its start
+    /// role's live surface, and kept only when it names a file directly under
+    /// this bucket's `cwd` ([`crate::agent_pty::is_own_context_path`]). Set on
+    /// the rebuilt tab so its re-arm reads the tab's own file; `None` (an older
+    /// daemon, a non-start surface, a path into another project) keeps the
+    /// mirror fallback.
+    pub context_path: Option<std::path::PathBuf>,
 }
 
 impl OrchestrationHydrationBucket {
@@ -3710,6 +3721,7 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                                 // `OrchestrationHydrationBucket::identity`.
                                 orchestration_id: orchestration_id.clone(),
                                 role_slots: Vec::new(),
+                                context_path: None,
                             });
                         i
                     }
@@ -3719,6 +3731,17 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                 // that omitted it: keep the first non-`None` value we see.
                 if out.orchestration_buckets[idx].display_title.is_none() {
                     out.orchestration_buckets[idx].display_title = display_title.clone();
+                }
+                // Issue #1395: only the start role's record carries it, and it
+                // is adopted only when it names a context file of THIS
+                // orchestration's own project — a path into another project
+                // would re-arm this tab with that project's task.
+                let bucket = &mut out.orchestration_buckets[idx];
+                if bucket.context_path.is_none() {
+                    bucket.context_path = h.orchestrator_context_path.clone().filter(|p| {
+                        p.to_str()
+                            .is_some_and(|p| crate::agent_pty::is_own_context_path(&bucket.cwd, p))
+                    });
                 }
                 out.orchestration_buckets[idx]
                     .role_slots
@@ -5794,6 +5817,61 @@ fn apply_pane_closure(
     ui.mark_session_dirty();
 }
 
+/// Issue #1395 item 1: point a live-surfaced orchestration tab at the context
+/// file its surface carries. A surface with none — a non-start role's, or one
+/// from an older daemon — leaves whatever path the tab already holds, so a
+/// later role's surface never reverts the tab to the fixed-path mirror.
+fn adopt_surfaced_context_path(
+    tab_manager: &mut TabManager,
+    tab_index: usize,
+    bucket: &OrchestrationHydrationBucket,
+) {
+    if let Some(path) = bucket.context_path.clone() {
+        tab_manager.set_orchestration_context_path(tab_index, Some(path));
+    }
+}
+
+/// Issue #1395 (Qodo on PR #1444): a surface whose role panes a tab already
+/// owns is otherwise dropped whole, and with it any context path it carries.
+/// That loses the path when startup hydration built the tab from a record
+/// listed before the daemon recorded the start role's path, and the start
+/// role's surface — the one carrying it — arrives afterwards: the tab would
+/// then re-arm from the shared mirror for its whole life.
+///
+/// So adopt the path here, but only into a tab that (a) owns one of this
+/// surface's role panes, (b) is the same orchestration instance by
+/// [`TabManager::orchestration_tab_is`], and (c) has no path yet. Never
+/// overwrite one: a tab that already knows its file learned it from the
+/// daemon's own record at hydration, from its start, or from a later re-arm
+/// publish, and a surface queued before any of those is no newer.
+fn adopt_context_path_into_owning_tab(
+    tab_manager: &mut TabManager,
+    surface: &OrchestrationSurface,
+) {
+    let Some(path) = surface.context_path.as_deref() else {
+        return;
+    };
+    let owner = surface.roles.iter().find_map(|r| {
+        tab_manager.tab_index_for_pane(&r.pane_id).filter(|&i| {
+            tab_manager.orchestration_tab_is(
+                i,
+                &surface.cwd,
+                &surface.name,
+                surface.orchestration_id.as_deref(),
+            )
+        })
+    });
+    let Some(owner) = owner else {
+        return;
+    };
+    if let Some(Tab::Orchestration {
+        context_path: None, ..
+    }) = tab_manager.tabs().get(owner)
+    {
+        tab_manager.set_orchestration_context_path(owner, Some(PathBuf::from(path)));
+    }
+}
+
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
 /// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
 /// reconnect that already hydrated the tab) doesn't double-build.
@@ -5815,6 +5893,7 @@ fn surface_one_orchestration(
         .iter()
         .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
     if already_built {
+        adopt_context_path_into_owning_tab(tab_manager, &surface);
         tracing::debug!(
             cwd = %surface.cwd,
             orchestration = %surface.name,
@@ -5850,6 +5929,9 @@ fn surface_one_orchestration(
                 is_start_role: r.is_start_role,
             })
             .collect(),
+        // Issue #1395: the start role's surface carries the file the daemon
+        // recorded for it; any other surface (or an older daemon) carries none.
+        context_path: surface.context_path.as_deref().map(PathBuf::from),
     };
     let project_config = load_project_config(Path::new(&surface.cwd)).map_err(|e| e.to_string());
     let local = project_config
@@ -6128,6 +6210,10 @@ fn surface_one_orchestration(
                 "live orchestration surface: grew existing tab with newly-spawned role(s)"
             );
         }
+        // Issue #1395: an attach start surfaces one role at a time, so the
+        // start role's surface may arrive after the tab was built from another
+        // role's. Take its path then; a surface without one leaves the tab's.
+        adopt_surfaced_context_path(tab_manager, existing_tab_index, &bucket);
         // Issue #554 (Greptile on PR #1281): a role spawned into a tab whose
         // config changed since it opened is drift too — the new pane is
         // labelled from the current file while the daemon registered the name
@@ -6215,6 +6301,9 @@ fn surface_one_orchestration(
         Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
+            // Issue #1395 item 1: re-arm this tab from the file its coordinator
+            // was started with, as a hydrated or `Ctrl+n` tab does.
+            adopt_surfaced_context_path(tab_manager, tab_index, &bucket);
             if let Some(warning) = drift_warning {
                 tracing::warn!(
                     cwd = %surface.cwd,
@@ -13061,6 +13150,10 @@ pub fn run_tui(
                     if first_orchestration_tab_index.is_none() {
                         first_orchestration_tab_index = Some(tab_index);
                     }
+                    // Issue #1395 item 1: re-arm this tab from the file its
+                    // coordinator was started with, as a Ctrl+n tab does.
+                    tab_manager
+                        .set_orchestration_context_path(tab_index, bucket.context_path.clone());
                     if let Some(warning) = drift_warning {
                         surface_orchestration_config_drift(
                             &mut ui,
@@ -20431,19 +20524,25 @@ fn render_session_card(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| "—".into());
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
-
     // PRD #339: with the counters on the border, `Dir:` gets the whole inner
     // width at every card width — one un-branched form, always ellipsized (the
     // old narrow branch bare-clipped the path with no `…`).
     let dir_label_len = 6; // "Dir:  "
-    lines.push(Line::from(vec![
+    let dir_line = Line::from(vec![
         Span::styled("Dir:  ", text_primary()),
         Span::raw(truncate_with_ellipsis(
             cwd_display.as_ref(),
             w.saturating_sub(dir_label_len),
         )),
-    ]));
+    ]);
+
+    // Issue #1368: the conditional rows below (`Orphaned`, the Blocked reason)
+    // are NOT part of `CardDensity::card_height` — every card in a grid row
+    // shares one height, and a card's height stays a function of density alone.
+    // They are collected separately so `fit_card_rows` can make room for them
+    // inside that height instead of letting the Paragraph clip the newest tool
+    // line off the bottom.
+    let mut status_lines: Vec<Line<'_>> = Vec::new();
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
@@ -20451,7 +20550,7 @@ fn render_session_card(
     // the fact that explains why those rows keep advancing while the run has in
     // fact stalled.
     if is_orphaned {
-        lines.push(Line::from(Span::styled(
+        status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis("Orphaned — delegation unavailable", w),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
         )));
@@ -20490,38 +20589,104 @@ fn render_session_card(
             Some(detail) => format!("⚠ {label}{resets} — {detail}"),
             None => format!("⚠ {label}{resets}"),
         };
-        lines.push(Line::from(Span::styled(
+        status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis(&text, w),
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
         )));
     }
 
-    if is_placeholder {
-        lines.push(Line::from(Span::styled(
-            "Launch an agent to get started",
-            text_primary(),
-        )));
+    let prompts = if is_placeholder {
+        vec!["Launch an agent to get started".to_string()]
     } else {
-        let prompts = collect_recent_prompts(session, density.max_prompts());
-        for (i, prompt) in prompts.iter().enumerate() {
-            let prefix = if i == 0 { "Prmt: " } else { "      " };
-            let max_prompt = w.saturating_sub(6);
-            let display = truncate_with_ellipsis(prompt, max_prompt);
-            lines.push(Line::from(vec![
-                Span::styled(prefix, text_primary()),
-                Span::raw(display),
-            ]));
-        }
-    }
+        collect_recent_prompts(session, density.max_prompts())
+    };
 
-    if density != CardDensity::Compact {
+    let tool_lines = recent_tool_lines(session, density.max_tools());
+
+    let plan = fit_card_rows(
+        inner.height as usize,
+        status_lines.len(),
+        prompts.len(),
+        density != CardDensity::Compact,
+        tool_lines.len(),
+    );
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    if plan.dir {
+        lines.push(dir_line);
+    }
+    lines.extend(status_lines);
+    let skip_prompts = prompts.len() - plan.prompts;
+    // The `Prmt:` label goes on the first prompt that survives shedding, not on
+    // the oldest one collected, or a card that shed its oldest prompt loses it.
+    for (i, prompt) in prompts.iter().skip(skip_prompts).enumerate() {
+        if is_placeholder {
+            lines.push(Line::from(Span::styled(prompt.clone(), text_primary())));
+            continue;
+        }
+        let prefix = if i == 0 { "Prmt: " } else { "      " };
+        let display = truncate_with_ellipsis(prompt, w.saturating_sub(6));
+        lines.push(Line::from(vec![
+            Span::styled(prefix, text_primary()),
+            Span::raw(display),
+        ]));
+    }
+    if plan.separator {
         lines.push(Line::from(""));
     }
-    let tool_lines = recent_tool_lines(session, density.max_tools());
     lines.extend(tool_lines);
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Which of a card's sheddable rows [`render_session_card`] draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CardRowPlan {
+    dir: bool,
+    /// How many of the NEWEST prompt rows to keep.
+    prompts: usize,
+    separator: bool,
+}
+
+/// Fit a card's rows into `budget` inner rows (issue #1368).
+///
+/// A card's height is a function of density alone ([`CardDensity::card_height`])
+/// because a grid row shares one height, so the conditional status rows — the
+/// `Orphaned` line and the Blocked reason — have to find room inside it. Rows are
+/// shed in this order until everything fits: the blank separator (dropped
+/// whenever a status row is shown, so a Blocked card's tools never jump a row as
+/// the history fills), then prompts oldest-first, then `Dir:`. Status rows and
+/// tool history are never shed here; the tool rows are what the card is for, and
+/// the status row is why the card needs attention. A card with no status row at
+/// its own density's height already fits, so its layout is unchanged.
+fn fit_card_rows(
+    budget: usize,
+    status_rows: usize,
+    prompt_rows: usize,
+    separator: bool,
+    tool_rows: usize,
+) -> CardRowPlan {
+    let mut plan = CardRowPlan {
+        dir: true,
+        prompts: prompt_rows,
+        separator: separator && status_rows == 0,
+    };
+    let used = |p: &CardRowPlan| {
+        usize::from(p.dir) + status_rows + p.prompts + usize::from(p.separator) + tool_rows
+    };
+    if used(&plan) > budget {
+        plan.separator = false;
+    }
+    // Prompts go before `Dir:`: `Dir:` is the card's identity and every card in
+    // the grid leads with it, while the prompt is the least time-sensitive row —
+    // the status reason and the newest tool already tell the current story.
+    while used(&plan) > budget && plan.prompts > 0 {
+        plan.prompts -= 1;
+    }
+    if used(&plan) > budget {
+        plan.dir = false;
+    }
+    plan
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
@@ -23319,7 +23484,7 @@ mod tests {
         );
     }
     use crate::authoring_seeds::{
-        AuthoringKind, DISPATCHER_SEED_PROMPT, SCHEDULE_AUTHORING_SEED_PROMPT,
+        AuthoringKind, dispatcher_seed_prompt, schedule_authoring_seed_prompt,
     };
     use crate::event::{AgentEvent, AgentType, EventType};
     use crate::orchestrator_context::build_orchestrator_context;
@@ -24004,6 +24169,154 @@ mod tests {
             (25, 75),
             "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
         );
+    }
+
+    /// Issue #1395 item 1: a live-surfaced tab takes the context path its start
+    /// role's surface carries, and a later surface without one — a worker's,
+    /// or an older daemon's — leaves that path in place rather than reverting
+    /// the tab to the fixed-path mirror.
+    #[test]
+    fn a_surface_without_a_context_path_does_not_clear_the_tabs() {
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+        let (tab_index, _) = tm
+            .open_orchestration_tab_with_existing_role_panes(
+                &cfg,
+                "/work",
+                vec![Some("lead".into()), Some("coder".into())],
+                None,
+                None,
+            )
+            .expect("open the tab");
+        let tab_path = |tm: &TabManager| match &tm.tabs()[tab_index] {
+            Tab::Orchestration { context_path, .. } => context_path.clone(),
+            _ => panic!("expected an orchestration tab"),
+        };
+        let bucket = |context_path: Option<PathBuf>| OrchestrationHydrationBucket {
+            cwd: "/work".into(),
+            orchestration_name: "team".into(),
+            display_title: None,
+            orchestration_id: None,
+            role_slots: Vec::new(),
+            context_path,
+        };
+        let own = PathBuf::from(
+            "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+
+        assert_eq!(tab_path(&tm), None, "a fresh tab starts on the mirror");
+        adopt_surfaced_context_path(&mut tm, tab_index, &bucket(Some(own.clone())));
+        assert_eq!(tab_path(&tm).as_deref(), Some(own.as_path()));
+        adopt_surfaced_context_path(&mut tm, tab_index, &bucket(None));
+        assert_eq!(
+            tab_path(&tm).as_deref(),
+            Some(own.as_path()),
+            "a surface without a path must not clear the tab's own"
+        );
+    }
+
+    /// Issue #1395 (Qodo on PR #1444): a start role's surface that arrives
+    /// after startup hydration already built its tab — from a record listed
+    /// before the daemon recorded the path — takes that path into the tab,
+    /// rather than being dropped whole by the already-built guard. It never
+    /// overwrites a path the tab already holds, and never lands in a tab of a
+    /// different orchestration instance that happens to own the pane id.
+    #[test]
+    fn an_already_built_tab_adopts_a_late_surfaced_context_path_only_when_unset() {
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let open = |orchestration_id: Option<&str>| {
+            let mut tm = TabManager::new(Arc::new(CapturingPaneController::new()));
+            let (tab_index, _) = tm
+                .open_orchestration_tab_with_existing_role_panes(
+                    &cfg,
+                    "/work",
+                    vec![Some("lead".into())],
+                    None,
+                    orchestration_id,
+                )
+                .expect("open the tab");
+            (tm, tab_index)
+        };
+        let tab_path = |tm: &TabManager, i: usize| match &tm.tabs()[i] {
+            Tab::Orchestration { context_path, .. } => context_path.clone(),
+            _ => panic!("expected an orchestration tab"),
+        };
+        let own = "/work/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let other =
+            "/work/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md";
+        let surface =
+            |orchestration_id: Option<&str>, context_path: Option<&str>| OrchestrationSurface {
+                name: "team".into(),
+                cwd: "/work".into(),
+                display_title: None,
+                orchestration_id: orchestration_id.map(str::to_string),
+                roles: vec![crate::event::OrchestrationSurfaceRole {
+                    pane_id: "lead".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                }],
+                context_path: context_path.map(str::to_string),
+            };
+
+        // Hydration built the tab with no path; the start role's surface
+        // carries one: adopted.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(own)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // The tab already knows its file: a surface never overwrites it.
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-a"), Some(other)));
+        assert_eq!(tab_path(&tm, i), Some(PathBuf::from(own)));
+
+        // A surface of another orchestration instance naming the same pane id
+        // (a reused slot) leaves this tab alone.
+        let (mut tm, i) = open(Some("inst-a"));
+        adopt_context_path_into_owning_tab(&mut tm, &surface(Some("inst-b"), Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, Some(own)));
+        assert_eq!(tab_path(&tm, i), None);
+
+        // A surface with no path changes nothing.
+        let (mut tm, i) = open(None);
+        adopt_context_path_into_owning_tab(&mut tm, &surface(None, None));
+        assert_eq!(tab_path(&tm, i), None);
     }
 
     /// Issue #717: the close-confirmation preview asks the daemon about EVERY
@@ -25745,6 +26058,7 @@ mod tests {
             tab_membership: membership,
             agent_type: None,
             live: None,
+            orchestrator_context_path: None,
         }
     }
 
@@ -25969,6 +26283,52 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Issue #1395 audit round 2: a hydrated start role's context path is kept
+    /// only when it names a per-publish file directly under the bucket's own
+    /// orchestration cwd; another project's file, a `..` detour or the mirror
+    /// leaves the bucket on the mirror fallback.
+    #[test]
+    fn partition_keeps_only_a_context_path_under_the_orchestrations_own_project() {
+        const NAME: &str = "orchestrator-context-0123456789abcdef0123456789abcdef.md";
+        let start = |path: &str| {
+            let mut pane = hydrated(
+                "1",
+                "a-1",
+                Some("/proj"),
+                Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/proj".into()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+            );
+            pane.orchestrator_context_path = Some(PathBuf::from(path));
+            pane
+        };
+        let own = format!("/proj/.dot-agent-deck/{NAME}");
+        let p = partition_hydrated_panes(&[start(&own)]);
+        assert_eq!(
+            p.orchestration_buckets[0].context_path.as_deref(),
+            Some(Path::new(&own))
+        );
+        for bad in [
+            format!("/other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/../.dot-agent-deck/{NAME}"),
+            format!("/proj/.dot-agent-deck/../../other/.dot-agent-deck/{NAME}"),
+            format!("/proj/sub/.dot-agent-deck/{NAME}"),
+            "/proj/.dot-agent-deck/orchestrator-context.md".to_string(),
+        ] {
+            let p = partition_hydrated_panes(&[start(&bad)]);
+            assert_eq!(
+                p.orchestration_buckets[0].context_path, None,
+                "{bad:?} must not be adopted"
+            );
+        }
     }
 
     /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
@@ -27220,6 +27580,7 @@ mod tests {
                     is_start_role: false,
                 },
             ],
+            context_path: None,
         };
         let chosen = resolve_orch_config_for_hydration(Some(local.clone()), &bucket);
         assert_eq!(
@@ -31432,6 +31793,37 @@ mod tests {
         assert_eq!(CardDensity::Spacious.card_height(), 10);
     }
 
+    /// Issue #1368: a status row is fitted inside the density's height — the
+    /// separator goes first, then the oldest prompts, then `Dir:` — and a card
+    /// without one keeps every row at its own density's height.
+    #[test]
+    fn fit_card_rows_makes_room_for_status_rows() {
+        let plan = |d: CardDensity, status| {
+            let budget = d.card_height() as usize - 2;
+            fit_card_rows(
+                budget,
+                status,
+                d.max_prompts(),
+                d != CardDensity::Compact,
+                d.max_tools(),
+            )
+        };
+        let row = |dir, prompts, separator| CardRowPlan {
+            dir,
+            prompts,
+            separator,
+        };
+        assert_eq!(plan(CardDensity::Normal, 0), row(true, 1, true));
+        assert_eq!(plan(CardDensity::Spacious, 0), row(true, 3, true));
+        assert_eq!(plan(CardDensity::Compact, 0), row(true, 1, false));
+        assert_eq!(plan(CardDensity::Normal, 1), row(true, 1, false));
+        assert_eq!(plan(CardDensity::Spacious, 1), row(true, 3, false));
+        assert_eq!(plan(CardDensity::Compact, 1), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
+        assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
+    }
+
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
     /// when a resize grows `visible_rows`. While content still overflows the
     /// window a valid offset is left alone; once everything (or more) fits, the
@@ -33028,11 +33420,11 @@ mod tests {
     fn dispatcher_mode_name_and_seed_constants() {
         assert_eq!(DISPATCHER_MODE_NAME, "dispatcher");
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("dispatch"),
+            dispatcher_seed_prompt().contains("dispatch"),
             "seed must contain 'dispatch'"
         );
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("worktree"),
+            dispatcher_seed_prompt().contains("worktree"),
             "seed must contain 'worktree'"
         );
     }
@@ -33041,7 +33433,7 @@ mod tests {
     fn build_dispatcher_seed_carries_the_working_dir() {
         let seed = build_dispatcher_seed(std::path::Path::new("/tmp/test-repo"));
         assert!(
-            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            seed.starts_with(&dispatcher_seed_prompt()),
             "seed must start with the constant prompt, got:\n{seed}"
         );
         assert!(
@@ -33069,13 +33461,21 @@ mod tests {
             "NEVER do the work yourself",
         ] {
             assert!(
-                !DISPATCHER_SEED_PROMPT.contains(banned),
+                !dispatcher_seed_prompt().contains(banned),
                 "the dispatcher seed must not carry work-methodology copy, found {banned:?}"
             );
         }
         // The mechanics it MUST still carry.
+        // Issue #1385: the verb is named by the running deck's path, which an
+        // agent's `$PATH` cannot redirect, not by the bare name.
+        let bin = crate::platform::paths::binary_name();
+        let dispatch_verb = format!("{bin} dispatch <name>");
+        assert!(
+            !dispatcher_seed_prompt().contains("dot-agent-deck dispatch <name>"),
+            "the dispatcher seed must not name the deck by its bare name"
+        );
         for required in [
-            "dot-agent-deck dispatch <name>",
+            dispatch_verb.as_str(),
             "SELF-CONTAINED",
             "../<repo>-dispatch-<name>",
             "single-use",
@@ -33111,7 +33511,7 @@ mod tests {
             "RELATIVE to the repo root",
         ] {
             assert!(
-                DISPATCHER_SEED_PROMPT.contains(required),
+                dispatcher_seed_prompt().contains(required),
                 "the dispatcher seed must still teach {required:?}"
             );
         }
@@ -33135,7 +33535,7 @@ mod tests {
     fn dispatcher_seed_quotes_the_opening_the_daemon_actually_sends() {
         const QUOTED_OPENING: &str = "dispatch: a unit you dispatched has completed";
         assert!(
-            DISPATCHER_SEED_PROMPT.contains(QUOTED_OPENING),
+            dispatcher_seed_prompt().contains(QUOTED_OPENING),
             "the seed must quote the opening of the completion turn"
         );
         let delivered = crate::dispatch_return::compose_completion_report(
@@ -33153,7 +33553,7 @@ mod tests {
         // repository's words as data, so pin it against the real frames too.
         for frame in ["UNTRUSTED-ROLE-LABEL", "UNTRUSTED-WORKER-REPORT"] {
             assert!(
-                DISPATCHER_SEED_PROMPT.contains(frame),
+                dispatcher_seed_prompt().contains(frame),
                 "the seed must name the {frame:?} frame the agent will actually see"
             );
             assert!(
@@ -33176,16 +33576,16 @@ mod tests {
     #[test]
     fn dispatcher_seed_says_the_exit_status_is_not_the_outcome() {
         assert!(
-            DISPATCHER_SEED_PROMPT.contains(crate::dispatch::SPAWNED_OPENING),
+            dispatcher_seed_prompt().contains(crate::dispatch::SPAWNED_OPENING),
             "the seed must quote the opening the daemon's success reply actually uses, {:?}",
             crate::dispatch::SPAWNED_OPENING
         );
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("exit status says only that the daemon ACCEPTED"),
+            dispatcher_seed_prompt().contains("exit status says only that the daemon ACCEPTED"),
             "the seed must say what the exit status does and does not assert"
         );
         assert!(
-            !DISPATCHER_SEED_PROMPT.contains("Returns immediately and reports what was started"),
+            !dispatcher_seed_prompt().contains("Returns immediately and reports what was started"),
             "the pre-#530 sentence read the return as the report of what started"
         );
     }
@@ -33202,12 +33602,12 @@ mod tests {
     #[test]
     fn dispatcher_seed_asks_the_shape_once_per_unit() {
         assert!(
-            DISPATCHER_SEED_PROMPT.contains("ONCE PER UNIT"),
+            dispatcher_seed_prompt().contains("ONCE PER UNIT"),
             "the dispatcher seed must ask the shape per unit"
         );
         for banned in ["before the FIRST dispatch", "Reuse the answer"] {
             assert!(
-                !DISPATCHER_SEED_PROMPT.contains(banned),
+                !dispatcher_seed_prompt().contains(banned),
                 "the dispatcher seed must not ask the shape once per batch, found {banned:?}"
             );
         }
@@ -33283,7 +33683,7 @@ mod tests {
             .as_deref()
             .expect("the dispatcher card must carry its seed on the request");
         assert!(
-            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            seed.starts_with(&dispatcher_seed_prompt()),
             "the card's seed must be the dispatcher seed, got:\n{seed}"
         );
         assert!(
@@ -33379,7 +33779,7 @@ mod tests {
         // Add starts from the base seed (invokes `schedule add`, no edit block) —
         // PRD #170 appends the picked-dir working_dir DEFAULT line.
         assert!(
-            seed.starts_with(SCHEDULE_AUTHORING_SEED_PROMPT),
+            seed.starts_with(&schedule_authoring_seed_prompt()),
             "add seed must begin with the base authoring seed"
         );
         assert!(seed.contains("schedule add"));
@@ -33421,9 +33821,13 @@ mod tests {
             "edit seed must carry the row's name"
         );
         // Edit drives `schedule update`, never `add`-as-rename, and forbids rename.
+        // Issue #1385: named by the running deck's path, not the bare name.
         assert!(
-            seed.contains("schedule update"),
-            "edit seed must instruct `schedule update`"
+            seed.contains(&format!(
+                "{} schedule update --name digest",
+                crate::platform::paths::binary_name()
+            )),
+            "edit seed must instruct `schedule update` through the running deck, got:\n{seed}"
         );
         assert!(
             seed.to_lowercase().contains("rename is forbidden"),
@@ -41966,6 +42370,7 @@ mod config_drift_tests {
                     is_start_role: *i == 0,
                 })
                 .collect(),
+            context_path: None,
         }
     }
 

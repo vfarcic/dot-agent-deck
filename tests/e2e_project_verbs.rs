@@ -1214,7 +1214,8 @@ fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
 }
 
 /// Scenario: Start both roles of launch A through the daemon, then prepare B in
-/// the same project. The file named by A's coordinator prompt still holds A's task.
+/// the same project. A's coordinator record names its own context file, its
+/// worker record does not, and the file still holds A's task.
 #[spec("project/launch/006")]
 #[test]
 fn project_launch_006_a_later_prepare_does_not_replace_a_started_launchs_context() {
@@ -1299,6 +1300,121 @@ fn project_launch_006_a_later_prepare_does_not_replace_a_started_launchs_context
         "A's prompt must name its own published file"
     );
     assert_ne!(a_path, b_path, "each preparation needs its own file");
+
+    let records = daemon.agent_records();
+    assert_eq!(records.len(), a.roles.len(), "every A role is still live");
+    for role in &a.roles {
+        let record = records
+            .iter()
+            .find(|record| record.display_name.as_deref() == Some(role.name.as_str()))
+            .unwrap_or_else(|| panic!("missing daemon record for {}", role.name));
+        let wire = serde_json::to_value(record).expect("serialize the ListAgents record");
+        let expected = role.start.then_some(a.context_path.as_str());
+        assert_eq!(
+            wire.get("orchestrator_context_path")
+                .and_then(Value::as_str),
+            expected,
+            "the ListAgents record for role {} must carry A's own context path only when it is the start role: {wire}",
+            role.name
+        );
+    }
+}
+
+/// Scenario: Start two orchestrations prepared in the same project, then stop
+/// every pane of the first. Its unique context file disappears, while the
+/// second live orchestration's file and the compatibility mirror remain.
+#[spec("project/launch/008")]
+#[test]
+fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let workspace = common::harness_tempdir().expect("mint the project sandbox");
+    let project = canonical(&make_dir(
+        workspace.path(),
+        "cleanup-project",
+        Some(NAMED_PROJECT_TOML),
+    ));
+    let project_wire = wire_path(&project);
+    let prepare = |task: &str| {
+        let reply = daemon
+            .send_attach_request(&AttachRequest::PrepareWorkflow {
+                path: project_wire.clone(),
+                orchestration: "loop".into(),
+                task: task.into(),
+                config_revision: None,
+            })
+            .expect("PrepareWorkflow over the attach socket");
+        assert!(reply.ok, "preparation for {task} failed: {:?}", reply.error);
+        reply
+            .workflow_prepared
+            .expect("preparation carries a binding")
+    };
+    let first = prepare("FIRST-LIVE-BRIEF");
+    let second = prepare("SECOND-LIVE-BRIEF");
+    let first_path = unique_context_path(&project, &first.context_path);
+    let second_path = unique_context_path(&project, &second.context_path);
+    assert_ne!(first_path, second_path);
+    let mirror = project.join(".dot-agent-deck/orchestrator-context.md");
+    assert!(first_path.is_file() && second_path.is_file() && mirror.is_file());
+
+    let start =
+        |prepared: &dot_agent_deck::event::PreparedOrchestration, title: &str, instance: &str| {
+            let (role_index, role) = prepared
+                .roles
+                .iter()
+                .enumerate()
+                .find(|(_, role)| role.start)
+                .expect("fixture has a start role");
+            let reply = daemon
+                .send_attach_request(&AttachRequest::StartPreparedAgent {
+                    prep_token: prepared.token.clone(),
+                    command: Some("cat".into()),
+                    cwd: Some(project_wire.clone()),
+                    rows: 24,
+                    cols: 80,
+                    env: vec![("DOT_AGENT_DECK_PANE_ID".into(), instance.into())],
+                    display_name: Some(role.name.clone()),
+                    tab_membership: Some(TabMembership::Orchestration {
+                        name: "loop".into(),
+                        role_index,
+                        role_name: role.name.clone(),
+                        is_start_role: true,
+                        orchestration_cwd: Some(project_wire.clone()),
+                        display_title: Some(title.into()),
+                        orchestration_id: Some(instance.into()),
+                    }),
+                    agent_type: None,
+                    seed: None,
+                    use_configured_command: false,
+                })
+                .expect("StartPreparedAgent over the attach socket");
+            assert!(reply.ok, "start {title} failed: {:?}", reply.error);
+            reply.id.expect("started role has an agent id")
+        };
+    let first_id = start(&first, "First run", "cleanup-first");
+    let second_id = start(&second, "Second run", "cleanup-second");
+    assert_eq!(daemon.agent_records().len(), 2, "both runs are live");
+
+    let stopped = daemon
+        .send_attach_request(&AttachRequest::StopAgent { id: first_id })
+        .expect("stop first orchestration's only pane");
+    assert!(stopped.ok, "stop failed: {:?}", stopped.error);
+    assert!(
+        common::wait_until(Duration::from_secs(10), || !first_path.exists()),
+        "ended orchestration left its unique context file at {}",
+        first_path.display()
+    );
+    assert!(
+        daemon
+            .agent_records()
+            .iter()
+            .any(|record| record.id == second_id),
+        "the second orchestration must still be live"
+    );
+    assert!(
+        second_path.is_file(),
+        "live orchestration lost its own context"
+    );
+    assert!(mirror.is_file(), "the compatibility mirror must remain");
 }
 
 /// Scenario: Resolve a single `loop`, add another role-bearing `loop`, then

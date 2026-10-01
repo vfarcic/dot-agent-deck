@@ -2040,14 +2040,38 @@ function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: s
 function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void }) {
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
+  //
+  // Issue #1426: the rename is applied HERE, through `settings.apply`, because a
+  // rename is not a save — the panel never hands it to `onSave` — and the
+  // document it answers with is what every surface reading settings must see.
+  //
+  // The panel names the deck by id; the rename carries the row as this window
+  // shows it, so the crate can refuse when the deck on disk is no longer that
+  // one (a CLI row's id is derived from its name, and can pass to another deck).
+  // Read through a ref so the function keeps its identity across renders.
+  const { renameDeck: runtimeRename, defaultDeckName, checkDeckName } = runtime;
+  const apply = settings.apply;
+  const shownDocument = useRef(settings.settings);
+  shownDocument.current = settings.settings;
+  const renameDeck = useMemo(() => {
+    if (!runtimeRename) return undefined;
+    return (id: string, name: string) => {
+      const deck = shownDocument.current.endpoints?.remote.find((row) => row.id === id);
+      if (!deck) return Promise.reject(new Error("That deck is no longer in the deck list."));
+      return apply ? apply(() => runtimeRename(deck, name)) : runtimeRename(deck, name);
+    };
+  }, [runtimeRename, apply]);
   const settingsBridge = useMemo(
     () => ({
       testEndpoint: runtime.testEndpoint,
       secretStatus: runtime.secretStatus,
       storeSecret: runtime.storeSecret,
       forgetSecret: runtime.forgetSecret,
+      renameDeck,
+      defaultDeckName,
+      checkDeckName,
     }),
-    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret],
+    [runtime.testEndpoint, runtime.secretStatus, runtime.storeSecret, runtime.forgetSecret, renameDeck, defaultDeckName, checkDeckName],
   );
   return (
     <SettingsBridgeProvider value={settingsBridge}>

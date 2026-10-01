@@ -211,6 +211,7 @@ async fn handle_connection(
                 spawned_at_ms: None,
                 cli_name: None,
                 crashed: None,
+                orchestrator_context_path: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -309,6 +310,7 @@ fn orchestration_record(
         spawned_at_ms: None,
         cli_name: None,
         crashed: None,
+        orchestrator_context_path: None,
     }
 }
 

@@ -275,6 +275,31 @@ impl Requirement {
             Requirement::NewAgentDialogClosed => new_agent.is_none(),
         }
     }
+
+    /// Whether the webview's pending-answer staleness check notices this
+    /// requirement changing while an answer is in flight — and so whether a
+    /// row may key `heard_as_whole_while` on it (issue #1248).
+    ///
+    /// A contextual grounding is only sound if an answer grounded under one
+    /// side of the requirement can never be applied on the other. That check
+    /// is `sameNewAgentDeclaration` in `desktop/src/components/
+    /// VoiceControlPanel.tsx`, which refuses a pending answer
+    /// (`DIALOG_MOVED_ON`) when the New agent declaration's two presences
+    /// differ: the dialog's, and its form's. So the requirements [`met_by`]
+    /// answers from those two presences alone are covered, and the directory
+    /// ones — answered from the listing, which that check does not compare —
+    /// are not. Exhaustive, so a new requirement has to decide which side it
+    /// is on; one that says `true` has to be compared there as well.
+    ///
+    /// [`met_by`]: Requirement::met_by
+    pub fn rechecked_before_dispatch(self) -> bool {
+        match self {
+            Requirement::NewAgentForm
+            | Requirement::NewAgentDialog
+            | Requirement::NewAgentDialogClosed => true,
+            Requirement::DirectoryListing | Requirement::ParentDirectory => false,
+        }
+    }
 }
 
 impl fmt::Display for Requirement {
@@ -734,6 +759,14 @@ impl CommandTable {
                         requirement: requirement.clone(),
                     }
                 })?;
+                // A context the staleness check cannot see would let an answer
+                // grounded on one side of it dispatch on the other.
+                if !requires.rechecked_before_dispatch() {
+                    return Err(TableError::UnrecheckedGroundingWhile {
+                        id: id.clone(),
+                        requirement: requires,
+                    });
+                }
                 let phrases = own_words(phrases)?;
                 // Narrower only: each entry, said on its own, must already be
                 // grounded by the row's `heard_as` — checked as a contiguous
@@ -1042,6 +1075,14 @@ pub enum TableError {
         id: String,
         requirements: Vec<String>,
     },
+    /// A `heard_as_whole_while` keyed on a requirement the pending-answer
+    /// staleness check does not compare
+    /// ([`Requirement::rechecked_before_dispatch`]), so an answer grounded
+    /// before it changed could still dispatch after (issue #1248).
+    UnrecheckedGroundingWhile {
+        id: String,
+        requirement: Requirement,
+    },
     /// A `heard_as_also` on a row that is not token-grounded by `heard_as`,
     /// or that also declares `heard_as_whole_while`.
     MisplacedGroundingAlso { id: String },
@@ -1151,6 +1192,16 @@ impl fmt::Display for TableError {
                 f,
                 "command `{id}` declares `heard_as_whole_while` for more than one context ({}); a row takes one, since nothing would decide which grounds it where both hold",
                 joined(requirements.iter().map(String::as_str))
+            ),
+            TableError::UnrecheckedGroundingWhile { id, requirement } => write!(
+                f,
+                "command `{id}` declares `heard_as_whole_while.{requirement}`, but a pending answer is not re-checked against `{requirement}` before it dispatches, so an answer grounded before it changed could run after; the contexts are {}",
+                joined(
+                    Requirement::ALL
+                        .into_iter()
+                        .filter(|requirement| requirement.rechecked_before_dispatch())
+                        .map(Requirement::as_str)
+                )
             ),
             TableError::MisplacedGroundingAlso { id } => write!(
                 f,
@@ -2062,6 +2113,47 @@ mod tests {
                 .contains("`new_agent_dialog`, `new_agent_form`"),
             "{error}"
         );
+    }
+
+    /// Issue #1248: a context grounding is sound only where the webview's
+    /// pending-answer staleness check (`sameNewAgentDeclaration`) would notice
+    /// the context changing mid-flight. That check compares the dialog's and
+    /// the form's presence and nothing else, so a context keyed on the
+    /// directory listing is refused, while the three it does see still parse.
+    #[test]
+    fn voice_table_rejects_a_context_grounding_the_staleness_check_cannot_see() {
+        let with = |requirement: &str| {
+            one_row().replace(
+                "heard_as = [\"open\"]",
+                &format!("heard_as = [\"open\"]\nheard_as_whole_while.{requirement} = [\"open\"]"),
+            )
+        };
+        for requirement in [Requirement::DirectoryListing, Requirement::ParentDirectory] {
+            let error = CommandTable::parse(&with(requirement.as_str())).expect_err("refused");
+            assert_eq!(
+                error,
+                TableError::UnrecheckedGroundingWhile {
+                    id: "open_agent".to_string(),
+                    requirement,
+                },
+                "{requirement}"
+            );
+            assert!(
+                error.to_string().contains(
+                    "the contexts are `new_agent_form`, `new_agent_dialog`, `new_agent_dialog_closed`"
+                ),
+                "{error}"
+            );
+        }
+        for requirement in [
+            Requirement::NewAgentForm,
+            Requirement::NewAgentDialog,
+            Requirement::NewAgentDialogClosed,
+        ] {
+            let table = CommandTable::parse(&with(requirement.as_str()))
+                .unwrap_or_else(|error| panic!("{requirement}: {error}"));
+            assert_eq!(table.rows()[0].grounding_while[0].requires, requirement);
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@
 //! * bound back at their own absolute paths: the build clone **read-only** (so
 //!   `build.rs`'s `git describe` and cargo's fingerprints keep working, and build
 //!   code cannot plant a hook or a config in it), the trust domain's target dir
-//!   **read-write**, and the Rust toolchain's sysroot read-only when it lives
-//!   under the home;
+//!   **read-write**, and the Rust toolchain's sysroot read-only when a mask
+//!   would hide it;
 //! * a fresh Cargo home in the private `/tmp`, with the fetch phase's `registry`
 //!   bound read-only beneath it — never the operator's Cargo home, whose
 //!   `config.toml`, `credentials.toml` and `bin/` stay outside;
@@ -147,6 +147,22 @@ impl Shape {
             }
         }
         out
+    }
+
+    /// The `rw` mounts in `mountinfo` that are not this namespace's own: its
+    /// read-write binds, its masks, and everything under `/proc` and `/dev`.
+    fn rw_mounts(&self, mountinfo: &str) -> isolation::RwMounts {
+        let masks = self.masks();
+        isolation::classify_rw_mounts(
+            mountinfo,
+            |mp: &Path| {
+                self.rw.iter().any(|p| mp == p)
+                    || masks.contains(&mp)
+                    || mp.starts_with("/proc")
+                    || mp.starts_with("/dev")
+            },
+            &masks,
+        )
     }
 
     /// Every bind destination, which is what may exist inside the masked home.
@@ -328,6 +344,8 @@ pub struct Host {
     pub outer_net: String,
     /// This binary, bound read-only into every build namespace as the probe.
     pub harness: PathBuf,
+    /// `isolation::HOST_ONLY_DIRS` that exist here, canonical; masked.
+    pub host_only: Vec<PathBuf>,
 }
 
 impl Host {
@@ -345,6 +363,7 @@ impl Host {
             outer_pid: proc::namespace("self", "pid").ok_or("cannot read /proc/self/ns/pid")?,
             outer_net: proc::namespace("self", "net").ok_or("cannot read /proc/self/ns/net")?,
             harness: std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?,
+            host_only: isolation::host_only_dirs_to_mask(&[], &[]),
         })
     }
 }
@@ -409,7 +428,12 @@ pub const LINK_POOL_NOTE: &str = "linker pool: the link gate (`scripts/link-gate
      links and nothing else. The build was **not** gated against other builds on the host, and \
      the machine-wide pool was never bound into it";
 
-fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) -> Shape {
+fn base_shape(
+    host: &Host,
+    tc: &Toolchain,
+    cwd: &Path,
+    target: Option<&Path>,
+) -> Result<Shape, String> {
     let mut tmpfs = vec![
         (PathBuf::from("/tmp"), TMP_BYTES),
         (PathBuf::from("/var/tmp"), SMALL_BYTES),
@@ -424,14 +448,37 @@ fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) ->
     {
         tmpfs.push((ch.clone(), SMALL_BYTES));
     }
-    if host
+    // A running container leaves `rw` mounts under these that the read-only
+    // root cannot remount; masked, the probe finds them beneath the mask
+    // rather than residual (issue #1413).
+    for p in &host.host_only {
+        if !shape_masks.iter().any(|m| p.starts_with(m)) {
+            tmpfs.push((p.clone(), SMALL_BYTES));
+        }
+    }
+    // The toolchain is bound back read-only when any mask hides it — the home,
+    // an outside Cargo home, or a host-only dir such as `/var/lib/docker`. A
+    // toolchain that IS a mask's root is refused: binding it would replace
+    // that private mount with the host directory.
+    let masks: Vec<&PathBuf> = host
         .home
-        .as_ref()
-        .is_some_and(|h| tc.sysroot.starts_with(h))
-    {
+        .iter()
+        .chain(tmpfs.iter().map(|(p, _)| p))
+        .collect();
+    if let Some(m) = masks.iter().find(|m| tc.sysroot == ***m) {
+        return Err(format!(
+            "refusing the build namespace: the toolchain's sysroot {} is the root of a path the \
+             namespace masks with a private tmpfs, and binding it back would replace that mask \
+             with the host directory ({} itself). Run from a shell whose `rustc` resolves to a \
+             toolchain beneath it, such as a rustup toolchain",
+            tc.sysroot.display(),
+            m.display()
+        ));
+    }
+    if masks.iter().any(|m| tc.sysroot.starts_with(m)) {
         ro.push(tc.sysroot.clone());
     }
-    Shape {
+    Ok(Shape {
         home: host.home.clone(),
         tmpfs,
         ro,
@@ -440,7 +487,7 @@ fn base_shape(host: &Host, tc: &Toolchain, cwd: &Path, target: Option<&Path>) ->
         nulled_sockets: Vec::new(),
         cwd: cwd.to_path_buf(),
         env: env_for(tc, host.home.as_deref(), target),
-    }
+    })
 }
 
 /// Cover every host socket the shape leaves visible.
@@ -517,7 +564,7 @@ pub fn build_plan(
             }
         }
     }
-    let mut shape = base_shape(host, tc, clone, Some(target));
+    let mut shape = base_shape(host, tc, clone, Some(target))?;
     shape.ro.push(clone.to_path_buf());
     shape.rw.push(target.to_path_buf());
     for sub in ["registry", "git"] {
@@ -541,17 +588,22 @@ pub fn build_plan(
 /// The namespace the build-time gate's `cargo metadata --no-deps` runs in: the
 /// merge-base's extracted tree read-only as the working directory, no target
 /// dir, and no registry — `--no-deps --offline` reads neither.
-pub fn metadata_plan(host: &Host, tc: &Toolchain, tree: &Path, sockets: Vec<PathBuf>) -> ProbePlan {
-    let mut shape = base_shape(host, tc, tree, None);
+pub fn metadata_plan(
+    host: &Host,
+    tc: &Toolchain,
+    tree: &Path,
+    sockets: Vec<PathBuf>,
+) -> Result<ProbePlan, String> {
+    let mut shape = base_shape(host, tc, tree, None)?;
     shape.ro.push(tree.to_path_buf());
     cover_sockets(&mut shape, &sockets);
-    probe_plan(
+    Ok(probe_plan(
         "the build-time gate's `cargo metadata`",
         host,
         shape,
         vec![tree.to_path_buf()],
         sockets,
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -939,15 +991,12 @@ pub fn probe(plan: &ProbePlan) -> ProbeReport {
     // remount is a FAILURE here, not the exposure note the runtime namespace
     // records: it would let build code write a host filesystem outside the
     // target dir. So is mountinfo that cannot be read, since then no one knows.
+    // One the namespace's own masks lie over is not residual: no path inside
+    // reaches it (`isolation::classify_rw_mounts`).
     match std::fs::read_to_string("/proc/self/mountinfo") {
         Ok(info) => {
-            let own = |mp: &Path| {
-                plan.shape.rw.iter().any(|p| mp == p)
-                    || plan.shape.masks().contains(&mp)
-                    || mp.starts_with("/proc")
-                    || mp.starts_with("/dev")
-            };
-            let residual = isolation::residual_rw_mounts_where(&info, own);
+            let isolation::RwMounts { residual, covered } = plan.shape.rw_mounts(&info);
+            r.notes.extend(isolation::describe_covered(&covered));
             if residual.is_empty() {
                 r.notes.push(format!(
                     "writable inside: {}; the private tmpfs mounts {}; no residual `rw` submount",
@@ -1305,6 +1354,7 @@ mod tests {
             outer_pid: "pid:[2]".into(),
             outer_net: "net:[3]".into(),
             harness: "/home/op/code/dad/target/debug/xtask-cross-version".into(),
+            host_only: vec!["/var/lib/docker".into(), "/run/containerd".into()],
         }
     }
 
@@ -1361,7 +1411,14 @@ mod tests {
                 "/home/op/code/xver-src",
             ],
         );
-        for mask in ["/home/op", "/tmp", "/var/tmp", "/run", "/usr/share"] {
+        for mask in [
+            "/home/op",
+            "/tmp",
+            "/var/tmp",
+            "/run",
+            "/usr/share",
+            "/var/lib/docker",
+        ] {
             let at = pos(&args, &["--tmpfs", mask]);
             assert!(
                 at < clone,
@@ -1373,6 +1430,139 @@ mod tests {
                 "{mask} is RAM-backed and must be capped"
             );
         }
+    }
+
+    #[test]
+    fn a_host_only_dir_under_an_existing_mask_is_not_masked_twice() {
+        let tmpfs: Vec<PathBuf> = plan().shape.tmpfs.into_iter().map(|(p, _)| p).collect();
+        assert!(tmpfs.contains(&PathBuf::from("/var/lib/docker")));
+        assert!(
+            !tmpfs.contains(&PathBuf::from("/run/containerd")),
+            "`/run` already masks it: {tmpfs:?}"
+        );
+    }
+
+    #[test]
+    fn a_sysroot_under_any_mask_is_bound_back_read_only_after_it() {
+        let mut t = tc();
+        t.sysroot = "/var/lib/docker/rust/stable".into();
+        let p = build_plan(
+            &host(),
+            &t,
+            Path::new("/home/op/code/xver-src"),
+            Path::new("/home/op/code/xver-target"),
+            Path::new("/nonexistent-fetch-home"),
+            vec![],
+        )
+        .expect("plan");
+        let args = bwrap_args(&p.shape, &host().harness);
+        let mask = pos(&args, &["--tmpfs", "/var/lib/docker"]);
+        let back = pos(
+            &args,
+            &[
+                "--ro-bind",
+                "/var/lib/docker/rust/stable",
+                "/var/lib/docker/rust/stable",
+            ],
+        );
+        assert!(mask < back, "the sysroot must land on top of the mask");
+        // A sysroot under no mask needs no bind of its own.
+        t.sysroot = "/opt/rust/stable".into();
+        let p = build_plan(
+            &host(),
+            &t,
+            Path::new("/home/op/code/xver-src"),
+            Path::new("/home/op/code/xver-target"),
+            Path::new("/nonexistent-fetch-home"),
+            vec![],
+        )
+        .expect("plan");
+        assert!(!p.shape.ro.contains(&PathBuf::from("/opt/rust/stable")));
+    }
+
+    #[test]
+    fn a_sysroot_that_is_a_mask_root_is_refused_rather_than_bound_over_it() {
+        for root in ["/tmp", "/run", "/var/lib/docker", "/usr/share", "/home/op"] {
+            let mut t = tc();
+            t.sysroot = root.into();
+            let e = build_plan(
+                &host(),
+                &t,
+                Path::new("/home/op/code/xver-src"),
+                Path::new("/home/op/code/xver-target"),
+                Path::new("/nonexistent-fetch-home"),
+                vec![],
+            )
+            .unwrap_err();
+            assert!(e.contains("replace that mask"), "{root}: {e}");
+            let e =
+                metadata_plan(&host(), &t, Path::new("/home/op/code/runs/x"), vec![]).unwrap_err();
+            assert!(e.contains("replace that mask"), "{root}: {e}");
+        }
+    }
+
+    /// Container mounts as the build namespace sees them (issue #1413): the
+    /// copied host `/run` (21) with a netns mount in it, an overlay in the
+    /// copied root, the namespace's own masks over both, and the read-write
+    /// target dir bound into the masked home.
+    const CONTAINERS: &str = "\
+1 0 253:1 / / ro,nosuid,nodev - ext4 /dev/vda1 rw
+21 1 0:28 / /run ro,nosuid,nodev - tmpfs tmpfs rw
+28 21 0:5 net:[4026532620] /run/docker/netns/2b3b rw - nsfs nsfs rw
+33 1 0:50 / /var/lib/docker/rootfs/overlayfs/814c rw,relatime - overlay overlay rw
+40 1 0:60 / /home/op rw,nosuid,nodev - tmpfs tmpfs rw
+19 21 0:59 / /run rw,nosuid,nodev - tmpfs tmpfs rw
+34 1 0:62 / /var/lib/docker rw,nosuid,nodev - tmpfs tmpfs rw
+41 40 253:1 /home/op/code/xver-target /home/op/code/xver-target rw - ext4 /dev/vda1 rw
+";
+
+    #[test]
+    fn container_mounts_beneath_the_masks_do_not_refuse_the_build() {
+        let got = plan().shape.rw_mounts(CONTAINERS);
+        assert!(got.residual.is_empty(), "{got:?}");
+        assert_eq!(
+            got.covered,
+            vec![
+                ("/run/docker/netns/2b3b".into(), "/run".into()),
+                (
+                    "/var/lib/docker/rootfs/overlayfs/814c".into(),
+                    "/var/lib/docker".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reachable_rw_submount_still_refuses_the_build() {
+        // Without the `/var/lib/docker` mask the overlay is reachable; and a
+        // `rw` mount beneath the target dir's bind, or one on top of the
+        // `/run` mask, is reachable whatever else is masked.
+        let mut h = host();
+        h.host_only.clear();
+        let unmasked = build_plan(
+            &h,
+            &tc(),
+            Path::new("/home/op/code/xver-src"),
+            Path::new("/home/op/code/xver-target"),
+            Path::new("/nonexistent-fetch-home"),
+            vec![],
+        )
+        .expect("plan");
+        let info = CONTAINERS.replace("34 1 0:62 / /var/lib/docker", "34 1 0:62 / /var/lib/other");
+        assert_eq!(
+            unmasked.shape.rw_mounts(&info).residual,
+            vec!["/var/lib/docker/rootfs/overlayfs/814c", "/var/lib/other"]
+        );
+        let info = format!(
+            "{CONTAINERS}\
+42 41 0:70 / /home/op/code/xver-target/mnt rw - ext4 /dev/vdb rw
+43 19 0:71 / /run/later rw - tmpfs tmpfs rw
+"
+        );
+        assert_eq!(
+            plan().shape.rw_mounts(&info).residual,
+            vec!["/home/op/code/xver-target/mnt", "/run/later"]
+        );
     }
 
     #[test]
@@ -1576,7 +1766,8 @@ mod tests {
             &tc(),
             Path::new("/home/op/code/runs/.xver-merge-base-x"),
             vec![],
-        );
+        )
+        .expect("plan");
         assert!(p.shape.rw.is_empty());
         assert!(p.shape.ro_at.is_empty());
         assert!(

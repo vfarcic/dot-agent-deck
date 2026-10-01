@@ -3,6 +3,7 @@ import { ArrowDownToLine, BookOpenText, Copy, X } from "lucide-react";
 import type { AgentSession } from "../types";
 import { getTerminal, stripAnsi, terminalSnapshotText } from "../lib/terminalRegistry";
 import { blockedReasonText } from "../lib/blockedReason";
+import { writeClipboardText } from "../lib/clipboard";
 
 /** How often the reader re-snapshots the live terminal buffer while open. */
 const REFRESH_MS = 700;
@@ -80,10 +81,14 @@ export function OutputReader({ agent, onClose }: OutputReaderProps) {
   }, []);
 
   const copyAll = useCallback(() => {
-    void navigator.clipboard?.writeText(text).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    });
+    // Issue #1403: the same clipboard path as the terminal's copy chord.
+    void writeClipboardText(text).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1_500);
+      },
+      () => undefined,
+    );
   }, [text]);
 
   return (

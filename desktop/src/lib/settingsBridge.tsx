@@ -56,6 +56,19 @@ export interface SettingsBridge {
   secretStatus: (id: VoiceSecretId) => Promise<SecretStatusDto>;
   storeSecret: (id: VoiceSecretId, secret: string) => Promise<SecretStatusDto>;
   forgetSecret: (id: VoiceSecretId) => Promise<SecretStatusDto>;
+  /**
+   * Deck naming (issue #1426) — actions, like the rest of this context.
+   *
+   * `renameDeck` resolves with the document as it now is on disk; whoever
+   * provides it applies that document, so the rename does not travel through
+   * `onSave` (a save never renames a deck). `defaultDeckName` and
+   * `checkDeckName` let the Daemons panel pre-fill and pre-validate a name
+   * without its own copy of the naming rule. Optional: without them the panel
+   * shows no name field, and an added deck takes the derived name on save.
+   */
+  renameDeck?: (id: string, name: string) => Promise<DesktopSettingsDto>;
+  defaultDeckName?: (host: string, user?: string) => Promise<string>;
+  checkDeckName?: (name: string, id?: string) => Promise<string | null>;
 }
 
 const SettingsBridgeContext = createContext<SettingsBridge | undefined>(undefined);

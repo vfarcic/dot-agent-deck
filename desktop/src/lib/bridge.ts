@@ -193,6 +193,8 @@ export interface UnconfiguredDeckDto {
   label: string;
   /** Why there is nothing to show. */
   reason: string;
+  /** The row's name in the shared deck list (issue #1426); absent when it has no usable one. */
+  name?: string;
 }
 
 /** One deck the app connects to, named before it has reported (PRD #742 M14). */
@@ -203,6 +205,12 @@ export interface ObservedDeckDto {
   label: string;
   /** Whether this deck runs on this machine; what decides how it is named. */
   deckKind?: "local" | "remote";
+  /**
+   * A remote deck's name in the shared deck list (issue #1426). Absent for the
+   * local deck and for a remote one with no usable name, which is then called
+   * by {@link label}.
+   */
+  name?: string;
 }
 
 export interface DesktopAgentDto {
@@ -467,15 +475,29 @@ export interface EndpointSettingsDto {
 /**
  * One `[[endpoints.remote]]` row. References only — a host, an optional user, a
  * port, an optional identity-file *path*, an optional jump-host *name* — and
- * never a secret. There is no display name: `RemoteEndpoint::describe()` derives
- * the label from the address, because a free-text label is exactly the arbitrary
- * `String` the settings field-type guard refuses.
+ * never a secret.
+ *
+ * `name` is the deck's name in the shared deck list — what `dot-agent-deck
+ * connect <name>` takes (issue #1426) — and what the app calls the deck on
+ * screen. It is a validated slug on the Rust side (`DeckName`), not free text.
+ * `null` (or absent) is a row whose stored name is not a usable deck name; the
+ * deck is then called by its address, as `RemoteEndpoint::describe()` derives
+ * it. A save never renames a stored deck: renaming is `desktop_rename_deck`.
  */
 export interface RemoteEndpointDto {
   host: string;
   id: string;
   identity?: string;
   jump?: string;
+  name?: string | null;
+  /**
+   * When `name` is `null` because the stored name is not a usable deck name:
+   * a fingerprint of that stored name (16 hex digits), never the name itself
+   * (issue #1426's review). Not for display. It rides back on a rename so the
+   * crate can tell the name this window showed from another unusable name
+   * written since, and refuse a stale rename.
+   */
+  name_digest?: string;
   port: number;
   /**
    * The deck's attach socket path **on the remote host**. Optional because it
@@ -489,7 +511,7 @@ export interface RemoteEndpointDto {
 
 /**
  * The {@link RemoteEndpointDto} fields that make up a row's ADDRESS — every one
- * but its `id` — in the order {@link endpointsFingerprint} reads them. A change
+ * but its `id` and its `name` — in the order {@link endpointsFingerprint} reads them. A change
  * to any of them names a different deck or a different route to it: `host`,
  * `user` and `port` pick the machine, `socket` the deck on it, and `identity`
  * and `jump` how SSH gets there. One list, so the fingerprint, a spoken
@@ -499,6 +521,10 @@ export interface RemoteEndpointDto {
  * `selector_voice_decks_add_the_decks_the_selector_lists` holds it to the
  * settings row's fields less `id`, and `bridge.test.ts` holds the keys a
  * switch's identity reaches the webview with to this list.
+ *
+ * `name` is deliberately not here (issue #1426): renaming a deck keeps it the
+ * same deck, so a rename must neither re-establish the fleet nor refuse a spoken
+ * switch resolved before it.
  */
 export const REMOTE_ADDRESS_FIELDS = ["host", "user", "port", "socket", "identity", "jump"] as const satisfies readonly (keyof RemoteEndpointDto)[];
 
@@ -1283,11 +1309,18 @@ function normalizeRemoteEndpoint(value: unknown): RemoteEndpointDto | undefined 
     const raw = record[key];
     return typeof raw === "string" && raw ? raw : undefined;
   };
+  // Issue #1426: `null` is carried as `null` rather than dropped, because it is
+  // what the crate sends for a row with no usable name and a round trip should
+  // hand it back the way it came. Assigned rather than spread in: a spread here
+  // is what the settings-secret guard refuses.
+  const name = typeof record.name === "string" && record.name ? record.name : record.name === null ? null : undefined;
   return {
     host,
     id,
     identity: optional("identity"),
     jump: optional("jump"),
+    name,
+    name_digest: optional("name_digest"),
     port: typeof record.port === "number" && Number.isInteger(record.port) && record.port > 0 && record.port <= 65535 ? record.port : DEFAULT_SSH_PORT,
     socket: optional("socket"),
     user: optional("user"),
@@ -1553,6 +1586,32 @@ export interface DeckBridge {
    * only when the call itself could not be made.
    */
   testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto>;
+  /**
+   * Rename the stored deck `deck` — the row as the window shows it — to `name`
+   * in the shared deck list (issue #1426), resolving with the settings as they
+   * now are on disk.
+   *
+   * Not a settings save: a save never renames a deck. The deck keeps its id, so
+   * the selection and everything keyed on the deck still name it. **Rejects
+   * with the sentence to show** when the name is refused — invalid, or another
+   * deck's — or the deck list could not be written. When the deck on disk is no
+   * longer `deck` (its address or name changed elsewhere, or its id now names
+   * another deck), nothing is renamed and it rejects with a
+   * {@link PartialSettingsSaveError} carrying the settings as they are on disk.
+   */
+  renameDeck(deck: RemoteEndpointDto, name: string): Promise<DesktopSettingsDto>;
+  /**
+   * The name a deck at `host` (and `user`) would get if added without one —
+   * what the add form pre-fills (issue #1426). The shared library derives it,
+   * so the webview holds no copy of the rule.
+   */
+  defaultDeckName(host: string, user?: string): Promise<string>;
+  /**
+   * `null` when `name` can be a deck's name, otherwise the sentence a save or
+   * rename would refuse it with (issue #1426). `id` is the deck being renamed —
+   * its own current name is no clash; omit it for a deck being added.
+   */
+  checkDeckName(name: string, id?: string): Promise<string | null>;
   /**
    * Whether a credential is stored under `id`, without reading it (PRD #802 M4).
    *
@@ -2041,6 +2100,7 @@ export function unconfiguredDeckSnapshot(deck: UnconfiguredDeckDto, clientProtoc
   // BRIDGE knows about an entry it built, not something a deck reported, and
   // `mapDesktopSnapshot` describes decks that answered.
   snapshot.connection.unconfigured = true;
+  if (deck.name) snapshot.connection.name = deck.name;
   return snapshot;
 }
 
@@ -2119,6 +2179,7 @@ export function pendingDeckSnapshot(deck: ObservedDeckDto, clientProtocolVersion
   });
   snapshot.connection.status = "loading";
   snapshot.connection.pending = true;
+  if (deck.name) snapshot.connection.name = deck.name;
   return snapshot;
 }
 
@@ -2580,6 +2641,28 @@ class FixtureDeckBridge implements DeckBridge {
       clientProtocolVersion: 0,
       clientBuildVersion: "browser-preview",
     };
+  }
+
+  /**
+   * The browser preview has no shared deck list, so a rename is refused in as
+   * many words rather than faked in `localStorage` — a name stored there would
+   * be one `dot-agent-deck connect` could never find.
+   */
+  async renameDeck(): Promise<DesktopSettingsDto> {
+    await Promise.resolve();
+    throw new Error("Browser preview — it has no deck list, so a daemon cannot be renamed here.");
+  }
+
+  /** The preview has no deck list to derive against, so it suggests nothing. */
+  async defaultDeckName(): Promise<string> {
+    await Promise.resolve();
+    return "";
+  }
+
+  /** The preview holds no copy of the naming rule, so it refuses nothing. */
+  async checkDeckName(): Promise<string | null> {
+    await Promise.resolve();
+    return null;
   }
 
   /**
@@ -3588,7 +3671,7 @@ export class TauriDeckBridge implements DeckBridge {
   private fleetView(): DeckFleet {
     const entries = Array.from(this.fleet.entries());
     const selectedAt = entries.findIndex(([deckId]) => deckId === this.selectedDeckId);
-    const decks = entries.map(([, deck]) => deck);
+    const decks = entries.map(([deckId, deck]) => this.named(deckId, deck));
     /*
       PRD #742 M12: the configured decks with no address, last and never first.
       They are built here rather than held in `fleet` because nothing upserts
@@ -3615,6 +3698,26 @@ export class TauriDeckBridge implements DeckBridge {
     if (selectedAt <= 0) return [...decks, ...pending, ...unconfigured];
     const [selected] = decks.splice(selectedAt, 1);
     return [selected, ...decks, ...pending, ...unconfigured];
+  }
+
+  /**
+   * `deck` with the name the crate's `observed` list gives it (issue #1426).
+   *
+   * A deck's own snapshot carries only its address; its name in the shared
+   * deck list is a property of the applied settings document, restated on
+   * every arrival in `observed` and keyed by the same `deckId`. Joined here, on
+   * every view, rather than stored on the snapshot, so a rename shows on the
+   * next arrival from ANY deck — the crate emits one after a rename — without
+   * waiting for the renamed deck's own watcher. The same object comes back when
+   * nothing changes, so a view with no names allocates nothing.
+   */
+  private named(deckId: string, deck: DeckSnapshot): DeckSnapshot {
+    const name = this.observed?.decks.find((entry) => entry.deckId === deckId)?.name || undefined;
+    if (deck.connection.name === name) return deck;
+    const connection = { ...deck.connection };
+    if (name) connection.name = name;
+    else delete connection.name;
+    return { ...deck, connection };
   }
 
   /**
@@ -4117,6 +4220,39 @@ export class TauriDeckBridge implements DeckBridge {
   async testEndpoint(settings: DesktopSettingsDto, selection: string): Promise<EndpointTestReportDto> {
     const invoke = await this.getInvoke();
     return invoke<EndpointTestReportDto>("desktop_test_endpoint", { settings, selection });
+  }
+
+  /**
+   * Issue #1426. The reply goes through the same normaliser and the same
+   * after-write step a save's does: it is the document as it now is on disk,
+   * and the rename changed no address, so the fleet is not re-established — the
+   * crate emits a snapshot carrying the new name itself.
+   */
+  async renameDeck(deck: RemoteEndpointDto, name: string): Promise<DesktopSettingsDto> {
+    const invoke = await this.getInvoke();
+    let raw: DesktopSettingsDto;
+    try {
+      raw = await invoke<DesktopSettingsDto>("desktop_rename_deck", { deck, name });
+    } catch (cause) {
+      // The deck changed since this window loaded it: nothing was renamed, and
+      // the crate hands back the list as it is so the window can show it.
+      const partial = partialSettingsSave(cause);
+      if (!partial) throw cause;
+      const written = await this.afterSettingsWrite(normalizeDesktopSettings(partial.written));
+      throw new PartialSettingsSaveError(partial.message, written);
+    }
+    return this.afterSettingsWrite(normalizeDesktopSettings(raw));
+  }
+
+  async defaultDeckName(host: string, user?: string): Promise<string> {
+    const invoke = await this.getInvoke();
+    return invoke<string>("desktop_default_deck_name", { host, user: user || undefined });
+  }
+
+  async checkDeckName(name: string, id?: string): Promise<string | null> {
+    const invoke = await this.getInvoke();
+    const refusal = await invoke<string | null>("desktop_check_deck_name", { name, id });
+    return typeof refusal === "string" && refusal ? refusal : null;
   }
 
   /**

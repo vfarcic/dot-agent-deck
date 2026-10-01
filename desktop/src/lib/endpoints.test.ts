@@ -4,7 +4,7 @@
  * (M9).
  */
 import { describe, expect, it } from "vitest";
-import { ALL_ENDPOINT_SELECTION, LOCAL_ENDPOINT_SELECTION, type EndpointSettingsDto } from "./bridge";
+import { ALL_ENDPOINT_SELECTION, LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type EndpointSettingsDto } from "./bridge";
 import {
   ALL_DECKS_SELECTION,
   deckChoices,
@@ -160,6 +160,14 @@ describe("deckChoices", () => {
 });
 
 describe("describeEndpoint", () => {
+  /// Scenario: A named remote deck uses its CLI name on screen; a legacy name that cannot be shown falls back to its address.
+  it("uses a deck name when present and its address when the name is unavailable", () => {
+    const named = { host: "build-box", id: ID, port: 2222, user: "deploy", name: "build" };
+    const legacy = { ...named, name: null };
+    expect(describeEndpoint(named)).toBe("build");
+    expect(describeEndpoint(legacy)).toBe("deploy@build-box:2222");
+    expect(REMOTE_ADDRESS_FIELDS).not.toContain("name");
+  });
   it("drops the default port and keeps any other", () => {
     expect(describeEndpoint({ host: "h", id: ID, port: 22 })).toBe("h");
     expect(describeEndpoint({ host: "h", id: ID, port: 2222 })).toBe("h:2222");

@@ -21,12 +21,27 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     rows = 24;
     disposed = false;
     host?: HTMLElement;
+    /** What `getSelection` answers: the text the operator has highlighted. */
+    selection = "";
     private readonly handlers = new Set<(data: string) => void>();
     constructor(options: Record<string, unknown>) {
       this.options = { ...options };
       this.textarea = document.createElement("textarea");
+      // Issue #1403 — xterm's own `keydown` binding on its helper textarea,
+      // reduced to the one key the copy chord sits next to: plain Ctrl+C, which
+      // xterm hands the agent as ETX. Any key event that reaches this listener
+      // is one the real xterm would have evaluated.
+      this.textarea.addEventListener("keydown", (event) => {
+        this.keysSeen.push(event.key);
+        if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "c") {
+          this.typeKey("\x03");
+        }
+      });
       terminals.push(this);
     }
+    /** Every `keydown` that reached xterm's own listener, by key. */
+    keysSeen: string[] = [];
+    getSelection(): string { return this.selection; }
     loadAddon(addon: { activate?: (terminal: FakeTerminal) => void }): void { addon.activate?.(this); }
     open(host: HTMLElement): void { this.host = host; host.appendChild(this.textarea); }
     write(): void {}
@@ -59,6 +74,9 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
   }
   return { terminals, FakeTerminal, FakeFitAddon };
 });
+
+const { writeClipboardText } = vi.hoisted(() => ({ writeClipboardText: vi.fn(async (_text: string) => undefined) }));
+vi.mock("../lib/clipboard", () => ({ writeClipboardText }));
 
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal as unknown as typeof import("@xterm/xterm").Terminal }));
 vi.mock("@xterm/addon-fit", () => ({
@@ -280,6 +298,84 @@ describe("TerminalViewport input gate", () => {
 
     expect(terminals).toHaveLength(2);
     expect(first.disposed).toBe(true);
+  });
+});
+
+describe("TerminalViewport copy", () => {
+  beforeEach(() => {
+    terminals.length = 0;
+    writeClipboardText.mockClear();
+  });
+
+  /**
+   * Scenario: the operator highlights part of an agent's output and presses
+   * Ctrl+Shift+C (Cmd+C on macOS). The highlighted text goes to the clipboard,
+   * and the keystroke never reaches xterm — so nothing at all, and certainly
+   * not an interrupt, is sent to the agent. Issue #1403.
+   */
+  it("copies the selection on Ctrl+Shift+C and Cmd+C without the agent seeing the keystroke", () => {
+    const onInput = vi.fn();
+    renderViewport(false, onInput);
+    const terminal = terminals[0];
+    terminal.selection = "cargo test passed";
+
+    const shiftChord = fireEvent.keyDown(terminal.textarea, { key: "C", ctrlKey: true, shiftKey: true });
+    const macChord = fireEvent.keyDown(terminal.textarea, { key: "c", metaKey: true });
+
+    expect(writeClipboardText.mock.calls).toEqual([["cargo test passed"], ["cargo test passed"]]);
+    // `fireEvent` returns false when the event was default-prevented: the
+    // webview's own reaction to either chord is claimed too.
+    expect(shiftChord).toBe(false);
+    expect(macChord).toBe(false);
+    expect(terminal.keysSeen).toEqual([]);
+    expect(onInput).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the chord with nothing highlighted. The clipboard keeps what it
+   * had, and the chord still goes nowhere near the agent.
+   */
+  it("leaves the clipboard alone when nothing is selected", () => {
+    const onInput = vi.fn();
+    renderViewport(false, onInput);
+    const terminal = terminals[0];
+
+    fireEvent.keyDown(terminal.textarea, { key: "C", ctrlKey: true, shiftKey: true });
+
+    expect(writeClipboardText).not.toHaveBeenCalled();
+    expect(terminal.keysSeen).toEqual([]);
+    expect(onInput).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: plain Ctrl+C while text is highlighted. It is the agent's
+   * interrupt, exactly as before, and copies nothing.
+   */
+  it("hands plain Ctrl+C to the agent as an interrupt even over a selection", () => {
+    const onInput = vi.fn();
+    renderViewport(false, onInput);
+    const terminal = terminals[0];
+    terminal.selection = "cargo test passed";
+
+    fireEvent.keyDown(terminal.textarea, { key: "c", ctrlKey: true });
+
+    expect(onInput).toHaveBeenCalledWith("\x03");
+    expect(writeClipboardText).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: a pane that cannot be typed into — history only, or another
+   * client holds the write lease. Its output can still be copied, which is most
+   * of what such a pane is for.
+   */
+  it("copies from a read-only pane", () => {
+    renderViewport(true, vi.fn());
+    const terminal = terminals[0];
+    terminal.selection = "exit status 0";
+
+    fireEvent.keyDown(screen.getByTestId("terminal-planner"), { key: "C", ctrlKey: true, shiftKey: true });
+
+    expect(writeClipboardText).toHaveBeenCalledWith("exit status 0");
   });
 });
 

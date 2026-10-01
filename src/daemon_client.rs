@@ -1488,6 +1488,7 @@ impl DaemonClient {
                     // derivation this field exists to remove.
                     cli_name: None,
                     crashed: None,
+                    orchestrator_context_path: None,
                 })
                 .collect(),
             schedule_revision,
@@ -5632,6 +5633,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -5695,6 +5697,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -5721,6 +5724,7 @@ start = true
             spawned_at_ms: None,
             cli_name: None,
             crashed: None,
+            orchestrator_context_path: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

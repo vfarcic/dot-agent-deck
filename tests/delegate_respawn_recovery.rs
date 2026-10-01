@@ -933,6 +933,22 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         String::from_utf8_lossy(&snapshot)
     );
 
+    // Issue #1423: the worker was given nothing, so the delegation's idle-worker
+    // watch must not stay armed to tell the orchestrator, hours later, that the
+    // worker went idle on this task. The release follows the notice's submit on
+    // the same dispatch task, so it is waited for rather than read once.
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
+    while let Some(seq) = fx.daemon.registry.outstanding_delegation_seq(WORKER_PANE) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a delegation whose replacement worker died still holds its idle-worker record \
+             (seq {seq}) {DEAD_REPLACEMENT_NOTICE_BUDGET:?} after the orchestrator was told, so \
+             the orchestrator would later be told the worker went idle on a task it never \
+             received"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     // Issue #708 (Greptile P2 on PR #1338): the SAME failure a second time. The
     // `die` marker is still there, so the next delegate's replacement dies too and
     // the daemon composes byte-identical text for the same worker pane. The user
