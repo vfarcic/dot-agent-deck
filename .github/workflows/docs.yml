@@ -34,7 +34,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: 1.97.1
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Generates the published Markdown, llms.txt/llms-full.txt, images, the
