@@ -3070,12 +3070,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let uid = probe_uid();
         let expected = format!("{}/dot-agent-deck-{uid}/attach.sock", temp.path().display());
+        // A developer may have a real legacy socket bound at /tmp; point the
+        // legacy rung at this sandbox so it cannot win the fallback probe.
+        let probe = REMOTE_SOCKET_PROBE.replace(
+            "/tmp/dot-agent-deck-attach-",
+            &format!("{}/legacy-", temp.path().display()),
+        );
 
         assert_eq!(
-            run_socket_probe(
-                REMOTE_SOCKET_PROBE,
-                &[("TMPDIR", &temp.path().to_string_lossy())]
-            ),
+            run_socket_probe(&probe, &[("TMPDIR", &temp.path().to_string_lossy())]),
             expected,
             "nothing bound anywhere: name the path a fresh daemon would bind"
         );
@@ -3085,10 +3088,7 @@ mod tests {
         let _listener =
             std::os::unix::net::UnixListener::bind(&expected).expect("bind the new endpoint");
         assert_eq!(
-            run_socket_probe(
-                REMOTE_SOCKET_PROBE,
-                &[("TMPDIR", &temp.path().to_string_lossy())]
-            ),
+            run_socket_probe(&probe, &[("TMPDIR", &temp.path().to_string_lossy())]),
             expected,
             "a live new-spelling endpoint is the answer"
         );
@@ -5307,18 +5307,33 @@ mod tunnel_tests {
     #[test]
     fn a_regular_file_at_the_forward_path_is_not_mistaken_for_a_bound_socket() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let ssh = standin_ssh(temp.path(), "printf x > \"$local_sock\"\nsleep 30");
+        let ssh = standin_ssh(
+            temp.path(),
+            "printf x > \"$local_sock\"\nprintf x > \"${local_sock}.plain\"\nsleep 30",
+        );
         let socket = socket_in(temp.path());
+        // Under a full, parallel fast-tier run the stand-in may not be
+        // scheduled before a subsecond readiness deadline. It must create the
+        // non-socket inode for this to exercise the intended guard.
         let err =
-            RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_millis(300))
+            RemoteTunnel::open_at_within(&ssh, &deck(), socket.clone(), Duration::from_secs(10))
                 .expect_err("a regular file must not read as a forward");
         assert!(
             matches!(err, TunnelError::ForwardTimeout { .. }),
             "got {err:?}"
         );
         assert!(
-            socket.exists() && !is_socket_at(&socket),
-            "the premise: the stand-in did create a non-socket inode there"
+            socket.with_extension("sock.plain").exists()
+                && socket.is_file()
+                && !is_socket_at(&socket),
+            "the stand-in created a regular file, which was not mistaken for a socket: marker={}, file={}, socket={} entries={:?}",
+            socket.with_extension("sock.plain").exists(),
+            socket.is_file(),
+            is_socket_at(&socket),
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<Vec<_>>()
         );
     }
 

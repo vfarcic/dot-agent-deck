@@ -330,8 +330,8 @@ pub fn address_key(entry: &RemoteEntry) -> (String, Option<String>, u16) {
 /// under one user's home). Kept across a move, it has `connect` and `remote
 /// doctor` run the old host's path on the new one and report the binary
 /// missing (PR #1373's review). Cleared, the row falls back to
-/// [`crate::remote::REMOTE_INSTALL_PATH`], the contract for any row with no
-/// recorded install, until the next `remote upgrade` detects what is there.
+/// [`crate::remote::REMOTE_INSTALL_PATH`], the first path tried for a row with
+/// no recorded install; `connect` can rediscover Homebrew if it is missing.
 ///
 /// The port counts, because [`address_key`] is this module's one definition
 /// of "the same deck" and a different port routinely *is* a different machine

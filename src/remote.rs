@@ -1057,10 +1057,10 @@ pub struct RemoteEntry {
     /// How the deck is installed on the remote, as `remote add` / `remote
     /// upgrade` last detected it (issue #1372): [`INSTALL_LOCAL_BIN`] or
     /// [`INSTALL_HOMEBREW`]. `None` on entries written before the field
-    /// existed, which are treated as [`INSTALL_LOCAL_BIN`] until the next
-    /// `remote upgrade` detects otherwise. Kept as a string rather than an
-    /// enum so a value written by a newer build does not make this build
-    /// refuse the whole registry.
+    /// existed, which try [`REMOTE_INSTALL_PATH`] first; `connect` can discover
+    /// and record a Homebrew install if that path is gone. Kept as a string
+    /// rather than an enum so a value written by a newer build does not make
+    /// this build refuse the whole registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<String>,
     /// Absolute path of the deck binary on the remote, recorded when it is not
@@ -1531,6 +1531,26 @@ fn install_probe_command() -> String {
         local_bin = REMOTE_INSTALL_PATH,
         brews = brews.join(" "),
     )
+}
+
+/// Discover a Homebrew binary without changing the remote install. Used when
+/// `connect` finds that a legacy entry's default ~/.local/bin path is gone.
+/// The connect executor supplies its short SSH deadline; cap the answer as
+/// well, since this is a probe rather than an installation operation.
+pub(crate) fn discover_homebrew_binary(
+    executor: &dyn SshExecutor,
+    target: &SshTarget,
+) -> Result<Option<RemoteBinaryPath>, SshError> {
+    let probe = executor.run_capped(target, &install_probe_command(), 8 * 1024)?;
+    if probe.truncated || probe.output.status != 0 {
+        return Ok(None);
+    }
+    let prefix = probe.output.stdout.lines().find_map(|line| {
+        line.strip_prefix("homebrew=")
+            .filter(|prefix| !prefix.is_empty())
+    });
+    Ok(prefix
+        .and_then(|prefix| RemoteBinaryPath::try_from(format!("{prefix}/bin/dot-agent-deck")).ok()))
 }
 
 /// Find out how the deck is installed on the remote (issue #1372).

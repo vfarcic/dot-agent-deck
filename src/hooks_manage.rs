@@ -1610,7 +1610,10 @@ mod tests {
                 pid_file.display()
             ),
         );
-        let bound = std::time::Duration::from_millis(500);
+        // Leave room for the stand-in to be scheduled when the fast tier is
+        // running in parallel; otherwise the probe can time out before the
+        // script even writes helper.pid, leaving this test without its premise.
+        let bound = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
         let outcome = probe_claude_version(claude.as_os_str(), bound);
         let elapsed = started.elapsed();
