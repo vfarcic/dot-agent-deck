@@ -347,17 +347,21 @@ fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
 
     // The centered modal leaves the bottom status line visible. Check that
     // line directly, so a warning in unrelated content cannot satisfy this.
-    let status_line = grid
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default();
-    assert!(
-        status_line
+    //
+    // WAITED for rather than read off the frame that first showed "Mode:":
+    // the warning can paint a frame later, and on a starved CI runner it did,
+    // twice in a row (PR #1451's `e2e-deterministic`, load verdict STARVED).
+    let bottom_line_warns = |grid: &str| {
+        grid.lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
             .to_ascii_lowercase()
-            .contains("workspace modes were removed"),
-        "opening a legacy project should warn in the visible bottom status line.\n\
-         Status line: {status_line:?}\nGrid:\n{grid}"
+            .contains("workspace modes were removed")
+    };
+    deck.wait_until_grid(
+        "the legacy-workspace warning in the visible bottom status line",
+        bottom_line_warns,
     );
     assert!(
         !mode_row.contains("legacy-mode-xyz"),
