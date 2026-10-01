@@ -1,7 +1,7 @@
 #!/bin/sh
 # Regenerate the derived copies of the Agent Deck mark from its one master,
-# assets/brand/logo.svg: the docs navbar logo, the desktop rail badge, the
-# full Tauri icon set, and the docs favicon. Run from anywhere; needs the
+# assets/brand/logo.svg: the landing page logo, the desktop rail badge, the
+# full Tauri icon set, and the site favicon. Run from anywhere; needs the
 # desktop's node dependencies (`pnpm --dir desktop install`). The lockups are
 # separate -- scripts/brand-lockups.py -- because they need a font toolchain.
 # docs/develop/brand-assets.md has the rest.
@@ -26,7 +26,7 @@ pnpm --dir "$root/desktop" exec tauri icon "$master" --output "$icons"
 rm -rf "$icons/android" "$icons/ios" "$icons"/Square*Logo.png "$icons/StoreLogo.png"
 
 # The Windows .ico carries 16/24/32/48/64/256px frames, which is exactly what
-# a favicon wants, so the docs site reuses it rather than building its own.
+# a favicon wants, so the website reuses it rather than building its own.
 cp "$icons/icon.ico" "$root/site/static/img/favicon.ico"
 
 echo "brand assets regenerated from $master"

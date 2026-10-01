@@ -1,18 +1,497 @@
 /*
- * Landing page (issue #1021) — direction C, bold product marketing.
+ * The landing page's stylesheet (issue #1021; ported from Docusaurus to plain
+ * CSS by PRD #1419).
  *
- * Everything here is scoped under `.page`, which is the landing page's own
- * visual layer: its own bands, its own background, its own marketing devices.
- * The navbar and footer around it stay the docs' own, deliberately (see the
- * note at the top of `index.js`).
+ * Four parts, in order:
  *
- * The `--c-*` COLOUR TOKENS are no longer declared here. They were this page's
- * alone, which is exactly why `/` and `/docs` read as two different products;
- * they now live on `:root` / `html[data-theme='dark']` in `src/css/custom.css`,
- * where the docs consume them too, and this page simply inherits them. Nothing
- * else moved with them: the type scale, the spacing and the devices below stay
- * the landing page's own, and no gradient, spotlight or device frame reaches
- * the docs.
+ * 1. The colour tokens, carried over from `site/src/css/custom.css`. Light is
+ *    the default; dark applies when the OS prefers it and nothing explicit is
+ *    chosen, or when the toggle has set `data-theme="dark"`. The toggle's
+ *    `data-theme="light"` overrides a dark OS preference.
+ * 2. Base element styles standing in for the Infima defaults the page used to
+ *    inherit from the Docusaurus theme (font stacks, link colour, code chips).
+ * 3. The page's own header and footer, which replaced the Docusaurus navbar
+ *    and footer, and the pieces PRD #1419 added (the agent prompt in the
+ *    hero, and the docs index for agents above the footer).
+ * 4. The design itself, `site/src/pages/index.module.css` ported rather than
+ *    restyled: the CSS-module class names became plain classes and nothing
+ *    else moved.
+ */
+
+/* ---------- 1. colour tokens ---------- */
+
+:root {
+  --c-bg: #ffffff;
+  --c-bg-alt: #f5f7f9;
+  --c-ink: #0e1418;
+  --c-dim: #55636e;
+  --c-line: #e2e7eb;
+  --c-teal: #0a7c73;
+  --c-teal-soft: rgba(15, 156, 144, 0.12);
+  --c-violet: #6248d6;
+  --c-violet-soft: rgba(98, 72, 214, 0.1);
+  --c-amber: #8a5200;
+  --c-amber-soft: rgba(224, 165, 49, 0.14);
+  --c-shadow: 0 30px 70px -30px rgba(14, 20, 24, 0.35);
+  --c-cta-from: #0b7d74;
+  --c-cta-to: #5a3fd0;
+  --c-cta-ink: #ffffff;
+  --c-code-bg: rgba(14, 20, 24, 0.05);
+  --c-code-line: rgba(14, 20, 24, 0.1);
+  --c-nav-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.1);
+  /* The footer is dark in both themes, as the Docusaurus `style: 'dark'` footer was. */
+  --c-footer-bg: #303846;
+  --c-footer-ink: #ebedf0;
+  --c-footer-dim: #c3c7cd;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --c-bg: #0a0e12;
+    --c-bg-alt: #101720;
+    --c-ink: #edf2f6;
+    --c-dim: #9aa8b4;
+    --c-line: #1e2833;
+    --c-teal: #4ecdc4;
+    --c-teal-soft: rgba(78, 205, 196, 0.14);
+    --c-violet: #9d8bff;
+    --c-violet-soft: rgba(157, 139, 255, 0.14);
+    --c-amber: #e0a531;
+    --c-amber-soft: rgba(224, 165, 49, 0.14);
+    --c-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.85);
+    --c-cta-from: #4ecdc4;
+    --c-cta-to: #9d8bff;
+    --c-cta-ink: #07121a;
+    --c-code-bg: rgba(255, 255, 255, 0.08);
+    --c-code-line: rgba(255, 255, 255, 0.1);
+    --c-nav-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.6);
+    color-scheme: dark;
+  }
+}
+
+/* The same dark values, for an explicit choice from the toggle. */
+:root[data-theme='dark'] {
+  --c-bg: #0a0e12;
+  --c-bg-alt: #101720;
+  --c-ink: #edf2f6;
+  --c-dim: #9aa8b4;
+  --c-line: #1e2833;
+  --c-teal: #4ecdc4;
+  --c-teal-soft: rgba(78, 205, 196, 0.14);
+  --c-violet: #9d8bff;
+  --c-violet-soft: rgba(157, 139, 255, 0.14);
+  --c-amber: #e0a531;
+  --c-amber-soft: rgba(224, 165, 49, 0.14);
+  --c-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.85);
+  --c-cta-from: #4ecdc4;
+  --c-cta-to: #9d8bff;
+  --c-cta-ink: #07121a;
+  --c-code-bg: rgba(255, 255, 255, 0.08);
+  --c-code-line: rgba(255, 255, 255, 0.1);
+  --c-nav-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
+}
+
+/* ---------- 2. base ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--c-bg);
+  color: var(--c-ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, Cantarell,
+    'Noto Sans', sans-serif, BlinkMacSystemFont, Helvetica, Arial,
+    'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+  font-size: 100%;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+a {
+  color: var(--c-teal);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+pre {
+  font-family: SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono',
+    'Courier New', monospace;
+}
+
+code {
+  font-size: 95%;
+  background: var(--c-code-bg);
+  border: 1px solid var(--c-code-line);
+  border-radius: 0.4rem;
+  padding: 0.1rem 0.25rem;
+  vertical-align: middle;
+}
+
+.skipLink {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  z-index: 10;
+  padding: 0.5rem 0.9rem;
+  border-radius: 6px;
+  background: var(--c-bg);
+  border: 1px solid var(--c-line);
+}
+
+.skipLink:focus {
+  top: 0.5rem;
+}
+
+/* ---------- 3. header ---------- */
+
+.navbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  height: 3.75rem;
+  padding: 0.5rem 1rem;
+  background: var(--c-bg-alt);
+  box-shadow: var(--c-nav-shadow);
+}
+
+.navbarInner {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 1.25rem;
+}
+
+.navbarBrand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--c-ink);
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+
+.navbarBrand:hover {
+  color: var(--c-ink);
+  text-decoration: none;
+}
+
+.navbarBrand img {
+  width: 2rem;
+  height: 2rem;
+}
+
+.navbarLinks,
+.navbarRight {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.navbarRight {
+  margin-left: auto;
+}
+
+.navbarLinks a,
+.navbarRight a {
+  color: var(--c-ink);
+  font-weight: 500;
+}
+
+.navbarLinks a:hover,
+.navbarRight a:hover {
+  color: var(--c-teal);
+  text-decoration: none;
+}
+
+.themeToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--c-ink);
+  cursor: pointer;
+}
+
+.themeToggle[hidden] {
+  display: none;
+}
+
+.themeToggle:hover {
+  background: var(--c-bg-alt);
+}
+
+/* The toggle shows the theme it will switch TO. */
+.iconSun {
+  display: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .iconSun {
+    display: block;
+  }
+
+  :root:not([data-theme='light']) .iconMoon {
+    display: none;
+  }
+}
+
+:root[data-theme='dark'] .iconSun {
+  display: block;
+}
+
+:root[data-theme='dark'] .iconMoon {
+  display: none;
+}
+
+@media (max-width: 560px) {
+  .navbarLinks a[href='/llms.txt'] {
+    display: none;
+  }
+}
+
+/* ---------- 3. footer ---------- */
+
+.footer {
+  background: var(--c-footer-bg);
+  color: var(--c-footer-ink);
+  padding: 2rem 1rem;
+}
+
+.footerInner {
+  max-width: 1140px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.footerTitle {
+  font-weight: 700;
+  margin: 0 0 0.5rem;
+}
+
+.footer ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.footer li {
+  margin: 0.2rem 0;
+}
+
+.footer a {
+  color: var(--c-footer-dim);
+}
+
+.footer a:hover {
+  color: var(--c-footer-ink);
+}
+
+.footerCopyright {
+  text-align: center;
+  margin: 2rem 0 0;
+  color: var(--c-footer-dim);
+  font-size: 0.9rem;
+}
+
+/* ---------- 3. the agent prompt (PRD #1419) ---------- */
+
+/*
+ * The page's call to action, inside the hero under the lede: a heading, one
+ * line on what the prompt does, the prompt with its copy button, and the one
+ * link for a person who would rather install by hand. The hero is centred;
+ * the prompt itself is left-aligned, because it is text to read and copy.
+ */
+.heroPrompt {
+  max-width: 680px;
+  margin: 2.4rem auto 0;
+  padding: 1.4rem 1.5rem 1.2rem;
+  border: 1px solid var(--c-line);
+  border-radius: 12px;
+  background: var(--c-bg-alt);
+  box-shadow: 0 18px 40px -28px var(--c-violet);
+  text-align: left;
+}
+
+.heroPromptTitle {
+  font-size: clamp(1.15rem, 3.6vw, 1.4rem);
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.4rem;
+}
+
+.heroPromptLede {
+  color: var(--c-dim);
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* The one link for a person who would rather install it by hand. */
+.diyLink {
+  margin: 1rem 0 0;
+  font-size: 0.92rem;
+  color: var(--c-dim);
+}
+
+.diyLink a {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.promptBox {
+  position: relative;
+  margin-top: 1rem;
+  border: 1px solid var(--c-line);
+  border-left: 3px solid var(--c-teal);
+  border-radius: 8px;
+  background: var(--c-bg);
+}
+
+.promptBox pre {
+  margin: 0;
+  padding: 0.9rem 1rem;
+  font-size: 0.85rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--c-ink);
+}
+
+.copyButton {
+  display: block;
+  margin: 0 0.75rem 0.75rem auto;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--c-line);
+  border-radius: 6px;
+  background: var(--c-bg-alt);
+  color: var(--c-ink);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.copyButton[hidden] {
+  display: none;
+}
+
+.copyButton:hover {
+  border-color: var(--c-teal);
+}
+
+/* ---------- 3. the docs index, for agents (PRD #1419) ---------- */
+
+/*
+ * The last band above the footer, kept quiet: small text, flat surface,
+ * hairline rules. It is there for an agent reading the served HTML (every
+ * published page as a plain link, beside where an agent should start), not
+ * as something a person is asked to click through.
+ */
+.forAgents {
+  border-top: 1px solid var(--c-line);
+  background: var(--c-bg-alt);
+  padding: 2.5rem 1rem 3rem;
+}
+
+.forAgentsInner {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.forAgentsTitle {
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--c-dim);
+  margin: 0;
+}
+
+.forAgentsNote {
+  color: var(--c-dim);
+  font-size: 0.85rem;
+  margin: 0.75rem 0 1.25rem;
+  max-width: 80ch;
+}
+
+.forAgentsNote strong {
+  color: var(--c-ink);
+}
+
+.docsIndex {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  columns: 3;
+  column-gap: 2rem;
+}
+
+.docsIndex li {
+  break-inside: avoid;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--c-line);
+  font-size: 0.8rem;
+}
+
+.docsIndex a {
+  font-weight: 600;
+}
+
+.docsIndex span {
+  display: block;
+  color: var(--c-dim);
+  font-size: 0.75rem;
+}
+
+@media (max-width: 996px) {
+  .docsIndex {
+    columns: 2;
+  }
+}
+
+@media (max-width: 560px) {
+  .docsIndex {
+    columns: 1;
+  }
+}
+
+/* ---------- 4. the design (index.module.css) ---------- */
+
+/*
+ * Everything below is scoped under `.page`, the landing page's own visual
+ * layer: its own bands, its own background, its own marketing devices.
  */
 
 .page {
@@ -140,70 +619,6 @@
   border-color: var(--c-teal);
 }
 
-/*
- * The pill WRAPS at every width instead of scrolling sideways. It used to wrap
- * only at 560px and below and scroll above it, which was fine for the hero's
- * `brew tap ...` (471px in the box at every desktop width) and wrong for the
- * download check's `gh attestation verify ...`, which then sat in a separate
- * desktop-app band: 1105px of content in a 932px box from 1120px up, so it
- * rendered cut at "/.github/wo" and the rest was
- * reachable only by scrolling inside the pill. That is the command this page
- * gives a reader for checking a download before they open it -- for the
- * unsigned `.deb`, the only check anybody makes -- so the whole of it has to
- * be ON the page.
- *
- * Each word is its own inline-block (`InstallPill` in `index.js` does the
- * split), so a line ends at a space wherever the words fit. Letting the text
- * wrap directly was the simpler change and it breaks after hyphens too --
- * measured: `--signer-` / `workflow` at 768px, `vfarcic/dot-agent-` /
- * `deck/...` at 1120px and up -- which leaves a line ending meaning a space in
- * some places and nothing in others. That is not something a reader retyping a
- * verification command should have to work out. A word WIDER than the pill
- * still breaks inside itself, and `overflow-wrap` stays for exactly that: the
- * 52-character signer-workflow path does it at 300-552px and again at
- * 561-576px, where the alternative is overflow rather than a tidier break.
- * (Those widths were measured in the old desktop-app band, whose own padding
- * set the pill's width; since PRD #1321 moved the check into the install
- * section, the exact break points differ, and the reasoning does not.)
- *
- * `align-items: baseline` sits the `$` on the first line's baseline rather
- * than centring it against a two-line block, and the sigil's `line-height: 1`
- * keeps its taller line box from pushing the command down: 9.8px above the
- * first line and 9.8px below the last, at every width from 300 to 1440.
- */
-.installPill {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 0.6rem;
-  margin: 1.6rem auto 0;
-  padding: 0.55rem 1rem;
-  border: 1px solid var(--c-line);
-  border-radius: 8px;
-  background: var(--c-bg-alt);
-  max-width: 100%;
-}
-
-.installSigil {
-  color: var(--c-teal);
-  font-weight: 700;
-  line-height: 1;
-}
-
-.installPill code {
-  background: transparent;
-  border: none;
-  color: var(--c-ink);
-  font-size: 0.85rem;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  padding: 0;
-}
-
-.installWord {
-  display: inline-block;
-  max-width: 100%;
-}
-
 /* ---------- showcase ---------- */
 
 .showcase {
@@ -212,7 +627,7 @@
 
 /*
  * The hero is one window per client, side by side (PRD #1321). The column
- * widths come from `index.js` as `--hero-columns`, each in proportion to its
+ * widths come from `index.html` as `--hero-columns`, each in proportion to its
  * frame's aspect ratio, so the two windows stand the same height without
  * cropping either. A custom property rather than an inline
  * `grid-template-columns`, so the narrow-screen rule below can still
@@ -643,7 +1058,7 @@
   font-size: 0.95rem;
 }
 
-/* ---------- platforms and install routes ---------- */
+/* ---------- platforms ---------- */
 
 .install {
   background: var(--c-bg-alt);
@@ -653,30 +1068,11 @@
 }
 
 .installInner {
-  max-width: 1000px;
+  max-width: 720px;
   margin: 0 auto;
 }
 
-.installCols {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2.5rem;
-}
-
-.installCol {
-  min-width: 0;
-}
-
-.installHeading {
-  font-size: 0.72rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--c-dim);
-  margin: 0 0 1rem;
-}
-
-.platformList,
-.routeList {
+.platformList {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -690,19 +1086,11 @@
   border-bottom: 1px solid var(--c-line);
 }
 
-.markOk,
-.markNot {
+.markOk {
   flex: 0 0 1rem;
   font-weight: 700;
   font-size: 0.85rem;
-}
-
-.markOk {
   color: var(--c-teal);
-}
-
-.markNot {
-  color: var(--c-dim);
 }
 
 .platformName {
@@ -725,76 +1113,8 @@
   text-align: right;
 }
 
-.routeList li {
-  padding: 0.7rem 0;
-  border-bottom: 1px solid var(--c-line);
-}
-
-.routeName {
-  font-weight: 600;
-}
-
-.routeDetail {
-  display: block;
-  font-size: 0.82rem;
-  color: var(--c-dim);
-}
-
-.routeCode {
-  display: inline-block;
-  margin-top: 0.45rem;
-  font-size: 0.72rem;
-  background: var(--c-bg);
-  border: 1px solid var(--c-line);
-  border-radius: 5px;
-  padding: 0.2rem 0.5rem;
-  overflow-wrap: anywhere;
-}
-
-.installMore {
-  margin: 1.25rem 0 0;
-  font-weight: 600;
-}
-
-/*
- * The desktop app's route lists its two release assets rather than one
- * command, so each gets its own chip, wrapping as the column narrows, and the
- * route ends in a link to the install steps instead of a command to copy.
- */
-.routeFiles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-}
-
-.routeLink {
-  display: block;
-  margin-top: 0.5rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-}
-
-/*
- * The download check sits under both columns because it covers every asset
- * a release publishes, the CLI's binaries as well as the desktop app's
- * packages. The scope note sits UNDER the command: it says what the command
- * does not reach, which only means anything once the reader has seen it.
- */
-.verify {
-  margin-top: 2.5rem;
-}
-
-.verifyNote,
-.verifyScope {
-  font-size: 0.88rem;
-  color: var(--c-dim);
-  max-width: 62ch;
-  margin: 0;
-}
-
-.verifyScope {
-  font-size: 0.82rem;
-  margin-top: 0.75rem;
+.install .diyLink {
+  margin-top: 1.25rem;
 }
 
 /* ---------- close ---------- */
@@ -821,97 +1141,14 @@
   margin: 0 0 1.5rem;
 }
 
-/* ---------- the docs index ---------- */
+/* ---------- links inside the dimmed text, pinned to the accent ---------- */
 
-/*
- * The last band before the (shared) Docusaurus footer. It steps the page's own
- * visual layer back down -- flat surface, hairline rules, no gradient -- so the
- * handoff into the docs chrome reads as a step rather than a cut.
- *
- * It used to carry a kicker, a metaphor ("The furniture stays. The job
- * changes.") and a paragraph explaining which parts of the site persist across
- * the click. All three are gone: a visitor at the bottom of a landing page
- * wants to know where to click, not how the site is put together, and the
- * shared palette (see the header of this file) has removed the mismatch the
- * paragraph existed to apologise for. What is left is a plain heading over the
- * six pages, so `.doorHead` and `.doorLede` went with it.
- */
-.door {
-  border-top: 1px solid var(--c-line);
-  background: var(--c-bg-alt);
-  padding: 3.5rem 1rem 4rem;
-}
-
-.doorInner {
-  max-width: 1080px;
-  margin: 0 auto;
-}
-
-.doorTitle {
-  font-size: clamp(1.4rem, 4.5vw, 2rem);
-  font-weight: 750;
-  letter-spacing: -0.03em;
-  margin: 0;
-}
-
-.doorGrid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1rem;
-  margin-top: 2.25rem;
-}
-
-.doorCard {
-  position: relative;
-  display: block;
-  padding: 1.1rem 2.6rem 1.1rem 1.2rem;
-  border: 1px solid var(--c-line);
-  border-radius: 10px;
-  background: var(--c-bg);
-  text-decoration: none;
-  color: var(--c-ink);
-  transition: border-color 0.12s ease, transform 0.12s ease;
-}
-
-.doorCard:hover,
-.doorCard:focus-visible {
-  text-decoration: none;
-  color: var(--c-ink);
-  border-color: var(--c-teal);
-  transform: translateY(-1px);
-}
-
-.doorCardTitle {
-  display: block;
-  font-weight: 650;
-  margin-bottom: 0.25rem;
-}
-
-.doorCardBody {
-  display: block;
-  font-size: 0.85rem;
-  color: var(--c-dim);
-}
-
-.doorArrow {
-  position: absolute;
-  top: 1.1rem;
-  right: 1.2rem;
-  color: var(--c-teal);
-}
-
-/* ---------- links that would otherwise inherit Infima's link colour ---------- */
-
-.platformStatus a,
-.installMore a,
-.routeLink a,
+.diyLink a,
 .clientLink a {
   color: var(--c-teal);
 }
 
-.platformStatus a:hover,
-.installMore a:hover,
-.routeLink a:hover,
+.diyLink a:hover,
 .clientLink a:hover {
   color: var(--c-teal);
   text-decoration: underline;
@@ -920,18 +1157,32 @@
 /* ---------- focus ---------- */
 
 /*
- * One focus ring for every link on the page. `.ctaPrimary`, `.ctaGhost` and
- * `.doorCard` carried their own `:focus-visible` rules while the agent-strip
- * links and the three colour-override links fell back to the browser default,
- * so keyboard focus looked different in four places and was close to invisible
- * in two of them. Those rules stay -- they are the hover affordance repeated --
- * and this adds the indicator they were standing in for.
+ * One focus ring for every link on the page. `.ctaPrimary` and `.ctaGhost`
+ * carry their own `:focus-visible` rules while the agent-strip links and the
+ * colour-override links fell back to the browser default, so keyboard focus
+ * looked different from place to place and was close to invisible in some.
+ * Those rules stay -- they are the hover affordance repeated -- and this adds
+ * the indicator they were standing in for.
  *
  * `--c-teal` is #0a7c73 on the light background (5.07:1) and #4ecdc4 on the
  * dark one (10.01:1), so the ring clears WCAG's 3:1 for non-text in both.
  */
-.page a:focus-visible {
+.page a:focus-visible,
+.navbar a:focus-visible,
+.themeToggle:focus-visible,
+.copyButton:focus-visible {
   outline: 2px solid var(--c-teal);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/*
+ * The footer is dark in both themes, where the light theme's #0a7c73 would be
+ * about 2.3:1 against --c-footer-bg; the dark theme's #4ecdc4 is about 6:1
+ * there, so the footer uses that teal in both.
+ */
+.footer a:focus-visible {
+  outline: 2px solid #4ecdc4;
   outline-offset: 3px;
   border-radius: 4px;
 }
@@ -962,13 +1213,8 @@
   }
 
   .principleGrid,
-  .clientGrid,
-  .installCols {
+  .clientGrid {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .doorGrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .story {
@@ -981,19 +1227,25 @@
     padding-top: 3rem;
   }
 
+  .heroPrompt {
+    padding: 1.1rem 1rem 1rem;
+  }
+
   .ctaPrimary,
   .ctaGhost {
     width: 100%;
     text-align: center;
   }
 
-  .doorGrid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   /* The status column needs its own line before it starts squeezing the name. */
   .platformList li {
     flex-wrap: wrap;
+  }
+
+  /* A zero basis keeps a long detail beside its mark instead of wrapping it
+     onto a line of its own. */
+  .platformName {
+    flex-basis: 0;
   }
 
   .platformStatus {

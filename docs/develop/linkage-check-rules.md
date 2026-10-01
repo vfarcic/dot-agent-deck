@@ -13,7 +13,7 @@ Rule {
     number: 16,
     name: "site-image-refs",
     summary: "Every `/img/...` and `./img/...` image reference under `docs/` and \
-              `site/src/` resolves to a file in `site/static/img/`. …",
+              `site/landing/` resolves to a file in `site/static/img/`. …",
     check: rule_site_image_refs,
 },
 ```
