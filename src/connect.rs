@@ -1464,6 +1464,9 @@ pub fn run_connect<R: BufRead, W: Write>(
     // remember to tear it down before the `ssh -t` handoff, the nudge prompt
     // or an error.
     let mut progress = ConnectProgress::new(is_tty);
+    // A transient SSH failure after discovery may retry the handshake. Keep
+    // the verified candidate until the handshake succeeds and we record it.
+    let mut discovered_binary = None;
     loop {
         attempt += 1;
 
@@ -1482,6 +1485,61 @@ pub fn run_connect<R: BufRead, W: Write>(
         progress.clear(output);
         let remote_version = match probed_version {
             Ok(v) => v,
+            Err(RemoteConnectError::RemoteBinaryMissing { .. })
+                if install_path == REMOTE_INSTALL_PATH =>
+            {
+                // Legacy registry entries have no recorded binary path. If
+                // their ~/.local/bin copy has been removed, check for the
+                // Homebrew formula before telling the user to reinstall.
+                // Verify the discovered binary with the ordinary version and
+                // handshake probes before handing it the terminal.
+                let discovered = match crate::remote::discover_homebrew_binary(executor, &target) {
+                    Ok(binary) => binary,
+                    Err(e) => {
+                        let e = map_probe_ssh_error(&entry.name, e);
+                        if is_reachability_error(&e) {
+                            match on_probe_unreachable(
+                                attempt,
+                                &entry.name,
+                                session_established,
+                                backoff,
+                            ) {
+                                ProbeRetry::Again => continue,
+                                ProbeRetry::GaveUp(code) => return Ok(code),
+                                ProbeRetry::Fatal => return Err(e),
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let Some(binary) = discovered else {
+                    return Err(RemoteConnectError::RemoteBinaryMissing {
+                        name: entry.name.clone(),
+                        install_path,
+                    });
+                };
+                install_path = binary.as_str().to_string();
+                discovered_binary = Some(binary);
+                progress.show(output, &entry.name, ConnectPhase::BinaryProbe);
+                let version = probe_remote_version(executor, &target, &entry.name, &install_path);
+                progress.clear(output);
+                match version {
+                    Ok(v) => v,
+                    Err(e) if is_reachability_error(&e) => {
+                        match on_probe_unreachable(
+                            attempt,
+                            &entry.name,
+                            session_established,
+                            backoff,
+                        ) {
+                            ProbeRetry::Again => continue,
+                            ProbeRetry::GaveUp(code) => return Ok(code),
+                            ProbeRetry::Fatal => return Err(e),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) if is_reachability_error(&e) => {
                 match on_probe_unreachable(attempt, &entry.name, session_established, backoff) {
                     ProbeRetry::Again => continue,
@@ -1516,6 +1574,30 @@ pub fn run_connect<R: BufRead, W: Write>(
             }
             Err(e) => return Err(e),
         };
+
+        // Record a verified discovery for subsequent connects and `remote
+        // doctor`. Do not clobber a concurrent move or upgrade of the row.
+        if let Some(binary) = discovered_binary.take()
+            && let Err(e) = crate::deck_list::update(
+                remotes_path,
+                crate::deck_list::DeckRef::Name(&entry.name),
+                |row| {
+                    if crate::deck_list::address_key(row) == crate::deck_list::address_key(entry)
+                        && row.install == entry.install
+                        && row.binary == entry.binary
+                    {
+                        row.install = Some(crate::remote::INSTALL_HOMEBREW.to_string());
+                        row.binary = Some(binary);
+                        row.version = remote_version.clone();
+                    }
+                },
+            )
+        {
+            eprintln!(
+                "warning: connected to '{}' but could not record its Homebrew binary: {e}",
+                entry.name
+            );
+        }
 
         // Stage 1c: one-step, pre-handover upgrade nudge (PRD #161 M1.2). Only
         // on the *initial* connect — a reconnect after a transport drop must
@@ -1935,6 +2017,135 @@ mod tests {
     use crate::daemon_protocol::PROTOCOL_VERSION;
     use crate::remote::SshOutput;
     use std::cell::Cell;
+
+    /// Scenario: Connect to a legacy remote entry after its old ~/.local/bin copy has been removed, leaving only its Homebrew install. The command should hand the terminal to the Homebrew binary without asking the user to reinstall or upgrade; a working local-bin install should still use its recorded path.
+    #[test]
+    fn connect_recovers_legacy_entry_with_homebrew_only_install() {
+        struct LegacyInstallExecutor {
+            commands: std::cell::RefCell<Vec<String>>,
+            missing_local_bin: bool,
+            fail_homebrew_version_once: Cell<bool>,
+            fail_handshake_once: Cell<bool>,
+            concurrent_upgrade: Option<PathBuf>,
+        }
+        impl SshExecutor for LegacyInstallExecutor {
+            fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                self.commands.borrow_mut().push(command.to_string());
+                if command == format!("{REMOTE_INSTALL_PATH} --version") && self.missing_local_bin {
+                    return Ok(SshOutput {
+                        status: 127,
+                        stdout: String::new(),
+                        stderr: "not found".to_string(),
+                    });
+                }
+                if command.contains("local-bin=") && command.contains("homebrew=") {
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: "local-bin=\nhomebrew=/opt/homebrew\n".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                if command.ends_with("--version") {
+                    if command.starts_with("/opt/homebrew/")
+                        && self.fail_homebrew_version_once.replace(false)
+                    {
+                        return Err(SshError::ConnectionRefused {
+                            host: target.host.clone(),
+                            port: target.port,
+                            detail: "transient network drop".to_string(),
+                        });
+                    }
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: "dot-agent-deck 9.9.9\n".to_string(),
+                        stderr: String::new(),
+                    });
+                }
+                if command.ends_with("daemon hello") {
+                    if self.fail_handshake_once.replace(false) {
+                        return Err(SshError::ConnectionRefused {
+                            host: target.host.clone(),
+                            port: target.port,
+                            detail: "transient network drop".to_string(),
+                        });
+                    }
+                    if let Some(path) = &self.concurrent_upgrade {
+                        crate::deck_list::update(
+                            path,
+                            crate::deck_list::DeckRef::Name("mac-studio"),
+                            |row| row.install = Some(crate::remote::INSTALL_LOCAL_BIN.to_string()),
+                        )
+                        .unwrap();
+                    }
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: hello_body(Some(PROTOCOL_VERSION)),
+                        stderr: String::new(),
+                    });
+                }
+                panic!("unexpected remote command: {command}");
+            }
+        }
+
+        let entry = test_entry("mac-studio");
+        for (missing_local_bin, fail_version, fail_hello, expected_path) in [
+            (true, false, false, "/opt/homebrew/bin/dot-agent-deck"),
+            (true, true, false, "/opt/homebrew/bin/dot-agent-deck"),
+            (true, false, true, "/opt/homebrew/bin/dot-agent-deck"),
+            (false, false, false, REMOTE_INSTALL_PATH),
+        ] {
+            let (_dir, path) = registry_with(&entry);
+            let executor = LegacyInstallExecutor {
+                commands: Default::default(),
+                missing_local_bin,
+                fail_homebrew_version_once: Cell::new(fail_version),
+                fail_handshake_once: Cell::new(fail_hello),
+                concurrent_upgrade: None,
+            };
+            let spawner = ScriptedSpawner::new(vec![0]);
+            let backoff = RecordingBackoff::new();
+            let code = run_connect_no_nudge(&entry, &executor, &spawner, &backoff, &path)
+                .expect("a working remote install should connect");
+            assert_eq!(code, 0);
+            assert_eq!(backoff.count(), usize::from(fail_version || fail_hello));
+            assert_eq!(*spawner.install_paths.borrow(), vec![expected_path]);
+            let recorded = lookup_remote(&entry.name, &path).unwrap();
+            assert_eq!(
+                recorded.remote_binary(),
+                expected_path,
+                "the discovered path should be available to future connections"
+            );
+            assert_eq!(
+                executor
+                    .commands
+                    .borrow()
+                    .iter()
+                    .filter(|cmd| cmd.contains("local-bin=") && cmd.contains("homebrew="))
+                    .count(),
+                usize::from(missing_local_bin),
+                "only a missing legacy path should trigger install discovery"
+            );
+        }
+
+        // A concurrent upgrade that records a local-bin install must not be
+        // overwritten by our discovery, even though its binary field is None.
+        let (_dir, path) = registry_with(&entry);
+        let executor = LegacyInstallExecutor {
+            commands: Default::default(),
+            missing_local_bin: true,
+            fail_homebrew_version_once: Cell::new(false),
+            fail_handshake_once: Cell::new(false),
+            concurrent_upgrade: Some(path.clone()),
+        };
+        let spawner = ScriptedSpawner::new(vec![0]);
+        run_connect_no_nudge(&entry, &executor, &spawner, &RecordingBackoff::new(), &path).unwrap();
+        let recorded = lookup_remote(&entry.name, &path).unwrap();
+        assert_eq!(
+            recorded.install.as_deref(),
+            Some(crate::remote::INSTALL_LOCAL_BIN)
+        );
+        assert_eq!(recorded.binary, None);
+    }
 
     const TEST_LOCAL_VERSION: &str = "9.9.9";
 

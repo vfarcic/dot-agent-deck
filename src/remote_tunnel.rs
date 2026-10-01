@@ -3070,12 +3070,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let uid = probe_uid();
         let expected = format!("{}/dot-agent-deck-{uid}/attach.sock", temp.path().display());
+        // A developer may have a real legacy socket bound at /tmp; point the
+        // legacy rung at this sandbox so it cannot win the fallback probe.
+        let probe = REMOTE_SOCKET_PROBE.replace(
+            "/tmp/dot-agent-deck-attach-",
+            &format!("{}/legacy-", temp.path().display()),
+        );
 
         assert_eq!(
-            run_socket_probe(
-                REMOTE_SOCKET_PROBE,
-                &[("TMPDIR", &temp.path().to_string_lossy())]
-            ),
+            run_socket_probe(&probe, &[("TMPDIR", &temp.path().to_string_lossy())]),
             expected,
             "nothing bound anywhere: name the path a fresh daemon would bind"
         );
@@ -3085,10 +3088,7 @@ mod tests {
         let _listener =
             std::os::unix::net::UnixListener::bind(&expected).expect("bind the new endpoint");
         assert_eq!(
-            run_socket_probe(
-                REMOTE_SOCKET_PROBE,
-                &[("TMPDIR", &temp.path().to_string_lossy())]
-            ),
+            run_socket_probe(&probe, &[("TMPDIR", &temp.path().to_string_lossy())]),
             expected,
             "a live new-spelling endpoint is the answer"
         );
