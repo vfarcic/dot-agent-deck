@@ -102,9 +102,9 @@ function covers(words: string[], label: string[], kind: string): boolean {
 }
 
 /**
- * The 1-based number of the offered entry whose label is, word for word, a
- * bare ordinal or cancel phrase that `utterance` also is — an agent named
- * "two", or "cancel" — or `undefined` when there is no such collision. Such an
+ * The 1-based number of the offered entry whose label, or another of its
+ * spoken names, is, word for word, a bare ordinal or cancel phrase that
+ * `utterance` also is — an agent named "two", or whose role is "cancel" — or `undefined` when there is no such collision. Such an
  * utterance is refused rather than read either way, here and in
  * `voice::choice::answer`; the panel uses the number to say "number N".
  */
@@ -113,7 +113,10 @@ export function collidingChoiceEntry(utterance: string, offered: readonly VoiceR
   if (words.length === 0) return undefined;
   if (!CANCEL_PHRASES.includes(words.join(" ")) && ordinal(words) === undefined) return undefined;
   const said = words.join(" ");
-  const at = offered.findIndex((candidate) => spokenWords(candidate.label).join(" ") === said);
+  /* The label and every other name the entry answers to (`names`, from
+     `voice::choice::names_of`): an agent labelled "Builder" whose role is
+     "two" collides as surely as one labelled "two" (Qodo on PR #1451). */
+  const at = offered.findIndex((candidate) => [candidate.label, ...(candidate.names ?? [])].some((name) => spokenWords(name).join(" ") === said));
   return at >= 0 ? at + 1 : undefined;
 }
 

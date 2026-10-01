@@ -124,8 +124,9 @@ pub enum ChoiceAnswer {
 /// already uses. Anything else — including a command that contains an offered
 /// name — is [`ChoiceAnswer::NotAnswer`].
 ///
-/// A bare control that is ALSO, word for word, an offered entry's label — an
-/// agent named "two", or "cancel" — is [`ChoiceAnswer::Refused`] before either
+/// A bare control that is ALSO, word for word, an offered entry's label or one
+/// of its other spoken names ([`names_of`]) — an agent named "two", or whose
+/// role is "cancel" — is [`ChoiceAnswer::Refused`] before either
 /// reading is taken: acting on the number would pick another entry, and
 /// cancelling would drop the one the user named. An explicit ordinal with a
 /// lead, "number two", is not the label and stays a number. The webview names
@@ -141,10 +142,17 @@ pub fn answer(utterance: &str, offered: &[ResolvedParam], live: &ChoiceLive) -> 
     }
     let cancels = CANCEL_PHRASES.contains(&words.join(" ").as_str());
     let ordinal = ordinal(&words);
+    // The label, and every other name the entry answers to (an agent's role,
+    // CLI name or id, a deck's host …): an agent labelled "Builder" whose
+    // role is "two" collides with a bare "two" as surely as one labelled
+    // "two" does (Qodo on PR #1451).
     if (cancels || ordinal.is_some())
-        && offered
-            .iter()
-            .any(|candidate| spoken_words(&candidate.label) == words)
+        && offered.iter().any(|candidate| {
+            spoken_words(&candidate.label) == words
+                || names_of(candidate.kind, &candidate.value, live)
+                    .iter()
+                    .any(|name| spoken_words(name) == words)
+        })
     {
         return ChoiceAnswer::Refused;
     }

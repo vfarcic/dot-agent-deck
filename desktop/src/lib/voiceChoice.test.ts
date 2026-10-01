@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerChoiceLocally } from "./voiceChoice";
+import { answerChoiceLocally, collidingChoiceEntry } from "./voiceChoice";
 
 /* PRD #1261 — the webview's port of `voice::choice::answer`, for a runtime
    with no Rust behind it. Same order and closed lists as the Rust function. */
@@ -72,5 +72,21 @@ describe("answerChoiceLocally", () => {
     expect([answerChoiceLocally("two", names), answerChoiceLocally("cancel", cancel)]).toEqual([
       { kind: "refused" }, { kind: "refused" },
     ]);
+  });
+
+  /** Scenario: Qodo on PR #1451 — an entry labelled "Builder" also answers to
+   * "two" (its role), another labelled "Reviewer" to "cancel". A bare "two" or
+   * "cancel" is refused and names that entry, as a colliding label is. */
+  it("refuses bare controls that collide with an entry's other spoken name", () => {
+    const named = [
+      { name: "agent", kind: "agent_ref" as const, spoken: "x", value: "agent-builder", label: "Builder", names: ["Builder", "two", "agent-builder"] },
+      { name: "agent", kind: "agent_ref" as const, spoken: "x", value: "agent-reviewer", label: "Reviewer", names: ["Reviewer", "cancel"] },
+      { name: "agent", kind: "agent_ref" as const, spoken: "x", value: "agent-other", label: "Other", names: ["Other"] },
+    ];
+    expect([answerChoiceLocally("two", named), answerChoiceLocally("cancel", named)]).toEqual([
+      { kind: "refused" }, { kind: "refused" },
+    ]);
+    expect([collidingChoiceEntry("two", named), collidingChoiceEntry("cancel", named)]).toEqual([1, 2]);
+    expect(answerChoiceLocally("number one", named)).toEqual({ kind: "selected", candidate: named[0] });
   });
 });

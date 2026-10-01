@@ -270,3 +270,37 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
         ChoiceAnswer::Selected(deck)
     );
 }
+
+/// Scenario: Qodo on PR #1451 — an offered agent is labelled "Builder" but
+/// also answers to "two" (its role), or labelled "Reviewer" but answers to
+/// "cancel". A bare "two" or "cancel" is refused rather than picking the
+/// second entry or dropping the offer, exactly as for a colliding label; an
+/// explicit "number one" still selects.
+#[test]
+fn choice_refuses_bare_controls_that_collide_with_another_spoken_name() {
+    let mut builder = role_agent("agent-builder", "two");
+    builder.display_name = Some("Builder".to_string());
+    let mut reviewer = role_agent("agent-reviewer", "cancel");
+    reviewer.display_name = Some("Reviewer".to_string());
+    let other = role_agent("agent-other", "Other");
+    let agents = [builder, reviewer, other];
+    let live = ChoiceLive {
+        agents: &agents,
+        decks: &[],
+        directories: None,
+        new_agent: None,
+    };
+    let offered = [
+        candidate(ParamKind::AgentRef, "agent-builder", "Builder"),
+        candidate(ParamKind::AgentRef, "agent-reviewer", "Reviewer"),
+        candidate(ParamKind::AgentRef, "agent-other", "Other"),
+    ];
+    assert_eq!(
+        [answer("two", &offered, &live), answer("cancel", &offered, &live)],
+        [ChoiceAnswer::Refused, ChoiceAnswer::Refused]
+    );
+    assert_eq!(
+        answer("number one", &offered, &live),
+        ChoiceAnswer::Selected(offered[0].clone())
+    );
+}
