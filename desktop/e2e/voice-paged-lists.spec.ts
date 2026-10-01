@@ -121,6 +121,33 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(rows.nth(1)).toHaveAccessibleName(/^2\./);
   });
 
+  /** Scenario: after keyboard selection reaches the last directory on a later voice page, a narrower window shows the new page containing that row. Enter then opens the directory that is still visible. */
+  test("directory page follows its selected row after the window shrinks", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 720 });
+    await open(page, "voice-pages", "next page");
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await turnOnVoice(page);
+    const marker = page.getByTestId("new-agent-directory-page");
+    await expect(marker).toContainText(/Page 2 of \d+/i);
+    const list = page.getByTestId("new-agent-directory-list");
+    const rows = list.getByRole("option");
+    const initialCapacity = await rows.count();
+    expect(initialCapacity).toBeGreaterThan(1);
+    await list.focus();
+    for (let index = 1; index < initialCapacity; index += 1) await page.keyboard.press("ArrowDown");
+    const selectedPath = await rows.last().getAttribute("data-path");
+    expect(selectedPath).toBeTruthy();
+    await expect(rows.last()).toHaveAttribute("aria-selected", "true");
+
+    await page.setViewportSize({ width: 720, height: 720 });
+    await expect.poll(() => rows.count()).toBeLessThan(initialCapacity);
+    await expect(list.getByRole("option", { selected: true })).toHaveAttribute("data-path", selectedPath!);
+    await expect(marker).toContainText(/Page [2-9]\d* of \d+/i);
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText(selectedPath!);
+  });
+
   /** Scenario: on a crowded dashboard, Voice exposes only agents that fit the current page. A page marker changes when the window gains enough height to fit more rows. */
   test("crowded dashboard recomputes its voice page after resize", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 480 });
@@ -162,6 +189,34 @@ test.describe("visible pages for voice-selected lists", () => {
     expect(geometry.count).toBeGreaterThan(0);
     expect(geometry.clipped).toBe(false);
     await expect(page.getByTestId("new-agent-dialog").getByText(/Page 1 of [2-9]\d*/i)).toBeVisible();
+  });
+
+  /** Scenario: with Voice off, the last of the crowded project's modes is chosen in a short window. Turning Voice on, and then shrinking the window, each shows the Mode page holding that chosen chip. */
+  test("mode page shows the chosen mode when voice turns on and the window shrinks", async ({ page }) => {
+    await page.setViewportSize({ width: 720, height: 420 });
+    const decks = await openCrowdedDialog(page, false);
+    await decks.first().click();
+    await useDocsDirectory(page);
+    const modes = page.getByTestId("new-agent-modes");
+    const chosen = modes.getByRole("button", { disabled: false }).last();
+    const chosenMode = await chosen.getAttribute("data-mode");
+    expect(chosenMode).toBeTruthy();
+    await chosen.click();
+    const pressed = modes.getByRole("button", { pressed: true });
+    await expect(pressed).toHaveAttribute("data-mode", chosenMode!);
+
+    await turnOnVoice(page);
+    const marker = page.getByTestId("new-agent-mode-page");
+    await expect(marker).toContainText(/Page [2-9]\d* of \d+/i);
+    await expect(pressed).toHaveAttribute("data-mode", chosenMode!);
+    await expect(pressed).toBeVisible();
+
+    const pages = async () => Number((await marker.textContent())?.match(/of (\d+)/i)?.[1]);
+    const before = await pages();
+    await page.setViewportSize({ width: 560, height: 360 });
+    await expect.poll(pages).toBeGreaterThan(before);
+    await expect(pressed).toHaveAttribute("data-mode", chosenMode!);
+    await expect(pressed).toBeVisible();
   });
 
   /** Scenario: a short dialog pages the crowded project's modes, while a small set of ordinary modes fits without any marker. */

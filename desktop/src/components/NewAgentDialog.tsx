@@ -229,6 +229,8 @@ const MODE_CELL = { rowHeight: 26, minColumnWidth: 150, gap: 5 };
 const MODE_ROWS_RESERVE = 70;
 const FALLBACK_DIRECTORY_PAGE = 12;
 const FALLBACK_MODE_PAGE = 8;
+/** The page `index` of a list of `capacity`-sized pages is on. */
+const pageOfIndex = (index: number, capacity: number) => Math.floor(index / Math.max(1, capacity)) + 1;
 /** The agent is not among the ones this deck offers any more. */
 export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
@@ -1317,19 +1319,21 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     the Mode chips that do not fit are split into pages instead of scrolling,
     so every item voice can act on is on screen. Each page is a grid filling
     the space its list has; "Page N of M" is shown beside a list that pages,
-    and a list that fits is shown whole. A page is reset to the first when
-    what it lists changes (another directory, filter or Mode row). The rows'
-    and chips' indexes stay their indexes in the whole list — the cursor, the
-    row ids and the keyboard move over every row, and the page follows the
-    cursor.
+    and a list that fits is shown whole. The rows' and chips' indexes stay
+    their indexes in the whole list — the cursor, the row ids and the keyboard
+    move over every row — and the page shown is the one holding the
+    directory cursor, and the one holding the Mode chip in force unless voice
+    or an arrow has turned it since the Mode row last changed.
   */
   const voiceOn = useVoiceOn();
   const directoryBox = useMeasuredBox(directoryListRef, voiceOn && listing !== undefined);
   const directoryFit = directoryBox ? gridFit(directoryBox.width, directoryBox.height, DIRECTORY_CELL) : undefined;
   const directoryCapacity = directoryFit ? directoryFit.columns * directoryFit.rows : FALLBACK_DIRECTORY_PAGE;
-  const directoryPageKey = `${deck?.deckId ?? ""}\u0000${listing?.path ?? ""}\u0000${filter}\u0000${showHidden}\u0000${searchedHere ? "searched" : ""}`;
-  const [directoryPage, setDirectoryPage] = useState({ key: "", page: 1 });
-  const directorySlice = pageSlice(rows.length, directoryCapacity, directoryPage.key === directoryPageKey ? directoryPage.page : 1);
+  /* The directory page is always the cursor's — derived, never stored — so a
+     page cannot leave the active row hidden: not when voice turns on with the
+     cursor past the first page, not when a resize changes how many rows a page
+     holds. A page turn moves the cursor to that page's first row. */
+  const directorySlice = pageSlice(rows.length, directoryCapacity, rows[cursor] ? pageOfIndex(cursor, directoryCapacity) : 1);
   const directoriesPaged = voiceOn && directorySlice.pages > 1;
   const rowOffset = directoriesPaged ? directorySlice.start : 0;
   const shownRows = directoriesPaged ? rows.slice(directorySlice.start, directorySlice.end) : rows;
@@ -1337,9 +1341,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const chipsBox = useMeasuredBox(chipsRef, voiceOn);
   const modeFit = bodyBox && chipsBox ? gridFit(chipsBox.width, bodyBox.height - MODE_ROWS_RESERVE, MODE_CELL) : undefined;
   const modeCapacity = modeFit ? modeFit.columns * modeFit.rows : FALLBACK_MODE_PAGE;
-  const modePageKey = `${target?.path ?? ""}\u0000${modes.map((candidate) => candidate.id).join("\u0000")}`;
+  /* A Mode page turned by voice or reached by an arrow is kept only while the
+     row, its page size and voice stay as they were; any change shows the page
+     of the chip in force, so the mode Create would use is never hidden. */
+  const modePageKey = `${target?.path ?? ""}\u0000${modes.map((candidate) => candidate.id).join("\u0000")}\u0000${modeCapacity}\u0000${voiceOn}`;
   const [modePage, setModePage] = useState({ key: "", page: 1 });
-  const modeSlice = pageSlice(modes.length, modeCapacity, modePage.key === modePageKey ? modePage.page : 1);
+  const modeSlice = pageSlice(modes.length, modeCapacity, modePage.key === modePageKey ? modePage.page : pageOfIndex(Math.max(0, modes.findIndex((candidate) => candidate.id === mode)), modeCapacity));
   const modesPaged = voiceOn && modeSlice.pages > 1;
   const modeOffset = modesPaged ? modeSlice.start : 0;
   const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
@@ -1350,20 +1357,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * ambiguous and a number names one item.
    */
   const pagedList: "directories" | "modes" | undefined = modesPaged && target ? "modes" : directoriesPaged ? "directories" : modesPaged ? "modes" : undefined;
-  /** The page `index` of a list of `capacity`-sized pages is on. */
-  const pageOfIndex = (index: number, capacity: number) => Math.floor(index / Math.max(1, capacity)) + 1;
-  const turnDirectories = (delta: 1 | -1) => {
-    const page = directorySlice.page + delta;
-    setDirectoryPage({ key: directoryPageKey, page });
-    setCursor(pageSlice(rows.length, directoryCapacity, page).start);
-  };
+  const turnDirectories = (delta: 1 | -1) => setCursor(pageSlice(rows.length, directoryCapacity, directorySlice.page + delta).start);
   const turnModes = (delta: 1 | -1) => setModePage({ key: modePageKey, page: modeSlice.page + delta });
-  /* The keyboard moves the cursor over every row; the page follows it. */
-  useEffect(() => {
-    if (!directoriesPaged || (cursor >= directorySlice.start && cursor < directorySlice.end)) return;
-    setDirectoryPage({ key: directoryPageKey, page: pageOfIndex(cursor, directoryCapacity) });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- follows the cursor only; a page turn moves the cursor itself
-  }, [cursor]);
   /* A paged Mode row is brought into the body's view, where its chips can be seen. */
   useEffect(() => {
     if (modesPaged && target) modeFieldRef.current?.scrollIntoView?.({ block: "nearest" });
