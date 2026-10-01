@@ -5796,7 +5796,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         let (event_tx, event_rx) = broadcast::channel(8);
         tokio::time::pause();
@@ -8225,7 +8225,7 @@ mod tests {
             .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
             .with_ansi(false)
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
 
         // Both halves run on this task, not on a spawned one, so the delivery's
         // `warn!` lands in the thread-local subscriber above.
