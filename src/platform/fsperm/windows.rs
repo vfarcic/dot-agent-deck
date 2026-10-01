@@ -37,7 +37,7 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SUCCESS, GENERIC_WRITE, HANDLE, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -176,6 +176,25 @@ pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
 
     opts.access_mode(OWNER_ONLY_WRITE_ACCESS);
+}
+
+/// [`OWNER_ONLY_WRITE_ACCESS`] plus `GENERIC_READ`, for the one caller that has to
+/// read a file through the same handle it then rewrites (issue #331).
+const OWNER_ONLY_READ_WRITE_ACCESS: u32 = OWNER_ONLY_WRITE_ACCESS | GENERIC_READ;
+
+/// [`set_create_mode_owner_only`] for a caller that also READS through the
+/// handle — the widening that function's precondition prescribes, since
+/// `access_mode` overrides `.read(true)`.
+///
+/// Issue #331: `orchestrator_context::replace_coordination_file_if` reads a
+/// work-done summary to decide whether it may replace it, then rewrites it on
+/// the same handle. Under the write-only mask that read fails with
+/// `ERROR_ACCESS_DENIED`, which surfaced on the `build-windows` job as every
+/// second summary write failing.
+pub fn set_create_mode_owner_only_readable(opts: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    opts.access_mode(OWNER_ONLY_READ_WRITE_ACCESS);
 }
 
 /// Apply a protected current-user-only DACL to an already-open file — the
@@ -735,5 +754,11 @@ mod tests {
     fn the_create_mode_seam_requests_write_dac() {
         assert_eq!(OWNER_ONLY_WRITE_ACCESS & WRITE_DAC, WRITE_DAC);
         assert_eq!(OWNER_ONLY_WRITE_ACCESS & GENERIC_WRITE, GENERIC_WRITE);
+        // Issue #331: the readable variant keeps both and adds the read.
+        assert_eq!(
+            OWNER_ONLY_READ_WRITE_ACCESS & OWNER_ONLY_WRITE_ACCESS,
+            OWNER_ONLY_WRITE_ACCESS
+        );
+        assert_eq!(OWNER_ONLY_READ_WRITE_ACCESS & GENERIC_READ, GENERIC_READ);
     }
 }

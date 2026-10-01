@@ -474,6 +474,15 @@ GATES — CLAUDE.md is the authority, this is the summary:
   .dot-agent-deck/recordings/ — a filtered run, not the whole tier.
 - Rule 4: a user-visible TUI change needs L1 or L2 tests, and a major
   user-facing feature needs a PTY-attached L2 test and a real-agent test.
+- Rule 6: a test or check that goes red while you work is in scope, whoever
+  caused it and even if it passes on a retry. Rerun it alone first, to learn
+  whether this box's load caused it; that rerun is a diagnosis, not a fix. Then
+  fix it in this PR, or quarantine it (a named owner, an expiry issue, and
+  `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and say in your
+  report which you did for each one. Rerunning it until green and mentioning
+  it in the report is neither. Before fixing a red your change did not cause,
+  check whether an open PR already fixes it (`gh pr list --search '<test
+  name>'`); if one does, name that PR in your report and leave the red to it.
 - Rule 9: if this PRD adds a new user-visible surface, ask about the
   experimental flag before building it.
 - Rule 12: if it touches the daemon, the TUI↔daemon protocol, orchestration or
@@ -611,6 +620,16 @@ lifecycle, and it covers what /prd-full does not.
   warm clippy of ~9-15s. Your workers run the gates and you do not, so tell
   whoever you delegate to.
   docs/develop/ci-on-demand.md has the detail.
+- A red any of you meets is this unit's to own (CLAUDE.md rule 6), whoever
+  caused it and even if it passes on a retry: it is fixed in this PR, or
+  quarantined (a named owner, an expiry issue, and
+  `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and your report
+  says which for each one. Rerunning it until green and mentioning it is
+  neither. Before fixing a red this PRD did not cause, check whether an open
+  PR already fixes it (`gh pr list --search '<test name>'`); if one does, name
+  that PR in your report and leave the red to it. Your role template does not
+  say this, so tell whoever you delegate to, and treat a worker's report of a
+  red it re-ran to green as unfinished.
 - STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
   notification, report, and stop. Do not merge, and do not delegate a merge.
@@ -629,6 +648,8 @@ lifecycle, and it covers what /prd-full does not.
 ```
 
 Note what is **absent** from that template and deliberately so: the gate list from 8a. Workers get the gates from their own role templates — `compose_worker_task_file` (`src/state.rs:2224`) wraps each delegated task under `{role_template}\n\n## Task\n\n{task}` per delegation, so coder is already told to run `fmt`, `clippy` and the tests before committing, and tester is already told which tier a test belongs in and about rule 7's Scenario comments. Restating them at the orchestrator, which never runs a gate itself, adds a second copy that can disagree with the first. **Workers need no change from this skill at all** — that composition is separate and already correct.
+
+**The bullet on reds is the one obligation the team template does carry, and the reason is the reverse of that absence.** The absence rests on the worker role templates already carrying the gates; on CLAUDE.md rule 6 they are silent (`.dot-agent-deck.toml` never mentions it), so a worker meets it only in CLAUDE.md itself — which is where the units `/issue-queue` dispatched met it too, before they re-ran seven reds to green and only reported them (that skill records the 2026-10-01 report). Only the orchestrator, which reads every worker's report, is placed to send a re-run-to-green back as unfinished. The single template carries the same sentence in its GATES list.
 
 **The one line about *where* those gates run is not an exception to that absence.** It is in both templates because it is not a gate — it is a fact about the box, and the orchestrator is the only role in a team that knows how loaded the box is and how many workers it is about to put on it. A worker told to run `cargo clippy` and nothing else has no basis for choosing between here and a runner; the orchestrator does, and it is the one delegating.
 

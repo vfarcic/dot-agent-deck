@@ -2480,7 +2480,7 @@ pub fn write_coordination_file(
     name: &str,
     content: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    write_coordination_file_as(cwd, name, content, Overwrite::Replace)
+    write_coordination_file_as(cwd, name, content, Overwrite::Replace).map(GuardedReplace::path)
 }
 
 /// [`write_coordination_file`], but the file must not exist yet: an existing
@@ -2499,24 +2499,59 @@ pub fn write_new_coordination_file(
     name: &str,
     content: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    write_coordination_file_as(cwd, name, content, Overwrite::Refuse)
+    write_coordination_file_as(cwd, name, content, Overwrite::Refuse).map(GuardedReplace::path)
+}
+
+/// What [`replace_coordination_file_if`] did with the file at `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedReplace {
+    /// The content was written: the file did not exist, was empty, or the
+    /// caller's predicate accepted what it held.
+    Written(std::path::PathBuf),
+    /// The predicate declined what the file held, so it was left exactly as it
+    /// was — neither truncated, nor written, nor re-moded.
+    Kept(std::path::PathBuf),
+}
+
+/// [`write_coordination_file`], but an existing non-empty file is replaced only
+/// when `may_replace` accepts what it holds (issue #331).
+///
+/// The role-keyed files are reused on every delegation, and the directory they
+/// live in is one agents are told to write their own files into — so a path the
+/// daemon writes to can hold a file an agent put there. `may_replace` is handed
+/// the open handle, positioned at the start, and answers whether the daemon may
+/// replace it; the decision and the write are made on that ONE handle, so a file
+/// renamed into place between the two is not the one written. An empty file is
+/// replaced without asking, since replacing it loses nothing — which is also what
+/// a file this call has just created looks like.
+///
+/// What this does not stop is a process writing into the same file while the
+/// daemon holds it; nothing short of a lock shared with every writer could.
+pub fn replace_coordination_file_if(
+    cwd: &std::path::Path,
+    name: &str,
+    content: &str,
+    may_replace: &mut dyn FnMut(&mut std::fs::File) -> std::io::Result<bool>,
+) -> std::io::Result<GuardedReplace> {
+    write_coordination_file_as(cwd, name, content, Overwrite::ReplaceIf(may_replace))
 }
 
 /// Whether [`write_coordination_file_as`] may replace an existing file.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Overwrite {
+enum Overwrite<'a> {
     /// Truncate and rewrite — the role-keyed files the deck reuses per role.
     Replace,
     /// Fail with `AlreadyExists` rather than touch what is there.
     Refuse,
+    /// Rewrite only an empty file or one the predicate accepts; keep any other.
+    ReplaceIf(&'a mut dyn FnMut(&mut std::fs::File) -> std::io::Result<bool>),
 }
 
 fn write_coordination_file_as(
     cwd: &std::path::Path,
     name: &str,
     content: &str,
-    overwrite: Overwrite,
-) -> std::io::Result<std::path::PathBuf> {
+    overwrite: Overwrite<'_>,
+) -> std::io::Result<GuardedReplace> {
     let dir = context_dir_of(cwd);
     let refuse = |what: &str| {
         Err(std::io::Error::new(
@@ -2541,8 +2576,18 @@ fn write_coordination_file_as(
     match overwrite {
         Overwrite::Replace => options.create(true).write(true).truncate(true),
         Overwrite::Refuse => options.create_new(true).write(true),
+        // Not truncated at the open: the predicate has to read what is there
+        // first, and a declined file must come out of this untouched.
+        Overwrite::ReplaceIf(_) => options.create(true).read(true).write(true),
     };
-    crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    // Issue #331: the guarded replace reads the file before rewriting it, and on
+    // Windows the owner-only create mode replaces the handle's whole access mask,
+    // so `.read(true)` alone would be dropped there.
+    if matches!(overwrite, Overwrite::ReplaceIf(_)) {
+        crate::platform::fsperm::set_create_mode_owner_only_readable(&mut options);
+    } else {
+        crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2560,14 +2605,34 @@ fn write_coordination_file_as(
     // from the open handle — an `fstat` on the descriptor already held, not a
     // second path lookup. This is also what carries the property to a platform
     // with no such flag, where it is the only check there is.
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return refuse("the path is not a regular file");
+    }
+    if let Overwrite::ReplaceIf(may_replace) = overwrite {
+        // Before the chmod below, so a declined file keeps its mode too.
+        if metadata.len() > 0 && !may_replace(&mut file)? {
+            return Ok(GuardedReplace::Kept(path));
+        }
+        use std::io::Seek as _;
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
     }
     crate::platform::fsperm::set_file_owner_only(&file)?;
 
     use std::io::Write as _;
     file.write_all(content.as_bytes())?;
-    Ok(path)
+    Ok(GuardedReplace::Written(path))
+}
+
+impl GuardedReplace {
+    /// The path either way. Only [`Overwrite::ReplaceIf`] can produce `Kept`, so
+    /// for the other two modes this is the path that was written.
+    fn path(self) -> std::path::PathBuf {
+        match self {
+            Self::Written(path) | Self::Kept(path) => path,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

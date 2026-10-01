@@ -36,11 +36,14 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::io::Read as _;
+use std::os::unix::net::UnixListener;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};
+use dot_agent_deck::event::AgentEvent;
 
 /// A hook endpoint nothing can ever be listening on, so a probe wrapper's events
 /// cannot post into a developer's live deck. Mirrors `tests/wrap_io.rs`.
@@ -356,6 +359,145 @@ fn ambient_lifetime_caps_are_clamped_to_the_reapers_ceiling() {
     assert_eq!(clamped(Some("-1")).as_deref(), Some(ceiling.as_str()));
 }
 
+/// The cap the SIGKILL probes below arm, in seconds.
+///
+/// **3, not the parser's 1 s floor, and the difference is what keeps a starved
+/// box from failing these tests vacuously.** A probe child ignores SIGTERM, so
+/// once the cap is armed it dies at cap + one 250 ms backstop poll +
+/// `WRAP_TERMINATE_GRACE` (1.5 s) after the arm — whether the reaper or the
+/// wrapper's own self-defence gets there first. Every probe has to SIGKILL the
+/// wrapper *inside* that window, after it has seen proof of the arm (see
+/// [`ready_to_strand`]); a kill landing after it would find the child already
+/// ended by a wrapper that was never killed, which proves nothing. At 1 s that
+/// window was ~2.5 s; at 3 s it is ~4.5 s, the same headroom
+/// `tests/wrap_io.rs`'s `sigkilled_wrapper_case` takes for the same reason.
+const ARMED_CAP_SECS: &str = "3";
+
+/// How long a control probe — no cap armed — must survive.
+///
+/// 6 s is the FLOOR plus a margin, not a round number: it has to exceed an armed
+/// probe's own deadline ([`ARMED_CAP_SECS`] + one 250 ms backstop poll + the
+/// 1.5 s `WRAP_TERMINATE_GRACE` ≈ 4.75 s), or a child that merely happened to die
+/// on schedule would look like one nothing could end, and the armed assertion
+/// would pass for a reason other than the cap. Every second of it is spent
+/// proving a negative, which is why the controls run concurrently with the armed
+/// probes rather than in front of them.
+const CONTROL_BUDGET: Duration = Duration::from_secs(6);
+
+/// How long an armed probe's child may take to die once its wrapper is gone.
+/// Loose headroom for a loaded host, not an expected duration — that is ~4.75 s.
+const ARMED_BUDGET: Duration = Duration::from_secs(30);
+
+/// Bind the hook socket a probe's wrapper reports to, so [`ready_to_strand`] can
+/// hear its fork-time `SessionStart`.
+fn probe_hook_listener(dir: &std::path::Path) -> (std::path::PathBuf, UnixListener) {
+    let socket = dir.join("hook.sock");
+    let listener = UnixListener::bind(&socket).expect("bind probe wrapper event socket");
+    listener
+        .set_nonblocking(true)
+        .expect("make probe wrapper event socket nonblocking");
+    (socket, listener)
+}
+
+/// Whether `event` is the fork-time `SessionStart`, the one `wrap` emits only
+/// after `arm_child_group_backstop` has returned.
+fn is_backstop_armed_signal(event: &AgentEvent) -> bool {
+    event.event_type == dot_agent_deck::event::EventType::SessionStart
+        && event.is_wrapper_fork_session_start()
+}
+
+/// Wait until it is meaningful to SIGKILL a probe's wrapper: its child-group
+/// backstop is provably armed, and the process the probe is about (`pid`) is
+/// still alive. `Err` says which half did not hold.
+///
+/// **The arm, not the pid, is what the SIGKILL has to wait for.** `wrap` forks
+/// its reaper *after* `spawn` returns, and by then the child is already running,
+/// so it can record its pid before the wrapper has been scheduled to fork. A
+/// SIGKILL landing in that window strands the child with no reaper at all, and
+/// the armed assertion fails for a reason that has nothing to do with the cap.
+/// That is exactly how `a_term_resistant_wrapped_child_is_still_bounded_by_the_cap`
+/// failed on a loaded box: 35.4 s, which is the 5 s control plus the whole 30 s
+/// budget. Waiting on the pid alone, this file failed 6 of 64 copies run in
+/// parallel at a load average of ~107, every one at that assertion in ~35.3 s;
+/// holding the wrapper 500 ms before the arm failed both SIGKILL tests on every
+/// run. The same window was closed in `tests/wrap_io.rs` for issue #963, the
+/// same way: both wrap paths emit the fork-time `SessionStart` only after
+/// `arm_child_group_backstop` has returned, and that returns only after the
+/// forks that create the reaper have run.
+///
+/// **The liveness half keeps the wait from turning into a vacuous pass.** If the
+/// test stalls past [`ARMED_CAP_SECS`] + grace after the arm, the cap ends the
+/// child before the wrapper is ever killed, and the armed assertion would then
+/// pass without a reaper having outlived anything.
+///
+/// Every failure, the event socket's own included, comes back as `Err` rather
+/// than a panic, so the caller's cleanup still runs before it reports one.
+fn ready_to_strand(listener: &UnixListener, pid: libc::pid_t) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let armed = loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut json = String::new();
+                if let Err(error) = stream.read_to_string(&mut json) {
+                    return Err(format!("read probe wrapper event: {error}"));
+                }
+                let event: AgentEvent = match serde_json::from_str(json.trim()) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        return Err(format!("parse probe wrapper event {json:?}: {error}"));
+                    }
+                };
+                let matched = is_backstop_armed_signal(&event);
+                events.push(event);
+                if matched {
+                    break true;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("accept probe wrapper event: {error}")),
+        }
+    };
+    if !armed {
+        return Err(format!(
+            "the wrapper never emitted its fork-time SessionStart, so there is no \
+             evidence its child-group backstop was armed; events: {events:?}"
+        ));
+    }
+    if !common::process_running(pid) {
+        return Err(format!(
+            "pid {pid} was already gone when its wrapper was about to be \
+             SIGKILLed, so this run cannot tell a backstop that outlived the \
+             wrapper from a cap that fired while the wrapper was still alive — the \
+             test took longer than the cap plus its TERM grace between the arm and \
+             the kill"
+        ));
+    }
+    Ok(())
+}
+
+/// SIGKILL a probe's wrapper and collect it. Shared by the success path and the
+/// cleanup that follows a failed [`ready_to_strand`], so neither leaves the
+/// wrapper running.
+fn kill_wrapper(wrapper: &mut Child) {
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
+    // uncleanly is the behavior under test. Safe on a wrapper that has already
+    // exited too — an unreaped child of this process is a zombie, which `kill`
+    // still accepts.
+    assert_eq!(
+        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
+        0,
+        "deliver SIGKILL to wrapper pid {wrapper_pid}"
+    );
+    let _ = wrapper.wait();
+}
+
 /// Drive one `trap`-armoured probe under a wrapper that is then SIGKILL'd, and
 /// report whether the child was still alive at the end of `budget`.
 ///
@@ -365,6 +507,7 @@ fn ambient_lifetime_caps_are_clamped_to_the_reapers_ceiling() {
 fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) -> bool {
     let fixture = common::harness_tempdir().expect("create resistant-child fixture");
     let pid_path = fixture.path().join("child.pid");
+    let (socket, listener) = probe_hook_listener(fixture.path());
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
     command
@@ -386,7 +529,13 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
              while :; do sleep 1; done",
         ])
         .env("WRAP_CHILD_PID_FILE", &pid_path)
-        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // A real socket, not `UNREACHABLE_HOOK_SOCKET`: the fork-time event is
+        // this probe's proof the backstop was armed (see `ready_to_strand`).
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        // Each wrapper mints its own tag rather than reusing one this test
+        // process inherited, so a reaper's sweep can reach only its own probe
+        // and never a concurrently-running control's.
+        .env_remove(LIFETIME_TAG_VAR)
         .env_remove("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED")
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
@@ -412,41 +561,43 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
     }
     let child_pid = read_pid(&pid_path).expect("child pid recorded");
 
-    // SIGKILL, not SIGTERM: the wrapper gets no chance to reap, so the only
-    // thing that can still end the child is a bound the child's own group owns.
-    let wrapper_pid = wrapper.id() as libc::pid_t;
-    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
-    // uncleanly is the behavior under test.
-    assert_eq!(
-        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
-        0,
-        "deliver SIGKILL to wrapper pid {wrapper_pid}"
-    );
-    let _ = wrapper.wait();
-
-    let gone = common::wait_until(budget, || !common::process_running(child_pid));
-
-    // Never leak this test's own probe, whatever the outcome above — otherwise a
+    // Never leak this test's own probe, whatever the outcome — otherwise a
     // regression in the code under test would itself mint the orphans #668 is
     // about.
-    if common::process_running(child_pid) {
-        // SAFETY: best-effort cleanup of a pid this test created. Same
-        // check-then-act residual as the sites above: between
-        // `process_running` and the signal the pid could be reaped and
-        // reissued, so this is bounded same-UID exposure, not an impossibility.
-        // A strict guarantee needs an OS-owned container, not a numeric pid.
-        unsafe {
-            libc::kill(-child_pid, libc::SIGKILL);
-            libc::kill(child_pid, libc::SIGKILL);
+    let reap_probe = || {
+        if common::process_running(child_pid) {
+            // SAFETY: best-effort cleanup of a pid this test created. Same
+            // check-then-act residual as the sites above: between
+            // `process_running` and the signal the pid could be reaped and
+            // reissued, so this is bounded same-UID exposure, not an
+            // impossibility. A strict guarantee needs an OS-owned container, not
+            // a numeric pid.
+            unsafe {
+                libc::kill(-child_pid, libc::SIGKILL);
+                libc::kill(child_pid, libc::SIGKILL);
+            }
         }
+    };
+
+    if let Err(why) = ready_to_strand(&listener, child_pid) {
+        kill_wrapper(&mut wrapper);
+        reap_probe();
+        panic!("TERM/HUP-resistant probe (cap {cap:?}): {why}");
     }
+
+    // SIGKILL, not SIGTERM: the wrapper gets no chance to reap, so the only
+    // thing that can still end the child is a bound the child's own group owns.
+    kill_wrapper(&mut wrapper);
+
+    let gone = common::wait_until(budget, || !common::process_running(child_pid));
+    reap_probe();
     !gone
 }
 
 /// Scenario: Run a wrapped child that ignores SIGTERM and SIGHUP and never reads
 /// its terminal, then SIGKILL the wrapper so no reap loop runs. With no lifetime
 /// cap in the environment it must still be alive after the budget; with a
-/// one-second cap it must be gone inside it.
+/// three-second cap it must be gone inside it.
 ///
 /// Issue #668: this is the test that says out loud why the cap is kept once the
 /// fd fix lands. The fd fix ends a wrapped child by hanging its terminal up, and
@@ -457,26 +608,27 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
 /// is the variable `common::init_test_env` now pins.
 #[test]
 fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
-    // Control: nothing armed, so nothing can end it. Kept deliberately short —
-    // it is asserting survival, so every second is spent proving a negative.
-    //
-    // 5 s is the FLOOR, not a round number: it has to exceed the armed half's
-    // own deadline below (1 s cap + one 250 ms backstop poll + the 1.5 s
-    // `WRAP_TERMINATE_GRACE` ≈ 2.75 s), or a child that merely happened to die
-    // on schedule would look like one nothing could end, and the assertion
-    // underneath would pass for a reason other than the cap. Anything shorter
-    // weakens the precondition; anything longer just buys idle seconds on every
-    // fast-tier run, on all three CI platforms.
+    // Control: nothing armed, so nothing can end it. Run beside the armed probe
+    // rather than in front of it, so proving the negative costs no wall clock of
+    // its own; see `CONTROL_BUDGET` for why it is 6 s.
+    let (control, armed) = std::thread::scope(|scope| {
+        let control = scope.spawn(|| term_and_hup_resistant_child_survives(None, CONTROL_BUDGET));
+        let armed = scope
+            .spawn(|| term_and_hup_resistant_child_survives(Some(ARMED_CAP_SECS), ARMED_BUDGET));
+        (control.join(), armed.join())
+    });
+    let (control, armed) = (
+        control.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        armed.unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+    );
     assert!(
-        term_and_hup_resistant_child_survives(None, Duration::from_secs(5)),
+        control,
         "precondition failed: a TERM/HUP-ignoring wrapped child that reads \
          nothing died with no lifetime cap armed, so the assertion below would \
          pass for a reason other than the cap"
     );
-    // Armed: 1 s cap + one 250 ms backstop poll + WRAP_TERMINATE_GRACE (1.5 s).
-    // 30 s is loose headroom for a loaded host, not an expected duration.
     assert!(
-        !term_and_hup_resistant_child_survives(Some("1"), Duration::from_secs(30)),
+        !armed,
         "a SIGKILL'd wrapper stranded a TERM/HUP-ignoring child that no hangup \
          can reach, with the lifetime cap armed — this is the orphan that runs \
          unkillable for days, holding a working directory that has already been \
@@ -535,6 +687,7 @@ fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration)
 
     let fixture = common::harness_tempdir().expect("create setsid-escapee fixture");
     let escapee_pid_path = fixture.path().join("escapee.pid");
+    let (socket, listener) = probe_hook_listener(fixture.path());
 
     // `setsid` is `exec`'d rather than forked here — the wrapped shell is a
     // process-group leader but the `setsid` it runs is not, so `setsid(1)` has
@@ -561,7 +714,10 @@ fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration)
     command
         .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", &script])
         .env("ESCAPEE_PID_FILE", &escapee_pid_path)
-        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // Real socket and a freshly minted tag, for the reasons given on the
+        // group-resident probe above.
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        .env_remove(LIFETIME_TAG_VAR)
         .env_remove("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED")
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
@@ -601,19 +757,21 @@ fn setsid_escapee_survives(cap: Option<&str>, fate: OuterFate, budget: Duration)
          wrapped child's process group and this probe is not the #861 shape"
     );
 
+    if let Err(why) = ready_to_strand(&listener, escapee_pid) {
+        kill_wrapper(&mut wrapper);
+        if common::process_running(escapee_pid) {
+            // SAFETY: best-effort cleanup of a pid this test created; the
+            // single-pid form for the reason given at the cleanup below.
+            unsafe {
+                libc::kill(escapee_pid, libc::SIGKILL);
+            }
+        }
+        panic!("setsid-escapee probe (cap {cap:?}): {why}");
+    }
+
     // SIGKILL, not SIGTERM: the wrapper gets no chance to reap, so the only
-    // thing that can still end the escapee is a bound that outlives it. Safe on
-    // an `ExitAtOnce` run too — an unreaped child of this process is a zombie,
-    // which `kill` still accepts.
-    let wrapper_pid = wrapper.id() as libc::pid_t;
-    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
-    // uncleanly is the behavior under test.
-    assert_eq!(
-        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
-        0,
-        "deliver SIGKILL to wrapper pid {wrapper_pid}"
-    );
-    let _ = wrapper.wait();
+    // thing that can still end the escapee is a bound that outlives it.
+    kill_wrapper(&mut wrapper);
 
     let gone = common::wait_until(budget, || !common::process_running(escapee_pid));
 
@@ -656,7 +814,7 @@ fn session_id_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 /// Scenario: Run a wrapped child that `setsid`s a grandchild into its own
 /// session — the shape Claude Code's Bash tool really has — then SIGKILL the
 /// wrapper so no reap loop runs. With no lifetime cap in the environment the
-/// escapee must still be alive after the budget; with a one-second cap it must
+/// escapee must still be alive after the budget; with a three-second cap it must
 /// be gone inside it, whether the wrapped child kept running or exited the
 /// moment it had launched the escapee.
 ///
@@ -670,14 +828,31 @@ fn session_id_of(pid: libc::pid_t) -> Option<libc::pid_t> {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_setsid_escapee_is_still_bounded_by_the_cap() {
-    // Control: nothing armed, so nothing can end it. 5 s for the same reason
-    // the group-resident control uses it — it has to exceed the armed halves'
-    // own deadline below (1 s cap + one 250 ms poll + the 1.5 s
-    // `WRAP_TERMINATE_GRACE` ≈ 2.75 s), or an escapee that merely happened to
-    // die on schedule would look like one nothing could end.
-    let Some(survived) =
-        setsid_escapee_survives(None, OuterFate::ExitAtOnce, Duration::from_secs(5))
-    else {
+    // Control: nothing armed, so nothing can end it — `CONTROL_BUDGET`, for the
+    // same reason the group-resident control uses it.
+    //
+    // Armed: both fates, and every probe runs concurrently, deliberately: the
+    // two fates fail for *different* reasons — `ExitAtOnce` needs the reaper to
+    // stop treating group death as "nothing left to bound", and `Persist` needs
+    // the sweep at the deadline itself — so a loop that panicked on the first one
+    // would leave the second's assertion never observed failing, which is no
+    // evidence at all. Concurrency is what keeps proving the control's negative
+    // from adding its budget to the armed probes'.
+    let [control, exit_at_once, persist] = std::thread::scope(|scope| {
+        [
+            scope.spawn(|| setsid_escapee_survives(None, OuterFate::ExitAtOnce, CONTROL_BUDGET)),
+            scope.spawn(|| {
+                setsid_escapee_survives(Some(ARMED_CAP_SECS), OuterFate::ExitAtOnce, ARMED_BUDGET)
+            }),
+            scope.spawn(|| {
+                setsid_escapee_survives(Some(ARMED_CAP_SECS), OuterFate::Persist, ARMED_BUDGET)
+            }),
+        ]
+        .map(|probe| probe.join())
+    })
+    .map(|outcome| outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+
+    let Some(survived) = control else {
         eprintln!(
             "SKIP: the #861 escapee probe needs `setsid(1)` on PATH to put a \
              grandchild in its own session"
@@ -690,30 +865,14 @@ fn a_setsid_escapee_is_still_bounded_by_the_cap() {
          nothing died with no lifetime cap armed, so the assertions below would \
          pass for a reason other than the cap"
     );
-    // Armed: 1 s cap + one 250 ms backstop poll + WRAP_TERMINATE_GRACE (1.5 s).
-    // 30 s is loose headroom for a loaded host, not an expected duration.
-    //
-    // Both fates are run before anything is asserted, deliberately: they fail
-    // for *different* reasons — `ExitAtOnce` needs the reaper to stop treating
-    // group death as "nothing left to bound", and `Persist` needs the sweep at
-    // the deadline itself — so a loop that panicked on the first one would leave
-    // the second's assertion never observed failing, which is no evidence at
-    // all.
-    let outcomes = [
-        ("wrapped child exited at once", OuterFate::ExitAtOnce),
-        ("wrapped child kept running", OuterFate::Persist),
+    let stranded: Vec<&str> = [
+        ("wrapped child exited at once", exit_at_once),
+        ("wrapped child kept running", persist),
     ]
-    .map(|(label, fate)| {
-        (
-            label,
-            setsid_escapee_survives(Some("1"), fate, Duration::from_secs(30)),
-        )
-    });
-    let stranded: Vec<&str> = outcomes
-        .iter()
-        .filter(|(_, outcome)| *outcome != Some(false))
-        .map(|(label, _)| *label)
-        .collect();
+    .iter()
+    .filter(|(_, outcome)| *outcome != Some(false))
+    .map(|(label, _)| *label)
+    .collect();
     assert!(
         stranded.is_empty(),
         "a SIGKILL'd wrapper stranded a descendant that had `setsid`'d out of \

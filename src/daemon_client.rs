@@ -5000,7 +5000,8 @@ start = true
         let client = DaemonClient::new(path);
         let scratch = crate::test_temp::tempdir().expect("scratch dir");
         let pi = scratch.path().join("pi");
-        std::fs::write(&pi, "#!/bin/sh\nexec sleep 30\n").expect("write the pi stand-in");
+        crate::test_isolation::write_script(&pi, "#!/bin/sh\nexec sleep 30\n")
+            .expect("write the pi stand-in");
         std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755))
             .expect("make the pi stand-in executable");
         let cwd = scratch.path().to_str().expect("scratch paths are UTF-8");

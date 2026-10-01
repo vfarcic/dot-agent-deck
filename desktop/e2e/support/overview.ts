@@ -105,7 +105,18 @@ export async function selectOverview(page: Page): Promise<void> {
   await expect(tableRegion(page).first()).toBeVisible();
 }
 
-/** Enter the experimental deck for browser cases that exercise its tiles or controls. */
+/**
+ * Enter the experimental deck for browser cases that exercise its tiles or controls.
+ *
+ * The rail's deck button is clicked with an auto-waiting `click()`, never
+ * behind a `count()` check. The app asks the bridge for its experimental flags
+ * after the first render (`useDeckRuntime`), so the rail is visible for a
+ * moment WITHOUT the deck button. A `count()` taken in that moment read 0, the
+ * click was skipped, and the run then waited five seconds for a grid nobody
+ * had opened (WebKit, `main`, CI run 36799153180). `?experimental=1` is forced
+ * just above, so the button always arrives, and clicking it while the deck is
+ * already up just keeps the deck.
+ */
 export async function enterDeck(page: Page): Promise<void> {
   const url = new URL(page.url());
   if (url.searchParams.get("experimental") !== "1") {
@@ -113,8 +124,7 @@ export async function enterDeck(page: Page): Promise<void> {
     await page.goto(url.toString());
   }
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
-  const button = page.getByTestId("open-deck");
-  if (await button.count()) await button.click();
+  await page.getByTestId("open-deck").click();
   await expect(page.locator(".agent-grid")).toBeVisible();
 }
 
