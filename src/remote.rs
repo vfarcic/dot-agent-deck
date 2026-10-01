@@ -1508,9 +1508,10 @@ impl RemoteInstall {
 /// `homebrew=` and `formula=` lines, and exits 0.
 ///
 /// A Homebrew install is recognised by asking Homebrew, not by the shape of a
-/// path: `brew list --formula` must succeed for stable or beta, and
-/// `<prefix>/bin/dot-agent-deck` must exist. Both formulas link that name;
-/// upgrade uses the name the probe reports rather than switching channels.
+/// path: `brew list --formula` must succeed for stable or beta, and the
+/// linked executable must be the same file as the formula's own binary.
+/// A formula can remain installed after another one takes over the link, so
+/// checking only that both exist can upgrade the wrong channel.
 /// `brew` is looked for on `PATH` first and then
 /// at each of [`HOMEBREW_PREFIXES`], because the `PATH` of a non-interactive
 /// ssh command usually lacks it.
@@ -1524,13 +1525,14 @@ fn install_probe_command() -> String {
             "if [ -x {local_bin} ]; then echo local-bin=present; else echo local-bin=; fi; ",
             "for dad_brew in \"$(command -v brew 2>/dev/null)\" {brews}; do ",
             "[ -n \"$dad_brew\" ] && [ -x \"$dad_brew\" ] || continue; ",
-            "dad_found=; for dad_formula in dot-agent-deck dot-agent-deck-beta; do ",
-            "if \"$dad_brew\" list --formula \"$dad_formula\" >/dev/null 2>&1; ",
-            "then dad_found=1; break; fi; done; ",
-            "[ -n \"$dad_found\" ] || continue; ",
             "dad_prefix=$(\"$dad_brew\" --prefix 2>/dev/null) || continue; ",
             "[ -x \"$dad_prefix/bin/dot-agent-deck\" ] || continue; ",
+            "for dad_formula in dot-agent-deck dot-agent-deck-beta; do ",
+            "\"$dad_brew\" list --formula \"$dad_formula\" >/dev/null 2>&1 || continue; ",
+            "dad_keg=$(\"$dad_brew\" --prefix \"$dad_formula\" 2>/dev/null) || continue; ",
+            "[ \"$dad_prefix/bin/dot-agent-deck\" -ef \"$dad_keg/bin/dot-agent-deck\" ] || continue; ",
             "echo \"homebrew=$dad_prefix\"; echo \"formula=$dad_formula\"; exit 0; ",
+            "done; ",
             "done; ",
             "echo homebrew=; echo formula="
         ),
@@ -3172,8 +3174,9 @@ mod homebrew_remote_tests {
                 write_script(
                     &brew_prefix.join("bin/brew"),
                     &format!(
-                        "#!/bin/sh\nprefix='{prefix}'\ncase \"$1\" in\n--prefix) printf '%s\\n' \"$prefix\" ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck ] && [ -d \"$prefix/Cellar/dot-agent-deck\" ] ;;\nupgrade)\necho \"brew $*\" >> '{log}'\n{upgrade} ;;\n*) exit 1 ;;\nesac\n",
+                        "#!/bin/sh\nprefix='{prefix}'\ncase \"$1\" in\n--prefix) if [ \"$2\" = dot-agent-deck ]; then printf '%s\\n' \"$prefix/Cellar/dot-agent-deck/{version}\"; else printf '%s\\n' \"$prefix\"; fi ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck ] && [ -d \"$prefix/Cellar/dot-agent-deck\" ] ;;\nupgrade)\necho \"brew $*\" >> '{log}'\n{upgrade} ;;\n*) exit 1 ;;\nesac\n",
                         prefix = brew_prefix.display(),
+                        version = v,
                         log = log.display(),
                     ),
                 );
@@ -3287,24 +3290,32 @@ mod homebrew_remote_tests {
     }
 
     #[test]
-    fn beta_only_homebrew_can_be_discovered_and_upgraded_without_a_second_install() {
+    fn beta_link_wins_over_installed_but_unlinked_stable_formula() {
         let remote = Remote::new(Fixture {
             brew: None,
             local_bin: None,
             tap: "0.44.0-rc.1",
             brew_upgrade_fails: false,
         });
+        let stable_keg = remote
+            .brew_prefix
+            .join("Cellar/dot-agent-deck/0.44.0/bin/dot-agent-deck");
+        let beta_keg = remote
+            .brew_prefix
+            .join("Cellar/dot-agent-deck-beta/0.44.0-rc.1/bin/dot-agent-deck");
+        write_script(&stable_keg, &deck_script("0.44.0", &remote.log));
+        write_script(&beta_keg, &deck_script("0.44.0-rc.1", &remote.log));
+        std::fs::create_dir_all(remote.brew_prefix.join("bin")).unwrap();
+        symlink(&beta_keg, remote.brew_binary()).unwrap();
         write_script(
             &remote.brew_prefix.join("bin/brew"),
             &format!(
-                "#!/bin/sh\ncase \"$1\" in\n--prefix) echo '{prefix}' ;;\nlist) [ \"$2\" = --formula ] && [ \"$3\" = dot-agent-deck-beta ] ;;\nupgrade) echo \"brew $*\" >> '{log}' ;;\n*) exit 1 ;;\nesac\n",
+                "#!/bin/sh\ncase \"$1\" in\n--prefix) case \"$2\" in\ndot-agent-deck) echo '{stable}' ;;\ndot-agent-deck-beta) echo '{beta}' ;;\n*) echo '{prefix}' ;;\nesac ;;\nlist) [ \"$2\" = --formula ] && case \"$3\" in dot-agent-deck|dot-agent-deck-beta) true ;; *) false ;; esac ;;\nupgrade) echo \"brew $*\" >> '{log}' ;;\n*) exit 1 ;;\nesac\n",
                 prefix = remote.brew_prefix.display(),
+                stable = stable_keg.parent().unwrap().parent().unwrap().display(),
+                beta = beta_keg.parent().unwrap().parent().unwrap().display(),
                 log = remote.log.display(),
             ),
-        );
-        write_script(
-            &remote.brew_binary(),
-            &deck_script("0.44.0-rc.1", &remote.log),
         );
         let shell = remote.shell(BrewAt::OnPath);
         let target = SshTarget::parse("user@mac", 22, None);

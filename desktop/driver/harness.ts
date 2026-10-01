@@ -429,22 +429,22 @@ export class Deck {
          }
        }`,
     );
-    await this.session.drag(span.from, span.to);
     // WebDriver can deliver the window's first focus-driven resize on the
     // drag's mousedown even after the preparatory click and settled grid.
     // xterm clears a selection in progress when that happens. Re-measure and
     // repeat the gesture once on the new grid; the final assertion still
     // requires the user's text to be selected, not merely a mouse event.
-    let selected = false;
     try {
-      await waitFor(`the first drag to select ${text}`, () => this.hasSelection(text), 1000);
-      selected = true;
-    } catch {
-      await this.gridSettled();
-      const retry = await waitFor(`${text} on its own row after resize`, () => this.rowSpan(text));
-      await this.session.drag(retry.from, retry.to);
-    }
-    try {
+      await this.session.drag(span.from, span.to);
+      let selected = false;
+      try {
+        await waitFor(`the first drag to select ${text}`, () => this.hasSelection(text), 1000);
+        selected = true;
+      } catch {
+        await this.gridSettled();
+        const retry = await waitFor(`${text} on its own row after resize`, () => this.rowSpan(text));
+        await this.session.drag(retry.from, retry.to);
+      }
       if (!selected) await waitFor(`the drag to select ${text}`, () => this.hasSelection(text), SELECT_MS);
     } catch (error) {
       const seen = await this.session
