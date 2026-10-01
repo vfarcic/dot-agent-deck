@@ -1569,7 +1569,7 @@ pub(crate) struct SelectedDeck {
 impl Default for SelectedDeck {
     fn default() -> Self {
         Self {
-            endpoint: Endpoint::local(),
+            endpoint: crate::local_deck::local_endpoint(),
             fallback: None,
             all_decks: false,
         }
@@ -1659,7 +1659,7 @@ impl Default for AppliedSelection {
     fn default() -> Self {
         Self {
             selected: SelectedDeck::default(),
-            observed: vec![Endpoint::local()],
+            observed: vec![crate::local_deck::local_endpoint()],
             unconfigured: Vec::new(),
             observed_generation: 0,
         }
@@ -1681,33 +1681,33 @@ impl Default for AppliedSelection {
 static APPLIED_SELECTION: std::sync::RwLock<Option<AppliedSelection>> =
     std::sync::RwLock::new(None);
 
-/// Serializes the TESTS that write [`APPLIED_SELECTION`], wherever they live.
+/// Serializes the TESTS that write [`APPLIED_SELECTION`], or read it back and
+/// depend on the answer, wherever they live.
 ///
 /// [`apply_settings_selection`] is a process-global write, so a test that makes
 /// one and asserts on what it reads back needs every other test's write to be
-/// outside its own window. Under nextest each test owns its process and this is
-/// always free; under a plain `cargo test` the crate's tests are threads in one
-/// process and this is the only thing keeping those writes out of each other's
-/// windows.
+/// outside its own window. So does a test that only publishes a terminal
+/// session: [`DeckScope::revalidate`] refuses a publish when the observed
+/// generation moved, and a sibling's write moves it. Under nextest each test
+/// owns its process and this is always free; under a plain `cargo test` the
+/// crate's tests are threads in one process and this is the only thing keeping
+/// those writes out of each other's windows.
 ///
 /// It lives here rather than in [`tests`] because the writers do not: issue
 /// #1078 found eight tests across `endpoint_test::tests` and `lib::tests`
 /// writing the global without it, six of them by way of
-/// `lib::retarget_selection`.
+/// `lib::retarget_selection`, and then the `terminal::tests` that write or
+/// revalidate against it.
 ///
-/// **It is one of three process-globals `cargo test --lib` raced on, not the
-/// only one**, so taking it does not on its own make that command green —
-/// measured, with the tests that move the other two excluded, at 6 runs red
-/// before this lock and 6 green after. The other two are the
-/// `DOT_AGENT_DECK_ATTACH_SOCKET` override that `endpoint_test::tests` sets
-/// process-wide (every `Endpoint::local()` in the crate reads it, and only
-/// `endpoint_test` holds `ATTACH_ENV_LOCK` while it moves) and the umask
-/// `bind_attach_listener` flips inside `daemon_bridge::tests`' `RealDeck`
-/// (documented and accepted there). Both need their own change and neither is
-/// what this guards.
+/// **It is one of three process-globals `cargo test --lib` raced on**, and it
+/// is the only one a lock serialises. The other two are removed rather than
+/// locked: the local deck's address, which tests move with
+/// [`crate::local_deck`]'s per-thread seam instead of the process-wide
+/// `DOT_AGENT_DECK_ATTACH_SOCKET` that every production read resolved; and the
+/// process umask, which the tests that run a real attach server no longer flip
+/// (`crate::test_listener`).
 ///
-/// **Async-aware on purpose**, matching `endpoint_test::tests`'
-/// `ATTACH_ENV_LOCK`: most of the writers are `#[tokio::test]`s that hold the
+/// **Async-aware on purpose**: most of the writers are `#[tokio::test]`s that hold the
 /// selection across an `.await`, and a `std::sync::MutexGuard` doing that is
 /// `clippy::await_holding_lock` — an error under the workspace's `-D warnings`.
 /// It also has no poisoning, so a test that panics mid-selection releases the
@@ -3387,7 +3387,8 @@ mod tests {
 
     #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
-        let snapshot = disconnected_snapshot(&Endpoint::local(), "offline\u{1b}[31m");
+        let snapshot =
+            disconnected_snapshot(&crate::local_deck::local_endpoint(), "offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
         assert_eq!(snapshot.connection.error.as_deref(), Some("offline[31m"));
         assert!(snapshot.agents.is_empty());

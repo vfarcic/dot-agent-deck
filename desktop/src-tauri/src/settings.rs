@@ -1278,7 +1278,7 @@ impl DesktopSettings {
         match &self.endpoints {
             Some(endpoints) => endpoints.resolve(),
             None => ResolvedEndpoint {
-                endpoint: Endpoint::local(),
+                endpoint: crate::local_deck::local_endpoint(),
                 fallback: None,
             },
         }
@@ -1315,7 +1315,7 @@ impl DesktopSettings {
     pub fn connectable_endpoints(&self) -> Vec<Endpoint> {
         match &self.endpoints {
             Some(endpoints) => endpoints.connectable_endpoints(),
-            None => vec![Endpoint::local()],
+            None => vec![crate::local_deck::local_endpoint()],
         }
     }
 
@@ -1435,7 +1435,7 @@ impl EndpointSettings {
     /// reason, via [`DesktopSettings::selects_all_decks`].
     pub fn resolve(&self) -> ResolvedEndpoint {
         let local = || ResolvedEndpoint {
-            endpoint: Endpoint::local(),
+            endpoint: crate::local_deck::local_endpoint(),
             fallback: None,
         };
         let Selection::One(id) = &self.selection else {
@@ -1443,7 +1443,7 @@ impl EndpointSettings {
         };
         let Some(deck) = self.find(id) else {
             return ResolvedEndpoint {
-                endpoint: Endpoint::local(),
+                endpoint: crate::local_deck::local_endpoint(),
                 fallback: Some(SelectionFallback::UnknownDeck { id: id.clone() }),
             };
         };
@@ -1453,7 +1453,7 @@ impl EndpointSettings {
                 fallback: None,
             },
             None => ResolvedEndpoint {
-                endpoint: Endpoint::local(),
+                endpoint: crate::local_deck::local_endpoint(),
                 fallback: Some(SelectionFallback::NoRemoteSocket { id: id.clone() }),
             },
         }
@@ -1493,7 +1493,7 @@ impl EndpointSettings {
         if !matches!(self.selection, Selection::All) {
             return vec![self.resolve().endpoint];
         }
-        let mut observed = vec![Endpoint::local()];
+        let mut observed = vec![crate::local_deck::local_endpoint()];
         observed.extend(
             self.remote
                 .iter()
@@ -9041,7 +9041,7 @@ level = 1.0
         };
 
         let resolved = endpoints.resolve();
-        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(resolved.endpoint, crate::local_deck::local_endpoint());
         assert_eq!(
             resolved.fallback,
             Some(SelectionFallback::UnknownDeck { id: gone })
@@ -9072,7 +9072,7 @@ level = 1.0
         };
 
         let resolved = endpoints.resolve();
-        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(resolved.endpoint, crate::local_deck::local_endpoint());
         assert_eq!(
             resolved.fallback,
             Some(SelectionFallback::NoRemoteSocket { id }),
@@ -9118,7 +9118,7 @@ level = 1.0
         std::fs::write(&path, "version = 1\n\n[appearance]\nmode = \"dark\"\n").unwrap();
 
         let resolved = load_from(&path).resolve_endpoint();
-        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(resolved.endpoint, crate::local_deck::local_endpoint());
         assert_eq!(resolved.fallback, None);
     }
 
@@ -9145,7 +9145,7 @@ level = 1.0
         let resolved = loaded.resolve_endpoint();
         assert_eq!(
             resolved.endpoint,
-            Endpoint::local(),
+            crate::local_deck::local_endpoint(),
             "an unknown selection is not a reason to have no deck"
         );
         assert!(matches!(
@@ -9209,7 +9209,7 @@ level = 1.0
         assert_eq!(
             all.resolve_endpoint(),
             ResolvedEndpoint {
-                endpoint: Endpoint::local(),
+                endpoint: crate::local_deck::local_endpoint(),
                 fallback: None,
             },
             "All Decks resolves to the local deck with no fallback, so the resolved endpoint cannot tell it apart"
@@ -9248,7 +9248,7 @@ level = 1.0
         // the deck screen still has one target (DECISION 1) but NOTHING failed
         // to be honoured, so there is no substitution to report.
         let resolved = loaded.resolve_endpoint();
-        assert_eq!(resolved.endpoint, Endpoint::local());
+        assert_eq!(resolved.endpoint, crate::local_deck::local_endpoint());
         assert_eq!(
             resolved.fallback, None,
             "a selection that IS in force must not print a fallback notice"
@@ -9337,7 +9337,11 @@ level = 1.0
             2,
             "the local deck and the one row with somewhere to connect to"
         );
-        assert_eq!(observed[0], Endpoint::local(), "the local deck leads");
+        assert_eq!(
+            observed[0],
+            crate::local_deck::local_endpoint(),
+            "the local deck leads"
+        );
         let Endpoint::Remote(remote) = &observed[1] else {
             panic!("the second observed deck must be the configured remote row");
         };
