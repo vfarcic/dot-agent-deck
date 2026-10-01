@@ -179,6 +179,35 @@ cpal = "0.18"
 # arbitrary. Deliberately `getrandom` and not `rand`, for the root package's
 # reason: the whole requirement is "N bytes from the operating system".
 getrandom = "0.4"
+# Issue #1403: copying an agent terminal's selection (`Ctrl+Shift+C`, `Cmd+C`)
+# writes to the OS clipboard from here rather than through the webview's
+# `navigator.clipboard`, because the three webviews do not agree on whether the
+# page may use it. Read from `wry` 0.55.1: on WebKitGTK it registers the
+# `tauri` scheme as a secure context, which is why the web API was measured
+# working there; on WKWebView it does nothing of the kind, so whether
+# `tauri://localhost` is a secure context — `navigator.clipboard` does not
+# exist outside one — is left to WebKit's own rules and could not be checked
+# from this Linux box. Writing Rust-side makes it one code path on every
+# platform, and the one the driver tier's `terminal_002` drives on Linux.
+#
+# WRITE ONLY. `capabilities/default.json` grants `allow-write-text` and nothing
+# else: the page can put text on the clipboard but never read it. The frontend
+# calls the plugin's command through `@tauri-apps/api/core`'s `invoke` rather
+# than through `@tauri-apps/plugin-clipboard-manager`, so there is no npm half
+# for Renovate's two lanes to move out of step with this crate (the #1358
+# split `renovate.json` describes) and no pair for `tauri build`'s
+# mismatched-versions check to refuse.
+#
+# WHAT IT COSTS. 37 new lockfile entries. The clipboard itself is `arboard`:
+# `x11rb` and `wl-clipboard-rs` on Linux, both pure Rust — `wayland-sys` comes
+# in with its default features only, which link nothing — so no system package
+# is added to `tauri-deps/flake.nix` or the `apt-get` blocks; `objc2-app-kit`
+# on macOS; `clipboard-win` on Windows. Most of the rest is `image` and its
+# decoders, from arboard's default `image-data` feature, which the plugin
+# turns on and a dependent cannot turn off. Pinned at 2.3.3 rather than the
+# newest 2.4.0, which was three days old when this was written and inside the
+# four days `renovate.json` holds a Tauri crate.
+tauri-plugin-clipboard-manager = "2.3.3"
 
 [dev-dependencies]
 # The `#[tokio::test]` attribute needs `macros` + `rt`, and the scripted-socket

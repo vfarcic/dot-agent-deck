@@ -30,6 +30,10 @@
 #     through glvnd's own override variables. It is resolved here, not added to
 #     devbox.json, because tauri-deps/flake.nix deliberately ships no shared
 #     libraries (see its header) and only this tier needs one.
+#   * xclip: `DAD_DRIVER_XCLIP`, else PATH, else — on a devbox (Nix) WebKitGTK,
+#     for the same reason as the EGL driver — built from that same nixpkgs
+#     revision. `terminal_002` reads the display's clipboard with it from
+#     outside the app (issue #1403). CI installs it with apt.
 
 set -euo pipefail
 
@@ -101,6 +105,23 @@ case "$webkit_libdir" in
     fi
     ;;
 esac
+
+xclip=${DAD_DRIVER_XCLIP:-$(command -v xclip || true)}
+if [ -z "$xclip" ]; then
+  case "$webkit_libdir" in
+    /nix/store/*)
+      rev=$(jq -r '.nodes.nixpkgs.locked.rev' "$REPO_ROOT/tauri-deps/flake.lock")
+      echo "driver-test: resolving xclip from nixpkgs $rev" >&2
+      xclip=$(nix --extra-experimental-features 'nix-command flakes' build --no-link --print-out-paths \
+        "github:NixOS/nixpkgs/$rev#xclip")/bin/xclip
+      ;;
+    *)
+      echo "driver-test: xclip not found (apt: xclip), which terminal_002 reads the clipboard with" >&2
+      exit 1
+      ;;
+  esac
+fi
+export DAD_DRIVER_XCLIP=$xclip
 
 if [ "$build" = 1 ]; then
   (cd "$REPO_ROOT" && cargo build --locked --bin dot-agent-deck)

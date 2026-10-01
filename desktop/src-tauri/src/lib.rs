@@ -5018,6 +5018,9 @@ pub fn run() {
         // already the one the user chose. Registered before `build()`, which is
         // what puts it in the plugin store ahead of the config-declared window.
         .plugin(appearance::init())
+        // Issue #1403: the terminal copy chord's clipboard write. The page may
+        // only write through it (`capabilities/default.json`).
+        .plugin(tauri_plugin_clipboard_manager::init())
         // PRD #744: apply the stored zoom before the webview has run any of our
         // JavaScript, so a user at 150% does not watch the app paint at 100%
         // and then jump. That is the whole reason this leg exists Rust-side;
