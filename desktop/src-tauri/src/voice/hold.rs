@@ -32,14 +32,14 @@
 //!
 //! # The two device releases that deliberately KEEP the inhibit
 //!
-//! [`VoiceHold::stop`] and [`VoiceHold::cap_reached`] close the device without
+//! [`VoiceHold::stop`] and [`VoiceHold::cap_reached`] end an utterance without
 //! touching the wake lock, and that is the design rather than an oversight.
 //!
 //! Voice control is a **cycle**, not one long recording: start → speak → stop →
-//! transcribe → resolve → start, for as long as the button says on. The
-//! microphone is shut for the whole transcribe-and-resolve leg, which PRD #802
-//! measured at over a second per utterance. An inhibit that tracked the device
-//! would therefore lapse in every gap between sentences — and an idle timer
+//! transcribe → resolve → start, for as long as the button says on. Since PR
+//! #1451 `stop` keeps the device open for the next utterance, but the cap
+//! still closes it, and an inhibit tied to either the device or the utterance
+//! would lapse in every gap between sentences — and an idle timer
 //! that comes due in one of those gaps sleeps the machine in the middle of a
 //! voice session, which is the entire defect this was built to fix. So the
 //! inhibit spans the cycle: taken when the device first opens, kept across the
@@ -117,11 +117,13 @@ impl VoiceHold {
         Ok(started)
     }
 
-    /// Close the device and take the audio, leaving the session mid-cycle.
+    /// Take the utterance, leaving the session mid-cycle and the microphone
+    /// open for the next one (PR #1451).
     ///
     /// **Keeps the inhibit.** This is the end of an utterance, not the end of
-    /// voice: the transcribe and resolve that follow run with the microphone
-    /// shut, and [`VoiceHold::start`] opens it again straight after. See the
+    /// voice: the transcribe and resolve that follow run while the next
+    /// utterance is already being recorded, and [`VoiceHold::start`] carries
+    /// on with it straight after. See the
     /// module docs for why an inhibit that lapsed in that gap would reintroduce
     /// the defect.
     pub fn stop(&self) -> Result<Pcm16, CaptureError> {

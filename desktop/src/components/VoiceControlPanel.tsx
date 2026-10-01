@@ -402,6 +402,38 @@ export const VOICE_DICTATION_SEND_MS = 5_000;
  */
 export const VOICE_SEND_NUDGE_MS = 4_000;
 
+/**
+ * PR #1451 — how long the panel waits for more words after an utterance that
+ * matched no command, before saying so. A pause mid-command ("Set the command
+ * to be … devbox run agent") ends an utterance after `voice::SILENCE_HOLD`, and
+ * the half said before it matches nothing; if the user carries on inside this
+ * window, the two halves are joined and worked out as one sentence. Measured
+ * from when the first half's answer arrives, and the microphone records
+ * throughout, so speech that began while the first half was being worked out
+ * counts too. Only outcomes that ran nothing are held — see
+ * `HOLDABLE_OUTCOMES` — so a complete command is as fast as before.
+ */
+export const VOICE_JOIN_WINDOW_MS = 2_000;
+
+/**
+ * The answers that are held for {@link VOICE_JOIN_WINDOW_MS} rather than
+ * reported at once: each one ran nothing, and each is what the first half of a
+ * command cut by a pause typically gets — nothing matched, a row the words did
+ * not ask for, or a row missing what it acts on ("open" with no name yet).
+ * Anything that did or offered something is never held.
+ */
+const HOLDABLE_OUTCOMES: ReadonlySet<VoiceOutcomeDto["kind"]> = new Set(["no_match", "unknown_action", "action_ungrounded", "param_missing"]);
+
+/** Two halves of one sentence: the first loses the full stop the transcriber gave it. */
+function joinUtterances(first: string, next: string): string {
+  return `${first.replace(/[\s.,!?…]+$/u, "")} ${next.trim()}`;
+}
+
+/** The transcription's own sentence, as Rust's `heard_sentence` renders it. */
+function heardSentence(transcript: string): string {
+  return `Heard “${transcript}”${/[.?!…]$/u.test(transcript) ? "" : "."}`;
+}
+
 /** How often the countdown redraws, and the resolution it is shown at. */
 export const VOICE_DICTATION_TICK_MS = 1_000;
 
@@ -1391,6 +1423,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [setNudge, stopNudge]);
   useEffect(() => () => stopNudge(true), [stopNudge]);
   /**
+   * PR #1451 — an answer that ran nothing, waiting {@link VOICE_JOIN_WINDOW_MS}
+   * for the rest of the sentence. `continued` is set by the poll when the
+   * microphone hears speech inside the window; the held answer then waits for
+   * that utterance instead of the clock.
+   */
+  const held = useRef<{ answer: VoiceResultDto; transcript: string; continued: boolean }>(undefined);
+  const heldTimer = useRef<number>(undefined);
+  const clearHeld = useCallback(() => {
+    if (heldTimer.current !== undefined) window.clearTimeout(heldTimer.current);
+    heldTimer.current = undefined;
+    held.current = undefined;
+  }, []);
+  /** Nothing followed after all: say what the held answer says. */
+  const reportHeld = useCallback(() => {
+    const waiting = held.current;
+    clearHeld();
+    if (waiting) setResult(waiting.answer);
+  }, [clearHeld]);
+  useEffect(() => clearHeld, [clearHeld]);
+  /**
    * PRD #1260 review, round 4 — hold the live one-shot send to its declared
    * context ({@link contextLost}), calling it off if the context no longer
    * holds. Answers whether it was called off. Run when the write finishes,
@@ -1763,6 +1815,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (lost.code !== "mode" || declaredDictation === undefined) setProblem(answerRefusal(lost));
         return;
       }
+      /* PR #1451 — the first half of a command cut by a pause matches
+         nothing on its own. Rather than say so at once, wait a moment for the
+         rest; the next utterance joins it (`takeUtterance`). Not while
+         typing, where every utterance is the user's own words. */
+      if (declaredDictation === undefined && HOLDABLE_OUTCOMES.has(answer.outcome.kind)) {
+        clearHeld();
+        held.current = { answer, transcript: utterance, continued: false };
+        heldTimer.current = window.setTimeout(() => {
+          heldTimer.current = undefined;
+          if (held.current && !held.current.continued) reportHeld();
+        }, VOICE_JOIN_WINDOW_MS);
+        return;
+      }
       setResult(answer);
       if (answer.outcome.kind === "param_ambiguous") {
         offerChoice(answer, declared);
@@ -1782,17 +1847,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } catch (cause) {
       if (ours()) setProblem(sentenceOf(cause));
     }
-  }, [answerVoiceChoice, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, resolveVoice, setPhase]);
+  }, [answerVoiceChoice, clearHeld, closeChoice, current, declareVoiceScreen, dispatchChoice, dispatchDeclared, offerChoice, reportHeld, resolveVoice, setPhase]);
 
   /**
-   * One whole utterance: close the device, transcribe, resolve, listen again.
+   * One whole utterance: take it, transcribe, resolve, listen again.
    *
-   * Serial on purpose — the microphone is shut while the backends are working
-   * rather than recording over them. Overlapping would let a second command
-   * resolve against a screen the first one is still changing, and the
-   * {@link SCREEN_MOVED_ON} guard would then be refusing the user's own
-   * sentences. The cost is stated plainly: speech during those seconds is not
-   * captured, which is why the report says what it is doing.
+   * Serial on purpose — one utterance is worked on at a time, in order.
+   * Overlapping the WORK would let a second command resolve against a screen
+   * the first one is still changing, and the {@link SCREEN_MOVED_ON} guard
+   * would then be refusing the user's own sentences. The RECORDING does
+   * overlap (PR #1451): the microphone stays open while this one is worked on,
+   * so what the user says meanwhile is the start of the next utterance rather
+   * than lost — the next `listen` carries on with it.
    */
   const takeUtterance = useCallback(async (capped = false) => {
     if (!voiceStop) return;
@@ -1818,6 +1884,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          was reading. So the last report stays exactly as it was and the
          microphone simply reopens. `forget()` waits until there is something
          to say, which is why it is here and not before the stop. */
+      /* PR #1451 — an answer held for the rest of its sentence. Words that
+         follow are joined to it and the whole is worked out as one; a sound
+         that was not speech, after speech was heard, means nothing more is
+         coming; and a failure replaces it. */
+      const waiting = held.current;
+      if (waiting && transcription.outcome.kind === "heard") {
+        clearHeld();
+        const joined = joinUtterances(waiting.transcript, transcription.outcome.transcript);
+        forget();
+        setCapture({ sentence: heardSentence(joined), transcript: joined });
+        await resolveOne(joined, ours);
+        if (!ours()) return;
+        await listen(ours);
+        return;
+      }
+      if (waiting && transcription.outcome.kind === "silent") {
+        if (waiting.continued) reportHeld();
+      } else if (waiting) {
+        clearHeld();
+      }
       if (transcription.outcome.kind !== "silent") {
         forget();
         /* PRD #1260 — a capped segment reaches here only while dictating,
@@ -1840,7 +1926,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     if (!ours()) return;
     await listen(ours);
-  }, [cancelPendingSend, claim, forget, listen, resolveOne, setPhase, voiceStop]);
+  }, [cancelPendingSend, claim, clearHeld, forget, listen, reportHeld, resolveOne, setPhase, voiceStop]);
 
   /**
    * The capped utterance: thrown away unheard, and said so — see
@@ -1852,6 +1938,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const discardCapped = useCallback(async (quietly = false) => {
     const ours = claim();
     setPhase("opening");
+    /* A held answer whose continuation ran to the cap: the sentence is gone
+       either way, and the cap's own report says why. */
+    if (held.current?.continued) clearHeld();
     if (!quietly) {
       forget();
       setProblem(VOICE_CAP_DISCARDED);
@@ -1861,7 +1950,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     try { await voiceCancel?.(); } catch { /* idempotent and never refused */ }
     if (!ours()) return;
     await listen(ours);
-  }, [claim, forget, listen, setPhase, voiceCancel]);
+  }, [claim, clearHeld, forget, listen, setPhase, voiceCancel]);
 
   /**
    * One poll: ask what the microphone is doing, and act if the utterance ended.
@@ -1904,6 +1993,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        words still unsent starts its clock again. The clock is otherwise started
        by the write that typed them, so this re-arms it only after a pause that
        followed speech which typed nothing. */
+    if (status.speech && held.current && !held.current.continued) {
+      held.current.continued = true;
+      if (heldTimer.current !== undefined) window.clearTimeout(heldTimer.current);
+      heldTimer.current = undefined;
+    }
     if (status.speech) stopNudge();
     else if (unsent.current && nudgeTimer.current === undefined && !nudgeShown.current && panelStateRef.current.kind === "dictating") armNudge();
     if (status.capped) {
@@ -2046,6 +2140,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        after, so a pending send cannot fire during it. */
     cancelPendingSend();
     setPending(undefined);
+    clearHeld();
     /* PRD #1260 — voice off ends the dictation mode too, sending nothing. The
        report is the release's own, so the mode ends without a sentence. */
     setPanelState(IDLE);
@@ -2086,7 +2181,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        handler routes `unreleased` here), and without this the button would fall
        back to `Voice…` after a release that actually succeeded. */
     setKnown(true);
-  }, [cancelPendingSend, claim, releasedAfterRefusal, setOn, setPanelState, setPending, setPhase, voiceCancel]);
+  }, [cancelPendingSend, claim, clearHeld, releasedAfterRefusal, setOn, setPanelState, setPending, setPhase, voiceCancel]);
 
   /**
    * What the discovery overlay is showing, or `undefined` for closed

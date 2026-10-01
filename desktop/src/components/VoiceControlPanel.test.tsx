@@ -28,6 +28,7 @@ import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
+  VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
   VOICE_UNAVAILABLE,
   VOICE_UNDO_WINDOW_MS,
@@ -184,6 +185,13 @@ async function completeAutomaticUtterance(voice: VoiceControls) {
     await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS);
   });
   expect(voice.voiceStop).toHaveBeenCalledTimes(1);
+}
+
+/** Let a held answer — one that ran nothing — be reported: it waits for the rest of its sentence first (PR #1451). */
+async function settleHeldAnswer() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS);
+  });
 }
 
 function automaticVoice(outcome: VoiceTranscriptionOutcomeDto, capped = false): VoiceControls {
@@ -593,6 +601,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText(outcome.sentence)).toBeVisible();
     if (outcome.kind === "dispatch") expect(screen.getByTestId("overview-table-region")).toBeVisible();
@@ -610,6 +619,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText(sentence).textContent).toBe(sentence);
   });
@@ -626,6 +636,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     const report = screen.getByTestId("voice-report").textContent ?? "";
     expect(report.split(utterance).length - 1, report).toBe(1);
@@ -647,6 +658,81 @@ describe("voice control panel", () => {
     expect(screen.getByText(DISPATCH.sentence)).toBeVisible();
   });
 
+  /** Resolves "show me every agent" (however it is punctuated) to the dashboard, and anything else to a no-match. */
+  function joiningResolver() {
+    return vi.fn<(utterance: string) => Promise<VoiceResultDto>>(async (utterance) => (
+      /^show me every agent\.?$/i.test(utterance)
+        ? result({ ...DISPATCH, transcript: utterance })
+        : result({ kind: "no_match", transcript: utterance, sentence: `Heard: “${utterance}” — no matching action.` })
+    ));
+  }
+
+  /** Scenario: the user says "Show me", pauses long enough to end the utterance, then says "every agent". The halves are joined and the dashboard opens; "Show me" alone is never reported as matching nothing (PR #1451). */
+  it("joins a command that matched nothing with the words that follow a pause", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Show me.") },
+      { outcome: heard("every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    expect(screen.queryByText("Heard: “Show me.” — no matching action.")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Show me.", "Show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: the user says something that matches no command and stops. The app waits briefly for more, then says it matched nothing. */
+  it("reports a command that matched nothing once nothing follows it", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: heard("Set the command to be.") }]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    const sentence = "Heard: “Set the command to be.” — no matching action.";
+    expect(screen.queryByText(sentence)).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
+
+    expect(screen.getByText(sentence)).toBeVisible();
+  });
+
+  /** Scenario: a command that matched nothing is followed by a sound that turns out not to be speech. The app says the command matched nothing rather than waiting on. */
+  it("reports a held command when what followed it was not speech", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: SILENT, status: { speech: true } },
+    ]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(voice.voiceStop).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Heard: “Set the command to be.” — no matching action.")).toBeVisible();
+  });
+
+  /** Scenario: the user says something that matches no command, then turns voice off before the app has said so. Nothing about it appears afterwards. */
+  it("drops a held command when voice is turned off", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: heard("Set the command to be.") }]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+    await settleHeldAnswer();
+
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
+  });
+
   /** Scenario: a slow Claude result reports its backend and 4.2-second latency together beside the sentence. */
   it("shows backend and latency together", async () => {
     vi.useFakeTimers();
@@ -661,6 +747,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText("claude, 4.2 s")).toBeVisible();
   });

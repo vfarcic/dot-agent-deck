@@ -46,6 +46,7 @@ import {
   VOICE_NOTHING_TO_CLOSE,
   VOICE_DICTATION_SUBMIT,
   VOICE_DICTATION_TICK_MS,
+  VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
 } from "./VoiceControlPanel";
 
@@ -451,6 +452,8 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     expect(entry(2, second.label)).toBeVisible();
     voice.deliver("what time is it");
     await completeUtterance();
+    // A no-match waits for the rest of its sentence before it is reported (PR #1451).
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/choice closed/i);
     expect(screen.getByTestId("voice-report")).toHaveTextContent("no matching action");
@@ -3527,6 +3530,7 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
 
     voice.deliver("set the command to rm -rf");
     await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
 
     expect(screen.getByTestId("voice-report")).toHaveTextContent("no matching action");
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
