@@ -79,7 +79,7 @@
  * overlay above all — so the row overlaps nothing and nothing overlaps it. The
  * comment on the returned element has the reasoning and the one it replaced.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
@@ -383,6 +383,24 @@ export const VOICE_EMPTY_STATE = "Say “what can I say?” for the list, or “
  * pressing Enter in the prompt they are looking at.
  */
 export const VOICE_DICTATION_SEND_MS = 5_000;
+
+/**
+ * PR #1451 — how long typing mode waits, with dictated words in the prompt
+ * not yet sent and nobody speaking, before it highlights how to send them.
+ *
+ * **It never sends.** Typing mode sends only on "send it" or the user's own
+ * Enter; this is a nudge, not a countdown. The hand test that asked for it
+ * found users dictating, falling silent and waiting for something to happen,
+ * so after a pause the "“send it” to send" part of the status is highlighted.
+ *
+ * Four seconds is longer than a pause between dictated sentences — the
+ * capture's own 800 ms end-of-utterance hold plus about a second to transcribe
+ * and type, then the user starting the next one — so it does not flash while
+ * somebody is still talking, and short enough that someone waiting notices it
+ * before they give up. Speaking again clears it, and it comes back after the
+ * next pause; sending or leaving typing mode clears it for good.
+ */
+export const VOICE_SEND_NUDGE_MS = 4_000;
 
 /** How often the countdown redraws, and the resolution it is shown at. */
 export const VOICE_DICTATION_TICK_MS = 1_000;
@@ -976,6 +994,34 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   */
   const onRef = useRef(false);
   const setOn = useCallback((next: boolean) => { onRef.current = next; setOnState(next); }, []);
+
+  /*
+    PR #1451 — while voice is on the row is half as large again and its
+    sentences wrap rather than elide (`.voice-row[data-voice="on"]` in
+    `styles.css`), so its height is its content's. Every surface that keeps
+    clear of the row reads `--voice-row-height`, so while voice is on that
+    variable is the row's MEASURED height, kept current as the text wraps and
+    unwraps, and it goes back to the stylesheet's constant when voice is off.
+    A layout effect, so the first frame with the larger row already reserves
+    it. jsdom has no `ResizeObserver` and lays nothing out, hence the guards.
+  */
+  const rowRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!on || !row) return;
+    const root = document.documentElement;
+    const reserve = () => {
+      const height = row.getBoundingClientRect().height;
+      if (height > 0) root.style.setProperty("--voice-row-height", `${height}px`);
+    };
+    reserve();
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(reserve);
+    observer?.observe(row);
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--voice-row-height");
+    };
+  }, [on]);
   const phaseRef = useRef<VoicePhase>("idle");
   const setPhase = useCallback((next: VoicePhase) => { phaseRef.current = next; setPhaseState(next); }, []);
 
@@ -1009,13 +1055,30 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * target's identity alone cannot tell apart.
    */
   const modeGeneration = useRef(0);
+  /**
+   * PR #1451 — typing mode's nudge to send ({@link VOICE_SEND_NUDGE_MS}):
+   * whether it is showing, its timer, and whether words dictated in the mode
+   * are still unsent, which is the only time there is anything to nudge about.
+   */
+  const [nudge, setNudgeState] = useState(false);
+  const nudgeShown = useRef(false);
+  const setNudge = useCallback((next: boolean) => { nudgeShown.current = next; setNudgeState(next); }, []);
+  const nudgeTimer = useRef<number | undefined>(undefined);
+  const unsent = useRef(false);
   const setPanelState = useCallback((next: VoicePanelState) => {
     const was = panelStateRef.current;
-    if (was.kind === "dictating" || next.kind === "dictating") modeGeneration.current += 1;
+    if (was.kind === "dictating" || next.kind === "dictating") {
+      modeGeneration.current += 1;
+      /* PR #1451 — every entry and exit starts the nudge from nothing. */
+      unsent.current = false;
+      if (nudgeTimer.current !== undefined) window.clearTimeout(nudgeTimer.current);
+      nudgeTimer.current = undefined;
+      setNudge(false);
+    }
     panelStateRef.current = next;
     setPanelStateState(next);
     if (was.kind === "dictating" || next.kind === "dictating") dictationChanged.current?.(next.kind === "dictating" ? next.target : undefined);
-  }, []);
+  }, [setNudge]);
   /** The host's view of the pane and the deck, for the entry check. */
   const paneRef = useRef(pane);
   paneRef.current = pane;
@@ -1281,6 +1344,22 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     sending.current = undefined;
     clearSendTimer();
   }, [clearSendTimer]);
+  /** Take the nudge down and stop its clock; `sent` also forgets the unsent words. */
+  const stopNudge = useCallback((sent = false) => {
+    if (nudgeTimer.current !== undefined) window.clearTimeout(nudgeTimer.current);
+    nudgeTimer.current = undefined;
+    if (sent) unsent.current = false;
+    setNudge(false);
+  }, [setNudge]);
+  /** Start the pause clock from now; it shows the nudge when it runs out. */
+  const armNudge = useCallback(() => {
+    stopNudge();
+    nudgeTimer.current = window.setTimeout(() => {
+      nudgeTimer.current = undefined;
+      if (unsent.current && panelStateRef.current.kind === "dictating") setNudge(true);
+    }, VOICE_SEND_NUDGE_MS);
+  }, [setNudge, stopNudge]);
+  useEffect(() => () => stopNudge(true), [stopNudge]);
   /**
    * PRD #1260 review, round 4 — hold the live one-shot send to its declared
    * context ({@link contextLost}), calling it off if the context no longer
@@ -1400,6 +1479,19 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   useEffect(() => () => {
     if (panelStateRef.current.kind === "dictating") dictationChanged.current?.(undefined);
   }, []);
+
+  /* PR #1451 — the user's own Enter is a send, so it takes the nudge down for
+     good. Capture phase on the window, because the key lands in the agent's
+     terminal, which handles it before anything could bubble back here. */
+  const dictatingNow = panelState.kind === "dictating";
+  useEffect(() => {
+    if (!dictatingNow) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Enter" && unsent.current) stopNudge(true);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [dictatingNow, stopNudge]);
 
   /** Everything the last utterance left behind, cleared when the next one has words in it. */
   const forget = useCallback(() => {
@@ -1774,6 +1866,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       send.
     */
     if (pendingRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
+    /* PR #1451 — the nudge to send: speaking takes it down, and a pause with
+       words still unsent starts its clock again. The clock is otherwise started
+       by the write that typed them, so this re-arms it only after a pause that
+       followed speech which typed nothing. */
+    if (status.speech) stopNudge();
+    else if (unsent.current && nudgeTimer.current === undefined && !nudgeShown.current && panelStateRef.current.kind === "dictating") armNudge();
     if (status.capped) {
       /* PR #1451 — nobody spoke in it (`speech` is the same rule the
          transcription gate applies), so there is nothing to type and nothing
@@ -1787,7 +1885,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     if (status.state === "done") await takeUtterance();
-  }, [cancelPendingSend, discardCapped, takeUtterance, voiceStatus]);
+  }, [armNudge, cancelPendingSend, discardCapped, stopNudge, takeUtterance, voiceStatus]);
 
   /*
     The poll, reached through a ref so the interval below survives a re-render.
@@ -2067,7 +2165,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          incarnation as well. */
       const generation = modeGeneration.current;
       void sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed).then(
-        () => undefined,
+        /* PR #1451 — words are in the prompt and unsent: start the pause
+           clock for the nudge to send. A write from a mode that has since
+           ended arms nothing. */
+        () => {
+          if (modeGeneration.current !== generation) return;
+          unsent.current = true;
+          armNudge();
+        },
         /* A terminal that refuses once will refuse every utterance after it,
            so the mode ends with the refusal rather than repeating it. A
            failure from a mode that has since ended is dropped: it must not end
@@ -2104,7 +2209,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         setProblem(sentenceOf(cause));
       },
     );
-  }, [armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending]);
+  }, [armNudge, armSend, callOffLostSend, cancelPendingSend, current, endDictation, paneLost, reportRefused, sendTerminalInput, setPanelState, setPending]);
 
   /**
    * Press Enter in the open agent's prompt, because the user said to.
@@ -2117,13 +2222,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const submitAgentPrompt = useCallback((target: VoiceDispatchTarget) => {
     cancelPendingSend();
     setPending(undefined);
+    stopNudge(true);
     const lost = paneLost(target);
     if (lost) {
       reportRefused(answerRefusal(lost));
       return;
     }
     void submitDictation({ deckId: target.deckId, agentId: target.agentId, label: target.agentLabel ?? target.agentId });
-  }, [cancelPendingSend, paneLost, reportRefused, setPending, submitDictation]);
+  }, [cancelPendingSend, paneLost, reportRefused, setPending, stopNudge, submitDictation]);
 
   /** Say there was nothing on top to close. See {@link VOICE_NOTHING_TO_CLOSE}. */
   const reportNothingToClose = useCallback(() => setProblem(VOICE_NOTHING_TO_CLOSE), []);
@@ -2262,7 +2368,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       now. The trigger and the Undo inside the report stay reachable behind an
       open pane, which is what the exemption exists for.
     */
-    <div className="voice-row" data-testid="voice-row" {...VOICE_PEER_PROPS}>
+    <div ref={rowRef} className="voice-row" data-testid="voice-row" data-voice={on ? "on" : "off"} {...VOICE_PEER_PROPS}>
       <button
         type="button"
         className="voice-trigger"
@@ -2374,7 +2480,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
               <p className="voice-dictation" data-testid="voice-dictating">
                 {"Typing to "}
                 {dictatingLabel}
-                {". Say “type off” to stop, “send it” to send."}
+                {". Say “type off” to stop, "}
+                {/* PR #1451 — highlighted after a pause with dictated words
+                    unsent ({@link VOICE_SEND_NUDGE_MS}). Styling only: the
+                    wording is the same whether or not it is lit. */}
+                <span className="voice-send-hint" data-testid="voice-send-hint" data-nudge={nudge ? "on" : undefined}>“send it” to send</span>
+                {"."}
               </p>
             )}
             {/*

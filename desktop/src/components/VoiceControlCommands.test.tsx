@@ -41,6 +41,7 @@ import {
   VOICE_CHOICE_SCREEN_MOVED_ON,
   NOTHING_DISPATCHED,
   VOICE_DICTATION_SEND_MS,
+  VOICE_SEND_NUDGE_MS,
   VOICE_NOTHING_TO_CLOSE,
   VOICE_DICTATION_SUBMIT,
   VOICE_DICTATION_TICK_MS,
@@ -92,7 +93,10 @@ function heard(transcript: string): VoiceTranscriptionDto {
  * utterance — the dictation cases are about what the utterance after the first
  * one does, and a stand-in that spoke once could not ask that question.
  */
-function microphone(transcripts: string[]): VoiceControls & { deliver: (transcript: string) => void; speak: () => void; capNext: () => void } {
+/** What the microphone stand-in answers for {@link microphone}'s `mumble`: a segment with no words in it. */
+const MUMBLE = "\u0000mumble";
+
+function microphone(transcripts: string[]): VoiceControls & { deliver: (transcript: string) => void; mumble: () => void; speak: () => void; capNext: () => void } {
   const queue = [...transcripts];
   let recording = false;
   let ready = false;
@@ -120,7 +124,15 @@ function microphone(transcripts: string[]): VoiceControls & { deliver: (transcri
     voiceStop: vi.fn(async () => {
       recording = false;
       speaking = false;
-      return heard(queue.shift() ?? "");
+      const next = queue.shift() ?? "";
+      return next === MUMBLE
+        ? {
+          outcome: { kind: "silent", detail: "the transcription held no words", sentence: "I could not make out any words. Say that again; still listening." },
+          transcribeMs: 11,
+          backend: "stub",
+          audioMs: 900,
+        } satisfies VoiceTranscriptionDto
+        : heard(next);
     }),
     voiceCancel: vi.fn(async () => {
       recording = false;
@@ -132,6 +144,11 @@ function microphone(transcripts: string[]): VoiceControls & { deliver: (transcri
     ...controls,
     deliver: (transcript: string) => {
       queue.push(transcript);
+      ready = recording;
+    },
+    /** A segment ends that turns out to hold no words — a cough, a keyboard. */
+    mumble: () => {
+      queue.push(MUMBLE);
       ready = recording;
     },
     /** Start talking, with no utterance boundary yet — a sentence in progress. */
@@ -1809,7 +1826,7 @@ describe("sticky dictation in the open agent pane", () => {
   it("accumulates whole utterances without a countdown and stays on after send it", async () => {
     const { voice, deck } = start({ "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent — still typing to Coder.", "send it") });
     await enter(voice);
-    expect(screen.getByText(/say.*type off.*send it/i)).toBeVisible();
+    expect(screen.getByTestId("voice-dictating")).toHaveTextContent(/say.*type off.*send it/i);
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
     voice.deliver("type fix the bug");
     await completeUtterance();
@@ -1828,6 +1845,93 @@ describe("sticky dictation in the open agent pane", () => {
     voice.deliver("one more prompt");
     await completeUtterance();
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, "one more prompt ");
+  });
+
+  /** Scenario: in typing mode the user dictates a sentence and then says
+   * nothing. After a few seconds the "“send it” to send" part of the status is
+   * highlighted — the wording does not change and nothing is sent. Speaking
+   * again clears it and it returns after the next pause; "send it", the user's
+   * own Enter and "type off" each clear it. */
+  it("highlights how to send after a pause with dictated text unsent, and never sends", async () => {
+    const { voice, deck } = start({
+      "send it": dispatch("submit_prompt", "submitAgentPrompt", "Sent — still typing to Coder.", "send it"),
+      "type off": modeOff,
+    });
+    await enter(voice);
+    const status = () => screen.getByTestId("voice-dictating");
+    const nudged = () => screen.getByTestId("voice-send-hint").getAttribute("data-nudge") === "on";
+    const wait = async (ms: number) => { await act(async () => { await vi.advanceTimersByTimeAsync(ms); }); };
+    const wording = "Typing to coder. Say “type off” to stop, “send it” to send.";
+
+    // Nothing typed yet, so nothing to nudge about however long the pause.
+    await wait(VOICE_SEND_NUDGE_MS * 2);
+    expect(nudged()).toBe(false);
+
+    voice.deliver("fix the bug");
+    await completeUtterance();
+    expect(nudged()).toBe(false);
+    await wait(VOICE_SEND_NUDGE_MS - 1_000);
+    expect(nudged(), "the nudge came before the pause was long enough").toBe(false);
+    await wait(1_000);
+    expect(nudged()).toBe(true);
+    expect(status()).toHaveTextContent(wording);
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
+
+    // Speaking again clears it, and a pause brings it back — after a segment
+    // that typed nothing, and after the next words.
+    voice.speak();
+    await wait(VOICE_STATUS_POLL_MS);
+    expect(nudged()).toBe(false);
+    const before = screen.getByTestId("voice-report").textContent;
+    voice.mumble();
+    await completeUtterance();
+    expect(voice.voiceStop).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId("voice-report").textContent, "a wordless segment changed the report").toBe(before);
+    expect(nudged()).toBe(false);
+    await wait(VOICE_SEND_NUDGE_MS + VOICE_STATUS_POLL_MS);
+    expect(nudged()).toBe(true);
+    voice.speak();
+    await wait(VOICE_STATUS_POLL_MS);
+    expect(nudged()).toBe(false);
+    voice.deliver("and check the logs");
+    await completeUtterance();
+    expect(nudged()).toBe(false);
+    await wait(VOICE_SEND_NUDGE_MS);
+    expect(nudged()).toBe(true);
+
+    // "send it" sends and clears it; with nothing unsent it does not return.
+    voice.deliver("send it");
+    await completeUtterance();
+    expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
+    expect(nudged()).toBe(false);
+    await wait(VOICE_SEND_NUDGE_MS * 2);
+    expect(nudged()).toBe(false);
+
+    // The user's own Enter is a send too.
+    voice.deliver("one more prompt");
+    await completeUtterance();
+    await wait(VOICE_SEND_NUDGE_MS);
+    expect(nudged()).toBe(true);
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(nudged()).toBe(false);
+
+    // And leaving the mode takes it, and the status, away.
+    voice.deliver("and another");
+    await completeUtterance();
+    await wait(VOICE_SEND_NUDGE_MS);
+    expect(nudged()).toBe(true);
+    voice.deliver("type off");
+    await completeUtterance();
+    expect(screen.queryByTestId("voice-send-hint")).toBeNull();
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(5);
+    // Back in the mode, the words left in the prompt by the last one are not
+    // this mode's to nudge about.
+    voice.deliver("type on");
+    await completeUtterance();
+    await wait(VOICE_SEND_NUDGE_MS * 2);
+    expect(nudged()).toBe(false);
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(5);
   });
 
   /** Scenario: a long dictated segment reaches the 30-second capture limit.

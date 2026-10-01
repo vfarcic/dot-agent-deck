@@ -224,6 +224,93 @@ test.describe("the voice row is reserved space", () => {
     await voiceButton(page).click({ trial: true });
   });
 
+  /** What the row and its text measure, and what the page reserves for it. */
+  async function rowSize(page: Page) {
+    return page.evaluate(() => {
+      const row = document.querySelector<HTMLElement>(".voice-row");
+      const label = document.querySelector<HTMLElement>(".voice-trigger span");
+      if (!row || !label) throw new Error("the voice row is not mounted");
+      return {
+        height: row.getBoundingClientRect().height,
+        label: parseFloat(getComputedStyle(label).fontSize),
+        sentences: [...row.querySelectorAll<HTMLElement>(".voice-sentence")].map((sentence) => parseFloat(getComputedStyle(sentence).fontSize)),
+        reserved: parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--voice-row-height")),
+      };
+    });
+  }
+
+  /**
+   * Scenario: PR #1451 — turn voice on and let the fixture's utterance report.
+   * The row and its text are half as large again while voice is on, the page
+   * reserves the row's real height, and turning voice off returns the row and
+   * the reservation to their resting 40px.
+   */
+  test("is half as large again while voice is on and back to its resting size when off", async ({ page }) => {
+    await openWithSpeech(page);
+    const off = await rowSize(page);
+    expect(off.height).toBeCloseTo(40, 0);
+    expect(off.reserved).toBe(40);
+
+    await voiceButton(page).click();
+    await expect(page.getByText("Opening the agent dashboard.")).toBeVisible();
+    const on = await rowSize(page);
+    expect(on.height / off.height).toBeGreaterThanOrEqual(1.5);
+    expect(on.label / off.label).toBeCloseTo(1.5, 2);
+    expect(on.sentences.length).toBeGreaterThan(0);
+    for (const size of on.sentences) expect(size).toBeCloseTo(16.5, 2);
+    expect(on.reserved).toBeCloseTo(on.height, 0);
+
+    await voiceButton(page).click();
+    await expect(voiceButton(page)).toHaveAttribute("aria-pressed", "false");
+    const again = await rowSize(page);
+    expect(again.height).toBeCloseTo(40, 0);
+    expect(again.reserved).toBe(40);
+    expect(again.label).toBe(off.label);
+    for (const size of again.sentences) expect(size).toBeCloseTo(11, 2);
+  });
+
+  /**
+   * Scenario: PR #1451 — at a narrow window, enter typing mode in a writable
+   * agent's pane. The larger typing-mode status wraps onto more lines rather
+   * than being cut off or overflowing, the row grows to hold it, and the
+   * enlarged agent still stops above the taller row.
+   */
+  test("wraps the larger typing-mode status at a narrow window rather than cutting it off", async ({ page }) => {
+    await page.setViewportSize({ width: 420, height: 760 });
+    await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on");
+    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await voiceButton(page).click();
+    const status = page.getByTestId("voice-dictating");
+    await expect(status).toHaveText("Typing to coder. Say “type off” to stop, “send it” to send.");
+
+    const text = await status.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return {
+        scrollWidth: element.scrollWidth,
+        clientWidth: element.clientWidth,
+        height: box.height,
+        right: box.right,
+        lineHeight: parseFloat(getComputedStyle(element).lineHeight),
+        pageScrollWidth: document.documentElement.scrollWidth,
+        viewportWidth: window.innerWidth,
+      };
+    });
+    expect(text.scrollWidth, "the status is cut off inside its box").toBeLessThanOrEqual(text.clientWidth + 1);
+    expect(text.height, "the status did not wrap").toBeGreaterThan(text.lineHeight * 1.5);
+    expect(text.right, "the status runs past the window").toBeLessThanOrEqual(text.viewportWidth + 1);
+    expect(text.pageScrollWidth, "the page scrolls sideways").toBeLessThanOrEqual(text.viewportWidth);
+
+    const geometry = await rowGeometry(page);
+    const statusBox = await status.boundingBox();
+    expect(statusBox).not.toBeNull();
+    expect(statusBox!.y).toBeGreaterThanOrEqual(geometry.row.top - 1);
+    expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(geometry.row.bottom + 1);
+    expect(geometry.centreIsInsideTheRow).toBe(true);
+    const tile = await page.getByTestId("agent-pane-overlay").locator('.agent-tile[data-presentation="overlay"]').boundingBox();
+    expect(tile, "the enlarged pane has no layout box").not.toBeNull();
+    expect(tile!.y + tile!.height, "the enlarged agent runs under the taller voice row").toBeLessThanOrEqual(geometry.row.top + 1);
+  });
+
   /** Scenario: open a writable agent's modal pane and enter dictation with the
    * browser fixture's spoken script. Stop typing stays in the tab order and
    * passes the browser's real click hit test behind that modal. */
@@ -237,6 +324,27 @@ test.describe("the voice row is reserved space", () => {
     await stop.click({ trial: true });
     await stop.focus();
     await expect(stop).toBeFocused();
+  });
+
+  /**
+   * Scenario: PR #1451 — enter typing mode in a writable agent's pane and
+   * dictate a sentence, then say nothing. After the pause the "“send it” to
+   * send" words are visibly highlighted, the status reads exactly as before,
+   * and nothing was sent.
+   */
+  test("highlights how to send after a pause in typing mode", async ({ page }) => {
+    await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on&voice=fix%20the%20bug");
+    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await voiceButton(page).click();
+    const hint = page.getByTestId("voice-send-hint");
+    await expect(page.getByTestId("voice-report")).toContainText("fix the bug");
+    await expect(hint).not.toHaveAttribute("data-nudge", "on");
+
+    await expect(hint).toHaveAttribute("data-nudge", "on", { timeout: 10_000 });
+    await expect(page.getByTestId("voice-dictating")).toHaveText("Typing to coder. Say “type off” to stop, “send it” to send.");
+    const lit = await hint.evaluate((element) => getComputedStyle(element).backgroundColor);
+    expect(lit, "the nudge is not visibly highlighted").not.toBe("rgba(0, 0, 0, 0)");
+    await expect(page.getByTestId("voice-report")).not.toContainText(/sent/i);
   });
 
   /** Scenario: the browser fixture enters typing mode in a writable agent pane, then hears a punctuated stop command. It ends the mode without typing those command words into the pane. */
