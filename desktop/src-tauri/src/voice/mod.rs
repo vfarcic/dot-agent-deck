@@ -375,6 +375,13 @@ impl Transcript {
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
     }
+
+    /// Whether the text holds a word at all — a letter or a digit — rather
+    /// than being empty or only punctuation. Whisper-family models answer
+    /// non-speech with runs of `...`, which is not something anybody said.
+    pub fn has_words(&self) -> bool {
+        self.0.chars().any(char::is_alphanumeric)
+    }
 }
 
 impl fmt::Debug for Transcript {

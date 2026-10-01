@@ -209,6 +209,37 @@ function automaticVoice(outcome: VoiceTranscriptionOutcomeDto, capped = false): 
   });
 }
 
+/**
+ * Several recordings in a row: each `voiceStart` opens one, the next poll
+ * reports it done (with `status` merged in), and `voiceStop` answers with that
+ * step's outcome. A step with `capped` set is never stopped, only cancelled.
+ */
+function sequencedVoice(steps: Array<{ outcome: VoiceTranscriptionOutcomeDto; status?: Partial<VoiceStatusDto> }>): VoiceControls {
+  const voiceStart = vi.fn(async () => voiceStatus({ state: "recording", available: true, backend: "remote" }));
+  let delivered = 0;
+  let stopped = 0;
+  return voiceControls({
+    voiceStart,
+    voiceStatus: vi.fn(async () => {
+      const opened = voiceStart.mock.calls.length;
+      if (opened === 0) return voiceStatus({ available: true, backend: "remote" });
+      if (delivered < opened && opened <= steps.length) {
+        delivered = opened;
+        return voiceStatus({ state: "done", capturedMs: 1_240, available: true, backend: "remote", ...steps[opened - 1].status });
+      }
+      return voiceStatus({ state: "recording", available: true, backend: "remote" });
+    }),
+    voiceStop: vi.fn(async () => transcription(steps[Math.min(stopped++, steps.length - 1)].outcome)),
+  });
+}
+
+/** What `voice::transcribe::NOTHING_HEARD` says, as the crate sends it. */
+const SILENT: VoiceTranscriptionOutcomeDto = {
+  kind: "silent",
+  detail: "only 60 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest moment reached 858 against a room at 64, where speech has to reach 192",
+  sentence: "I could not make out any words. Say that again; still listening.",
+};
+
 const DISPATCH = {
   kind: "dispatch" as const,
   transcript: "show me every agent",
@@ -287,14 +318,8 @@ const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionO
     name: "capture-failure",
     outcome: { kind: "failed", detail: "the microphone did not produce audio", sentence: "Could not turn that recording into text (the microphone did not produce audio)." },
   },
-  // A noise ended a segment and there was nothing in it. Neither a failure nor
-  // an instruction, and no resolver call — the assertion below that
-  // `resolveVoice` was never called is the half that matters here, because a
-  // segment of room tone must cost nothing at all.
-  {
-    name: "silent",
-    outcome: { kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." },
-  },
+  // `silent` is deliberately not here: it renders NOTHING — see "says nothing
+  // about a segment with no speech in it".
 ];
 
 describe("voice control panel", () => {
@@ -390,36 +415,56 @@ describe("voice control panel", () => {
   });
 
   /**
-   * Scenario: a segment of room tone with a noise in it comes back `silent`.
-   * The row prints the measurement behind the refusal, keeps listening, and
-   * spends no resolver call — and it never blames the user's microphone.
+   * Scenario: PR #1451's hand test — voice is on, a command has just been
+   * reported, and the user types on the keyboard instead of talking. Each burst
+   * of keys ends a segment that comes back `silent`. The row says nothing about
+   * it: no "Heard …", no refusal with milliseconds and levels in it, the last
+   * report stays where it was, and no resolver call is spent.
    */
-  it("reports a segment with no speech in it without calling the resolver", async () => {
+  it("says nothing about a segment with no speech in it", async () => {
     vi.useFakeTimers();
-    const voice = automaticVoice({ kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." });
+    const voice = sequencedVoice([{ outcome: heard("show me every agent") }, { outcome: SILENT }, { outcome: SILENT }]);
     const resolveVoice = resolver(result(DISPATCH));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
     await turnVoiceOn(voice);
-    await completeAutomaticUtterance(voice);
+    for (let utterance = 0; utterance < 3; utterance += 1) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    }
+    expect(voice.voiceStop).toHaveBeenCalledTimes(3);
 
     const report = screen.getByTestId("voice-report");
-    // The measurement, not "Nothing was said" — a user who DID speak has to be
-    // able to tell a quiet input from a short utterance from a bug, and the
-    // old wording told them they had imagined speaking (PRD #802).
-    expect(report).toHaveTextContent("I did not hear enough to transcribe");
-    expect(report).toHaveTextContent("40 ms of speech inside the loudest 200 ms");
-    expect(report).toHaveTextContent("still listening");
-    expect(report).not.toHaveTextContent(/nothing was said/i);
-    // The two readings the wording exists to avoid: a failure, and a fault in
-    // hardware that is working perfectly.
-    expect(report).not.toHaveTextContent(/could not/i);
-    expect(report).not.toHaveTextContent(/microphone/i);
-    expect(resolveVoice).not.toHaveBeenCalled();
-    // Still on, and the device was reopened for the next utterance, which is
-    // what makes "still listening" true rather than reassuring.
+    expect(report).toHaveTextContent("Opening the agent dashboard.");
+    expect(report).not.toHaveTextContent(SILENT.sentence);
+    expect(report).not.toHaveTextContent(/did not hear|make out|ms of speech|loudest/i);
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    // Still on, and the device reopened after every segment.
     expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
-    expect(voice.voiceStart.mock.calls.length).toBeGreaterThan(1);
+    expect(voice.voiceStart).toHaveBeenCalledTimes(4);
+  });
+
+  /**
+   * Scenario: the microphone stays open for thirty seconds while the user
+   * types and never speaks, so the recording runs to the cap with nobody's
+   * speech in it. It is dropped without a word — no "ran to the 30 s limit" —
+   * and listening resumes. A capped recording somebody DID speak in still says
+   * so (the test below).
+   */
+  it("drops a capped recording nobody spoke in without a word", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: SILENT, status: { capped: true, capturedMs: 30_000, speech: false } }]);
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+
+    expect(voice.voiceStop).not.toHaveBeenCalled();
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(VOICE_CAP_DISCARDED)).not.toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/30 s/);
+    expect(voice.voiceStart).toHaveBeenCalledTimes(2);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
   });
 
   /**

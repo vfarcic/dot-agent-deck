@@ -277,10 +277,13 @@ impl Pcm16 {
 /// **against the room under it**, so both sides of that comparison travel with
 /// the verdict.
 ///
-/// All three are rendered to the user on **both** refusals
-/// ([`super::transcribe::handle_audio`]) rather than logged, because the person
-/// who can answer "is my microphone quiet?" is the one holding it — and because
-/// a refusal that names only one side of a ratio cannot be self-diagnosed.
+/// All three travel in the refusal's `detail` on **both** refusals
+/// ([`super::transcribe::handle_audio`]), because a refusal that names only one
+/// side of a ratio cannot be diagnosed. They are no longer in the sentence a
+/// user reads: PR #1451's hand test found a status line full of thresholds
+/// about keyboard noise unhelpful, so the sentence is plain words and the
+/// numbers are for whoever is diagnosing — see
+/// [`super::transcribe::NOTHING_HEARD`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeechMeasure {
     /// The most speech-level audio found inside any one [`SPEECH_WINDOW`], so

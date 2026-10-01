@@ -83,48 +83,53 @@ use super::capture::{MIN_SPEECH, Pcm16, SPEECH_WINDOW, SpeechMeasure};
 /// sentence.
 pub const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The measurement clause and the sentence for a segment that held no speech.
+/// What the report would say about audio that held no words: the gate refused
+/// it, or the model's answer to it held none.
+///
+/// **No surface shows it while voice is listening.** PR #1451's hand test: a
+/// user typing on the keyboard with voice on saw a refusal for every burst of
+/// keys, each carrying milliseconds and RMS levels, about audio they had never
+/// meant as speech. The webview now drops a `silent` outcome without a word
+/// (`VoiceControlPanel`'s `takeUtterance`), so this sentence is what a future
+/// surface gets if it does report one — for instance after an explicit press
+/// to talk, where the user did mean to speak — and it is written for that user:
+/// plain words, something to do, no measurement.
+pub const NOTHING_HEARD: &str = "I could not make out any words. Say that again; still listening.";
+
+/// [`NOTHING_HEARD`]'s counterpart for audio in which nothing at all rose out
+/// of the room: the thing to do is different — speak up or move closer — so
+/// the sentence is too.
+pub const TOO_QUIET: &str =
+    "That was too quiet to make out. Move closer or turn the input up; still listening.";
+
+/// The measurement and the sentence for a segment the audio gate refused.
 ///
 /// # Two refusals, because there are two things to do about them
 ///
-/// This used to be one frozen string — *"Nothing was said — still listening."*
-/// — and PRD #802's product owner met it **with a real microphone, about words
-/// he had said**. Two things were wrong with it and only one of them was the
-/// gate. A sentence that says nothing was said tells the user they imagined
-/// speaking; it names no threshold, no measurement and nothing to do next, so
-/// the three causes it can have — a quiet input, a short utterance, or a bug —
-/// are indistinguishable from outside the app. The owner had no way to tell
-/// which he was looking at, and neither did anyone reading his report.
-///
-/// So the refusal is now a measurement, and [`SpeechMeasure`]'s two fields pick
-/// which of the two it is:
+/// [`SpeechMeasure`]'s two fields pick which it is:
 ///
 /// * **nothing ever rose out of the room** — no frame anywhere in the buffer
-///   counted as speech, so no gate at any length would have passed it. The
-///   user can act on that in a second by speaking up, moving closer or raising
-///   the device's level. The numbers are printed as the comparison the rule
-///   made, because "quiet" is not actionable and *"reached 410 against a room
-///   at 180, where speech has to reach 540"* is.
-/// * **something did and there was not enough of it** — the audio was speech
-///   and the utterance was too short or too sparse. Saying it again, a little
-///   longer, is the fix.
+///   counted as speech, so no gate at any length would have passed it.
+///   [`TOO_QUIET`].
+/// * **something did and there was not enough of it** — too short or too
+///   sparse to be a word, which is also what a keyboard tap is.
+///   [`NOTHING_HEARD`].
 ///
 /// Neither is phrased as a failure or as a fault in the user's hardware, which
 /// is the rule [`TranscriptionOutcome::Silent`] exists to keep: nothing is
 /// broken, voice is still on, and the microphone is still open.
 ///
-/// # Both branches carry all three numbers, and the second one did not
+/// # The numbers are in the detail, not the sentence
 ///
-/// The density branch used to report a voiced duration and nothing else. PRD
-/// #802's product owner hit exactly that branch — *"60 ms of speech inside the
-/// loudest 200 ms, where 120 ms is needed"* — and the fact that mattered most
-/// was the one it left out: his peak had cleared the old absolute floor while
-/// two thirds of his densest window had not, which is what falsified the
-/// constant. Learning it cost a round trip to the person holding the
-/// microphone. So every refusal now states what the rule measured in the
-/// rule's own terms — the loudest moment, the room it was measured against,
-/// and the bar that produced — and any user can self-diagnose in one utterance
-/// whether the input is quiet, the room is loud, or the gate is strict.
+/// The `detail` states what the rule measured in its own terms — the loudest
+/// moment, the room it was measured against and the bar that produced — which
+/// is what a maintainer diagnosing a refused utterance needs: PRD #802's
+/// product owner once had to be asked for exactly those numbers. They used to
+/// be in the sentence as well, so any user could self-diagnose; PR #1451's
+/// hand test showed the cost of that, a status line full of thresholds about
+/// noise the user had not meant as speech. They stay on the outcome, where the
+/// developer docs (`docs/develop/desktop-gui.md`) say to find them, and leave
+/// the screen.
 fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
     let against = format!(
         "the loudest moment reached {} against a room at {}, where speech has to reach {}",
@@ -138,12 +143,7 @@ fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
     // own answer to "did anything count", and it is the only one that cannot
     // contradict the sentence beside it.
     if measure.voiced.is_zero() {
-        let detail = format!("too quiet — {against}");
-        let sentence = format!(
-            "Too quiet to transcribe — {against}. Move closer or turn the input up; still \
-             listening."
-        );
-        return (detail, sentence);
+        return (format!("too quiet — {against}"), TOO_QUIET.into());
     }
     let detail = format!(
         "only {} ms of speech inside the loudest {} ms, where {} ms is needed — {against}",
@@ -151,14 +151,7 @@ fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
         SPEECH_WINDOW.as_millis(),
         MIN_SPEECH.as_millis()
     );
-    let sentence = format!(
-        "I did not hear enough to transcribe — {} ms of speech inside the loudest {} ms, where {} \
-         ms is needed; {against}. Say that again; still listening.",
-        measure.voiced.as_millis(),
-        SPEECH_WINDOW.as_millis(),
-        MIN_SPEECH.as_millis()
-    );
-    (detail, sentence)
+    (detail, NOTHING_HEARD.into())
 }
 
 /// Why a transcriber could not answer.
@@ -568,10 +561,11 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
     // `response_format` is named explicitly rather than left to the default:
     // the default is a JSON object today, and `parse_response` reads one, so a
     // server-side default that moved would turn a working build into an
-    // unreadable-answer error.
+    // unreadable-answer error. Which object depends on the model — see
+    // [`response_format_for`].
     part(&format!("--{boundary}\r\n"));
     part("content-disposition: form-data; name=\"response_format\"\r\n\r\n");
-    part("json");
+    part(response_format_for(model));
     part("\r\n");
 
     // Named rather than detected: with no `language`, Whisper-family models
@@ -599,14 +593,87 @@ pub fn multipart_body(audio: &Pcm16, model: &str, boundary: &str) -> Vec<u8> {
     body
 }
 
-/// The transcript, out of the reply.
-pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError> {
-    match payload["text"].as_str() {
-        Some(text) => Ok(Transcript::new(text.trim())),
-        None => Err(TranscriptionError::Backend(
-            "the transcription backend answered without a transcript".into(),
-        )),
+/// The `response_format` a request asks `model` for.
+///
+/// `verbose_json` for a whisper-family model — OpenAI's `whisper-1` and the
+/// local container's `faster-whisper` builds — because that is where the
+/// model's own per-segment `no_speech_prob` lives, which [`parse_response`]
+/// reads to drop the training artefacts Whisper produces on non-speech. Plain
+/// `json` for everything else: OpenAI's `gpt-4o-transcribe` models refuse
+/// `verbose_json` with a 400, and a configured model must not start failing
+/// because of a guard it does not need the same way. Both formats carry the
+/// same top-level `text`, so a server that ignores the request still parses.
+pub fn response_format_for(model: &str) -> &'static str {
+    if model.to_ascii_lowercase().contains("whisper") {
+        "verbose_json"
+    } else {
+        "json"
     }
+}
+
+/// Above this `no_speech_prob`, a whisper segment is the model saying there
+/// was no speech in that stretch of audio, and its text is dropped.
+///
+/// # Why this guard, and why on its own
+///
+/// Whisper models are trained on captioned video, and on non-speech — a quiet
+/// room, a keyboard, a breath — they emit the captions' boilerplate as if it
+/// had been said: *"Thanks for watching"*, *"Go to Beadaholique.com for all of
+/// your beading supply needs!"* (PR #1451's hand test, typed into an agent's
+/// prompt in typing mode). The audio gate in front of every call
+/// ([`super::capture::MIN_SPEECH`]) is a level-and-density heuristic, and
+/// non-speech can clear it: thirty seconds of fast typing does. So the model's
+/// own verdict on each segment is the second check, and it is the standard
+/// one. **No list of known artefacts is kept**, for the reason
+/// [`super::capture::MIN_SPEECH`] gives: it would be endless and wrong the
+/// first time somebody said one.
+///
+/// `0.6` is openai/whisper's own default `no_speech_threshold`. **Its other
+/// half is deliberately not used**: the reference implementation keeps a
+/// no-speech segment anyway when `avg_logprob` is above `-1.0`, and whisper-1's
+/// reply to a quiet room with one burst in it, measured 2026-10-01, was exactly
+/// that — `no_speech_prob` 0.918 with `avg_logprob` -0.515. With the combined
+/// rule the artefact passes.
+///
+/// # What it was measured against
+///
+/// Measured 2026-10-01 with real calls. Non-speech — thirty seconds of a quiet
+/// room, the same with a 250 ms burst, two seconds of keystrokes — scored
+/// 0.918-0.976 on whisper-1 and 0.896 on `faster-whisper-tiny.en`. Speech at
+/// a peak of 400 and 250 against a room at 64, the quiet end of what the audio
+/// gate passes, scored 0.089-0.202 on whisper-1 and 0.166-0.377 on the local
+/// model. The speech was synthesised (OpenAI TTS, attenuated, room tone
+/// added); a real quiet speaker on a real microphone is the remaining
+/// unknown, and the margin to 0.6 is what is betting on it.
+pub const NO_SPEECH_LIMIT: f64 = 0.6;
+
+/// The transcript, out of the reply.
+///
+/// A whisper-family `verbose_json` reply also carries `segments`, each with
+/// the model's `no_speech_prob`. Segments over [`NO_SPEECH_LIMIT`] are
+/// dropped; when none is, `text` is taken verbatim, so speech reaches the
+/// pipeline exactly as before. A reply with no `segments` — plain `json`, or a
+/// server that ignored the format — is read from `text` alone.
+pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError> {
+    let Some(text) = payload["text"].as_str() else {
+        return Err(TranscriptionError::Backend(
+            "the transcription backend answered without a transcript".into(),
+        ));
+    };
+    let Some(segments) = payload["segments"].as_array() else {
+        return Ok(Transcript::new(text.trim()));
+    };
+    let no_speech =
+        |segment: &Value| segment["no_speech_prob"].as_f64().unwrap_or(0.0) > NO_SPEECH_LIMIT;
+    if !segments.iter().any(no_speech) {
+        return Ok(Transcript::new(text.trim()));
+    }
+    let kept: String = segments
+        .iter()
+        .filter(|segment| !no_speech(segment))
+        .filter_map(|segment| segment["text"].as_str())
+        .collect();
+    Ok(Transcript::new(kept.trim()))
 }
 
 /// What a non-2xx reply becomes.
@@ -666,6 +733,15 @@ impl StubTranscriber {
 
     pub fn failing(error: TranscriptionError) -> Self {
         Self { answer: Err(error) }
+    }
+
+    /// A stand-in that answers with a backend's raw reply, read by the same
+    /// [`parse_response`] the HTTP backend reads its reply with — so a test can
+    /// replay what a real model returned, confidence fields and all.
+    pub fn replying(payload: &Value) -> Self {
+        Self {
+            answer: parse_response(payload),
+        }
     }
 }
 
@@ -745,7 +821,9 @@ pub enum TranscriptionOutcome {
     /// loopback endpoint, or a keyed service has no key. **Not a failure**: the
     /// sentence is an instruction naming what to start or what to paste.
     NotConfigured { detail: String, sentence: String },
-    /// The segment held no speech, so no backend was called.
+    /// The segment held no speech: the audio gate refused it and no backend
+    /// was called, or the backend's answer held no words once the segments
+    /// the model itself marked as no-speech were dropped ([`NO_SPEECH_LIMIT`]).
     ///
     /// **Not a failure either, and the distinction is the whole of the fix PRD
     /// #802's product owner asked for.** A noise ends a segment
@@ -765,6 +843,11 @@ pub enum TranscriptionOutcome {
     /// the measurement [`not_enough_speech`] renders, and it is a statement
     /// about the AUDIO — never about the device, which is the rule that has not
     /// changed.
+    ///
+    /// **The webview drops it without a word while listening** (PR #1451):
+    /// with voice on, most segments that end here are a keyboard or the room,
+    /// and a sentence about each one is noise. The `sentence` is plain words
+    /// for a surface that does report it; the `detail` stays for diagnosis.
     Silent { detail: String, sentence: String },
     /// Speech could not be turned into text.
     Failed { detail: String, sentence: String },
@@ -822,6 +905,15 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     let transcribe_ms = Some(millis(started.elapsed()));
 
     let outcome = match answered {
+        // Nothing with a word in it came back: empty, only punctuation, or
+        // only segments the model itself called no-speech
+        // ([`NO_SPEECH_LIMIT`]). That is the same situation as audio the gate
+        // refused — nobody said anything — so it is the same outcome, and
+        // nothing downstream sees it.
+        Ok(transcript) if !transcript.has_words() => TranscriptionOutcome::Silent {
+            detail: "the transcription held no words".into(),
+            sentence: NOTHING_HEARD.into(),
+        },
         Ok(transcript) => TranscriptionOutcome::Heard {
             sentence: format!("Heard “{}”.", transcript.text()),
             transcript,
@@ -1236,14 +1328,14 @@ mod tests {
     }
 
     #[test]
-    fn voice_transcribe_request_names_the_model_and_the_json_response_format() {
+    fn voice_transcribe_request_names_the_model_and_the_response_format() {
         let rendered = text_of(&body(&audio(8)));
         assert!(
             rendered.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("name=\"response_format\"\r\n\r\njson\r\n"),
+            rendered.contains("name=\"response_format\"\r\n\r\nverbose_json\r\n"),
             "{rendered}"
         );
     }
@@ -1341,6 +1433,179 @@ mod tests {
         let rendered = text_of(&body(&audio(8)));
         assert!(!rendered.contains("sk-not-a-real-key"), "{rendered}");
         assert!(!rendered.contains("authorization"), "{rendered}");
+    }
+
+    // -- non-speech the model answered anyway (PR #1451 hand test) ---------
+
+    /// Thirty seconds of a quiet room with a keyboard being typed on in it —
+    /// key presses and releases as 12 ms decaying bursts, in runs of quick
+    /// keystrokes with pauses between — which is what a typing-mode segment
+    /// holds while the user types instead of talking. Deterministic: a fixed
+    /// linear congruential generator, so the gate's verdict below is the same
+    /// on every run.
+    fn typing_on_a_keyboard() -> Pcm16 {
+        let mut seed: u32 = 7;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from((seed >> 8) as i32 % 2_001 - 1_000) / 1_000.0
+        };
+        let rate = 16_000.0;
+        let mut samples: Vec<f64> = (0..30 * 16_000).map(|_| noise() * 90.0).collect();
+        let mut at = 0.5;
+        let mut run = 0;
+        while at < 29.5 {
+            for (offset, level) in [(0.0, 6_000.0), (0.09, 3_600.0)] {
+                let start = ((at + offset) * rate) as usize;
+                for i in 0..(0.012 * rate) as usize {
+                    if let Some(sample) = samples.get_mut(start + i) {
+                        *sample += noise() * level * (-(i as f64) / (0.002 * rate)).exp();
+                    }
+                }
+            }
+            run += 1;
+            // Eight quick keys — a fast typist, 80 ms apart — then a pause to
+            // read what was typed.
+            at += if run % 8 == 0 { 0.9 } else { 0.08 };
+        }
+        Pcm16::new(
+            samples
+                .into_iter()
+                .map(|sample| sample.clamp(-32_768.0, 32_767.0) as i16)
+                .collect(),
+        )
+    }
+
+    /// A whisper-family `verbose_json` reply: the text, and one segment per
+    /// `(text, no_speech_prob, avg_logprob)`.
+    fn verbose(segments: &[(&str, f64, f64)]) -> Value {
+        let text: String = segments.iter().map(|(text, ..)| *text).collect();
+        json!({
+            "text": text.trim(),
+            "segments": segments
+                .iter()
+                .map(|(text, no_speech, logprob)| json!({
+                    "text": text,
+                    "no_speech_prob": no_speech,
+                    "avg_logprob": logprob,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Scenario: in typing mode the maintainer said the opener and then
+    /// nothing, and the agent's prompt received "Go to Beadaholique.com for all
+    /// of your beading supply needs! Thank you." — a sentence nobody said, the
+    /// known Whisper artefact on non-speech. The audio here is a keyboard being
+    /// typed on, which the audio gate lets through (it is a heuristic, and a
+    /// fast run of keys fills its window); whisper-1 answers such audio with
+    /// its own verdict that there was no speech in it, and that verdict must
+    /// win: nothing is heard, so nothing is typed and no "Heard …" is shown.
+    #[tokio::test]
+    async fn voice_transcribe_text_whisper_itself_marks_as_no_speech_is_never_heard() {
+        let typing = typing_on_a_keyboard();
+        assert!(
+            typing.has_speech(),
+            "the premise: keyboard noise clears the audio gate ({:?})",
+            typing.measure_speech()
+        );
+        let artefact = "Go to Beadaholique.com for all of your beading supply needs! Thank you.";
+        let result = handle_audio(
+            &StubTranscriber::replying(&verbose(&[(&format!(" {artefact}"), 0.93, -0.42)])),
+            &typing,
+        )
+        .await;
+
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        assert_eq!(result.transcript(), None);
+        assert!(
+            !result.sentence().contains("Beadaholique"),
+            "{}",
+            result.sentence()
+        );
+        assert!(
+            !result.sentence().starts_with("Heard"),
+            "{}",
+            result.sentence()
+        );
+    }
+
+    /// Scenario: what whisper-1 actually returned, measured 2026-10-01, for
+    /// thirty seconds of a quiet room with one 250 ms non-speech burst in it —
+    /// audio the gate passes. The text is nothing but ellipses, and every
+    /// segment but the trailing duplicates carries a no-speech probability of
+    /// 0.918. Neither half may reach the agent: the confident segments are
+    /// no-speech, and what is left holds no word.
+    #[tokio::test]
+    async fn voice_transcribe_the_measured_whisper_reply_to_a_quiet_room_is_not_heard() {
+        let mut segments = vec![(" ...", 0.918, -0.515); 5];
+        segments.push((" ...", 0.348, -0.249));
+        let result = handle_audio(
+            &StubTranscriber::replying(&verbose(&segments)),
+            &audio(16_000),
+        )
+        .await;
+        assert!(!result.outcome.is_heard(), "{:?}", result.outcome);
+        assert!(!result.sentence().contains("..."), "{}", result.sentence());
+    }
+
+    /// The control, and the reason the guard is a threshold and not a mute:
+    /// quiet speech measured through both shipping models on 2026-10-01 — the
+    /// same sentence at a peak of 400 and of 250 against a room at 64 —
+    /// scored a no-speech probability of 0.089 and 0.202 on whisper-1 and up
+    /// to 0.377 on the local container's `faster-whisper-tiny.en`. All of it
+    /// is still heard, word for word.
+    #[tokio::test]
+    async fn voice_transcribe_quiet_real_speech_is_still_heard() {
+        for no_speech in [0.089, 0.202, 0.377] {
+            let result = handle_audio(
+                &StubTranscriber::replying(&verbose(&[
+                    (" Please list the files in this directory.", no_speech, -0.4),
+                    (" Yes.", no_speech, -0.4),
+                ])),
+                &audio(16_000),
+            )
+            .await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some("Please list the files in this directory. Yes."),
+                "no_speech_prob {no_speech}: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// A reply that is speech and then an artefact keeps the speech: the guard
+    /// is per segment, because a dictated sentence followed by a long pause is
+    /// exactly where Whisper appends one.
+    #[test]
+    fn voice_transcribe_keeps_the_speech_and_drops_a_trailing_no_speech_segment() {
+        let transcript = parse_response(&verbose(&[
+            (" Add a test for the parser.", 0.05, -0.2),
+            (" Thank you for watching!", 0.88, -0.3),
+        ]))
+        .expect("parses");
+        assert_eq!(transcript.text(), "Add a test for the parser.");
+    }
+
+    /// The request asks a whisper-family model for `verbose_json`, which is
+    /// where its per-segment confidence lives, and every other model for plain
+    /// `json` — OpenAI's `gpt-4o-transcribe` refuses `verbose_json` outright,
+    /// and a configured model must not start failing because of a guard.
+    #[test]
+    fn voice_transcribe_asks_a_whisper_model_for_its_confidence() {
+        let boundary = "b";
+        for (model, format) in [
+            ("whisper-1", "verbose_json"),
+            ("Systran/faster-whisper-tiny.en", "verbose_json"),
+            ("gpt-4o-transcribe", "json"),
+            ("gpt-4o-mini-transcribe", "json"),
+        ] {
+            let rendered = text_of(&multipart_body(&audio(8), model, boundary));
+            assert!(
+                rendered.contains(&format!("name=\"response_format\"\r\n\r\n{format}\r\n")),
+                "{model}: {rendered}"
+            );
+        }
     }
 
     // -- the response shape ------------------------------------------------
@@ -1574,28 +1839,28 @@ mod tests {
             "nothing goes on to the resolver"
         );
         assert_eq!(result.transcript(), None);
-        // The sentence a user actually reads. It used to be "Nothing was
-        // said", which tells somebody who DID speak that they imagined it; the
-        // measurement is what lets them tell a quiet microphone from a short
-        // utterance from a bug.
-        assert!(
-            result
-                .sentence()
-                .starts_with("I did not hear enough to transcribe"),
-            "{}",
-            result.sentence()
-        );
+        // The sentence, were a surface to show it: plain words and something
+        // to do. It used to be "Nothing was said", which tells somebody who
+        // DID speak that they imagined it; then it carried the measurement,
+        // which PR #1451's hand test found unreadable. The measurement is the
+        // detail's job now, and no number reaches the sentence.
+        assert_eq!(result.sentence(), NOTHING_HEARD);
         assert!(
             result.sentence().contains("still listening"),
             "the refusal must not read as a stop: {}",
             result.sentence()
         );
         assert!(
-            result
-                .sentence()
-                .contains("20 ms of speech inside the loudest 200 ms"),
-            "the refusal carries no measurement: {}",
+            !result.sentence().chars().any(|c| c.is_ascii_digit()),
+            "a measurement on screen: {}",
             result.sentence()
+        );
+        let TranscriptionOutcome::Silent { detail, .. } = &result.outcome else {
+            unreachable!()
+        };
+        assert!(
+            detail.contains("20 ms of speech inside the loudest 200 ms"),
+            "the detail carries no measurement: {detail}"
         );
         assert!(
             !result.sentence().contains("Nothing was said"),
@@ -1658,17 +1923,11 @@ mod tests {
             "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
              moment reached 5000 against a room at 180, where speech has to reach 540"
         );
-        assert!(
-            json["sentence"]
-                .as_str()
-                .expect("a sentence")
-                .starts_with("I did not hear enough"),
-            "{json}"
-        );
+        assert_eq!(json["sentence"], NOTHING_HEARD, "{json}");
     }
 
     /// The two refusals, pinned as the two different things a user has to DO —
-    /// and pinned WHOLE, because the numbers are the point of them.
+    /// and the details pinned WHOLE, because the numbers are the point of them.
     ///
     /// The branch is on whether any frame counted as speech at all, which is
     /// what separates "nothing you said rose out of your room" from "that was
@@ -1677,11 +1936,12 @@ mod tests {
     /// the bar printed beside it is not a question with one answer, and
     /// `voiced` is the rule's own.
     ///
-    /// **Both sentences carry all three numbers**, which is the correction PRD
+    /// **Both details carry all three numbers**, which is the correction PRD
     /// #802's product owner bought with a round trip: his refusal was the
     /// density one, it reported 60 ms and no level, and the fact that decided
     /// the redesign — that his peak cleared the old absolute floor while two
-    /// thirds of his densest window did not — was not in it.
+    /// thirds of his densest window did not — was not in it. The sentences
+    /// carry none of them since PR #1451 (see [`NOTHING_HEARD`]).
     #[test]
     fn voice_transcribe_the_refusal_names_which_of_the_two_causes_it_was() {
         let (detail, sentence) = not_enough_speech(SpeechMeasure {
@@ -1694,11 +1954,7 @@ mod tests {
             "too quiet — the loudest moment reached 410 against a room at 180, where speech has \
              to reach 540"
         );
-        assert_eq!(
-            sentence,
-            "Too quiet to transcribe — the loudest moment reached 410 against a room at 180, \
-             where speech has to reach 540. Move closer or turn the input up; still listening."
-        );
+        assert_eq!(sentence, TOO_QUIET);
 
         // PRD #802's own report, as the sentence he would get today.
         let (detail, sentence) = not_enough_speech(SpeechMeasure {
@@ -1711,12 +1967,7 @@ mod tests {
             "only 60 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest \
              moment reached 820 against a room at 95, where speech has to reach 285"
         );
-        assert_eq!(
-            sentence,
-            "I did not hear enough to transcribe — 60 ms of speech inside the loudest 200 ms, \
-             where 120 ms is needed; the loudest moment reached 820 against a room at 95, where \
-             speech has to reach 285. Say that again; still listening."
-        );
+        assert_eq!(sentence, NOTHING_HEARD);
 
         // One frame counted, so it is the LENGTH branch however quiet the peak
         // was: `voiced` is the rule's own answer and the sentence follows it.

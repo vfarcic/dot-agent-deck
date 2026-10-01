@@ -1401,7 +1401,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (panelStateRef.current.kind === "dictating") dictationChanged.current?.(undefined);
   }, []);
 
-  /** Everything the last utterance left behind, cleared before the next one. */
+  /** Everything the last utterance left behind, cleared when the next one has words in it. */
   const forget = useCallback(() => {
     setProblem(undefined);
     setCapture(undefined);
@@ -1674,10 +1674,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const takeUtterance = useCallback(async (capped = false) => {
     if (!voiceStop) return;
     const ours = claim();
-    forget();
-    /* PRD #1260 — a capped segment reaches here only while dictating, where it
-       is the user's own words rather than a runaway command. */
-    if (capped) setProblem(VOICE_CAP_TYPED);
     /* A new utterance has arrived, so whatever was about to be sent is no
        longer the whole of what the user said. The poll below cancels on SPEECH,
        which covers the sentence still being spoken; this covers the gap between
@@ -1692,7 +1688,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     try {
       const transcription = await voiceStop();
       if (!ours()) return;
-      setCapture(transcription.outcome.sentence);
+      /* PR #1451's hand test — a segment with no words in it says NOTHING.
+         With voice on, most of these are a keyboard, a breath or the room
+         rather than anybody speaking, and a sentence about each one (it used
+         to carry milliseconds and RMS levels) buried the report the user
+         was reading. So the last report stays exactly as it was and the
+         microphone simply reopens. `forget()` waits until there is something
+         to say, which is why it is here and not before the stop. */
+      if (transcription.outcome.kind !== "silent") {
+        forget();
+        /* PRD #1260 — a capped segment reaches here only while dictating,
+           where it is the user's own words rather than a runaway command. */
+        if (capped) setProblem(VOICE_CAP_TYPED);
+        setCapture(transcription.outcome.sentence);
+      }
       /* **One path, where there used to be a fork.** An utterance is resolved,
          full stop. Whether it ends up typed into an agent is the resolver's
          answer — `dictate_to_agent` is a row like any other — rather than a
@@ -1700,18 +1709,27 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (transcription.outcome.kind === "heard") await resolveOne(transcription.outcome.transcript, ours);
     } catch (cause) {
       if (!ours()) return;
+      forget();
       setProblem(sentenceOf(cause));
     }
     if (!ours()) return;
     await listen(ours);
   }, [cancelPendingSend, claim, forget, listen, resolveOne, setPhase, voiceStop]);
 
-  /** The capped utterance: thrown away unheard, and said so. See {@link VOICE_CAP_DISCARDED}. */
-  const discardCapped = useCallback(async () => {
+  /**
+   * The capped utterance: thrown away unheard, and said so — see
+   * {@link VOICE_CAP_DISCARDED} — unless nobody spoke in it, which is dropped
+   * without a word (PR #1451): a microphone left open in a quiet room, or
+   * over a keyboard, reaches the cap with no speech in it every thirty
+   * seconds, and saying so each time is noise about nothing the user did.
+   */
+  const discardCapped = useCallback(async (quietly = false) => {
     const ours = claim();
-    forget();
     setPhase("opening");
-    setProblem(VOICE_CAP_DISCARDED);
+    if (!quietly) {
+      forget();
+      setProblem(VOICE_CAP_DISCARDED);
+    }
     // `voiceCancel` rather than `voiceStop`: stopping would transcribe it,
     // which is the whole of what this path exists to avoid.
     try { await voiceCancel?.(); } catch { /* idempotent and never refused */ }
@@ -1757,9 +1775,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     */
     if (pendingRef.current && status.speech && sendTimer.current !== undefined) cancelPendingSend();
     if (status.capped) {
+      /* PR #1451 — nobody spoke in it (`speech` is the same rule the
+         transcription gate applies), so there is nothing to type and nothing
+         to say: dropped quietly, typing mode or not. `undefined` is a runtime
+         that does no speech detection, which keeps the behaviour below. */
+      if (status.speech === false) await discardCapped(true);
       /* PRD #1260 — while dictating, a capped segment is typed rather than
          thrown away: a dictated paragraph is not a one-to-four-word command. */
-      if (panelStateRef.current.kind === "dictating") await takeUtterance(true);
+      else if (panelStateRef.current.kind === "dictating") await takeUtterance(true);
       else await discardCapped();
       return;
     }
@@ -2194,9 +2217,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     Keyed on the three report slots rather than on a "have we spoken" flag,
     because that is exactly the question — the hint is what stands in the row
     while none of them holds anything, and it goes the moment one does.
-    `forget()` clears all three at the start of each cycle, so it reappears
-    between utterances too, which is right: it is a label for an empty row
-    rather than a first-run tutorial.
+    `forget()` clears all three when an utterance with words in it arrives,
+    so it reappears between utterances too, which is right: it is a label for
+    an empty row rather than a first-run tutorial.
   */
   /* PRD #1260 — whose prompt the dictation mode is typing into, if it is on. */
   const dictating = panelState.kind === "dictating" ? panelState.target : undefined;
@@ -2325,8 +2348,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         is simply what the row says until there is something newer to say. It
         also has to stay — the pipeline goes straight back to listening, so a
         sentence that faded on a timer would be gone before a user who looked
-        away from the microphone and back. `forget()` at the start of the next
-        cycle is the one thing that clears it.
+        away from the microphone and back. `forget()` is the one thing that
+        clears it, and only once the next utterance turns out to have words in
+        it: a segment of keyboard or room noise leaves it standing (PR #1451).
       */}
       <div
         className="voice-report"
