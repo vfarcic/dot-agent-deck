@@ -208,6 +208,14 @@ mod site_image_refs;
 /// property exists purely at run time in repository files.
 #[cfg(test)]
 mod skill_frontmatter;
+/// `.claude/skills/tag-release/cleanup.sh`, the detector whose lists the
+/// tag-release skill deletes from once the user confirms. Which list a
+/// directory lands in — offered, held by a live process, labelled as holding
+/// unpushed commits — is a runtime decision in the script. Tests only, and Unix
+/// only: driven under `bash` against a sandbox repository, with the process
+/// assertions Linux-only because they read `/proc`.
+#[cfg(all(test, unix))]
+mod tag_release_cleanup;
 /// Issue #688: a `src/` unit test that spawns a hook emitter — a
 /// Wrapper-strategy `agent_type`, or a command naming an agent or the deck —
 /// pins that child's deck endpoints through `src/test_isolation.rs`. Like
