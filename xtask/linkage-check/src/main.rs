@@ -185,6 +185,12 @@ mod release_channel_vars;
 /// release has gone out wrong.
 #[cfg(test)]
 mod release_workflow_wiring;
+/// PR #1488: lock file maintenance automerges only through Renovate's own
+/// all-checks merge (`platformAutomerge: false`), because the jobs that reject
+/// a bad lock refresh are unrequired. Tests only — the config validator accepts
+/// either value, so nothing else notices the setting going away.
+#[cfg(test)]
+mod renovate_lock_file_maintenance;
 mod repo_state;
 /// Issue #906: `scripts/sample-attribution.sh`'s worktree-attribution rule, the
 /// prefix test that decides which worktree a toolchain process is building for.
