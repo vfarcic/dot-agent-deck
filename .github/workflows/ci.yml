@@ -1205,8 +1205,9 @@ jobs:
   #
   # Duplication is kept honest by Renovate rather than by discipline: the
   # `customManagers` entries in renovate.json track both pinned values (Rust from
-  # rust-lang/rust releases, nextest from the crates.io datasource) and open the
-  # same upgrade PRs the devbox pins get. The upstream-breakage signal that the
+  # the devbox datasource, grouped into one PR with devbox.json's Rust packages
+  # and Cargo.toml's `rust-version` since issue #1478; nextest from the crates.io
+  # datasource) and open the same upgrade PRs the devbox pins get. The upstream-breakage signal that the
   # old floating refs provided now arrives as those PRs — visible and gated on
   # CI, rather than landing unannounced in the middle of an unrelated change.
   #
