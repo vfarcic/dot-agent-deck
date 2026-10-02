@@ -8,9 +8,10 @@
 //!
 //! Nothing else would notice that setting going away: the config validator
 //! accepts either value, and the failure it allows is a red `main` some weeks
-//! later. So this pins it, and also fails on a later rule that could match a
-//! lock file maintenance update and re-enable platform automerge, since later
-//! packageRules override earlier ones.
+//! later. So this pins it, together with the settings that make the automerge
+//! fire at all, and also fails on a later rule that could match a lock file
+//! maintenance update and override any of them, since later packageRules
+//! override earlier ones.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,15 +47,43 @@ const PACKAGE_MATCHERS: &[&str] = &[
     "matchSourceUrls",
 ];
 
+/// Could this `matchUpdateTypes` entry select a lock file maintenance update?
+/// Renovate accepts match patterns here — negations (`!major`), regexes and
+/// globs — so only a plain update-type name other than `lockFileMaintenance`,
+/// or the exact negation `!lockFileMaintenance`, is known not to. Anything
+/// else counts as a match, which is the safe direction for this guard.
+fn update_type_pattern_could_match(pattern: &Value) -> bool {
+    let Some(pattern) = pattern.as_str() else {
+        return true;
+    };
+    if pattern == "lockFileMaintenance" {
+        return true;
+    }
+    if pattern == "!lockFileMaintenance" {
+        return false;
+    }
+    !pattern.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 fn could_match_lock_file_maintenance(rule: &Value) -> bool {
     let update_types_allow = match rule.get("matchUpdateTypes") {
         None => true,
         Some(types) => types
             .as_array()
-            .is_some_and(|types| types.iter().any(|t| t == "lockFileMaintenance")),
+            .is_none_or(|types| types.iter().any(update_type_pattern_could_match)),
     };
     update_types_allow && PACKAGE_MATCHERS.iter().all(|key| rule.get(*key).is_none())
 }
+
+/// The settings the dedicated rule pins, with the value each must keep. A
+/// later rule that could reach the update and sets one of them to anything
+/// else overrides it, because packageRules apply in order.
+const PINNED: &[(&str, &str)] = &[
+    ("automerge", "true"),
+    ("automergeType", "\"pr\""),
+    ("platformAutomerge", "false"),
+    ("minimumReleaseAgeBehaviour", "\"timestamp-optional\""),
+];
 
 /// Is the rule dedicated to lock file maintenance alone — matching on the
 /// update type and nothing else?
@@ -99,15 +128,17 @@ fn check(config: &Value) -> Result<(), String> {
         );
     }
     for (index, later) in rules.iter().enumerate().skip(dedicated + 1) {
-        if could_match_lock_file_maintenance(later)
-            && later
-                .get("platformAutomerge")
-                .is_some_and(|value| value != false)
-        {
-            return Err(format!(
-                "packageRules[{index}] can match a lock file maintenance update and sets \
-                 `platformAutomerge` after the rule that turns it off"
-            ));
+        if !could_match_lock_file_maintenance(later) {
+            continue;
+        }
+        for (key, expected) in PINNED {
+            let expected: Value = serde_json::from_str(expected).expect("PINNED value is JSON");
+            if later.get(*key).is_some_and(|value| *value != expected) {
+                return Err(format!(
+                    "packageRules[{index}] can match a lock file maintenance update and \
+                     overrides `{key}` after the rule that sets it to {expected}"
+                ));
+            }
         }
     }
     Ok(())
@@ -171,6 +202,38 @@ fn each_unsafe_edit_is_rejected() {
     assert!(
         check(&overridden).is_err(),
         "a later manager-wide rule re-enabling platform automerge must fail"
+    );
+
+    let later_rule_fails = |rule: Value, why: &str| {
+        let mut config = real_config();
+        config["packageRules"].as_array_mut().unwrap().push(rule);
+        assert!(check(&config).is_err(), "{why} must fail");
+    };
+    later_rule_fails(
+        serde_json::json!({ "matchUpdateTypes": ["!major"], "platformAutomerge": true }),
+        "a later negated update-type pattern re-enabling platform automerge",
+    );
+    later_rule_fails(
+        serde_json::json!({ "matchManagers": ["cargo"], "automerge": false }),
+        "a later manager-wide rule turning automerge off",
+    );
+    later_rule_fails(
+        serde_json::json!({
+            "matchManagers": ["npm"],
+            "minimumReleaseAgeBehaviour": "timestamp-required"
+        }),
+        "a later manager-wide rule restoring timestamp-required",
+    );
+
+    let mut other_type = real_config();
+    other_type["packageRules"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "matchUpdateTypes": ["major"], "automerge": false }));
+    assert!(
+        check(&other_type).is_ok(),
+        "a later rule scoped to another plain update type cannot reach lock file \
+         maintenance and must pass"
     );
 
     let mut unrelated = real_config();
