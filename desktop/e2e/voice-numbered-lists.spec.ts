@@ -88,6 +88,51 @@ test.describe("numbered lists while voice is on", () => {
     await expect(tiles.nth(2)).toHaveClass(/is-selected/);
   });
 
+  /** Scenario: with the Daemons screen's tiles numbered, a digit typed into an agent's terminal reaches that agent and selects no tile, and #1422's Shift+Enter reaches it as a newline without changing the selection either. */
+  test("digits and #1422 chords typed into an agent's terminal never select a numbered tile", async ({ page }) => {
+    await page.addInitScript(() => {
+      const originalSet = Map.prototype.set;
+      const terminals: unknown[] = [];
+      Object.defineProperty(window, "__dadE2eTerminals", { value: terminals });
+      Object.defineProperty(Map.prototype, "set", {
+        configurable: true,
+        writable: true,
+        value(this: Map<unknown, unknown>, key: unknown, value: unknown) {
+          if (value && typeof value === "object") {
+            const candidate = value as { element?: unknown; onData?: unknown };
+            if (candidate.element instanceof HTMLElement && typeof candidate.onData === "function") terminals.push(value);
+          }
+          return Reflect.apply(originalSet, this, [key, value]);
+        },
+      });
+    });
+    await openWithSpeech(page, "docs", [""]);
+    await enterDeck(page);
+    const tiles = page.locator(".agent-grid .agent-tile");
+    await expect(tiles).toHaveCount(4);
+    await turnOnVoice(page);
+    await expectNumbers(tiles, 1);
+    await page.keyboard.press("1");
+    await expect(tiles.nth(0)).toHaveClass(/is-selected/);
+
+    const writable = tiles.filter({ has: page.locator('[aria-disabled="false"]') }).first();
+    await expect(writable).toBeVisible();
+    const viewport = writable.locator('[aria-disabled="false"]').first();
+    await viewport.locator("textarea.xterm-helper-textarea").focus();
+    await viewport.evaluate((root) => {
+      type Recording = Window & { __dadE2eTerminals?: { element?: HTMLElement; onData(listener: (data: string) => void): unknown }[]; __dadE2eSent?: string[] };
+      const recording = window as Recording;
+      const terminal = recording.__dadE2eTerminals?.find((candidate) => candidate.element && root.contains(candidate.element));
+      if (!terminal) throw new Error("the writable tile's xterm was not captured");
+      recording.__dadE2eSent = [];
+      terminal.onData((data) => recording.__dadE2eSent?.push(data));
+    });
+    const selectedBefore = await tiles.evaluateAll((all) => all.findIndex((tile) => tile.classList.contains("is-selected")));
+    for (const key of ["2", "3", "4", "Shift+Enter"]) await page.keyboard.press(key);
+    expect(await page.evaluate(() => (window as Window & { __dadE2eSent?: string[] }).__dadE2eSent)).toEqual(["2", "3", "4", "\x1b[13;2u"]);
+    expect(await tiles.evaluateAll((all) => all.findIndex((tile) => tile.classList.contains("is-selected")))).toBe(selectedBefore);
+  });
+
   /** Scenario: the New agent dialog numbers daemons, directories (including ..) and modes separately from 1. Filtering renumbers only the directory section. */
   test("daemon, directory and mode numbers each start at one and update after filtering", async ({ page }) => {
     await openWithSpeech(page, "fleet");
@@ -246,11 +291,15 @@ test.describe("numbered lists while voice is on", () => {
     await selectOverview(page);
     await page.getByTestId("overview-new-agent").click();
     await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
-    await turnOnVoice(page);
-    const directory = page.getByTestId("new-agent-directory-list").getByRole("option", { name: /^13\./ });
-    await expect(directory).toBeVisible();
-    const path = await directory.getAttribute("data-path");
+    /* Read row 13 before Voice turns on: the scripted utterance is answered as
+       soon as it does, and entering the directory replaces the listing, so a
+       read after that races the answer. */
+    const options = page.getByTestId("new-agent-directory-list").getByRole("option");
+    await expect(options.nth(12)).toBeAttached();
+    const path = await options.nth(12).getAttribute("data-path");
     expect(path).toBeTruthy();
+    await expect(page.getByTestId("new-agent-current-path")).not.toHaveText(path!);
+    await turnOnVoice(page);
     await expect(page.getByTestId("new-agent-current-path")).toHaveText(path!);
     await expect(page.getByTestId("voice-report")).not.toContainText("no matching action");
   });

@@ -1717,12 +1717,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
 
   /* PR #1451 — the user's own Enter is a send, so it takes the nudge down for
      good. Capture phase on the window, because the key lands in the agent's
-     terminal, which handles it before anything could bubble back here. */
+     terminal, which handles it before anything could bubble back here.
+     Shift+Enter and Alt+Enter are not sends: the terminal sends them as a
+     newline in every agent (#1422), so the words are still unsent; nor is an
+     Enter that commits an input method's composition. */
   const dictatingNow = panelState.kind === "dictating";
   useEffect(() => {
     if (!dictatingNow) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Enter" && unsent.current) stopNudge(true);
+      if (event.key !== "Enter" || event.shiftKey || event.altKey || event.isComposing) return;
+      if (unsent.current) stopNudge(true);
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);

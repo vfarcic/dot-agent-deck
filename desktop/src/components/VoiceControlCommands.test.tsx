@@ -2106,6 +2106,12 @@ describe("sticky dictation in the open agent pane", () => {
     await completeUtterance();
     await wait(VOICE_SEND_NUDGE_MS);
     expect(nudged()).toBe(true);
+    // But not the newline chords (#1422): the agent's terminal sends Shift+Enter
+    // and Alt+Enter as a newline in every agent, so the words are still unsent.
+    fireEvent.keyDown(window, { key: "Enter", shiftKey: true });
+    fireEvent.keyDown(window, { key: "Enter", altKey: true });
+    fireEvent.keyDown(window, { key: "Enter", isComposing: true });
+    expect(nudged(), "a newline chord took the nudge down as if it had sent").toBe(true);
     fireEvent.keyDown(window, { key: "Enter" });
     expect(nudged()).toBe(false);
 
