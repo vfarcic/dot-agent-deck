@@ -1,6 +1,6 @@
 # New Agent
 
-**New agent** starts something on a daemon: a single agent, an orchestration from a project's `.dot-agent-deck.toml`, a dispatcher, or an agent that helps you write a schedule. It is the desktop counterpart of the TUI's `Ctrl+n` form and offers the same kinds of start except workspace modes.
+**New agent** starts something on a daemon: a single agent, an orchestration from a project's `.dot-agent-deck.toml`, a dispatcher, or an agent that helps you write a schedule. It is the desktop counterpart of the TUI's `Ctrl+n` form and offers the same kinds of start.
 
 ![The New agent dialog over the Dashboard: the Local daemon chosen under Daemon, a directory chosen in the browser with Use this directory beside it, and the form below with Dir, the Mode chips (No mode selected), Name pre-filled from the directory, an empty Command, and Discard and Create agent](/img/new-agent-desktop.png)
 

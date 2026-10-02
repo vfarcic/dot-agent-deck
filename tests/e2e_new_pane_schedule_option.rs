@@ -333,9 +333,32 @@ fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
 
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // confirm current directory → New Agent form
-    deck.wait_for_string("Mode:");
+    // The bottom status line: the last non-empty row of the grid.
+    let last_status_line = |grid: &str| {
+        grid.lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    // Wait for a whole frame, not the first sight of `Mode:`: on a starved
+    // runner a snapshot can land while the deck is still writing the frame that
+    // opens the form, with the modal's top half painted and the bottom rows
+    // still the dashboard's button bar (seen on PR #1480's CI run). The warning
+    // is set in the same handler that opens the form, so a finished frame has
+    // both; a missing warning still fails here, after the harness's timeout.
+    // The assertions below read the frame that matched, not a later snapshot.
+    let matched = std::cell::RefCell::new(String::new());
+    deck.wait_until_grid("the New Agent form with the legacy-modes warning", |grid| {
+        let complete = grid.contains("Mode:")
+            && last_status_line(grid).contains("workspace modes were removed");
+        if complete {
+            *matched.borrow_mut() = grid.to_string();
+        }
+        complete
+    });
 
-    let grid = deck.snapshot_grid();
+    let grid = matched.into_inner();
     let mode_row = grid
         .lines()
         .find(|line| line.contains("Mode:"))
@@ -347,21 +370,11 @@ fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
 
     // The centered modal leaves the bottom status line visible. Check that
     // line directly, so a warning in unrelated content cannot satisfy this.
-    //
-    // WAITED for rather than read off the frame that first showed "Mode:":
-    // the warning can paint a frame later, and on a starved CI runner it did,
-    // twice in a row (PR #1451's `e2e-deterministic`, load verdict STARVED).
-    let bottom_line_warns = |grid: &str| {
-        grid.lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .contains("workspace modes were removed")
-    };
-    deck.wait_until_grid(
-        "the legacy-workspace warning in the visible bottom status line",
-        bottom_line_warns,
+    let status_line = last_status_line(&grid);
+    assert!(
+        status_line.contains("workspace modes were removed"),
+        "opening a legacy project should warn in the visible bottom status line.\n\
+         Status line: {status_line:?}\nGrid:\n{grid}"
     );
     assert!(
         !mode_row.contains("legacy-mode-xyz"),

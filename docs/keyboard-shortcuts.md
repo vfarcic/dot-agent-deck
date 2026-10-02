@@ -4,7 +4,7 @@ Everything on this page is the TUI's, except [Editing an agent's prompt](#editin
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
-![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global, Tab Navigation, Dashboard (command mode), Mode Tab, New Agent Form, Directory Picker and Session](/img/help-tui.png)
+![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global (works from any pane), Tab Navigation and Dashboard (command mode) on the left; Mouse, New Agent Form, Directory Picker and Session on the right](/img/help-tui.png)
 
 ## Modes
 
@@ -124,6 +124,8 @@ While you type in an agent's prompt, in the TUI or in the [desktop app](desktop/
 `⌘` is the Windows key on Windows and the Super key on Linux. Your system keeps some of these chords for itself before either client sees them: macOS switches Spaces on `Ctrl+←` / `Ctrl+→`, and Windows and most Linux desktops arrange windows on the Windows key or Super with an arrow. On Linux the desktop app cannot see the Super key at all, so there `Super+←` arrives as a plain `←`; use `Home` and `End`.
 
 "Line" means the line the cursor is on, so in a message of several lines these keys stay on that line. Agents differ in small ways: moving a word right in OpenCode lands on the start of the next word, where the other agents stop at the end of the current one, and deleting the next word in OpenCode and Devin also removes the space after it.
+
+`Home` and `End` with `Ctrl`, `Shift` or `Alt` held, `Shift+Delete`, `Ctrl+Shift+Backspace` and `Ctrl+Alt+Backspace` are not in the table: both clients pass them to the agent as you pressed them, and they do whatever that agent does with them. For example, `Shift+Home` selects to the start of the line in OpenCode and moves there in Claude Code, `Ctrl+Home` moves there in Pi, and Codex and Devin ignore them. To move along the line in every agent, use the keys in the table. A program that asks the terminal for the alternate form of the arrow keys, `Home` and `End`, as some editors and pagers do, gets that form from both clients.
 
 Paste is not in the table, because each client pastes the way its platform does: in the TUI with your terminal's paste key, and in the desktop app with `⌘V` on macOS, `Ctrl+V` or `Ctrl+Shift+V` on Windows and `Ctrl+Shift+V` on Linux. `Ctrl+V` goes to the agent wherever it is not the paste key, and Claude Code, for one, pastes an image with it.
 

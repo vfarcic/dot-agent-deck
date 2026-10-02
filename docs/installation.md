@@ -328,7 +328,7 @@ dot-agent-deck daemon status
 
 ```text
 PANE	AGENT	ROLE	STATUS	TOOL	LABEL	CWD
-1	1	mode:review	Thinking	-	api	/home/you/src/api
+1	1	lead (orchestrator)	Thinking	-	api	/home/you/src/api
 2	2	-	Working	Bash	api	/home/you/src/api
 ```
 
@@ -338,7 +338,7 @@ The columns are tab-separated (`column -t -s $'\t'` aligns them). `-` means no v
 |---|---|
 | `PANE` | Pane id; a managed agent sees it as `DOT_AGENT_DECK_PANE_ID`. |
 | `AGENT` | The daemon's id for the agent. |
-| `ROLE` | `mode:<name>` for a mode pane, the role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `-` otherwise. |
+| `ROLE` | The role name for an [orchestration](orchestration.md) pane (with `(orchestrator)` on the start role), `mode:<name>` for an agent still running from a workspace mode started by a release before 0.44.0, `-` otherwise. |
 | `STATUS` | `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error` or `Blocked`. See [Session statuses](session-management.md#session-statuses). |
 | `TOOL` | The name of the tool running now, without its arguments. |
 | `LABEL` | The pane's display name. |
@@ -358,7 +358,7 @@ dot-agent-deck daemon status --json
 {
   "schema_version": 2,
   "agents": [
-    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "mode:review", "status": "Thinking" },
+    { "agent_id": "1", "pane_id": "1", "label": "api", "cwd": "/home/you/src/api", "role": "lead (orchestrator)", "status": "Thinking" },
     { "agent_id": "2", "pane_id": "2", "label": "api", "cwd": "/home/you/src/api", "status": "Working", "active_tool": { "name": "Bash" } }
   ]
 }
