@@ -34,7 +34,7 @@
  * production answers with.
  */
 import type { VoiceOutcomeDto, VoiceResolvedParamDto } from "./bridge";
-import { isCountWord, ordinal, saidAsCount, spokenWords, wholeUtterance } from "./voiceChoice";
+import { countSaid, ordinal, saidAsCount, spokenWords, wholeUtterance } from "./voiceChoice";
 
 /** What a numbered item is, which decides what choosing it does (`voice::numbers::NumberedKind`). */
 export type VoiceNumberedKind = "agent" | "deck" | "deck_switch" | "directory" | "parent" | "mode";
@@ -138,12 +138,14 @@ function readSection(words: string[]): { section?: VoiceNumberedSectionKind; wor
   return verb === 0 ? { said: words } : undefined;
 }
 
+/** `voice::numbers::trailing_count`: the count a name ends in, its last two words when they are one number. */
+function trailingCount(words: string[]): number | undefined {
+  return (words.length >= 2 ? countSaid(words.slice(-2)) : undefined) ?? (words.length > 0 ? countSaid(words.slice(-1)) : undefined);
+}
+
 /** `voice::numbers::ends_in`: one of the entry's names is, or ends in, `number`. */
 function endsIn(entry: VoiceNumberedEntryDto, number: number): boolean {
-  return [entry.label, ...entry.names].some((name) => {
-    const last = spokenWords(name).at(-1);
-    return last !== undefined && isCountWord(last) && ordinal([last]) === number;
-  });
+  return [entry.label, ...entry.names].some((name) => trailingCount(spokenWords(name)) === number);
 }
 
 /** `voice::choice::Ordinal::index`: the 0-based index `said` names in `len` entries, if any. */
@@ -156,7 +158,7 @@ function indexOf(said: number | "last", len: number): number | undefined {
 function isNamed(entry: VoiceNumberedEntryDto, word: string, number: number): boolean {
   return [entry.label, ...entry.names].some((name) => {
     const words = spokenWords(name);
-    return words.length === 2 && words[0] === word && isCountWord(words[1]) && ordinal([words[1]]) === number;
+    return (words.length === 2 || words.length === 3) && words[0] === word && countSaid(words.slice(1)) === number;
   });
 }
 

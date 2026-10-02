@@ -221,6 +221,16 @@ pub(crate) fn said_as_count(words: &[String]) -> bool {
         .is_some_and(|(_, count)| count)
 }
 
+/// `words` — one, or a ten and a unit — read as a number said as a count
+/// ("twenty three", "23"), or `None` for a position or anything else. What
+/// `voice::numbers` reads off the end of a name to see whether a spoken count
+/// collides with it.
+pub(crate) fn count_said(words: &[String]) -> Option<usize> {
+    number_said(words)
+        .filter(|&(_, count)| count)
+        .map(|(number, _)| number)
+}
+
 /// The number words [`ordinal`] reads as a count: "one" to "nine".
 const CARDINALS: [&str; 9] = [
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
@@ -275,15 +285,6 @@ const TENS_ORDINALS: [&str; 8] = [
     "eightieth",
     "ninetieth",
 ];
-
-/// Whether one word is a count in words — "one" to "nine", "ten" to
-/// "nineteen", or a ten — or plain digits.
-pub(crate) fn is_count_word(word: &str) -> bool {
-    CARDINALS.contains(&word)
-        || TEENS.contains(&word)
-        || TENS.contains(&word)
-        || (!word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()))
-}
 
 /// One word as a number: its value and whether it is a count (`true`) or a
 /// position (`false`). Digits are a count, digits with "st", "nd", "rd" or

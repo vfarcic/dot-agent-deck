@@ -75,6 +75,20 @@ describe("answerNumberLocally", () => {
     expect(answerNumberLocally("open agent 1", agents("Plan", "Docs", "agent-1"), 7)).toEqual({ kind: "ambiguous", choices: [{ section: "agent", number: 1 }, { section: "agent", number: 3 }] });
   });
 
+  /* Qodo on PR #1451: a name ending in a number said in two words is that whole number. */
+  it("collides a name ending in a compound number with that number only", () => {
+    const labels = Array.from({ length: 30 }, (_, at) => `Task ${at + 1}`);
+    labels[4] = "worker twenty three";
+    labels[6] = "agent twenty-three";
+    const heard = agents(...labels);
+    const offer = (...numbers: number[]) => ({ kind: "ambiguous", choices: numbers.map((number) => ({ section: "agent", number })) });
+    expect(answerNumberLocally("twenty three", heard, 7)).toEqual(offer(23, 5, 7));
+    expect(answerNumberLocally("number 23", heard, 7)).toEqual(offer(23, 5, 7));
+    expect(answerNumberLocally("three", heard, 7)).toEqual({ kind: "selected", section: "agent", number: 3 });
+    expect(answerNumberLocally("agent twenty three", heard, 7)).toEqual(offer(23, 7));
+    expect(answerNumberLocally("agent three", heard, 7)).toEqual({ kind: "selected", section: "agent", number: 3 });
+  });
+
   it("finds a numbered item by its section, or the first section showing it", () => {
     expect(numberedEntry(DIALOG, "mode", 3)?.label).toBe("Dispatcher");
     expect(numberedEntry(DIALOG, undefined, 3)?.label).toBe("scratch");

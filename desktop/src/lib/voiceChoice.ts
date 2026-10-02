@@ -64,11 +64,6 @@ export function wholeUtterance(text: string): string[] {
   return words.slice(start, end);
 }
 
-/** `voice::choice::is_count_word`: a count in words — one to nineteen, or a ten — or plain digits. */
-export function isCountWord(word: string): boolean {
-  return CARDINALS.includes(word) || TEENS.includes(word) || TENS.includes(word) || /^\d+$/.test(word);
-}
-
 /** `voice::choice::number_word`: one word as `[value, isCount]`. "Zero" is 0, a number no list shows (Qodo #16 on PR #1451). */
 function numberWord(word: string): [number, boolean] | undefined {
   if (word === "zero") return [0, true];
@@ -89,6 +84,12 @@ function numberSaid(words: string[]): [number, boolean] | undefined {
   if (CARDINALS.includes(words[1])) return [tens + CARDINALS.indexOf(words[1]) + 1, true];
   if (ORDINALS.includes(words[1])) return [tens + ORDINALS.indexOf(words[1]) + 1, false];
   return undefined;
+}
+
+/** `voice::choice::count_said`: one word, or a ten and a unit, read as a number said as a count. */
+export function countSaid(words: string[]): number | undefined {
+  const said = numberSaid(words);
+  return said?.[1] ? said[0] : undefined;
 }
 
 /**

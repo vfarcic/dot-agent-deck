@@ -41,7 +41,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::choice::{Ordinal, is_count_word, ordinal, said_as_count};
+use super::choice::{Ordinal, count_said, ordinal, said_as_count};
 use super::outcome::whole_utterance;
 use super::table::spoken_words;
 
@@ -404,30 +404,38 @@ fn named(listed: &VoiceNumberedSection, at: usize, collides: Collides) -> Vec<Nu
 }
 
 /// Whether one of `entry`'s names is `word` followed by `number` as a count:
-/// `folder-13` for "folder thirteen", `agent-1` for "agent 1".
+/// `folder-13` for "folder thirteen", `agent-1` for "agent 1", "agent
+/// twenty-three" for "agent 23".
 fn is_named(entry: &VoiceNumberedEntry, word: &str, number: usize) -> bool {
     std::iter::once(&entry.label)
         .chain(&entry.names)
         .any(|name| match spoken_words(name).as_slice() {
-            [first, last] => {
-                first == word
-                    && is_count_word(last)
-                    && ordinal(std::slice::from_ref(last)) == Some(Ordinal::Nth(number))
+            [first, rest @ ..] if (1..=2).contains(&rest.len()) => {
+                first == word && count_said(rest) == Some(number)
             }
             _ => false,
         })
 }
 
 /// Whether one of `entry`'s names is, or ends in, `number`: "orchestrator-1",
-/// "worker 2", an agent whose role is "three".
+/// "worker 2", an agent whose role is "three", "worker twenty three".
 fn ends_in(entry: &VoiceNumberedEntry, number: usize) -> bool {
     std::iter::once(&entry.label)
         .chain(&entry.names)
-        .any(|name| {
-            spoken_words(name).last().is_some_and(|last| {
-                is_count_word(last)
-                    && ordinal(std::slice::from_ref(last)) == Some(Ordinal::Nth(number))
-            })
+        .any(|name| trailing_count(&spoken_words(name)) == Some(number))
+}
+
+/// The count a name ends in: its last two words when they are one number
+/// ("worker twenty three" is 23, not 3), else its last word.
+fn trailing_count(words: &[String]) -> Option<usize> {
+    words
+        .len()
+        .checked_sub(2)
+        .and_then(|at| count_said(&words[at..]))
+        .or_else(|| {
+            words
+                .last()
+                .and_then(|last| count_said(std::slice::from_ref(last)))
         })
 }
 
@@ -898,6 +906,24 @@ mod tests {
     /// Scenario: round 4's crowded page — row 13 is `folder-12` and row 14 is
     /// `folder-13`. "Select directory 13" enters row 13; "folder 13" is also
     /// row 14's name, so it offers both, as "agent 1" does with `agent-1`.
+    /// Qodo on PR #1451: a name ending in a number said in two words —
+    /// "worker twenty three" — is that whole number, so "twenty three" offers
+    /// it beside row 23 and a bare "three" does not.
+    #[test]
+    fn a_name_ending_in_a_compound_number_collides_with_that_number() {
+        let mut labels: Vec<String> = (1..=30).map(|at| format!("Task {at}")).collect();
+        labels[4] = "worker twenty three".to_string();
+        labels[6] = "agent twenty-three".to_string();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let heard = list(7, &labels);
+        assert_eq!(answer("twenty three", &heard, 7), agents(&[23, 5, 7]));
+        assert_eq!(answer("number 23", &heard, 7), agents(&[23, 5, 7]));
+        assert_eq!(answer("three", &heard, 7), agent(3));
+        // After a section word, only the name that is the word and the number.
+        assert_eq!(answer("agent twenty three", &heard, 7), agents(&[23, 7]));
+        assert_eq!(answer("agent three", &heard, 7), agent(3));
+    }
+
     #[test]
     fn a_section_word_collides_only_with_a_name_that_is_what_was_said() {
         let folder = |label: String| VoiceNumberedEntry {
