@@ -137,7 +137,7 @@ fi
 
 # proc_cmd <pid> — the command line, space-joined and cut short for display.
 proc_cmd() {
-  tr '\0' ' ' 2>/dev/null < "${proc_root}/$1/cmdline" | cut -c1-120 || true
+  tr '\0' ' ' 2>/dev/null < "${proc_root}/$1/cmdline" | sed 's/ *$//' | cut -c1-120 || true
 }
 
 # is_daemon <pid> — a `dot-agent-deck … daemon …` process. Never offered for a
