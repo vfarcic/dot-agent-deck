@@ -175,6 +175,9 @@ impl Sandbox {
     /// | `repo-scratch`     | plain directory, purpose unknown              |
     /// | `dad-3-target`     | plain directory, purpose unknown              |
     /// | `repo-clone`       | standalone clone with an unpushed commit      |
+    /// | `repo-tagged`      | clone, an unpushed commit only a tag reaches  |
+    /// | `repo-unborn`      | `git init`, no commit, one staged file        |
+    /// | `repo-nest`        | plain directory, an unpushed clone inside it  |
     /// | `repo-held`        | plain directory — a process may park here     |
     /// | `repo-daemon`      | plain directory — a fake daemon may park here |
     /// | `other-project`    | unrelated, must never be listed               |
@@ -258,6 +261,37 @@ impl Sandbox {
             &["commit", "-q", "--allow-empty", "-m", "local only work"],
         );
 
+        // A clone whose only unpushed commit is reachable from a local tag.
+        let tagged = work.join("repo-tagged");
+        self.git(
+            &work,
+            &["clone", "-q", remote.to_str().unwrap(), "repo-tagged"],
+        );
+        self.git(&tagged, &["checkout", "-q", "--detach"]);
+        self.git(
+            &tagged,
+            &["commit", "-q", "--allow-empty", "-m", "tagged only"],
+        );
+        self.git(&tagged, &["tag", "-a", "-m", "keep", "keep-me"]);
+        self.git(&tagged, &["checkout", "-q", "main"]);
+
+        // A repository with no commit yet still holds work: a staged file.
+        let unborn = work.join("repo-unborn");
+        fs::create_dir_all(&unborn).unwrap();
+        self.git(&unborn, &["init", "-q"]);
+        fs::write(unborn.join("notes.txt"), "draft").unwrap();
+        self.git(&unborn, &["add", "notes.txt"]);
+
+        // A plain directory with a clone nested inside it, holding a commit
+        // that is nowhere else.
+        let nest = work.join("repo-nest/sub");
+        fs::create_dir_all(&nest).unwrap();
+        self.git(&nest, &["clone", "-q", remote.to_str().unwrap(), "clone"]);
+        self.git(
+            &nest.join("clone"),
+            &["commit", "-q", "--allow-empty", "-m", "nested work"],
+        );
+
         // The main checkout parks on a merged FEATURE branch, which is what the
         // default-branch exclusion alone let through as a merged worktree.
         self.git(&repo, &["checkout", "-q", "-b", "parked", "origin/main"]);
@@ -276,14 +310,29 @@ impl Sandbox {
         repo
     }
 
-    fn run(&self, repo: &Path, proc_root: Option<&Path>) -> Report {
+    fn run_raw(&self, cwd: &Path, args: &[&str], proc_root: Option<&Path>) -> Output {
         let mut cmd = Command::new("bash");
-        cmd.arg(script()).current_dir(repo);
+        cmd.arg(script()).args(args).current_dir(cwd);
         self.env(&mut cmd);
         if let Some(p) = proc_root {
             cmd.env("CLEANUP_PROC_ROOT", p);
         }
-        let out: Output = cmd.output().expect("run cleanup.sh");
+        cmd.output().expect("run cleanup.sh")
+    }
+
+    /// `cleanup.sh --holders <dir>`: its exit code and stdout.
+    fn holders(&self, cwd: &Path, dir: &Path, proc_root: Option<&Path>) -> (i32, String) {
+        let out = self.run_raw(cwd, &["--holders", dir.to_str().unwrap()], proc_root);
+        (
+            out.status
+                .code()
+                .expect("cleanup.sh --holders exited by signal"),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    }
+
+    fn run(&self, repo: &Path, proc_root: Option<&Path>) -> Report {
+        let out: Output = self.run_raw(repo, &[], proc_root);
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(
             out.status.success(),
@@ -504,6 +553,29 @@ fn every_leftover_lands_in_its_list_and_a_busy_directory_is_never_offered() {
         clone.contains("UNPUSHED 1 commit(s)") && clone.contains("local only work"),
         "the clone's unpushed commit must be named: {clone}"
     );
+    let tagged = r
+        .entry("STRAY_DIRS", &w("repo-tagged"))
+        .unwrap_or_else(|| panic!("repo-tagged not a stray:\n{}", r.stdout));
+    assert!(
+        tagged.contains("UNPUSHED 1 commit(s)") && tagged.contains("tagged only"),
+        "a commit only a local tag reaches must be named: {tagged}"
+    );
+    let unborn = r
+        .entry("STRAY_DIRS", &w("repo-unborn"))
+        .unwrap_or_else(|| panic!("repo-unborn not a stray:\n{}", r.stdout));
+    assert!(
+        unborn.contains("git: no commits; UNCOMMITTED CHANGES"),
+        "a repository with no commit but a staged file must say so: {unborn}"
+    );
+    let nest = r
+        .entry("STRAY_DIRS", &w("repo-nest"))
+        .unwrap_or_else(|| panic!("repo-nest not a stray:\n{}", r.stdout));
+    assert!(
+        nest.contains("nested sub/clone:")
+            && nest.contains("UNPUSHED 1 commit(s)")
+            && nest.contains("nested work"),
+        "a clone nested inside a stray must have its unpushed commit named: {nest}"
+    );
 
     if linux {
         assert_eq!(r.key("PROC_CHECK"), "ok");
@@ -545,6 +617,33 @@ fn every_leftover_lands_in_its_list_and_a_busy_directory_is_never_offered() {
             r.stdout
         );
         assert!(r.mentions("never offered for a kill"), "{}", r.stdout);
+        // Each process carries its start time, which the kill step compares to
+        // tell it from a later process given the same pid.
+        let entry = r
+            .list("PROCESSES")
+            .iter()
+            .find(|l| l.starts_with(&format!("{}|", held.pid())))
+            .unwrap();
+        let start = entry.split('|').nth(1).unwrap();
+        assert!(
+            start
+                .strip_prefix("start=")
+                .is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())),
+            "expected `start=<ticks>` as the second field: {entry}"
+        );
+
+        // `--holders`, the pre-removal re-check: 1 and the holder's pid for a
+        // busy directory, 0 for an idle one.
+        let (code, out) = sb.holders(&w("repo-active"), &w("repo-held"), None);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains(&format!("  {}|start=", held.pid())), "{out}");
+        let (code, out) = sb.holders(&w("repo-active"), &w("repo-scratch"), None);
+        assert_eq!(code, 0, "{out}");
+        // A process that arrives after the snapshot is still caught.
+        let late = Parked::cat_in(&w("repo-scratch"));
+        let (code, out) = sb.holders(&w("repo-active"), &w("repo-scratch"), None);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains(&format!("  {}|", late.pid())), "{out}");
     } else {
         assert_eq!(r.key("PROC_CHECK"), "unavailable");
         let e = r.entry("STRAY_DIRS", &w("repo-held")).unwrap();
@@ -581,4 +680,14 @@ fn without_proc_every_directory_says_the_process_check_could_not_run() {
     }
     assert!(r.list("HELD_DIRS").is_empty(), "{}", r.stdout);
     assert!(r.list("PROCESSES").is_empty(), "{}", r.stdout);
+
+    // The pre-removal re-check refuses to vouch for a directory it could not
+    // check: exit 2, not the 0 that means "nothing is there".
+    let (code, out) = sb.holders(
+        &repo,
+        &work.join("repo-scratch"),
+        Some(&sb.at("no-proc-here")),
+    );
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("PROC_CHECK=unavailable"), "{out}");
 }

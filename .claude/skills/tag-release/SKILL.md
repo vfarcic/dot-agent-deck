@@ -118,7 +118,7 @@ What each `cleanup.sh` list holds:
 | `TOOL_CACHES` | `<path>\|<kind>\|size=…\|processes: …\|git: …` | `land-worktree` is `/land-prs`'s `../<repo>-land`, a git worktree; `xver` is one of `cargo xver`'s `../<repo>-xver-*` directories (build clone, target dirs, cargo home, release downloads, run sandboxes — [`docs/develop/cross-version-harness.md`](../../../docs/develop/cross-version-harness.md)), plain directories rather than worktrees |
 | `STRAY_DIRS` | `<path>\|size=…\|modified=…\|processes: …\|git: …` | a `../<repo>-*` or `../dad-*` sibling that is neither a registered worktree nor a known cache; `modified` is the newest file below it |
 | `HELD_DIRS` | `<path>\|<kind>\|held by pid …` | a candidate from any directory list that a live process has its cwd inside; **not offered** |
-| `PROCESSES` | `<pid>\|<cwd>\|<command>` | a process of yours whose cwd was deleted or lies inside a `HELD_DIRS` entry |
+| `PROCESSES` | `<pid>\|start=<ticks>\|<cwd>\|<command>` | a process of yours whose cwd was deleted or lies inside a `HELD_DIRS` entry |
 
 Read the labels before presenting, and repeat them beside their entry:
 
@@ -137,20 +137,21 @@ The script excludes the default branch, the main checkout, and the branch and wo
 
 Remove only what the user confirmed, in this order:
 
-1. **Processes.** Each by its own pid, after confirming the pid still has the cwd `cleanup.sh` printed (which catches a reused pid):
+1. **Processes.** Each by its own pid, after confirming the pid is still the process `cleanup.sh` listed: the same start time (`/proc/<pid>/stat` field 22, which a reused pid does not share) and the same cwd:
 
    ```bash
-   [ "$(readlink /proc/[pid]/cwd)" = "[cwd]" ] && kill [pid]
+   [ "$(awk '{ sub(/.*\) /, ""); print $20 }' /proc/[pid]/stat)" = "[start]" ] \
+     && [ "$(readlink /proc/[pid]/cwd)" = "[cwd]" ] && kill [pid]
    ```
 
    **Never by a `pkill -f` pattern.** A pattern matches every process on the box whose command line contains it, and CLAUDE.md rule 12's teardown step records one that stopped nine production panes. Never kill a `dot-agent-deck daemon` here, even when asked to in passing: that is a decision about every agent it manages and belongs to rule 15's `daemon stop`. `kill` sends SIGTERM; if a process survives it, report it rather than escalating to SIGKILL unless the user asks.
 
-2. **Re-run `cleanup.sh`** and work from the fresh output for everything below. It drops what has gone or moved since the first run, and a held directory whose holders are now stopped appears in its own list; remove one of those only if the user confirmed it.
+2. **Re-run `cleanup.sh`** and work from the fresh output for everything below. It drops what has gone or moved since the first run, and a held directory whose holders are now stopped appears in its own list; remove one of those only if the user confirmed it. Even the fresh run is a snapshot, so each directory removal below is gated on `cleanup.sh --holders <path>`, which re-reads `/proc` at that moment and exits 0 only when it could check and found no process of yours inside the path (1 when one is there, listing it; 2 when it could not check). On a non-zero exit, skip that directory and report why; on 2, removing it anyway is the user's call, made knowing nothing was checked.
 
 3. **Worktrees** — `WORKTREES`, `DETACHED_WORKTREES` and the `land-worktree` cache. This must come before deleting a branch, because a branch checked out in a worktree cannot be deleted:
 
    ```bash
-   git worktree remove [worktree_path]
+   bash .claude/skills/tag-release/cleanup.sh --holders "[worktree_path]" && git worktree remove "[worktree_path]"
    ```
 
    If a worktree has uncommitted changes git refuses. Report it and skip rather than reaching for `--force`, unless the user explicitly asks. A branch whose worktree is still held stays checked out there, so `git branch -D` refuses it in the next step; report it and skip.
@@ -158,7 +159,7 @@ Remove only what the user confirmed, in this order:
 4. **Local branches.** Each entry is `<branch> <sha>`, where the SHA is the tip `cleanup.sh` vetted; confirm the branch still points at it and then use `-D`:
 
    ```bash
-   [ "$(git rev-parse [branch])" = "[sha]" ] && git branch -D [branch]
+   [ "$(git rev-parse "[branch]")" = "[sha]" ] && git branch -D "[branch]"
    ```
 
    **`-D`, and the `-d` this used to recommend was not the safety net it read as.** `git branch -d` tests *ancestry* — is this tip reachable from the branch's upstream, or from `HEAD` — and a squash merge never lands the branch's commits on `main`, so it refuses every correctly squash-merged branch and hints the operator straight to `-D`. Measured 2026-09-14: it would have refused all 13 correctly-merged dispatch branches. Re-measured while forking this skill on PR #1081's merged head: `error: the branch 'agent/dispatch-prd-220' is not fully merged`. A check that is wrong that often does not make anyone careful — it teaches them to type `-D` on everything, including the one branch that genuinely was not merged. The same trap is on the record at `src/main.rs:238`, where the deck's own `worktree` reclaim command says it *"never inspects git ancestry for merge state — squash-merges never enter `main`'s ancestry, and an ancestor branch with no PR must never be removed"*. Note that command drops the ancestry test in **both** directions, and this one does not: it removes worktree *directories*, which can hold work that is nowhere else, so an unmerged ancestor branch matters to it. Deleting a branch whose tip is reachable from `origin/main` loses no commit, so that arm is kept here.
@@ -168,7 +169,7 @@ Remove only what the user confirmed, in this order:
 5. **Remote branches**, gated the same way against their vetted SHA:
 
    ```bash
-   [ "$(git rev-parse refs/remotes/origin/[branch])" = "[sha]" ] && git push origin --delete [branch]
+   [ "$(git rev-parse "refs/remotes/origin/[branch]")" = "[sha]" ] && git push origin --delete "[branch]"
    ```
 
    That compares the remote-tracking ref `cleanup.sh` refreshed with its own `git fetch --prune`, so it catches a list gone stale in your hands but not the remote advancing since that fetch. Re-run `cleanup.sh` rather than working from an old list.
@@ -176,18 +177,19 @@ Remove only what the user confirmed, in this order:
 6. **Directories** — `xver` caches and strays — by the exact path the fresh run printed:
 
    ```bash
-   rm -rf -- [path]
+   bash .claude/skills/tag-release/cleanup.sh --holders "[path]" && rm -rf -- "[path]"
    ```
 
-   Only a path the fresh run still lists under `TOOL_CACHES` or `STRAY_DIRS`, never one under `HELD_DIRS`, and never a path built by hand or by a glob. A stray labelled `UNPUSHED`, `COULD NOT VERIFY` or `UNCOMMITTED CHANGES` is removed only when the user confirmed that entry with its label in front of them.
+   Only a path the fresh run still lists under `TOOL_CACHES` or `STRAY_DIRS`, never one under `HELD_DIRS`, and never a path built by hand or by a glob. Keep the path in double quotes exactly as printed, so a space or a glob character in a directory name cannot split it or expand it into other paths. A stray labelled `UNPUSHED`, `COULD NOT VERIFY` or `UNCOMMITTED CHANGES` is removed only when the user confirmed that entry with its label in front of them.
 
 7. **E2E temp roots:**
 
    ```bash
+   cargo xtask clean-e2e-tmp            # dry run again, immediately before
    cargo xtask clean-e2e-tmp --apply
    ```
 
-   `--apply` decides each root afresh rather than from the dry run's list, so a root whose owning process came alive since is kept. Report what it removed and the per-reason summary of what it kept.
+   `--apply` decides each root afresh rather than from the earlier dry run's list. That keeps a root whose owning process came alive since, but it also means a root can cross the reaper's age threshold after the user confirmed, and then `--apply` would remove a root the user saw listed as kept. So run the dry run again right before applying and compare its `reap:` list with the one the user confirmed: if it names any root the user did not see offered, show those and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
 
 Finally, prune stale worktree metadata:
 

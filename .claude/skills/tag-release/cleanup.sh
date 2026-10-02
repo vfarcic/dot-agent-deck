@@ -19,6 +19,93 @@ set -euo pipefail
 # the remote. The e2e harness's temp roots are not scanned here: the skill runs
 # `cargo xtask clean-e2e-tmp`, which already vets those by owning PID and age.
 
+# --- Processes owned by this user, and their working directories ---
+#
+# Read from `/proc/<pid>/cwd`, which exists on Linux only. Where it cannot be
+# read the script says `PROC_CHECK=unavailable` and labels every directory
+# `processes: could not check`, rather than printing `none` for a check that
+# never ran. `CLEANUP_PROC_ROOT` points the scan elsewhere; the tests use it to
+# take that degraded path on a Linux host.
+proc_root="${CLEANUP_PROC_ROOT:-/proc}"
+proc_check="unavailable"
+procs=$'\n'   # lines of "<pid><TAB><cwd>", cwd as the kernel reports it
+if readlink "${proc_root}/$$/cwd" >/dev/null 2>&1; then
+  proc_check="ok"
+  for p in "${proc_root}"/[0-9]*; do
+    # `-O`: owned by our effective uid. Another user's cwd is unreadable anyway,
+    # and none of their processes is ours to offer.
+    [ -O "$p" ] || continue
+    pid="${p##*/}"
+    [ "$pid" = "$$" ] && continue
+    cwd=$(readlink "${p}/cwd" 2>/dev/null) || continue
+    procs="${procs}${pid}"$'\t'"${cwd}"$'\n'
+  done
+fi
+
+# proc_start <pid> — the process's start time in clock ticks since boot
+# (`/proc/<pid>/stat` field 22). Printed beside each pid so the kill step can
+# tell the process it listed from a later one given the same pid. The comm in
+# field 2 may contain spaces and parentheses, so fields are counted after the
+# LAST ") ": field 3 is then $1 and field 22 is $20.
+proc_start() {
+  awk '{ sub(/.*\) /, ""); print $20 }' "${proc_root}/$1/stat" 2>/dev/null || true
+}
+
+# proc_cmd <pid> — the command line, space-joined and cut short for display.
+# NUL, newline and tab all become spaces: an argument can carry a newline (a
+# `bash -c` script, say), and one left in would split a single entry across
+# lines and forge the ones after it.
+proc_cmd() {
+  tr '\0\n\t' '   ' 2>/dev/null < "${proc_root}/$1/cmdline" | sed 's/ *$//' | cut -c1-120 || true
+}
+
+# is_daemon <pid> — a `dot-agent-deck … daemon …` process. Never offered for a
+# kill, whatever its cwd: stopping a daemon stops every agent it manages
+# (CLAUDE.md rule 12's teardown step and rule 15). Matching any argv element
+# rather than argv[0] alone also catches a daemon started through an
+# interpreter or wrapper.
+is_daemon() {
+  local a saw=false
+  while IFS= read -r -d '' a; do
+    if $saw && [ "$a" = "daemon" ]; then return 0; fi
+    case "${a##*/}" in dot-agent-deck*) saw=true ;; esac
+  done 2>/dev/null < "${proc_root}/$1/cmdline" || true
+  return 1
+}
+
+# holders <dir> — pids whose cwd is <dir> or below it, one per line. A cwd the
+# kernel marks ` (deleted)` is not inside any directory that still exists.
+holders() {
+  local d="$1" pid cwd
+  while IFS=$'\t' read -r pid cwd; do
+    [ -z "$pid" ] && continue
+    case "$cwd" in *" (deleted)") continue ;; esac
+    case "$cwd" in "$d"|"$d"/*) echo "$pid" ;; esac
+  done <<< "$procs"
+}
+
+# --- `--holders <path>`: the pre-removal check ---
+#
+# The lists below come from one snapshot of /proc, and a process can enter a
+# directory after it. So the skill runs this immediately before removing a
+# directory: it re-reads /proc, prints any process of this user whose cwd is
+# <path> or below, and exits 0 only when /proc was readable and none is there —
+# 1 when something holds it, 2 when the check could not run.
+if [ "${1:-}" = "--holders" ]; then
+  target="${2:?usage: cleanup.sh --holders <path>}"
+  echo "PROC_CHECK=${proc_check}"
+  [ "$proc_check" = "ok" ] || exit 2
+  c=$(cd "$target" 2>/dev/null && pwd -P) || c="$target"
+  found=$(holders "$c")
+  [ -z "$found" ] && exit 0
+  echo "HOLDERS:"
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    echo "  ${pid}|start=$(proc_start "$pid")|$(readlink "${proc_root}/${pid}/cwd" 2>/dev/null)|$(proc_cmd "$pid")"
+  done <<< "$found"
+  exit 1
+fi
+
 # --- Determine the default branch ---
 default_branch="main"
 if ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null); then
@@ -112,59 +199,6 @@ is_merged() {
 }
 
 
-# --- Processes owned by this user, and their working directories ---
-#
-# Read from `/proc/<pid>/cwd`, which exists on Linux only. Where it cannot be
-# read the script says `PROC_CHECK=unavailable` and labels every directory
-# `processes: could not check`, rather than printing `none` for a check that
-# never ran. `CLEANUP_PROC_ROOT` points the scan elsewhere; the tests use it to
-# take that degraded path on a Linux host.
-proc_root="${CLEANUP_PROC_ROOT:-/proc}"
-proc_check="unavailable"
-procs=$'\n'   # lines of "<pid><TAB><cwd>", cwd as the kernel reports it
-if readlink "${proc_root}/$$/cwd" >/dev/null 2>&1; then
-  proc_check="ok"
-  for p in "${proc_root}"/[0-9]*; do
-    # `-O`: owned by our effective uid. Another user's cwd is unreadable anyway,
-    # and none of their processes is ours to offer.
-    [ -O "$p" ] || continue
-    pid="${p##*/}"
-    [ "$pid" = "$$" ] && continue
-    cwd=$(readlink "${p}/cwd" 2>/dev/null) || continue
-    procs="${procs}${pid}"$'\t'"${cwd}"$'\n'
-  done
-fi
-
-# proc_cmd <pid> — the command line, space-joined and cut short for display.
-proc_cmd() {
-  tr '\0' ' ' 2>/dev/null < "${proc_root}/$1/cmdline" | sed 's/ *$//' | cut -c1-120 || true
-}
-
-# is_daemon <pid> — a `dot-agent-deck … daemon …` process. Never offered for a
-# kill, whatever its cwd: stopping a daemon stops every agent it manages
-# (CLAUDE.md rule 12's teardown step and rule 15). Matching any argv element
-# rather than argv[0] alone also catches a daemon started through an
-# interpreter or wrapper.
-is_daemon() {
-  local a saw=false
-  while IFS= read -r -d '' a; do
-    if $saw && [ "$a" = "daemon" ]; then return 0; fi
-    case "${a##*/}" in dot-agent-deck*) saw=true ;; esac
-  done 2>/dev/null < "${proc_root}/$1/cmdline" || true
-  return 1
-}
-
-# holders <dir> — pids whose cwd is <dir> or below it, one per line. A cwd the
-# kernel marks ` (deleted)` is not inside any directory that still exists.
-holders() {
-  local d="$1" pid cwd
-  while IFS=$'\t' read -r pid cwd; do
-    [ -z "$pid" ] && continue
-    case "$cwd" in *" (deleted)") continue ;; esac
-    case "$cwd" in "$d"|"$d"/*) echo "$pid" ;; esac
-  done <<< "$procs"
-}
-
 # --- Directory facts: size, newest modification, git state ---
 
 # `du` exits non-zero when one file below is unreadable but still prints the
@@ -222,18 +256,20 @@ unpushed() {
   echo "UNPUSHED ${n} commit(s) per ${where}: ${list}"
 }
 
-# git_label <dir> — what removing <dir> would lose from git's point of view.
+# git_label_one <dir> — what removing <dir> would lose from git's point of view.
 # A linked worktree's branches live in the shared repository and survive the
 # directory, so only a detached HEAD is checked there; a standalone clone keeps
-# its branches inside the directory, so every one of them is checked.
-git_label() {
+# its refs inside the directory, so HEAD and every local branch, tag and stash
+# entry is checked.
+git_label_one() {
   local d="$1" head br tips="" t u out="" dirty=""
-  if [ ! -e "$d/.git" ]; then echo "git: not a checkout"; return; fi
-  if ! head=$(dgit "$d" rev-parse --verify --quiet HEAD 2>/dev/null); then
-    echo "git: no commits"; return
-  fi
+  # Status first: a repository with no commit yet can still hold staged and
+  # untracked files, and those are exactly what removal would lose.
   if [ -n "$(dgit "$d" status --porcelain 2>/dev/null | head -1)" ]; then
     dirty="; UNCOMMITTED CHANGES"
+  fi
+  if ! head=$(dgit "$d" rev-parse --verify --quiet HEAD 2>/dev/null); then
+    echo "git: no commits${dirty}"; return
   fi
   if [ -f "$d/.git" ]; then
     if br=$(dgit "$d" symbolic-ref --quiet --short HEAD 2>/dev/null); then
@@ -241,7 +277,12 @@ git_label() {
     fi
     tips="$head"
   else
-    tips="$head"$'\n'"$(dgit "$d" for-each-ref --format='%(objectname)' refs/heads 2>/dev/null || true)"
+    # Tags and the stash too: a commit reachable only from a local tag or a
+    # stash entry lives in this directory and nowhere else. Annotated tags are
+    # peeled to the commit they name.
+    tips="$head"$'\n'"$(dgit "$d" for-each-ref \
+      --format='%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)' \
+      refs/heads refs/tags refs/stash 2>/dev/null || true)"
   fi
   while IFS= read -r t; do
     [ -z "$t" ] && continue
@@ -251,6 +292,35 @@ git_label() {
     fi
   done <<< "$(printf '%s\n' "$tips" | sort -u)"
   echo "git: ${out:-every commit is on a remote or in a merged PR}${dirty}"
+}
+
+# git_label <dir> — git_label_one for a checkout. For a directory that is not
+# one, the checkouts NESTED inside it, because removing the directory removes
+# them too: a `cargo xver` run sandbox holds a standalone repository under
+# `project/`, and a scratch directory can hold clones. Nested checkouts with
+# nothing to lose are counted; any with unpushed, unverifiable or uncommitted
+# work is named. The search is bounded (depth 5, the first 20 found) so a huge
+# target dir costs a bounded walk, and the label says when the bound was hit.
+git_label() {
+  local d="$1" g sub l clean=0 found="" gits n
+  if [ -e "$d/.git" ]; then git_label_one "$d"; return; fi
+  gits=$(find "$d" -mindepth 2 -maxdepth 5 -name .git -prune -print 2>/dev/null | head -n 20 || true)
+  n=0
+  while IFS= read -r g; do
+    [ -z "$g" ] && continue
+    n=$((n + 1))
+    sub="${g%/.git}"
+    l=$(git_label_one "$sub")
+    case "$l" in
+      *UNPUSHED*|*"COULD NOT VERIFY"*|*UNCOMMITTED*)
+        found="${found}; nested ${sub#"$d"/}: ${l#git: }" ;;
+      *) clean=$((clean + 1)) ;;
+    esac
+  done <<< "$gits"
+  l="git: not a checkout"
+  if [ "$clean" -gt 0 ]; then l="${l}; ${clean} nested checkout(s) with nothing to lose"; fi
+  if [ "$n" -ge 20 ]; then l="${l}; nested scan stopped at 20 checkouts"; fi
+  echo "${l}${found}"
 }
 
 # --- Candidate directories, each vetted for live processes ---
@@ -447,7 +517,7 @@ while IFS= read -r pid; do
   [ -z "$pid" ] && continue
   [ -d "${proc_root}/${pid}" ] || continue
   cwd=$(readlink "${proc_root}/${pid}/cwd" 2>/dev/null || echo "?")
-  processes_out+=("${pid}|${cwd}|$(proc_cmd "$pid")")
+  processes_out+=("${pid}|start=$(proc_start "$pid")|${cwd}|$(proc_cmd "$pid")")
 done <<< "$proc_pids"
 
 # --- Output structured summary ---
