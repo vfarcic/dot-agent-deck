@@ -39,8 +39,10 @@ const NEEDS_WEB = process.env.DAD_DOCS_SCREENSHOTS_WEB !== "0";
 // terminal-only run, whose `baseURL` is never loaded), so two concurrent runs
 // never share a server; `--strictPort` below makes a run that lost the race for it
 // fail instead of screenshotting another run's bundle. Unset — a hand-run of
-// this config — falls back to 4183, which is not the browser test tier's port,
-// so the two do not serve each other's bundle either.
+// this config — falls back to a fixed 4183. A hand-run that finds it busy
+// (another hand-run, or a browser-tier run the OS happened to give it) fails
+// with Playwright's "already used" error instead of screenshotting that
+// server, because this config never reuses one.
 const PORT = Number(process.env.DAD_DOCS_SCREENSHOTS_PORT ?? "4183");
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65_535) {
   throw new Error(`DAD_DOCS_SCREENSHOTS_PORT is not a port: ${process.env.DAD_DOCS_SCREENSHOTS_PORT}`);
