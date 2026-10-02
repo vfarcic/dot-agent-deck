@@ -193,7 +193,7 @@ Remove only what the user confirmed, in this order:
 
    `--apply` decides each root afresh rather than from the earlier dry run's list. That keeps a root whose owning process came alive since, but it also means a root can cross the reaper's age threshold after the user confirmed, and then `--apply` would remove a root the user saw listed as kept.
 
-   What the user confirms is therefore the reaper's verdict as its dry run summarised it — the `reap:` count and size and the per-reason breakdown below it — not a list of individual roots. The reaper prints at most 20 paths per group and says `… and N more` past that; when it does, tell the user that the remainder is counted in the summary but not listed. So run the dry run again right before applying and compare it with what the user confirmed: if the `reap:` count, a per-reason count, or any listed path differs, show the new summary and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
+   What the user confirms is therefore the reaper's verdict as its dry run summarised it — the `reap:` count and size and the per-reason breakdown below it — not a list of individual roots. The reaper prints at most 20 paths per group and says `… and N more` past that; when it does, tell the user that the remainder is counted in the summary but not listed. So run the dry run again right before applying and compare it with what the user confirmed: if the `reap:` count or size, any per-reason count or size, or any listed path differs, show the new summary and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
 
 Finally, prune stale worktree metadata:
 
