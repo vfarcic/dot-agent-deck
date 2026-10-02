@@ -4,7 +4,7 @@ Everything on this page is the TUI's, except [Editing an agent's prompt](#editin
 
 Press `?` in command mode to see the shortcuts in the TUI. The overlay and the bottom button bar are generated from your active [keybindings](#customizing-keybindings), so they show your real keys.
 
-![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global, Tab Navigation, Dashboard (command mode), Mode Tab, New Agent Form, Directory Picker and Session](/img/help-tui.png)
+![The TUI's help overlay, opened with ?, listing the shortcuts by section: Global (works from any pane), Tab Navigation and Dashboard (command mode) on the left; Mouse, New Agent Form, Directory Picker and Session on the right](/img/help-tui.png)
 
 ## Modes
 

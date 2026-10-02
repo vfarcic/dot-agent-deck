@@ -36,7 +36,6 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 These are TUI-only:
 
 - The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
-- Workspace modes: the desktop's **New agent** offers no mode tab. Mode tabs started from the TUI still appear on the Dashboard as their own group.
 - Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
 - Installing the deck on a remote machine and starting a daemon there (`dot-agent-deck remote add`, `dot-agent-deck connect`). The desktop app connects to a remote daemon that is already running; see [Daemons](daemons.md).
