@@ -9681,10 +9681,14 @@ impl AgentPtyRegistry {
     ///   ordinary prompt write submits these bytes fused to the NEXT real prompt
     ///   (pinned by
     ///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
-    /// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
-    ///   Because these bytes can be submitted later, glued to somebody else's
-    ///   turn, nothing a repository or an agent controls should ride them, and
-    ///   there is no submitted-turn framing to fence such a value inside. A
+    /// * **Fixed daemon-authored text, with nothing a repository or an agent
+    ///   controls interpolated.** Because these bytes can be submitted later,
+    ///   glued to somebody else's turn, no such value should ride them, and
+    ///   there is no submitted-turn framing to fence one inside. A character
+    ///   scrub does not make a value safe here: a pane id passes
+    ///   [`is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub yet an orchestration
+    ///   role pane's id embeds the config-supplied orchestration name (issue
+    ///   #1380), so it is excluded too. A
     ///   caller that wants an untrusted value in its text belongs on
     ///   [`Self::write_and_submit_guarded`] instead, where the text is a turn
     ///   of its own rather than a prefix glued to the next one.
