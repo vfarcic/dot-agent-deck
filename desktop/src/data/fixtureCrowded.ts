@@ -28,13 +28,27 @@ export function voicePagesFleet(base: DeckSnapshot): DeckSnapshot[] {
   }];
 }
 
-/** The home listing is long; child folders are empty so browsing remains deterministic. */
+/** Issue #1494 — `folder-01` holds only these, each too long for one column of a wide page, short enough for the whole width. */
+export const VOICE_PAGES_FEW_DIRECTORY = `${VOICE_PAGES_HOME}/folder-01`;
+export const VOICE_PAGES_FEW_DIRECTORY_NAMES = [
+  "customer-onboarding-service-integration-tests",
+  "payments-reconciliation-batch-worker-archive",
+  "observability-dashboards-and-alerting-rules",
+];
+
+/** The home listing is long; `folder-01` holds three long names and every other child folder is empty, so browsing remains deterministic. */
 export function voicePagesDirectory(path: string): { path: string; parent?: string; entries: DeckDirectoryEntry[] } | undefined {
   if (path === VOICE_PAGES_HOME) return {
     path,
     parent: "/home",
     entries: VOICE_PAGES_DIRECTORY_NAMES.map((name) => ({ path: `${VOICE_PAGES_HOME}/${name}`, displayName: name, isProject: name === "docs" })),
   };
+  if (path === VOICE_PAGES_FEW_DIRECTORY) return {
+    path,
+    parent: VOICE_PAGES_HOME,
+    entries: VOICE_PAGES_FEW_DIRECTORY_NAMES.map((name) => ({ path: `${path}/${name}`, displayName: name, isProject: false })),
+  };
+  if (VOICE_PAGES_FEW_DIRECTORY_NAMES.some((name) => path === `${VOICE_PAGES_FEW_DIRECTORY}/${name}`)) return { path, parent: VOICE_PAGES_FEW_DIRECTORY, entries: [] };
   if (VOICE_PAGES_DIRECTORY_NAMES.some((name) => path === `${VOICE_PAGES_HOME}/${name}`)) return { path, parent: VOICE_PAGES_HOME, entries: [] };
   return undefined;
 }
