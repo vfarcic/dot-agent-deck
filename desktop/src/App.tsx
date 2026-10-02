@@ -62,7 +62,7 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -792,6 +792,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
       ...(filterText ? { filterText: filterText.value } : {}),
       ...(commandText ? { commandText: commandText.value } : {}),
+      ...(saysCommand(outcome.transcript) ? { saysCommand: true } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
       ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),

@@ -3847,6 +3847,31 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /**
+   * Scenario: with a live New agent form, the backend mistakes the "run" in
+   * "Set the command to devbox run agent." for Start. The panel must leave
+   * Command and the agent list untouched and report that nothing started.
+   */
+  it("does not start an agent when a command sentence is misresolved as Start", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    const said = "Set the command to devbox run agent.";
+    deck.resolveVoice = vi.fn(async () => dispatch("start_new_agent", "startNewAgent", "Starting the agent.", said));
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+    const before = screen.getByTestId("new-agent-command");
+    expect(before).toHaveValue("bash");
+
+    voice.deliver(said);
+    await completeUtterance();
+
+    expect(deck.runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Starting the agent.");
+  });
+
+  /**
    * Scenario: "make the command npm run dev" replaces what "use claude" put
    * in Command, and "use claude" afterwards still fills Claude Code's registry
    * default — the two rows set the same field and neither starts anything.

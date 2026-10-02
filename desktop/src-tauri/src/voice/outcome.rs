@@ -86,6 +86,9 @@ const CLOSE_ROW: &str = "close";
 const DICTATION_ON_ROW: &str = "dictation_on";
 const DICTATION_OFF_ROW: &str = "dictation_off";
 const VOICE_OFF_ROW: &str = "voice_off";
+/// The New agent dialog's Start — the one row a spoken command line keeps
+/// from grounding at all, wherever its start word is ([`heard_outside_command`]).
+const START_ROW: &str = "start_new_agent";
 /// PRD #1195 M3 — the Deck selector's row, and the one `deck_ref` row that is
 /// not about the New agent dialog.
 ///
@@ -438,6 +441,22 @@ impl VoiceOutcome {
                     None => row.try_saying.as_str(),
                 }
             ),
+            // Grounded by the whole transcript yet refused: the only words
+            // that asked for the row were inside a spoken command line
+            // ([`heard_outside_command`]), so "nothing in that asks" would
+            // contradict what the user can see they said.
+            (ActionGrounding::HeardAs(phrases), _)
+                if heard_grounds(row, phrases, &Heard::new(transcript.text())) =>
+            {
+                let mut why = format!(
+                    "a sentence that sets the command does not also {}, so nothing was done",
+                    row.asks_to
+                );
+                if let Some(example) = suggestion(row, &transcript, answered) {
+                    why.push_str(&format!("; say \u{201c}{example}\u{201d} on its own"));
+                }
+                why
+            }
             _ => {
                 let mut why = format!(
                     "nothing in that asks to {}, so nothing was done",
@@ -2351,7 +2370,10 @@ struct Heard {
 
 impl Heard {
     fn new(transcript: &str) -> Self {
-        let words = spoken_words(transcript);
+        Self::from_words(spoken_words(transcript))
+    }
+
+    fn from_words(words: Vec<String>) -> Self {
         let mut joined: BTreeSet<String> = words.iter().cloned().collect();
         for width in 2..=3 {
             for window in words.windows(width) {
@@ -2449,17 +2471,71 @@ fn action_grounded(
         ActionGrounding::Exempt(_) => true,
         // `grounding_also` beside it: a row that stops several things at once
         // needs what it stops NAMED as well as a verb (`close_orchestration`).
-        ActionGrounding::HeardAs(phrases) => {
-            let heard = Heard::new(transcript);
-            phrases.iter().any(|phrase| heard.phrase(phrase))
-                && (row.grounding_also.is_empty()
-                    || row.grounding_also.iter().any(|phrase| heard.phrase(phrase)))
-        }
+        ActionGrounding::HeardAs(phrases) => heard_grounds(
+            row,
+            phrases,
+            &heard_outside_command(row, transcript, directories, new_agent),
+        ),
         ActionGrounding::HeardAsWhole(phrases) => {
             let said = whole_utterance(transcript);
             !said.is_empty() && phrases.iter().any(|phrase| spoken_words(phrase) == said)
         }
     }
+}
+
+/// Whether `heard` holds one of `phrases` and, where the row declares
+/// `grounding_also`, one of those too — [`action_grounded`]'s token rule.
+fn heard_grounds(row: &CommandRow, phrases: &[String], heard: &Heard) -> bool {
+    phrases.iter().any(|phrase| heard.phrase(phrase))
+        && (row.grounding_also.is_empty()
+            || row.grounding_also.iter().any(|phrase| heard.phrase(phrase)))
+}
+
+/// The word that opens a spoken command line in the New agent form — "set the
+/// COMMAND to devbox run agent", "make the COMMAND npm run dev" — and the one
+/// word of `set_new_agent_command`'s `heard_as`.
+const COMMAND_PHRASE_OPENER: &str = "command";
+
+/// What a token-grounded `row` may be heard in: the transcript, or — while the
+/// New agent form is live and `row` takes no `command_text` — only the words
+/// BEFORE the first [`COMMAND_PHRASE_OPENER`] (PR #1451 round 4, audit A1).
+///
+/// A command line is the user's words for another program, and they are full
+/// of this table's verbs: "Set the command to devbox RUN agent" holds `run`,
+/// which is `start_new_agent`'s, so a model that read the sentence as Start
+/// was grounded and started the form as it WAS — Command still `bash`. From
+/// the opener on, the words are the command, and they ground the command row
+/// alone; words before it still ground the others.
+///
+/// **Start is held to the whole sentence** ([`START_ROW`]): it is grounded by
+/// nothing in a sentence that says a command at all, before the opener or
+/// after it. Start acts on the form as shown, and "set the command to bash and
+/// start it" or "start it with the command bash" asks for a form with a
+/// command the field may not hold yet — so it is refused, and
+/// [`VoiceOutcome::action_ungrounded`] says to ask for the start on its own.
+/// The webview's `voiceStart` refuses the same sentences, for a backend that
+/// answers Start regardless.
+///
+/// The singular only: "what commands can I say" is `list_commands`, and off
+/// the form a command is just a word.
+fn heard_outside_command(
+    row: &CommandRow,
+    transcript: &str,
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+) -> Heard {
+    let mut words = spoken_words(transcript);
+    let sets_command = row
+        .params
+        .iter()
+        .any(|param| param.kind == ParamKind::CommandText);
+    if !sets_command
+        && Requirement::NewAgentForm.met_by(directories, new_agent)
+        && let Some(at) = words.iter().position(|word| word == COMMAND_PHRASE_OPENER)
+    {
+        words.truncate(if row.id == START_ROW { 0 } else { at });
+    }
+    Heard::from_words(words)
 }
 
 /// Words that may open or close a whole-utterance command without making it a
@@ -6401,6 +6477,86 @@ mod tests {
         let outcome = run_form(&start, Screen::Overview, Some(&form), said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::ActionUngrounded { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: with a live New agent form, the maintainer says "Set the command
+    /// to devbox run agent." A backend pick of Start must leave the form alone;
+    /// the word "run" inside the command is not a request to start it.
+    #[tokio::test]
+    async fn voice_outcome_command_containing_run_cannot_start_the_previous_form() {
+        let said = "Set the command to devbox run agent.";
+        let form = new_agent_form();
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("start_new_agent"));
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: with a live New agent form, "set the command to devbox run
+    /// agent and start it" answered as Start is refused, not started: the start
+    /// words follow the command opener, so they are the command's, and the
+    /// report says to ask for the start on its own (audit A1).
+    #[tokio::test]
+    async fn voice_outcome_a_start_after_the_command_opener_is_refused_in_words() {
+        let said = "set the command to devbox run agent and start it";
+        let form = new_agent_form();
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("start_new_agent"));
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "start_new_agent"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.sentence(),
+            format!(
+                "Heard: \u{201c}{said}\u{201d} — a sentence that sets the command does not also \
+                 start the new agent, so nothing was done; say \u{201c}start it\u{201d} on its own."
+            )
+        );
+    }
+
+    /// Scenario: with a live form, a start word BEFORE the command opener
+    /// does not start either — "start it with the command npm test" asks for
+    /// a command the field does not hold — while another row's word before the
+    /// opener still grounds it ("list the command words" lists commands).
+    #[tokio::test]
+    async fn voice_outcome_only_start_is_held_to_the_whole_command_sentence() {
+        let form = new_agent_form();
+        let said = "start it with the command npm test";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("start_new_agent"));
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { action, .. } if action == "start_new_agent"),
+            "{outcome:?}"
+        );
+        let said = "list the command words";
+        let resolver = StubResolver::new().answering(said, IntentAnswer::new("list_commands"));
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "list_commands"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: with a live New agent form, a transcript and model value
+    /// containing a bidi override are refused before dispatch, so the current
+    /// Command field keeps its prior value.
+    #[tokio::test]
+    async fn voice_outcome_command_with_bidi_override_leaves_the_field_unchanged() {
+        let said = "set the command to echo \u{202e}safe";
+        let form = new_agent_form();
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("set_new_agent_command").with_param("command", "echo \u{202e}safe"),
+        );
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { action, param, .. }
+                if action == "set_new_agent_command" && param == "command"),
             "{outcome:?}"
         );
     }

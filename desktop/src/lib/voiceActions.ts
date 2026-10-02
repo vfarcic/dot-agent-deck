@@ -954,6 +954,16 @@ void NEEDS_COVERS_RUN;
  * It is `AgentViewTarget` because that is the widest target any entry takes;
  * `AgentTarget`'s single member is a subset of it.
  */
+/**
+ * Whether `transcript` says the word "command" — `voice::table::spoken_words`'
+ * reading of it, lowercased runs of letters and digits, and the singular only,
+ * as `voice::outcome::COMMAND_PHRASE_OPENER` ("what commands can I say" is not
+ * about the field).
+ */
+export function saysCommand(transcript: string): boolean {
+  return transcript.toLowerCase().split(/[^\p{L}\p{N}]+/u).includes("command");
+}
+
 export type VoiceDispatchTarget = AgentViewTarget & {
   /**
    * The deck to PRESELECT — what a row's `deck_ref` param resolved to (PRD
@@ -1005,6 +1015,16 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * sentence's full stop.
    */
   commandText?: string;
+  /**
+   * The utterance said the word "command" — it was about the Command field
+   * (PR #1451 round 4, audit A1). `voiceStart` refuses to start on such a
+   * sentence, whatever the backend answered: Start acts on the form as shown,
+   * and "Set the command to devbox run agent" (whose `run` is a start word)
+   * or "set the command to bash and start it" asks for a different form.
+   * Rust's action grounding refuses the same sentences
+   * (`voice::outcome::heard_outside_command`); this is the dialog's own half.
+   */
+  saysCommand?: boolean;
   /**
    * The directory browser the utterance was JUDGED against: the deck and the
    * listing `path` the webview declared with it (PRD #1223), or absent when it

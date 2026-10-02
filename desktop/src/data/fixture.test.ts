@@ -181,4 +181,24 @@ describe("browser fixture Command row parity with Rust (PR #1451 round 4, D8)", 
     ];
     expect(cases.map(([said, value]) => fixtureGroundedCommandText(said, value))).toEqual(cases.map(([, , expected]) => expected));
   });
+
+  /** Scenario: the preview takes a command only as whole spoken tokens, as `voice::command_text` does: "./run.sh" and "--model=haiku" are kept whole, and a part of either is refused. */
+  it("keeps whole path and option tokens and refuses a part of one", () => {
+    const cases: [string, string, string | undefined][] = [
+      ["set the command to ./run.sh", "./run.sh", "./run.sh"],
+      ["set the command to ./run.sh", "run.sh", undefined],
+      ["set the command to claude --model=haiku", "claude --model=haiku", "claude --model=haiku"],
+      ["set the command to claude --model=haiku", "model=haiku", undefined],
+      ["set the command to cd ..", "cd .", undefined],
+      ["set the command to “npm run dev.”", "npm run dev", "npm run dev"],
+    ];
+    expect(cases.map(([said, value]) => fixtureGroundedCommandText(said, value))).toEqual(cases.map(([, , expected]) => expected));
+  });
+
+  /** Scenario: the browser preview refuses C1 and bidi format controls in a spoken Command, matching the live Rust resolver's control-character boundary. */
+  it("refuses C1 and bidi controls in Command", () => {
+    expect(["\u0085", "\u202e"].map((control) =>
+      fixtureGroundedCommandText(`set the command to echo ${control}safe`, `echo ${control}safe`),
+    )).toEqual([undefined, undefined]);
+  });
 });

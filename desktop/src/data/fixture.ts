@@ -1479,21 +1479,47 @@ const FIXTURE_COMMAND_QUOTES: ReadonlyArray<readonly [string, string]> = [["\"",
  * command `value` without surrounding whitespace, a sentence's trailing full
  * stop (a single `.` after a letter, digit or closing quote — `cd ..` keeps
  * its dots) or one pair of surrounding quotes, and otherwise exactly as said.
- * It must occur in `transcript` on word boundaries; the preview's value is
- * always a slice of the utterance, so that half only refuses an empty one.
+ * It must occur in `transcript` as whole spoken tokens, and hold no control,
+ * format character or line separator.
  */
 export function fixtureGroundedCommandText(transcript: string, value: string): string | undefined {
   const withoutFullStop = (text: string) => (/[\p{L}\p{N}”’"'`]\.$/u.test(text) ? text.slice(0, -1).trimEnd() : text);
   let text = withoutFullStop(value.trim());
   const pair = FIXTURE_COMMAND_QUOTES.find(([open, close]) => text.length >= 2 && text.startsWith(open) && text.endsWith(close) && !text.slice(1, -1).includes(open) && !text.slice(1, -1).includes(close));
   if (pair) text = withoutFullStop(text.slice(1, -1).trim());
-  if (text === "" || /[\u0000-\u001f\u007f]/u.test(text)) return undefined;
-  const at = transcript.indexOf(text);
-  if (at < 0) return undefined;
-  const joins = (outside: string | undefined, inside: string | undefined) => outside !== undefined && inside !== undefined && /[\p{L}\p{N}]/u.test(outside) && /[\p{L}\p{N}]/u.test(inside);
-  if (joins(transcript[at - 1], text[0]) || joins(transcript[at + text.length], text[text.length - 1])) return undefined;
-  return text;
+  if (text === "" || FIXTURE_COMMAND_INVISIBLE.test(text)) return undefined;
+  const opens = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([open]) => open === c);
+  const closes = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([, close]) => close === c);
+  const edge = (c: string | undefined) => c === undefined || /\s/u.test(c);
+  // Whole spoken tokens, as `starts_a_token` / `ends_a_token`: whitespace or an
+  // end of the transcript, past one opening quote before and a full stop and
+  // one closing quote after.
+  const whole = (at: number) => {
+    let before = at - 1;
+    if (opens(transcript[before])) before -= 1;
+    if (!edge(transcript[before])) return false;
+    let after = at + text.length;
+    let last: string | undefined = text[text.length - 1];
+    let stopped = false;
+    let quoted = false;
+    for (;;) {
+      const next = transcript[after];
+      if (next === "." && !stopped && last !== undefined && (/[\p{L}\p{N}]/u.test(last) || closes(last))) stopped = true;
+      else if (!quoted && closes(next)) quoted = true;
+      else break;
+      last = next;
+      after += 1;
+    }
+    return edge(transcript[after]);
+  };
+  for (let at = transcript.indexOf(text); at >= 0; at = transcript.indexOf(text, at + 1)) {
+    if (whole(at)) return text;
+  }
+  return undefined;
 }
+
+/** What `voice::command_text::has_invisible` refuses: controls (C0 and C1), format characters, and line or paragraph separators. */
+const FIXTURE_COMMAND_INVISIBLE = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
 
 /**
  * The Filter box's text out of what followed the opener: a letter named after

@@ -253,6 +253,8 @@ export const START_NEEDS_DECK = "Nothing was started: choose a daemon first.";
 export const START_NEEDS_DIRECTORY = "Nothing was started: choose a directory first — the agent needs one to start in.";
 /** A start is already in flight or waiting for the deck to list it. */
 export const START_IN_FLIGHT = "A start is already under way, so nothing else was started.";
+/** The sentence was about the Command field (PR #1451 round 4, audit A1): a start is asked for on its own. */
+export const START_SAID_A_COMMAND = "Nothing was started: a sentence that sets the command does not also start the agent — say “start it” on its own.";
 
 /**
  * A spoken Name as the Name field takes it: the words after the marked
@@ -1557,9 +1559,14 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * directory that moved during the round trip refuses with `FORM_MOVED_ON`,
    * as every fill does. An edit the declaration does not carry, such as a typed
    * Name, is on screen and is started, as the Start button would start it.
+   *
+   * A sentence that says "command" never starts (PR #1451 round 4, audit A1):
+   * it is about the Command field, whose words are full of start verbs ("devbox
+   * RUN agent"), and starting would run the form as it was before them.
    */
   const voiceStart = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return START_IN_FLIGHT;
+    if (dispatch.saysCommand) return START_SAID_A_COMMAND;
     if (!deck) return START_NEEDS_DECK;
     if (!target) return START_NEEDS_DIRECTORY;
     const declared = dispatch.declaredForm;
