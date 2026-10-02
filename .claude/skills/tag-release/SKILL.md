@@ -1,6 +1,6 @@
 ---
 name: tag-release
-description: Cut a release from the accumulated changelog fragments by dispatching the Tag Release workflow, then prune the worktrees and branches whose work it contains. Run when ready to cut a release.
+description: Cut a release from the accumulated changelog fragments by dispatching the Tag Release workflow, then clean up what working sessions left behind. Run when ready to cut a release. Its cleanup step also runs on its own at any time — use it when asked to clean up the box — and finds merged worktrees and branches, tool caches, stray sibling directories, e2e temp roots and orphaned processes, deleting only what the user confirms.
 user-invocable: true
 ---
 
@@ -15,6 +15,8 @@ This skill is **project-local and owned here** (CLAUDE.md rule 13). It was forke
 ## When to use
 
 Several PRs have merged with changelog fragments in `changelog.d/` and you are ready to cut a release. It is a separate activity from any PR workflow — never run it as part of one.
+
+Also use Step 5 alone, whenever asked to clean up the box or to find what earlier sessions left behind; it needs no release.
 
 ## Step 0 — Land the open PRs first
 
@@ -91,29 +93,69 @@ The workflow pushes twice — the pin commit to `main`, then the tag — so a fa
 - **The pin landed but the tag push failed.** `main` carries `chore: pin flake version to v<X.Y.Z>` and there is no tag and no release. Do not revert it. Dispatch again with the same version: the fragments are untouched so it computes the same value, the pin edit is a no-op so no second commit is made, and it retries the tag.
 - **The tag landed but `release.yml` failed.** Which recovery depends on whether its `prepare` job finished, because `prepare` commits the assembled changelog and consumes `changelog.d/`. If the fragments are still there, delete the tag (`git push origin :refs/tags/v<X.Y.Z>`) and the GitHub Release if one was created, fix the cause, and dispatch this workflow again. If the fragments are gone, the tag and the pin are already correct — re-run `release.yml` from its own `workflow_dispatch` with `version=<X.Y.Z>` instead, and do not re-dispatch this one (it would refuse with `NO_FRAGMENTS`).
 
-## Step 5 — Clean up merged worktrees and branches
+## Step 5 — Clean up what the session left behind
 
-Once the release is tagged, the branches and worktrees whose work it contains are done.
+Once the release is tagged, the branches and worktrees whose work it contains are done, and the box usually carries more than that: tool caches, scratch directories, e2e temp roots and processes nobody stopped.
+
+**This step also runs on its own, at any time, not only after a release.** A request like "clean up the box", "prune the worktrees" or "what is left lying around" maps to it: start here, skip Steps 0–4, and the guideline about cleaning only after tagging does not apply.
+
+### Detect
 
 ```bash
 bash .claude/skills/tag-release/cleanup.sh
+cargo xtask clean-e2e-tmp
 ```
 
-The script is detection-only — it never removes a worktree or deletes a branch (it does run `git fetch --prune`, which refreshes local remote-tracking refs and touches the remote not at all). If it prints `NOTHING_TO_CLEAN=true`, say so and finish. Otherwise present the `WORKTREES`, `LOCAL_BRANCHES` and `REMOTE_BRANCHES` lists and get explicit confirmation before deleting anything.
+Both are detection-only. `cleanup.sh` never removes a worktree, deletes a branch or directory, or signals a process (it does run `git fetch --prune`, which refreshes local remote-tracking refs and touches the remote not at all). `cargo xtask clean-e2e-tmp` without `--apply` is a dry run of the e2e harness's temp-root reaper (`/var/tmp/dad-e2e-<uid>/…` and the older `/tmp/dad-*` roots), which already decides ownership by owning PID and age (CLAUDE.md rule 14), so its own verdict is the one to show. If `cleanup.sh` prints `NOTHING_TO_CLEAN=true` and the reaper finds nothing to remove, say so and finish.
 
-**This step is destructive — always show the full list and get explicit confirmation first.** The script excludes the default branch and the branch and worktree you are standing in. The open-PR guard and the squash-merge half of the detection both come from `gh pr list`, so they hold only where `gh` is on PATH and authenticated: without it the script silently falls back to the ancestry test alone, which offers fewer branches but also stops protecting one that has an open PR. Check that `gh` works before trusting a list.
+What each `cleanup.sh` list holds:
 
-After confirmation, process the items **in this order**:
+| list | entry | what it is |
+| --- | --- | --- |
+| `WORKTREES` | `<path>\|<branch>` | a registered worktree whose branch is merged |
+| `LOCAL_BRANCHES`, `REMOTE_BRANCHES` | `<branch> <sha>` | a merged branch, with the tip the script vetted |
+| `DETACHED_WORKTREES` | `<path>\|HEAD <sha>\|size=…\|processes: …\|git: …` | a registered worktree at a detached HEAD, such as `/verify-pr`'s `-pr-<n>-base` |
+| `TOOL_CACHES` | `<path>\|<kind>\|size=…\|processes: …\|git: …` | `land-worktree` is `/land-prs`'s `../<repo>-land`, a git worktree; `xver` is one of `cargo xver`'s `../<repo>-xver-*` directories (build clone, target dirs, cargo home, release downloads, run sandboxes — [`docs/develop/cross-version-harness.md`](../../../docs/develop/cross-version-harness.md)), plain directories rather than worktrees |
+| `STRAY_DIRS` | `<path>\|size=…\|modified=…\|processes: …\|git: …` | a `../<repo>-*` or `../dad-*` sibling that is neither a registered worktree nor a known cache; `modified` is the newest file below it |
+| `HELD_DIRS` | `<path>\|<kind>\|held by pid …` | a candidate from any directory list that a live process has its cwd inside; **not offered** |
+| `PROCESSES` | `<pid>\|<cwd>\|<command>` | a process of yours whose cwd was deleted or lies inside a `HELD_DIRS` entry |
 
-1. Remove each worktree. This must come before deleting its branch, because a branch checked out in a worktree cannot be deleted:
+Read the labels before presenting, and repeat them beside their entry:
+
+- `UNPUSHED <n> commit(s) per …: <commits>` counts the commits that are on no remote and in no merged PR, and names up to three of them. Removing that directory leaves them reachable from nothing.
+- `COULD NOT VERIFY` means the script could not tell whether the commits are pushed. Treat it as unpushed.
+- `UNCOMMITTED CHANGES` means the checkout has work git would lose.
+- `PROC_CHECK=unavailable` means the script could not read `/proc` on this host, so no directory was checked for running processes. Say "could not check for running processes" for every directory, the `WORKTREES` included, rather than presenting them as idle.
+
+The script excludes the default branch, the main checkout, and the branch and worktree you are standing in, and it never lists a process for a kill whose command line runs a `dot-agent-deck*` binary with a `daemon` argument: stopping one stops every agent it manages (CLAUDE.md rules 12 and 15). A held directory names a daemon among its holders when one is there, so the reason it is held is visible. The open-PR guard and the squash-merge half of the branch detection both come from `gh pr list`, so they hold only where `gh` is on PATH and authenticated: without it the script silently falls back to the ancestry test alone, which offers fewer branches but also stops protecting one that has an open PR. Check that `gh` works before trusting a list.
+
+### Present and confirm
+
+**This step is destructive — always show the full list and get explicit confirmation first.** Show one combined list, grouped by kind in the order they would be removed: processes, worktrees (merged, detached, and the `land-worktree` cache), branches, directories (`xver` caches, then strays), and last the reaper's summary. Give every directory its size, and say of each tool cache that it is recreated on demand at the cost of a cold build. Present strays one by one with their size, last modification, process status and git label: their purpose cannot be inferred, so the user decides each. Show `HELD_DIRS` as not removable now, with what holds them; a held directory becomes removable only if its holders are stopped and a fresh run offers it.
+
+### Remove, in this order
+
+Remove only what the user confirmed, in this order:
+
+1. **Processes.** Each by its own pid, after confirming the pid still has the cwd `cleanup.sh` printed (which catches a reused pid):
+
+   ```bash
+   [ "$(readlink /proc/[pid]/cwd)" = "[cwd]" ] && kill [pid]
+   ```
+
+   **Never by a `pkill -f` pattern.** A pattern matches every process on the box whose command line contains it, and CLAUDE.md rule 12's teardown step records one that stopped nine production panes. Never kill a `dot-agent-deck daemon` here, even when asked to in passing: that is a decision about every agent it manages and belongs to rule 15's `daemon stop`. `kill` sends SIGTERM; if a process survives it, report it rather than escalating to SIGKILL unless the user asks.
+
+2. **Re-run `cleanup.sh`** and work from the fresh output for everything below. It drops what has gone or moved since the first run, and a held directory whose holders are now stopped appears in its own list; remove one of those only if the user confirmed it.
+
+3. **Worktrees** — `WORKTREES`, `DETACHED_WORKTREES` and the `land-worktree` cache. This must come before deleting a branch, because a branch checked out in a worktree cannot be deleted:
 
    ```bash
    git worktree remove [worktree_path]
    ```
 
-   If a worktree has uncommitted changes git refuses. Report it and skip rather than reaching for `--force`, unless the user explicitly asks.
+   If a worktree has uncommitted changes git refuses. Report it and skip rather than reaching for `--force`, unless the user explicitly asks. A branch whose worktree is still held stays checked out there, so `git branch -D` refuses it in the next step; report it and skip.
 
-2. Delete each local branch. Each entry is `<branch> <sha>`, where the SHA is the tip `cleanup.sh` vetted; confirm the branch still points at it and then use `-D`:
+4. **Local branches.** Each entry is `<branch> <sha>`, where the SHA is the tip `cleanup.sh` vetted; confirm the branch still points at it and then use `-D`:
 
    ```bash
    [ "$(git rev-parse [branch])" = "[sha]" ] && git branch -D [branch]
@@ -123,13 +165,29 @@ After confirmation, process the items **in this order**:
 
    The check that does hold is the one `cleanup.sh` already made, from PR state rather than ancestry: it offers a branch only when its tip is either reachable from `origin/<default>` or is exactly the head SHA of a merged, same-repo PR, and never when an open PR points at that name. The SHA comparison above is what carries that verdict to the delete — it is what catches the branch having moved since the scan, which is the one thing the scan cannot see. So delete only names `cleanup.sh` printed, and re-run it rather than reusing a stale list.
 
-3. Delete each remote branch, gated the same way against its vetted SHA:
+5. **Remote branches**, gated the same way against their vetted SHA:
 
    ```bash
    [ "$(git rev-parse refs/remotes/origin/[branch])" = "[sha]" ] && git push origin --delete [branch]
    ```
 
    That compares the remote-tracking ref `cleanup.sh` refreshed with its own `git fetch --prune`, so it catches a list gone stale in your hands but not the remote advancing since that fetch. Re-run `cleanup.sh` rather than working from an old list.
+
+6. **Directories** — `xver` caches and strays — by the exact path the fresh run printed:
+
+   ```bash
+   rm -rf -- [path]
+   ```
+
+   Only a path the fresh run still lists under `TOOL_CACHES` or `STRAY_DIRS`, never one under `HELD_DIRS`, and never a path built by hand or by a glob. A stray labelled `UNPUSHED`, `COULD NOT VERIFY` or `UNCOMMITTED CHANGES` is removed only when the user confirmed that entry with its label in front of them.
+
+7. **E2E temp roots:**
+
+   ```bash
+   cargo xtask clean-e2e-tmp --apply
+   ```
+
+   `--apply` decides each root afresh rather than from the dry run's list, so a root whose owning process came alive since is kept. Report what it removed and the per-reason summary of what it kept.
 
 Finally, prune stale worktree metadata:
 
@@ -142,4 +200,4 @@ git worktree prune
 - **Review the fragments before proposing a version.** The bump is derived from their types, so a mistyped type changes the release.
 - **The bump policy is `docs/develop/versioning.md`.** `analyze.sh` is the implementation of the table there, including the pre-1.0 recalibration where `breaking` bumps the *minor* and `feature`/`bugfix` are patches. Do not restate the policy — read it there, and if you change one, change both.
 - **Keep the tag message to one or two sentences.** The GitHub Release body comes from the fragments, not from here.
-- **Clean up only after tagging**, never before.
+- **Within a release, clean up only after tagging**, never before. Run on its own, Step 5 has no such precondition.
