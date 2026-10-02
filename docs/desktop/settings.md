@@ -50,10 +50,28 @@ The desktop app has a few keyboard shortcuts of its own. None of the TUI's [keyb
 | Keys | Where | Does |
 | --- | --- | --- |
 | `Ctrl+N` / `⌘N` | Dashboard, with no agent pane open and no text field focused | Opens [New agent](new-agent.md) |
-| `Escape` | Agent pane | Closes the pane and returns to the Dashboard |
+| `Escape` | Agent pane, when you are not typing in its terminal | Closes the pane and returns to the Dashboard |
 | `Ctrl+Shift+C` / `⌘C` | An agent's terminal, with text selected | Copies the selected text. Plain `Ctrl+C` still goes to the agent as an interrupt |
 | `Escape` | Settings | Closes Settings |
 | `Escape` | New agent | Clears the directory filter; otherwise closes the dialog, keeping a draft |
 | `Ctrl` / `⌘` with `=`, `+`, `-`, `0` | Everywhere | Zoom (above) |
 | `j` `k` `l` `h` `Space` `/` `.` `q` | New agent's directory list | Move, open, go up, use, filter, show hidden, close (see [New agent → Directory](new-agent.md#directory)) |
 | `←` `→` | New agent's Mode chips | Previous or next chip |
+
+### Keys typed into an agent's terminal
+
+While you are typing in an agent's terminal, your keys go to the agent the way they do in the TUI, so the agent's own shortcuts work: `Escape`, `Tab`, `Shift+Tab`, the arrow keys and `Ctrl` with a letter all reach it. `Ctrl+C` interrupts the agent, and `Escape` goes to the agent rather than closing the pane, so use **Back to dashboard** to leave. The zoom keys stay with the app.
+
+To start a new line without sending the message, press `Shift+Enter` or `Ctrl+J`; both work in every supported agent. `Ctrl+Enter` reaches the agent as `Ctrl+Enter`, and what it does is up to the agent, as it is in the TUI. See [Shift+Enter or Ctrl+Enter sends the message](../troubleshooting.md#shiftenter-or-ctrlenter-sends-the-message) for what each agent does with it.
+
+#### Editing and pasting in an agent's prompt
+
+The agent's prompt answers to the same text-editing shortcuts as in the TUI, in every supported agent, on every platform: `Home` / `End` or `⌘←` / `⌘→` for the start and end of the line, `Ctrl+←` / `Ctrl+→` or `⌥←` / `⌥→` to move by a word, `⌘⌫` to delete to the start of the line, `Ctrl+Backspace` or `⌥⌫` to delete the previous word, and `Ctrl+Delete` or `⌥⌦` to delete the next one. Outside a Mac, `⌥` is `Alt` and `⌘` is the Windows key. [Editing an agent's prompt](../keyboard-shortcuts.md#editing-an-agents-prompt) has the table, which chords your system keeps for itself, and how agents differ. On Linux the app cannot see the Super key, so `Super+←` arrives as a plain `←`; use `Home` and `End` there.
+
+Paste follows the computer you are typing on, not the machine the agent runs on:
+
+| macOS | Windows | Linux |
+| --- | --- | --- |
+| `⌘V` | `Ctrl+V` or `Ctrl+Shift+V` | `Ctrl+Shift+V` |
+
+`Ctrl+V` pastes only on Windows. On macOS and Linux it goes to the agent, which may have its own use for it — Claude Code, for one, pastes an image with it.

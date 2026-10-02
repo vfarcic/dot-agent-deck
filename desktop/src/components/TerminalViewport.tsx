@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import type { SendResult, TerminalBuffer, TerminalFeed } from "../types";
 import { writeClipboardText } from "../lib/clipboard";
 import { isTerminalCopyChord } from "../lib/terminalCopy";
+import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 
 interface TerminalViewportProps {
@@ -246,6 +247,39 @@ export function TerminalViewport({
     };
     wrapper?.addEventListener("keydown", onCopyKey, true);
     wrapper?.addEventListener("mousedown", onPress, true);
+    // Issue #1422 — the keys xterm would encode differently from the TUI
+    // (Ctrl+Enter and Shift+Enter above all: xterm sends the submitting CR for
+    // both), or in a form the agents do not act on (the editing
+    // chords, such as Cmd+Left). `terminal.input` routes the replacement through
+    // `onData`, so it passes the same input gates as a key xterm sent itself.
+    //
+    // Copy is not handled here, and this handler claims neither copy chord:
+    // issue #1403's Ctrl+Shift+C / Cmd+C is the capture-phase listener on the
+    // wrapper above, which sees the key before xterm or this handler does.
+    // Keep Ctrl+Shift+C and Cmd+C out of both tables below.
+    //
+    // The platform is the webview's (what `navigator` reports), read once per
+    // terminal: it decides the paste key. The editing keys are one table on
+    // every platform, the TUI's.
+    const platform = keyPlatform();
+    terminal.attachCustomKeyEventHandler((event) => {
+      // The platform's paste key: keep xterm from encoding it (on Windows it
+      // would send Ctrl+V as ^V and cancel the paste) and leave the event
+      // uncancelled, so the webview pastes into xterm's textarea and xterm's
+      // own paste handling sends the text to the agent.
+      if (leavesPasteToWebview(event, platform)) return false;
+      const sequence = agentKeySequence(event);
+      if (sequence === undefined) return true;
+      // Claim the key the way xterm claims one it sends: no newline typed into
+      // its helper textarea, and no bubbling to the app's window shortcuts.
+      // Returning false covers the keypress and keyup halves as well.
+      event.preventDefault();
+      if (event.type === "keydown") {
+        event.stopPropagation();
+        terminal.input(sequence, true);
+      }
+      return false;
+    });
     // PRD #882 — `fit()` PROPOSES a size; the daemon disposes.
     //
     // A PTY has exactly one window size, so every client attached to an agent

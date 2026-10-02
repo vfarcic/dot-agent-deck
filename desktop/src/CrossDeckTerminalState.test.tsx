@@ -39,6 +39,7 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
     onData(): { dispose: () => void } { return { dispose: () => {} }; }
+    attachCustomKeyEventHandler(): void {}
     dispose(): void {}
   }
   class FakeFitAddon {

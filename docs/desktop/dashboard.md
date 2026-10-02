@@ -58,9 +58,9 @@ What each status means, and which agents can report Blocked, is on [Session Mana
 To watch or talk to one agent:
 
 1. Click its row, or its open control (`Open <name> agent`). Its live terminal opens in a full-window pane over the Dashboard.
-2. Type into the terminal as you would into the TUI's pane.
+2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
 3. To copy the agent's output, select it with the mouse and press `Ctrl+Shift+C` (`⌘C` on macOS). Plain `Ctrl+C` still goes to the agent as an interrupt, even while text is selected.
-4. Press `Escape`, or **Back to dashboard**, to close the pane. The agent keeps running.
+4. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
 The TUI copies differently: a mouse drag in a pane copies when you release the button, and whether that reaches your clipboard depends on your terminal.
 

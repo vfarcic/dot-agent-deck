@@ -6767,7 +6767,48 @@ fn ctrl_c0_byte(c: char) -> Option<u8> {
 }
 
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
+/// Issue #1422: the platform line-editing chords, as the bytes the desktop
+/// app's agent terminal sends for them (`desktop/src/lib/terminalKeys.ts`), so
+/// the same shortcut does the same thing in an agent whichever client it was
+/// typed into. Each is readline's binding for the edit, and every supported
+/// agent was measured to act on it (`docs/develop/desktop-gui.md`, "Keys in an
+/// agent's terminal").
+///
+/// Without this the encoder below dropped the modifier on every one of them:
+/// Ctrl+Backspace and Cmd+Backspace went out as a one-character DEL, Ctrl+Delete
+/// as a one-character `ESC[3~`, Cmd+Left/Right as a one-character arrow, and
+/// Option+Delete as `ESC ESC[3~`, which Codex and Devin type as `[3~`.
+///
+/// Only the bare chord is translated (Ctrl+Shift+Backspace is not), as on the
+/// desktop. The table does not depend on the platform, in either client: the
+/// deck cannot tell which keyboard is in front of the user — over SSH the
+/// machine it runs on is not the one being typed on — and no chord here means
+/// something else on another platform. Both clients' tests read the table
+/// from `tests/fixtures/editing-shortcuts.json`, so a row changed here alone
+/// fails `keyevent_editing_chords_match_the_shared_table`. Cmd arrives as SUPER only from a
+/// terminal speaking the kitty keyboard protocol that does not keep Cmd chords
+/// for itself; Ctrl+Backspace arrives as `Backspace + CONTROL` only under that
+/// protocol too, since a legacy terminal sends it as BS, the same byte as
+/// Ctrl+H, which is forwarded unchanged.
+fn editing_chord_bytes(key: &KeyEvent) -> Option<&'static [u8]> {
+    let held = key.modifiers;
+    match key.code {
+        KeyCode::Left if held == KeyModifiers::SUPER => Some(b"\x01"), // start of line
+        KeyCode::Right if held == KeyModifiers::SUPER => Some(b"\x05"), // end of line
+        KeyCode::Backspace if held == KeyModifiers::SUPER => Some(b"\x15"), // delete to line start
+        KeyCode::Backspace if held == KeyModifiers::CONTROL => Some(b"\x17"), // delete previous word
+        KeyCode::Delete if held == KeyModifiers::CONTROL || held == KeyModifiers::ALT => {
+            Some(b"\x1bd") // delete next word
+        }
+        _ => None,
+    }
+}
+
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    if let Some(bytes) = editing_chord_bytes(key) {
+        return Some(bytes.to_vec());
+    }
+
     // Alt modifier: wrap the base key bytes with an ESC prefix.
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -6786,11 +6827,25 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
     // submitted instead of inserting a newline.
     //
-    // Only SHIFT/CONTROL open this path. ALT on its own keeps its historical
-    // ESC-prefix form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is
-    // meaningful to some agents; when ALT accompanies SHIFT/CONTROL it is folded
-    // into the modifier bitmask rather than dropped.
-    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL)
+    // Only SHIFT/CONTROL open this path, plus ALT on an arrow. ALT on its own
+    // otherwise keeps its historical ESC-prefix form (Alt+Enter → `ESC\r`),
+    // because a genuine Alt+Enter is meaningful to some agents; when ALT
+    // accompanies SHIFT/CONTROL it is folded into the modifier bitmask rather
+    // than dropped.
+    //
+    // Issue #1422: Alt+arrow is `ESC[1;3<dir>`, what xterm, the desktop app
+    // and most terminals send, rather than `ESC` + the bare arrow. Claude Code
+    // and Pi read that ESC-prefixed form as a one-character move and Codex and
+    // Devin type its `[D` into the draft, so Option+Left (Alt+Left) did not
+    // move by a word.
+    let alt_arrow = key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        );
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+        || alt_arrow
     {
         let m = csi_modifier_param(key.modifiers);
         match key.code {
@@ -32793,6 +32848,153 @@ mod tests {
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
             Some(b"\x1b[D".to_vec())
         );
+    }
+
+    /// Issue #1422: the platform editing chords reach a pane as the bytes the
+    /// desktop app's agent terminal sends for them, not with the modifier
+    /// dropped; anything other than the bare chord keeps its old encoding.
+    #[test]
+    fn keyevent_editing_chords_match_the_desktop() {
+        let cases: &[(KeyCode, KeyModifiers, &[u8])] = &[
+            (KeyCode::Backspace, KeyModifiers::CONTROL, b"\x17"),
+            (KeyCode::Delete, KeyModifiers::CONTROL, b"\x1bd"),
+            (KeyCode::Delete, KeyModifiers::ALT, b"\x1bd"),
+            (KeyCode::Left, KeyModifiers::SUPER, b"\x01"),
+            (KeyCode::Right, KeyModifiers::SUPER, b"\x05"),
+            (KeyCode::Backspace, KeyModifiers::SUPER, b"\x15"),
+            (KeyCode::Left, KeyModifiers::ALT, b"\x1b[1;3D"),
+            (KeyCode::Right, KeyModifiers::ALT, b"\x1b[1;3C"),
+            (KeyCode::Up, KeyModifiers::ALT, b"\x1b[1;3A"),
+            (KeyCode::Down, KeyModifiers::ALT, b"\x1b[1;3B"),
+            // Unchanged: already the desktop's bytes, or not a bare chord.
+            (KeyCode::Backspace, KeyModifiers::ALT, b"\x1b\x7f"),
+            (KeyCode::Backspace, KeyModifiers::NONE, b"\x7f"),
+            (KeyCode::Delete, KeyModifiers::NONE, b"\x1b[3~"),
+            (KeyCode::Left, KeyModifiers::CONTROL, b"\x1b[1;5D"),
+            (
+                KeyCode::Left,
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                b"\x1b[1;7D",
+            ),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+                b"\x7f",
+            ),
+            (KeyCode::Char('h'), KeyModifiers::CONTROL, b"\x08"),
+            (KeyCode::Enter, KeyModifiers::ALT, b"\x1b\r"),
+        ];
+        for (code, modifiers, expected) in cases {
+            assert_eq!(
+                keyevent_to_bytes(&KeyEvent::new(*code, *modifiers)).as_deref(),
+                Some(*expected),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+    }
+
+    /// Issue #1422: the TUI's editing shortcuts are the shared table in
+    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
+    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
+    /// translates exactly the `translated` rows: a chord added on this side
+    /// only, or dropped from it, fails here instead of drifting from the
+    /// desktop.
+    #[test]
+    fn keyevent_editing_chords_match_the_shared_table() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/editing-shortcuts.json"
+        )))
+        .expect("the shared editing-shortcut table parses");
+        let code_for = |key: &str| match key {
+            "ArrowLeft" => KeyCode::Left,
+            "ArrowRight" => KeyCode::Right,
+            "ArrowUp" => KeyCode::Up,
+            "ArrowDown" => KeyCode::Down,
+            "Backspace" => KeyCode::Backspace,
+            "Delete" => KeyCode::Delete,
+            "Home" => KeyCode::Home,
+            "End" => KeyCode::End,
+            other => panic!("the shared table names a key this test cannot map: {other}"),
+        };
+        let modifier_for = |name: &str| match name {
+            "ctrl" => KeyModifiers::CONTROL,
+            "alt" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            "super" => KeyModifiers::SUPER,
+            other => panic!("the shared table names a modifier this test cannot map: {other}"),
+        };
+        let rows = |list: &str| -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
+            table[list]
+                .as_array()
+                .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
+                .iter()
+                .map(|row| {
+                    let modifiers = row["modifiers"]
+                        .as_array()
+                        .expect("a row's modifiers are a list")
+                        .iter()
+                        .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
+                        .fold(KeyModifiers::NONE, KeyModifiers::union);
+                    let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
+                    (
+                        code_for(row["key"].as_str().expect("a row names its key")),
+                        modifiers,
+                        bytes.as_bytes().to_vec(),
+                    )
+                })
+                .collect()
+        };
+        let translated = rows("translated");
+        let standard = rows("standard");
+        assert!(!translated.is_empty() && !standard.is_empty());
+
+        for (code, modifiers, bytes) in translated.iter().chain(&standard) {
+            assert_eq!(
+                keyevent_to_bytes(&KeyEvent::new(*code, *modifiers)).as_deref(),
+                Some(bytes.as_slice()),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+
+        let keys = [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+        ];
+        let bits = [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+        ];
+        for code in keys {
+            for mask in 0u32..(1 << bits.len()) {
+                let modifiers = bits
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .fold(KeyModifiers::NONE, |held, (_, bit)| held.union(*bit));
+                let expected = translated
+                    .iter()
+                    .find(|(c, m, _)| *c == code && *m == modifiers)
+                    .map(|(_, _, bytes)| bytes.as_slice());
+                assert_eq!(
+                    editing_chord_bytes(&KeyEvent::new(code, modifiers)),
+                    expected,
+                    "{code:?} with {modifiers:?}: the TUI translates exactly the shared table's chords"
+                );
+            }
+        }
     }
 
     #[test]
