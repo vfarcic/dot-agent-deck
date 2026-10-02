@@ -88,8 +88,8 @@ test.describe("numbered lists while voice is on", () => {
     await expect(tiles.nth(2)).toHaveClass(/is-selected/);
   });
 
-  /** Scenario: in the New agent dialog, daemon options, directory rows and mode chips share one sequence in reading order. Filtering changes the visible rows and renumbers the remaining items. */
-  test("daemon, directory and mode numbers are unique and update after filtering", async ({ page }) => {
+  /** Scenario: the New agent dialog numbers daemons, directories (including ..) and modes separately from 1. Filtering renumbers only the directory section. */
+  test("daemon, directory and mode numbers each start at one and update after filtering", async ({ page }) => {
     await openWithSpeech(page, "fleet");
     await selectOverview(page);
     await page.getByTestId("overview-new-agent").click();
@@ -97,30 +97,32 @@ test.describe("numbered lists while voice is on", () => {
     await expect(decks).toHaveCount(2);
     await expect(decks.first()).not.toHaveAccessibleName(/^1\./);
     await turnOnVoice(page);
-    let next = await expectNumbers(decks, 1);
+    await expectNumbers(decks, 1);
 
     await decks.first().click();
     const directories = page.getByTestId("new-agent-directory-list").getByRole("option");
     await expect(directories.first()).toBeVisible();
-    next = await expectNumbers(directories, next);
+    await expectNumbers(directories, 1);
+    await expect(directories.first()).toContainText("..");
     const modes = page.getByTestId("new-agent-modes").getByRole("button").filter({ visible: true });
-    await expectNumbers(modes, next);
+    await expectNumbers(modes, 1);
 
     await page.getByTestId("new-agent-filter").fill("project");
     await expect(directories).toHaveCount(2); // parent plus the matching project
-    next = await expectNumbers(directories, 3);
-    await expectNumbers(modes, next);
+    await expectNumbers(directories, 1);
+    await expectNumbers(modes, 1);
   });
 
-  /** Scenario: a digit on the directory list enters the row showing that number. The same digit in the Filter field is text and leaves the current directory alone. */
-  test("directory digit keys select a row but digits in Filter are typed", async ({ page }) => {
+  /** Scenario: key 3 on the directory list enters directory 3. The same key in Filter, Name and Command types text without browsing. */
+  test("directory digit key selects directory 3 but digits in fields are typed", async ({ page }) => {
     await openWithSpeech(page, "fleet");
     await selectOverview(page);
     await page.getByTestId("overview-new-agent").click();
     await turnOnVoice(page);
     await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
     const list = page.getByTestId("new-agent-directory-list");
-    const third = list.getByRole("option").first(); // the first directory follows two daemon numbers
+    const third = list.getByRole("option").nth(2);
+    await expect(third).toHaveAccessibleName(/^3\./);
     const path = await third.getAttribute("data-path");
     expect(path).toBeTruthy();
     await list.focus();
@@ -133,6 +135,33 @@ test.describe("numbered lists while voice is on", () => {
     await page.keyboard.press("3");
     await expect(filter).toHaveValue("3");
     await expect(page.getByTestId("new-agent-current-path")).toHaveText(current!);
+    await filter.fill("");
+    await page.getByTestId("new-agent-use-directory").click();
+    for (const field of ["new-agent-name", "new-agent-command"]) {
+      const input = page.getByTestId(field);
+      await input.fill("");
+      await input.focus();
+      await page.keyboard.press("3");
+      await expect(input).toHaveValue("3");
+      await expect(page.getByTestId("new-agent-current-path")).toHaveText(current!);
+    }
+  });
+
+  /** Scenario: key 3 in the Mode chips chooses the chip labelled 3; it does not enter directory 3 or choose daemon 3. */
+  test("mode digit key selects mode 3 in the focused section", async ({ page }) => {
+    await openWithSpeech(page, "fleet");
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await page.getByTestId("new-agent-use-directory").click();
+    await turnOnVoice(page);
+    const modes = page.getByTestId("new-agent-modes");
+    const third = modes.getByRole("button").nth(2);
+    await expect(third).toHaveAccessibleName(/^3\./);
+    await modes.getByRole("button").first().focus();
+    await page.keyboard.press("3");
+    await expect(third).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
   });
 
   /** Scenario: the two daemon options are numbered first; saying “two” chooses the second daemon and shows its own home directory. */
@@ -144,20 +173,91 @@ test.describe("numbered lists while voice is on", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/build");
   });
 
-  /** Scenario: after the two daemon options, the parent directory is 3 and demo-project is 4. Saying “number four” browses into that project. */
+  /** Scenario: the New agent dialog shows daemon 1. Saying “Select daemon 1” chooses that displayed daemon and opens its directory browser. */
+  test("Select daemon 1 chooses the daemon showing 1", async ({ page }) => {
+    await openWithSpeech(page, "fleet", ["Select daemon 1"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    const daemon = page.getByTestId("new-agent-deck-list").getByRole("option").first();
+    const deckId = await daemon.getAttribute("data-deck-id");
+    await turnOnVoice(page);
+    await expect(daemon).toHaveAccessibleName(/^1\./);
+    await expect(page.getByTestId("new-agent-deck-list").locator("[data-chosen='true']")).toHaveAttribute("data-deck-id", deckId!);
+    await expect(page.getByTestId("new-agent-directory-list")).toBeVisible();
+    await expect(page.getByTestId("voice-report")).not.toContainText("no matching action");
+  });
+
+  /** Scenario: with only the directory section showing 3, saying “three” enters that directory directly without a choice dialog. */
   test("a spoken number enters the displayed directory", async ({ page }) => {
-    await openWithSpeech(page, "fleet", ["number four"]);
+    await openWithSpeech(page, "fleet", ["three"]);
     await selectOverview(page);
     await page.getByTestId("overview-new-agent").click();
     await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
     await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
     await turnOnVoice(page);
-    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/demo-project");
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/scratch");
+    await expect(page.getByTestId("voice-choice")).toHaveCount(0);
   });
 
-  /** Scenario: with two daemon options and three directory rows before the mode chips, number 7 chooses schedule on the remote daemon. */
-  test("a spoken number chooses the displayed mode chip", async ({ page }) => {
-    await openWithSpeech(page, "fleet", ["number seven"]);
+  /** Scenario: “directory 3” names the third directory even while the Mode section also shows a 3. Its kind removes the ambiguity. */
+  test("directory 3 chooses its section without offering a choice", async ({ page }) => {
+    await openWithSpeech(page, "fleet", ["directory 3"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await page.getByTestId("new-agent-use-directory").click();
+    await turnOnVoice(page);
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/scratch");
+    await expect(page.getByTestId("voice-choice")).toHaveCount(0);
+  });
+
+  for (const answer of ["Directory", "Mode"]) {
+    /** Scenario: two sections show 3, so bare “three” offers exactly Directory 3 and Mode 3. Choosing either labelled answer acts on that section. */
+    test(`bare three offers both sections and choosing ${answer} acts there`, async ({ page }) => {
+      await openWithSpeech(page, "fleet", ["three"]);
+      await selectOverview(page);
+      await page.getByTestId("overview-new-agent").click();
+      await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+      await page.getByTestId("new-agent-use-directory").click();
+      const modeId = await page.getByTestId("new-agent-modes").getByRole("button").nth(2).getAttribute("data-mode");
+      await turnOnVoice(page);
+      const choice = page.getByTestId("voice-choice");
+      await expect(choice).toBeVisible();
+      await expect(choice.getByRole("button")).toHaveCount(3); // two answers and Cancel
+      await expect(choice.getByRole("button", { name: /^1\. Directory 3: scratch$/ })).toBeVisible();
+      const modeAnswer = choice.getByRole("button", { name: /^2\. Mode 3: / });
+      await expect(modeAnswer).toBeVisible();
+      if (answer === "Directory") {
+        await choice.getByRole("button", { name: /^1\. Directory 3: scratch$/ }).click();
+        await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/scratch");
+      } else {
+        await modeAnswer.click();
+        await expect(page.getByTestId(`new-agent-mode-${modeId}`)).toHaveAttribute("aria-pressed", "true");
+        await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
+      }
+      await expect(choice).toHaveCount(0);
+    });
+  }
+
+  /** Scenario: a crowded directory page visibly includes row 13. Saying “Select directory 13” enters that row and the voice report does not claim there was no action. */
+  test("Select directory 13 enters the directory showing 13", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 720 });
+    await openWithSpeech(page, "voice-pages", ["Select directory 13"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await turnOnVoice(page);
+    const directory = page.getByTestId("new-agent-directory-list").getByRole("option", { name: /^13\./ });
+    await expect(directory).toBeVisible();
+    const path = await directory.getAttribute("data-path");
+    expect(path).toBeTruthy();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText(path!);
+    await expect(page.getByTestId("voice-report")).not.toContainText("no matching action");
+  });
+
+  /** Scenario: “mode 2” chooses the mode visibly numbered 2, independent of daemon and directory counts. */
+  test("mode 2 chooses the displayed mode chip", async ({ page }) => {
+    await openWithSpeech(page, "fleet", ["mode 2"]);
     await selectOverview(page);
     await page.getByTestId("overview-new-agent").click();
     await page.getByTestId("new-agent-deck-list").getByRole("option").nth(1).click();
@@ -166,6 +266,49 @@ test.describe("numbered lists while voice is on", () => {
     await expect(page.getByTestId("new-agent-mode-schedule")).toBeEnabled();
     await turnOnVoice(page);
     await expect(page.getByTestId("new-agent-mode-schedule")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  /** Scenario: Schedule shows 2 in the New agent form. Saying “choose mode 2” selects that chip. */
+  test("choose mode 2 selects the mode showing 2", async ({ page }) => {
+    await openWithSpeech(page, "fleet", ["choose mode 2"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").nth(1).click();
+    await page.getByTestId("new-agent-use-directory").click();
+    const schedule = page.getByTestId("new-agent-mode-schedule");
+    await turnOnVoice(page);
+    await expect(schedule).toHaveAccessibleName(/^2\./);
+    await expect(schedule).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("voice-report")).not.toContainText("no matching action");
+  });
+
+  /** Scenario: directory 13 is visible but “select daemon 13” names the wrong kind. The browser stays in place and reports the mismatch briefly. */
+  test("select daemon 13 refuses a directory numbered 13", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 720 });
+    await openWithSpeech(page, "voice-pages", ["select daemon 13"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await turnOnVoice(page);
+    await expect(page.getByTestId("new-agent-directory-list").getByRole("option", { name: /^13\./ })).toBeVisible();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
+    const report = page.getByTestId("voice-report");
+    await expect(report).toContainText(/no daemon.*13|13 is.*directory|13.*not.*daemon/i);
+    await expect(report).not.toContainText("no matching action");
+  });
+
+  /** Scenario: no directory shows 99, so “select directory 99” leaves the browser in place and says the requested number is out of range. */
+  test("select directory 99 refuses an unseen number", async ({ page }) => {
+    await openWithSpeech(page, "fleet", ["select directory 99"]);
+    await selectOverview(page);
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await turnOnVoice(page);
+    await expect(page.getByTestId("new-agent-directory-list").getByRole("option", { name: /^99\./ })).toHaveCount(0);
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
+    const report = page.getByTestId("voice-report");
+    await expect(report).toContainText(/no directory.*99|99.*not|99.*out of range/i);
+    await expect(report).not.toContainText("no matching action");
   });
 
   for (const phrase of ["three", "number three", "the third one"]) {
@@ -180,4 +323,16 @@ test.describe("numbered lists while voice is on", () => {
       await expect(page.getByRole("dialog", { name: "Which agent?" })).toHaveCount(0);
     });
   }
+
+  /** Scenario: “open agent 3” opens the dashboard row visibly numbered 3, just as saying the bare number does. */
+  test("open agent 3 opens the dashboard agent showing 3", async ({ page }) => {
+    await openWithSpeech(page, "docs", ["open agent 3"]);
+    await selectOverview(page);
+    await turnOnVoice(page);
+    await expect(page.getByRole("row", { name: /^3\./ })).toHaveCount(1);
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+    await expect(page.getByTestId("agent-pane-overlay").locator(".agent-assignment p"))
+      .toHaveText("Check the payment API for breaking changes.");
+    await expect(page.getByTestId("voice-report")).not.toContainText("no matching action");
+  });
 });

@@ -1,6 +1,6 @@
 import { createContext, useContext, useLayoutEffect } from "react";
 import { useVoiceOn } from "./useVoiceOn";
-import type { VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import type { VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 
 /**
  * PR #1451 round 3, change 3 — where a surface declares what it numbers.
@@ -11,6 +11,9 @@ import type { VoiceNumberedEntryDto } from "../lib/voiceNumbers";
  * screen's otherwise (`DeckShell`'s `readNumbered`), and hands that to the
  * voice panel, which answers a spoken number against it.
  *
+ * Each surface declares its SECTIONS — one kind of list each, numbered from 1
+ * (round 4, D7).
+ *
  * A surface declares its items whether or not voice is on — the numbers it
  * RENDERS follow `useVoiceOn` — so the list the user is looking at is already
  * declared at the moment voice turns on. `undefined` declares nothing: a
@@ -19,22 +22,22 @@ import type { VoiceNumberedEntryDto } from "../lib/voiceNumbers";
 export type NumberedLayer = "screen" | "dialog";
 
 export interface VoiceNumbering {
-  publish: (layer: NumberedLayer, entries: readonly VoiceNumberedEntryDto[] | undefined) => void;
+  publish: (layer: NumberedLayer, sections: readonly VoiceNumberedSectionDto[] | undefined) => void;
 }
 
 export const VoiceNumberingContext = createContext<VoiceNumbering | undefined>(undefined);
 
 /**
- * Declare `entries` as `layer`'s numbered list for as long as the caller is
+ * Declare `sections` as `layer`'s numbered list for as long as the caller is
  * mounted, updated on every commit that changes it. Layout effects, so the
  * declaration has moved by the time anything reads the screen after the
  * commit; the cleanup withdraws it before a replacing surface declares its own.
  */
-export function useNumberedList(layer: NumberedLayer, entries: readonly VoiceNumberedEntryDto[] | undefined): void {
+export function useNumberedList(layer: NumberedLayer, sections: readonly VoiceNumberedSectionDto[] | undefined): void {
   const numbering = useContext(VoiceNumberingContext);
   useLayoutEffect(() => {
-    numbering?.publish(layer, entries);
-  }, [entries, layer, numbering]);
+    numbering?.publish(layer, sections);
+  }, [sections, layer, numbering]);
   useLayoutEffect(() => () => numbering?.publish(layer, undefined), [layer, numbering]);
 }
 

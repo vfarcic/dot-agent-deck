@@ -86,7 +86,7 @@ import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
 import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
-import { answerNumberLocally, numberedOutcome, numberedParam, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "../lib/voiceNumbers";
+import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
@@ -303,9 +303,25 @@ export const VOICE_NUMBERS_MOVED_ON = "The numbers on screen changed while you w
 export const VOICE_NUMBERS_CHOICE_MOVED_ON = "The numbers on screen changed after the choice was offered, so nothing ran. Say the number again.";
 /** What a numbered answer's report names as having answered it: the app itself, with no backend asked. */
 const NUMBERS_BACKEND = "local";
-/** A spoken number no item on screen shows. */
-export function voiceNumberNotShown(number: number): string {
-  return number < 1 ? "No item on screen shows that number, so nothing ran." : `No item on screen shows number ${number}, so nothing ran.`;
+/**
+ * A spoken number no item on screen shows — in the section said, when one
+ * was ("select directory 99"). `elsewhere` names the other sections that do
+ * show it ("select daemon 13" while directory 13 is on screen), which the
+ * sentence points at without acting on (round 4, D7).
+ */
+export function voiceNumberNotShown(number: number, section?: VoiceNumberedSectionKind, elsewhere: readonly VoiceNumberedSectionKind[] = []): string {
+  const item = section === undefined ? "item" : SECTION_NOUNS[section].one;
+  if (number < 1) return `No ${item} on screen shows that number, so nothing ran.`;
+  const refusal = `No ${item} on screen shows number ${number}, so nothing ran.`;
+  const other = elsewhere[0];
+  return other === undefined ? refusal : `${refusal} ${number} is ${SECTION_NOUNS[other].a}: say “${SECTION_NOUNS[other].one} ${number}”.`;
+}
+
+/** A section said with a number when that section numbers nothing on screen: "mode 2" on the dashboard (round 4, D7). */
+export function voiceSectionNotNumbered(section: VoiceNumberedSectionKind, shown: readonly VoiceNumberedSectionKind[]): string {
+  const names = shown.map((kind) => SECTION_NOUNS[kind].many);
+  const what = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0];
+  return `No ${SECTION_NOUNS[section].many} are numbered on screen, so nothing ran.${what ? ` The numbers are on ${what}.` : ""}`;
 }
 
 /**
@@ -1797,24 +1813,34 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [current, runNumbered]);
 
   /**
-   * PR #1451 round 3, change 3 — a number that is also another item's name:
-   * the items it could mean, offered as the numbered choice, the one showing
-   * the number first. With a confirmation open, or more items than a choice
+   * PR #1451 round 3, change 3 — a number that names several items: the same
+   * number in several sections (round 4, D7), or an item showing it and
+   * another item of its section whose name is or ends in it. Offered as the
+   * numbered choice in the order Rust gave them; an entry is labelled by its
+   * section ("Directory 3: scratch", "Mode 3: Review") when the choice spans
+   * more than one. With a confirmation open, or more items than a choice
    * shows, it is only refused.
    */
-  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, numbers: number[], declared: VoiceContext) => {
-    const entries = numbers.flatMap((number) => heard.entries[number - 1] ?? []);
+  const offerNumbered = useCallback((utterance: string, heard: VoiceNumberedListDto, choices: VoiceNumberRefDto[], declared: VoiceContext) => {
+    const found = choices.flatMap((choice) => {
+      const entry = numberedEntry(heard, choice.section, choice.number);
+      return entry ? [{ choice, entry }] : [];
+    });
+    const entries = found.map(({ entry }) => entry);
+    const spansSections = new Set(found.map(({ choice }) => choice.section)).size > 1;
+    const labelOf = ({ choice, entry }: (typeof found)[number]) => (spansSections ? `${SECTION_NOUNS[choice.section].title} ${choice.number}: ${entry.label}` : entry.label);
     const first = entries[0];
-    const labels = entries.map((entry) => `“${entry.label}”`).join(" or ");
+    const labels = found.map((item) => `“${labelOf(item)}”`).join(" or ");
     const sentence = `“${utterance}” could mean ${labels}.`;
     if (first === undefined || entries.length > VOICE_CHOICE_MAX || confirmationRef.current) {
       setProblem(`${sentence} Nothing ran.`);
       return;
     }
     const row = numberedOutcome(first, utterance);
-    /* Each candidate's `value` is its number: unique, where two decks'
-       agents can share an id. The item itself rides in `numbered`. */
-    const candidates = entries.map((entry, at) => ({ ...numberedParam(entry, utterance), value: String(numbers[at]) }));
+    /* Each candidate's `value` is its section and number: unique, where two
+       decks' agents can share an id and two sections a number. The item
+       itself rides in `numbered`. */
+    const candidates = found.map((item) => ({ ...numberedParam(item.entry, utterance), value: `${item.choice.section}:${item.choice.number}`, label: labelOf(item) }));
     const outcome: VoiceChoiceOffer["outcome"] = {
       kind: "param_ambiguous",
       transcript: utterance,
@@ -1822,7 +1848,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       invoke: row.invoke,
       param: candidates[0].name,
       spoken: utterance,
-      matches: entries.map((entry) => entry.label),
+      matches: found.map(labelOf),
       candidates,
       params: [],
       sentence,
@@ -1835,8 +1861,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [setPanelState]);
 
   /**
-   * PR #1451 round 3, change 3 — answer `utterance` if it is a bare number
-   * said about the numbered list on screen, locally: no Commands backend
+   * PR #1451 round 3, change 3 — answer `utterance` if it is a number, bare
+   * or with its section ("directory 13", "select daemon 1" — round 4), said
+   * about the numbered list on screen, locally: no Commands backend
    * call, Rust's `voice::numbers::answer` where the runtime has it and the
    * webview's port where it does not. Answers whether the utterance was
    * handled here; `false` means it is not a number (or nothing is numbered)
@@ -1851,7 +1878,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const answerNumber = useCallback(async (utterance: string, ours: () => boolean): Promise<boolean> => {
     const heard = heardNumbers.current;
     const read = numberedRef.current;
-    if (heard === undefined || read === undefined || heard.entries.length === 0) return false;
+    if (heard === undefined || read === undefined || !hasNumbered(heard)) return false;
     const declared = heardContext.current ?? current();
     setPhase("resolving");
     let verdict: VoiceNumberAnswerDto;
@@ -1870,16 +1897,20 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return true;
     }
     if (verdict.kind === "out_of_range") {
-      setProblem(voiceNumberNotShown(verdict.number));
+      setProblem(voiceNumberNotShown(verdict.number, verdict.section, verdict.elsewhere));
+      return true;
+    }
+    if (verdict.kind === "not_numbered") {
+      setProblem(voiceSectionNotNumbered(verdict.section, verdict.shown));
       return true;
     }
     /* The gate for acting on the answer at all, as for a resolved one. */
     const lost = contextLost(declared, current(), { answer: true });
     if (lost) setProblem(answerRefusal(lost));
-    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.numbers, declared);
+    else if (verdict.kind === "ambiguous") offerNumbered(utterance, heard, verdict.choices, declared);
     else {
-      const entry = heard.entries[verdict.number - 1];
-      if (entry === undefined) setProblem(voiceNumberNotShown(verdict.number));
+      const entry = numberedEntry(heard, verdict.section, verdict.number);
+      if (entry === undefined) setProblem(voiceNumberNotShown(verdict.number, verdict.section));
       else runNumbered(entry, utterance, declared, answerRefusal);
     }
     return true;
@@ -2064,8 +2095,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       closeChoice(VOICE_CHOICE_CLOSED);
     }
-    /* PR #1451 round 3, change 3 — a bare number said about the numbered list
-       on screen is answered here, locally, with no Commands backend call. Not
+    /* PR #1451 round 3, change 3 — a number said about the numbered list on
+       screen, bare or with its section (round 4), is answered here, locally, with no Commands backend call. Not
        while typing, where a number is the user's words. Anything else falls
        through to be resolved. */
     if (panelStateRef.current.kind === "idle" && await answerNumber(utterance, ours)) return;
@@ -3150,7 +3181,9 @@ function VoiceChoiceDialog({ offer, secondsLeft, onPick, onCancel }: {
   const firstEntry = useRef<HTMLButtonElement>(null);
   const titleId = `voice-choice-title-${offer.deadline}`;
   const candidates = offer.outcome.candidates;
-  const noun = VOICE_CHOICE_NOUNS[candidates[0]?.kind ?? ""];
+  /* A choice across sections (round 4, D7) mixes kinds: "Which one?". */
+  const kind = candidates[0]?.kind;
+  const noun = candidates.every((candidate) => candidate.kind === kind) ? VOICE_CHOICE_NOUNS[kind ?? ""] : undefined;
   /* Layout effects, so the opener is read before anything else on this commit
      moves focus, and given back before the passive effects of whatever the
      close opened (a pane takes focus in one) run after it. */

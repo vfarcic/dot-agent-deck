@@ -7,7 +7,7 @@ import { useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
 import { useVoiceOn } from "../hooks/useVoiceOn";
-import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto, type VoiceNumberedSectionKind } from "../lib/voiceNumbers";
 import { gridFit, offPageSentence, pageMarker, pageSlice, type PageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
 import { VoiceNumber } from "./VoiceNumber";
 import {
@@ -1376,10 +1376,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const modeOffset = modesPaged ? modeSlice.start : 0;
   const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
   /**
-   * Which list "next page" turns and the numbers count on: the Mode row once
-   * a directory is chosen and it pages, else the directory rows when they
-   * page, else the Mode row when it pages — never both, so a turn is never
-   * ambiguous and a number names one item.
+   * Which list "next page" turns: the Mode row once a directory is chosen
+   * and it pages, else the directory rows when they page, else the Mode row
+   * when it pages — never both, so a turn is never ambiguous. Numbers are per
+   * section (round 4, D7), so each paged list numbers its own page from 1.
    */
   const pagedList: "directories" | "modes" | undefined = modesPaged && target ? "modes" : directoriesPaged ? "directories" : modesPaged ? "modes" : undefined;
   const turnDirectories = (delta: 1 | -1) => setCursor(pageSlice(rows.length, directoryCapacity, directorySlice.page + delta).start);
@@ -1653,47 +1653,43 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const formDisabled = busy || !target;
 
   /*
-    PR #1451 round 3, change 3 — the dialog's three lists as ONE numbered
-    sequence in reading order: the daemons it lists, the directory rows on
-    screen (after the filter, `..` first), then the Mode chips. A number names
-    one item in the whole dialog, and the numbers move whenever a list does —
-    another directory, another filter. Declared for voice whether or not voice
-    is on; shown only while it is.
+    PR #1451 round 3, change 3, as round 4 (D7) re-decided it — the dialog's
+    three lists as three SECTIONS, each numbered from 1: the daemons it lists,
+    the directory rows on screen (after the filter, `..` first), then the Mode
+    chips. "directory 3" and "mode 3" name one item each, and a bare "three"
+    shown by both is offered as a choice between them. The numbers move
+    whenever a list does — another directory, another filter. Declared for
+    voice whether or not voice is on; shown only while it is.
 
     Change 4: while a list is split into pages, ITS page is what is numbered,
-    from 1 on every page, and the dialog's other lists carry no numbers — a
-    number still names one item, and turning the page renumbers it.
+    from 1 on every page, and turning the page renumbers it.
+
+    The Mode chips are declared only while the form is live: until a directory
+    is chosen they cannot be chosen, so a number they show acts on nothing and
+    takes no part in a bare number's answer.
   */
   const rowEntry = (row: DirectoryRow): VoiceNumberedEntryDto => (row.kind === "up"
     ? { kind: "parent", value: row.path, label: "..", names: [] }
     : { kind: "directory", value: row.entry.path, label: row.entry.displayName, names: [] });
   const modeEntry = (chip: { id: ModeId; label: string }): VoiceNumberedEntryDto => ({ kind: "mode", value: chip.id, label: chip.label, names: [] });
-  const numberedEntries: VoiceNumberedEntryDto[] = pagedList === "directories"
-    ? shownRows.map(rowEntry)
-    : pagedList === "modes"
-      ? shownModes.map(modeEntry)
-      : [
-        ...usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })),
-        ...rows.map(rowEntry),
-        ...modes.map(modeEntry),
-      ];
-  useNumberedList("dialog", numberedEntries);
+  const numberedSections: VoiceNumberedSectionDto[] = [
+    { kind: "deck", entries: usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })) },
+    { kind: "directory", entries: shownRows.map(rowEntry) },
+    ...(formDisabled ? [] : [{ kind: "mode" as const, entries: shownModes.map(modeEntry) }]),
+  ];
+  useNumberedList("dialog", numberedSections);
   const numbersShown = useNumbersShown();
-  /** The number the deck at `index`, the row at `index` and the chip at `index` show, if any. */
-  const deckNumber = numbersShown && pagedList === undefined ? (index: number) => index + 1 : () => undefined;
-  const rowNumber = !numbersShown
-    ? () => undefined
-    : pagedList === "directories" ? (index: number) => index - rowOffset + 1 : pagedList === undefined ? (index: number) => usable.length + index + 1 : () => undefined;
-  const modeNumber = !numbersShown
-    ? () => undefined
-    : pagedList === "modes" ? (index: number) => index - modeOffset + 1 : pagedList === undefined ? (index: number) => usable.length + rows.length + index + 1 : () => undefined;
+  /** The number the deck at `index`, the row at `index` and the chip at `index` show, if any: each from 1 in its own section. */
+  const deckNumber = numbersShown ? (index: number) => index + 1 : () => undefined;
+  const rowNumber = numbersShown ? (index: number) => index - rowOffset + 1 : () => undefined;
+  const modeNumber = numbersShown ? (index: number) => index - modeOffset + 1 : () => undefined;
   /**
-   * The item showing `number`, as a click on it would choose it: a daemon,
-   * a directory row (entered, or `..` gone up), or a Mode chip while the form
-   * is live.
+   * The item showing `number` in `section`, as a click on it would choose
+   * it: a daemon, a directory row (entered, or `..` gone up), or a Mode chip
+   * while the form is live.
    */
-  const chooseNumbered = (number: number) => {
-    const entry = numberedEntries[number - 1];
+  const chooseNumbered = (section: VoiceNumberedSectionKind, number: number) => {
+    const entry = numberedSections.find((candidate) => candidate.kind === section)?.entries[number - 1];
     if (!entry) return;
     if (entry.kind === "deck") {
       chooseDeck(usable.find((choice) => choice.deckId === entry.value));
@@ -1710,19 +1706,24 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (row.kind === "up") goUp();
     else if (deck) void loadListing(deck.deckId, row.entry.path);
   };
-  /** A digit on one of the numbered lists, while voice shows the numbers; never in a field. */
-  const onNumberKey = (event: KeyboardEvent<HTMLElement>): boolean => {
+  /**
+   * A digit on one of the numbered lists, while voice shows the numbers:
+   * the item showing it in `section`, the list with keyboard focus (round 4,
+   * D7). Never in a field.
+   */
+  const onNumberKey = (event: KeyboardEvent<HTMLElement>, section: VoiceNumberedSectionKind): boolean => {
     if (!numbersShown || busy) return false;
     const number = numberKey(event.nativeEvent);
-    if (number === undefined || number > numberedEntries.length) return false;
+    const entries = numberedSections.find((candidate) => candidate.kind === section)?.entries ?? [];
+    if (number === undefined || number > entries.length) return false;
     event.preventDefault();
-    chooseNumbered(number);
+    chooseNumbered(section, number);
     return true;
   };
 
   // -- keys --------------------------------------------------------------------
   const onDeckKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy || onNumberKey(event)) return;
+    if (busy || onNumberKey(event, "deck")) return;
     const index = usable.findIndex((choice) => choice.deckId === highlight);
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
@@ -1737,7 +1738,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   };
 
   const onDirectoryKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy || event.ctrlKey || event.metaKey || event.altKey || onNumberKey(event)) return;
+    if (busy || event.ctrlKey || event.metaKey || event.altKey || onNumberKey(event, "directory")) return;
     switch (event.key) {
       case "ArrowDown":
       case "j":
@@ -1818,7 +1819,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   /** The TUI form's Left / Right on the Mode row: move to the previous or next chip, wrapping. */
   const onModeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (onNumberKey(event)) return;
+    if (onNumberKey(event, "mode")) return;
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
     const index = modes.findIndex((candidate) => candidate.id === mode);

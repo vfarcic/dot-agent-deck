@@ -16,7 +16,7 @@ import { VoiceNumber } from "./VoiceNumber";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { usePager } from "../hooks/useVoicePages";
 import { useVoiceOn } from "../hooks/useVoiceOn";
-import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { pageMarker, pageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
@@ -1245,7 +1245,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
        id, which nobody reads off the row and which often ends in a digit. */
     names: [agent.tab.kind === "orchestration" ? agent.tab.roleName : undefined, agent.cli].filter((name): name is string => Boolean(name)),
   })), [numberedAgents]);
-  useNumberedList("screen", numberedEntries);
+  /* One section across every daemon group (round 4, D7). */
+  const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "agent", entries: numberedEntries }], [numberedEntries]);
+  useNumberedList("screen", numberedSections);
   const voiceOn = useNumbersShown("screen");
   const rowNumbers = useMemo(() => (
     voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined

@@ -76,7 +76,7 @@ import {
 } from "../lib/endpoints";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
-import { numberKey, type VoiceNumberedEntryDto } from "../lib/voiceNumbers";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { VoiceNumber } from "./VoiceNumber";
 import type { ConnectionView } from "../types";
 
@@ -193,7 +193,8 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
     label: choice.label,
     names: choice.address ? [choice.address] : [],
   })), [numberedChoices]);
-  useNumberedList("dialog", numberedEntries);
+  const numberedSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedEntries && [{ kind: "deck", entries: numberedEntries }], [numberedEntries]);
+  useNumberedList("dialog", numberedSections);
   const numbersShown = useNumbersShown();
 
   /*

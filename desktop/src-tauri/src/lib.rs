@@ -3498,8 +3498,13 @@ async fn desktop_voice_choice(
 /// the directory listing's own bound, which is the longest list voice numbers.
 const MAX_VOICE_NUMBERED_ENTRIES: usize = MAX_VOICE_DIRECTORY_ENTRIES;
 
+/// The most sections a numbered list may declare: one per kind of list
+/// (round 4, D7).
+const MAX_VOICE_NUMBERED_SECTIONS: usize = 4;
+
 /// Refuse a numbered list no screen could show: more items than the longest
-/// list voice numbers, or text longer than any name.
+/// list voice numbers, more sections than kinds of list, or text longer than
+/// any name.
 fn validate_voice_numbered(heard: &voice::numbers::VoiceNumberedList) -> Result<(), String> {
     let too_long = |entry: &voice::numbers::VoiceNumberedEntry| {
         [&entry.value, &entry.label]
@@ -3509,7 +3514,14 @@ fn validate_voice_numbered(heard: &voice::numbers::VoiceNumberedList) -> Result<
             .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
             || entry.names.len() > MAX_VOICE_NUMBERED_NAMES
     };
-    if heard.entries.len() > MAX_VOICE_NUMBERED_ENTRIES || heard.entries.iter().any(too_long) {
+    if heard.len() > MAX_VOICE_NUMBERED_ENTRIES
+        || heard.sections.len() > MAX_VOICE_NUMBERED_SECTIONS
+        || heard
+            .sections
+            .iter()
+            .flat_map(|section| &section.entries)
+            .any(too_long)
+    {
         return Err(
             "the numbered list sent with that answer is larger than any screen shows".to_string(),
         );
@@ -6214,7 +6226,10 @@ mod tests {
         };
         let list = |entries| voice::numbers::VoiceNumberedList {
             generation: 1,
-            entries,
+            sections: vec![voice::numbers::VoiceNumberedSection {
+                kind: voice::numbers::SectionKind::Directory,
+                entries,
+            }],
         };
         let fits = list(
             (0..MAX_VOICE_NUMBERED_ENTRIES)
@@ -6237,6 +6252,20 @@ mod tests {
         let mut named = item("docs".to_string());
         named.names = vec!["n".to_string(); MAX_VOICE_NUMBERED_NAMES + 1];
         assert!(validate_voice_numbered(&list(vec![named])).is_err());
+        // The bound is on every section together, and on how many there are.
+        let mut split = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        split.sections.push(voice::numbers::VoiceNumberedSection {
+            kind: voice::numbers::SectionKind::Mode,
+            entries: vec![item("m".to_string())],
+        });
+        assert!(validate_voice_numbered(&split).is_err());
+        let mut sections = list(vec![item("d".to_string())]);
+        sections.sections = vec![sections.sections[0].clone(); MAX_VOICE_NUMBERED_SECTIONS + 1];
+        assert!(validate_voice_numbered(&sections).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

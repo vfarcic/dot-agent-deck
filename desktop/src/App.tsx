@@ -59,7 +59,7 @@ import { useShellOverlays, type RailScreen, type ScreenOverlays } from "./hooks/
 import { useVoiceOn, VoiceOn } from "./hooks/useVoiceOn";
 import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, VoiceNumberingContext, type NumberedLayer, type VoiceNumbering } from "./hooks/useVoiceNumbers";
 import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
-import { NO_NUMBERED_LIST, sameNumberedEntries, type VoiceNumberedEntryDto, type VoiceNumberedListDto } from "./lib/voiceNumbers";
+import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
 import { VOICE_ACTIONS, dispatchVoiceAction, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
@@ -875,7 +875,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * → A between two reads is a different list to the user, who watched the
    * numbers move, and an answer about the first A must be refused.
    */
-  const numberedLayers = useRef<Partial<Record<NumberedLayer, readonly VoiceNumberedEntryDto[]>>>({});
+  const numberedLayers = useRef<Partial<Record<NumberedLayer, readonly VoiceNumberedSectionDto[]>>>({});
   const numberedChanges = useRef(0);
   const numberedRead = useRef<VoiceNumberedListDto>(NO_NUMBERED_LIST);
   const numberedReadAt = useRef(0);
@@ -885,19 +885,19 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   // voice-registry-exempt: a mirror of which layer is numbered, written only by the lists' own declarations so the screen can hide its numbers under a dialog's
   const [dialogNumbered, setDialogNumbered] = useState(false);
   const numbering = useMemo<VoiceNumbering>(() => ({
-    publish: (layer, entries) => {
+    publish: (layer, sections) => {
       const layers = numberedLayers.current;
       const before = layers.dialog ?? layers.screen ?? [];
-      layers[layer] = entries;
-      if (!sameNumberedEntries(before, layers.dialog ?? layers.screen ?? [])) numberedChanges.current += 1;
-      if (layer === "dialog") setDialogNumbered(entries !== undefined);
+      layers[layer] = sections;
+      if (!sameNumberedSections(before, layers.dialog ?? layers.screen ?? [])) numberedChanges.current += 1;
+      if (layer === "dialog") setDialogNumbered(sections !== undefined);
     },
   }), []);
   const readNumbered = useCallback((): VoiceNumberedListDto => {
     const layers = numberedLayers.current;
-    const entries = layers.dialog ?? layers.screen ?? [];
-    if (numberedReadAt.current !== numberedChanges.current || !sameNumberedEntries(entries, numberedRead.current.entries)) {
-      numberedRead.current = { generation: numberedRead.current.generation + 1, entries: [...entries] };
+    const sections = layers.dialog ?? layers.screen ?? [];
+    if (numberedReadAt.current !== numberedChanges.current || !sameNumberedSections(sections, numberedRead.current.sections)) {
+      numberedRead.current = { generation: numberedRead.current.generation + 1, sections: sections.map((section) => ({ kind: section.kind, entries: [...section.entries] })) };
       numberedReadAt.current = numberedChanges.current;
     }
     return numberedRead.current;
@@ -1311,7 +1311,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       }))
       : undefined
   ), [shownTiles, tilesPageable]);
-  useNumberedList("screen", numberedTiles);
+  const numberedTileSections = useMemo<VoiceNumberedSectionDto[] | undefined>(() => numberedTiles && [{ kind: "agent", entries: numberedTiles }], [numberedTiles]);
+  useNumberedList("screen", numberedTileSections);
   const tileNumbers = useNumbersShown("screen") && numberedTiles !== undefined;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
