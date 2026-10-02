@@ -1,0 +1,22 @@
+{
+  "description": "Issue #1422: the editing shortcuts an agent's prompt gets from both clients, and the bytes each one sends. One table, every platform: neither client picks rows by platform. Read by the TUI's `keyevent_editing_chords_match_the_shared_table` (src/ui.rs) and by the desktop's terminalKeys.test.ts, TerminalViewport.keys.test.tsx and e2e/agent-terminal-input.spec.ts, so a row changed on one side fails the other. `translated` is the TUI's `editing_chord_bytes` and the desktop's `editingSequence`: each client checks that it translates exactly these chords and no others. `standard` is what both send with the ordinary terminal encoding (the TUI's `keyevent_to_bytes`, xterm.js on the desktop). Modifiers are `ctrl`, `alt`, `shift` and `super` (Cmd on a Mac, the Windows key on Windows); `key` is the DOM KeyboardEvent.key.",
+  "translated": [
+    { "key": "ArrowLeft", "modifiers": ["super"], "bytes": "\u0001", "action": "start of line" },
+    { "key": "ArrowRight", "modifiers": ["super"], "bytes": "\u0005", "action": "end of line" },
+    { "key": "Backspace", "modifiers": ["super"], "bytes": "\u0015", "action": "delete to the start of the line" },
+    { "key": "Backspace", "modifiers": ["ctrl"], "bytes": "\u0017", "action": "delete the previous word" },
+    { "key": "Delete", "modifiers": ["ctrl"], "bytes": "\u001bd", "action": "delete the next word" },
+    { "key": "Delete", "modifiers": ["alt"], "bytes": "\u001bd", "action": "delete the next word" }
+  ],
+  "standard": [
+    { "key": "Home", "modifiers": [], "bytes": "\u001b[H", "action": "start of line" },
+    { "key": "End", "modifiers": [], "bytes": "\u001b[F", "action": "end of line" },
+    { "key": "ArrowLeft", "modifiers": ["ctrl"], "bytes": "\u001b[1;5D", "action": "previous word" },
+    { "key": "ArrowRight", "modifiers": ["ctrl"], "bytes": "\u001b[1;5C", "action": "next word" },
+    { "key": "ArrowLeft", "modifiers": ["alt"], "bytes": "\u001b[1;3D", "action": "previous word" },
+    { "key": "ArrowRight", "modifiers": ["alt"], "bytes": "\u001b[1;3C", "action": "next word" },
+    { "key": "Backspace", "modifiers": ["alt"], "bytes": "\u001b\u007f", "action": "delete the previous word" },
+    { "key": "Backspace", "modifiers": [], "bytes": "\u007f", "action": "delete one character" },
+    { "key": "Delete", "modifiers": [], "bytes": "\u001b[3~", "action": "delete the next character" }
+  ]
+}

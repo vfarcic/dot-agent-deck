@@ -1,10 +1,11 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTileProps } from "./components/AgentTile";
+import { OVERVIEW_CLOCK_TICK_MS } from "./components/AgentOverview";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
-import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
-import type { DeckActionResult, DeckRuntimeState } from "./types";
+import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopSettingsDto } from "./lib/bridge";
+import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
 
 /**
  * Two spies, because the property PRD #1105 M3 needs is about BUILDS and the
@@ -320,5 +321,127 @@ describe("agent pane overlay", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
     expect(setShownTerminals).toHaveBeenLastCalledWith([]);
+  });
+});
+
+/**
+ * Issue #1400. With the `experimental` flag off — the shipped default — the
+ * agent screen offers only what a live daemon supplies: the Terminal tab, and
+ * TIME and TOOLS among the readings. The Diff, Checks, Delegations and
+ * Artifacts tabs and the ATT, MODEL and USAGE fields come back with the flag.
+ */
+describe("agent details behind the experimental flag", () => {
+  const DETAILS_OFF = { ...fixtureDesktopFeatures("?experimental=1"), showAgentDetails: false };
+
+  beforeEach(() => {
+    terminalBuilt.mockClear();
+    window.localStorage.clear();
+  });
+
+  function liveRuntime(spawnedAtMs: number) {
+    const snapshot = mapDesktopSnapshot({
+      connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, spawnedAtMs, tab: { kind: "dashboard" } }],
+      protocolVersion: 8,
+      source: "daemon",
+    });
+    return runtime({ mode: "live", desktopFeatures: undefined, snapshot, fleet: [snapshot] });
+  }
+
+  /**
+   * Scenario: with the flag off, open a live agent's pane from the dashboard.
+   * The tab strip holds Terminal alone, the header has no ATT, the readings
+   * are TIME and TOOLS with no MODEL or USAGE, and TIME counts the agent's
+   * uptime from the spawn instant the daemon reported.
+   */
+  it("shows only the terminal tab and the readings the daemon supplies while the flag is off", () => {
+    const view = { kind: "agent" as const, deckId: "deck-000000000000dec1", agentId: "7", from: "overview" as const };
+    render(<DeckShell runtime={liveRuntime(Date.now() - 5 * 60_000 - 5_000)} initialView={view} />);
+    const pane = screen.getByTestId("agent-pane-overlay");
+
+    expect(within(pane).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal"]);
+    expect(within(pane).queryByText("ATT")).not.toBeInTheDocument();
+    const metrics = within(pane).getByLabelText(/run metrics$/);
+    expect(Array.from(metrics.children, (cell) => cell.querySelector("span")?.textContent)).toEqual(["TIME", "TOOLS"]);
+    const time = within(metrics).getByText("TIME").parentElement!;
+    expect(time).toHaveTextContent("5m");
+    expect(time.getAttribute("title")).toMatch(/^Spawned by the daemon at: \d{4}-/);
+  });
+
+  /**
+   * Scenario: the same live agent with the flag on. All five tabs and the
+   * ATT, MODEL and USAGE fields are back, and TIME still reads the uptime.
+   */
+  it("brings back the four tabs and the ATT, MODEL and USAGE fields with the flag on", () => {
+    const view = { kind: "agent" as const, deckId: "deck-000000000000dec1", agentId: "7", from: "overview" as const };
+    render(<DeckShell runtime={{ ...liveRuntime(Date.now() - 2 * 3_600_000), desktopFeatures: fixtureDesktopFeatures("?experimental=1") }} initialView={view} />);
+    const pane = screen.getByTestId("agent-pane-overlay");
+
+    expect(within(pane).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal", "Diff", "Checks", "Delegations", "Artifacts"]);
+    expect(within(pane).getByText("ATT")).toBeVisible();
+    const metrics = within(pane).getByLabelText(/run metrics$/);
+    expect(Array.from(metrics.children, (cell) => cell.querySelector("span")?.textContent)).toEqual(["TIME", "TOOLS", "MODEL", "USAGE"]);
+    expect(within(metrics).getByText("TIME").parentElement).toHaveTextContent("2h");
+  });
+
+  /**
+   * Scenario: open a deck of three live agents and let four minutes pass. All
+   * three TIME readings count on ONE shared interval rather than one per tile,
+   * and leaving the deck stops it.
+   */
+  it("counts every tile's TIME on one shared clock that stops with the deck", () => {
+    vi.useFakeTimers();
+    const started = vi.spyOn(window, "setInterval");
+    const stopped = vi.spyOn(window, "clearInterval");
+    try {
+      vi.setSystemTime(new Date("2026-09-29T09:00:00.000Z").getTime());
+      const spawnedAtMs = Date.now() - 60_000;
+      const snapshot = mapDesktopSnapshot({
+        connection: { status: "connected", deckId: "deck-000000000000dec1", socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+        agents: ["7", "8", "9"].map((id) => ({ id, displayName: `Coder ${id}`, cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 0, spawnedAtMs, tab: { kind: "dashboard" as const } })),
+        protocolVersion: 8,
+        source: "daemon",
+      });
+      const { container, unmount } = render(<DeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} />);
+      const times = () => Array.from(container.querySelectorAll(".agent-instruments > div:first-child strong"), (cell) => cell.textContent);
+      const tileTicks = () => started.mock.calls.filter(([, ms]) => ms === OVERVIEW_CLOCK_TICK_MS);
+
+      expect(times()).toEqual(["1m", "1m", "1m"]);
+      expect(tileTicks()).toHaveLength(1);
+
+      act(() => { vi.advanceTimersByTime(4 * 60_000); });
+      expect(times()).toEqual(["5m", "5m", "5m"]);
+      expect(tileTicks()).toHaveLength(1);
+
+      const interval = started.mock.results[started.mock.calls.indexOf(tileTicks()[0])]?.value;
+      unmount();
+      expect(stopped).toHaveBeenCalledWith(interval);
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
+  });
+
+  /**
+   * Scenario: pick Planner's Diff tab on the deck, then render the same deck
+   * with the agent details hidden. Planner shows its terminal with the
+   * Terminal tab selected rather than a Diff panel no tab selects, and the
+   * deck declares Planner's terminal as shown again.
+   */
+  it("falls back to the terminal for an agent whose stored tab is hidden", () => {
+    const setShownTerminals = vi.fn(async (_targets: AgentTarget[]) => undefined);
+    const { rerender } = render(<DeckShell runtime={runtime({ setShownTerminals })} />);
+    const tile = () => screen.getByTestId("agent-tile-planner");
+    fireEvent.click(within(tile()).getByRole("tab", { name: "Diff" }));
+    expect(within(tile()).queryByTestId("terminal-planner")).not.toBeInTheDocument();
+    expect(setShownTerminals.mock.lastCall?.[0]).not.toContainEqual({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" });
+
+    rerender(<DeckShell runtime={runtime({ setShownTerminals, desktopFeatures: DETAILS_OFF })} />);
+
+    expect(within(tile()).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal"]);
+    expect(within(tile()).getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    expect(within(tile()).getByTestId("terminal-planner")).toBeInTheDocument();
+    expect(tile().querySelector(".diff-panel")).toBeNull();
+    expect(setShownTerminals.mock.lastCall?.[0]).toContainEqual({ deckId: FIXTURE_DAEMON_ID, agentId: "planner" });
   });
 });

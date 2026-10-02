@@ -1140,7 +1140,8 @@ mod tests {
     /// is executable" gate is a real `stat`, so this cannot be faked.
     fn write_executable(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("path has a parent")).expect("create parent");
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n")
+            .expect("write executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1515,7 +1516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("payloads.jsonl");
         let recorder = dir.path().join("recorder.sh");
-        std::fs::write(
+        crate::test_isolation::write_script(
             &recorder,
             format!(
                 "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",

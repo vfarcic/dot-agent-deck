@@ -1433,7 +1433,7 @@ export type DesktopRunActionDto =
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
-  | { type: "allow_build_mismatch" };
+  | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
  * PRD #742 M4: the listener takes the WHOLE fleet, never one deck's snapshot.
@@ -1800,7 +1800,7 @@ export function normalizeDesktopFeatures(value: unknown): DesktopFeatures {
 export function fixtureDesktopFeatures(search = window.location.search): DesktopFeatures {
   const requested = new URLSearchParams(search).get("experimental")?.trim().toLowerCase();
   if (requested !== "1" && requested !== "true") return { ...DEFAULT_DESKTOP_FEATURES };
-  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true };
+  return { showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true };
 }
 
 

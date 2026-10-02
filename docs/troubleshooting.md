@@ -355,17 +355,38 @@ Treat `--force` at that point as abandoning those runs.
 
 ## Panes and the dashboard
 
-### Shift+Enter Submits Instead of Inserting a Newline
+### Shift+Enter or Ctrl+Enter Sends the Message
 
-*Applies to the TUI.*
+In an agent's pane, in the TUI or in the [desktop app](desktop/index.md), **Shift+Enter** and **Ctrl+J** insert a new line in the agent's draft and **Enter** sends it, the same as when you run the agent directly. Both newline keys work in every supported agent.
 
-In an agent pane, **Shift+Enter** inserts a newline in the agent's draft and **Enter** submits it. The deck asks the terminal for the enhanced ("kitty") keyboard protocol at startup, which is what lets it tell the two apart; a terminal that supports that protocol needs no configuration. If you already have `keybind = shift+enter=csi:13;2u` in your Ghostty config, it does no harm.
+**Ctrl+Enter** reaches the agent as Ctrl+Enter, and agents do different things with it:
 
-If Shift+Enter still submits:
+| Agent | Ctrl+Enter |
+| --- | --- |
+| Claude Code | Sends the message (its own "send now" shortcut) |
+| OpenCode | Inserts a new line |
+| Codex, Pi, Devin | Nothing |
+
+That is each agent's own choice, and an agent's update can change it. If you want a new line, use Shift+Enter or Ctrl+J.
+
+The desktop app needs no configuration for any of this. The TUI asks the terminal for the enhanced ("kitty") keyboard protocol at startup, which is what lets it tell the keys apart; a terminal that supports that protocol needs no configuration. If you already have `keybind = shift+enter=csi:13;2u` in your Ghostty config, it does no harm.
+
+If Shift+Enter still sends the message in the TUI:
 
 - **You are running the deck inside tmux.** The deck does not enable the enhanced protocol when the terminal does not report support for it, which is the usual case inside tmux, and Shift+Enter then arrives as plain Enter. Run the deck outside tmux, or try having tmux pass extended keys through (`set -s extended-keys always` and `set -s extended-keys-format csi-u` in `~/.tmux.conf`).
 - **Your terminal does not support the enhanced protocol.** If it supports custom key bindings, bind Shift+Enter to the CSI u sequence yourself (in Ghostty, the `keybind` line above). The deck forwards the modifier either way.
 - **Your deck is older than this behaviour.** Upgrade.
+
+### An editing shortcut does nothing in an agent's prompt
+
+In an agent's prompt, in the TUI or in the desktop app, the same editing shortcuts work on every platform: `Home`, `End`, `⌘←`, `⌘→`, `Ctrl+←`, `Ctrl+→`, `⌥←`, `⌥→`, `⌘⌫`, `Ctrl+Backspace`, `⌥⌫`, `Ctrl+Delete` and `⌥⌦` (`⌥` is `Alt` and `⌘` the Windows or Super key outside a Mac), plus the paste key. [Editing an agent's prompt](keyboard-shortcuts.md#editing-an-agents-prompt) has the table. If one of them does nothing, or deletes or moves by a single character instead of a word or a line:
+
+- **Your deck or desktop app is older than this behaviour.** Earlier desktop apps sent nothing for `⌘←` and `⌘→`, deleted one character for `⌘⌫` and `Ctrl+Backspace`, typed `Ctrl+V` into the agent on Windows instead of pasting. On a Mac they deleted one character, or nothing, for `Ctrl+Backspace` and `Ctrl+Delete`; on Windows and Linux, `Alt+Delete` made Claude Code delete everything after the cursor. Earlier TUIs deleted one character for `Ctrl+Backspace`, `Ctrl+Delete` and `⌘⌫`, and in some agents `⌥⌦` deleted one character and `Alt+←` / `Alt+→` moved one, while others typed `[3~`, `[D` or `[C` into the prompt. Upgrade.
+- **Your system keeps the key.** macOS switches Spaces on `Ctrl+←` / `Ctrl+→`, and Windows and most Linux desktops arrange windows on the Windows key or Super with an arrow, so neither client receives those chords. Use `Home`, `End` or the `⌥` chords instead.
+- **In the TUI: your terminal keeps the key or sends a plainer one.** The TUI acts only on what your terminal passes on. iTerm2 switches tabs on `⌘←` / `⌘→`, and a terminal without the enhanced keyboard protocol (GNOME Terminal, Konsole, or any terminal inside tmux) sends `Ctrl+Backspace` as a one-character backspace. [Editing an agent's prompt](keyboard-shortcuts.md#in-the-tui-what-your-terminal-passes-on) says what to set in each.
+- **In the desktop app on Linux: a Super chord.** The app cannot see the Super key, so `Super+←` arrives as a plain `←`. Use `Home` and `End`.
+
+**Check it worked:** type a few words into the agent's prompt, without sending them, and press `Ctrl+Backspace` or `⌥⌫`. The last word disappears.
 
 ### A pane says "disconnected" and ignores what you type
 
@@ -483,6 +504,6 @@ It tells apart two causes whose ssh error messages are identical: `AllowTcpForwa
 *Applies to the desktop app.*
 
 - **Daemon disconnected** (`No daemon is listening on the configured socket.`): no daemon answered. Start one as described in [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon), then press **Reconnect**. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
-- **Incompatible daemon** (`A daemon answered but this build cannot speak to it.`): the daemon is from a build the app cannot read, usually after upgrading one of the two. Bring them to the same version (for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary) and reconnect. When the two builds share a wire protocol and differ only by a declared compatibility change, the app also offers **Connect anyway**, which connects to the daemon as it is.
+- **Incompatible daemon** (`A daemon answered but this build cannot speak to it.`): the daemon is from a build the app cannot read, usually after upgrading one of the two. Bring them to the same version (for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary) and reconnect. When the two builds share a wire protocol and differ only by a declared compatibility change, the app also offers **Connect anyway**, which connects to the daemon as it is. If it still cannot connect, for example because the daemon stopped answering in the meantime, the daemon's card says why and what to do next.
 
 See [Daemons](desktop/daemons.md) for adding and testing daemons in the app.

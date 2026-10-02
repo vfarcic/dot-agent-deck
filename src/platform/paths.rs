@@ -2553,8 +2553,9 @@ mod tests {
         let name = "delegate-019-shared-name";
         let shadow_candidate = shadow_dir.join(name);
         let real_candidate = real_dir.join(name);
-        std::fs::write(&shadow_candidate, b"#!/bin/sh\necho shadow\n").unwrap();
-        std::fs::write(&real_candidate, b"#!/bin/sh\necho real\n").unwrap();
+        crate::test_isolation::write_script(&shadow_candidate, b"#!/bin/sh\necho shadow\n")
+            .unwrap();
+        crate::test_isolation::write_script(&real_candidate, b"#!/bin/sh\necho real\n").unwrap();
 
         let word = resolve_binary_name(Ok(real_candidate.clone()));
         // #561: on Windows the word carries the forward-slash respelling, so the
@@ -3569,7 +3570,7 @@ mod tests {
     fn write_stub_executable(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("candidate has a parent"))
             .expect("create candidate dir");
-        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

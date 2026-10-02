@@ -680,11 +680,20 @@ pub enum DesktopAction {
     },
     RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
-    /// hand back a freshly classified snapshot (issue #801). Carries no
-    /// payload: it is an assertion by the user, not a parameter, and it can
-    /// only ever relax the stamp check — the protocol check runs first and is
-    /// never bypassed.
-    AllowBuildMismatch,
+    /// hand back a freshly classified snapshot (issue #801). The allowance
+    /// itself is an assertion by the user, not a parameter, and it can only
+    /// ever relax the stamp check — the protocol check runs first and is never
+    /// bypassed.
+    AllowBuildMismatch {
+        /// The deck whose refusal the user pressed Connect anyway on (issue
+        /// #1472), resolved with [`DeckScope::resolve`]. The allowance is
+        /// app-wide either way; what this names is the deck the action
+        /// CONNECTS and reports on, so a refusal on a deck other than the
+        /// selected one is answered for that deck. Absent means the selected
+        /// deck, which is what every caller sent before.
+        #[serde(default)]
+        deck_id: Option<String>,
+    },
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
@@ -1343,6 +1352,7 @@ pub struct DesktopFeatures {
     pub show_prompts: bool,
     pub show_orchestrations: bool,
     pub show_agent_profiles: bool,
+    pub show_agent_details: bool,
 }
 
 impl DesktopFeatures {
@@ -1356,6 +1366,7 @@ impl DesktopFeatures {
             show_prompts: features::show_desktop_prompts(),
             show_orchestrations: features::show_desktop_orchestrations(),
             show_agent_profiles: features::show_desktop_agent_profiles(),
+            show_agent_details: features::show_desktop_agent_details(),
         }
     }
 }
@@ -3518,12 +3529,29 @@ mod tests {
     }
 
     #[test]
-    fn allow_build_mismatch_action_carries_no_payload() {
+    fn allow_build_mismatch_action_needs_no_payload() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "allow_build_mismatch"
         }))
         .unwrap();
-        assert!(matches!(action, DesktopAction::AllowBuildMismatch));
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: None }
+        ));
+    }
+
+    /// Issue #1472: the overview names the deck the button was pressed on.
+    #[test]
+    fn allow_build_mismatch_action_carries_the_deck_it_was_pressed_on() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "allow_build_mismatch",
+            "deckId": "remote:prod"
+        }))
+        .unwrap();
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: Some(ref deck) } if deck == "remote:prod"
+        ));
     }
 
     #[test]
@@ -3950,7 +3978,9 @@ mod tests {
 
         let one = selecting_a_remote_deck();
         let all = observing_all(&["build-box.example.com", "laptop.example.com"]);
-        // The two legal answers, each read while nothing else is writing.
+        // The two reference shapes, each read while nothing else is writing.
+        // The local endpoint's wire id may change during the loop if an old
+        // daemon's fallback socket appears or disappears on this host.
         apply_settings_selection(&one);
         let fleet_of_one = observed_fleet();
         apply_settings_selection(&all);
@@ -3976,9 +4006,12 @@ mod tests {
                     while WRITING.load(Ordering::SeqCst) {
                         let fleet = observed_fleet();
                         assert!(
-                            fleet == fleet_of_one || fleet == fleet_of_all,
+                            fleet == fleet_of_one
+                                || (fleet.len() == fleet_of_all.len()
+                                    && fleet[1..] == fleet_of_all[1..]),
                             "a fleet must describe ONE applied document: {fleet:?} is neither \
-                             {fleet_of_one:?} nor {fleet_of_all:?}"
+                             {fleet_of_one:?} nor the three-deck fleet with remote tail {:?}",
+                            &fleet_of_all[1..]
                         );
                     }
                 });
@@ -4025,6 +4058,7 @@ mod tests {
                 show_prompts: false,
                 show_orchestrations: false,
                 show_agent_profiles: false,
+                show_agent_details: false,
             }
         );
 
@@ -4037,6 +4071,7 @@ mod tests {
                 show_prompts: true,
                 show_orchestrations: true,
                 show_agent_profiles: true,
+                show_agent_details: true,
             }
         );
     }
@@ -4051,6 +4086,7 @@ mod tests {
             show_prompts: true,
             show_orchestrations: false,
             show_agent_profiles: true,
+            show_agent_details: false,
         })
         .expect("serialises");
         assert_eq!(
@@ -4061,6 +4097,7 @@ mod tests {
                 "showPrompts": true,
                 "showOrchestrations": false,
                 "showAgentProfiles": true,
+                "showAgentDetails": false,
             })
         );
     }

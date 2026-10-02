@@ -1409,7 +1409,7 @@ mod tests {
         let a = a_dir.path().join(DEFAULT_BINARY_NAME);
         let b = b_dir.path().join(DEFAULT_BINARY_NAME);
         for path in [&a, &b] {
-            std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+            crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1589,7 +1589,7 @@ mod tests {
     fn stand_in_claude(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("claude");
-        std::fs::write(&path, body).unwrap();
+        crate::test_isolation::write_script(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -1610,7 +1610,10 @@ mod tests {
                 pid_file.display()
             ),
         );
-        let bound = std::time::Duration::from_millis(500);
+        // Leave room for the stand-in to be scheduled when the fast tier is
+        // running in parallel; otherwise the probe can time out before the
+        // script even writes helper.pid, leaving this test without its premise.
+        let bound = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
         let outcome = probe_claude_version(claude.as_os_str(), bound);
         let elapsed = started.elapsed();

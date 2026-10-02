@@ -407,6 +407,12 @@ export interface DesktopFeatures {
   showPrompts: boolean;
   showOrchestrations: boolean;
   showAgentProfiles: boolean;
+  /**
+   * Issue #1400 — the agent screen's Diff, Checks, Delegations and Artifacts
+   * tabs and its ATT, MODEL and USAGE fields, which a live daemon supplies
+   * nothing for today. Off leaves Terminal as the only tab.
+   */
+  showAgentDetails: boolean;
 }
 
 /** Every experimental surface hidden — the shipped default, and what fixture mode answers unless `?experimental=1`. */
@@ -416,6 +422,7 @@ export const DEFAULT_DESKTOP_FEATURES: DesktopFeatures = {
   showPrompts: false,
   showOrchestrations: false,
   showAgentProfiles: false,
+  showAgentDetails: false,
 };
 
 /**
@@ -850,7 +857,13 @@ export type DeckAction =
   | { type: "start_daemon" }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
-  | { type: "allow_build_mismatch" }
+  /**
+   * Connect anyway (issue #801). `deckId` names the deck whose refusal the
+   * user pressed it on (issue #1472); the crate connects to THAT deck and
+   * rejects with the reason when it still cannot. Absent means the selected
+   * deck.
+   */
+  | { type: "allow_build_mismatch"; deckId?: string }
   /**
    * The Runs screen's launch. `taskPrompt` may be empty (issue #1044): the deck
    * then composes a coordinator context with no task section and the

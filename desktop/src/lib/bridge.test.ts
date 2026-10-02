@@ -448,12 +448,12 @@ describe("TauriDeckBridge", () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
-    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true });
+    invoke.mockResolvedValueOnce({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: false, showPrompts: true, showOrchestrations: false, showAgentProfiles: true, showAgentDetails: true });
     expect(invoke).toHaveBeenLastCalledWith("desktop_features");
 
     invoke.mockResolvedValueOnce({ showDeck: "yes", showProjects: 1 });
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
     await bridge.dispose();
   });
 
@@ -1186,13 +1186,43 @@ describe("FixtureDeckBridge scenarios", () => {
     const { createDeckBridge } = await import("./bridge");
     const bridge = createDeckBridge("fixture");
 
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=1");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: true, showProjects: true, showPrompts: true, showOrchestrations: true, showAgentProfiles: true, showAgentDetails: true });
 
     window.history.replaceState({}, "", "/?fixture=1&experimental=0");
-    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false });
+    await expect(bridge.desktopFeatures()).resolves.toEqual({ showDeck: false, showProjects: false, showPrompts: false, showOrchestrations: false, showAgentProfiles: false, showAgentDetails: false });
+  });
+
+  /**
+   * Scenario: the preview's microphone, scripted from the URL. A `?voice=`
+   * holding only blank phrases is a microphone that hears nothing, so polls
+   * after a start keep reporting `recording` and never an utterance. A real
+   * phrase is heard on the first poll, and no `?voice=` at all still says the
+   * one canned utterance.
+   */
+  it("hears nothing from a ?voice= script that holds only blank phrases", async () => {
+    const { createDeckBridge, FIXTURE_SETTINGS_KEY } = await import("./bridge");
+    const { fixtureVoiceScript, FIXTURE_VOICE_UTTERANCE } = await import("../data/fixture");
+    expect(fixtureVoiceScript("?fixture=1")).toEqual([FIXTURE_VOICE_UTTERANCE]);
+    expect(fixtureVoiceScript("?fixture=1&voice=%20%20%20%20")).toEqual([]);
+    expect(fixtureVoiceScript("?fixture=1&voice=&voice=send%20it")).toEqual(["send it"]);
+
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify({ version: 1, voice: { activation: "toggle", intent: "claude", transcription: "remote" } }));
+    try {
+      window.history.replaceState({}, "", "/?fixture=1&voice=%20%20%20%20");
+      const silent = createDeckBridge("fixture");
+      await silent.voiceStart();
+      for (let poll = 0; poll < 3; poll += 1) expect((await silent.voiceStatus()).state).toBe("recording");
+
+      window.history.replaceState({}, "", "/?fixture=1&voice=send%20it");
+      const speaking = createDeckBridge("fixture");
+      await speaking.voiceStart();
+      expect((await speaking.voiceStatus()).state).toBe("done");
+    } finally {
+      window.localStorage.removeItem(FIXTURE_SETTINGS_KEY);
+    }
   });
 
   it("treats ?state=empty as a healthy daemon owning nothing, not as a disconnected one", async () => {

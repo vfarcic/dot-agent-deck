@@ -312,6 +312,8 @@ Every task states the same job:
 
 **Verification is the DEFAULT.** A unit that decides to skip it must say so explicitly, and give its reason, in its final message. Silent skipping is the dangerous direction — an unverified PR reported as resolved reads exactly like a verified one — so make it visible, the same discipline as never applying a silent cap.
 
+**A red the unit meets is a finding with two exits, not a retry.** CLAUDE.md rule 6 puts a red met while working on something else in scope by default, and `/verify-pr`'s Phase 5 already says so — but a unit reaches that phase only after its gates have run, and it reads the task text first. So the template carries the one sentence, keyed to this skill's push rules: the unit reports which exit each red needs (fixed in this PR, or quarantined with an owner, an expiry issue and the `#[ignore = "quarantined: <owner>, #<issue>"]` mark), and on its own PR asks for the fix or the quarantine through the pre-push gate and pushes it on a yes, since the push scope below bounds what it may push unasked — listing the red under what remains until then, so a proposal never reads as an exit taken. Reported on 2026-10-01: units `/issue-queue` dispatched met seven flaky tests between them, re-ran each until green, and only reported them.
+
 The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — rule 2's `fmt`/`clippy` gates before any commit, rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
 
 ### Check the closing references against what the PR actually does
@@ -410,6 +412,19 @@ WHAT TO DO
   multi-part issue should say `Refs #N`, not `Closes #N`. Report any mismatch as
   a finding, naming which issues the diff finishes and which it only advances.
   Do not silently rewrite the PR body.
+- A RED YOU MEET IS NOT CLEARED BY A RETRY (CLAUDE.md rule 6). A test or check
+  that fails in this PR's CI or in your own run, whoever caused it and even if
+  it passed when retried, has two exits and only two: fixed in this PR, or
+  quarantined (a named owner, an expiry issue, and
+  `#[ignore = "quarantined: <owner>, #<issue>"]` on the test). After rule 6's
+  isolation rerun, report each one as a finding saying which exit it needs and
+  whether it has taken one. /verify-pr's Phase 5 has the mechanics. Rerunning
+  it until green and mentioning it is neither exit. On your own PR, ask the
+  user for the fix or the quarantine through the pre-push gate below and push
+  it once they say yes; until it is pushed, list the red under what remains,
+  never as resolved. Before proposing a fix for a red this PR did not cause,
+  check whether an open PR already fixes it (`gh pr list --search '<test
+  name>'`); if one does, name it and leave the red to that PR.
 - END with what remains: what you verified, what you fixed, what is still open,
   and who it is waiting on.
 

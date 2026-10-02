@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import { AgentOverview } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
-import { AgentTile, type AgentTileProps } from "./components/AgentTile";
+import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
@@ -883,6 +883,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
     <AgentPaneFrame
       open
       agent={agent}
+      showDetails={desktopFeaturesOf(runtime).showAgentDetails}
       mode={runtime.mode}
       selected
       tab={tab}
@@ -1247,10 +1248,11 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   /**
    * Every tile currently rendering a terminal (PRD #745 M7). `AgentTile` mounts
    * a terminal whenever its tab is `"terminal"`, which is also the default, so
-   * the derivation has to repeat that `?? "terminal"` fallback exactly.
+   * the derivation has to repeat that `?? "terminal"` fallback exactly — and,
+   * since issue #1400, the tile's own `shownPanelTab` fallback with it.
    */
   const shownTerminals = snapshot.agents
-    .filter((agent) => (tabs[agent.id] ?? "terminal") === "terminal")
+    .filter((agent) => shownPanelTab(tabs[agent.id] ?? "terminal", features.showAgentDetails) === "terminal")
     /* The agent's OWN deck, which on this screen is always the selected one —
        written as the agent's rather than read off the connection so the
        declaration cannot drift from what the tile actually mounted. */
@@ -1498,11 +1500,12 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       label: "Connect anyway",
       busyLabel: "Connecting…",
       action: async () => {
+        const deckId = snapshot.connection.deckId;
         try {
-          await runtime.runAction({ type: "allow_build_mismatch" });
-          // The allowance is read by the NEXT handshake, so the reconnect is
-          // what actually connects; the crate caches no verdict.
-          await runtime.reconnect();
+          // The crate handshakes this deck again, emits its snapshot and
+          // rejects with the reason if it still did not connect (issue #1472),
+          // so the notice below is only reached once it has.
+          await runtime.runAction({ type: "allow_build_mismatch", ...(deckId === undefined ? {} : { deckId }) });
           setNotice("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.");
         } catch (cause) {
           setNotice(cause instanceof Error ? cause.message : String(cause));
@@ -1829,6 +1832,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   open={agent.id === paneAgentId}
                   panePresent={paneAgentId !== undefined}
                   agent={agent}
+                  showDetails={features.showAgentDetails}
                   mode={mode}
                   selected={agent.id === selectedAgentId}
                   tab={tabs[agent.id] ?? "terminal"}

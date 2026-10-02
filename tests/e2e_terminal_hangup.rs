@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "e2e"))]
+#![cfg(all(target_os = "linux", feature = "e2e"))]
 
 //! L2 coverage for issue #1138 — the TUI must end when its terminal hangs up.
 //!
@@ -23,11 +23,8 @@
 //! at all, because the hangup is a property of the event loop rather than of
 //! anything running under it.
 //!
-//! **Linux only in practice.** Nothing `cfg`s this off for macOS, but no macOS
-//! job enables the `e2e` feature — `e2e-deterministic` is a Linux job — so the
-//! real-binary path is exercised there only by a developer running it. The L1
-//! tests in `crate::terminal_hangup` are what `build-macos` runs, and they are
-//! what caught Apple's `poll` reporting no hangup for an unrequested event.
+//! Linux-only: this scenario uses Linux's controlling-terminal behaviour. The
+//! L1 tests in `crate::terminal_hangup` cover macOS's hangup detection.
 
 mod common;
 

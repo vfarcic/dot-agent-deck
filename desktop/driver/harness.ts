@@ -48,6 +48,14 @@ const SELECT_MS = 15_000;
  */
 const SETTLE_MS = 1_000;
 
+/**
+ * How many drags `selectRow` makes when a resize of the grid during the drag
+ * cleared what it selected. The focus claim that causes that resize happens
+ * once per focus-in, so a second drag is the one that counts and a third is
+ * margin.
+ */
+const DRAG_ATTEMPTS = 3;
+
 const paths = {
   app: process.env.DAD_DRIVER_APP ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck-desktop"),
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
@@ -398,46 +406,87 @@ export class Deck {
    * to hold `text` as its selection.
    *
    * The first click matters. WebDriver types into the page without the window
-   * holding focus, so the scenario's first press is also the window's focus-in,
-   * and on a focus-in the app claims this terminal's size on its daemon
-   * (PRD #1105). When that changes the grid's row count, xterm drops any
-   * selection in progress, so a drag started by that same press selects
-   * nothing. The click lets that settle, and the row is measured again after
-   * it, because a new grid moves the rows. When the selection still does not
-   * appear, the error carries the mouse events the page saw during the drag
-   * and every selection clear and resize, with the stack that caused it.
+   * holding focus, so a press is also the window's focus-in, and on a focus-in
+   * the app claims this terminal's size on its daemon (PRD #1105). When that
+   * changes the grid's row count, xterm drops any selection in progress, so a
+   * drag started by that same press selects nothing (#1457 asks whether a
+   * person can hit this). The click lets that settle, and the row is measured
+   * again after it, because a new grid moves the rows.
+   *
+   * The click is not always the press that focuses the window. In five
+   * failed runs on GitHub runners the grid held still for the whole settle
+   * after the click and the resize landed 5-10ms after the DRAG's press
+   * instead, so a drag that
+   * ends with no selection after the grid resized during it is made again,
+   * once the grid has settled at the new size and the row has been measured on
+   * it, up to `DRAG_ATTEMPTS` drags. A drag that selected nothing with no
+   * resize to explain it fails at once. Either failure carries the mouse events
+   * the page saw during the last drag and every selection clear and resize,
+   * with the stack that caused it.
    */
   async selectRow(text: string): Promise<void> {
     const before = await waitFor(`${text} on its own row`, () => this.rowSpan(text));
     await this.session.clickAt(before.from);
-    await this.gridSettled();
-    const span = await waitFor(`${text} on its own row after the click`, () => this.rowSpan(text));
-    // Installed once per page; each call only empties the pointer record. The
-    // selection trace runs from `traceTerminals` and is never emptied.
+    // Installed once per page. The selection trace is never emptied.
     await this.traceTerminals();
-    await this.session.execute(
-      `window.__dadPointerLog = [];
-       if (!window.__dadPointerProbe) {
-         window.__dadPointerProbe = true;
-         for (const type of ["mousedown", "mousemove", "mouseup"]) {
-           document.addEventListener(type, (e) => {
-             if (window.__dadPointerLog.length < 60) {
-               const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
-               window.__dadPointerLog.push([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
-             }
-           }, { capture: true });
+    for (let attempt = 1; ; attempt += 1) {
+      await this.gridSettled();
+      const span = await waitFor(`${text} on its own row after the grid settled`, () => this.rowSpan(text));
+      // Installed once per page; each drag only empties the pointer record,
+      // and reads the page clock that a resize in the trace is stamped with.
+      const draggedAt = await this.session.execute<number>(
+        `window.__dadPointerLog = [];
+         if (!window.__dadPointerProbe) {
+           window.__dadPointerProbe = true;
+           for (const type of ["mousedown", "mousemove", "mouseup"]) {
+             document.addEventListener(type, (e) => {
+               if (window.__dadPointerLog.length < 60) {
+                 const mods = (e.shiftKey ? "S" : "") + (e.ctrlKey ? "C" : "") + (e.altKey ? "A" : "") + (e.metaKey ? "M" : "");
+                 window.__dadPointerLog.push([type, Math.round(performance.now()), Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.detail, mods]);
+               }
+             }, { capture: true });
+           }
          }
-       }`,
-    );
-    await this.session.drag(span.from, span.to);
-    try {
-      await waitFor(`the drag to select ${text}`, () => this.hasSelection(text), SELECT_MS);
-    } catch (error) {
-      const seen = await this.session
-        .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
-        .catch((probe: unknown) => String(probe));
-      throw new Error(`${(error as Error).message}; the page saw ${JSON.stringify(seen)}`);
+         return Math.floor(performance.now());`,
+      );
+      await this.session.drag(span.from, span.to);
+      let outcome: "selected" | "resized";
+      try {
+        outcome = await waitFor(
+          `the drag to select ${text}`,
+          async () => {
+            if (await this.hasSelection(text)) return "selected" as const;
+            if (await this.resizedSince(draggedAt)) return "resized" as const;
+            return undefined;
+          },
+          SELECT_MS,
+        );
+      } catch (error) {
+        throw new Error(`${(error as Error).message}; the page saw ${await this.selectionRecord()}`);
+      }
+      if (outcome === "selected") return;
+      if (attempt >= DRAG_ATTEMPTS) {
+        throw new Error(
+          `the grid resized during each of ${attempt} drags to select ${text}; the page saw ${await this.selectionRecord()}`,
+        );
+      }
+      console.warn(`selectRow: the grid resized during drag ${attempt} to select ${text}; dragging again once it settles`);
     }
+  }
+
+  /** Whether any mounted terminal resized at or after `since` on the page's clock. */
+  private async resizedSince(since: number): Promise<boolean> {
+    return this.session.execute<boolean>(
+      `return (window.__dadSelectionTrace || []).some((entry) => entry[0] === "resize" && entry[1] >= ${since});`,
+    );
+  }
+
+  /** The last drag's mouse events and the selection trace, for a failure message. */
+  private async selectionRecord(): Promise<string> {
+    const seen = await this.session
+      .execute<unknown>("return { events: window.__dadPointerLog, trace: window.__dadSelectionTrace };")
+      .catch((probe: unknown) => String(probe));
+    return JSON.stringify(seen);
   }
 
   /**
