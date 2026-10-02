@@ -2433,6 +2433,12 @@ pub struct FirstWriteSend {
     /// Time spent asleep waiting for the draft to clear. Zero when nothing was
     /// pending. Excludes time spent queued behind another writer.
     pub deferred: Duration,
+    /// Issue #1455: the send was [`GuardedSend::Ambiguous`], and every byte it
+    /// put into the input box was erased back out again (issue #876's drain),
+    /// so nothing of it is left there and it kept no payload record. Always
+    /// `false` for any other outcome, and for an ambiguous write that left
+    /// bytes behind. The one ambiguous case a caller may write again.
+    pub erased: bool,
 }
 
 impl GuardedSendDetail {
@@ -9780,6 +9786,7 @@ impl AgentPtyRegistry {
             Ok(FirstWriteSend {
                 detail: GuardedSendDetail::Outcome(outcome),
                 deferred,
+                erased: false,
             })
         };
         let mut deferred = Duration::ZERO;
@@ -9980,6 +9987,7 @@ impl AgentPtyRegistry {
                 return Ok(FirstWriteSend {
                     detail: GuardedSendDetail::RefusedUserInput,
                     deferred,
+                    erased: false,
                 });
             }
         }
@@ -10136,6 +10144,7 @@ impl AgentPtyRegistry {
             PayloadDelivery::Ambiguous { stranded } => {
                 let leaves_bytes_behind = stranded > 0;
                 let is_submit = matches!(mode, SubmitMode::Submit);
+                let erased = !leaves_bytes_behind && is_submit && !payload.is_empty();
                 if leaves_bytes_behind || payload.is_empty() {
                     w.note_automatic_write(pane_id, mode, &payload);
                 }
@@ -10163,7 +10172,7 @@ impl AgentPtyRegistry {
                                  prompt above whatever you had typed: clear or submit it before \
                                  typing on",
                     });
-                } else if is_submit && !payload.is_empty() {
+                } else if erased {
                     // `is_submit` matters: a NOTICE reaching this arm was never
                     // offered to the drain (its bytes are meant to stay), so
                     // saying they were erased would be a lie in the log.
@@ -10175,7 +10184,11 @@ impl AgentPtyRegistry {
                          out of the input box, so no payload record is kept"
                     );
                 }
-                finish(GuardedSend::Ambiguous, deferred)
+                Ok(FirstWriteSend {
+                    detail: GuardedSendDetail::Outcome(GuardedSend::Ambiguous),
+                    deferred,
+                    erased,
+                })
             }
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
         }
