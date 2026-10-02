@@ -347,11 +347,18 @@ fn new_pane_018_legacy_workspace_modes_warn_and_continue() {
     // still the dashboard's button bar (seen on PR #1480's CI run). The warning
     // is set in the same handler that opens the form, so a finished frame has
     // both; a missing warning still fails here, after the harness's timeout.
+    // The assertions below read the frame that matched, not a later snapshot.
+    let matched = std::cell::RefCell::new(String::new());
     deck.wait_until_grid("the New Agent form with the legacy-modes warning", |grid| {
-        grid.contains("Mode:") && last_status_line(grid).contains("workspace modes were removed")
+        let complete = grid.contains("Mode:")
+            && last_status_line(grid).contains("workspace modes were removed");
+        if complete {
+            *matched.borrow_mut() = grid.to_string();
+        }
+        complete
     });
 
-    let grid = deck.snapshot_grid();
+    let grid = matched.into_inner();
     let mode_row = grid
         .lines()
         .find(|line| line.contains("Mode:"))
