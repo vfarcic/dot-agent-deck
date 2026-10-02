@@ -1543,11 +1543,16 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
 
     let second = second.unwrap_or_else(|| prepare(second_brief));
     assert_ne!(first.context_path, second.context_path);
+    // The daemon writes the compatibility mirror after it has replied to the
+    // preparation (`PrepareWorkflow` in `src/daemon_protocol.rs`), so the reply
+    // alone does not mean the write has landed; on a starved runner a single
+    // read straight after it found the earlier brief (PR #1480's CI run).
     assert!(
-        std::fs::read_to_string(&mirror)
-            .expect("read the later compatibility mirror")
-            .contains(second_brief),
-        "the mirror must hold the later brief before compaction"
+        common::wait_until(Duration::from_secs(10), || {
+            std::fs::read_to_string(&mirror).is_ok_and(|text| text.contains(second_brief))
+        }),
+        "the mirror must hold the later brief before compaction; it holds:\n{}",
+        std::fs::read_to_string(&mirror).unwrap_or_default()
     );
     let deck = deck.unwrap_or_else(launch_deck);
     deck.wait_until_grid("first orchestration tab", |grid| {

@@ -2674,6 +2674,19 @@ fn reattach_replaces_the_child(previous_agent_id: &str, new_agent_id: &str) -> b
     !previous_agent_id.is_empty() && previous_agent_id != new_agent_id
 }
 
+/// Issue #1477: forget the application cursor mode (DECCKM) a replaced child
+/// left in the pane's parser. The TUI encodes the arrows, Home and End from that
+/// mode, and the parser outlives the child, so without this a replacement agent
+/// would be sent the SS3 form its predecessor asked for. Called only where
+/// [`reattach_replaces_the_child`] says the child changed, before the new
+/// child's snapshot replays, for the reason that function gives: a same-PTY
+/// reconnect keeps the mode, since its `ESC[?1h` is long past.
+fn forget_replaced_childs_cursor_mode(parser: &Mutex<vt100::Parser>) {
+    if let Ok(mut parser) = parser.lock() {
+        parser.process(b"\x1b[?1l");
+    }
+}
+
 /// PRD #92 F12: per-pane I/O task body. Drives the attach-stream
 /// reader/writer pair for a single pane; on STREAM_END from the daemon
 /// (typically: OLD agent died as part of F9's clear=true respawn), look
@@ -2917,6 +2930,7 @@ async fn run_pane_io_task(
                     // `reattach_replaces_the_child`.
                     if reattach_replaces_the_child(&held, &new_agent_id) {
                         mouse_mode.store(false, Ordering::Relaxed);
+                        forget_replaced_childs_cursor_mode(&parser);
                     }
                     *held = new_agent_id;
                 }
@@ -4757,6 +4771,21 @@ mod tests {
             !reattach_replaces_the_child("", "agent-1"),
             "no previous id is no evidence — preserve, the conservative direction"
         );
+    }
+
+    /// Issue #1477: a replacement child starts in the ordinary cursor mode,
+    /// whatever its predecessor asked for, and keeps what is on screen.
+    #[test]
+    fn a_replaced_childs_application_cursor_mode_is_forgotten() {
+        let parser = Mutex::new(vt100::Parser::new(4, 20, 0));
+        parser.lock().unwrap().process(b"old child\x1b[?1h");
+        assert!(parser.lock().unwrap().screen().application_cursor());
+
+        forget_replaced_childs_cursor_mode(&parser);
+
+        let parser = parser.lock().unwrap();
+        assert!(!parser.screen().application_cursor());
+        assert!(parser.screen().contents().contains("old child"));
     }
 
     // PRD #104 M2: hydration sizes the local vt100 parser from the
