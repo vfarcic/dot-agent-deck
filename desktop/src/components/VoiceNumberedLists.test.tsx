@@ -327,7 +327,7 @@ describe("numbered voice lists through the dashboard", () => {
     const changed = { ...snapshot, agents: snapshot.agents.slice(1) };
     view.rerender(<DeckShell runtime={{ ...runtime, snapshot: changed, fleet: [changed] }} initialView={{ kind: "overview" }} />);
     view.rerender(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
-    await act(async () => { finishAnswer({ kind: "selected", number: 3 }); });
+    await act(async () => { finishAnswer({ kind: "selected", section: "agent", number: 3 }); });
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|changed/i);
   });
@@ -345,7 +345,7 @@ describe("numbered voice lists through the dashboard", () => {
     await poll();
     const switched = { ...snapshot, connection: { ...snapshot.connection, deckId: "another-daemon" } };
     view.rerender(<DeckShell runtime={{ ...runtime, snapshot: switched }} initialView={{ kind: "overview" }} />);
-    await act(async () => { finishAnswer({ kind: "selected", number: 3 }); });
+    await act(async () => { finishAnswer({ kind: "selected", section: "agent", number: 3 }); });
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/moved on|changed/i);
   });
