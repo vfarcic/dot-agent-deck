@@ -69,8 +69,9 @@ export function isCountWord(word: string): boolean {
   return CARDINALS.includes(word) || TEENS.includes(word) || TENS.includes(word) || /^\d+$/.test(word);
 }
 
-/** `voice::choice::number_word`: one word as `[value, isCount]`. */
+/** `voice::choice::number_word`: one word as `[value, isCount]`. "Zero" is 0, a number no list shows (Qodo #16 on PR #1451). */
 function numberWord(word: string): [number, boolean] | undefined {
+  if (word === "zero") return [0, true];
   const lists: [string[], number, boolean][] = [[CARDINALS, 1, true], [TEENS, 10, true], [ORDINALS, 1, false], [TEEN_ORDINALS, 10, false]];
   for (const [list, base, count] of lists) if (list.includes(word)) return [list.indexOf(word) + base, count];
   if (TENS.includes(word)) return [TENS.indexOf(word) * 10 + 20, true];

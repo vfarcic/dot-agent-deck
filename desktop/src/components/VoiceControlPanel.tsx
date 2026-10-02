@@ -311,7 +311,8 @@ const NUMBERS_BACKEND = "local";
  */
 export function voiceNumberNotShown(number: number, section?: VoiceNumberedSectionKind, elsewhere: readonly VoiceNumberedSectionKind[] = []): string {
   const item = section === undefined ? "item" : SECTION_NOUNS[section].one;
-  if (number < 1) return `No ${item} on screen shows that number, so nothing ran.`;
+  /* Zero, and a number too long to say back (Qodo #16 on PR #1451). */
+  if (number < 1 || !Number.isSafeInteger(number)) return `No ${item} on screen shows that number, so nothing ran.`;
   const refusal = `No ${item} on screen shows number ${number}, so nothing ran.`;
   const other = elsewhere[0];
   return other === undefined ? refusal : `${refusal} ${number} is ${SECTION_NOUNS[other].a}: say “${SECTION_NOUNS[other].one} ${number}”.`;

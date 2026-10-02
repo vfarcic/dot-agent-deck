@@ -516,13 +516,7 @@ mod tests {
     #[test]
     fn anything_but_a_bare_number_is_left_to_the_resolver() {
         let heard = list(7, &DASHBOARD);
-        for said in [
-            "open docs",
-            "three agents",
-            "open the third one",
-            "",
-            "zero",
-        ] {
+        for said in ["open docs", "three agents", "open the third one", ""] {
             assert_eq!(answer(said, &heard, 7), NumberAnswer::NotNumber, "{said}");
         }
         // No numbered list on screen: a number is an ordinary utterance.
@@ -535,6 +529,28 @@ mod tests {
         assert_eq!(answer("seven", &heard, 7), out_of_range(7));
         assert_eq!(answer("number 12", &heard, 7), out_of_range(12));
         assert_eq!(answer("number 0", &heard, 7), out_of_range(0));
+    }
+
+    /// Qodo #16 on PR #1451: "zero" said as a word is the same number as
+    /// "number 0", and no item shows it, so it is refused here rather than
+    /// sent to the Commands backend. So is a number too large to read.
+    #[test]
+    fn zero_and_a_number_too_large_to_read_are_refused() {
+        let heard = list(7, &DASHBOARD);
+        for said in ["zero", "number zero", "Number zero.", "option zero"] {
+            assert_eq!(answer(said, &heard, 7), out_of_range(0), "{said}");
+        }
+        for said in ["99999999999999999999", "number 99999999999999999999"] {
+            assert_eq!(answer(said, &heard, 7), out_of_range(usize::MAX), "{said}");
+        }
+        assert_eq!(
+            answer("select agent zero", &heard, 7),
+            NumberAnswer::OutOfRange {
+                section: Some(SectionKind::Agent),
+                number: 0,
+                elsewhere: Vec::new(),
+            }
+        );
     }
 
     #[test]

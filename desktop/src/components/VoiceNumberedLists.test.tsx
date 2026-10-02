@@ -280,6 +280,21 @@ describe("numbered voice lists through the dashboard", () => {
     expect(resolveVoice).not.toHaveBeenCalled();
   });
 
+  /** Scenario: with the dashboard's numbered agents displayed, saying “number zero”, “zero”, or a number too long to read names no agent. The panel says so in a plain sentence, opens nothing, and never asks the Commands backend (Qodo #16 on PR #1451). */
+  it.each(["number zero", "zero", "99999999999999999999"])("refuses %s locally as a number no agent shows", async (phrase) => {
+    const voice = microphone();
+    const { runtime, resolveVoice } = makeRuntime(voice);
+    render(<DeckShell runtime={runtime} initialView={{ kind: "overview" }} />);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+    expect(screen.getAllByRole("row", { name: /^1\./ })).toHaveLength(1);
+    voice.deliver(phrase);
+    await poll();
+    await finishPossibleNoMatch();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("No item on screen shows that number, so nothing ran.");
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
   /** Scenario: the spoken number names both the first displayed position and an agent named orchestrator-1 in another position. The app offers both choices rather than guessing either agent. */
   it("offers a numbered choice when an agent name collides with one", async () => {
     const voice = microphone();

@@ -195,10 +195,12 @@ impl Ordinal {
 /// "2", "number two", "option 2", "the second", "the second one", "2nd", "the
 /// last one" — and, past nine (PR #1451 round 3, change 4, where a page can
 /// show more numbers than that), "twelve", "number twenty-three", "the
-/// twelfth", "twentieth", "the twenty-first one", up to ninety-nine.
-/// Whole-utterance, so "open the second tab" is not one; `words` are what
-/// [`whole_utterance`] makes of the transcript, which splits "twenty-three"
-/// into two words.
+/// twelfth", "twentieth", "the twenty-first one", up to ninety-nine. "Zero"
+/// and "number 0" are `Nth(0)`, and digits too many for a `usize` are
+/// `Nth(usize::MAX)`, so each is a number no list shows rather than not a
+/// number (Qodo #16 on PR #1451). Whole-utterance, so "open the second tab"
+/// is not one; `words` are what [`whole_utterance`] makes of the transcript,
+/// which splits "twenty-three" into two words.
 pub(crate) fn ordinal(words: &[String]) -> Option<Ordinal> {
     let said = ordinal_words(words)?;
     if let [word] = said
@@ -285,9 +287,12 @@ pub(crate) fn is_count_word(word: &str) -> bool {
 
 /// One word as a number: its value and whether it is a count (`true`) or a
 /// position (`false`). Digits are a count, digits with "st", "nd", "rd" or
-/// "th" a position.
+/// "th" a position, and digits too many for a `usize` are `usize::MAX`.
 fn number_word(word: &str) -> Option<(usize, bool)> {
     let at = |list: &[&str]| list.iter().position(|entry| *entry == word);
+    if word == "zero" {
+        return Some((0, true));
+    }
     if let Some(at) = at(&CARDINALS) {
         return Some((at + 1, true));
     }
@@ -307,14 +312,20 @@ fn number_word(word: &str) -> Option<(usize, bool)> {
         return Some((at * 10 + 20, false));
     }
     if !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()) {
-        return word.parse().ok().map(|number| (number, true));
+        return Some((digits_value(word), true));
     }
     ["st", "nd", "rd", "th"]
         .iter()
         .find_map(|suffix| word.strip_suffix(suffix))
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|digits| digits.parse().ok())
-        .map(|number| (number, false))
+        .map(|digits| (digits_value(digits), false))
+}
+
+/// Plain ASCII digits as a number, `usize::MAX` when there are too many to
+/// hold: a number past every list, so refused as one rather than left to the
+/// Commands backend.
+fn digits_value(digits: &str) -> usize {
+    digits.parse().unwrap_or(usize::MAX)
 }
 
 /// One or two words as a number: one word ([`number_word`]), or a ten
@@ -745,7 +756,7 @@ mod tests {
             );
         }
         assert_eq!(answer("Atlas", &offered, &live), ChoiceAnswer::Refused);
-        assert_eq!(answer("zero", &offered, &live), ChoiceAnswer::NotAnswer);
+        assert_eq!(answer("zero", &offered, &live), ChoiceAnswer::Refused);
         assert_eq!(answer("number 0", &offered, &live), ChoiceAnswer::Refused);
         assert_eq!(answer("", &offered, &live), ChoiceAnswer::NotAnswer);
     }

@@ -46,6 +46,17 @@ describe("answerNumberLocally", () => {
     expect(answerNumberLocally("directory 3", DIALOG, 8)).toEqual({ kind: "stale" });
   });
 
+  /* Qodo #16 on PR #1451: "zero" said as a word is "number 0", and a number too large to read is past every list; both are refused here, never resolved. */
+  it.each(["zero", "number zero", "Number zero.", "option zero", "99999999999999999999"])("refuses %s as a number no item shows", (said) => {
+    const answer = answerNumberLocally(said, DIALOG, 7);
+    expect(answer).toMatchObject({ kind: "out_of_range", elsewhere: [] });
+    expect(answer.kind === "out_of_range" && answer.section).toBeFalsy();
+  });
+
+  it("refuses zero in the section it was said with", () => {
+    expect(answerNumberLocally("select directory zero", DIALOG, 7)).toEqual({ kind: "out_of_range", section: "directory", number: 0, elsewhere: [] });
+  });
+
   it.each(["open the third one", "select 3", "open docs", "directory scratch"])("leaves %s to the resolver", (said) => {
     expect(answerNumberLocally(said, DIALOG, 7)).toEqual({ kind: "not_number" });
   });
