@@ -123,7 +123,9 @@ What each `cleanup.sh` list holds:
 Read the labels before presenting, and repeat them beside their entry:
 
 - `UNPUSHED <n> commit(s) per …: <commits>` counts the commits that are on no remote and in no merged PR, and names up to three of them. Removing that directory leaves them reachable from nothing.
-- `COULD NOT VERIFY` means the script could not tell whether the commits are pushed. Treat it as unpushed.
+- `COULD NOT VERIFY` means the script could not tell whether the commits are pushed, or (for nested checkouts) stopped examining them after the first 20. Treat it as unpushed.
+- `LOCAL TAGS not in this repository: …` names tags in a standalone clone that this repository does not have with the same object. Removing the clone loses them even when their commits are pushed.
+- `nested <path>: …` carries any of these labels for a checkout inside a directory that is not itself one, since removing the directory removes it too.
 - `UNCOMMITTED CHANGES` means the checkout has work git would lose.
 - `PROC_CHECK=unavailable` means the script could not read `/proc` on this host, so no directory was checked for running processes. Say "could not check for running processes" for every directory, the `WORKTREES` included, rather than presenting them as idle.
 
@@ -180,7 +182,7 @@ Remove only what the user confirmed, in this order:
    bash .claude/skills/tag-release/cleanup.sh --holders "[path]" && rm -rf -- "[path]"
    ```
 
-   Only a path the fresh run still lists under `TOOL_CACHES` or `STRAY_DIRS`, never one under `HELD_DIRS`, and never a path built by hand or by a glob. Keep the path in double quotes exactly as printed, so a space or a glob character in a directory name cannot split it or expand it into other paths. A stray labelled `UNPUSHED`, `COULD NOT VERIFY` or `UNCOMMITTED CHANGES` is removed only when the user confirmed that entry with its label in front of them.
+   Only a path the fresh run still lists under `TOOL_CACHES` or `STRAY_DIRS`, never one under `HELD_DIRS`, and never a path built by hand or by a glob. Keep the path in double quotes exactly as printed, so a space or a glob character in a directory name cannot split it or expand it into other paths. A stray labelled `UNPUSHED`, `COULD NOT VERIFY`, `LOCAL TAGS` or `UNCOMMITTED CHANGES` is removed only when the user confirmed that entry with its label in front of them.
 
 7. **E2E temp roots:**
 
@@ -189,7 +191,9 @@ Remove only what the user confirmed, in this order:
    cargo xtask clean-e2e-tmp --apply
    ```
 
-   `--apply` decides each root afresh rather than from the earlier dry run's list. That keeps a root whose owning process came alive since, but it also means a root can cross the reaper's age threshold after the user confirmed, and then `--apply` would remove a root the user saw listed as kept. So run the dry run again right before applying and compare its `reap:` list with the one the user confirmed: if it names any root the user did not see offered, show those and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
+   `--apply` decides each root afresh rather than from the earlier dry run's list. That keeps a root whose owning process came alive since, but it also means a root can cross the reaper's age threshold after the user confirmed, and then `--apply` would remove a root the user saw listed as kept.
+
+   What the user confirms is therefore the reaper's verdict as its dry run summarised it — the `reap:` count and size and the per-reason breakdown below it — not a list of individual roots. The reaper prints at most 20 paths per group and says `… and N more` past that; when it does, tell the user that the remainder is counted in the summary but not listed. So run the dry run again right before applying and compare it with what the user confirmed: if the `reap:` count, a per-reason count, or any listed path differs, show the new summary and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
 
 Finally, prune stale worktree metadata:
 

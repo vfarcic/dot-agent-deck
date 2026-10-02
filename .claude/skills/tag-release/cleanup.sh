@@ -262,7 +262,7 @@ unpushed() {
 # its refs inside the directory, so HEAD and every local branch, tag and stash
 # entry is checked.
 git_label_one() {
-  local d="$1" head br tips="" t u out="" dirty=""
+  local d="$1" head br tips="" t u out="" dirty="" tags="" ntags=0 ref obj name
   # Status first: a repository with no commit yet can still hold staged and
   # untracked files, and those are exactly what removal would lose.
   if [ -n "$(dgit "$d" status --porcelain 2>/dev/null | head -1)" ]; then
@@ -283,6 +283,20 @@ git_label_one() {
     tips="$head"$'\n'"$(dgit "$d" for-each-ref \
       --format='%(if)%(*objectname)%(then)%(*objectname)%(else)%(objectname)%(end)' \
       refs/heads refs/tags refs/stash 2>/dev/null || true)"
+    # A tag is lost with the clone even when its commit is pushed, so a local
+    # tag is also checked BY NAME: it is safe only when this repository has a
+    # tag of that name naming the same object (for an annotated tag, the same
+    # tag object, so its message survives too). This repository's tags are the
+    # ones fetched from its remote, so a tag the remote has but this checkout
+    # never fetched is named too — the safe direction.
+    while IFS=' ' read -r ref obj; do
+      [ -z "$ref" ] && continue
+      name="${ref#refs/tags/}"
+      [ "$(git rev-parse --quiet --verify "refs/tags/${name}" 2>/dev/null || true)" = "$obj" ] && continue
+      ntags=$((ntags + 1))
+      if [ "$ntags" -le 5 ]; then tags="${tags:+${tags}, }${name}"; fi
+    done <<< "$(dgit "$d" for-each-ref --format='%(refname) %(objectname)' refs/tags 2>/dev/null || true)"
+    if [ "$ntags" -gt 5 ]; then tags="${tags} and $((ntags - 5)) more"; fi
   fi
   while IFS= read -r t; do
     [ -z "$t" ] && continue
@@ -291,6 +305,10 @@ git_label_one() {
       case "$out" in *"$u"*) ;; *) out="${out:+${out}; }${u}" ;; esac
     fi
   done <<< "$(printf '%s\n' "$tips" | sort -u)"
+  if [ -n "$tags" ]; then
+    out="${out:+${out}; }LOCAL TAGS not in this repository: ${tags}"
+    echo "git: ${out}${dirty}"; return
+  fi
   echo "git: ${out:-every commit is on a remote or in a merged PR}${dirty}"
 }
 
@@ -299,27 +317,31 @@ git_label_one() {
 # them too: a `cargo xver` run sandbox holds a standalone repository under
 # `project/`, and a scratch directory can hold clones. Nested checkouts with
 # nothing to lose are counted; any with unpushed, unverifiable or uncommitted
-# work is named. The search is bounded (depth 5, the first 20 found) so a huge
-# target dir costs a bounded walk, and the label says when the bound was hit.
+# work is named. The walk has no depth limit — `du` and `dir_modified` walk the
+# whole tree anyway — but at most 20 checkouts are examined, since each costs
+# several git calls and a cargo home can hold hundreds of git checkouts. Past
+# that the label says COULD NOT VERIFY rather than vouching for the rest.
 git_label() {
-  local d="$1" g sub l clean=0 found="" gits n
+  local d="$1" g sub l clean=0 found="" gits n=0 more=false
   if [ -e "$d/.git" ]; then git_label_one "$d"; return; fi
-  gits=$(find "$d" -mindepth 2 -maxdepth 5 -name .git -prune -print 2>/dev/null | head -n 20 || true)
-  n=0
+  gits=$(find "$d" -xdev -mindepth 2 -name .git -prune -print 2>/dev/null | head -n 21 || true)
   while IFS= read -r g; do
     [ -z "$g" ] && continue
     n=$((n + 1))
+    if [ "$n" -gt 20 ]; then more=true; break; fi
     sub="${g%/.git}"
     l=$(git_label_one "$sub")
     case "$l" in
-      *UNPUSHED*|*"COULD NOT VERIFY"*|*UNCOMMITTED*)
+      *UNPUSHED*|*"COULD NOT VERIFY"*|*UNCOMMITTED*|*"LOCAL TAGS"*)
         found="${found}; nested ${sub#"$d"/}: ${l#git: }" ;;
       *) clean=$((clean + 1)) ;;
     esac
   done <<< "$gits"
   l="git: not a checkout"
   if [ "$clean" -gt 0 ]; then l="${l}; ${clean} nested checkout(s) with nothing to lose"; fi
-  if [ "$n" -ge 20 ]; then l="${l}; nested scan stopped at 20 checkouts"; fi
+  if $more; then
+    l="${l}; COULD NOT VERIFY nested checkouts past the first 20 examined"
+  fi
   echo "${l}${found}"
 }
 

@@ -175,7 +175,10 @@ impl Sandbox {
     /// | `repo-scratch`     | plain directory, purpose unknown              |
     /// | `dad-3-target`     | plain directory, purpose unknown              |
     /// | `repo-clone`       | standalone clone with an unpushed commit      |
-    /// | `repo-tagged`      | clone, an unpushed commit only a tag reaches  |
+    /// | `repo-tagged`      | clone, an unpushed commit only a tag reaches, |
+    /// |                    | and a local-only tag on a pushed commit       |
+    /// | `repo-deep`        | plain directory, a dirty checkout 7 levels in |
+    /// | `repo-many`        | plain directory, 21 nested checkouts          |
     /// | `repo-unborn`      | `git init`, no commit, one staged file        |
     /// | `repo-nest`        | plain directory, an unpushed clone inside it  |
     /// | `repo-held`        | plain directory — a process may park here     |
@@ -274,6 +277,22 @@ impl Sandbox {
         );
         self.git(&tagged, &["tag", "-a", "-m", "keep", "keep-me"]);
         self.git(&tagged, &["checkout", "-q", "main"]);
+        // A local-only tag on a commit that IS pushed: the commit survives the
+        // clone's removal, the tag does not.
+        self.git(&tagged, &["tag", "pushed-tag", "origin/main"]);
+
+        // A checkout seven levels down, beyond any shallow search.
+        let deep = work.join("repo-deep/a/b/c/d/e/f/inner");
+        fs::create_dir_all(&deep).unwrap();
+        self.git(&deep, &["init", "-q"]);
+        fs::write(deep.join("deep.txt"), "deep").unwrap();
+
+        // More nested checkouts than the script examines.
+        for i in 0..21 {
+            let d = work.join(format!("repo-many/n{i:02}"));
+            fs::create_dir_all(&d).unwrap();
+            self.git(&d, &["init", "-q"]);
+        }
 
         // A repository with no commit yet still holds work: a staged file.
         let unborn = work.join("repo-unborn");
@@ -559,6 +578,26 @@ fn every_leftover_lands_in_its_list_and_a_busy_directory_is_never_offered() {
     assert!(
         tagged.contains("UNPUSHED 1 commit(s)") && tagged.contains("tagged only"),
         "a commit only a local tag reaches must be named: {tagged}"
+    );
+    assert!(
+        tagged.contains("LOCAL TAGS not in this repository:")
+            && tagged.contains("keep-me")
+            && tagged.contains("pushed-tag"),
+        "local-only tags must be named, even on a pushed commit: {tagged}"
+    );
+    let deep = r
+        .entry("STRAY_DIRS", &w("repo-deep"))
+        .unwrap_or_else(|| panic!("repo-deep not a stray:\n{}", r.stdout));
+    assert!(
+        deep.contains("nested a/b/c/d/e/f/inner: no commits; UNCOMMITTED CHANGES"),
+        "a dirty checkout deep inside a stray must be named: {deep}"
+    );
+    let many = r
+        .entry("STRAY_DIRS", &w("repo-many"))
+        .unwrap_or_else(|| panic!("repo-many not a stray:\n{}", r.stdout));
+    assert!(
+        many.contains("COULD NOT VERIFY nested checkouts past the first 20 examined"),
+        "a scan that stopped early must say so rather than vouch: {many}"
     );
     let unborn = r
         .entry("STRAY_DIRS", &w("repo-unborn"))
