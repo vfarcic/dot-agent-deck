@@ -1433,7 +1433,7 @@ export type DesktopRunActionDto =
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
-  | { type: "allow_build_mismatch" };
+  | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
  * PRD #742 M4: the listener takes the WHOLE fleet, never one deck's snapshot.

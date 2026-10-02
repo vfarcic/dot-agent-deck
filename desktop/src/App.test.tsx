@@ -1552,10 +1552,41 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
-    // The allowance is only read by the NEXT handshake, so the reconnect is
-    // what actually connects.
-    await waitFor(() => expect(reconnect).toHaveBeenCalled());
-    expect(screen.getByText("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.")).toBeVisible();
+    // The crate connects and emits the deck's snapshot itself (issue #1472),
+    // so nothing re-establishes the fleet behind it.
+    expect(await screen.findByText("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.")).toBeVisible();
+    expect(reconnect).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Issue #1472: a click never silently does nothing. When the crate cannot
+   * connect after all, its reason is what the user reads, not the success line.
+   */
+  /** Scenario: Confirms Connect anyway against a daemon that then fails to connect, and shows why instead of announcing a connection. */
+  it("says why when Connect anyway does not connect", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "local:/tmp/dot-agent-deck.sock",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "contract mismatch: the daemon is behind this app across 505-unsolicited-work-done-label-reworded.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+    };
+    const runAction = vi.fn(async () => {
+      throw new Error("Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds.");
+    });
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible, runAction })} />);
+
+    fireEvent.click(screen.getByTestId("connect-anyway"));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: "local:/tmp/dot-agent-deck.sock" }));
+    expect(await screen.findByText(/it did not respond as expected/)).toBeVisible();
+    expect(screen.queryByText(/Connected to the differently-built daemon/)).not.toBeInTheDocument();
   });
 
   /**
