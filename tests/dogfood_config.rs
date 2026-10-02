@@ -158,6 +158,11 @@ fn devbox_script_bodies() -> serde_json::Map<String, serde_json::Value> {
 
 /// What one role's `command` ends up running, as a flat string. `None` for a
 /// command that is not a `devbox run <script>` indirection.
+///
+/// For a multi-line script it is the LAST line: devbox runs the lines in order
+/// and stops at the first that fails, so earlier lines are preflight checks
+/// (`codex-big` runs `scripts/require-codex-version.sh` first) and the last is
+/// what launches the agent.
 fn launched_program(
     scripts: &serde_json::Map<String, serde_json::Value>,
     command: &str,
@@ -171,8 +176,9 @@ fn launched_program(
         serde_json::Value::Array(lines) => lines
             .iter()
             .filter_map(|l| l.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
+            .next_back()
+            .unwrap_or_else(|| panic!("devbox script `{script}` has no command line"))
+            .to_string(),
         other => panic!("devbox script `{script}` is neither a string nor an array: {other}"),
     })
 }
