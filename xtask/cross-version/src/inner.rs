@@ -45,6 +45,14 @@ const COMMAND_MODE_BUTTONS: [&str; 2] = ["[New Agent Ctrl+N]", "[New Pane Ctrl+N
 /// The deck's own experimental-flag label, drawn alone on the screen's last
 /// row below the footer — see [`footer_mode`].
 const EXPERIMENTAL_LABEL: &str = "experimental: on";
+/// The status line the deck paints when `Ctrl+E` toggles its command-entry
+/// lock (PRD #393, `ToggleOrchestrationLock` in `src/ui.rs`), naming the state
+/// the press left it in — see [`entry_lock`].
+const ENTRY_UNLOCKED: &str = "Pane entry: unlocked";
+const ENTRY_LOCKED: &str = "Pane entry: locked";
+/// What the deck paints instead of forwarding a keystroke into a locked worker
+/// pane (`ORCHESTRATION_LOCK_STATUS_MESSAGE` in `src/ui.rs`).
+pub(crate) const ENTRY_REFUSED: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
 /// How long the daemon gets after its one SIGTERM. Well past its 3 s agent
 /// grace (`AGENT_TERMINATE_GRACE`).
 pub(crate) const DAEMON_GRACE: Duration = Duration::from_secs(20);
@@ -1527,6 +1535,27 @@ fn with_attached_tui(
             tui.grid(),
         );
     }
+    // `--experimental` engages PRD #393's command-entry lock, which drops every
+    // keystroke typed into a worker pane (issue #1456). Unlock it the TUI's own
+    // way, once: the lock is deck-global for the life of this TUI.
+    if plan.experimental {
+        match unlock_worker_entry(tui, plan, ROLE_REVIEWER) {
+            Ok(note) => ev.step(note),
+            Err(e) => {
+                ev.step(format!(
+                    "could NOT confirm the command-entry unlock under `--experimental`; the hook \
+                     commands below may be refused by the lock, so a tell-4 failure in this run \
+                     may be the lock rather than the contract: {}",
+                    e.lines().next().unwrap_or_default()
+                ));
+                ev.excerpt(
+                    "the TUI when the command-entry unlock was not confirmed",
+                    tui.grid(),
+                );
+                focus_role(tui, plan, ROLE_REVIEWER)?;
+            }
+        }
+    }
     let work_done_sentinel = format!("XVER-WORKDONE-{nonce}");
     g.preconnect_logged(
         &format!("pane: {} work-done", cast.pane_cli_label),
@@ -1540,6 +1569,7 @@ fn with_attached_tui(
             cast.pane_cli
         ),
     );
+    let mut refused = tui.grid().contains(ENTRY_REFUSED);
     focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let feedback = format!("Worker {ROLE_REVIEWER} has completed their task");
     let work_done_arrived = tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
@@ -1558,6 +1588,7 @@ fn with_attached_tui(
         tui,
         &format!("{} agent-event --type running", cast.pane_cli),
     );
+    refused |= tui.grid().contains(ENTRY_REFUSED);
     let client_cli = format!("{} CLI: daemon status", cast.client_side);
     let status_rows = wait_for_status(
         g,
@@ -1600,14 +1631,22 @@ fn with_attached_tui(
              `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in the \
              orchestrator's pane.\n\
              status: issued `{} agent-event --type running` from inside the `{ROLE_REVIEWER}` \
-             pane, LAST as rule 12 requires. {status_note}",
+             pane, LAST as rule 12 requires. {status_note}{}",
             cast.pane_cli,
             if work_done_arrived {
                 "appeared"
             } else {
                 "did NOT appear"
             },
-            cast.pane_cli
+            cast.pane_cli,
+            if refused {
+                format!(
+                    "\nthe TUI REFUSED typed input into the `{ROLE_REVIEWER}` pane: its footer \
+                     read {ENTRY_REFUSED:?} (PRD #393's command-entry lock, issue #1456)"
+                )
+            } else {
+                String::new()
+            }
         ),
     );
 
@@ -2854,10 +2893,7 @@ pub(crate) enum FooterMode {
 /// `--experimental` the footer is the row above that label — which is skipped
 /// the same way a blank row is.
 pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
-    let row = grid
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)?;
+    let row = footer_row(grid)?;
     let head = row.trim_start();
     if head.starts_with("TYPING") {
         Some(FooterMode::Typing)
@@ -2870,6 +2906,113 @@ pub(crate) fn footer_mode(grid: &str) -> Option<FooterMode> {
     } else {
         None
     }
+}
+
+/// The deck's footer: the grid's last non-blank row that is not the
+/// `experimental: on` label drawn below it (see [`footer_mode`]).
+fn footer_row(grid: &str) -> Option<&str> {
+    grid.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && l.trim() != EXPERIMENTAL_LABEL)
+}
+
+/// The state of the deck's command-entry lock (PRD #393), as the footer last
+/// stated it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryLock {
+    Locked,
+    Unlocked,
+}
+
+/// Read the command-entry lock's state off the footer.
+///
+/// The deck draws no standing lock indicator: the only on-screen statement of
+/// the state is the status line a `Ctrl+E` toggle paints into the footer, beside
+/// the mode chip, for its 15 s `STATUS_MESSAGE_TTL`. That line names the state
+/// the press LEFT, so while it is up it is the current state — any later toggle
+/// would have replaced it. `None` when the footer carries neither line: no
+/// toggle recently, or a build with no lock to toggle.
+pub(crate) fn entry_lock(grid: &str) -> Option<EntryLock> {
+    let row = footer_row(grid)?;
+    if row.contains(ENTRY_UNLOCKED) {
+        Some(EntryLock::Unlocked)
+    } else if row.contains(ENTRY_LOCKED) {
+        Some(EntryLock::Locked)
+    } else {
+        None
+    }
+}
+
+/// Unlock command entry into worker panes, proving it by the footer, so the
+/// hook commands typed into a worker pane reach its shell (issue #1456).
+///
+/// Under the experimental flag a deck starts with PRD #393's command-entry lock
+/// engaged: on an Orchestration tab it drops every keystroke typed into a
+/// focused pane other than the orchestrator's, painting [`ENTRY_REFUSED`]
+/// instead, so tell 4's `work-done` and `agent-event` never reached the daemon.
+/// The unlock is the TUI's own, `Ctrl+D` then `Ctrl+E` — the chord that refusal
+/// names — rather than anything that steps around the TUI: `focus_role` puts
+/// the deck on the Orchestration tab (the only place `Ctrl+E` is bound),
+/// [`ensure_command_mode`] reads the ` COMMAND ` chip before anything is
+/// pressed, and then `role` is focused again in `PaneInput`.
+///
+/// `Ctrl+E` TOGGLES, the same trap `Ctrl+D` is, so it is pressed only when the
+/// footer does not already say [`EntryLock::Unlocked`], and each press waits
+/// for the footer to state the result. A press that reports `locked` found the
+/// deck already unlocked and earns exactly one more. The lock is deck-global and
+/// lives as long as the TUI process, so one unlock covers every later worker
+/// pane in the run, the reverse probes' included.
+///
+/// `Ok(note)` for the evidence when the unlock was confirmed. `Err` when it was
+/// not, or `role` could not be focused: the caller records it and types anyway,
+/// so tell 4 fails on what the deck did with the input — [`ENTRY_REFUSED`] on
+/// screen says it was the lock — rather than on this step's guess.
+pub(crate) fn unlock_worker_entry(
+    deck: &pty::PtyDeck,
+    plan: &Plan,
+    role: &str,
+) -> Result<String, String> {
+    focus_role(deck, plan, role)?;
+    if !ensure_command_mode(deck) {
+        let grid = deck.grid();
+        return Err(format!(
+            "the TUI never showed a COMMAND footer, so `Ctrl+E` was not sent (the footer reads \
+             {:?}).\n=== grid ===\n{grid}",
+            footer_mode(&grid)
+        ));
+    }
+    let mut presses = 0;
+    while entry_lock(&deck.grid()) != Some(EntryLock::Unlocked) && presses < 2 {
+        let before = entry_lock(&deck.grid());
+        deck.send(b"\x05"); // Ctrl+E: toggle the command-entry lock
+        presses += 1;
+        // Wait for the state this press CHANGES: from no statement, any
+        // statement; from `locked`, `unlocked`.
+        deck.wait_for_grid(STEP_TIMEOUT, |g| match before {
+            None => entry_lock(g).is_some(),
+            Some(_) => entry_lock(g) == Some(EntryLock::Unlocked),
+        });
+        if entry_lock(&deck.grid()).is_none() {
+            // No answer on screen: pressing again could undo a toggle that was
+            // merely slow to paint.
+            break;
+        }
+    }
+    let grid = deck.grid();
+    if entry_lock(&grid) != Some(EntryLock::Unlocked) {
+        return Err(format!(
+            "pressed `Ctrl+E` {presses} time(s) in command mode and the footer never said \
+             {ENTRY_UNLOCKED:?} (it reads {:?}) — this TUI build may have no command-entry lock to \
+             toggle, or did not redraw.\n=== grid ===\n{grid}",
+            footer_row(&grid).map(str::trim)
+        ));
+    }
+    focus_role(deck, plan, role)?;
+    Ok(format!(
+        "unlocked command entry into worker panes (PRD #393's lock, on under \
+         `--experimental`) with the TUI's own `Ctrl+D` then `Ctrl+E`: the footer read \
+         {ENTRY_UNLOCKED:?} after {presses} press(es), then `{role}` was focused again"
+    ))
 }
 
 /// Put the deck in command mode and prove it by the footer, sending `Ctrl+D`
@@ -3111,6 +3254,58 @@ mod tests {
         let typing =
             grid_with_footer(" TYPING  PaneInput mode\n                experimental: on   ");
         assert_eq!(footer_mode(&typing), Some(FooterMode::Typing));
+    }
+
+    #[test]
+    fn entry_lock_reads_the_toggle_line_on_the_footer_only() {
+        let unlocked = grid_with_footer(" COMMAND  Pane entry: unlocked\nexperimental: on");
+        assert_eq!(entry_lock(&unlocked), Some(EntryLock::Unlocked));
+        assert_eq!(
+            footer_mode(&unlocked),
+            Some(FooterMode::Command),
+            "the toggle line sits beside the chip, so the mode still reads"
+        );
+        let locked = grid_with_footer(" COMMAND  Pane entry: locked\nexperimental: on");
+        assert_eq!(entry_lock(&locked), Some(EntryLock::Locked));
+        let bar = grid_with_footer(" COMMAND  [Back to Pane Ctrl+D] [New Agent Ctrl+N]");
+        assert_eq!(entry_lock(&bar), None, "no toggle line, no statement");
+        let refused = grid_with_footer(&format!(" TYPING  {ENTRY_REFUSED}  [Command Mode Ctrl+D]"));
+        assert_eq!(
+            entry_lock(&refused),
+            None,
+            "the refusal names the unlock chord; it is not a statement of the toggle's result"
+        );
+        let in_a_pane = "┌reviewer─────────┐\n│$ echo Pane entry: unlocked│\n└─────────────────┘\n \
+             COMMAND  [Back to Pane Ctrl+D]\n";
+        assert_eq!(
+            entry_lock(in_a_pane),
+            None,
+            "text in a pane is not the deck's footer"
+        );
+    }
+
+    /// The strings [`entry_lock`] and tell 4's refusal note read are the TUI's
+    /// own, so a rename in `src/ui.rs` turns this red instead of leaving
+    /// `--experimental` runs to fail tell 4 again (issue #1456). This checks the
+    /// TUI in this tree, which is the branch side of a run; the previous
+    /// release's TUI is whatever that release shipped.
+    #[test]
+    fn the_command_entry_lock_strings_are_the_tuis_own() {
+        let ui = include_str!("../../../src/ui.rs");
+        assert!(
+            ui.contains(&format!(
+                "const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = \"{ENTRY_REFUSED}\";"
+            )),
+            "src/ui.rs no longer paints {ENTRY_REFUSED:?} for a refused keystroke"
+        );
+        assert!(
+            ui.contains("format!(\"Pane entry: {lock_name}\")")
+                && ui.contains("\"locked\"")
+                && ui.contains("\"unlocked\""),
+            "src/ui.rs no longer paints `Pane entry: locked` / `Pane entry: unlocked` on Ctrl+E"
+        );
+        assert_eq!(ENTRY_LOCKED, "Pane entry: locked");
+        assert_eq!(ENTRY_UNLOCKED, "Pane entry: unlocked");
     }
 
     #[test]
