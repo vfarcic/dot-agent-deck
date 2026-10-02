@@ -1867,9 +1867,13 @@ There is no `pnpm build` to run first: the Playwright `webServer` builds and ser
 - `DAD_BROWSER_REUSE_SERVER=1` reuses whatever already answers on `DAD_BROWSER_PORT`, or on 4173 (`vite preview`'s default) when that is unset, and starts the usual build-and-serve only if nothing does. The specs then drive the bundle that server holds, which is only as current as its last `vite build`. CI ignores it.
 
 ```sh
-./node_modules/.bin/vite build && ./node_modules/.bin/vite preview --port 4300 --strictPort --host 127.0.0.1 &
+./node_modules/.bin/vite build
+./node_modules/.bin/vite preview --port 4300 --strictPort --host 127.0.0.1 &
+until curl -sf http://127.0.0.1:4300/ >/dev/null; do sleep 0.2; done   # serving before Playwright looks
 DAD_BROWSER_REUSE_SERVER=1 DAD_BROWSER_PORT=4300 pnpm test:browser overview-scroll
 ```
+
+Wait for the server before starting the run. Playwright checks the port once, at startup, and if nothing answers yet it starts its own build-and-serve on that port, competing with yours.
 
 The build itself still goes to `desktop/dist`, which belongs to the checkout, so two runs in the *same* checkout at once rebuild the one directory the other is serving. Run them from separate worktrees.
 
