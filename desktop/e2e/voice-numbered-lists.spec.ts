@@ -74,13 +74,15 @@ test.describe("numbered lists while voice is on", () => {
     await expect(rows.first()).not.toHaveAccessibleName(/^1\./);
   });
 
-  /** Scenario: the Daemons screen prints the same one-based numbers its 1–4 focus keys already use. The number is removed when Voice is turned off. */
+  /** Scenario: with a silent microphone, the Daemons screen shows four numbered tiles while Voice is on. Pressing 3 selects the tile labelled 3. */
   test("daemon agent tiles agree with their focus keys", async ({ page }) => {
-    await openWithSpeech(page, "docs");
+    await openWithSpeech(page, "docs", [""]);
     await enterDeck(page);
     const tiles = page.locator(".agent-grid .agent-tile");
     await expect(tiles).toHaveCount(4);
     await turnOnVoice(page);
+    await expect(tiles).toHaveCount(4);
+    await expect(tiles.nth(3)).toHaveAccessibleName(/^4\./);
     await expectNumbers(tiles, 1);
     await page.keyboard.press("3");
     await expect(tiles.nth(2)).toHaveClass(/is-selected/);
