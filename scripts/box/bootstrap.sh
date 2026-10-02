@@ -164,6 +164,12 @@ npm_missing=()
 have codex || npm_missing+=(@openai/codex)
 have pi    || npm_missing+=(@earendil-works/pi-coding-agent)
 [ ${#npm_missing[@]} -eq 0 ] || sudo npm install -g --no-fund --no-audit "${npm_missing[@]}"
+# An installed Codex older than the repo's minimum (scripts/require-codex-version.sh)
+# is upgraded, not only a missing one: `codex-big` needs it for its model.
+codex_check="$HERE/../require-codex-version.sh"
+if have codex && [ -x "$codex_check" ] && ! "$codex_check" 2>/dev/null; then
+  sudo npm install -g --no-fund --no-audit @openai/codex@latest
+fi
 # Devin's installer ends by running `devin setup`, an interactive login, which
 # fails without a terminal. The install itself is complete by then, so feed it
 # no input and judge by whether the binary landed.
