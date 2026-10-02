@@ -1830,8 +1830,10 @@ describe("AgentOverview", () => {
     expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
-    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
-    await waitFor(() => expect(reconnect).toHaveBeenCalled());
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: snapshot.connection.deckId }));
+    // The crate connects and emits the deck's snapshot (issue #1472); a
+    // reconnect would re-establish the whole fleet to show one deck.
+    expect(reconnect).not.toHaveBeenCalled();
   });
 
   /** The same load-bearing negative as on the daemon: the wire check is not negotiable. */
@@ -2957,5 +2959,130 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
       from: "overview",
     });
     expect(terminalMounted).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Issue #1472. The fleet a maintainer actually runs: the local deck is the
+   * selected one and connects, while a production deck on an older release is
+   * refused over a declared compatibility break. Its group offers Connect
+   * anyway, and before the fix the click did nothing at all — the handler
+   * re-checked the SELECTED deck's connection, which was healthy.
+   */
+  function fleetWithARefusedDeck(): DeckSnapshot[] {
+    const fleet = createFixtureFleet("fleet");
+    fleet[1] = {
+      ...fleet[1],
+      agents: [],
+      connection: {
+        ...fleet[1].connection,
+        status: "error",
+        daemonDetected: true,
+        runningAgentCount: 0,
+        message: "contract mismatch: the daemon is behind this app across 505-unsolicited-work-done-label-reworded. Protocol 10 matched on both sides, so the frames decode — but a declared compatibility break sits between these two builds, so a field can be read with the wrong meaning rather than failing outright. Builds: desktop is 0.44.0-12-gabc1234, daemon is 0.44.0. No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.",
+        buildStampMismatchOnly: true,
+      },
+    };
+    return fleet;
+  }
+
+  function refusedGroup(): HTMLElement {
+    const group = deckSections().find((section) => section.getAttribute("data-daemon-id") === FIXTURE_REMOTE_DAEMON_ID);
+    expect(group).toBeDefined();
+    return group!;
+  }
+
+  /**
+   * Scenario: The local deck is selected and connected while a second deck is
+   * refused over a declared compatibility break. Clicking that deck's Connect
+   * anyway opens the confirmation, and confirming asks the app to connect THAT
+   * deck anyway rather than the selected one.
+   */
+  it("connects anyway to a refused deck that is not the selected one", async () => {
+    const fleet = fleetWithARefusedDeck();
+    const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
+    const reconnect = vi.fn(async () => undefined);
+    const { rerender } = render(<AgentOverview runtime={runtime({ mode: "live", snapshot: fleet[0], fleet, runAction, reconnect })} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("may show some of this daemon's information wrongly");
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: FIXTURE_REMOTE_DAEMON_ID }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(reconnect).not.toHaveBeenCalled();
+
+    // The crate then emits that deck's snapshot, connected with the caveat
+    // kept, and the group becomes the daemon's dashboard.
+    const connected = createFixtureFleet("fleet");
+    connected[1] = {
+      ...connected[1],
+      connection: {
+        ...connected[1].connection,
+        message: "contract mismatch: the daemon is behind this app across 505-unsolicited-work-done-label-reworded. Builds: desktop is 0.44.0-12-gabc1234, daemon is 0.44.0. Connected anyway for this session.",
+        buildStampMismatchOnly: true,
+      },
+    };
+    rerender(<AgentOverview runtime={runtime({ mode: "live", snapshot: connected[0], fleet: connected, runAction, reconnect })} onNavigate={vi.fn()} />);
+    expect(within(refusedGroup()).queryByTestId("overview-incompatible")).not.toBeInTheDocument();
+    expect(within(refusedGroup()).getByTestId("daemon-state")).toHaveTextContent("Connected anyway for this session");
+    expect(rows(refusedGroup()).length).toBe(connected[1].agents.length);
+    expect(rows(refusedGroup()).length).toBeGreaterThan(0);
+  });
+
+  /**
+   * Scenario: The same refused, non-selected deck, but the app cannot connect
+   * to it when the user confirms Connect anyway. The reason is shown inside
+   * that deck's group, where the button was pressed.
+   */
+  it("says why on the refused deck's own group when connecting anyway fails", async () => {
+    const fleet = fleetWithARefusedDeck();
+    const runAction = vi.fn(async () => {
+      throw new Error("Could not connect to this daemon: it did not respond as expected, and its card shows what went wrong. The app keeps trying and connects to it as soon as it responds.");
+    });
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot: fleet[0], fleet, runAction })} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+
+    expect(await within(refusedGroup()).findByTestId("overview-connect-anyway-error")).toHaveTextContent("it did not respond as expected");
+  });
+
+  /**
+   * Scenario: Connect anyway fails on a refused, non-selected deck and its
+   * reason is shown; the deck later connects, then stops answering. The old
+   * reason is gone rather than reappearing on the disconnected note, and
+   * pressing Reconnect clears a reason the same way.
+   */
+  it("drops a Connect anyway failure once that deck has moved on", async () => {
+    const fleet = fleetWithARefusedDeck();
+    const runAction = vi.fn(async () => {
+      throw new Error("Could not connect to this daemon: it did not respond as expected.");
+    });
+    const reconnect = vi.fn(async () => undefined);
+    const view = (decks: DeckSnapshot[]) => <AgentOverview runtime={runtime({ mode: "live", snapshot: decks[0], fleet: decks, runAction, reconnect })} onNavigate={vi.fn()} />;
+    const { rerender } = render(view(fleet));
+
+    const fail = async () => {
+      fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
+      expect(await within(refusedGroup()).findByTestId("overview-connect-anyway-error")).toBeVisible();
+    };
+    await fail();
+
+    const connected = createFixtureFleet("fleet");
+    rerender(view(connected));
+    await waitFor(() => expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument());
+
+    const down = createFixtureFleet("fleet");
+    down[1] = { ...down[1], connection: { ...down[1].connection, status: "disconnected", message: "No daemon is listening on the configured socket." } };
+    rerender(view(down));
+    expect(within(refusedGroup()).getByTestId("overview-disconnected")).toBeVisible();
+    expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument();
+
+    rerender(view(fleet));
+    await fail();
+    fireEvent.click(within(refusedGroup()).getByRole("button", { name: /Reconnect/ }));
+    expect(reconnect).toHaveBeenCalled();
+    expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument();
   });
 });

@@ -73,10 +73,7 @@ use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
 use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
-use crate::daemon_bridge::{
-    DaemonLinks, allow_build_mismatch_this_session, bootstrap, get_snapshot, snapshot_with,
-    trusted_daemon,
-};
+use crate::daemon_bridge::{DaemonLinks, bootstrap, get_snapshot, snapshot_with, trusted_daemon};
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
     DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
@@ -5047,24 +5044,45 @@ async fn desktop_run_action(
                 snapshot,
             });
         }
-        DesktopAction::AllowBuildMismatch => {
-            // Session-scoped and nothing else: no daemon call, no persistence,
-            // no restart. The refusal it lifts is the desktop's own stamp
-            // comparison, so the whole act is setting a process flag and
-            // classifying the handshake again — which the `refresh_and_emit`
-            // at the tail of this function does unconditionally, and which is
-            // why nothing here may cache a verdict.
-            allow_build_mismatch_this_session();
-            // PRD #741 M4(a): this action's ENTIRE effect is that the handshake
-            // must be classified again — the comment above says so, and since
-            // the classification is now held it has to be dropped explicitly.
-            // Without this the flag would be set and the banner would keep
-            // reporting the refusal it just lifted.
-            state.daemon.invalidate_all().await;
-            result_message = Some(
-                "Build-stamp mismatch accepted for this session; the caveat stays in the connection banner."
-                    .into(),
-            );
+        DesktopAction::AllowBuildMismatch { deck_id } => {
+            // Session-scoped and nothing else: no daemon call beyond a
+            // handshake, no persistence, no restart. The refusal it lifts is
+            // the desktop's own contract comparison, so the whole act is
+            // setting a process flag and classifying the handshake again.
+            //
+            // Issue #1472: against the deck the button was pressed on, which
+            // on the overview need not be the selected one, and VERIFIED —
+            // `connect_anyway` handshakes that deck again under the allowance.
+            // Its snapshot is emitted here so the deck's group updates at once
+            // rather than on its watcher's next retry, and a deck that still
+            // did not connect is reported as a failure instead of announced as
+            // connected.
+            //
+            // It returns here rather than through the tail's
+            // `refresh_and_emit`, which would fetch the SELECTED deck too: on
+            // the overview that is usually another deck, and a slow one would
+            // hold the confirmation open after this one had connected. Every
+            // other deck re-reads the allowance on its own watcher's next pass.
+            let scope = crate::dto::DeckScope::resolve(deck_id.as_deref())?;
+            let snapshot =
+                crate::daemon_bridge::connect_anyway(&state.daemon, scope.endpoint()).await;
+            emit_snapshot(&app, &snapshot);
+            if let Some(failure) =
+                crate::daemon_bridge::connect_anyway_failure(&snapshot.connection)
+            {
+                return Err(failure.into());
+            }
+            return Ok(DesktopActionResult {
+                ok: true,
+                agent_id: None,
+                agent_ids: Vec::new(),
+                send_result: None,
+                terminal: None,
+                message: Some(
+                    "Connected anyway for this session; the mismatch stays on screen.".into(),
+                ),
+                snapshot,
+            });
         }
         DesktopAction::RenameAgent {
             agent_id,

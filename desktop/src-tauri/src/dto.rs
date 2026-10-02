@@ -686,11 +686,20 @@ pub enum DesktopAction {
     },
     RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
-    /// hand back a freshly classified snapshot (issue #801). Carries no
-    /// payload: it is an assertion by the user, not a parameter, and it can
-    /// only ever relax the stamp check — the protocol check runs first and is
-    /// never bypassed.
-    AllowBuildMismatch,
+    /// hand back a freshly classified snapshot (issue #801). The allowance
+    /// itself is an assertion by the user, not a parameter, and it can only
+    /// ever relax the stamp check — the protocol check runs first and is never
+    /// bypassed.
+    AllowBuildMismatch {
+        /// The deck whose refusal the user pressed Connect anyway on (issue
+        /// #1472), resolved with [`DeckScope::resolve`]. The allowance is
+        /// app-wide either way; what this names is the deck the action
+        /// CONNECTS and reports on, so a refusal on a deck other than the
+        /// selected one is answered for that deck. Absent means the selected
+        /// deck, which is what every caller sent before.
+        #[serde(default)]
+        deck_id: Option<String>,
+    },
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
@@ -3527,12 +3536,29 @@ mod tests {
     }
 
     #[test]
-    fn allow_build_mismatch_action_carries_no_payload() {
+    fn allow_build_mismatch_action_needs_no_payload() {
         let action: DesktopAction = serde_json::from_value(serde_json::json!({
             "type": "allow_build_mismatch"
         }))
         .unwrap();
-        assert!(matches!(action, DesktopAction::AllowBuildMismatch));
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: None }
+        ));
+    }
+
+    /// Issue #1472: the overview names the deck the button was pressed on.
+    #[test]
+    fn allow_build_mismatch_action_carries_the_deck_it_was_pressed_on() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "allow_build_mismatch",
+            "deckId": "remote:prod"
+        }))
+        .unwrap();
+        assert!(matches!(
+            action,
+            DesktopAction::AllowBuildMismatch { deck_id: Some(ref deck) } if deck == "remote:prod"
+        ));
     }
 
     #[test]

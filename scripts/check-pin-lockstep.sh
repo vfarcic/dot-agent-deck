@@ -26,6 +26,9 @@
 # are: one `<file>:<line> <version>` per site and one `!ERR <message>` per
 # unreadable one. It exists for `pin_lockstep.rs`, which compares those sites
 # against what renovate.json's pnpm regex extracts from the same files.
+# `--toolchain-sites` does the same for the Rust toolchain scanner, which
+# `pin_lockstep.rs` compares against renovate.json's workflow `rustc` regex
+# (issue #1478).
 #
 # WHERE IT RUNS
 #
@@ -64,7 +67,7 @@
 # this script never needs touching when a pin moves — only when a new pin class
 # starts being duplicated across the two.
 #
-# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites] [REPO_ROOT]
+# Usage: scripts/check-pin-lockstep.sh [--pnpm-sites | --toolchain-sites] [REPO_ROOT]
 # Exit:  0 = the pins agree, 1 = they do not (details on stderr).
 
 set -euo pipefail
@@ -76,6 +79,10 @@ case "${1:-}" in
     ;;
   --pnpm-sites)
     pnpm_sites_only=1
+    shift
+    ;;
+  --toolchain-sites)
+    toolchain_sites_only=1
     shift
     ;;
 esac
@@ -645,6 +652,10 @@ compare() {
 
 if [ "${pnpm_sites_only:-0}" -eq 1 ]; then
   scan_workflow_pnpm
+  exit 0
+fi
+if [ "${toolchain_sites_only:-0}" -eq 1 ]; then
+  scan_workflow_toolchain
   exit 0
 fi
 
