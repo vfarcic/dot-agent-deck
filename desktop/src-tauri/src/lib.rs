@@ -2951,7 +2951,9 @@ async fn desktop_voice_start(
     // open for the life of the app. The ticket is what stops a timer outliving
     // its own utterance and closing the next one.
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(voice::MAX_UTTERANCE).await;
+        // Not always the whole cap: a microphone kept open since the last
+        // utterance has been recording this one since then (PR #1451).
+        tokio::time::sleep(ticket.remaining()).await;
         // Blocking for the reason the open above is: releasing the device
         // joins its thread, which is as slow as the platform's teardown.
         let _ = tauri::async_runtime::spawn_blocking(move || hold.cap_reached(ticket)).await;
@@ -3061,7 +3063,15 @@ const MAX_VOICE_DECK_ID_BYTES: usize = 256;
 /// reach it.
 fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(), String> {
     let too_long = |value: &str, limit: usize| value.len() > limit;
-    if directories.entries.len() > MAX_VOICE_DIRECTORY_ENTRIES
+    // A paged listing's other pages are children of the same directory, so
+    // the pages together are bounded as one listing is (PR #1451 round 3,
+    // change 4).
+    let elsewhere = directories
+        .paging
+        .as_ref()
+        .map_or(&[][..], |paging| paging.elsewhere.as_slice());
+    if directories.entries.len() + elsewhere.len() > MAX_VOICE_DIRECTORY_ENTRIES
+        || !voice_paging_is_sound(directories.paging.as_ref(), MAX_VOICE_DIRECTORY_NAME_BYTES)
         || too_long(&directories.deck_id, MAX_VOICE_DECK_ID_BYTES)
         || too_long(&directories.path, MAX_VOICE_DIRECTORY_PATH_BYTES)
         || directories.entries.iter().any(|entry| {
@@ -3075,6 +3085,19 @@ fn validate_voice_directories(directories: &voice::VoiceDirectories) -> Result<(
         );
     }
     Ok(())
+}
+
+/// Whether a declared [`voice::VoicePaging`] is one a real paged list could
+/// have produced: pages counted from 1 and every name within `name_limit`.
+/// Absent paging is sound. How many items it may carry is the caller's bound.
+fn voice_paging_is_sound(paging: Option<&voice::VoicePaging>, name_limit: usize) -> bool {
+    paging.is_none_or(|paging| {
+        paging.page >= 1
+            && paging
+                .elsewhere
+                .iter()
+                .all(|item| item.page >= 1 && item.name.len() <= name_limit)
+    })
 }
 
 /// The bounds on the New agent form a webview may declare (PRD #1223), checked
@@ -3105,9 +3128,27 @@ fn validate_voice_new_agent(new_agent: &voice::VoiceNewAgent) -> Result<(), Stri
         || oversized(&form.modes)
         || oversized(&form.agent_types)
         || oversized(&form.withheld_modes)
+        || form
+            .mode_paging
+            .as_ref()
+            .is_some_and(|paging| paging.elsewhere.len() > MAX_VOICE_FORM_CHOICES)
+        || !voice_paging_is_sound(form.mode_paging.as_ref(), MAX_VOICE_FORM_CHOICE_BYTES)
     {
         return Err(
             "the New agent form sent with that command is larger than any form shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// PRD #1260 — the dictation target a webview may declare: two ids, each
+/// bounded like the deck id a form declares, and neither empty, since a mode
+/// aimed at nobody is not a mode.
+fn validate_voice_dictation(dictation: &voice::VoiceDictationTarget) -> Result<(), String> {
+    let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad(&dictation.deck_id) || bad(&dictation.agent_id) {
+        return Err(
+            "the typing target sent with that command names no agent a pane shows".to_string(),
         );
     }
     Ok(())
@@ -3226,6 +3267,14 @@ fn selector_rows_beyond_voice(
 /// an IPC argument between this app's own webview and its own Rust half, in
 /// one binary, and never reaches the daemon.
 ///
+/// **`dictation` is the sixth** (PRD #1260): the agent the voice panel is in
+/// the dictation mode for, present only while the mode is on. Its presence
+/// makes the utterance local — classified against the reserved phrases and
+/// otherwise typed, with no Commands backend call
+/// ([`voice::handle_utterance_with_dictation`]). Bounded like the deck id above
+/// and trusted no further: the typing itself goes through the webview's own
+/// `sendTerminalInput` to the pane on screen, never to whatever this names.
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -3253,6 +3302,7 @@ async fn desktop_voice_resolve(
     new_agent: Option<voice::VoiceNewAgent>,
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
     endpoints: Option<crate::settings::EndpointSettings>,
+    dictation: Option<voice::VoiceDictationTarget>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3268,6 +3318,9 @@ async fn desktop_voice_resolve(
     }
     if let Some(deck_step) = &deck_step {
         validate_voice_deck_step(deck_step)?;
+    }
+    if let Some(dictation) = &dictation {
+        validate_voice_dictation(dictation)?;
     }
     // Read per call rather than cached, for `voice_speech_settings`'s reason: a
     // user who changes the backend, the endpoint or the model uses it on the
@@ -3287,6 +3340,7 @@ async fn desktop_voice_resolve(
             new_agent: new_agent.as_ref(),
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
+            dictation: dictation.as_ref(),
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3304,12 +3358,13 @@ struct VoiceDeclaration<'a> {
     new_agent: Option<&'a voice::VoiceNewAgent>,
     deck_step: Option<&'a [voice::VoiceDeckChoice]>,
     endpoints: Option<&'a crate::settings::EndpointSettings>,
+    dictation: Option<&'a voice::VoiceDictationTarget>,
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
 /// resolves against, the utterance's outcome, and a switch addressed to the
 /// Deck selector's token. Separate so it runs without a webview or a daemon.
-// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with` takes them.
+// Eight: each piece `desktop_voice_resolve` reads or is sent, as `handle_utterance_with_dictation` takes them.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_declared_utterance(
     resolver: &dyn voice::IntentResolver,
@@ -3327,7 +3382,7 @@ async fn resolve_declared_utterance(
     // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
-    let mut result = voice::handle_utterance_with(
+    let mut result = voice::handle_utterance_with_dictation(
         resolver,
         voice::table(),
         screen,
@@ -3335,6 +3390,7 @@ async fn resolve_declared_utterance(
         &decks,
         declared.directories,
         declared.new_agent,
+        declared.dictation,
         transcript,
         labels,
         show_deck,
@@ -3352,6 +3408,186 @@ async fn resolve_declared_utterance(
         );
     }
     Ok(result)
+}
+
+/// The most bytes one offered candidate's text may carry across the boundary
+/// ([`validate_voice_choice`]): a label or a value is a name, an id or a path.
+const MAX_VOICE_CHOICE_TEXT_BYTES: usize = 4 * 1024;
+
+/// Refuse an offered list no real choice could have produced: more entries
+/// than [`voice::choice::MAX_CHOICES`], or text longer than any name.
+fn validate_voice_choice(offered: &[voice::ResolvedParam]) -> Result<(), String> {
+    let too_long = |param: &voice::ResolvedParam| {
+        [&param.name, &param.spoken, &param.value, &param.label]
+            .iter()
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+    };
+    if offered.is_empty()
+        || offered.len() > voice::choice::MAX_CHOICES
+        || offered.iter().any(too_long)
+    {
+        return Err("the choice sent with that answer is not one this app offers".to_string());
+    }
+    Ok(())
+}
+
+/// PRD #1261: answer a pending numbered choice, locally.
+///
+/// **No Commands backend call.** The utterance is answered by
+/// [`voice::choice::answer`] against the list the panel offered and against
+/// what the app observes NOW — the selected deck's agents, read here as
+/// [`desktop_voice_resolve`] reads them, and the dialog's declarations, sent
+/// with the answer for that command's reasons. No model is asked anything, so
+/// no observed name can steer which entry is chosen.
+///
+/// `action` is the row the choice completes; it only decides how decks are
+/// keyed, because a switch's candidates carry the Deck selector's token
+/// ([`voice::address_deck_switch`]). The webview dispatches the chosen entry
+/// itself, through the same staleness checks a resolved dispatch meets.
+#[tauri::command]
+// Nine: each declaration piece is a parameter, for `desktop_voice_resolve`'s reason.
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_choice(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    utterance: String,
+    action: String,
+    offered: Vec<voice::ResolvedParam>,
+    directories: Option<voice::VoiceDirectories>,
+    new_agent: Option<voice::VoiceNewAgent>,
+    deck_step: Option<Vec<voice::VoiceDeckChoice>>,
+    endpoints: Option<crate::settings::EndpointSettings>,
+) -> Result<voice::ChoiceAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_choice(&offered)?;
+    if let Some(directories) = &directories {
+        validate_voice_directories(directories)?;
+    }
+    if let Some(new_agent) = &new_agent {
+        validate_voice_new_agent(new_agent)?;
+    }
+    if let Some(deck_step) = &deck_step {
+        validate_voice_deck_step(deck_step)?;
+    }
+    let snapshot = get_snapshot(&state.daemon).await;
+    Ok(answer_declared_choice(
+        &utterance,
+        &action,
+        &offered,
+        &snapshot.agents,
+        &snapshot.observed,
+        VoiceDeclaration {
+            directories: directories.as_ref(),
+            new_agent: new_agent.as_ref(),
+            deck_step: deck_step.as_deref(),
+            endpoints: endpoints.as_ref(),
+            dictation: None,
+        },
+    ))
+}
+
+/// The most items a numbered list may declare ([`validate_voice_numbered`]):
+/// the directory listing's own bound, which is the longest list voice numbers.
+const MAX_VOICE_NUMBERED_ENTRIES: usize = MAX_VOICE_DIRECTORY_ENTRIES;
+
+/// The most sections a numbered list may declare: one per kind of list
+/// (round 4, D7).
+const MAX_VOICE_NUMBERED_SECTIONS: usize = 4;
+
+/// Refuse a numbered list no screen could show: more items than the longest
+/// list voice numbers, more sections than kinds of list, or text longer than
+/// any name.
+fn validate_voice_numbered(heard: &voice::numbers::VoiceNumberedList) -> Result<(), String> {
+    let too_long = |entry: &voice::numbers::VoiceNumberedEntry| {
+        [&entry.value, &entry.label]
+            .into_iter()
+            .chain(entry.deck_id.as_ref())
+            .chain(&entry.names)
+            .any(|text| text.len() > MAX_VOICE_CHOICE_TEXT_BYTES)
+            || entry.names.len() > MAX_VOICE_NUMBERED_NAMES
+    };
+    if heard.len() > MAX_VOICE_NUMBERED_ENTRIES
+        || heard.sections.len() > MAX_VOICE_NUMBERED_SECTIONS
+        || heard
+            .sections
+            .iter()
+            .flat_map(|section| &section.entries)
+            .any(too_long)
+    {
+        return Err(
+            "the numbered list sent with that answer is larger than any screen shows".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The most other names one numbered item may carry: an agent's role, CLI
+/// name and id, with room to spare.
+const MAX_VOICE_NUMBERED_NAMES: usize = 8;
+
+/// PR #1451 round 3, change 3 (PRD #1261): answer a bare number said against
+/// the numbered list on screen, locally.
+///
+/// **No Commands backend call**, as for [`desktop_voice_choice`]: the
+/// utterance is read by [`voice::numbers::answer`] against `heard` — the list
+/// as it stood when the user spoke — and `generation`, the list's generation
+/// on screen now. The webview dispatches the item chosen itself, through the
+/// same checks a resolved dispatch meets.
+#[tauri::command]
+async fn desktop_voice_number(
+    webview: Webview,
+    utterance: String,
+    heard: voice::numbers::VoiceNumberedList,
+    generation: u64,
+) -> Result<voice::numbers::NumberAnswer, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_numbered(&heard)?;
+    Ok(voice::numbers::answer(&utterance, &heard, generation))
+}
+
+/// [`desktop_voice_choice`] once the live state is read. The decks are the
+/// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
+/// keyed by the Deck selector's token, as that row's candidates are, and a
+/// deck the selector does not list is not live for it.
+fn answer_declared_choice(
+    utterance: &str,
+    action: &str,
+    offered: &[voice::ResolvedParam],
+    agents: &[voice::DesktopAgent],
+    observed: &[crate::dto::ObservedDeckDto],
+    declared: VoiceDeclaration<'_>,
+) -> voice::ChoiceAnswer {
+    let mut decks = voice_decks(observed, declared.deck_step);
+    let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
+    if action == voice::SWITCH_DECK_ROW {
+        decks = decks
+            .into_iter()
+            .filter_map(|mut deck| {
+                deck.id = selections.get(&deck.id)?.token.clone();
+                Some(deck)
+            })
+            .collect();
+    }
+    voice::choice::answer(
+        utterance,
+        offered,
+        &voice::choice::ChoiceLive {
+            agents,
+            decks: &decks,
+            directories: declared.directories,
+            new_agent: declared.new_agent,
+        },
+    )
 }
 
 /// PRD #1195 M3 — the Deck selector's decks, for `switch_deck`: every deck it
@@ -3381,9 +3617,9 @@ async fn resolve_declared_utterance(
 /// path — so a deck that later connects keeps its key, and labelled the way the
 /// overview labels it. It is appended as unable to take a new agent, since the
 /// New agent dialog lists only decks the app is connected to: with the deck
-/// step's own reason when the step names one, otherwise
-/// [`voice::DECK_NOT_CONNECTED`], or the fleet view's "not configured"
-/// sentence for a row with no address. That keeps the New agent flow exactly
+/// step's own short reason when the step names one, otherwise
+/// [`voice::DECK_NOT_CONNECTED`], or [`voice::DECK_NO_ADDRESS`] for a row with
+/// no address. That keeps the New agent flow exactly
 /// as it was — it never offers or preselects such a deck — while
 /// `switch_deck`, which ignores that reason, can switch to it.
 ///
@@ -3443,7 +3679,7 @@ fn selector_voice_decks(
             None => (
                 crate::dto::unconfigured_deck_id(&row.id),
                 crate::dto::safe_display_text(row.describe()),
-                crate::dto::UNCONFIGURED_DECK_REASON,
+                voice::DECK_NO_ADDRESS,
             ),
         };
         let unavailable = Some(step_reason(&id).unwrap_or_else(|| fallback.to_string()));
@@ -3512,8 +3748,9 @@ fn selector_voice_decks(
 ///
 /// **Eligibility is the webview's `deck_step`**, the New agent dialog's deck
 /// step as it stands ([`voice::VoiceDeckChoice`] says why that one piece is
-/// declared): a deck it gives a reason keeps that reason, word for word, and a
-/// deck it does not list at all is one the webview's fleet has not heard from
+/// declared): a deck it gives a short reason keeps that reason, word for word,
+/// and a deck it does not declare at all is one the webview's fleet has not
+/// heard from
 /// ([`voice::DECK_NOT_REPORTED`]). With no declaration every deck is taken as
 /// eligible, which is what voice assumed before it was told.
 fn voice_decks(
@@ -5179,6 +5416,8 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_choice,
+            desktop_voice_number,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())
@@ -5239,6 +5478,7 @@ mod tests {
                     path: format!("/home/dev/dir-{index}"),
                 })
                 .collect(),
+            paging: None,
         }
     }
 
@@ -5267,6 +5507,82 @@ mod tests {
         let mut long_deck = voice_listing(1);
         long_deck.deck_id = "d".repeat(MAX_VOICE_DECK_ID_BYTES + 1);
         assert!(validate_voice_directories(&long_deck).is_err());
+    }
+
+    /// PR #1451 round 3, change 4: a paged listing's other pages are part of
+    /// the same declaration and bounded with it — together never more children
+    /// than a deck lists, each name as short as an entry's, and a page counted
+    /// from 1. The webview's shape parses; an unknown key does not.
+    #[test]
+    fn voice_paged_declarations_are_bounded_and_webview_shaped() {
+        let parsed: voice::VoiceDirectories = serde_json::from_value(serde_json::json!({
+            "deckId": "deck-1",
+            "path": "/home/dev",
+            "hasParent": true,
+            "entries": [{ "name": "a", "path": "/home/dev/a" }],
+            "paging": { "page": 1, "elsewhere": [{ "name": "docs", "page": 3 }] },
+        }))
+        .expect("parses");
+        assert!(validate_voice_directories(&parsed).is_ok());
+        assert!(
+            serde_json::from_value::<voice::VoiceDirectories>(serde_json::json!({
+                "deckId": "deck-1", "path": "/home/dev", "hasParent": true, "entries": [],
+                "paging": { "page": 1, "elsewhere": [], "extra": true },
+            }))
+            .is_err()
+        );
+        let off_page = |count: usize, name: &str, page: u32| {
+            let mut listing = voice_listing(1);
+            listing.paging = Some(voice::VoicePaging {
+                page: 1,
+                elsewhere: (0..count)
+                    .map(|_| voice::VoiceOffPage {
+                        name: name.to_string(),
+                        page,
+                    })
+                    .collect(),
+            });
+            listing
+        };
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES - 1, "d", 2)).is_ok()
+        );
+        assert!(
+            validate_voice_directories(&off_page(MAX_VOICE_DIRECTORY_ENTRIES, "d", 2)).is_err()
+        );
+        assert!(
+            validate_voice_directories(&off_page(
+                1,
+                &"x".repeat(MAX_VOICE_DIRECTORY_NAME_BYTES + 1),
+                2
+            ))
+            .is_err()
+        );
+        assert!(validate_voice_directories(&off_page(1, "d", 0)).is_err());
+        let mut no_page = off_page(1, "d", 2);
+        no_page.paging.as_mut().expect("paged").page = 0;
+        assert!(validate_voice_directories(&no_page).is_err());
+
+        let form = |count: usize| voice::VoiceNewAgent {
+            form: Some(voice::VoiceNewAgentForm {
+                deck_id: "deck-1".to_string(),
+                path: "/home/dev".to_string(),
+                modes: Vec::new(),
+                agent_types: Vec::new(),
+                withheld_modes: Vec::new(),
+                mode_paging: Some(voice::VoicePaging {
+                    page: 1,
+                    elsewhere: (0..count)
+                        .map(|_| voice::VoiceOffPage {
+                            name: "Orch: x".to_string(),
+                            page: 2,
+                        })
+                        .collect(),
+                }),
+            }),
+        };
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES)).is_ok());
+        assert!(validate_voice_new_agent(&form(MAX_VOICE_FORM_CHOICES + 1)).is_err());
     }
 
     /// PRD #1223: a New agent form declaration is bounded like a listing —
@@ -5412,12 +5728,74 @@ mod tests {
                 new_agent: None,
                 deck_step: None,
                 endpoints: Some(endpoints),
+                dictation: None,
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
             true,
         )
         .await
+    }
+
+    /// Scenario: the Deck selector lists a build box and a staging box, and
+    /// the user says "switch deck to build box or staging box". The tie is
+    /// offered with each deck's selector token; "two" answers it with the
+    /// staging row, and once that row is gone from Settings the same answer
+    /// is refused rather than switching to whatever the second deck is now.
+    #[tokio::test]
+    async fn a_switch_choice_is_answered_against_the_selector_tokens() {
+        let section = |hosts: &[(&str, &str)]| -> crate::settings::EndpointSettings {
+            serde_json::from_value(serde_json::json!({
+                "remote": hosts
+                    .iter()
+                    .map(|(id, host)| serde_json::json!({ "id": id, "host": host, "port": 22 }))
+                    .collect::<Vec<_>>(),
+                "selection": "local",
+            }))
+            .expect("parses")
+        };
+        let both = section(&[("rowbuild", "build-box"), ("rowstage", "staging-box")]);
+        let said = "switch deck to build box or staging box";
+        let result = resolve_with_section(
+            &both,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("resolves");
+        let voice::VoiceOutcome::ParamAmbiguous { candidates, .. } = &result.outcome else {
+            panic!("a choice: {:?}", result.outcome);
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>(),
+            ["rowbuild", "rowstage"]
+        );
+        let declared = |endpoints| VoiceDeclaration {
+            directories: None,
+            new_agent: None,
+            deck_step: None,
+            endpoints: Some(endpoints),
+            dictation: None,
+        };
+        assert_eq!(
+            answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
+            voice::ChoiceAnswer::Selected(candidates[1].clone())
+        );
+        let without_staging = section(&[("rowbuild", "build-box")]);
+        assert_eq!(
+            answer_declared_choice(
+                "two",
+                "switch_deck",
+                candidates,
+                &[],
+                &[],
+                declared(&without_staging)
+            ),
+            voice::ChoiceAnswer::Refused
+        );
     }
 
     /// Scenario: the user keeps more remote decks in Settings than voice takes
@@ -5615,7 +5993,7 @@ mod tests {
         assert_eq!(find(&build_key).label, "build-box");
         assert_eq!(
             find("unconfigured-newbox01").unavailable.as_deref(),
-            Some(crate::dto::UNCONFIGURED_DECK_REASON)
+            Some(voice::DECK_NO_ADDRESS)
         );
         let token = |key: &str| {
             selections
@@ -5791,7 +6169,7 @@ mod tests {
         ];
         let step: Vec<voice::VoiceDeckChoice> = serde_json::from_value(serde_json::json!([
             { "deckId": "deck-local" },
-            { "deckId": "deck-build", "reason": "No deck is listening on the configured socket." },
+            { "deckId": "deck-build", "reason": "it is not connected" },
             { "deckId": "deck-elsewhere", "reason": "not in this fleet" },
         ]))
         .expect("the webview's shape parses");
@@ -5814,7 +6192,7 @@ mod tests {
         assert_eq!(unavailable("deck-local"), None);
         assert_eq!(
             unavailable("deck-build").as_deref(),
-            Some("No deck is listening on the configured socket.")
+            Some("it is not connected")
         );
         assert_eq!(
             unavailable("deck-new").as_deref(),
@@ -5851,6 +6229,61 @@ mod tests {
             reason: None,
         }];
         assert!(validate_voice_deck_step(&long_id).is_err());
+    }
+
+    /// PR #1451 round 3 — a numbered list is bounded like the listing it can
+    /// carry: no more items than a listing, no name longer than any name.
+    #[test]
+    fn voice_numbered_lists_are_bounded() {
+        let item = |label: String| voice::numbers::VoiceNumberedEntry {
+            kind: voice::numbers::NumberedKind::Directory,
+            value: format!("/home/{label}"),
+            deck_id: None,
+            label,
+            names: Vec::new(),
+        };
+        let list = |entries| voice::numbers::VoiceNumberedList {
+            generation: 1,
+            sections: vec![voice::numbers::VoiceNumberedSection {
+                kind: voice::numbers::SectionKind::Directory,
+                entries,
+            }],
+        };
+        let fits = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&fits).is_ok());
+        let many = list(
+            (0..=MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        assert!(validate_voice_numbered(&many).is_err());
+        assert!(
+            validate_voice_numbered(&list(vec![item(
+                "x".repeat(MAX_VOICE_CHOICE_TEXT_BYTES + 1)
+            )]))
+            .is_err()
+        );
+        let mut named = item("docs".to_string());
+        named.names = vec!["n".to_string(); MAX_VOICE_NUMBERED_NAMES + 1];
+        assert!(validate_voice_numbered(&list(vec![named])).is_err());
+        // The bound is on every section together, and on how many there are.
+        let mut split = list(
+            (0..MAX_VOICE_NUMBERED_ENTRIES)
+                .map(|at| item(format!("d{at}")))
+                .collect(),
+        );
+        split.sections.push(voice::numbers::VoiceNumberedSection {
+            kind: voice::numbers::SectionKind::Mode,
+            entries: vec![item("m".to_string())],
+        });
+        assert!(validate_voice_numbered(&split).is_err());
+        let mut sections = list(vec![item("d".to_string())]);
+        sections.sections = vec![sections.sections[0].clone(); MAX_VOICE_NUMBERED_SECTIONS + 1];
+        assert!(validate_voice_numbered(&sections).is_err());
     }
 
     /// The declaration's wire shape is the webview's: camelCase, and nothing

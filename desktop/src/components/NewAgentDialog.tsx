@@ -4,6 +4,12 @@ import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
+import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
+import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
+import { useVoiceOn } from "../hooks/useVoiceOn";
+import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto, type VoiceNumberedSectionKind } from "../lib/voiceNumbers";
+import { gridFit, offPageSentence, pageMarker, pageSlice, type PageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
+import { VoiceNumber } from "./VoiceNumber";
 import {
   ambiguousOrchestrationReason,
   AUTHORING_MODES,
@@ -165,8 +171,17 @@ export const draftDeckGone = (savedDeck: string, hadDirectory: boolean) => `${sa
 export const DECK_CHANGE_IN_FLIGHT = "A start is under way, so the daemon was not changed.";
 /** The deck is not in the field's list any more. */
 export const DECK_NOT_LISTED = "That daemon is not in the New agent dialog's daemon list any more, so the daemon was not changed.";
-/** The deck is listed, disabled. */
-export const DECK_CANNOT_TAKE_AGENT = "That daemon cannot take a new agent now, so the daemon was not changed.";
+/**
+ * The deck cannot take a new agent, so the field does not list it (PR #1451
+ * round 3): one line naming it, with its short reason class
+ * (`deckUnavailableShort`) — the same shape the desktop crate's
+ * `deck_unavailable` gives a deck Rust refuses before dispatch.
+ */
+export const deckCannotTakeAgent = (deck: string, reason: string) => `\u201c${deck}\u201d can't take a new agent: ${reason}.`;
+/** The deck field's one line when the fleet has no deck at all. */
+export const NO_DECK_CONFIGURED = "No daemon is configured.";
+/** The deck field's one line when every deck in the fleet cannot take a new agent (PR #1451 round 3). */
+export const NO_DECK_CAN_TAKE_AGENT = "No daemon can take a new agent now.";
 /** The dialog closed during the round trip (served by the overview). */
 export const NO_DIALOG_FOR_DECK = "The New agent dialog is not open, so no daemon was chosen.";
 /** The dialog closed during the round trip, so there was nothing to discard. */
@@ -199,12 +214,31 @@ export const NO_NEW_AGENT_FORM = "The New agent form has no daemon and directory
 export const FORM_MOVED_ON = "The New agent form moved on while that was being worked out, so nothing was changed. Say it again.";
 /** The chip is not in the Mode row any more. */
 export const MODE_NOT_OFFERED = "That mode is not offered on this form any more, so the mode was not changed.";
+
+/*
+  PR #1451 round 3, change 4 — the two lists this dialog pages while voice is
+  on. A directory row is one cell of a grid that fills the space the browser
+  has left (`gridFit` over the list's measured box); a Mode chip is one cell of
+  a grid as wide as the Mode field and as tall as the dialog body can show
+  beside Dir and Name. The fallbacks are the page sizes used where nothing is
+  laid out (jsdom), which is what the component tests page by.
+*/
+const DIRECTORY_CELL = { rowHeight: 30, minColumnWidth: 160, gap: 2 };
+const MODE_CELL = { rowHeight: 26, minColumnWidth: 150, gap: 5 };
+/** What the dialog body keeps for the form's other rows while the Mode chips page. */
+const MODE_ROWS_RESERVE = 70;
+const FALLBACK_DIRECTORY_PAGE = 12;
+const FALLBACK_MODE_PAGE = 8;
+/** The page `index` of a list of `capacity`-sized pages is on. */
+const pageOfIndex = (index: number, capacity: number) => Math.floor(index / Math.max(1, capacity)) + 1;
 /** The agent is not among the ones this deck offers any more. */
 export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon any more, so the Command was not changed.";
 /** An orchestration is selected, so there is no Command field to fill. */
 export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
 /** The words after "name it" were only punctuation. */
 export const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
+/** A Command dispatch arrived with no command in it (Rust refuses that first, so this is the dialog's own line). */
+export const NO_COMMAND_HEARD = "No command was heard, so the Command was not changed.";
 
 /*
   PRD #802 D5 — why a spoken start opened no confirmation. Each names what is
@@ -219,6 +253,8 @@ export const START_NEEDS_DECK = "Nothing was started: choose a daemon first.";
 export const START_NEEDS_DIRECTORY = "Nothing was started: choose a directory first — the agent needs one to start in.";
 /** A start is already in flight or waiting for the deck to list it. */
 export const START_IN_FLIGHT = "A start is already under way, so nothing else was started.";
+/** The sentence was about the Command field (PR #1451 round 4, audit A1): a start is asked for on its own. */
+export const START_SAID_A_COMMAND = "Nothing was started: a sentence that sets the command does not also start the agent — say “start it” on its own.";
 
 /**
  * A spoken Name as the Name field takes it: the words after the marked
@@ -246,13 +282,14 @@ function messageOf(cause: unknown): string {
  * deck → listing and options; directory → orchestration chips; agent →
  * Command.
  *
- * 1. **Deck** — every deck in the fleet; the ones that cannot take a spawn are
- *    listed disabled with the reason the overview gives for them.
+ * 1. **Deck** — the decks in the fleet that can take a spawn. One that cannot
+ *    is not listed at all (PR #1451 round 3): its explanation and buttons
+ *    stay on the overview and the Daemons screen, and voice names it with a
+ *    short reason if the user asks for it.
  * 2. **Directory** — that deck's filesystem, browsed one level per request with
  *    the TUI picker's keys, in a panel of its own. Browsing is the only way to
  *    choose one (PRD #1223 U1 removed the typed path), so a deck without the
- *    listing verb is disabled in the deck field with the crate's
- *    `newAgentReason`.
+ *    listing verb cannot take a spawn and is left out of the deck field.
  * 3. **Form** — Mode, Name and Command, prefilled in the TUI's order and
  *    enabled once a directory is chosen.
  *    Mode offers a plain agent; one `Orch: <name>` chip per orchestration the
@@ -298,6 +335,13 @@ function messageOf(cause: unknown): string {
 export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppeared, onNotAppeared, appearTimeoutMs = NEW_AGENT_APPEAR_TIMEOUT_MS, closeRequest, voice }: NewAgentDialogProps) {
   const titleId = useId();
   const choices = useMemo(() => deckChoices(runtime.fleet), [runtime.fleet]);
+  /**
+   * What the deck field LISTS: only the decks that can take a spawn (PR #1451
+   * round 3, change 6). Filtered here, at render, and nowhere upstream —
+   * `choices` stays whole for voice (`voiceChooseDeck`, `voiceDeckStep`), so
+   * a deck the user names that cannot take one is refused for what it is.
+   */
+  const usable = useMemo(() => choices.filter((choice) => choice.reason === undefined), [choices]);
   /** The draft this mount was opened with (#1247) — read once, by the open effect. */
   const savedDraft = useRef(draft);
   /**
@@ -309,6 +353,16 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * directory is then not restored (the open effect says so).
    */
   const [highlight, setHighlight] = useState<string | undefined>(() => preselectedDeck(deckChoices(runtime.fleet), initialDeckId ?? draft?.deckId));
+  /**
+   * A highlighted deck that stops being usable while the dialog is open leaves
+   * the list, so the highlight must not stay on it: Enter would then act on a
+   * row nobody can see. It moves to the first deck still listed, or clears
+   * when none is.
+   */
+  useEffect(() => {
+    if (highlight === undefined || usable.some((choice) => choice.deckId === highlight)) return;
+    setHighlight(usable[0]?.deckId);
+  }, [usable, highlight]);
   /** What the open put back and what it could not (#1247); absent for a fresh form. */
   const [restoreNotes, setRestoreNotes] = useState<string[]>();
   const [deckNotice, setDeckNotice] = useState<string>();
@@ -346,6 +400,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const [options, setOptions] = useState<NewAgentOptions>();
   const [optionsError, setOptionsError] = useState<string>();
   const [modeChoice, setModeChoice] = useState<ModeId>(NO_MODE.id);
+  /**
+   * A Mode page voice turned to since the Mode row last changed, with the row
+   * it was turned on. Every reset of the mode drops it, even one back to the
+   * chip already in force.
+   */
+  const [modeTurn, setModeTurn] = useState<{ key: string; page: number }>();
   const [name, setName] = useState("");
   const [command, setCommand] = useState("");
   const commandTouched = useRef(false);
@@ -409,6 +469,9 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   const deckListRef = useRef<HTMLUListElement>(null);
   const directoryListRef = useRef<HTMLUListElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const chipsRef = useRef<HTMLDivElement>(null);
+  const modeFieldRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
   const commandRef = useRef<HTMLInputElement>(null);
@@ -442,6 +505,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
     setModeChoice(NO_MODE.id);
+    setModeTurn(undefined);
     setFormError(undefined);
     setFormCleanup(undefined);
     if (!keepEdits || !nameTouched.current) {
@@ -872,6 +936,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setTarget({ path, displayPath });
     if (!nameTouched.current) setName(directoryLabel(path));
     setModeChoice(NO_MODE.id);
+    setModeTurn(undefined);
     pendingMode.current = restoring && restoring.mode !== NO_MODE.id ? restoring.mode : undefined;
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
@@ -988,6 +1053,16 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const searching = deck?.listingOptions === true && listing?.truncated === true && filter !== "" && searchedHere === undefined && searchError === undefined;
 
   /**
+   * The Filter box's one change path — a keystroke in it and a spoken "filter
+   * …" / "clear filter" alike: the text, a cleared search error, and the cursor
+   * back at the top of the narrowed listing.
+   */
+  const changeFilter = (value: string) => {
+    setFilter(value);
+    setSearchError(undefined);
+    setCursor(0);
+  };
+  /**
    * PRD #1223 — the directory browser by voice. Each move calls the function
    * the browser's own control calls (a click on a row, the `..` row / `h`, the
    * Use this directory button / Space) and nothing else, so voice and the
@@ -1019,6 +1094,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     const index = rows.findIndex((row) => row.kind === "entry" && row.entry.path === target.directoryPath);
     const row = rows[index];
     if (row?.kind !== "entry") return DIRECTORY_NOT_LISTED;
+    // Voice acts only on what is on screen: a row on another page is named
+    // back with its page (PR #1451 round 3, change 4).
+    const offPage = offPageRefusal(directoryElsewhere, row.entry.path, directorySlice);
+    if (offPage !== undefined) return offPage;
     // A click on the row: the cursor lands on it, then the deck lists it.
     setCursor(index);
     void loadListing(deck.deckId, row.entry.path);
@@ -1038,23 +1117,43 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     return undefined;
   };
   /**
-   * PRD #1223 — the rest of the form by voice: Mode, the agent and Name. Mode
-   * and Name call what the control's own click or keystroke calls
-   * (`selectMode`, the Name input's setter) and nothing else, so a spoken Name
+   * PR #1451 round 3, change 5 — the Filter box by voice, "as if typed": the
+   * box's own change path, so the cursor returns to the top and a truncated
+   * listing searches the deck exactly as a keystroke would. The text is what
+   * Rust accepted from the user's words; "clear filter" empties the box.
+   */
+  const voiceFilterDirectories = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    changeFilter(target.filterText ?? "");
+    return undefined;
+  };
+  const voiceClearDirectoryFilter = (target: VoiceDispatchTarget): string | undefined => {
+    const refused = browserMovedOn(target);
+    if (refused !== undefined) return refused;
+    changeFilter("");
+    return undefined;
+  };
+  /**
+   * PRD #1223 — the rest of the form by voice: Mode, the agent, Name and —
+   * since PR #1451 round 4 (decision D8) — Command. Mode, Name and Command call
+   * what the control's own click or keystroke calls (`selectMode`, the Name
+   * and Command inputs' setters) and nothing else, so a spoken Name or Command
    * is an edit exactly as a typed one is. The agent has no control of its own
    * any more — the Agent picker was removed, because every `default_command`
    * is the bare binary name and the picker saved one word of typing while its
    * `auto` meant nothing and its label went stale against an edited Command —
    * so "use claude" sets Command to that agent's default command
    * ({@link commandFromAgent}), resolved against the deck's own registry (or
-   * this app's fallback copy for a deck that reports none). Voice has no other
-   * way to choose what the agent runs, since Command is never dictated.
+   * this app's fallback copy for a deck that reports none).
    *
    * Each first re-checks that the form is still the one the utterance was
    * judged against — its deck and its chosen directory — for the browser's
    * reason, and refuses in the dialog's words when it is not.
    *
-   * Command has no move: it is the field that executes, and it stays typed.
+   * A spoken Command is the user's words as Rust held them to the transcript
+   * (`target.commandText`), and setting it starts nothing: the agent runs only
+   * on Start, with the field in front of the user.
    */
   const formMovedOn = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (!deck || !target || phase !== "idle") return NO_NEW_AGENT_FORM;
@@ -1067,6 +1166,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (refused !== undefined) return refused;
     const chip = modes.find((candidate) => candidate.id === dispatch.modeId);
     if (!chip) return MODE_NOT_OFFERED;
+    const offPage = offPageRefusal(modeElsewhere, chip.id, modeSlice);
+    if (offPage !== undefined) return offPage;
     selectMode(chip.id);
     return undefined;
   };
@@ -1086,6 +1187,15 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (!spoken) return NO_NAME_HEARD;
     nameTouched.current = true;
     setName(spoken);
+    return undefined;
+  };
+  const voiceSetCommand = (dispatch: VoiceDispatchTarget): string | undefined => {
+    const refused = formMovedOn(dispatch);
+    if (refused !== undefined) return refused;
+    if (selectedOrchestration) return COMMAND_HIDDEN_BY_ORCHESTRATION;
+    if (!dispatch.commandText) return NO_COMMAND_HEARD;
+    commandTouched.current = true;
+    setCommand(dispatch.commandText);
     return undefined;
   };
   /**
@@ -1109,9 +1219,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const voiceChooseDeck = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return DECK_CHANGE_IN_FLIGHT;
+    // Against every deck, not only the listed ones: a deck the field hides is
+    // refused with its own short reason rather than as one that has left.
     const choice = choices.find((candidate) => candidate.deckId === dispatch.preselectDeckId);
     if (!choice) return DECK_NOT_LISTED;
-    if (choice.reason !== undefined) return DECK_CANNOT_TAKE_AGENT;
+    if (choice.reason !== undefined) return deckCannotTakeAgent(choice.name, choice.reason);
     chooseDeck(choice);
     return undefined;
   };
@@ -1134,12 +1246,20 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           deckId: deck.deckId,
           path: listing.path,
           hasParent: listing.parent !== undefined,
-          entries: rows.flatMap((row) => (row.kind === "entry" ? [{ name: row.entry.displayName, path: row.entry.path }] : [])),
+          entries: shownRows.flatMap((row) => (row.kind === "entry" ? [{ name: row.entry.displayName, path: row.entry.path }] : [])),
+          /* PR #1451 round 3, change 4 — while the rows page, the entries are
+             the page showing and the others ride here, so a name said for
+             one is told its page instead of matching nothing. */
+          ...(directoriesPaged
+            ? { paging: { page: directorySlice.page, elsewhere: directoryElsewhere.flatMap((item) => (item.kind === "directory" ? [{ name: item.label, page: item.page }] : [])) } }
+            : {}),
         }
         : undefined,
       openDirectory: voiceOpenDirectory,
       goToParentDirectory: voiceGoToParent,
       useThisDirectory: voiceUseThisDirectory,
+      filterDirectories: voiceFilterDirectories,
+      clearDirectoryFilter: voiceClearDirectoryFilter,
       /* PRD #1223 — present while mounted; its `form` only while the fields
          are live, carrying the chips and picker entries AS OFFERED on this
          render — a disabled namesake orchestration chip is not among them,
@@ -1149,7 +1269,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           ? {
             deckId: deck.deckId,
             path: target.path,
-            modes: modes.map(({ id, label }) => ({ id, label })),
+            modes: shownModes.map(({ id, label }) => ({ id, label })),
+            ...(modesPaged ? { modePaging: { page: modeSlice.page, elsewhere: modeElsewhere.map((item) => ({ name: item.label, page: item.page })) } } : {}),
             agentTypes: agents.map((agent) => ({ id: agent.id, label: agent.displayName })),
             /* The authoring chips this form withholds — for a deck that cannot
                compose them, or `schedule: issues` with its flag off — so a
@@ -1163,6 +1284,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       chooseNewAgentMode: voiceChooseMode,
       chooseNewAgentType: voiceChooseAgentType,
       nameNewAgent: voiceNameNewAgent,
+      setNewAgentCommand: voiceSetCommand,
       startNewAgent: voiceStart,
       discardNewAgent: requestDiscard,
       instance: instanceId.current,
@@ -1215,6 +1337,83 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const selectedOrchestration: DaemonOrchestration | undefined = orchestrationChips.find((chip) => chip.id === mode)?.orchestration;
   const authoringKind: AuthoringKind | undefined = AUTHORING_MODES.find((candidate) => candidate.kind === mode)?.kind;
   const defaultCommand = options?.kind === "deck" ? options.defaultCommand : undefined;
+
+  /*
+    PR #1451 round 3, change 4 — while voice is on, the directory rows and
+    the Mode chips that do not fit are split into pages instead of scrolling,
+    so every item voice can act on is on screen. Each page is a grid filling
+    the space its list has; "Page N of M" is shown beside a list that pages,
+    and a list that fits is shown whole. The rows' and chips' indexes stay
+    their indexes in the whole list — the cursor, the row ids and the keyboard
+    move over every row — and the page shown is the one holding the
+    directory cursor, and the one holding the Mode chip in force unless voice
+    has turned it since the Mode row last changed.
+  */
+  const voiceOn = useVoiceOn();
+  const directoryBox = useMeasuredBox(directoryListRef, voiceOn && listing !== undefined);
+  const directoryFit = directoryBox ? gridFit(directoryBox.width, directoryBox.height, DIRECTORY_CELL) : undefined;
+  const directoryCapacity = directoryFit ? directoryFit.columns * directoryFit.rows : FALLBACK_DIRECTORY_PAGE;
+  /* The directory page is always the cursor's — derived, never stored — so a
+     page cannot leave the active row hidden: not when voice turns on with the
+     cursor past the first page, not when a resize changes how many rows a page
+     holds. A page turn moves the cursor to that page's first row. */
+  const directorySlice = pageSlice(rows.length, directoryCapacity, rows[cursor] ? pageOfIndex(cursor, directoryCapacity) : 1);
+  const directoriesPaged = voiceOn && directorySlice.pages > 1;
+  const rowOffset = directoriesPaged ? directorySlice.start : 0;
+  const shownRows = directoriesPaged ? rows.slice(directorySlice.start, directorySlice.end) : rows;
+  const bodyBox = useMeasuredBox(bodyRef, voiceOn);
+  const chipsBox = useMeasuredBox(chipsRef, voiceOn);
+  const modeFit = bodyBox && chipsBox ? gridFit(chipsBox.width, bodyBox.height - MODE_ROWS_RESERVE, MODE_CELL) : undefined;
+  const modeCapacity = modeFit ? modeFit.columns * modeFit.rows : FALLBACK_MODE_PAGE;
+  /* The Mode page shown is the chip in force's, unless voice has turned it
+     since the row last changed. A turn is forgotten — not merely set aside —
+     the first render the deck, the chip in force, the chips offered, the page
+     size or voice differs from when it was made, and on every mode reset, so
+     the mode Create would use is never hidden, and coming back to the same
+     row never brings an old turn back. */
+  const modePageKey = [deck?.deckId ?? "", target?.path ?? "", mode, modeCapacity, voiceOn, ...modes.map((candidate) => candidate.id)].join("\u0000");
+  if (modeTurn !== undefined && modeTurn.key !== modePageKey) setModeTurn(undefined);
+  const modeSlice = pageSlice(modes.length, modeCapacity, modeTurn?.key === modePageKey ? modeTurn.page : pageOfIndex(Math.max(0, modes.findIndex((candidate) => candidate.id === mode)), modeCapacity));
+  const modesPaged = voiceOn && modeSlice.pages > 1;
+  const modeOffset = modesPaged ? modeSlice.start : 0;
+  const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
+  /**
+   * Which list "next page" turns: the Mode row once a directory is chosen
+   * and it pages, else the directory rows when they page, else the Mode row
+   * when it pages — never both, so a turn is never ambiguous. Numbers are per
+   * section (round 4, D7), so each paged list numbers its own page from 1.
+   */
+  const pagedList: "directories" | "modes" | undefined = modesPaged && target ? "modes" : directoriesPaged ? "directories" : modesPaged ? "modes" : undefined;
+  const turnDirectories = (delta: 1 | -1) => setCursor(pageSlice(rows.length, directoryCapacity, directorySlice.page + delta).start);
+  const turnModes = (delta: 1 | -1) => setModeTurn({ key: modePageKey, page: modeSlice.page + delta });
+  /* A paged Mode row is brought into the body's view, where its chips can be seen. */
+  useEffect(() => {
+    if (modesPaged && target) modeFieldRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [modesPaged, modeSlice.page, target]);
+  const directoryElsewhere: VoiceOffPageItem[] = directoriesPaged
+    ? rows.flatMap((row, index) => (index >= directorySlice.start && index < directorySlice.end ? [] : [{
+      kind: row.kind === "up" ? "parent" as const : "directory" as const,
+      value: row.kind === "up" ? row.path : row.entry.path,
+      label: row.kind === "up" ? ".." : row.entry.displayName,
+      page: pageOfIndex(index, directoryCapacity),
+    }]))
+    : [];
+  const modeElsewhere: VoiceOffPageItem[] = modesPaged
+    ? modes.flatMap((chip, index) => (index >= modeSlice.start && index < modeSlice.end ? [] : [{ kind: "mode" as const, value: chip.id, label: chip.label, page: pageOfIndex(index, modeCapacity) }]))
+    : [];
+  const activeSlice: PageSlice | undefined = pagedList === "modes" ? modeSlice : pagedList === "directories" ? directorySlice : undefined;
+  const pager: VoicePager | undefined = activeSlice && {
+    page: activeSlice.page,
+    pages: activeSlice.pages,
+    turn: pagedList === "modes" ? turnModes : turnDirectories,
+    elsewhere: [...directoryElsewhere, ...modeElsewhere],
+  };
+  usePager("dialog", pager);
+  /** The refusal for a dispatch naming a directory row or a Mode chip on a page that is not showing. */
+  const offPageRefusal = (items: readonly VoiceOffPageItem[], value: string | undefined, slice: PageSlice): string | undefined => {
+    const item = items.find((candidate) => candidate.value === value);
+    return item && offPageSentence(item.label, item.page, slice.page);
+  };
 
   // PRD #1223 M6 — the TUI's Name rules, against the CHOSEN deck's own fleet
   // entry: never another deck's orchestrations, and never the selected deck's.
@@ -1360,9 +1559,14 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * directory that moved during the round trip refuses with `FORM_MOVED_ON`,
    * as every fill does. An edit the declaration does not carry, such as a typed
    * Name, is on screen and is started, as the Start button would start it.
+   *
+   * A sentence that says "command" never starts (PR #1451 round 4, audit A1):
+   * it is about the Command field, whose words are full of start verbs ("devbox
+   * RUN agent"), and starting would run the form as it was before them.
    */
   const voiceStart = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return START_IN_FLIGHT;
+    if (dispatch.saysCommand) return START_SAID_A_COMMAND;
     if (!deck) return START_NEEDS_DECK;
     if (!target) return START_NEEDS_DIRECTORY;
     const declared = dispatch.declaredForm;
@@ -1452,26 +1656,96 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   }, [activeRowId, rows]);
 
   const busy = phase !== "idle";
+  /** The form's fields wait for a directory: until one is chosen there is nothing to start in. */
+  const formDisabled = busy || !target;
+
+  /*
+    PR #1451 round 3, change 3, as round 4 (D7) re-decided it — the dialog's
+    three lists as three SECTIONS, each numbered from 1: the daemons it lists,
+    the directory rows on screen (after the filter, `..` first), then the Mode
+    chips. "directory 3" and "mode 3" name one item each, and a bare "three"
+    shown by both is offered as a choice between them. The numbers move
+    whenever a list does — another directory, another filter. Declared for
+    voice whether or not voice is on; shown only while it is.
+
+    Change 4: while a list is split into pages, ITS page is what is numbered,
+    from 1 on every page, and turning the page renumbers it.
+
+    The Mode chips are declared only while the form is live: until a directory
+    is chosen they cannot be chosen, so a number they show acts on nothing and
+    takes no part in a bare number's answer.
+  */
+  const rowEntry = (row: DirectoryRow): VoiceNumberedEntryDto => (row.kind === "up"
+    ? { kind: "parent", value: row.path, label: "..", names: [] }
+    : { kind: "directory", value: row.entry.path, label: row.entry.displayName, names: [] });
+  const modeEntry = (chip: { id: ModeId; label: string }): VoiceNumberedEntryDto => ({ kind: "mode", value: chip.id, label: chip.label, names: [] });
+  const numberedSections: VoiceNumberedSectionDto[] = [
+    { kind: "deck", entries: usable.map((choice): VoiceNumberedEntryDto => ({ kind: "deck", value: choice.deckId, label: choice.name, names: [] })) },
+    { kind: "directory", entries: shownRows.map(rowEntry) },
+    ...(formDisabled ? [] : [{ kind: "mode" as const, entries: shownModes.map(modeEntry) }]),
+  ];
+  useNumberedList("dialog", numberedSections);
+  const numbersShown = useNumbersShown();
+  /** The number the deck at `index`, the row at `index` and the chip at `index` show, if any: each from 1 in its own section. */
+  const deckNumber = numbersShown ? (index: number) => index + 1 : () => undefined;
+  const rowNumber = numbersShown ? (index: number) => index - rowOffset + 1 : () => undefined;
+  const modeNumber = numbersShown ? (index: number) => index - modeOffset + 1 : () => undefined;
+  /**
+   * The item showing `number` in `section`, as a click on it would choose
+   * it: a daemon, a directory row (entered, or `..` gone up), or a Mode chip
+   * while the form is live.
+   */
+  const chooseNumbered = (section: VoiceNumberedSectionKind, number: number) => {
+    const entry = numberedSections.find((candidate) => candidate.kind === section)?.entries[number - 1];
+    if (!entry) return;
+    if (entry.kind === "deck") {
+      chooseDeck(usable.find((choice) => choice.deckId === entry.value));
+      return;
+    }
+    if (entry.kind === "mode") {
+      if (!formDisabled) selectMode(entry.value as ModeId);
+      return;
+    }
+    const index = rows.findIndex((row) => (row.kind === "up" ? entry.kind === "parent" && row.path === entry.value : entry.kind === "directory" && row.entry.path === entry.value));
+    const row = rows[index];
+    if (!row) return;
+    setCursor(index);
+    if (row.kind === "up") goUp();
+    else if (deck) void loadListing(deck.deckId, row.entry.path);
+  };
+  /**
+   * A digit on one of the numbered lists, while voice shows the numbers:
+   * the item showing it in `section`, the list with keyboard focus (round 4,
+   * D7). Never in a field.
+   */
+  const onNumberKey = (event: KeyboardEvent<HTMLElement>, section: VoiceNumberedSectionKind): boolean => {
+    if (!numbersShown || busy) return false;
+    const number = numberKey(event.nativeEvent);
+    const entries = numberedSections.find((candidate) => candidate.kind === section)?.entries ?? [];
+    if (number === undefined || number > entries.length) return false;
+    event.preventDefault();
+    chooseNumbered(section, number);
+    return true;
+  };
 
   // -- keys --------------------------------------------------------------------
   const onDeckKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy) return;
-    const eligible = choices.filter((choice) => choice.reason === undefined);
-    const index = eligible.findIndex((choice) => choice.deckId === highlight);
+    if (busy || onNumberKey(event, "deck")) return;
+    const index = usable.findIndex((choice) => choice.deckId === highlight);
     if (event.key === "ArrowDown" || event.key === "j") {
       event.preventDefault();
-      if (eligible.length) setHighlight(eligible[(index + 1) % eligible.length].deckId);
+      if (usable.length) setHighlight(usable[(index + 1) % usable.length].deckId);
     } else if (event.key === "ArrowUp" || event.key === "k") {
       event.preventDefault();
-      if (eligible.length) setHighlight(eligible[(index <= 0 ? eligible.length : index) - 1].deckId);
+      if (usable.length) setHighlight(usable[(index <= 0 ? usable.length : index) - 1].deckId);
     } else if (event.key === "Enter") {
       event.preventDefault();
-      chooseDeck(choices.find((choice) => choice.deckId === highlight));
+      chooseDeck(usable.find((choice) => choice.deckId === highlight));
     }
   };
 
   const onDirectoryKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
-    if (busy || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (busy || event.ctrlKey || event.metaKey || event.altKey || onNumberKey(event, "directory")) return;
     switch (event.key) {
       case "ArrowDown":
       case "j":
@@ -1552,12 +1826,18 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
 
   /** The TUI form's Left / Right on the Mode row: move to the previous or next chip, wrapping. */
   const onModeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (onNumberKey(event, "mode")) return;
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
     const index = modes.findIndex((candidate) => candidate.id === mode);
-    const next = modes[(index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length];
+    const nextIndex = (index + (event.key === "ArrowRight" ? 1 : modes.length - 1)) % modes.length;
+    const next = modes[nextIndex];
     selectMode(next.id);
-    event.currentTarget.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
+    const focusChip = () => chipsRef.current?.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
+    // A paged Mode row shows the chip the arrow reached (change 4) — the
+    // selection changed, so the page is that chip's — and renders it on the next frame.
+    if (modesPaged && (nextIndex < modeSlice.start || nextIndex >= modeSlice.end)) window.requestAnimationFrame(focusChip);
+    else focusChip();
   };
 
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -1573,10 +1853,8 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     </button>
   ));
 
-  const highlighted = choices.find((choice) => choice.deckId === highlight);
+  const highlighted = usable.find((choice) => choice.deckId === highlight);
   const noSubdirectories = listing !== undefined && listing.entries.length === 0;
-  /** The form's fields wait for a directory: until one is chosen there is nothing to start in. */
-  const formDisabled = busy || !target;
 
   const deckField = (
     <section className="new-agent-section" aria-labelledby={`${titleId}-deck`} data-testid="new-agent-deck-field">
@@ -1590,11 +1868,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         aria-disabled={busy || undefined}
         tabIndex={busy ? -1 : 0}
         data-testid="new-agent-deck-list"
-        aria-activedescendant={highlighted ? `${titleId}-deck-${choices.indexOf(highlighted)}` : undefined}
+        aria-activedescendant={highlighted ? `${titleId}-deck-${usable.indexOf(highlighted)}` : undefined}
+        aria-describedby={usable.length === 0 ? `${titleId}-no-deck` : undefined}
         onKeyDown={onDeckKeyDown}
       >
-        {choices.map((choice, index) => {
-          const disabled = choice.reason !== undefined;
+        {usable.map((choice, index) => {
           const chosen = choice.deckId === deck?.deckId;
           return (
             <li
@@ -1602,30 +1880,31 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               id={`${titleId}-deck-${index}`}
               role="option"
               aria-selected={choice.deckId === highlight}
-              aria-disabled={disabled || undefined}
               aria-current={chosen || undefined}
-              className={`new-agent-row${choice.deckId === highlight ? " is-active" : ""}${chosen ? " is-chosen" : ""}${disabled ? " is-disabled" : ""}`}
+              className={`new-agent-row${choice.deckId === highlight ? " is-active" : ""}${chosen ? " is-chosen" : ""}`}
               data-deck-id={choice.deckId}
               data-chosen={chosen || undefined}
-              onClick={() => {
-                if (!disabled) chooseDeck(choice);
-              }}
+              onClick={() => chooseDeck(choice)}
             >
+              <VoiceNumber number={deckNumber(index)} />
               {chosen ? <Check size={13} aria-hidden="true" /> : <Server size={13} aria-hidden="true" />}
               <span className="new-agent-row-name">{choice.name}</span>
               <span className="new-agent-row-tag">{choice.deckKind}</span>
-              {disabled && <span className="new-agent-row-reason">{choice.reason}</span>}
             </li>
           );
         })}
       </ul>
-      {choices.length === 0 && <p className="new-agent-hint">No daemon is configured.</p>}
+      {/* The list stays mounted when empty, so it still takes the dialog's opening focus and Escape still reaches the dialog. */}
+      {usable.length === 0 && <p id={`${titleId}-no-deck`} className="new-agent-hint" data-testid="new-agent-no-deck">{choices.length === 0 ? NO_DECK_CONFIGURED : NO_DECK_CAN_TAKE_AGENT}</p>}
     </section>
   );
 
   const directoryPanel = (
-    <section className="new-agent-section" aria-labelledby={`${titleId}-directory`} data-testid="new-agent-directory-panel">
-      <h3 id={`${titleId}-directory`}>Directory</h3>
+    <section className="new-agent-section new-agent-directory-panel" aria-labelledby={`${titleId}-directory`} data-testid="new-agent-directory-panel">
+      <div className="new-agent-section-head">
+        <h3 id={`${titleId}-directory`}>Directory</h3>
+        {directoriesPaged && <span className="new-agent-page" data-testid="new-agent-directory-page">{pageMarker(directorySlice)}</span>}
+      </div>
       {!deck && <p className="new-agent-hint" data-testid="new-agent-directory-idle">Choose a daemon to browse its directories.</p>}
       {listingState === "unsupported" && <p className="new-agent-hint" data-testid="new-agent-no-browse">This daemon cannot list directories, so no directory can be chosen on it here. Choose another daemon.</p>}
       {listingError && <p className="new-agent-error" role="alert" data-testid="new-agent-directory-error">{displayText(listingError, DISPLAY_LIMITS.message)}</p>}
@@ -1644,11 +1923,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              onChange={(event) => {
-                setFilter(event.target.value);
-                setSearchError(undefined);
-                setCursor(0);
-              }}
+              onChange={(event) => changeFilter(event.target.value)}
               onKeyDown={onFilterKeyDown}
             />
             {deck?.listingOptions && (
@@ -1660,7 +1935,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           </div>
           <ul
             ref={directoryListRef}
-            className="new-agent-list is-directories"
+            className={`new-agent-list is-directories${voiceOn ? " is-paged" : ""}`}
+            /* While voice is on the rows are a grid that fills the browser's
+               space, a page at a time (change 4): as many columns as fit,
+               filled top to bottom. */
+            style={voiceOn && directoryFit ? { gridTemplateColumns: `repeat(${directoryFit.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${directoryFit.rows}, minmax(${DIRECTORY_CELL.rowHeight}px, 1fr))` } : undefined}
             role="listbox"
             aria-label="Directories"
             aria-disabled={busy || undefined}
@@ -1669,7 +1948,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             aria-activedescendant={rows[cursor] ? activeRowId : undefined}
             onKeyDown={onDirectoryKeyDown}
           >
-            {rows.map((row, index) => (
+            {shownRows.map((row, at) => ({ row, index: rowOffset + at })).map(({ row, index }) => (
               <li
                 // Name and path: a symlink shares its target's path (issue #1240).
                 key={row.kind === "up" ? ".." : `${row.entry.displayName}\u0000${row.entry.path}`}
@@ -1685,6 +1964,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                   else if (deck) void loadListing(deck.deckId, row.entry.path);
                 }}
               >
+                <VoiceNumber number={rowNumber(index)} />
                 {row.kind === "up"
                   ? <><ArrowUp size={13} aria-hidden="true" /><span className="new-agent-row-name">..</span></>
                   : (
@@ -1728,10 +2008,18 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         <span>Dir</span>
         <strong data-testid="new-agent-dir" title={target ? displayText(target.displayPath, DISPLAY_LIMITS.message) : undefined}>{target ? displayText(target.displayPath, DISPLAY_LIMITS.path) : <span className="new-agent-unset">No directory chosen yet</span>}</strong>
       </div>
-      <div className="new-agent-field">
-        <span id={`${titleId}-mode`}>Mode</span>
-        <div className="new-agent-chips" role="group" aria-labelledby={`${titleId}-mode`} data-testid="new-agent-modes" onKeyDown={formDisabled ? undefined : onModeKeyDown}>
-          {modes.map((candidate, index) => (
+      <div className="new-agent-field" ref={modeFieldRef}>
+        <span id={`${titleId}-mode`}>Mode{modesPaged && <small className="new-agent-page" data-testid="new-agent-mode-page">{pageMarker(modeSlice)}</small>}</span>
+        <div
+          ref={chipsRef}
+          className={`new-agent-chips${voiceOn ? " is-paged" : ""}`}
+          style={voiceOn && modeFit ? { gridTemplateColumns: `repeat(${modeFit.columns}, minmax(0, 1fr))` } : undefined}
+          role="group"
+          aria-labelledby={`${titleId}-mode`}
+          data-testid="new-agent-modes"
+          onKeyDown={formDisabled ? undefined : onModeKeyDown}
+        >
+          {shownModes.map((candidate, at) => ({ candidate, index: modeOffset + at })).map(({ candidate, index }) => (
             <Fragment key={candidate.id}>
               {index === orchestrationEnd && ambiguousChipButtons}
               <button
@@ -1743,11 +2031,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                 disabled={formDisabled}
                 onClick={() => selectMode(candidate.id)}
               >
+                <VoiceNumber number={modeNumber(index)} />
                 {candidate.label}
               </button>
             </Fragment>
           ))}
-          {orchestrationEnd >= modes.length && ambiguousChipButtons}
+          {orchestrationEnd >= modes.length && (!modesPaged || modeSlice.end === modes.length) && ambiguousChipButtons}
         </div>
       </div>
       {ambiguousReasons.map((reason) => <p key={reason} className="new-agent-hint" data-testid="new-agent-orchestration-ambiguous">{reason}</p>)}
@@ -1831,7 +2120,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     <div className="dialog-backdrop" role="presentation" data-testid="new-agent-backdrop" onMouseDown={requestClose}>
       <section
         ref={dialogRef}
-        className="new-agent-dialog"
+        className={`new-agent-dialog${voiceOn ? " is-voice-pages" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -1852,7 +2141,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         </header>
         {/* Top to bottom in the tab order the wizard's steps had: deck, the
             directory browser, then Mode, Name, Command and Start. */}
-        <div className="new-agent-body">
+        <div className="new-agent-body" ref={bodyRef}>
           {restoreNotes && (
             <div className="new-agent-restored" role="status" data-testid="new-agent-restored">
               {restoreNotes.map((note) => <p key={note} className="new-agent-hint">{note}</p>)}

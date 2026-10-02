@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
  * The fixture's stand-in for a deck identity — used as BOTH `deckId` and
@@ -43,7 +44,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -884,6 +885,7 @@ function fleetDeck(
  */
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
   if (state === "docs-fleet") return docsFleet();
+  if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -948,12 +950,12 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
-      ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; daemon reported v5." }
+      ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
   const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
@@ -1034,7 +1036,7 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
  * the voice surface as a peer dialog, so the question is askable and the row is
  * here to answer it.
  */
-const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
+export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   readonly phrases: readonly string[];
   readonly action: string;
   readonly invoke: string;
@@ -1066,6 +1068,13 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    * resolver.
    */
   readonly openers?: readonly string[];
+  /**
+   * `commands.toml`'s `requires = ["directory_listing"]` or `["new_agent_form"]`:
+   * callable only while the webview has declared a directory listing, or the
+   * New agent dialog's live form, and otherwise refused with the row's own
+   * hint — the same `Not here — <hint>.` Rust renders.
+   */
+  readonly requires?: "directory_listing" | "new_agent_form";
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -1110,7 +1119,10 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // matcher is `screens.includes(screen)`, so an empty array here would mean
     // the opposite of what an empty column means in `commands.toml`; spelling
     // the three out is what keeps the preview and the table agreeing.
-    phrases: ["voice off", "turn off the voice", "stop listening"],
+    //
+    // The phrases are `voice::dictation::VOICE_OFF_PHRASES`, all of them —
+    // `fixture.test.ts` compares this row with the Rust list.
+    phrases: ["voice off", "turn off the voice", "turn voice off", "stop listening", "stop voice control", "stop voice", "mute", "mic off"],
     action: "voice_off",
     invoke: "stopVoice",
     screens: ["deck", "overview", "agent"],
@@ -1157,16 +1169,103 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typed.",
   },
   {
-    // Whole-utterance equality, which is what the phrase matcher already is —
-    // the real fast path draws the same line, and for the reason its own
-    // constant documents at length: a trailing rule would submit "the meeting
-    // is at the" when somebody said "type the meeting is at the end".
-    phrases: ["end", "send", "send it", "submit", "enter", "press enter"],
+    // PRD #1260 — the dictation mode's switches, the real fast path's lists
+    // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
+    // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
+    // the opener row, as `local_intercept` checks them.
+    phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
+    action: "dictation_on",
+    invoke: "startDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode needs an agent's pane open — open one first",
+    report: "Typing to the agent.",
+  },
+  {
+    phrases: ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"],
+    action: "dictation_off",
+    invoke: "stopDictation",
+    screens: ["agent"],
+    unavailableHint: "typing mode is only on in an agent's pane",
+    report: "Stopped typing.",
+  },
+  {
+    // Whole-utterance equality ({@link fixtureSaidWhole}) — the real fast path
+    // draws the same line, and for the reason its own constant documents at
+    // length: a trailing rule would submit "the meeting is at the" when
+    // somebody said "type the meeting is at the end".
+    //
+    // `voice::dictation::SUBMIT_PHRASES` together with `submit_prompt`'s
+    // `heard_as_whole` entries in `commands.toml`, which is the set the mode
+    // answers ("go ahead" is one); `fixture.test.ts` compares this row with both.
+    phrases: [
+      "end", "send", "send it", "submit", "enter", "press enter",
+      "submit it", "go ahead", "that is the end", "finished", "the prompt is finished",
+    ],
     action: "submit_prompt",
     invoke: "submitAgentPrompt",
     screens: ["agent"],
     unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
+  },
+  {
+    // PR #1451 round 3, change 5 — the New agent browser's Filter box.
+    // Matched by OPENER, `commands.toml`'s `heard_as` for the row; the text
+    // is then picked out of the utterance by {@link fixtureFilterText} and
+    // kept only if `voice::filter::grounded_filter_text` would keep it. The
+    // picking is the one part a model does in a live build, so the preview's
+    // version is deliberately small: a named letter, or what follows the
+    // opener.
+    phrases: [],
+    openers: ["filter", "show only", "only show", "narrow"],
+    action: "filter_directories",
+    invoke: "filterDirectories",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "filtering needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filtering by “{text}”.",
+  },
+  {
+    phrases: ["clear filter", "clear the filter", "remove the filter", "reset the filter", "no filter", "show all directories"],
+    action: "clear_directory_filter",
+    invoke: "clearDirectoryFilter",
+    screens: ["overview"],
+    requires: "directory_listing",
+    unavailableHint: "clearing the filter needs the New agent dialog's directory listing; say “new agent” and choose a daemon first",
+    report: "Filter cleared.",
+  },
+  {
+    // PR #1451 round 4, decision D8 — the New agent form's Command field.
+    // Matched by OPENER; the command is then the rest of the utterance, kept
+    // as said by {@link fixtureGroundedCommandText}, which is
+    // `voice::command_text::grounded_command_text`'s presentation rule. A live
+    // build has the model locate the command inside a longer sentence; the
+    // preview's stand-in for that is "everything after the opener".
+    phrases: [],
+    openers: ["set the command to", "change the command to", "make the command", "the command is"],
+    action: "set_new_agent_command",
+    invoke: "setNewAgentCommand",
+    screens: ["overview"],
+    requires: "new_agent_form",
+    unavailableHint: "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first",
+    report: "Command: “{command}”.",
+  },
+  {
+    // PR #1451 round 3, change 4 — turning the page of a list voice shows a
+    // page at a time. The app refuses a turn with nothing to turn to itself.
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
+    action: "next_page",
+    invoke: "nextPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Next page.",
+  },
+  {
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back"],
+    action: "previous_page",
+    invoke: "previousPage",
+    screens: ["deck", "overview"],
+    unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
+    report: "Previous page.",
   },
 ];
 
@@ -1183,11 +1282,11 @@ const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
  * honest about what this stand-in is — a matcher over a fixed list — and is
  * what a preview reader most needs to know.
  */
-export function fixtureVoiceCommands(screen: VoiceScreen): VoiceCommandDto[] {
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false): VoiceCommandDto[] {
   return FIXTURE_VOICE_COMMANDS.map((command) => ({
     id: command.action,
     description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
-    callable: command.screens.includes(screen),
+    callable: fixtureCallable(command, screen, directoryListing, newAgentForm),
     unavailable_hint: command.unavailableHint,
     params: [],
   }));
@@ -1206,6 +1305,30 @@ function fixtureHeard(transcript: string, situation: string): string {
 }
 
 /**
+ * PRD #1261 — one canned TIE, so the browser tier can drive the numbered
+ * chooser: "open the agent" on the Daemons screen or the dashboard, answered as
+ * `open_agent` with the two agents of the `connected` deck it names in turn.
+ *
+ * **Fixture data, not the `agent_ref` resolver {@link FIXTURE_VOICE_COMMANDS}
+ * refuses to invent**, for the same line that note draws: this is one canned
+ * answer for one canned phrase, whose interest is what happens AFTER the tie —
+ * the list, its answers, its expiry — which the real resolver's own tests in
+ * `voice/outcome.rs` cannot reach. The sentence and the two reports are the
+ * ones Rust renders for this tie. The agents are the `connected` state's own
+ * `planner` and `builder`, so a chosen entry opens a pane that exists, and
+ * each carries the `names` Rust's `spoken_names` gives that agent — its display
+ * name and its role — so the fallback answers "planner" as Rust would.
+ */
+const FIXTURE_VOICE_TIE = {
+  phrases: ["open the agent"] as readonly string[],
+  screens: ["deck", "overview"] as readonly VoiceScreen[],
+  candidates: [
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "planner", label: "Plan / architecture", names: ["Plan / architecture", "planner"] },
+    { name: "agent", kind: "agent_ref", spoken: "agent", value: "builder", label: "Desktop implementation", names: ["Desktop implementation", "builder"] },
+  ] as readonly VoiceResolvedParamDto[],
+} as const;
+
+/**
  * Resolve one utterance the way the Rust pipeline would, against the screen the
  * webview has stated.
  *
@@ -1214,18 +1337,112 @@ function fixtureHeard(transcript: string, situation: string): string {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
-  const command = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+  /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
+     and matches only the reserved whole utterances, typing everything else
+     whole. The same rule here, over this module's own rows, in
+     `dictation_intercept`'s order: the biggest stop first. */
+  if (dictating) {
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
+    /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
+       what precedes it and asks the panel to send after it. */
+    const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
+    const text = prompt ?? utterance.trim();
+    return {
+      ...stub,
+      outcome: reserved
+        ? { kind: "dispatch", transcript: utterance, action: reserved.action, invoke: reserved.invoke, params: [], sentence: reserved.report }
+        : {
+          kind: "dispatch",
+          transcript: utterance,
+          action: "dictate_to_agent",
+          invoke: "dictateToAgent",
+          params: [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: text, label: text }],
+          sentence: prompt === undefined ? `Typed: “${text}”.` : `Typed: “${text}”. Sent.`,
+          ...(prompt === undefined ? {} : { thenSubmit: true }),
+        },
+    };
+  }
+  /* Outside the mode `local_intercept` answers the switches and a submit by
+     the same whole-utterance rule, ahead of the `type` opener — "type on"
+     opens with `type` and would otherwise type the word "on". */
+  const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
+    const hint = "opening an agent works from the Daemons screen or the agent dashboard";
+    if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
+      return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: "open_agent", hint, sentence: `Not here — ${hint}.` } };
+    }
+    const candidates = [...FIXTURE_VOICE_TIE.candidates];
+    const matches = candidates.map((candidate) => candidate.label);
+    return {
+      ...stub,
+      outcome: {
+        kind: "param_ambiguous",
+        transcript: utterance,
+        action: "open_agent",
+        invoke: "openAgent",
+        param: "agent",
+        spoken: "agent",
+        matches,
+        candidates,
+        params: [],
+        reports: matches.map((label) => `Opening ${label}.`),
+        sentence: fixtureHeard(utterance, `“agent” matches more than one agent: ${matches.join(", ")}`),
+      },
+    };
+  }
+  const command = reserved
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
-  if (!command.screens.includes(screen)) {
+  if (!fixtureCallable(command, screen, directoryListing, newAgentForm)) {
     return {
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
+    };
+  }
+  if (command.action === "filter_directories") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
+    // Not `fixtureOpening`'s text: that drops a leading `-`, and "filter -tmp"
+    // means `-tmp`. Only separators that cannot open a name are dropped here.
+    const rest = opener === undefined ? undefined : utterance.trim().slice(opener.length).replace(/^[\s:,]+/u, "");
+    const text = rest === undefined ? undefined : fixtureFilterText(utterance, rest);
+    if (text === undefined) {
+      return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "text", kind: "filter_text", spoken: text, value: text, label: text }],
+        sentence: command.report.replace("{text}", text),
+      },
+    };
+  }
+  if (command.action === "set_new_agent_command") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined)!;
+    const said = utterance.trim().slice(opener.length).trim();
+    const value = fixtureGroundedCommandText(utterance, said);
+    if (value === undefined) {
+      return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "command", sentence: fixtureHeard(utterance, "I could not tell what command you said, so the command was not changed") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "command", kind: "command_text", spoken: said, value, label: value }],
+        sentence: command.report.replace("{command}", value),
+      },
     };
   }
   /* The typed text is a slice of the UTTERANCE, never of anything this module
@@ -1247,6 +1464,169 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen): Voi
       sentence: text === undefined ? command.report : `Typed: “${text}”.`,
     },
   };
+}
+
+/** Whether `command` can run on `screen`, given whether a directory listing and a live New agent form are declared. */
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean): boolean {
+  if (!command.screens.includes(screen)) return false;
+  if (command.requires === "directory_listing") return directoryListing;
+  if (command.requires === "new_agent_form") return newAgentForm;
+  return true;
+}
+
+/** The quote pairs `voice::command_text` drops from around a command. */
+const FIXTURE_COMMAND_QUOTES: ReadonlyArray<readonly [string, string]> = [["\"", "\""], ["'", "'"], ["`", "`"], ["“", "”"], ["‘", "’"]];
+
+/**
+ * `voice::command_text::grounded_command_text`'s presentation rule: the
+ * command `value` without surrounding whitespace, a sentence's trailing full
+ * stop (a single `.` after a letter, digit or closing quote — `cd ..` keeps
+ * its dots) or one pair of surrounding quotes, and otherwise exactly as said.
+ * It must occur in `transcript` as whole spoken tokens, and hold no control,
+ * format character or line separator.
+ */
+export function fixtureGroundedCommandText(transcript: string, value: string): string | undefined {
+  const withoutFullStop = (text: string) => (/[\p{L}\p{N}”’"'`]\.$/u.test(text) ? text.slice(0, -1).trimEnd() : text);
+  let text = withoutFullStop(value.trim());
+  const pair = FIXTURE_COMMAND_QUOTES.find(([open, close]) => text.length >= 2 && text.startsWith(open) && text.endsWith(close) && !text.slice(1, -1).includes(open) && !text.slice(1, -1).includes(close));
+  if (pair) text = withoutFullStop(text.slice(1, -1).trim());
+  if (text === "" || FIXTURE_COMMAND_INVISIBLE.test(text)) return undefined;
+  const opens = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([open]) => open === c);
+  const closes = (c: string | undefined) => FIXTURE_COMMAND_QUOTES.some(([, close]) => close === c);
+  const edge = (c: string | undefined) => c === undefined || /\s/u.test(c);
+  // Whole spoken tokens, as `starts_a_token` / `ends_a_token`: whitespace or an
+  // end of the transcript, past one opening quote before and a full stop and
+  // one closing quote after.
+  const whole = (at: number) => {
+    let before = at - 1;
+    if (opens(transcript[before])) before -= 1;
+    if (!edge(transcript[before])) return false;
+    let after = at + text.length;
+    let last: string | undefined = text[text.length - 1];
+    let stopped = false;
+    let quoted = false;
+    for (;;) {
+      const next = transcript[after];
+      if (next === "." && !stopped && last !== undefined && (/[\p{L}\p{N}]/u.test(last) || closes(last))) stopped = true;
+      else if (!quoted && closes(next)) quoted = true;
+      else break;
+      last = next;
+      after += 1;
+    }
+    return edge(transcript[after]);
+  };
+  for (let at = transcript.indexOf(text); at >= 0; at = transcript.indexOf(text, at + 1)) {
+    if (whole(at)) return text;
+  }
+  return undefined;
+}
+
+/** What `voice::command_text::has_invisible` refuses: controls (C0 and C1), format characters, and line or paragraph separators. */
+const FIXTURE_COMMAND_INVISIBLE = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
+/**
+ * The Filter box's text out of what followed the opener: a letter named after
+ * "letter" ("show only those starting with letter D" is "d"), or else the rest
+ * less a leading "by" ("filter by api" is "api"). Kept only if
+ * {@link fixtureGroundedFilterText} keeps it, which is the half of the live
+ * path this reproduces exactly.
+ */
+function fixtureFilterText(utterance: string, rest: string): string | undefined {
+  const letter = /\bletter\s+(\p{L})(?![\p{L}\p{N}])/iu.exec(rest);
+  const value = letter ? letter[1] : rest.replace(/^by\s+/iu, "");
+  return fixtureGroundedFilterText(utterance, value);
+}
+
+/**
+ * `voice::filter::grounded_filter_text`: the value, trimmed of what is not a
+ * letter or digit (but keeping joiners at the front) and lowercased, made only
+ * of letters, digits, spaces and the joiners `-` `_` `.`, and said — its words adjacent in the transcript, or one
+ * letter named straight after "letter". Spelled letter names ("letter dee")
+ * are Rust's alone; the preview has no model that would produce one.
+ */
+function fixtureGroundedFilterText(transcript: string, value: string): string | undefined {
+  const text = value.replace(/^[^\p{L}\p{N}._-]+|[^\p{L}\p{N}]+$/gu, "").toLowerCase();
+  const core = text.replace(/^[._-]+/u, "");
+  const lead = text.slice(0, text.length - core.length);
+  if (core === "" || !/^[\p{L}\p{N} ._-]+$/u.test(core)) return undefined;
+  const wanted = fixtureSpokenWords(core);
+  const said = [...transcript.matchAll(/[\p{L}\p{N}]+/gu)].map((match) => ({ at: match.index, word: match[0].toLowerCase() }));
+  const windows = said.filter((_, at) => wanted.every((word, offset) => said[at + offset]?.word === word));
+  if (windows.length === 0) return undefined;
+  // A leading joiner stays only where the transcript opens that word's token
+  // with it, as `voice::filter::lead_before` reads it.
+  const leadBefore = (at: number) => {
+    const run = /[._-]*$/u.exec(transcript.slice(0, at))![0];
+    return /[\p{L}\p{N}]$/u.test(transcript.slice(0, at - run.length)) ? "" : run;
+  };
+  const kept = windows.some(({ at }) => leadBefore(at) === lead) ? lead : "";
+  return kept + core.split(/\s+/u).join(" ");
+}
+
+/**
+ * `voice::outcome::WHOLE_UTTERANCE_POLITENESS` — words that may open or close a
+ * reserved phrase without making it a different request ("okay, send it
+ * please"). Only these, and only at the edges; `fixture.test.ts` says every
+ * one of them on both edges of every reserved phrase.
+ */
+const FIXTURE_WHOLE_UTTERANCE_POLITENESS: readonly string[] = [
+  "okay", "ok", "alright", "yes", "yeah", "please", "just", "now", "thanks",
+];
+
+/** `voice::table::spoken_words`: lowercased runs of letters and digits, so a transcriber's case and punctuation decide nothing. */
+function fixtureSpokenWords(text: string): string[] {
+  return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word !== "");
+}
+
+/**
+ * `voice::outcome::said_whole`: the utterance's words less any edge politeness
+ * word ARE one of `phrases`. Never a prefix or a suffix test, so "please send
+ * it to the tester later" is not a send.
+ */
+function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolean {
+  const words = fixtureSpokenWords(utterance);
+  const polite = (word: string) => FIXTURE_WHOLE_UTTERANCE_POLITENESS.includes(word);
+  const start = words.findIndex((word) => !polite(word));
+  if (start < 0) return false;
+  const end = words.length - [...words].reverse().findIndex((word) => !polite(word));
+  const said = words.slice(start, end).join(" ");
+  return phrases.some((phrase) => fixtureSpokenWords(phrase).join(" ") === said);
+}
+
+/**
+ * `voice::dictation::TRAILING_SEND_PHRASES` — the send phrases that also count
+ * as a separate final sentence of a longer utterance in typing mode. The wider
+ * `submit_prompt` list ("end", "enter", "finished", "go ahead") sends only as
+ * the whole utterance.
+ */
+const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::outcome::trailing_send`: the words before a separate final sentence
+ * that, less an edge politeness word, IS one of
+ * {@link FIXTURE_TRAILING_SEND_PHRASES}. The final sentence follows the last
+ * `.`, `?` or `!` that is followed by whitespace, once the utterance's own
+ * closing punctuation is set aside; what precedes it must carry a word.
+ */
+function fixtureTrailingSend(utterance: string): string | undefined {
+  const body = utterance.replace(/[\s.?!]+$/u, "");
+  let cut = -1;
+  for (let at = 0; at + 1 < body.length; at += 1) {
+    if (".?!".includes(body[at]) && /\s/u.test(body[at + 1])) cut = at + 1;
+  }
+  if (cut < 0) return undefined;
+  const prompt = body.slice(0, cut).trim();
+  if (!fixtureSaidWhole(body.slice(cut), FIXTURE_TRAILING_SEND_PHRASES)) return undefined;
+  return /[\p{L}\p{N}]/u.test(prompt) ? prompt : undefined;
+}
+
+/** The first of `actions`, in order, whose row's phrases the whole utterance is. */
+function fixtureReserved(utterance: string, actions: readonly string[]): (typeof FIXTURE_VOICE_COMMANDS)[number] | undefined {
+  for (const action of actions) {
+    const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);
+    if (row && fixtureSaidWhole(utterance, row.phrases)) return row;
+  }
+  return undefined;
 }
 
 /**
@@ -1368,7 +1748,13 @@ export const FIXTURE_VOICE_UTTERANCE = FIXTURE_VOICE_COMMANDS[0].phrases[0];
  */
 export function fixtureVoiceScript(search: string): string[] {
   const params = new URLSearchParams(search);
-  if (!params.has("voice")) return [FIXTURE_VOICE_UTTERANCE];
+  if (!params.has("voice")) {
+    /* PR #1451 round 3, change 4 — the crowded paging state is about what voice
+       SHOWS (pages, numbers, markers), so its microphone says nothing unless a
+       spec scripts it: the default line would navigate away from the screen
+       under test the moment voice turns on. */
+    return params.get("state") === "voice-pages" ? [] : [FIXTURE_VOICE_UTTERANCE];
+  }
   return params.getAll("voice").filter((phrase) => phrase.trim() !== "");
 }
 
@@ -1391,7 +1777,9 @@ export function fixtureVoiceHeard(transcript: string = FIXTURE_VOICE_UTTERANCE):
     outcome: {
       kind: "heard",
       transcript,
-      sentence: `Heard: “${transcript}”.`,
+      // Rendered as Rust's `heard_sentence` renders it: no colon, and no
+      // second full stop after a transcript that already ends a sentence.
+      sentence: `Heard “${transcript}”${/[.?!…]$/.test(transcript) ? "" : "."}`,
     },
     transcribeMs: null,
     backend: "stub",

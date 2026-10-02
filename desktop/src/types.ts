@@ -130,6 +130,13 @@ export interface ConnectionView {
   pending?: boolean;
   message?: string;
   /**
+   * The technical half of an incompatible daemon's `message`: the declared
+   * compatibility breaks by name, the protocol number on each side and the two
+   * builds. A user cannot act on any of it, so it is shown only behind a
+   * Technical details disclosure, never in the sentence.
+   */
+  detail?: string;
+  /**
    * Which kind of deck this connection is to (PRD #741 M7): `"local"` for a
    * daemon on this machine, `"remote"` for one reached over an ssh tunnel.
    *
@@ -1327,8 +1334,22 @@ export interface DeckRuntimeState {
    * screen is the one piece of live state that exists ONLY in the webview; see
    * `DeckBridge.declareVoiceScreen` for the whole of that seam.
    */
-  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto) => void;
+  declareVoiceScreen?: (screen: import("./lib/bridge").VoiceScreen, directories?: import("./lib/bridge").VoiceDirectoriesDto, newAgent?: import("./lib/bridge").VoiceNewAgentDto, endpoints?: import("./lib/bridge").EndpointSettingsDto, dictation?: import("./lib/bridge").VoiceDictationTargetDto) => void;
   resolveVoice?: (utterance: string) => Promise<import("./lib/bridge").VoiceResultDto>;
+  /**
+   * PRD #1261 — answer a pending numbered choice, locally
+   * (`DeckBridge.answerVoiceChoice`). Optional like the rest: a panel on a
+   * runtime without it answers with `answerChoiceLocally`, the webview's port
+   * of the same rule.
+   */
+  answerVoiceChoice?: (utterance: string, action: string, offered: import("./lib/bridge").VoiceResolvedParamDto[]) => Promise<import("./lib/voiceChoice").VoiceChoiceAnswerDto>;
+  /**
+   * PR #1451 round 3, change 3 — answer a bare number against the numbered
+   * list on screen, locally (`DeckBridge.answerVoiceNumber`). Optional like
+   * the rest: a panel on a runtime without it answers with
+   * `answerNumberLocally`, the webview's port of the same rule.
+   */
+  answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
   /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.

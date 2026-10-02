@@ -159,7 +159,8 @@ test.describe("the empty report row", () => {
    * Scenario: press Voice in the preview and read the row before it has heard
    * anything. It names the phrase that lists everything, the phrase that
    * stops, and the button — and it fits the reserved row rather than growing
-   * it, which is the one property the row has to keep.
+   * it, even at the larger size the row's text takes while voice is on
+   * (PR #1451).
    */
   test("names both ways out and does not grow the row", async ({ page }) => {
     // A script with nothing in it: the fixture then hears nothing at all, which
@@ -178,7 +179,7 @@ test.describe("the empty report row", () => {
 
     const after = await page.locator(".voice-row").boundingBox();
     expect(before, "the voice row has no layout box").not.toBeNull();
-    expect(after!.height, "the empty-state hint grew the reserved row").toBe(before!.height);
+    expect(after!.height, "the empty-state hint grew the reserved row").toBeCloseTo(before!.height, 0);
   });
 });
 

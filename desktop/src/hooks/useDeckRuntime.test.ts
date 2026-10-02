@@ -91,8 +91,9 @@ describe("useDeckRuntime", () => {
   /**
    * Scenario (PRD #1223): a voice declaration made through the runtime carries
    * the New agent dialog's deck step for the fleet the runtime holds — the
-   * same list the dialog preselects from — so an unreachable deck reaches Rust
-   * with the reason the step shows, and the panel had to say nothing about it.
+   * same list the dialog preselects from — so an unreachable deck, which the
+   * dialog does not list, reaches Rust with its short reason class (PR #1451
+   * round 3), and the panel had to say nothing about it.
    */
   /** Scenario: Declares the fleet's deck step with every voice declaration. */
   it("declares the fleet's deck step with every voice declaration", async () => {
@@ -106,7 +107,7 @@ describe("useDeckRuntime", () => {
     const [screen, directories, newAgent, deckStep] = bridge.declareVoiceScreen.mock.calls[0];
     expect([screen, directories, newAgent]).toEqual(["overview", undefined, undefined]);
     expect(deckStep).toContainEqual({ deckId: FIXTURE_DAEMON_ID });
-    expect(deckStep).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "No daemon is listening on the configured socket." });
+    expect(deckStep).toContainEqual({ deckId: FIXTURE_UNREACHABLE_DAEMON_ID, reason: "it is not connected" });
   });
 
   /**

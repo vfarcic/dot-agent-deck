@@ -219,6 +219,12 @@ describe("VoicePanel", () => {
     expect(disclosure).toHaveTextContent("the hint shown when it cannot");
     expect(disclosure).toHaveTextContent("the model name and token limit");
     expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
+    // PRD #1260 and #1261: every locally decided case is named — the typing
+    // mode's phrases and everything said in it, and an answer to a choice.
+    expect(disclosure).toHaveTextContent("“type on” and “type off” said on their own");
+    expect(disclosure).toHaveTextContent("everything said while typing mode is on");
+    expect(disclosure).toHaveTextContent("while a numbered choice is on offer, an answer to it");
+    expect(disclosure).toHaveTextContent("Anything else said while a choice is on offer closes it and is sent as usual.");
     // PRD #1223, closing audit G2: the negations are about the app-observed
     // names only, and the words spoken are said to be always sent.
     // PRD #1223, closing audit H2: stated as FIELD provenance — the app adds

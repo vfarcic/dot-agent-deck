@@ -36,6 +36,13 @@ import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
  * Backed by a plain object so a remount reads back what an earlier render
  * saved, which is what makes the persistence assertions mean anything.
  */
+/** What a reader sees without opening any `<details>`: the element's text with every disclosure removed. */
+function textOutsideDisclosures(element: HTMLElement): string {
+  const copy = element.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("details").forEach((disclosure) => disclosure.remove());
+  return copy.textContent ?? "";
+}
+
 function settingsStore(initial?: Partial<DesktopSettingsDto>, path?: string, problem?: string) {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, ...initial };
   return {
@@ -1532,7 +1539,8 @@ describe("ControlDeck", () => {
       status: "error",
       socketPath: "/tmp/dot-agent-deck.sock",
       deckKind: "local",
-      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The deck reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 505-unsolicited-work-done-label-reworded. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       daemonDetected: true,
       runningAgentCount: 9,
       buildStampMismatchOnly: true,
@@ -1544,18 +1552,69 @@ describe("ControlDeck", () => {
 
     // Replacement stays refused: it is the one that would kill nine agents.
     expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+    // And the banner says why it is not there, rather than leaving a gap.
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent("Incompatible daemon");
+    expect(textOutsideDisclosures(banner)).toMatch(/Replace daemon is not offered while 9 agents are running on this daemon/);
 
     fireEvent.click(screen.getByTestId("connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("may show some of this daemon's information wrongly");
+    expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
     // The crate connects and emits the deck's snapshot itself (issue #1472),
     // so nothing re-establishes the fleet behind it.
-    expect(await screen.findByText("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.")).toBeVisible();
+    expect(await screen.findByText("Connected anyway. The warning stays at the top of this screen until you quit the app.")).toBeVisible();
     expect(reconnect).not.toHaveBeenCalled();
+  });
+
+  /*
+   * Found by hand on 2026-10-01 (PR #1451): the banner read `contract mismatch:
+   * the daemon is behind this app across 505-…. Protocol 10 matched on both
+   * sides, so the frames decode — …` under the title "Desktop bridge error".
+   * The banner now titles an incompatible daemon as one, says which side is
+   * older in the crate's plain sentence, names every button it renders with
+   * what that button does, and keeps the slug and protocol number behind a
+   * Technical details disclosure.
+   */
+  /** Scenario: Explains an incompatible daemon in plain words, names each of its buttons, and keeps the technical detail behind a disclosure. */
+  it("explains an incompatible daemon in plain words and names each button it offers", () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.stages = [];
+    incompatible.evidence = [];
+    incompatible.connection = {
+      status: "error",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 505-unsolicited-work-done-label-reworded. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
+
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent("Incompatible daemon");
+    expect(banner).not.toHaveTextContent("Desktop bridge error");
+    const visible = textOutsideDisclosures(banner);
+    expect(visible).toContain("This daemon is older than this app");
+    expect(visible).not.toMatch(/contract|protocol|mismatch|handshake|declared|wire|build stamp/i);
+    expect(visible).not.toContain("505-unsolicited-work-done-label-reworded");
+    const buttons = within(banner).getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
+    expect(buttons).toEqual(["Replace daemon", "Connect anyway", "Reconnect"]);
+    for (const label of buttons) {
+      expect(visible, `the banner explains its "${label}" button`).toMatch(new RegExp(`${label} (uses|tries|goes|stops) `));
+    }
+    const detail = within(banner).getByTestId("connection-detail");
+    expect(detail.tagName).toBe("DETAILS");
+    expect(within(detail).getByText("Technical details")).toBeInTheDocument();
+    expect(detail).toHaveTextContent("505-unsolicited-work-done-label-reworded");
+    expect(detail).toHaveTextContent("Both sides speak protocol 10");
   });
 
   /**
@@ -1586,7 +1645,7 @@ describe("ControlDeck", () => {
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: "local:/tmp/dot-agent-deck.sock" }));
     expect(await screen.findByText(/it did not respond as expected/)).toBeVisible();
-    expect(screen.queryByText(/Connected to the differently-built daemon/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Connected anyway\./)).not.toBeInTheDocument();
   });
 
   /**
@@ -1629,7 +1688,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
 
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent("Connected to a differently-built daemon");
+    expect(banner).toHaveTextContent("Connected to a daemon from a different version");
     expect(banner).toHaveTextContent("Connected anyway for this session");
     // Accepted, not re-offered: the override is already in force.
     expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();

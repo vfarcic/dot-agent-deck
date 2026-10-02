@@ -36,9 +36,12 @@ vi.mock("./TerminalViewport", () => ({
   },
 }));
 
-import { DeckShell } from "../App";
+import { DeckShell, DeckSurface } from "../App";
+import { VoiceOn } from "../hooks/useVoiceOn";
+import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
 import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
@@ -59,6 +62,13 @@ const HOSTILE_CODEPOINTS = [
   "\u2066", "\u2067", "\u2068", "\u2069",
   "\u200e", "\u200f", "\u061c",
 ];
+
+/** What a reader sees without opening any `<details>`: the element's text with every disclosure removed. */
+function textOutsideDisclosures(element: HTMLElement): string {
+  const copy = element.cloneNode(true) as HTMLElement;
+  copy.querySelectorAll("details").forEach((disclosure) => disclosure.remove());
+  return copy.textContent ?? "";
+}
 
 function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   const base = createFixtureSnapshot("crowded");
@@ -114,6 +124,37 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     fleet: overrides.fleet ?? [overrides.snapshot ?? base],
   };
 }
+
+describe.each(["selector", "overview", "deck"] as const)("%s voice toggle", (surface) => {
+  /// Scenario: Turning voice on and off keeps this numbered desktop surface mounted without React reporting a changed hook order.
+  /// The selector, overview, and deck each have hooks after their voice-number visibility check.
+  it("keeps the hook order stable off, on, and off", () => {
+    const deck = runtime();
+    const settings: DesktopSettingsState = {
+      settings: structuredClone(DEFAULT_DESKTOP_SETTINGS),
+      loaded: true,
+      chosen: true,
+      save: () => undefined,
+    };
+    const body = surface === "overview"
+      ? <AgentOverview runtime={deck} settings={settings} onNavigate={vi.fn()} />
+      : surface === "deck"
+        ? <DeckSurface runtime={deck} settings={settings} />
+        : <DeckSelector settings={settings} connection={deck.snapshot.connection} />;
+    const errors: string[] = [];
+    const error = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    try {
+      const { rerender } = render(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={true}>{body}</VoiceOn.Provider>);
+      rerender(<VoiceOn.Provider value={false}>{body}</VoiceOn.Provider>);
+      expect(errors.filter((message) => /order of Hooks|Rendered (more|fewer) hooks/i.test(message))).toEqual([]);
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
 
 /**
  * The overview with EVERY column on screen, which is what most of this file is
@@ -1692,6 +1733,23 @@ describe("AgentOverview", () => {
     expect(screen.getByTestId("overview-loading")).toBeVisible();
   });
 
+  /** Scenario: the app's own connection fails before any daemon answers. The dashboard says so and offers Reconnect, without calling the daemon incompatible or advising a version update (Qodo on PR #1451). */
+  it("does not give version advice for a bridge failure no daemon answered", () => {
+    const snapshot = createFixtureSnapshot("error");
+    snapshot.connection = { status: "error", socketPath: FIXTURE_DAEMON_ID, message: "The control channel could not be opened." };
+    renderOverview({ snapshot });
+
+    expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
+    const note = screen.getByTestId("overview-bridge-error");
+    expect(note).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Desktop bridge error" })).toBeVisible();
+    expect(note).toHaveTextContent("The control channel could not be opened.");
+    expect(note.textContent).not.toMatch(/version|older|incompatible|match/i);
+    expect(screen.getByRole("button", { name: "Reconnect" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Connect anyway" })).not.toBeInTheDocument();
+    expect(rows(document.body)).toHaveLength(0);
+  });
+
   /** Scenario: Refuses to imply a fleet it cannot read from an incompatible daemon. */
   it("refuses to imply a fleet it cannot read from an incompatible daemon", () => {
     const snapshot = createFixtureSnapshot("error");
@@ -1725,13 +1783,23 @@ describe("AgentOverview", () => {
    * declared break, not a stamp difference. Reported against v0.43.0, whose
    * hint read "Only the build stamps differ" under a contract mismatch.
    */
+  /*
+   * Found by hand on 2026-10-01 (PR #1451): the overview showed `contract
+   * mismatch: the daemon is behind this app across 505-…. Protocol 10 matched
+   * on both sides, so the frames decode — …`, which no user can act on. The
+   * message below is the plain sentence `daemon_bridge.rs` now produces, and
+   * the slug and protocol number travel in `detail` instead. What is asserted
+   * is what a reader sees OUTSIDE the disclosure: no developer vocabulary, and
+   * every button the note offers named with what it does.
+   */
   it("offers Connect anyway on the overview across a declared contract break", async () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = {
       ...snapshot.connection,
       daemonDetected: true,
       runningAgentCount: 9,
-      message: "contract mismatch: the daemon is behind this app across 708-worker-failure-reports-submitted. Protocol 10 matched on both sides, so the frames decode — but a declared compatibility break sits between these two builds, so a field can be read with the wrong meaning rather than failing outright. Builds: desktop is 0.43.0, daemon is 0.42.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+      detail: "The daemon lacks these declared compatibility breaks: 708-worker-failure-reports-submitted. Both sides speak protocol 10. Builds: app 0.43.0, daemon 0.42.0.",
       buildStampMismatchOnly: true,
     };
     const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
@@ -1739,18 +1807,30 @@ describe("AgentOverview", () => {
     const deck = runtime({ mode: "live", snapshot, runAction, reconnect });
     render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
 
-    expect(screen.getByTestId("overview-incompatible")).toBeVisible();
-    const hint = within(screen.getByTestId("overview-incompatible")).getByText(/reports 9 running agents/);
-    expect(hint).not.toHaveTextContent("Only the build stamps differ");
-    expect(hint).toHaveTextContent("a declared compatibility break separates this daemon from this app");
+    const note = screen.getByTestId("overview-incompatible");
+    expect(note).toBeVisible();
+    expect(note).toHaveTextContent("This daemon is older than this app");
+    const visible = textOutsideDisclosures(note);
+    expect(visible).not.toMatch(/contract|protocol|mismatch|handshake|declared|wire|build stamp/i);
+    expect(visible).not.toContain("708-worker-failure-reports-submitted");
+    for (const button of within(note).getAllByRole("button")) {
+      const label = button.textContent?.trim() ?? "";
+      expect(visible, `the note explains its "${label}" button`).toMatch(new RegExp(`${label} (uses|tries|goes|stops) `));
+    }
+    const detail = within(note).getByTestId("connection-detail");
+    expect(detail.tagName).toBe("DETAILS");
+    expect(within(detail).getByText("Technical details")).toBeInTheDocument();
+    expect(detail).toHaveTextContent("708-worker-failure-reports-submitted");
+    expect(detail).toHaveTextContent("Both sides speak protocol 10");
+
     fireEvent.click(screen.getByTestId("overview-connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
-    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("stamp difference");
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("may show some of this daemon's information wrongly");
+    expect(dialog.textContent).not.toMatch(/contract|protocol|mismatch|declared|wire|stamp/i);
     fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
 
-    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: snapshot.connection.deckId }));
     // The crate connects and emits the deck's snapshot (issue #1472); a
     // reconnect would re-establish the whole fleet to show one deck.
     expect(reconnect).not.toHaveBeenCalled();
@@ -2924,7 +3004,7 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     const { rerender } = render(<AgentOverview runtime={runtime({ mode: "live", snapshot: fleet[0], fleet, runAction, reconnect })} onNavigate={vi.fn()} />);
 
     fireEvent.click(within(refusedGroup()).getByTestId("overview-connect-anyway"));
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("a declared compatibility break separates the two builds");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("may show some of this daemon's information wrongly");
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Connect anyway" }));
 
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch", deckId: FIXTURE_REMOTE_DAEMON_ID }));

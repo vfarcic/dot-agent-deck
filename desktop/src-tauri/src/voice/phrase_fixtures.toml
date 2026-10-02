@@ -36,6 +36,7 @@ utterance = "switch deck to the box"
 screen = "overview"
 action = "switch_deck"
 outcome = "param_ambiguous"
+candidates = ["deck-build-box", "deck-stale-box"]
 
 [[fixtures]]
 name = "switch-deck-unknown"
@@ -75,6 +76,7 @@ utterance = "zoom coder"
 screen = "deck"
 action = "open_agent"
 outcome = "param_ambiguous"
+candidates = ["agent-atlas-one", "agent-atlas-two"]
 
 [[fixtures]]
 name = "open-agent-unavailable"
@@ -532,6 +534,165 @@ action = "dictate_to_agent"
 outcome = "dispatch"
 dictate_prefix = "tell it to"
 
+# PRD #1260 — the dictation MODE's switches, in `Idle` (the only state these
+# fixtures run in: with the mode on nothing reaches the model, so in-mode
+# classification is proven by `voice::outcome`'s unit tests, not here).
+#
+# **The entry and exit phrasings never reach the model**, and that is stated
+# rather than hidden: both rows are `heard_as_whole`, and every utterance that
+# grounds to one of them — the phrase, less an edge politeness word — is
+# answered by the local fast path first. So these fixtures pin the whole
+# pipeline's answer for the phrasings users say (a local path that went away
+# would hand them to the model, and they would still have to route here), and
+# the `screens` column through the unavailable pair.
+[[fixtures]]
+name = "dictation-on-type-on"
+utterance = "type on"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-typing-politely"
+utterance = "Okay, start typing."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-dictation"
+utterance = "Start dictation."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-unavailable"
+utterance = "type on"
+screen = "overview"
+action = "dictation_on"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "dictation-off-type-off"
+utterance = "Type off."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-typing"
+utterance = "stop typing"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-done-typing-please"
+utterance = "done typing, thanks"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-unavailable"
+utterance = "type off"
+screen = "deck"
+action = "dictation_off"
+outcome = "unavailable"
+
+# A switch phrase said INSIDE a sentence is not a switch. The first two go
+# through the local `type` opener; the last three reach the model, through an
+# opener no list holds, with a reserved phrase in the middle of what is to be
+# typed — the case where another row stealing it would be a silent wrong
+# action rather than a visible typo.
+[[fixtures]]
+name = "dictate-type-on-in-passing"
+utterance = "type on the tester's prompt that the build is on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-the-word-on"
+utterance = "type the word on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-stop-typing-in-passing"
+utterance = "tell it we should stop typing the logs to a file"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it"
+
+[[fixtures]]
+name = "dictate-send-it-in-passing"
+utterance = "ask it to send it to the reviewer when it is done"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "ask it to"
+
+# Measured 2026-09-29: "tell it the mute button in the settings is broken"
+# came back `list_commands` (refused by grounding, so nothing ran) — the model
+# does not read a bare "tell it <statement>" as dictation. `voice_off` did not
+# steal it, which is what this fixture is for, so it is phrased the way the
+# row's description offers ("tell it to ...") rather than pinned red on a gap
+# that predates the mode.
+[[fixtures]]
+name = "dictate-mute-in-passing"
+utterance = "tell it to fix the mute button in the settings"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "tell it to"
+
+# The in-mode "voice off" list (`VOICE_OFF_PHRASES`) is answered locally only
+# while the mode is on; in `Idle` the same words are the model's to answer. So
+# each phrase the list holds that no other fixture says is pinned to
+# `voice_off` here, on the agent screen the mode lives on — the model and the
+# list must mean the same thing by them, or "mute" would stop the microphone in
+# the mode and do something else a moment later.
+[[fixtures]]
+name = "voice-off-mute"
+utterance = "mute"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-mic-off"
+utterance = "mic off"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-stop-voice-control"
+utterance = "stop voice control"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-turn-voice-off"
+utterance = "turn voice off"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "voice-off-stop-voice"
+utterance = "stop voice"
+screen = "agent"
+action = "voice_off"
+outcome = "dispatch"
+
 # PRD #1223 — `open_new_agent`, the first row with a `deck_ref` and the first
 # optional param. The bare phrase must open the dialog; a named deck must
 # resolve against the planted fleet; and the deck screen must say where the
@@ -587,11 +748,12 @@ action = "open_new_agent"
 outcome = "dispatch"
 resolved_deck = "deck-local"
 
-# PRD #1223 — a deck the New agent dialog shows DISABLED (`ci@stale-box`, whose
-# daemon is not listening). It is never offered to the model, so it cannot be
-# preselected — the harness checks that on every fixture — and when the user
-# names it the report must say it cannot take a new agent, with the deck step's
-# own reason, rather than claim a preselection the dialog will not make.
+# PRD #1223 — a deck that cannot take a new agent (`ci@stale-box`, not
+# connected), which the New agent dialog does not list (PR #1451 round 3). It is
+# never offered to the model, so it cannot be preselected — the harness checks
+# that on every fixture — and when the user names it the report must say in one
+# line that it can't take a new agent, with its short reason, rather than claim
+# a preselection the dialog will not make.
 [[fixtures]]
 name = "open-new-agent-on-a-deck-that-cannot-take-one"
 utterance = "new agent on the stale box"
@@ -750,6 +912,55 @@ screen = "overview"
 action = "open_dir"
 outcome = "unavailable"
 
+# PR #1451 round 3, change 5 — the directory Filter box by voice. The model
+# extracts the text and the app holds it to the transcript, so
+# `resolved_filter` is what the box would be set to: the user's word, or the
+# letter they named inside a longer sentence, lowercased.
+[[fixtures]]
+name = "filter-directories-word"
+utterance = "filter docs"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = "docs"
+
+[[fixtures]]
+name = "filter-directories-letter-in-a-sentence"
+utterance = "show only those starting with letter D"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = "d"
+
+# A leading dot the user said is part of the name (`.git`), not presentation.
+[[fixtures]]
+name = "filter-directories-leading-dot"
+utterance = "filter .git"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = ".git"
+
+[[fixtures]]
+name = "filter-directories-clear"
+utterance = "clear filter"
+screen = "overview"
+listing = true
+action = "clear_directory_filter"
+outcome = "dispatch"
+
+# The negative: with no listing on screen there is no Filter box, so the filter
+# is refused as not available here and nothing is set.
+[[fixtures]]
+name = "filter-directories-dialog-closed"
+utterance = "filter docs"
+screen = "overview"
+action = "filter_directories"
+outcome = "unavailable"
+
 # PRD #1223 — the rest of the New agent form by voice. `form = true` plants a
 # live form (it implies the dialog is open): Mode chips No mode, Orch:
 # billing-run, schedule and dispatcher — NO `schedule: issues`, because the
@@ -817,6 +1028,50 @@ form = true
 action = "name_new_agent"
 outcome = "dispatch"
 dictate_prefix = "call it"
+
+# PR #1451 round 4, decision D8 — the Command field by voice. The model
+# locates the command and the app keeps the transcript's own words for it, so
+# `resolved_command` is exactly what the user said, less the sentence's full
+# stop. The first row is the maintainer's report, verbatim.
+[[fixtures]]
+name = "set-new-agent-command-devbox"
+utterance = "Set the command to devbox run agent."
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "dispatch"
+resolved_command = "devbox run agent"
+
+[[fixtures]]
+name = "set-new-agent-command-make-it"
+utterance = "make the command npm run dev"
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "dispatch"
+resolved_command = "npm run dev"
+
+# The negative: the transcript holds no command, so there is nothing of the
+# user's to put in the field and Command keeps what it had. (A model that
+# "fixed" or invented a command is refused by `voice::command_text`; that is
+# deterministic and pinned by the outcome tests with a stub model, since a
+# real model asked to copy the user's words copies them — even prose.)
+[[fixtures]]
+name = "set-new-agent-command-none-said"
+utterance = "set the command"
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "param_missing"
+
+# With no live form there is no Command field: the row's hint, not a guess.
+[[fixtures]]
+name = "set-new-agent-command-form-not-live"
+utterance = "Set the command to devbox run agent."
+screen = "overview"
+dialog = true
+action = "set_new_agent_command"
+outcome = "unavailable"
 
 [[fixtures]]
 name = "choose-mode-form-not-live"
@@ -1207,3 +1462,51 @@ utterance = "Close"
 screen = "overview"
 action = "close"
 outcome = "dispatch"
+
+# PR #1451 round 3, change 4 — turning the page of a list voice shows a page
+# at a time. The rows need no declaration (the app answers "nothing pages"
+# itself), so they are callable on the dashboard and the Daemons screen and
+# never over an agent's pane. A "go back" that names a page is a page turn; a
+# "go back" that names a screen is not.
+[[fixtures]]
+name = "next-page"
+utterance = "next page"
+screen = "overview"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "next-page-go-to-the-next-page"
+utterance = "Go to the next page."
+screen = "deck"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "previous-page"
+utterance = "previous page"
+screen = "overview"
+dialog = true
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "previous-page-go-back-a-page"
+utterance = "go back a page"
+screen = "overview"
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-turn-negative-back-to-the-daemons-is-a-screen"
+utterance = "go back to the daemons"
+screen = "overview"
+action = "open_deck"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-turn-negative-over-an-agent-pane"
+utterance = "next page"
+screen = "agent"
+action = "next_page"
+outcome = "unavailable"

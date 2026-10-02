@@ -7,6 +7,14 @@
 //! false positive truncated somebody mid-sentence. What replaces it is one
 //! utterance at a time: open the agent's pane, then say what you want typed.
 //!
+//! **PRD #1260 brought a mode back, on different terms.** *"type on"* enters
+//! it for the pane on screen and *"type off"* leaves it, each only as the
+//! WHOLE utterance ([`DICTATION_ON_PHRASES`], [`DICTATION_OFF_PHRASES`]), so a
+//! false positive cannot truncate anybody mid-sentence; and the mode arms no
+//! countdown, so a missed exit lands visibly and unsent in the prompt. While it
+//! is on, nothing reaches the model: `outcome::dictation_intercept` classifies
+//! each utterance against the reserved lists and types the rest whole.
+//!
 //! # The one property this module exists to hold
 //!
 //! **The app supplies the typed text; the model may only say where it starts.**
@@ -76,7 +84,9 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// defeats *"send it"* identically. Submitting is the last thing that happens
 /// to a prompt, so a half-finished instruction delivered to an agent is
 /// unrecoverable. Whole-utterance equality means only an utterance that IS one
-/// of these phrases submits anything.
+/// of these phrases submits anything. The one allowance is an edge politeness
+/// word — *"okay, send it please"* — stripped exactly as `submit_prompt`'s
+/// `heard_as_whole` grounding strips it, and never a word that carries content.
 ///
 /// The cost is stated rather than hidden: these six phrases are the words a
 /// user cannot dictate *alone*. *"type end"* types `end`; a bare *"end"*
@@ -101,6 +111,74 @@ pub const DICTATION_OPENERS: [&str; 4] = ["type", "write", "say", "dictate"];
 /// utterance is ever typed whole. *"type go ahead"* is how those words get
 /// typed.
 pub const SUBMIT_PHRASES: [&str; 6] = ["end", "send", "send it", "submit", "enter", "press enter"];
+
+/// What sends the prompt when said as a SEPARATE FINAL SENTENCE of an
+/// utterance in the dictation mode (PR #1451 round 3): *"What's the weather
+/// over there? Send it."* types the question and then presses Enter.
+///
+/// **Narrower than [`SUBMIT_PHRASES`] on purpose.** A sentence of its own is
+/// still a trailing rule, so it carries the false positive that list's doc
+/// describes; these four are the words that say *send* and nothing else.
+/// *"end"*, *"enter"*, *"finished"* and *"go ahead"* are ordinary closing words
+/// of a dictated sentence (*"…and stop at the end."*, *"Go ahead."* answering
+/// an agent's question), so they keep sending only as the whole utterance. A
+/// send phrase inside a sentence is never one: *"tell him to send it"* is
+/// typed.
+pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "press enter"];
+
+/// What enters the dictation mode (PRD #1260), said as the whole utterance.
+///
+/// **Whole-utterance equality only**, for the reason [`SUBMIT_PHRASES`] is:
+/// entering changes how every later utterance is treated, so it must never
+/// ground on words said in passing — *"type on the tester's prompt that the
+/// build is on"* is dictation, not a mode switch. Answered locally ahead of
+/// [`DICTATION_OPENERS`], because *"type on"* opens with the opener `type` and
+/// would otherwise type the word `on`. The cost is stated rather than hidden: a
+/// bare *"type on"* can no longer dictate the single word `on`; *"type the word
+/// on"* still can.
+pub const DICTATION_ON_PHRASES: [&str; 6] = [
+    "type on",
+    "typing on",
+    "start typing",
+    "dictation on",
+    "start dictation",
+    "keep typing",
+];
+
+/// What leaves the dictation mode, said as the whole utterance.
+///
+/// Live in the mode, and answered locally in `Idle` too — where it reports
+/// there was nothing to stop rather than typing the word `off`. An exit is only
+/// ever a whole utterance, which is what keeps a false positive from
+/// truncating somebody mid-sentence: *"we should stop typing the logs"* is
+/// typed.
+pub const DICTATION_OFF_PHRASES: [&str; 6] = [
+    "type off",
+    "typing off",
+    "stop typing",
+    "dictation off",
+    "stop dictation",
+    "done typing",
+];
+
+/// What turns voice off while the dictation mode is on, said as the whole
+/// utterance.
+///
+/// Outside the mode `voice_off` is the model's to answer, from its row's
+/// description; inside it nothing reaches the model, so the phrases that stay
+/// live have to be a list. The biggest stop is checked first — a future
+/// overlap with another list must not leave a live microphone after a user
+/// asked for it to stop.
+pub const VOICE_OFF_PHRASES: [&str; 8] = [
+    "voice off",
+    "turn off the voice",
+    "turn voice off",
+    "stop listening",
+    "stop voice control",
+    "stop voice",
+    "mute",
+    "mic off",
+];
 
 /// One transcript, reduced to the form the phrase lists are compared against.
 ///
@@ -338,6 +416,79 @@ mod tests {
         }
     }
 
+    /// Scenario: switching dictation on or off requires the entire utterance.
+    /// A phrase embedded in words to type must remain ordinary dictation.
+    #[test]
+    fn voice_dictation_mode_switches_match_only_whole_utterances() {
+        for phrase in [
+            "type on",
+            "typing on",
+            "start typing",
+            "dictation on",
+            "start dictation",
+            "keep typing",
+        ] {
+            assert!(
+                whole_utterance_is(phrase, &DICTATION_ON_PHRASES),
+                "{phrase}"
+            );
+            assert!(
+                !whole_utterance_is(&format!("{phrase} the tests"), &DICTATION_ON_PHRASES),
+                "{phrase}"
+            );
+        }
+        for phrase in [
+            "type off",
+            "typing off",
+            "stop typing",
+            "dictation off",
+            "stop dictation",
+            "done typing",
+        ] {
+            assert!(
+                whole_utterance_is(phrase, &DICTATION_OFF_PHRASES),
+                "{phrase}"
+            );
+            assert!(
+                !whole_utterance_is(
+                    &format!("we should {phrase} the logs"),
+                    &DICTATION_OFF_PHRASES
+                ),
+                "{phrase}"
+            );
+        }
+        assert!(!whole_utterance_is(
+            "type on the tester's prompt that the build is on",
+            &DICTATION_ON_PHRASES
+        ));
+        assert!(!whole_utterance_is(
+            "we should stop typing the logs to the file",
+            &DICTATION_OFF_PHRASES
+        ));
+    }
+
+    /// Scenario: all locally reserved mode and submit words have one meaning.
+    /// A newly shared phrase would make classification order determine an action.
+    #[test]
+    fn voice_dictation_reserved_phrase_lists_are_pairwise_disjoint() {
+        let lists: [(&str, &[&str]); 4] = [
+            ("dictation on", &DICTATION_ON_PHRASES),
+            ("dictation off", &DICTATION_OFF_PHRASES),
+            ("submit", &SUBMIT_PHRASES),
+            ("voice off", &VOICE_OFF_PHRASES),
+        ];
+        for (left_index, (left_name, left)) in lists.iter().enumerate() {
+            for (right_name, right) in lists.iter().skip(left_index + 1) {
+                for phrase in *left {
+                    assert!(
+                        !right.contains(phrase),
+                        "{phrase:?} is both {left_name} and {right_name}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn voice_dictation_no_opener_starts_another_row_s_own_trigger_phrase() {
         // The mechanical half of "unambiguous": a row's description offers its
@@ -345,7 +496,10 @@ mod tests {
         // opener. A row that started claiming `"type ..."` would make the fast
         // path steal utterances the model should have judged.
         for row in table().rows() {
-            if row.id == "dictate_to_agent" {
+            if matches!(
+                row.id.as_str(),
+                "dictate_to_agent" | "dictation_on" | "dictation_off"
+            ) {
                 continue;
             }
             for quoted in row.description.split('"').skip(1).step_by(2) {

@@ -271,34 +271,71 @@ describe("New agent dialog — closing (PRD #1223 U2)", () => {
 
 describe("New agent dialog — deck field (PRD #1223 M4)", () => {
   /**
-   * Scenario: open the flow over a fleet of four decks — one connected, one
-   * disconnected with its own message, one still waiting to report and one
-   * incompatible. Every deck is listed; the three that cannot take a spawn are
-   * disabled and each says why, and clicking one of them lists nothing.
+   * Scenario (PR #1451 round 3, change 6): open the flow over a fleet of four
+   * decks — one connected, one disconnected with its own message, one still
+   * waiting to report and one refused as older than this app. Only the
+   * connected deck is listed; the other three are not in the dialog at all,
+   * and none of their explanations or buttons appear in it.
    */
-  it("lists every deck and disables the ones that cannot take a spawn, with the reason", async () => {
+  it("lists only the decks that can take a spawn, with no explanation for the others", async () => {
     const runtime = fakeRuntime({
       fleet: [
         deck(LOCAL, { deckKind: "local" }),
         deck(REMOTE, { status: "disconnected", message: "ssh: connect to host build-box port 22: Connection refused" }),
         deck("deck-000000000000cccc", { status: "loading", pending: true }),
-        deck("deck-000000000000dddd", { status: "error", message: "Protocol handshake failed." }),
+        deck("deck-000000000000dddd", {
+          status: "error",
+          daemonDetected: true,
+          buildStampMismatchOnly: true,
+          message: "This daemon is older than this app. The app has not connected, because it could misread some of what this daemon reports. Update the daemon to this app's version.",
+        }),
       ],
     });
     renderDialog(runtime);
     await currentPath("/home/dev");
 
     const options = within(deckList()).getAllByRole("option");
-    expect(options).toHaveLength(4);
+    expect(options.map((option) => option.getAttribute("data-deck-id"))).toEqual([LOCAL]);
     expect(options[0]).not.toHaveAttribute("aria-disabled");
-    expect(options[1]).toHaveAttribute("aria-disabled", "true");
-    expect(options[1]).toHaveTextContent("Connection refused");
-    expect(options[2]).toHaveTextContent("This daemon has not reported yet.");
-    expect(options[3]).toHaveTextContent("Protocol handshake failed.");
-    fireEvent.click(options[1]);
-    expect(runtime.listDirectories).toHaveBeenCalledTimes(1);
+    const dialog = screen.getByTestId("new-agent-dialog");
+    expect(dialog.querySelector(".new-agent-row-reason")).toBeNull();
+    expect(dialog).not.toHaveTextContent(/older than this app|Connection refused|not reported yet|Update the daemon/);
+    expect(within(dialog).queryByRole("button", { name: /connect anyway|reconnect|replace daemon/i })).toBeNull();
     expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
-    expect(deckList().querySelector("[data-chosen='true']")).toHaveAttribute("data-deck-id", LOCAL);
+  });
+
+  /**
+   * Scenario (PR #1451 round 3, change 6): open the flow when no deck can take
+   * a spawn — one disconnected, one refused as older than this app. The deck
+   * field says so in one short line instead of an empty list, nothing is
+   * listed or asked for, and Start stays disabled.
+   */
+  it("says in one line that no deck can take a new agent, and offers no Start", async () => {
+    const runtime = fakeRuntime({
+      fleet: [
+        deck(LOCAL, { deckKind: "local", status: "disconnected" }),
+        deck(REMOTE, { status: "error", daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version." }),
+      ],
+    });
+    renderDialog(runtime);
+
+    const none = await screen.findByTestId("new-agent-no-deck");
+    expect(none).toHaveTextContent("No daemon can take a new agent now.");
+    expect(screen.queryByRole("option")).toBeNull();
+    expect(screen.getByTestId("new-agent-dialog")).not.toHaveTextContent(/older than this app|No daemon is configured/);
+    expect(screen.getByTestId("new-agent-start")).toBeDisabled();
+    expect(runtime.listDirectories).not.toHaveBeenCalled();
+    expect(runtime.newAgentOptions).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: a fleet with no deck at all still says that none is configured —
+   * the "none can take one" line is for decks that exist but cannot.
+   */
+  it("still says no deck is configured when the fleet has none", () => {
+    renderDialog(fakeRuntime({ fleet: [] }));
+
+    expect(screen.getByTestId("new-agent-no-deck")).toHaveTextContent("No daemon is configured.");
   });
 
   /**
@@ -330,11 +367,12 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
 
   /**
    * Scenario: two decks can take a spawn and a disconnected one sits between
-   * them. Nothing is preselected; `j` moves to the first eligible deck and
-   * again past the disconnected one to the second, and Enter chooses the daemon
-   * the cursor is on — moving the cursor alone chooses nothing.
+   * them in the fleet. Nothing is preselected; `j` moves to the first eligible
+   * deck and again to the second — the disconnected one is not listed — and
+   * Enter chooses the daemon the cursor is on; moving the cursor alone chooses
+   * nothing.
    */
-  it("preselects nothing between two eligible decks and moves over disabled ones", async () => {
+  it("preselects nothing between two eligible decks and moves between them", async () => {
     const third = "deck-000000000000eeee";
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { status: "disconnected" }), deck(third)] });
     renderDialog(runtime);
@@ -350,6 +388,29 @@ describe("New agent dialog — deck field (PRD #1223 M4)", () => {
     await currentPath("/home/dev");
     expect(runtime.listDirectories).toHaveBeenCalledWith(third, undefined);
     await waitFor(() => expect(directoryList()).toHaveFocus());
+  });
+
+  /**
+   * Scenario: while the daemon field is focused, its highlighted remote daemon
+   * disconnects and disappears from the usable list. The highlight moves to
+   * the remaining visible daemon, and Enter chooses that daemon's directory.
+   */
+  it("moves the highlight to a visible daemon when the highlighted one disconnects", async () => {
+    const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE)] });
+    const { rerenderWith } = renderDialog(runtime);
+    await waitFor(() => expect(deckList()).toHaveFocus());
+    fireEvent.keyDown(deckList(), { key: "j" });
+    fireEvent.keyDown(deckList(), { key: "ArrowDown" });
+    expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", REMOTE);
+
+    rerenderWith({ ...runtime, fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { status: "disconnected" })] });
+    expect(within(deckList()).getAllByRole("option")).toHaveLength(1);
+    await waitFor(() => expect(deckList().querySelector("[aria-selected='true']")).toHaveAttribute("data-deck-id", LOCAL));
+    fireEvent.keyDown(deckList(), { key: "Enter" });
+
+    await currentPath("/home/dev");
+    expect(runtime.listDirectories).toHaveBeenCalledWith(LOCAL, undefined);
+    expect(runtime.listDirectories).not.toHaveBeenCalledWith(REMOTE, undefined);
   });
 });
 
@@ -1042,21 +1103,20 @@ describe("New agent dialog — a daemon that leaves mid-flow (PRD #1223 M4)", ()
 
 describe("New agent dialog — older decks (PRD #1223 M5)", () => {
   /**
-   * Scenario (PRD #1223 U1): a connected deck that does not advertise the
-   * listing verb carries the crate's `newAgentReason`. It is listed disabled
-   * with that reason, is not chosen even when the flow was opened from it —
-   * the one eligible deck is — and neither a click nor the keys choose it.
+   * Scenario (PRD #1223 U1, PR #1451 round 3): a connected deck that does not
+   * advertise the listing verb carries the crate's `newAgentReason`, so it
+   * cannot take a spawn. It is not listed — nor is its reason shown — and is
+   * not chosen even when the flow was opened from it: the one eligible deck
+   * is, and the keys only move among listed decks.
    */
-  it("disables a daemon without the listing verb in the daemon field, with the crate's reason", async () => {
+  it("leaves a daemon without the listing verb out of the daemon field", async () => {
     const reason = "This deck does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
     const runtime = fakeRuntime({ fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { newAgentReason: reason })] });
     renderDialog(runtime, { initialDeckId: REMOTE });
 
     const options = within(deckList()).getAllByRole("option");
-    expect(options[1]).toHaveAttribute("aria-disabled", "true");
-    expect(options[1]).toHaveTextContent(reason);
-    expect(options[1]).toHaveAttribute("aria-selected", "false");
-    fireEvent.click(options[1]);
+    expect(options.map((option) => option.getAttribute("data-deck-id"))).toEqual([LOCAL]);
+    expect(screen.getByTestId("new-agent-dialog")).not.toHaveTextContent("list-directories");
     fireEvent.keyDown(deckList(), { key: "j" });
     fireEvent.keyDown(deckList(), { key: "Enter" });
     // The local deck, the only eligible one, is what the field chose on open.

@@ -387,11 +387,11 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No daemon is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
   });
 
   /**
@@ -408,7 +408,54 @@ describe("TauriDeckBridge", () => {
     const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
     bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
     await bridge.resolveVoice("switch deck to the new box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null });
+  });
+
+  /**
+   * Scenario (PRD #1260): the dictation mode's target declared with an
+   * utterance travels to `desktop_voice_resolve` as `dictation`, which is what
+   * keeps that utterance off the Commands backend; the next declaration made
+   * without one sends `null` again, so the mode never outlives the panel's own
+   * state.
+   */
+  it("sends the declared dictation target with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const dictation = { deckId: "deck-local", agentId: "coder" };
+    bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, dictation);
+    await bridge.resolveVoice("run the tests");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation });
+
+    bridge.declareVoiceScreen("agent");
+    await bridge.resolveVoice("type on");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
+  });
+
+  /**
+   * Scenario (PRD #1261): answering a numbered choice sends the utterance, the
+   * row it completes and the offered list to `desktop_voice_choice` with the
+   * declaration last stated — and hands back the OFFERED entry Rust selected,
+   * so the deck identity keeps the keys it was given on the way in.
+   */
+  it("answers a numbered choice through desktop_voice_choice", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const offered = [
+      { name: "agent", kind: "agent_ref", spoken: "atlas", value: "atlas-a", label: "Atlas" },
+      { name: "agent", kind: "agent_ref", spoken: "atlas", value: "atlas-b", label: "Atlas" },
+    ];
+    invoke.mockResolvedValue({ kind: "selected", candidate: { ...offered[1] } });
+
+    bridge.declareVoiceScreen("overview");
+    const answer = await bridge.answerVoiceChoice("two", "open_agent", offered);
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_choice", { utterance: "two", action: "open_agent", offered, directories: null, newAgent: null, deckStep: null, endpoints: null });
+    expect(answer).toEqual({ kind: "selected", candidate: offered[1] });
+    expect(answer.kind === "selected" && answer.candidate).toBe(offered[1]);
+
+    invoke.mockResolvedValue({ kind: "not_answer" });
+    expect(await bridge.answerVoiceChoice("open the tester", "open_agent", offered)).toEqual({ kind: "not_answer" });
   });
 
   /**
@@ -926,13 +973,33 @@ describe("TauriDeckBridge", () => {
     stampOnly.connection.daemonBuildVersion = "v0.39.0";
     stampOnly.connection.buildStampMismatchOnly = true;
     delete stampOnly.connection.error;
-    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0.");
+    const stampMapped = mapDesktopSnapshot(stampOnly).connection;
+    // In the user's terms (CLAUDE.md rule 21); the builds go to the disclosure.
+    expect(stampMapped.message).toContain("could misread some of what this daemon reports");
+    expect(stampMapped.message).not.toMatch(/mismatch|protocol|v0\.3/i);
+    expect(stampMapped.detail).toContain("Builds: app v0.38.0-50-gf118e99, daemon v0.39.0.");
 
     const protocolMismatch = structuredClone(snapshot);
     protocolMismatch.connection.status = "incompatible";
     protocolMismatch.connection.serverProtocolVersion = 7;
     delete protocolMismatch.connection.error;
-    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, daemon v7");
+    const protocolMapped = mapDesktopSnapshot(protocolMismatch).connection;
+    expect(protocolMapped.message).toContain("cannot work together");
+    expect(protocolMapped.message).not.toMatch(/mismatch|protocol|\d/i);
+    expect(protocolMapped.detail).toContain("Protocol: app 6, daemon 7.");
+  });
+
+  /** Scenario: Carries the crate's technical detail beside its sentence, and only beside its own sentence. */
+  it("carries the crate's technical detail beside its sentence", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const refused = structuredClone(snapshot);
+    refused.connection.status = "incompatible";
+    refused.connection.error = "This daemon is older than this app.";
+    refused.connection.errorDetail = "The daemon lacks these declared compatibility breaks: 505-x.";
+    expect(mapDesktopSnapshot(refused).connection.detail).toBe("The daemon lacks these declared compatibility breaks: 505-x.");
+
+    const healthy = structuredClone(snapshot);
+    expect(mapDesktopSnapshot(healthy).connection.detail).toBeUndefined();
   });
 
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {

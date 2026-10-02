@@ -821,12 +821,14 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives.
+/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives. The test runs as it would from inside a developer's deck pane — with that deck's endpoints in its environment, stood in for by a decoy — and nothing it spawns may reach that deck: the user saw this test's `worker-pane` appear on their real dashboard (PR #1451).
 #[spec("orchestration/delegate/007")]
 #[test]
 #[cfg(unix)]
 fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let real_deck = DecoyDeck::bind();
+    let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
         (
             DELEGATE_READINESS_BUFFER_ENV,
@@ -842,6 +844,79 @@ fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
         .build()
         .expect("build wrapper readiness runtime")
         .block_on(delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inner());
+    real_deck.assert_untouched("delegate_007");
+}
+
+/// The deck a developer runs this suite from, stood in for: a hook and an
+/// attach socket that nothing in a test may ever reach. [`DecoyDeck::ambient`]
+/// puts it where the developer's pane puts the real one — in
+/// `DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, and as the default
+/// endpoint under `XDG_RUNTIME_DIR` that a child with its endpoint scrubbed
+/// falls back to.
+#[cfg(unix)]
+struct DecoyDeck {
+    dir: tempfile::TempDir,
+    listeners: Vec<std::os::unix::net::UnixListener>,
+}
+
+#[cfg(unix)]
+impl DecoyDeck {
+    fn bind() -> Self {
+        let dir = common::race_safe_tempdir();
+        let listeners = ["dot-agent-deck.sock", "dot-agent-deck-attach.sock"]
+            .into_iter()
+            .map(|name| {
+                let listener = std::os::unix::net::UnixListener::bind(dir.path().join(name))
+                    .expect("bind decoy deck endpoint");
+                listener
+                    .set_nonblocking(true)
+                    .expect("decoy deck endpoint non-blocking");
+                listener
+            })
+            .collect();
+        Self { dir, listeners }
+    }
+
+    fn ambient(&self) -> EnvGuard {
+        let runtime = self.dir.path().display().to_string();
+        let hook = self
+            .dir
+            .path()
+            .join("dot-agent-deck.sock")
+            .display()
+            .to_string();
+        let attach = self
+            .dir
+            .path()
+            .join("dot-agent-deck-attach.sock")
+            .display()
+            .to_string();
+        EnvGuard::set(&[
+            ("XDG_RUNTIME_DIR", &runtime),
+            ("DOT_AGENT_DECK_SOCKET", &hook),
+            ("DOT_AGENT_DECK_ATTACH_SOCKET", &attach),
+        ])
+    }
+
+    /// Fails with what reached the decoy, if anything did.
+    fn assert_untouched(&self, test: &str) {
+        use std::io::Read;
+        let mut reached = Vec::new();
+        for listener in &self.listeners {
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .expect("decoy read timeout");
+                let mut frame = Vec::new();
+                let _ = stream.read_to_end(&mut frame);
+                reached.push(String::from_utf8_lossy(&frame).into_owned());
+            }
+        }
+        assert!(
+            reached.is_empty(),
+            "{test}: something it spawned reached the developer's real deck, which would paint a ghost card there: {reached:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -2444,12 +2519,18 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, and does reach it once the 5000 ms interface buffer measured from the strong fact has passed.
+/// Scenario: Delegate with `clear = true` to a worker the deck respawns as a wrapped Codex, on a paused clock. The worker's wrapper reports only its weak output-settled fact, so the delegate gate holds it for the whole 30 s upgrade window and then releases on it with the ordinary 1000 ms buffer; 300 ms into that buffer the strong raw-input fact arrives. Assert the pointer has NOT reached the worker when the ordinary buffer would have ended, does reach it once the 5000 ms interface buffer measured from the strong fact has passed, and that the wrapped worker never reaches the decoy deck standing in for the developer's own.
 #[spec("orchestration/delegate/039")]
 #[test]
 #[cfg(unix)]
 fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Run as a developer runs it, from inside a deck pane with that deck's
+    // endpoints in the environment: this test's wrapped worker reached the
+    // real deck that way and showed up as a `worker-pane` ghost card on the
+    // user's dashboard (PR #1451).
+    let real_deck = DecoyDeck::bind();
+    let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
@@ -2465,6 +2546,7 @@ fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() 
         .block_on(
             delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight_inner(),
         );
+    real_deck.assert_untouched("delegate_039");
 }
 
 #[cfg(unix)]
@@ -2476,13 +2558,15 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
     // A cooked-mode `cat` named `codex`, so the respawn resolves it to a
     // Wrapper-strategy agent and runs it under a REAL `dot-agent-deck wrap` —
     // which is what makes the pane a wrapper host in the deck's own launch
-    // record. This registry has no hook socket, so nothing the wrapper reports
-    // reaches THIS test, and the two interface facts below are the test's to
-    // place in time. It does still report: with no endpoint in its environment
-    // it resolves the platform default and posts a fork-time `SessionStart`
-    // there. Until issue #1473 that default was the developer's live deck —
-    // the ghost "Codex" card — and it now lands on the harness's redirected,
-    // listener-less `XDG_RUNTIME_DIR` (`common::detach_before_main`).
+    // record. This registry has no hook socket, so the registry hands that
+    // wrapper an endpoint that leads nowhere and the two interface facts below
+    // are the test's to place in time. The wrapper does still report — a
+    // fork-time `SessionStart` — and before PR #1451 the registry handed it NO
+    // endpoint, so it resolved the platform default: the developer's live deck,
+    // as a ghost "Codex" `worker-pane` card. Issue #1473 separately redirects
+    // that default for the whole test process (`common::detach_before_main`);
+    // `DecoyDeck::ambient` puts a live-looking `XDG_RUNTIME_DIR` back on top of
+    // that redirect, so this test still proves the registry's own pin holds.
     // `app-server` is the hook-listing probe; see `scheduler/spawn/010`.
     write_executable(
         &bin_dir.join("codex"),

@@ -44,14 +44,15 @@ A field whose value the app refuses (a character ssh would misread, a key path t
 
 ## Test connection
 
-**Test connection** checks the chosen daemon and says what it found in one sentence, with a command to run when there is one. It works for **This machine** and for each remote daemon; **All daemons** has nothing to test, so choose one daemon first.
+**Test connection** checks the chosen daemon and says what it found in one sentence, with a command to run when there is one. A line under the sentence can carry the exact versions or the error behind it, which is what to include in a bug report. It works for **This machine** and for each remote daemon; **All daemons** has nothing to test, so choose one daemon first.
 
 | Result | What to do |
 | --- | --- |
 | `<daemon> answered and is compatible with this app.` | Nothing: the daemon is ready. |
-| `<daemon> answered; a declared compatibility break sits between the two builds.` | Run the same release on the host as the app. The Dashboard offers **Connect anyway** for this case. |
-| `<daemon> speaks a different protocol version.` | Run the same release on the host as the app. Nothing overrides this. |
-| `<daemon> refused the connection.` | Read the reason the test shows; usually a daemon from another release. |
+| `This daemon is older than this app. The app has not connected, because it could misread …` (or `This app is older than the daemon. …`) | Update the older of the two so both run the same version. Until then the Dashboard offers **Connect anyway**, which uses the daemon as it is until you quit the app. |
+| `This daemon is older than this app, and the two cannot work together.` (or `This app is older than the daemon, …`) | Update the older of the two so both run the same version. Nothing overrides this. |
+| `This daemon and this app are different versions. …` | Each has changes the other lacks, which usually means two development builds. Run the same version of both. |
+| `The daemon turned this app away.` | Test again in a moment. If it keeps happening, restart the daemon on its host. |
 | `The ssh connection to <daemon> works, but nothing is listening on its daemon socket over there.` | Start a daemon on the host (below), then test again. |
 | `No daemon answered at <daemon>. Start Agent Deck on this machine, then test again.` | For **This machine**: start a daemon here, for example with `dot-agent-deck`. |
 | `This machine has not verified <daemon>'s host key.` | Run the `ssh` command shown under it once in a terminal, accept the key, then test again. |

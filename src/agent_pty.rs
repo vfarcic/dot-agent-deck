@@ -73,6 +73,31 @@ pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 /// A caller-supplied value always wins — the injection only fills the gap.
 pub const DOT_AGENT_DECK_SOCKET: &str = "DOT_AGENT_DECK_SOCKET";
 
+/// The endpoint a child is handed when there is no deck for it to report to:
+/// a registry with no hook socket of its own (only tests build one — the
+/// daemon sets its socket before it serves) and a caller that pinned none.
+///
+/// **Scrubbing the variable is not "no endpoint"**, and that false belief is
+/// how a test's agent reached a developer's live deck twice. Every hook client
+/// resolves a MISSING `DOT_AGENT_DECK_SOCKET` to the default
+/// `$XDG_RUNTIME_DIR/dot-agent-deck.sock`, which on a developer's machine is
+/// their real daemon — so `orchestration/delegate/039`'s wrapped worker posted
+/// its `SessionStart` there and painted a `worker-pane` ghost card with a
+/// `.tmpXXXXXX` working directory on the user's dashboard (PR #1451). A path
+/// under `/dev/null` can never be bound or connected, so a child given it
+/// emits nowhere, which is what the scrub always meant to achieve.
+#[cfg(unix)]
+pub const UNREACHABLE_HOOK_SOCKET: &str = "/dev/null/dot-agent-deck-no-deck.sock";
+/// [`UNREACHABLE_HOOK_SOCKET`]'s attach counterpart: `daemon stop` and
+/// `daemon status` speak the attach endpoint, so a child of a socketless
+/// registry must not fall back to the developer's control plane either.
+#[cfg(unix)]
+pub const UNREACHABLE_ATTACH_SOCKET: &str = "/dev/null/dot-agent-deck-no-deck-attach.sock";
+#[cfg(windows)]
+pub const UNREACHABLE_HOOK_SOCKET: &str = r"\\.\pipe\dot-agent-deck-no-deck-hook";
+#[cfg(windows)]
+pub const UNREACHABLE_ATTACH_SOCKET: &str = r"\\.\pipe\dot-agent-deck-no-deck-attach";
+
 /// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
 /// `daemon serve` captures its parent pid at startup and gracefully exits once
 /// it is orphaned (parent becomes `init`/pid 1, or otherwise changes). OFF by
@@ -1791,8 +1816,15 @@ fn spawn_with_dir(
     // pin their own (tests, `respawn_agent_for_pane` replaying `spawn_env`)
     // pass it through `opts.env`. What changes is only the *unpinned* case,
     // which goes from "silently addresses whichever daemon happens to be in
-    // the ambient environment" to "no endpoint" — a child that emits nowhere
-    // rather than into a stranger's deck.
+    // the ambient environment" to "no endpoint in the environment".
+    //
+    // **That is not "emits nowhere", and this comment used to say it was.** A
+    // child with no `DOT_AGENT_DECK_SOCKET` resolves the DEFAULT endpoint under
+    // `XDG_RUNTIME_DIR`, which on a developer's machine is the live daemon, so
+    // the 2026-07-29 leak came back through it on 2026-09-28 (PR #1451). A
+    // socketless registry therefore hands its children
+    // [`UNREACHABLE_HOOK_SOCKET`] / [`UNREACHABLE_ATTACH_SOCKET`] in
+    // `spawn_agent`; this scrub alone only removes the *inherited* value.
     //
     // `DOT_AGENT_DECK_STATE_DIR` is deliberately NOT scrubbed: no agent-side
     // flow reads it (the CLI paths agents invoke — `delegate`, `work-done` —
@@ -8462,12 +8494,29 @@ impl AgentPtyRegistry {
         // A caller-supplied value wins (tests pin their own socket, and
         // `respawn_agent_for_pane` replays a `spawn_env` that already carries
         // ours), so this only fills the gap.
+        let registry_socket = self.hook_socket.lock().unwrap().clone();
         if !opts.env.iter().any(|(k, _)| k == DOT_AGENT_DECK_SOCKET)
-            && let Some(sock) = self.hook_socket.lock().unwrap().clone()
+            && let Some(sock) = registry_socket.as_ref()
             && let Some(sock) = sock.to_str()
         {
             opts.env
                 .push((DOT_AGENT_DECK_SOCKET.to_string(), sock.to_string()));
+        }
+        // A registry with no socket of its own is not part of any running deck
+        // — only tests build one — so its children get endpoints that lead
+        // nowhere rather than the default ones, which are the developer's live
+        // daemon (see [`UNREACHABLE_HOOK_SOCKET`]). Caller-pinned values still
+        // win, and a daemon's registry is untouched: its children keep reaching
+        // their own attach endpoint through the default, as they always have.
+        if registry_socket.is_none() {
+            for (key, unreachable) in [
+                (DOT_AGENT_DECK_SOCKET, UNREACHABLE_HOOK_SOCKET),
+                ("DOT_AGENT_DECK_ATTACH_SOCKET", UNREACHABLE_ATTACH_SOCKET),
+            ] {
+                if !opts.env.iter().any(|(k, _)| k == key) {
+                    opts.env.push((key.to_string(), unreachable.to_string()));
+                }
+            }
         }
 
         // M2.11: capture display_name and cwd into the registry so renamed
@@ -17632,6 +17681,62 @@ mod spawn_tests {
             "the child must be handed the daemon's own hook socket, not left to \
              re-resolve one from inherited environment at emit time"
         );
+    }
+
+    /// What a child of `registry` sees as its hook and attach endpoints, as
+    /// `hook|attach`, `<unset>` for either one absent.
+    fn child_observed_endpoints(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("endpoints.txt");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s|%s\" \"${{DOT_AGENT_DECK_SOCKET:-<unset>}}\" \"${{DOT_AGENT_DECK_ATTACH_SOCKET:-<unset>}}\" > {}'",
+                    out.display()
+                )),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its endpoints");
+    }
+
+    /// Scenario: PR #1451's ghost card — a registry with no hook socket (only
+    /// tests build one) spawns a child. The child is handed endpoints that lead
+    /// nowhere, for hooks and for attach, rather than being left to fall back
+    /// to the default ones under `XDG_RUNTIME_DIR`, which on a developer's
+    /// machine are their live deck.
+    #[test]
+    fn spawn_agent_from_a_socketless_registry_points_the_child_nowhere() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let observed = child_observed_endpoints(&registry, "pane-socketless");
+        registry.shutdown_all();
+        assert_eq!(
+            observed,
+            format!("{UNREACHABLE_HOOK_SOCKET}|{UNREACHABLE_ATTACH_SOCKET}"),
+            "a socketless registry's child must not be left to resolve the default \
+             endpoints — they are the developer's live deck"
+        );
+    }
+
+    /// The control: a daemon's registry is unchanged by the above. Its child
+    /// gets the daemon's own hook socket, and NO attach override, so it keeps
+    /// reaching its own daemon's attach endpoint through the default.
+    #[test]
+    fn spawn_agent_from_a_daemon_registry_leaves_the_attach_endpoint_alone() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_endpoints(&registry, "pane-daemon");
+        registry.shutdown_all();
+        assert_eq!(observed, "/tmp/dad-test-daemon.sock|<unset>");
     }
 
     #[test]

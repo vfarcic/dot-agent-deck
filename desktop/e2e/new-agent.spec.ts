@@ -22,8 +22,9 @@ const REMOTE_DECK = "dev@build-box";
 test.describe("the New agent flow", () => {
   /**
    * Scenario: on the four-deck fleet, click New agent in the overview's top
-   * bar. The unreachable and pending decks are listed disabled; choose the
-   * remote deck. Its home lists a project directory and an ordinary one; move
+   * bar. Only the two connected decks are listed — the unreachable and
+   * pending ones cannot take a new agent, so the dialog leaves them out
+   * (PR #1451 round 3) — and choose the remote deck. Its home lists a project directory and an ordinary one; move
    * to the ordinary one with `j`, enter it with Enter, and use it with Space.
    * The form names the agent after the directory and prefills the daemon's
    * configured command; Start opens the new agent's pane over the overview.
@@ -40,8 +41,9 @@ test.describe("the New agent flow", () => {
     await expect(page.getByTestId("new-agent-name")).toBeDisabled();
     await expect(page.getByTestId("new-agent-start")).toBeDisabled();
     const decks = page.getByTestId("new-agent-deck-list").getByRole("option");
-    await expect(decks).toHaveCount(4);
-    await expect(decks.and(page.locator("[aria-disabled='true']"))).toHaveCount(2);
+    await expect(decks).toHaveCount(2);
+    await expect(decks.and(page.locator("[aria-disabled='true']"))).toHaveCount(0);
+    await expect(dialog).not.toContainText("No daemon is listening");
 
     await page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`).click();
 
@@ -324,31 +326,57 @@ test.describe("the New agent flow", () => {
   });
 
   /**
-   * Scenario (PRD #1223 U1): with the remote deck playing a daemon from before
-   * PRD #1223, it has no directory listing, and browsing is the only way the
-   * flow chooses a directory. Its header offers no New agent; opened from the
-   * top bar, the daemon field lists it disabled with the daemon's reason, and
-   * clicking it chooses nothing. The local deck — the one eligible deck, so
-   * chosen on open — still lists its home.
+   * Scenario (PRD #1223 U1, PR #1451 round 3): with the remote deck playing a
+   * daemon from before PRD #1223, it has no directory listing, and browsing is
+   * the only way the flow chooses a directory. Its header offers no New agent;
+   * opened from the top bar, the daemon field does not list it at all, nor
+   * shows its reason. The local deck — the one eligible deck, so chosen on
+   * open — still lists its home.
    */
-  test("disables a daemon without the listing verb in the daemon field", async ({ page }) => {
+  test("leaves a daemon without the listing verb out of the daemon field", async ({ page }) => {
     await page.goto(`/?fixture=1&state=fleet&older=${encodeURIComponent(REMOTE_DECK)}`);
     await page.getByTestId("open-overview").click();
     await expect(page.locator(`[data-testid="daemon-group"][data-daemon-id="${REMOTE_DECK}"]`).getByTestId("daemon-new-agent")).toHaveCount(0);
 
     await page.getByTestId("overview-new-agent").click();
     const dialog = page.getByTestId("new-agent-dialog");
-    const remote = page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`);
-    await expect(remote).toHaveAttribute("aria-disabled", "true");
-    await expect(remote).toContainText("does not advertise list-directories");
-    // Playwright will not click an `aria-disabled` element, which is the point;
-    // the click is dispatched to prove the row itself ignores it too.
-    await remote.dispatchEvent("click");
-    await expect(dialog).toBeVisible();
-    await expect(remote).not.toHaveAttribute("data-chosen", "true");
-    await expect(page.getByTestId("new-agent-deck-list").locator("[data-chosen='true']")).toHaveCount(1);
     await expect(page.getByTestId("new-agent-directory-list")).toBeFocused();
+    await expect(page.getByTestId("new-agent-deck-list").locator(`[data-deck-id="${REMOTE_DECK}"]`)).toHaveCount(0);
+    await expect(page.getByTestId("new-agent-deck-list").getByRole("option")).toHaveCount(1);
+    await expect(dialog).not.toContainText("too old to let this app browse its folders");
+    await expect(page.getByTestId("new-agent-deck-list").locator("[data-chosen='true']")).toHaveCount(1);
     await expect(page.getByTestId("new-agent-path")).toHaveCount(0);
+  });
+
+  /**
+   * Scenario (PR #1451 round 3, change 6): the only daemon is older than this
+   * app, so the app refused it. The overview shows it with its full
+   * explanation and buttons. Open New agent: the daemon field says in one
+   * line that no daemon can take a new agent — no list, none of the
+   * explanation, none of its buttons — and Start stays disabled. Close it and
+   * the overview's explanation is still there.
+   */
+  test("shows no unusable daemon in the dialog, only a line saying none can take one", async ({ page }) => {
+    await page.goto("/?fixture=1&state=error");
+    // Not `selectOverview`: it waits for an agent table, and a refused daemon
+    // has none — its group is the explanation instead.
+    await page.getByTestId("open-overview").click();
+    const note = page.getByTestId("overview-incompatible");
+    await expect(note).toContainText("This daemon is older than this app");
+    await expect(note.getByRole("button", { name: "Reconnect" })).toBeVisible();
+
+    await page.getByTestId("overview-new-agent").click();
+    const dialog = page.getByTestId("new-agent-dialog");
+    await expect(page.getByTestId("new-agent-no-deck")).toHaveText("No daemon can take a new agent now.");
+    await expect(dialog.getByRole("option")).toHaveCount(0);
+    await expect(dialog).not.toContainText("older than this app");
+    await expect(dialog.getByRole("button", { name: /reconnect|connect anyway|replace daemon/i })).toHaveCount(0);
+    await expect(page.getByTestId("new-agent-start")).toBeDisabled();
+
+    await page.getByRole("button", { name: "Close new agent" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(note).toContainText("This daemon is older than this app");
+    await expect(note.getByRole("button", { name: "Reconnect" })).toBeVisible();
   });
 
   /**

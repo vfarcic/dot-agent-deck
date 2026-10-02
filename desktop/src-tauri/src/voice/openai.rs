@@ -308,14 +308,21 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
+                "next_page",
+                "previous_page",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "set_new_agent_command",
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
@@ -388,6 +395,10 @@ mod tests {
             json!(["string", "null"])
         );
         assert_eq!(
+            schema["properties"]["params"]["properties"]["text"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
             schema["properties"]["params"]["required"],
             // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
             // which sits above the dictation pair in the table.
@@ -396,8 +407,10 @@ mod tests {
                 "deck",
                 "prefix",
                 "dir",
+                "text",
                 "mode",
                 "agent_type",
+                "command",
                 "orchestration"
             ])
         );

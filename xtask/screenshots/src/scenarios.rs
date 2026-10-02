@@ -112,6 +112,26 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-typing-mode",
+        description: "The desktop agent pane with voice typing mode on: the pane's Typing to marker, the voice row's reminder and its Stop typing button.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "voice-choice",
+        description: "The desktop dashboard with the numbered voice choice open: a dialog centred over the screen offering two agents as a numbered list, with its countdown and Cancel, and the voice row below saying what was heard.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "voice-numbers",
+        description: "The desktop agent dashboard with voice on: a number before each agent row, one sequence across the daemons, ready to be said or pressed.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
+        name: "voice-pages",
+        description: "The desktop New agent dialog with voice on over a long directory: the directories fill the dialog as numbered columns, one page at a time, with the page marker beside the Directory heading.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "schedules",
         description: "The TUI Schedules manager with one configured task.",
         clients: &[Client::Tui],

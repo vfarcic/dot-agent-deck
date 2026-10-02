@@ -41,9 +41,13 @@
 //! are what the panel will call.
 
 pub mod capture;
+pub mod choice;
+mod command_text;
 pub mod dictation;
+mod filter;
 pub mod hold;
 pub mod http;
+pub mod numbers;
 pub mod openai;
 pub mod outcome;
 pub mod prompt;
@@ -53,6 +57,10 @@ pub mod schema;
 pub mod table;
 pub mod transcribe;
 pub mod wake;
+
+#[cfg(test)]
+#[path = "choice_tests.rs"]
+mod choice_tests;
 
 use std::fmt;
 
@@ -91,8 +99,10 @@ pub struct VoiceDeck {
     pub address: Option<String>,
     /// Whether it is the local endpoint.
     pub local: bool,
-    /// Why this deck cannot take a new agent, in the words the New agent
-    /// dialog's deck step shows beside it — or `None` when it can.
+    /// Why this deck cannot take a new agent, as the short reason class the
+    /// webview declares for it ("it is not connected") — or `None` when it
+    /// can. The New agent dialog does not list such a deck (PR #1451 round 3),
+    /// so this short class is what voice names it with there.
     ///
     /// **Taken from the webview's [`VoiceDeckChoice`] declaration**, the one
     /// piece of a deck that is not read here: the dialog decides what to
@@ -112,10 +122,11 @@ impl VoiceDeck {
     }
 }
 
-/// One row of the New agent dialog's deck step, as the webview DECLARED it
+/// One deck of the New agent dialog's deck step, as the webview DECLARED it
 /// with an utterance (PRD #1223): a deck id and, for a deck that cannot take a
-/// spawn, the reason the step shows beside it (`deckChoices` in
-/// `desktop/src/lib/newAgent.ts`).
+/// spawn, its short reason class (`deckChoices` in
+/// `desktop/src/lib/newAgent.ts`). Every deck in the webview's fleet is
+/// declared, the ones the dialog does not list included (PR #1451 round 3).
 ///
 /// # It comes from the webview, and only annotates [`VoiceDeck`]
 ///
@@ -134,23 +145,28 @@ impl VoiceDeck {
 pub struct VoiceDeckChoice {
     /// The wire `deckId`.
     pub deck_id: String,
-    /// Why it cannot take a new agent, as display text; absent when it can.
+    /// Why it cannot take a new agent, as a short reason class ("it is not
+    /// connected"); absent when it can.
     #[serde(default)]
     pub reason: Option<String>,
 }
 
-/// What a deck the fleet observes but the deck step does not list says about
-/// itself: `DECK_STATE_FALLBACK.pending` in `desktop/src/lib/newAgent.ts`,
+/// The short reason class for a deck the fleet observes but the webview did
+/// not declare: `DECK_SHORT_REASON.pending` in `desktop/src/lib/newAgent.ts`,
 /// because a deck the webview's fleet has no entry for is one that has not
 /// reported to it yet.
-pub const DECK_NOT_REPORTED: &str = "This daemon has not reported yet.";
+pub const DECK_NOT_REPORTED: &str = "it has not reported yet";
 
 /// What a deck the Deck selector lists but the app is not connected to says
 /// about itself (PRD #1195 M3). Under a single-deck selection that is every
 /// deck but the one shown, and the New agent dialog does not list them: a new
 /// agent starts on a deck the app is talking to, so the way to one is to
 /// switch to it first — which is what the sentence says.
-pub const DECK_NOT_CONNECTED: &str = "The app is not connected to this daemon; switch to it first.";
+pub const DECK_NOT_CONNECTED: &str = "the app is not connected to it; switch to it first";
+
+/// The short reason class for a deck the Deck selector lists with no address
+/// yet — `DECK_SHORT_REASON.unconfigured` in `desktop/src/lib/newAgent.ts`.
+pub const DECK_NO_ADDRESS: &str = "it has no address yet";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken
@@ -184,8 +200,39 @@ pub struct VoiceDirectories {
     /// Whether the listing has a parent, i.e. whether `..` is on screen.
     pub has_parent: bool,
     /// The children on screen, in the order the browser shows them — after
-    /// the filter, because a spoken name means one the user can see.
+    /// the filter, because a spoken name means one the user can see. While
+    /// the listing is split into pages (voice on, more children than fit),
+    /// these are the CURRENT page's only.
     pub entries: Vec<VoiceDirectoryEntry>,
+    /// The listing's pages, present only while it is split into them (PR
+    /// #1451 round 3, change 4): which page is showing and the children on the
+    /// others, so a name said for one of those is refused with the page it is
+    /// on rather than as a name nothing matches.
+    #[serde(default)]
+    pub paging: Option<VoicePaging>,
+}
+
+/// A list split into pages while voice is on (PR #1451 round 3, change 4),
+/// as the webview declared it: the page showing, and every item on another
+/// page. Voice acts only on what is on screen, so an item here is never
+/// resolved — it is named back with its page ([`VoiceOffPage`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoicePaging {
+    /// The page showing, counted from 1.
+    pub page: u32,
+    /// The items on every other page, in list order.
+    pub elsewhere: Vec<VoiceOffPage>,
+}
+
+/// One item of a paged list that is not on the page showing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceOffPage {
+    /// The name the list renders for it, which is what a user says.
+    pub name: String,
+    /// The page it is on, counted from 1.
+    pub page: u32,
 }
 
 /// One child directory on screen.
@@ -247,6 +294,27 @@ pub struct VoiceNewAgentForm {
     /// measured substituting `schedule` for "schedule issues").
     #[serde(default)]
     pub withheld_modes: Vec<VoiceChoice>,
+    /// The Mode row's pages, present only while it is split into them (PR
+    /// #1451 round 3, change 4); `modes` is then the page showing. See
+    /// [`VoicePaging`].
+    #[serde(default)]
+    pub mode_paging: Option<VoicePaging>,
+}
+
+/// The agent the voice panel is in the dictation mode for (PRD #1260), declared
+/// with each utterance while the mode is on and absent otherwise.
+///
+/// The Rust side keeps no memory between utterances, so the mode travels in the
+/// declaration exactly as the New agent dialog's state does. Its presence is
+/// the whole signal: an utterance declared with one is classified locally
+/// against the reserved phrases and otherwise typed whole, and nothing reaches
+/// the Commands backend. The composite `{deck_id, agent_id}` rather than a bare
+/// agent id, because an agent id is only unique within its deck.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceDictationTarget {
+    pub deck_id: String,
+    pub agent_id: String,
 }
 
 /// One entry of a closed set on screen: the id the dialog selects by, and the
@@ -257,7 +325,10 @@ pub struct VoiceChoice {
     pub id: String,
     pub label: String,
 }
-pub use dictation::{DICTATION_OPENERS, SUBMIT_PHRASES};
+pub use dictation::{
+    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
+    VOICE_OFF_PHRASES,
+};
 
 pub use capture::{
     AudioFormat, AudioSource, AudioStream, Capture, CaptureError, CaptureSession, CaptureState,
@@ -265,12 +336,13 @@ pub use capture::{
     SILENCE_HOLD, SILENCE_RMS, SPEECH_MARGIN, SPEECH_WINDOW, SpeechMeasure, StubSource,
     TARGET_SAMPLE_RATE, Vad,
 };
+pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
     VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
-    handle_utterance_with, refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref,
-    resolve_dir_ref, resolve_mode_ref,
+    handle_utterance_with, handle_utterance_with_dictation, refuse_switch_beyond_selector,
+    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -349,6 +421,13 @@ impl Transcript {
 
     pub fn is_empty(&self) -> bool {
         self.0.trim().is_empty()
+    }
+
+    /// Whether the text holds a word at all — a letter or a digit — rather
+    /// than being empty or only punctuation. Whisper-family models answer
+    /// non-speech with runs of `...`, which is not something anybody said.
+    pub fn has_words(&self) -> bool {
+        self.0.chars().any(char::is_alphanumeric)
     }
 }
 

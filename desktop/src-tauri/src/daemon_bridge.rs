@@ -31,6 +31,10 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) struct HandshakeInfo {
     pub(crate) status: ConnectionStatus,
     pub(crate) error: Option<String>,
+    /// The technical half of [`Self::error`]: the declared breaks by name, the
+    /// protocol numbers on each side, the two build stamps. Kept out of the
+    /// sentence a user reads and shown behind a disclosure instead.
+    pub(crate) error_detail: Option<String>,
     pub(crate) server_protocol_version: Option<u32>,
     pub(crate) daemon_build_version: Option<String>,
     pub(crate) daemon_version: Option<String>,
@@ -586,16 +590,18 @@ fn named_breaks(breaks: &[String]) -> String {
 ///
 /// # What this function returns
 ///
-/// The refusal sentence for a deck a declared break separates this build from,
-/// or `None` when there is nothing to refuse — which covers both "we agree" and
+/// The refusal — which side is older, and the technical detail — for a deck a
+/// declared break separates this build from, or `None` when there is nothing to refuse — which covers both "we agree" and
 /// "this build predates the declaration and there is nothing to compare"
 /// ([`ContractComparison::Undeclared`], whose own doc states what that costs).
 ///
-/// The sentence names the breaks and the direction, because the two directions
-/// call for different actions from whoever reads it: a deck that lacks breaks
-/// this build has is the older of the two, and a deck that has breaks this build
-/// lacks means the app is the stale one.
-fn contract_refusal(response: &AttachResponse) -> Option<String> {
+/// The direction decides what the user is told to do, because the two
+/// directions call for different actions: a deck that lacks breaks this build
+/// has is the older of the two, and a deck that has breaks this build lacks
+/// means the app is the stale one. The break NAMES are not something a user can
+/// act on, so they go to the [`ContractRefusal::detail`] the screens show behind
+/// a disclosure, never into the sentence (CLAUDE.md rule 21).
+fn contract_refusal(response: &AttachResponse) -> Option<ContractRefusal> {
     let (peer_lacks, this_build_lacks) =
         match compare_contract_breaks(response.contract_breaks.as_deref()) {
             ContractComparison::Undeclared | ContractComparison::Agreed => return None,
@@ -604,25 +610,77 @@ fn contract_refusal(response: &AttachResponse) -> Option<String> {
                 this_build_lacks,
             } => (peer_lacks, this_build_lacks),
         };
-    let mut sides = Vec::new();
+    let mut detail = Vec::new();
     if !peer_lacks.is_empty() {
-        sides.push(format!(
-            "the daemon is behind this app across {}",
+        detail.push(format!(
+            "The daemon lacks these declared compatibility breaks: {}.",
             named_breaks(&peer_lacks)
         ));
     }
     if !this_build_lacks.is_empty() {
-        sides.push(format!(
-            "this app is behind the daemon across {}",
+        detail.push(format!(
+            "This app lacks these declared compatibility breaks: {}.",
             named_breaks(&this_build_lacks)
         ));
     }
-    Some(format!(
-        "contract mismatch: {}. Protocol {PROTOCOL_VERSION} matched on both sides, so the frames \
-         decode — but a declared compatibility break sits between these two builds, so a field can \
-         be read with the wrong meaning rather than failing outright",
-        sides.join(", and ")
-    ))
+    detail.push(format!("Both sides speak protocol {PROTOCOL_VERSION}."));
+    Some(ContractRefusal {
+        older: OlderSide::from_lacks(!peer_lacks.is_empty(), !this_build_lacks.is_empty()),
+        detail: detail.join(" "),
+    })
+}
+
+/// A declared break between the two builds: who is older, in the user's terms,
+/// and the technical facts behind it.
+struct ContractRefusal {
+    older: OlderSide,
+    detail: String,
+}
+
+/// Which of the two builds a user should update — the one thing about a refused
+/// connection they can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OlderSide {
+    Daemon,
+    App,
+    /// Each side has a change the other lacks: two branches, typically.
+    Neither,
+}
+
+impl OlderSide {
+    fn from_lacks(daemon_lacks: bool, app_lacks: bool) -> Self {
+        match (daemon_lacks, app_lacks) {
+            (true, false) => Self::Daemon,
+            (false, true) => Self::App,
+            _ => Self::Neither,
+        }
+    }
+
+    /// From the two protocol numbers. A daemon that reports none predates the
+    /// field, so it is the older one.
+    fn from_protocol(reported: Option<u32>) -> Self {
+        match reported {
+            Some(version) if version > PROTOCOL_VERSION => Self::App,
+            Some(version) if version == PROTOCOL_VERSION => Self::Neither,
+            _ => Self::Daemon,
+        }
+    }
+
+    fn who(self) -> &'static str {
+        match self {
+            Self::Daemon => "This daemon is older than this app",
+            Self::App => "This app is older than the daemon",
+            Self::Neither => "This daemon and this app are different versions",
+        }
+    }
+
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Daemon => "Update the daemon to this app's version.",
+            Self::App => "Update the app to the daemon's version.",
+            Self::Neither => "Run the same version of both.",
+        }
+    }
 }
 
 /// The verbs the desktop's project-aware surfaces need (PRD #819 M6).
@@ -699,10 +757,13 @@ fn new_agent_reason(response: &AttachResponse) -> Option<String> {
     if capabilities.supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES) {
         return None;
     }
-    Some(format!(
-        "This daemon does not advertise {}, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.",
-        dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES
-    ))
+    // The capability string stays out of the sentence, as it does in
+    // `project_actions_reason` (CLAUDE.md rule 21): the user is told what they
+    // cannot do here and what to do instead, not which verb is missing.
+    Some(
+        "This daemon is too old to let this app browse its folders, so new agents cannot be started on it from here. Start them from a terminal on its machine, or update the daemon."
+            .to_string(),
+    )
 }
 
 /// Whether this deck advertises [`CAP_LIST_DIRECTORIES_OPTIONS`] (issue #1240),
@@ -856,57 +917,76 @@ fn classify_handshake(
     // can advertise an override that the bypass would refuse to honour anyway.
     let mut build_stamp_mismatch_only = false;
     let mut build_mismatch_was_bypassed = false;
-    let error = if !response.ok {
-        Some(
-            response
-                .error
-                .clone()
-                .unwrap_or_else(|| "the daemon rejected Hello".into()),
-        )
+    // Two halves, kept apart (CLAUDE.md rule 21): `error` is the sentence a
+    // user reads — which side is older, what that means, what to do — and
+    // `detail` is everything a maintainer needs and a user cannot act on, which
+    // the screens show behind a Technical details disclosure. Which buttons to
+    // press is NOT said here: that depends on the screen showing the sentence,
+    // so the webview composes it (`desktop/src/lib/connectionRemedy.ts`).
+    let builds = format!(
+        "Builds: app {client_build}, daemon {}.",
+        daemon_build_version.as_deref().unwrap_or("unreported")
+    );
+    let refusal: Option<(String, String)> = if !response.ok {
+        Some((
+            "The daemon turned this app away. Try again in a moment, and restart the daemon if it keeps happening.".into(),
+            format!(
+                "The daemon's reply: {}. {builds}",
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or("it rejected Hello without a reason")
+            ),
+        ))
     } else if server_protocol_version != Some(PROTOCOL_VERSION) {
-        Some(format!(
-            "protocol mismatch: desktop expects {PROTOCOL_VERSION}, daemon reports {}",
-            server_protocol_version
-                .map(|version| version.to_string())
-                .unwrap_or_else(|| "no version".into())
+        let older = OlderSide::from_protocol(server_protocol_version);
+        Some((
+            format!(
+                "{}, and the two cannot work together. {}",
+                older.who(),
+                older.remedy()
+            ),
+            format!(
+                "The app speaks protocol {PROTOCOL_VERSION}; the daemon reports {}. {builds}",
+                server_protocol_version
+                    .map(|version| format!("protocol {version}"))
+                    .unwrap_or_else(|| "no protocol version".into())
+            ),
         ))
     } else if let Some(contract) = contract_refusal(response) {
         // Reached only AFTER the protocol check above returned equal, so the
         // wire shape is already agreed and what is left is meaning. Issue #801:
-        // the build stamps are named in the sentence but are not what was
+        // the build stamps are reported in the detail but are not what was
         // compared — the comparison is over the two builds' declared contract
         // breaks, which live in the contract's own source and move with it
         // rather than with a tag.
         build_stamp_mismatch_only = true;
-        let builds = format!(
-            "Builds: desktop is {client_build}, daemon is {}",
-            daemon_build_version.as_deref().unwrap_or("unreported")
-        );
+        let detail = format!("{} {builds}", contract.detail);
+        let who = contract.older.who();
         // Whichever switch is armed, the mismatch is kept in `error` (not
         // dropped) so the caveat stays on screen for the whole session rather
         // than being silently forgotten.
         build_mismatch_was_bypassed = allowance.allows();
-        match allowance {
-            BuildMismatchAllowance::Env => Some(format!(
-                "{contract}. {builds}. Bypassed by {BUILD_MISMATCH_BYPASS_ENV}. Development only."
-            )),
-            BuildMismatchAllowance::Session => Some(format!(
-                "{contract}. {builds}. Connected anyway for this session."
-            )),
-            BuildMismatchAllowance::Refuse => {
-                let recovery = match running_agent_count {
-                    Some(0) => "No live agents are reported; use Replace daemon to start the matching bundled build, or Connect anyway to keep this one.".into(),
-                    Some(count) => format!(
-                        "The daemon reports {count} live agent{}; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
-                        if count == 1 { "" } else { "s" }
-                    ),
-                    None => "The daemon could not report its live-agent count, so automatic replacement is disabled; Connect anyway keeps this one.".into(),
-                };
-                Some(format!("{contract}. {builds}. {recovery}"))
-            }
-        }
+        let sentence = match allowance {
+            BuildMismatchAllowance::Env => format!(
+                "{who}. Connected anyway because {BUILD_MISMATCH_BYPASS_ENV} is set, which is for development only, so some of what this daemon shows may be wrong."
+            ),
+            BuildMismatchAllowance::Session => format!(
+                "{who}. You chose to connect anyway for this session, so some of what this daemon shows may be wrong. {}",
+                contract.older.remedy()
+            ),
+            BuildMismatchAllowance::Refuse => format!(
+                "{who}. The app has not connected, because it could misread some of what this daemon reports. {}",
+                contract.older.remedy()
+            ),
+        };
+        Some((sentence, detail))
     } else {
         None
+    };
+    let (error, error_detail) = match refusal {
+        Some((sentence, detail)) => (Some(sentence), Some(detail)),
+        None => (None, None),
     };
 
     HandshakeInfo {
@@ -916,6 +996,7 @@ fn classify_handshake(
             ConnectionStatus::Connected
         },
         error: error.map(safe_message),
+        error_detail: error_detail.map(safe_message),
         server_protocol_version,
         daemon_build_version,
         daemon_version,
@@ -977,6 +1058,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         local_only_reason,
         selection_fallback,
         error: handshake.error,
+        error_detail: handshake.error_detail,
         client_protocol_version: PROTOCOL_VERSION,
         server_protocol_version: handshake.server_protocol_version,
         client_build_version: dot_agent_deck::build_id::local_build_id(),
@@ -1648,7 +1730,11 @@ mod tests {
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a refusal says why");
-        assert!(error.contains("contract mismatch"), "{error}");
+        assert!(
+            error.contains("This daemon is older than this app"),
+            "{error}"
+        );
+        let detail = info.error_detail.expect("the break is named in the detail");
         // `last()`, not `[0]`: `hello_from_a_deck_one_declared_break_behind`
         // makes its older deck by `pop()`ing the tail, so the break it withholds
         // is the LAST declared one. Those were the same element while
@@ -1659,8 +1745,8 @@ mod tests {
             .last()
             .expect("the fixture withholds a declared break, so there is one");
         assert!(
-            error.contains(withheld),
-            "the sentence names the withheld break {withheld}: {error}"
+            detail.contains(withheld),
+            "the detail names the withheld break {withheld}: {detail}"
         );
         assert!(
             info.build_stamp_mismatch_only,
@@ -1688,40 +1774,208 @@ mod tests {
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("the refusal says why");
-        assert!(error.contains("0.39.0-gdeadbee"), "{error}");
-        assert!(error.contains("0.39.0-gcafe123"), "{error}");
         assert!(
-            error.contains("read with the wrong meaning"),
+            error.contains("could misread some of what this daemon reports"),
             "what a decoding wire cannot rule out is stated rather than implied: {error}"
         );
-        assert!(error.contains("Connect anyway"), "{error}");
+        // The refusal comes first, as a fact (maintainer, PR #1451): "the two
+        // can still exchange information" read as "it will connect", which it
+        // does not unless the user chooses Connect anyway.
+        assert!(
+            error.starts_with("This daemon is older than this app. The app has not connected"),
+            "the refusal leads: {error}"
+        );
+        assert!(!error.contains("exchange information"), "{error}");
+        // Which buttons to press depends on the screen — Replace daemon is
+        // only rendered for a local deck — so the crate's sentence names none
+        // and the webview adds the ones it shows (`connectionRemedy.ts`).
+        for button in ["Replace daemon", "Connect anyway", "Reconnect"] {
+            assert!(!error.contains(button), "{button}: {error}");
+        }
+        let detail = info.error_detail.expect("the builds are in the detail");
+        assert!(detail.contains("0.39.0-gdeadbee"), "{detail}");
+        assert!(detail.contains("0.39.0-gcafe123"), "{detail}");
+    }
+
+    /// The words a refused connection puts in front of a user must be ones the
+    /// user can act on (CLAUDE.md rule 21).
+    ///
+    /// Found by hand on 2026-10-01: an app meeting an older daemon showed
+    /// `contract mismatch: the daemon is behind this app across
+    /// 505-unsolicited-work-done-label-reworded. Protocol 10 matched on both
+    /// sides, so the frames decode — …`. A user cannot act on a
+    /// `CONTRACT_BREAKS` slug or a protocol number. So the sentence says which
+    /// side is older, what that means, and what to do, in plain words, and the
+    /// technical facts move to `error_detail`, which the screens show behind a
+    /// disclosure. The classification is untouched — only where each fact is
+    /// written.
+    ///
+    /// "Plain words" is checked as: no digit at all (a slug starts with one,
+    /// and so does every protocol number and stamp), and none of the words a
+    /// maintainer reads in the code rather than on the screen.
+    #[test]
+    fn a_refusal_says_which_side_is_older_in_plain_words_and_keeps_the_jargon_in_the_detail() {
+        fn assert_plain(case: &str, sentence: &str) {
+            assert!(
+                !sentence.chars().any(|c| c.is_ascii_digit()),
+                "{case}: no slug, protocol number, stamp or count in the sentence: {sentence}"
+            );
+            let lower = sentence.to_lowercase();
+            for jargon in [
+                "contract",
+                "protocol",
+                "mismatch",
+                "hello",
+                "frames",
+                "stamp",
+                "declared",
+                "handshake",
+            ] {
+                assert!(
+                    !lower.contains(jargon),
+                    "{case}: `{jargon}` is developer vocabulary: {sentence}"
+                );
+            }
+        }
+        let _guard = AllowanceGuard::acquire();
+        let withheld = dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+            .last()
+            .expect("there is a declared break to withhold");
+
+        // The maintainer's case: the daemon is the older build.
+        let info = classify_handshake(
+            &hello_one_break_behind(Some("0.41.0-gdeadbee")),
+            "0.42.0-gcafe123",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        let error = info.error.clone().expect("a refusal says why");
+        assert_plain("daemon older", &error);
+        assert!(
+            error.contains("This daemon is older than this app"),
+            "names the older side: {error}"
+        );
+        assert!(
+            error.contains("Update the daemon"),
+            "says what to do: {error}"
+        );
+        let detail = info.error_detail.clone().expect("the jargon is kept");
+        assert!(detail.contains(withheld), "{detail}");
+        assert!(
+            detail.contains(&format!("protocol {PROTOCOL_VERSION}")),
+            "{detail}"
+        );
+        assert!(detail.contains("0.41.0-gdeadbee"), "{detail}");
+        assert!(detail.contains("0.42.0-gcafe123"), "{detail}");
+
+        // The other direction: the daemon declares a break this app predates.
+        let mut ahead = hello_with_build(Some("0.43.0-gdeadbee"));
+        ahead.contract_breaks = Some(
+            dot_agent_deck::daemon_protocol::CONTRACT_BREAKS
+                .iter()
+                .map(|entry| (*entry).to_string())
+                .chain(["9999-a-break-this-build-predates".to_string()])
+                .collect(),
+        );
+        let info = classify_handshake(&ahead, "0.42.0-gcafe123", BuildMismatchAllowance::Refuse);
+        let error = info.error.clone().expect("a refusal says why");
+        assert_plain("app older", &error);
+        assert!(
+            error.contains("This app is older than the daemon"),
+            "{error}"
+        );
+        assert!(error.contains("Update the app"), "{error}");
+        assert!(
+            info.error_detail
+                .expect("the jargon is kept")
+                .contains("9999-a-break-this-build-predates")
+        );
+
+        // Connected anyway: still plain, and says what the choice costs.
+        let info = classify_handshake(
+            &hello_one_break_behind(Some("0.41.0-gdeadbee")),
+            "0.42.0-gcafe123",
+            BuildMismatchAllowance::Session,
+        );
+        let error = info
+            .error
+            .clone()
+            .expect("the caveat survives the override");
+        assert_plain("connected anyway", &error);
+        assert!(error.contains("for this session"), "{error}");
+        assert!(error.contains("may be wrong"), "{error}");
+
+        // A protocol difference, in each direction and with no number at all.
+        for (reported, older) in [
+            (
+                Some(PROTOCOL_VERSION - 1),
+                "This daemon is older than this app",
+            ),
+            (
+                Some(PROTOCOL_VERSION + 1),
+                "This app is older than the daemon",
+            ),
+            (None, "This daemon is older than this app"),
+        ] {
+            let mut response = hello_with_build(Some("0.30.0-gdeadbee"));
+            response.server_version = reported;
+            let info =
+                classify_handshake(&response, "0.42.0-gcafe123", BuildMismatchAllowance::Refuse);
+            let case = format!("protocol {reported:?}");
+            let error = info.error.clone().expect("a refusal says why");
+            assert_plain(&case, &error);
+            assert!(error.contains(older), "{case}: {error}");
+            assert!(error.contains("cannot work together"), "{case}: {error}");
+            let detail = info.error_detail.expect("the numbers are kept");
+            assert!(
+                detail.contains(&format!("protocol {PROTOCOL_VERSION}")),
+                "{case}: {detail}"
+            );
+            if let Some(reported) = reported {
+                assert!(detail.contains(&reported.to_string()), "{case}: {detail}");
+            }
+        }
+
+        // The daemon turned the app away itself.
+        let mut rejected = AttachResponse::hello(PROTOCOL_VERSION);
+        rejected.ok = false;
+        rejected.error = Some("daemon is shutting down".into());
+        let info = classify_handshake(&rejected, "0.42.0-gcafe123", BuildMismatchAllowance::Refuse);
+        let error = info.error.clone().expect("a refusal says why");
+        assert_plain("rejected", &error);
+        assert!(error.contains("The daemon turned this app away"), "{error}");
+        assert!(
+            info.error_detail
+                .expect("the daemon's own words are kept")
+                .contains("daemon is shutting down")
+        );
     }
 
     /// The direction is named, because the two directions call for different
-    /// actions from whoever reads the sentence.
+    /// actions from whoever reads the sentence — and when each side has a break
+    /// the other lacks (two branches), neither is "older", so the sentence says
+    /// they differ and asks for the same version of both rather than picking a
+    /// side to blame. Both lists still reach the detail.
     #[test]
     fn the_refusal_names_which_side_is_behind() {
         let _guard = AllowanceGuard::acquire();
-        let mut ahead = hello_with_build(Some("0.39.0-gdeadbee"));
-        ahead.contract_breaks = Some(vec!["999-a-break-this-build-predates".to_string()]);
-        let error = classify_handshake(&ahead, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
-            .error
-            .expect("a refusal says why");
+        let mut diverged = hello_with_build(Some("0.39.0-gdeadbee"));
+        diverged.contract_breaks = Some(vec!["999-a-break-this-build-predates".to_string()]);
+        let info = classify_handshake(&diverged, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse);
+        let error = info.error.expect("a refusal says why");
         assert!(
-            error.contains("this app is behind the daemon"),
-            "a deck ahead of the app must say so: {error}"
+            error.contains("This daemon and this app are different versions")
+                && error.contains("Run the same version of both"),
+            "two builds that each lack the other's break: {error}"
         );
-
-        let error = classify_handshake(
-            &hello_one_break_behind(Some("0.39.0-gdeadbee")),
-            "0.39.0-gcafe123",
-            BuildMismatchAllowance::Refuse,
-        )
-        .error
-        .expect("a refusal says why");
+        let detail = info.error_detail.expect("both lists are in the detail");
         assert!(
-            error.contains("the daemon is behind this app"),
-            "a deck behind the app must say so: {error}"
+            detail.contains("The daemon lacks") && detail.contains("This app lacks"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("999-a-break-this-build-predates"),
+            "{detail}"
         );
     }
 
@@ -1743,9 +1997,10 @@ mod tests {
     /// capture reports 9, so every released daemon through `0.40.2` is now
     /// refused before the contract lists are ever compared. That is the version
     /// floor doing its job, not issue #801's false positive returning — and the
-    /// distinction is the whole point of keeping this capture: the error must
-    /// say `protocol mismatch`, because a `contract mismatch` here would mean
-    /// the classifier had reached a peer it should never have got to.
+    /// distinction is the whole point of keeping this capture: the refusal must
+    /// be the "cannot work together" one with the protocol numbers in its
+    /// detail, because named compatibility breaks there would mean the
+    /// classifier had reached a peer it should never have got to.
     ///
     /// The property the old assertion protected — that omitting the field is
     /// not itself a refusal — moved to
@@ -1776,12 +2031,18 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a protocol mismatch must be reported");
         assert!(
-            error.contains("protocol mismatch"),
+            error.contains("This daemon is older than this app, and the two cannot work together"),
             "the floor must refuse this, not the contract classifier: {error}"
         );
+        assert!(!info.build_stamp_mismatch_only);
+        let detail = info.error_detail.expect("the numbers are in the detail");
         assert!(
-            !error.contains("contract mismatch"),
-            "the contract lists must never be compared across a protocol gap: {error}"
+            detail.contains("the daemon reports protocol 9"),
+            "the floor must refuse this, not the contract classifier: {detail}"
+        );
+        assert!(
+            !detail.contains("compatibility breaks"),
+            "the contract lists must never be compared across a protocol gap: {detail}"
         );
     }
 
@@ -1841,9 +2102,12 @@ mod tests {
         declared.extend((0..500).map(|n| format!("{n}-flood-entry")));
         hostile.contract_breaks = Some(declared);
 
-        let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
-            .error
-            .expect("a divergence refuses");
+        let info = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse);
+        // The sentence carries nothing the peer sent; the names live only in
+        // the detail, which is where the bounds below now have to hold.
+        let sentence = info.error.expect("a divergence refuses");
+        assert!(!sentence.contains("flood"), "{sentence:?}");
+        let error = info.error_detail.expect("the names are in the detail");
 
         assert!(
             !error.contains('\u{202e}'),
@@ -1879,8 +2143,8 @@ mod tests {
         hostile.contract_breaks = Some(declared);
 
         let error = classify_handshake(&hostile, "0.39.0-gcafe123", BuildMismatchAllowance::Refuse)
-            .error
-            .expect("a divergence refuses");
+            .error_detail
+            .expect("a divergence names its breaks in the detail");
         assert!(
             error.contains("2 break(s) it did not name in a readable form"),
             "{error:?}"
@@ -1927,7 +2191,7 @@ mod tests {
             !info.build_stamp_mismatch_only,
             "a wire mismatch must never advertise an override"
         );
-        assert!(info.error.unwrap().contains("protocol mismatch"));
+        assert!(info.error.unwrap().contains("cannot work together"));
     }
 
     /// A daemon advertising every project verb offers the project surfaces; one
@@ -2019,8 +2283,12 @@ mod tests {
         .new_agent_reason
         .expect("an unadvertised daemon cannot be browsed");
         assert!(
-            reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES),
-            "the reason names the missing verb: {reason}"
+            !reason.contains(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES),
+            "no wire verb is named to the user (CLAUDE.md rule 21): {reason}"
+        );
+        assert!(
+            reason.contains("too old") && reason.contains("update the daemon"),
+            "the reason says why in the user's terms and what to do: {reason}"
         );
         assert!(
             !reason.to_lowercase().contains("type"),
@@ -2119,9 +2387,13 @@ mod tests {
             BuildMismatchAllowance::Refuse,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
-        assert!(info.error.unwrap().contains("protocol mismatch"));
+        assert!(info.error.unwrap().contains("cannot work together"));
     }
 
+    /// The live-agent count still reaches the webview, which is where the
+    /// Replace daemon guidance is now written: whether that button is on screen
+    /// depends on the screen and the deck kind, which this classifier cannot see
+    /// (`desktop/src/lib/connectionRemedy.ts`).
     #[test]
     fn zero_agent_contract_mismatch_points_to_safe_replacement() {
         let _guard = AllowanceGuard::acquire();
@@ -2131,11 +2403,19 @@ mod tests {
             BuildMismatchAllowance::Refuse,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
+        assert_eq!(info.running_agent_count, Some(0));
         let error = info.error.unwrap();
-        assert!(error.contains("contract mismatch"));
-        assert!(error.contains("use Replace daemon"));
+        assert!(
+            error.contains("This daemon is older than this app"),
+            "{error}"
+        );
+        assert!(!error.contains("Replace daemon"), "{error}");
     }
 
+    /// Issue #801: replacement is refused while agents are live, and that is
+    /// correct — but it used to be the ONLY thing offered, which left a user
+    /// with nine running agents no way into the app at all. The override is
+    /// still advertised here, and the screens say why Replace daemon is absent.
     #[test]
     fn live_agent_contract_mismatch_blocks_replacement() {
         let _guard = AllowanceGuard::acquire();
@@ -2150,15 +2430,11 @@ mod tests {
             BuildMismatchAllowance::Refuse,
         );
         assert_eq!(info.status, ConnectionStatus::Incompatible);
-        let error = info.error.unwrap();
+        assert_eq!(info.running_agent_count, Some(2));
         assert!(
-            error.contains("stop them individually before replacing"),
-            "{error}"
+            info.build_stamp_mismatch_only,
+            "Connect anyway stays offered"
         );
-        // Issue #801: replacement is refused while agents are live, and that is
-        // correct — but it used to be the ONLY thing offered, which left a user
-        // with nine running agents no way into the app at all.
-        assert!(error.contains("Connect anyway"), "{error}");
     }
 
     /// A declared break is downgraded to a warning, not silence: the deck
@@ -2174,8 +2450,14 @@ mod tests {
         );
         assert_eq!(info.status, ConnectionStatus::Connected);
         let error = info.error.expect("bypass must not swallow the mismatch");
-        assert!(error.contains("contract mismatch"), "{error}");
+        assert!(
+            error.contains("This daemon is older than this app"),
+            "{error}"
+        );
+        assert!(error.contains("Connected anyway because"), "{error}");
         assert!(error.contains(BUILD_MISMATCH_BYPASS_ENV), "{error}");
+        let detail = info.error_detail.expect("the detail survives the bypass");
+        assert!(detail.contains("0.39.0-gdeadbee"), "{detail}");
     }
 
     /// The in-app override says so in its own words. Naming the env var here
@@ -2199,12 +2481,15 @@ mod tests {
         let error = info
             .error
             .expect("the override must not swallow the mismatch");
-        assert!(error.contains("contract mismatch"), "{error}");
         assert!(
-            error.contains("Connected anyway for this session"),
+            error.contains("This daemon is older than this app"),
             "{error}"
         );
-        assert!(error.contains("read with the wrong meaning"), "{error}");
+        assert!(
+            error.contains("You chose to connect anyway for this session"),
+            "{error}"
+        );
+        assert!(error.contains("may be wrong"), "{error}");
         assert!(!error.contains(BUILD_MISMATCH_BYPASS_ENV), "{error}");
     }
 
@@ -2219,7 +2504,7 @@ mod tests {
             let info = classify_handshake(&response, "desktop-other-build", allowance);
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(
-                info.error.unwrap().contains("protocol mismatch"),
+                info.error.unwrap().contains("cannot work together"),
                 "{allowance:?}"
             );
         }
@@ -2295,7 +2580,7 @@ mod tests {
         let info = classify_handshake(&response, "desktop-build", BuildMismatchAllowance::Env);
         assert_eq!(info.status, ConnectionStatus::Connected);
         assert!(info.build_stamp_mismatch_only);
-        assert!(info.error.unwrap().contains("unreported"));
+        assert!(info.error_detail.unwrap().contains("unreported"));
     }
 
     /// Only `1` and `true` arm it. An unset variable, an empty string, or a
@@ -2384,7 +2669,7 @@ mod tests {
             retried
                 .error
                 .expect("the caveat must survive the override")
-                .contains("contract mismatch")
+                .contains("This daemon is older than this app")
         );
     }
 
@@ -2443,8 +2728,10 @@ mod tests {
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         assert!(info.build_stamp_mismatch_only);
         let error = info.error.unwrap();
-        assert!(error.contains("contract mismatch"), "{error}");
-        assert!(error.contains("Connect anyway"), "{error}");
+        assert!(
+            error.contains("This daemon is older than this app"),
+            "{error}"
+        );
     }
 
     /// An unreadable stamp is no longer a refusal, on either side.
@@ -2636,10 +2923,17 @@ mod tests {
 
         assert_eq!(info.status, ConnectionStatus::Incompatible);
         let error = info.error.expect("a refusal must say why");
-        assert!(error.contains("protocol mismatch"), "{error}");
         assert!(
-            error.contains(&(PROTOCOL_VERSION + 1).to_string()),
-            "the refusal must name the version the daemon reported: {error}"
+            error.contains("This app is older than the daemon"),
+            "{error}"
+        );
+        let detail = info.error_detail.expect("the numbers are in the detail");
+        assert!(
+            detail.contains(&format!(
+                "the daemon reports protocol {}",
+                PROTOCOL_VERSION + 1
+            )),
+            "the detail must name the version the daemon reported: {detail}"
         );
         assert!(!info.build_stamp_mismatch_only);
 
@@ -2676,7 +2970,7 @@ mod tests {
             assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
             assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
             assert!(
-                info.error.unwrap().contains("protocol mismatch"),
+                info.error.unwrap().contains("cannot work together"),
                 "{allowance:?}"
             );
         }
@@ -2966,6 +3260,7 @@ mod tests {
                 HandshakeInfo {
                     status: ConnectionStatus::Connected,
                     error: None,
+                    error_detail: None,
                     server_protocol_version: Some(PROTOCOL_VERSION),
                     daemon_build_version: None,
                     daemon_version: None,

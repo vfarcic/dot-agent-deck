@@ -54,9 +54,9 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The sample rate every [`super::transcribe::Transcriber`] in this build is
 /// handed.
@@ -277,10 +277,13 @@ impl Pcm16 {
 /// **against the room under it**, so both sides of that comparison travel with
 /// the verdict.
 ///
-/// All three are rendered to the user on **both** refusals
-/// ([`super::transcribe::handle_audio`]) rather than logged, because the person
-/// who can answer "is my microphone quiet?" is the one holding it — and because
-/// a refusal that names only one side of a ratio cannot be self-diagnosed.
+/// All three travel in the refusal's `detail` on **both** refusals
+/// ([`super::transcribe::handle_audio`]), because a refusal that names only one
+/// side of a ratio cannot be diagnosed. They are no longer in the sentence a
+/// user reads: PR #1451's hand test found a status line full of thresholds
+/// about keyboard noise unhelpful, so the sentence is plain words and the
+/// numbers are for whoever is diagnosing — see
+/// [`super::transcribe::NOTHING_HEARD`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeechMeasure {
     /// The most speech-level audio found inside any one [`SPEECH_WINDOW`], so
@@ -1170,6 +1173,36 @@ impl PcmSink {
         Pcm16::new(std::mem::take(&mut state.out))
     }
 
+    /// Take the utterance captured so far and start the next one on the same
+    /// device, without closing it (PR #1451).
+    ///
+    /// Everything the device delivers after this goes into the next
+    /// utterance, so words spoken while this one is transcribed and resolved
+    /// are kept rather than lost to a closed microphone. The resampler's
+    /// position carries over — it is the same stream — while the detector and
+    /// the per-utterance flags start afresh, exactly as a newly opened device
+    /// would. A position that fell behind while the buffer was full is moved
+    /// up to the present, so the next utterance does not open on a run of the
+    /// held sample standing in for audio that was never kept.
+    pub fn split(&self) -> Pcm16 {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let taken = std::mem::take(&mut state.out);
+        state.vad = Vad::default();
+        let present = state.base as f64;
+        if state.next < present {
+            state.next = present;
+        }
+        self.written.store(0, Ordering::Relaxed);
+        self.full.store(false, Ordering::Relaxed);
+        self.ended.store(false, Ordering::Relaxed);
+        self.speech.store(false, Ordering::Relaxed);
+        drop(state);
+        Pcm16::new(taken)
+    }
+
     fn finished_pushing(&self, state: &SinkState) {
         self.written
             .store(state.out.len() as u64, Ordering::Relaxed);
@@ -1479,6 +1512,12 @@ pub struct StubSource {
     /// Set when the stream this source handed out was dropped, which is how a
     /// test asserts the device was genuinely released.
     stopped: Arc<AtomicBool>,
+    /// How many times the device was opened, and the sink the latest open is
+    /// feeding — so a test can go on "speaking" into an open device after the
+    /// session has taken an utterance from it, which is what a real
+    /// microphone does.
+    opened: Arc<AtomicUsize>,
+    sink: Arc<Mutex<Option<Arc<PcmSink>>>>,
 }
 
 impl StubSource {
@@ -1489,6 +1528,8 @@ impl StubSource {
             samples,
             failure: None,
             stopped: Arc::new(AtomicBool::new(false)),
+            opened: Arc::new(AtomicUsize::new(0)),
+            sink: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1514,12 +1555,39 @@ impl StubSource {
             samples: Vec::new(),
             failure: Some(error),
             stopped: Arc::new(AtomicBool::new(false)),
+            opened: Arc::new(AtomicUsize::new(0)),
+            sink: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Whether the stream handed out has been dropped.
     pub fn stopped(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stopped)
+    }
+
+    /// How many times the device has been opened.
+    pub fn opened(&self) -> usize {
+        self.opened.load(Ordering::Relaxed)
+    }
+
+    /// Deliver more audio to the device opened last, as a microphone does
+    /// whenever it is open — including between two utterances. Audio sent to
+    /// a device that has since been closed goes nowhere, exactly as speech
+    /// into a closed microphone does.
+    pub fn speak(&self, samples: &[f32]) {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sink) = sink
+            && !self.stopped.load(Ordering::Relaxed)
+        {
+            let channels = self.format.channels.max(1) as usize;
+            for chunk in samples.chunks(1024 * channels) {
+                sink.push(chunk);
+            }
+        }
     }
 }
 
@@ -1539,6 +1607,12 @@ impl AudioSource for StubSource {
             return Err(error.clone());
         }
         let sink = Arc::new(PcmSink::new(self.format, cap));
+        self.opened.fetch_add(1, Ordering::Relaxed);
+        self.stopped.store(false, Ordering::Relaxed);
+        *self
+            .sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&sink));
         // Delivered in callback-sized chunks rather than one slab, because the
         // seam between two callbacks is where an incremental resampler is
         // wrong if it is wrong at all.
@@ -1569,7 +1643,9 @@ pub enum CaptureState {
     Idle,
     /// The device is open, or was and hit the cap.
     Recording,
-    /// The device is closed and the transcriber has the buffer.
+    /// The transcriber has the last utterance's buffer. The device is still
+    /// open, already recording the next one (PR #1451), unless the length cap
+    /// closed it.
     Transcribing,
     /// The last utterance produced a transcript.
     Done,
@@ -1632,6 +1708,12 @@ struct SessionInner {
     state: CaptureState,
     /// Present exactly while `state` is [`CaptureState::Recording`].
     live: Option<Live>,
+    /// The device left open by [`CaptureSession::stop`] for the next
+    /// utterance, already filling it (PR #1451). Taken by the next
+    /// [`CaptureSession::start`] instead of opening the device again, and
+    /// closed by [`CaptureSession::cancel`] — so voice off still releases the
+    /// microphone.
+    kept: Option<Live>,
     /// Bumped by every start and every cancel, so a cap timer that fires after
     /// its own recording has already been stopped ends nothing — and so a
     /// device that finishes opening after a cancel can tell that it did.
@@ -1663,6 +1745,15 @@ struct SessionInner {
 struct Live {
     stream: Box<dyn AudioStream>,
     sink: Arc<PcmSink>,
+    /// Whether `stream` is still the device. `false` once the length cap has
+    /// swapped in a [`ClosedStream`], so such a device is never kept for the
+    /// next utterance — that one opens the microphone again.
+    open: bool,
+    /// When this device began recording the current utterance: when it was
+    /// opened, or when [`CaptureSession::stop`] took the last utterance from
+    /// it. The cap is counted from here, so time spent working on the last
+    /// utterance with the device kept open is not a fresh thirty seconds.
+    began: Instant,
 }
 
 /// A cap timer's claim on one recording.
@@ -1671,7 +1762,21 @@ struct Live {
 /// *n+1* — the sequence that produces it is ordinary: record, stop, start
 /// again, all inside [`MAX_UTTERANCE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CaptureTicket(u64);
+pub struct CaptureTicket {
+    generation: u64,
+    /// How long until this recording reaches [`MAX_UTTERANCE`]: the whole cap
+    /// for a device just opened, and less for one kept open since the last
+    /// utterance, which has been recording since that one was taken.
+    remaining: Duration,
+}
+
+impl CaptureTicket {
+    /// How long the caller's cap timer should wait before calling
+    /// [`CaptureSession::cap_reached`] with this ticket.
+    pub fn remaining(&self) -> Duration {
+        self.remaining
+    }
+}
 
 impl CaptureSession {
     pub fn new(source: Arc<dyn AudioSource>) -> Self {
@@ -1680,6 +1785,7 @@ impl CaptureSession {
             inner: Mutex::new(SessionInner {
                 state: CaptureState::Idle,
                 live: None,
+                kept: None,
                 generation: 0,
                 opening: None,
             }),
@@ -1760,6 +1866,21 @@ impl CaptureSession {
             if inner.opening.is_some() {
                 return Err(CaptureError::Refused(OPENING_REFUSAL.to_string()));
             }
+            // The device is still open from the last utterance and has been
+            // filling the next one since (PR #1451): carry on with it, under
+            // the lock, with nothing to open.
+            if let Some(kept) = inner.kept.take() {
+                inner.generation += 1;
+                inner.state = CaptureState::Recording;
+                let remaining = MAX_UTTERANCE.saturating_sub(kept.began.elapsed());
+                inner.live = Some(kept);
+                let ticket = CaptureTicket {
+                    generation: inner.generation,
+                    remaining,
+                };
+                drop(inner);
+                return Ok((self.status(), ticket));
+            }
             inner.generation += 1;
             inner.opening = Some(inner.generation);
             inner.generation
@@ -1798,28 +1919,63 @@ impl CaptureSession {
         inner.live = Some(Live {
             stream: capture.stream,
             sink: capture.sink,
+            open: true,
+            began: Instant::now(),
         });
-        let ticket = CaptureTicket(reserved);
+        let ticket = CaptureTicket {
+            generation: reserved,
+            remaining: MAX_UTTERANCE,
+        };
         drop(inner);
         Ok((self.status(), ticket))
     }
 
-    /// Close the device and take the utterance. Recording → Transcribing.
+    /// Take the utterance. Recording → Transcribing.
     ///
     /// The buffer comes back with the state already moved, so nothing else can
     /// start a recording while the transcriber has it.
+    ///
+    /// **The device stays open** (PR #1451): what the user says next goes
+    /// into the next utterance while this one is transcribed and resolved,
+    /// and [`CaptureSession::start`] carries on with it. Before, the
+    /// microphone was shut for that whole leg — a second or more — and words
+    /// spoken in it were lost, which is how "Set the command to be devbox run
+    /// agent" came back as "Devbox run agent.". A device the length cap has
+    /// already closed is let go here instead, and the next start reopens it;
+    /// [`CaptureSession::cancel`] (voice off) closes a kept one.
     pub fn stop(&self) -> Result<Pcm16, CaptureError> {
         let mut inner = self.inner();
         if inner.state != CaptureState::Recording {
             return Err(CaptureError::Refused(refusal(inner.state, "stop")));
         }
-        let Live { stream, sink } = inner.live.take().ok_or_else(|| {
+        let mut live = inner.live.take().ok_or_else(|| {
             CaptureError::Device("the recording ended with no device attached".to_string())
         })?;
         // Moved UNDER the lock, before anything slow happens, so nothing can
         // start a recording in the window the teardown below opens —
         // `Transcribing` is a state `accepts_start` refuses.
         inner.state = CaptureState::Transcribing;
+        // PR #1451: the device stays open, so whatever is said while this
+        // utterance is transcribed and resolved is the start of the next one
+        // rather than lost. A device the cap already closed is let go, and so
+        // is one whose buffer reached the cap before the cap's timer got to
+        // close it (Qodo on the PR): `split` would clear its "full" and the
+        // next start's ticket would outrun the old timer, so the cap would
+        // never close it.
+        if let Live {
+            open: true,
+            sink,
+            began,
+            ..
+        } = &mut live
+            && !sink.is_full()
+        {
+            let audio = sink.split();
+            *began = Instant::now();
+            inner.kept = Some(live);
+            return Ok(audio);
+        }
+        let Live { stream, sink, .. } = live;
         // And the lock goes before the device does. `AudioStream::drop` joins
         // the device thread and is therefore as slow as the platform's own
         // teardown; holding the session mutex across it parked every
@@ -1866,11 +2022,13 @@ impl CaptureSession {
         // guard below is dropped — `inner.live = None` would have run it
         // here, with the lock held. See [`CaptureSession::stop`].
         let live = inner.live.take();
+        let kept = inner.kept.take();
         inner.state = CaptureState::Idle;
         inner.generation += 1;
         inner.opening = None;
         drop(inner);
         drop(live);
+        drop(kept);
         self.status()
     }
 
@@ -1889,11 +2047,12 @@ impl CaptureSession {
         // and the same defect as the other two. See [`CaptureSession::stop`].
         let mut released: Option<Box<dyn AudioStream>> = None;
         let mut inner = self.inner();
-        if inner.generation == ticket.0
+        if inner.generation == ticket.generation
             && inner.state == CaptureState::Recording
             && let Some(live) = inner.live.as_mut()
         {
             released = Some(std::mem::replace(&mut live.stream, Box::new(ClosedStream)));
+            live.open = false;
             live.sink.full.store(true, Ordering::Relaxed);
         }
         drop(inner);
@@ -2874,6 +3033,38 @@ mod tests {
         assert!(!audio.is_silent());
     }
 
+    /// Scenario: an utterance is spoken and ends, the app takes it, and the
+    /// microphone stays open for the next one. The next one starts as a new
+    /// utterance — nothing heard yet, not over — rather than inheriting the
+    /// last one's "the speaking stopped", which would end it the moment it
+    /// began (PR #1451).
+    #[test]
+    fn voice_capture_the_next_utterance_on_a_kept_microphone_starts_fresh() {
+        let format = mono(TARGET_SAMPLE_RATE);
+        let mut spoken = room(400);
+        spoken.extend(speech(out_samples(400)));
+        let mut samples: Vec<f32> = spoken
+            .into_iter()
+            .map(|s| f32::from(s) / f32::from(i16::MAX))
+            .collect();
+        samples.extend(std::iter::repeat_n(0.0, out_samples(1_000)));
+        let source = Arc::new(StubSource::new(format, samples));
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        session.start().expect("opens");
+        let first = session.status();
+        assert_eq!(first.state, CaptureState::Done, "{first:?}");
+        assert!(first.speech, "{first:?}");
+        session.stop().expect("stops");
+        session.settle(true);
+
+        let (next, _) = session.start().expect("listens again");
+        assert_eq!(next.state, CaptureState::Recording, "{next:?}");
+        assert!(!next.speech, "{next:?}");
+        assert!(!next.capped, "{next:?}");
+        assert_eq!(next.captured_ms, 0, "{next:?}");
+        assert_eq!(source.opened(), 1);
+    }
+
     #[test]
     fn voice_capture_status_stays_recording_while_speech_continues() {
         let format = mono(TARGET_SAMPLE_RATE);
@@ -3271,6 +3462,169 @@ mod tests {
         assert_eq!(session.status().state, CaptureState::Recording);
     }
 
+    /// Scenario: one utterance ends and the app takes it to transcribe, and
+    /// the user goes on speaking while that runs. What they said in that gap
+    /// is the start of the next utterance, and the microphone was opened once.
+    ///
+    /// PR #1451's second hand test: "Set the command to be devbox run agent"
+    /// was heard as "Devbox run agent.". The microphone was shut from the end
+    /// of one utterance until the app had transcribed and resolved it, so
+    /// words spoken in that window — after a key press or a cough had ended a
+    /// segment, or after a pause — were never recorded.
+    #[test]
+    fn voice_capture_keeps_listening_while_the_last_utterance_is_worked_on() {
+        let rate = TARGET_SAMPLE_RATE as usize;
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+
+        session.start().expect("starts");
+        source.speak(&vec![0.25; rate / 2]);
+        let first = session.stop().expect("the first utterance is taken");
+        assert!(
+            first.duration() >= Duration::from_millis(490),
+            "{:?}",
+            first.duration()
+        );
+
+        // Spoken while the first utterance is transcribed and resolved.
+        let gap = vec![0.5; rate];
+        source.speak(&gap);
+        session.settle(true);
+
+        session.start().expect("listens again");
+        source.speak(&vec![0.75; rate / 4]);
+        let second = session.stop().expect("the second utterance is taken");
+
+        assert_eq!(
+            source.opened(),
+            1,
+            "the microphone was reopened between utterances"
+        );
+        let lead = second
+            .samples()
+            .iter()
+            .filter(|&&sample| (16_000..=16_500).contains(&sample))
+            .count();
+        assert!(
+            lead >= rate - 2,
+            "the words spoken while the last utterance was worked on are missing: {lead} of {rate} samples"
+        );
+        assert!(
+            second.duration() >= Duration::from_millis(1_240),
+            "{:?}",
+            second.duration()
+        );
+    }
+
+    /// Scenario: voice is turned off between two utterances. The microphone
+    /// that was kept open for the next one is closed, and nothing it heard
+    /// survives into a later session.
+    #[test]
+    fn voice_capture_cancel_closes_the_microphone_kept_open_between_utterances() {
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let stopped = source.stopped();
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        session.start().expect("starts");
+        source.speak(&[0.25; 1_600]);
+        session.stop().expect("stops");
+        assert!(
+            !stopped.load(Ordering::Relaxed),
+            "the microphone stays open for the next utterance"
+        );
+        source.speak(&[0.5; 1_600]);
+
+        assert_eq!(session.cancel().state, CaptureState::Idle);
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "voice off closes the microphone"
+        );
+
+        session.start().expect("a new session starts");
+        assert_eq!(source.opened(), 2, "a new session opens the device afresh");
+        let audio = session.stop().expect("stops");
+        assert!(
+            audio.samples().iter().all(|&sample| sample != 16_384),
+            "audio from before voice was turned off leaked into the next session"
+        );
+    }
+
+    /// Scenario: the app takes an utterance and keeps the microphone open, and
+    /// working it out takes a while. When it listens again, the time left
+    /// before the cap closes the microphone counts from when it began
+    /// recording the next utterance, not from the restart — so slow
+    /// processing cannot stretch how long the microphone stays open
+    /// (Qodo on PR #1451).
+    #[test]
+    fn voice_capture_a_kept_microphone_s_cap_counts_from_when_it_began_recording() {
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        let (_, fresh) = session.start().expect("starts");
+        assert_eq!(
+            fresh.remaining(),
+            MAX_UTTERANCE,
+            "a freshly opened device gets the whole cap"
+        );
+        session.stop().expect("stops");
+
+        let working = Duration::from_millis(50);
+        std::thread::sleep(working);
+        session.settle(true);
+        let (_, kept) = session.start().expect("listens again");
+
+        assert!(
+            kept.remaining() <= MAX_UTTERANCE - working,
+            "the time spent working on the last utterance was not counted: {:?} left",
+            kept.remaining()
+        );
+    }
+
+    /// Scenario: an utterance fills the buffer to the length cap, and the app
+    /// takes it before the cap's timer has closed the device. The device is
+    /// closed then, as the cap would have done, rather than kept open for the
+    /// next utterance (Qodo on PR #1451).
+    #[test]
+    fn voice_capture_a_full_buffer_is_not_kept_open_when_the_timer_has_not_fired() {
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let stopped = source.stopped();
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        session.start().expect("starts");
+        let over_the_cap = (MAX_UTTERANCE.as_secs() as usize + 1) * TARGET_SAMPLE_RATE as usize;
+        source.speak(&vec![0.25; over_the_cap]);
+        assert!(session.status().capped, "the buffer reached the cap");
+
+        session.stop().expect("the capped utterance is taken");
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "a microphone that reached the cap was kept open for the next utterance"
+        );
+        session.settle(true);
+        session.start().expect("listens again");
+        assert_eq!(
+            source.opened(),
+            2,
+            "the next utterance opens the device again"
+        );
+    }
+
+    /// Scenario: an utterance runs to the length cap, which closes the device.
+    /// The next utterance opens it again rather than "listening" on a closed
+    /// one.
+    #[test]
+    fn voice_capture_reopens_the_microphone_after_the_cap_closed_it() {
+        let source = Arc::new(StubSource::new(mono(TARGET_SAMPLE_RATE), Vec::new()));
+        let session = CaptureSession::new(Arc::clone(&source) as Arc<dyn AudioSource>);
+        let (_, ticket) = session.start().expect("starts");
+        source.speak(&[0.25; 1_600]);
+        session.cap_reached(ticket);
+        session.stop().expect("the capped utterance is taken");
+        session.settle(true);
+
+        session.start().expect("listens again");
+        assert_eq!(source.opened(), 2, "a capped device is reopened");
+        source.speak(&[0.25; 1_600]);
+        assert!(session.stop().expect("stops").duration() > Duration::ZERO);
+    }
+
     #[test]
     fn voice_capture_a_failed_transcription_is_a_terminal_state_that_restarts() {
         let session = silent_session();
@@ -3636,35 +3990,39 @@ mod tests {
             })
     }
 
-    /// Scenario: stop a recording whose device is slow to let go. While the
-    /// teardown runs, a concurrent status poll is still answered.
+    /// Scenario: stop a recording whose device is slow to let go. The stop
+    /// returns at once and leaves the device open for the next utterance;
+    /// the slow teardown happens when voice is turned off, and a status poll
+    /// made during it is still answered.
     ///
-    /// The finding this is for: `stop` dropped the stream **while holding the
-    /// session mutex**, and that drop joins the device thread. On the async
-    /// side it is worse than a slow call — `desktop_voice_stop` is a runtime
-    /// task, so the join parked a runtime worker and every concurrent
-    /// `status`, `cancel` and `start` queued behind the mutex it was still
-    /// holding.
+    /// Two findings live here. The first: `stop` dropped the stream **while
+    /// holding the session mutex**, and that drop joins the device thread, so
+    /// every concurrent `status`, `cancel` and `start` queued behind a driver.
+    /// The second, PR #1451: `stop` closed the device at all, so words spoken
+    /// while the utterance was being worked on were lost. Since then `stop`
+    /// tears nothing down, and the teardown it used to do moved to `cancel` —
+    /// which must still do it off the lock.
     #[test]
-    fn voice_capture_stop_releases_the_lock_before_the_device_teardown() {
+    fn voice_capture_stop_keeps_the_device_and_cancel_releases_it_off_the_lock() {
         let (session, entered, release) = blocking_teardown();
 
-        let stopping = Arc::clone(&session);
-        let stopper = std::thread::spawn(move || stopping.stop());
+        let audio = session.stop().expect("the stop succeeded");
+        drop(audio);
+        assert!(
+            entered.recv_timeout(Duration::from_millis(200)).is_err(),
+            "stop closed the device it should keep open for the next utterance"
+        );
+        assert_eq!(session.status().state, CaptureState::Transcribing);
+
+        let cancelling = Arc::clone(&session);
+        let canceller = std::thread::spawn(move || cancelling.cancel());
         entered
             .recv_timeout(Duration::from_secs(5))
-            .expect("the teardown started");
-
-        let status = status_within(&session, "stop");
-        // The state moved under the lock even though the device has not let
-        // go yet, which is what keeps a start from beginning here.
-        assert_eq!(status.state, CaptureState::Transcribing);
+            .expect("voice off closes the kept device");
+        assert_eq!(status_within(&session, "cancel").state, CaptureState::Idle);
 
         release.send(()).expect("the teardown is still waiting");
-        stopper
-            .join()
-            .expect("the stopping thread finished")
-            .expect("the stop succeeded");
+        canceller.join().expect("the cancelling thread finished");
     }
 
     /// Scenario: the same, for the cancel a closing panel makes. A status poll

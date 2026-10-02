@@ -55,6 +55,7 @@ vi.mock("../components/TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
+import { saysCommand } from "./voiceActions";
 
 function settingsStore() {
   let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
@@ -166,6 +167,14 @@ describe("VOICE_ACTIONS", () => {
       "openDirectory",
       "goToParentDirectory",
       "useThisDirectory",
+      // PR #1451 round 3, change 5: the browser's Filter box.
+      "filterDirectories",
+      "clearDirectoryFilter",
+      // PR #1451 round 3, change 4: turning the page of a paged list.
+      "nextPage",
+      "previousPage",
+      // PR #1451 round 4, D8: the New agent form's Command field.
+      "setNewAgentCommand",
     ];
 
     expect(Array.isArray(VOICE_ACTIONS)).toBe(false);
@@ -640,5 +649,13 @@ describe("VOICE_ACTIONS", () => {
     expect(screen.queryByTestId("orchestration-editor")).not.toBeInTheDocument();
     expect(screen.getByTestId("toast")).toHaveTextContent("That project is no longer one this daemon knows");
     expectOneRegistryDispatch("openProjects");
+  });
+});
+
+describe("saysCommand (PR #1451 round 4, audit A1)", () => {
+  /** Scenario: a sentence that says "command" is about the Command field, whatever case or punctuation the transcriber used; "commands" and a word that merely contains it are not. */
+  it("reads the singular word command and nothing else", () => {
+    expect(["Set the command to devbox run agent.", "COMMAND: bash", "start it with the command npm test"].map(saysCommand)).toEqual([true, true, true]);
+    expect(["what commands can I say", "start it", "commander", ""].map(saysCommand)).toEqual([false, false, false, false]);
   });
 });

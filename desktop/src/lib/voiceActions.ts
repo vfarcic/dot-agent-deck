@@ -185,6 +185,18 @@ export type VoiceActionContext = {
    * which only the surface holds. */
   submitAgentPrompt: (target: VoiceDispatchTarget) => void;
   /**
+   * Enter the dictation mode for the pane on screen (PRD #1260): every later
+   * utterance is typed into that agent's prompt until the mode ends.
+   *
+   * Served by the voice surface, because the mode is the surface's own state —
+   * one of its panel states, beside a pending send — and it refuses entry,
+   * through {@link reportRefused}, on a pane that cannot take input.
+   */
+  startDictation: (target: VoiceDispatchTarget) => void;
+  /** Leave the dictation mode. Sends nothing: what was typed stays in the
+   * prompt. The voice surface's, for {@link startDictation}'s reason. */
+  stopDictation: () => void;
+  /**
    * Close the voice surface's own overlay.
    *
    * **Published only while that overlay is OPEN**, and that is the whole
@@ -239,6 +251,17 @@ export type VoiceActionContext = {
    */
   switchDeck: (selection: string, identity?: VoiceDeckIdentityDto) => string | undefined;
   /**
+   * PR #1451 round 3, change 4 — turn the page of the list on screen that is
+   * split into pages while voice is on: the New agent dialog's while it has
+   * one, else the dashboard's or the Daemons screen's. Answers `undefined`
+   * when it turned, or the sentence saying why not (nothing pages, or this is
+   * the last or the first page).
+   *
+   * **Served by the SHELL**, which holds the registry every paged list
+   * publishes to (`useVoicePages`), for the reason {@link switchDeck} is.
+   */
+  turnPage: (delta: 1 | -1) => string | undefined;
+  /**
    * Close the Settings sheet (issue #1197).
    *
    * **Served by the SHELL, and only while Settings is OPEN**, for
@@ -279,6 +302,14 @@ export type VoiceActionContext = {
   goToParentDirectory: (target: VoiceDispatchTarget) => string | undefined;
   useThisDirectory: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * PR #1451 round 3, change 5 — the browser's Filter box: set it to
+   * `target.filterText`, or empty it, through the path a keystroke in the box
+   * takes. Each re-checks the browser the utterance was judged against, as the
+   * moves above do, and answers a refusal in the dialog's words.
+   */
+  filterDirectories: (target: VoiceDispatchTarget) => string | undefined;
+  clearDirectoryFilter: (target: VoiceDispatchTarget) => string | undefined;
+  /**
    * PRD #1223 — the rest of the New agent form by voice: choose the Mode chip
    * a `mode_ref` resolved to (`target.modeId`), set Command to the default
    * command of the agent an `agent_type_ref` resolved to
@@ -291,13 +322,15 @@ export type VoiceActionContext = {
    * so each re-checks {@link VoiceDispatchTarget.declaredForm} against the
    * live form first.
    *
-   * Command is never DICTATED: it is the field that executes, so the only
-   * thing voice puts there is a registry default (`commands.toml` has the
-   * argument).
+   * Command takes the user's own words since PR #1451 round 4 (decision D8):
+   * `setNewAgentCommand` sets it to {@link VoiceDispatchTarget.commandText},
+   * through the path a keystroke in the field takes, so it counts as an edit.
+   * Filling it starts nothing — Start is still a separate act.
    */
   chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
   chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
   nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  setNewAgentCommand: (target: VoiceDispatchTarget) => string | undefined;
   /**
    * Issue #1263 — the New agent dialog's deck field, by voice: choose the deck
    * a `deck_ref` resolved to (`target.preselectDeckId`) through the function a
@@ -439,6 +472,22 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "submitAgentPrompt">, target: VoiceDispatchTarget) => context.submitAgentPrompt(target),
   },
 
+  startDictation: {
+    label: "Type everything said into the open agent's prompt until told to stop",
+    voice: true,
+    needs: ["startDictation"],
+    /** Targets the pane on screen — the row declares no agent param and is
+        `screens = ["agent"]` — and never a pane the user is not looking at. */
+    run: (context: Pick<VoiceActionContext, "startDictation">, target: VoiceDispatchTarget) => context.startDictation(target),
+  },
+
+  stopDictation: {
+    label: "Stop typing what is said into the agent's prompt",
+    voice: true,
+    needs: ["stopDictation"],
+    run: (context: Pick<VoiceActionContext, "stopDictation">) => context.stopDictation(),
+  },
+
   closeTopmost: {
     label: "Close whatever is open over the screen",
     voice: true,
@@ -563,6 +612,28 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "switchDeck"> & Partial<Pick<VoiceActionContext, "reportRefused">>, target: Pick<VoiceDispatchTarget, "deckSelection" | "deckIdentity">) => {
       const refused = context.switchDeck(target.deckSelection ?? "", target.deckIdentity);
       if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  /* PR #1451 round 3, change 4 — a page turn changes which items of a list
+     are showing and nothing else. Voice-only: with voice off nothing pages. */
+  nextPage: {
+    label: "Show the next page of the list on screen",
+    voice: true,
+    needs: ["turnPage", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "turnPage" | "reportRefused">) => {
+      const refused = context.turnPage(1);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  previousPage: {
+    label: "Show the previous page of the list on screen",
+    voice: true,
+    needs: ["turnPage", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "turnPage" | "reportRefused">) => {
+      const refused = context.turnPage(-1);
+      if (refused !== undefined) context.reportRefused(refused);
     },
   },
 
@@ -702,10 +773,33 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  /* PRD #1223 — the three `new_agent_form` rows: Mode, Agent and Name. None
-     starts anything, so none is in PRD #802 D5's confirmation set; the manual
-     chips, picker and Name input are unchanged and call the same functions.
-     Command has no entry here on purpose. */
+  /* PR #1451 round 3, change 5 — the browser's Filter box. Narrowing or
+     widening the listing starts and chooses nothing, and typing in the box is
+     unchanged: it calls the same dialog function. */
+  filterDirectories: {
+    label: "Filter the New agent browser's directories",
+    voice: true,
+    needs: ["filterDirectories", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "filterDirectories" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.filterDirectories(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  clearDirectoryFilter: {
+    label: "Clear the New agent browser's directory filter",
+    voice: true,
+    needs: ["clearDirectoryFilter", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "clearDirectoryFilter" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.clearDirectoryFilter(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  /* PRD #1223 — the `new_agent_form` rows: Mode, Agent and Name, and since
+     PR #1451 round 4 (D8) Command. None starts anything, so none is in PRD
+     #802 D5's confirmation set; the manual chips and the Name and Command
+     inputs are unchanged and call the same functions. */
   chooseNewAgentMode: {
     label: "Choose a Mode chip in the New agent form",
     voice: true,
@@ -732,6 +826,16 @@ export const VOICE_ACTIONS = {
     needs: ["nameNewAgent", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "nameNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
       const refused = context.nameNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  setNewAgentCommand: {
+    label: "Set the New agent form's Command",
+    voice: true,
+    needs: ["setNewAgentCommand", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "setNewAgentCommand" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.setNewAgentCommand(target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
@@ -850,6 +954,16 @@ void NEEDS_COVERS_RUN;
  * It is `AgentViewTarget` because that is the widest target any entry takes;
  * `AgentTarget`'s single member is a subset of it.
  */
+/**
+ * Whether `transcript` says the word "command" — `voice::table::spoken_words`'
+ * reading of it, lowercased runs of letters and digits, and the singular only,
+ * as `voice::outcome::COMMAND_PHRASE_OPENER` ("what commands can I say" is not
+ * about the field).
+ */
+export function saysCommand(transcript: string): boolean {
+  return transcript.toLowerCase().split(/[^\p{L}\p{N}]+/u).includes("command");
+}
+
 export type VoiceDispatchTarget = AgentViewTarget & {
   /**
    * The deck to PRESELECT — what a row's `deck_ref` param resolved to (PRD
@@ -885,6 +999,32 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * resolved to, against the browser's children on screen (PRD #1223).
    */
   directoryPath?: string;
+  /**
+   * The text for the directory browser's Filter box — what a row's
+   * `filter_text` param resolved to (PR #1451 round 3, change 5). The model
+   * extracted it ("letter D" is `d`) and Rust accepted it only because the
+   * user said it, so an entry reading this member reads the user's own words
+   * or nothing. Lowercase; the box matches case-insensitively.
+   */
+  filterText?: string;
+  /**
+   * The command line for the New agent form's Command field — what a row's
+   * `command_text` param resolved to (PR #1451 round 4, decision D8). Rust
+   * kept the model's value only because the transcript holds it, and this is
+   * the TRANSCRIPT's slice of it, as said, less surrounding quotes and a
+   * sentence's full stop.
+   */
+  commandText?: string;
+  /**
+   * The utterance said the word "command" — it was about the Command field
+   * (PR #1451 round 4, audit A1). `voiceStart` refuses to start on such a
+   * sentence, whatever the backend answered: Start acts on the form as shown,
+   * and "Set the command to devbox run agent" (whose `run` is a start word)
+   * or "set the command to bash and start it" asks for a different form.
+   * Rust's action grounding refuses the same sentences
+   * (`voice::outcome::heard_outside_command`); this is the dialog's own half.
+   */
+  saysCommand?: boolean;
   /**
    * The directory browser the utterance was JUDGED against: the deck and the
    * listing `path` the webview declared with it (PRD #1223), or absent when it
@@ -929,6 +1069,13 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    * this member is reading the user's own words or nothing.
    */
   text?: string;
+  /**
+   * Press Enter after {@link text} has been typed — the utterance ended with a
+   * separate send sentence in typing mode (PR #1451 round 3), which Rust
+   * decided and the outcome's `thenSubmit` carries. Read by `typeIntoAgent`
+   * alone.
+   */
+  thenSubmit?: boolean;
   /**
    * Whether an agent's pane is open over the screen.
    *
@@ -992,7 +1139,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *
@@ -1025,7 +1172,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * {@link VoiceActionContext.closeSettings} — and switching deck (PRD #1195),
  * whose selector sits on both screens and writes the shell's settings.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck">;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "switchDeck" | "turnPage">;
 
 /**
  * The members only the OVERVIEW serves (PRD #1223): opening the New agent
@@ -1035,10 +1182,10 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "startNewAgent" | "discardNewAgent";
+export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),
@@ -1055,7 +1202,7 @@ export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "
  * (see `AgentOverview`), which is what keeps "the dialog closed during the
  * round trip" a refusal with a sentence rather than a `needs` miss.
  */
-export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | NewAgentFormMember> & {
+export type NewAgentVoice = Pick<VoiceActionContext, "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember> & {
   directories: import("./bridge").VoiceDirectoriesDto | undefined;
   /**
    * The dialog's own declaration — present for as long as it is mounted, with

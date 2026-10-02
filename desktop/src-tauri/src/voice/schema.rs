@@ -351,14 +351,21 @@ mod tests {
                 "voice_off".to_string(),
                 "list_commands".to_string(),
                 "dictate_to_agent".to_string(),
+                "dictation_on".to_string(),
+                "dictation_off".to_string(),
                 "submit_prompt".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
                 "use_this_directory".to_string(),
+                "filter_directories".to_string(),
+                "clear_directory_filter".to_string(),
+                "next_page".to_string(),
+                "previous_page".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "set_new_agent_command".to_string(),
                 "choose_deck".to_string(),
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
@@ -422,14 +429,21 @@ mod tests {
                 "voice_off",
                 "list_commands",
                 "dictate_to_agent",
+                "dictation_on",
+                "dictation_off",
                 "submit_prompt",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
                 "use_this_directory",
+                "filter_directories",
+                "clear_directory_filter",
+                "next_page",
+                "previous_page",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "set_new_agent_command",
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
@@ -468,6 +482,7 @@ mod tests {
             path: "/home/dev".to_string(),
             has_parent,
             entries: Vec::new(),
+            paging: None,
         }
     }
 
@@ -481,8 +496,14 @@ mod tests {
             annotate_with(table(), screen, directories, None)
                 .into_iter()
                 .filter(|command| {
-                    ["open_dir", "go_to_parent", "use_this_directory"]
-                        .contains(&command.id.as_str())
+                    [
+                        "open_dir",
+                        "go_to_parent",
+                        "use_this_directory",
+                        "filter_directories",
+                        "clear_directory_filter",
+                    ]
+                    .contains(&command.id.as_str())
                 })
                 .map(|command| (command.id, command.callable))
                 .collect::<Vec<_>>()
@@ -495,6 +516,8 @@ mod tests {
                 ("open_dir".to_string(), true),
                 ("go_to_parent".to_string(), true),
                 ("use_this_directory".to_string(), true),
+                ("filter_directories".to_string(), true),
+                ("clear_directory_filter".to_string(), true),
             ]
         );
         assert_eq!(
@@ -503,6 +526,8 @@ mod tests {
                 ("open_dir".to_string(), true),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), true),
+                ("filter_directories".to_string(), true),
+                ("clear_directory_filter".to_string(), true),
             ]
         );
         for screen in [Screen::Deck, Screen::Agent] {
@@ -519,8 +544,14 @@ mod tests {
             annotate_with(table(), Screen::Overview, directories, None)
                 .into_iter()
                 .filter(|command| {
-                    !["open_dir", "go_to_parent", "use_this_directory"]
-                        .contains(&command.id.as_str())
+                    ![
+                        "open_dir",
+                        "go_to_parent",
+                        "use_this_directory",
+                        "filter_directories",
+                        "clear_directory_filter",
+                    ]
+                    .contains(&command.id.as_str())
                 })
                 .map(|command| (command.id, command.callable))
                 .collect::<Vec<_>>()
@@ -588,16 +619,24 @@ mod tests {
                 // The dictation pair is `agent`-only: with no pane on screen
                 // there is no one agent whose prompt "type this" could mean.
                 ("dictate_to_agent".to_string(), false),
+                ("dictation_on".to_string(), false),
+                ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), true),
+                ("previous_page".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
@@ -621,21 +660,30 @@ mod tests {
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), false),
+                ("dictation_on".to_string(), false),
+                ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), true),
+                ("previous_page".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
-                // The D5 stops: on the overview, and each only opens a confirmation.
+                // The D5 stops: on the overview with the New agent dialog
+                // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), true),
             ]
@@ -652,16 +700,24 @@ mod tests {
                 ("voice_off".to_string(), true),
                 ("list_commands".to_string(), true),
                 ("dictate_to_agent".to_string(), true),
+                ("dictation_on".to_string(), true),
+                ("dictation_off".to_string(), true),
                 ("submit_prompt".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
                 ("go_to_parent".to_string(), false),
                 ("use_this_directory".to_string(), false),
+                ("filter_directories".to_string(), false),
+                ("clear_directory_filter".to_string(), false),
+                // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
+                ("next_page".to_string(), false),
+                ("previous_page".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),

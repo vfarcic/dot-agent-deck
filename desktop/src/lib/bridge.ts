@@ -1,4 +1,5 @@
 import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey } from "./agentKey";
@@ -8,6 +9,8 @@ import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
+import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
+import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -71,6 +74,8 @@ export interface DesktopSnapshotDto {
     /** Issue #1240: the deck honours the directory browser's listing options. */
     listingOptions?: boolean;
     error?: string;
+    /** The technical half of `error` — break names, protocol numbers, builds — for a disclosure, never the sentence. */
+    errorDetail?: string;
     clientProtocolVersion: number;
     serverProtocolVersion?: number;
     clientBuildVersion: string;
@@ -749,6 +754,23 @@ export interface VoiceDirectoriesDto {
   path: string;
   hasParent: boolean;
   entries: { name: string; path: string }[];
+  /**
+   * PR #1451 round 3, change 4 — present only while voice is on and the rows
+   * are split into pages: `entries` is then the page showing, and this names
+   * the page and the children on the others (`voice::VoicePaging`).
+   */
+  paging?: VoicePagingDto;
+}
+
+/**
+ * A list split into pages while voice is on, as declared to Rust
+ * (`voice::VoicePaging`): the page showing, and each item on another page by
+ * the name it shows and its page — so a name said for one is refused with its
+ * page, never chosen.
+ */
+export interface VoicePagingDto {
+  page: number;
+  elsewhere: { name: string; page: number }[];
 }
 
 /**
@@ -761,6 +783,18 @@ export interface VoiceDirectoriesDto {
 export interface VoiceDeckChoiceDto {
   deckId: string;
   reason?: string;
+}
+
+/**
+ * PRD #1260 — the agent the voice panel is in the dictation mode for, declared
+ * with each utterance while the mode is on and absent otherwise —
+ * `voice::VoiceDictationTarget`. Its presence is the whole signal: Rust then
+ * answers the utterance locally (the reserved phrases, or the words typed
+ * whole) and calls no Commands backend.
+ */
+export interface VoiceDictationTargetDto {
+  deckId: string;
+  agentId: string;
 }
 
 /**
@@ -786,6 +820,8 @@ export interface VoiceNewAgentDto {
      * than answered with the nearest chip that is.
      */
     withheldModes?: { id: string; label: string }[];
+    /** PR #1451 round 3, change 4 — the Mode row's pages while it pages; `modes` is then the page showing. */
+    modePaging?: VoicePagingDto;
   };
 }
 
@@ -839,6 +875,21 @@ export interface VoiceResolvedParamDto {
    * row before writing. Absent for the local deck, which has no remote address.
    */
   deckIdentity?: VoiceDeckIdentityDto;
+  /**
+   * PRD #1261 — on an offered candidate of a `param_ambiguous` outcome alone,
+   * every name the entry answers to, from the same per-kind list Rust's
+   * `voice::choice::answer` matches a spoken answer against
+   * (`ResolvedParam::names`). `answerChoiceLocally` reads these beside the
+   * label, never `value`. Rust omits it when empty.
+   */
+  names?: string[];
+  /**
+   * PR #1451 round 3, change 3 — on an `agent_ref` chosen by its number on
+   * the dashboard alone: the deck that agent is on, since those rows span
+   * every deck where a resolved agent is the selected deck's. Never sent by
+   * Rust.
+   */
+  deckId?: string;
 }
 
 /**
@@ -868,15 +919,20 @@ export interface VoiceDeckIdentityDto extends Pick<RemoteEndpointDto, RemoteAddr
  * field and would refuse every switch to that row.
  */
 function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
-  if (result.outcome.kind !== "dispatch") return result;
-  const params = result.outcome.params.map((param) => {
+  const keyed = (param: VoiceResolvedParamDto): VoiceResolvedParamDto => {
     const identity = param.deckIdentity;
     if (!identity) return param;
     const sent = identity as Partial<Record<RemoteAddressField, unknown>>;
     const deckIdentity = Object.fromEntries(REMOTE_ADDRESS_FIELDS.map((field) => [field, sent[field] ?? undefined])) as unknown as VoiceDeckIdentityDto;
     return { ...param, deckIdentity };
-  });
-  return { ...result, outcome: { ...result.outcome, params } };
+  };
+  /* PRD #1261 — a switch offered as a choice carries each candidate's
+     identity too, and the chosen one reaches the same guard. */
+  if (result.outcome.kind === "param_ambiguous" && result.outcome.candidates) {
+    return { ...result, outcome: { ...result.outcome, candidates: result.outcome.candidates.map(keyed) } };
+  }
+  if (result.outcome.kind !== "dispatch") return result;
+  return { ...result, outcome: { ...result.outcome, params: result.outcome.params.map(keyed) } };
 }
 
 /**
@@ -891,14 +947,27 @@ function withDeckIdentityKeys(result: VoiceResultDto): VoiceResultDto {
  * `params`.
  */
 export type VoiceOutcomeDto =
-  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string }
+  /*
+    PR #1451 round 3 — `thenSubmit` is set on a dictation dispatch made in
+    typing mode whose utterance ended with a separate send sentence ("… Send
+    it."): the panel types `params`' text and then presses Enter, once that
+    write has landed. Absent everywhere else.
+  */
+  | { kind: "dispatch"; transcript: string; action: string; invoke: string; params: VoiceResolvedParamDto[]; sentence: string; thenSubmit?: boolean }
   | { kind: "unavailable"; transcript: string; action: string; hint: string; sentence: string }
   | { kind: "no_match"; transcript: string; sentence: string }
   | { kind: "unknown_action"; transcript: string; action: string; sentence: string }
   | { kind: "action_ungrounded"; transcript: string; action: string; sentence: string }
   | { kind: "param_missing"; transcript: string; action: string; param: string; sentence: string }
   | { kind: "param_unresolved"; transcript: string; action: string; param: string; spoken: string; sentence: string }
-  | { kind: "param_ambiguous"; transcript: string; action: string; param: string; spoken: string; matches: string[]; sentence: string }
+  /*
+    PRD #1261 — `candidates` is the tie as something to choose from, in the
+    order offered, and `params`, `invoke` and `reports` are what a chosen one is
+    dispatched with and reported as. Empty `candidates` means no choice is
+    offered (a tie beyond `VOICE_CHOICE_MAX`), and the four are optional
+    because a fixture written before them carries none.
+  */
+  | { kind: "param_ambiguous"; transcript: string; action: string; invoke?: string; param: string; spoken: string; matches: string[]; candidates?: VoiceResolvedParamDto[]; params?: VoiceResolvedParamDto[]; reports?: string[]; sentence: string }
   | { kind: "resolution_failed"; transcript: string; detail: string; sentence: string }
   | { kind: "transcription_failed"; detail: string; sentence: string };
 
@@ -1628,9 +1697,12 @@ export interface DeckBridge {
    * section the Deck selector is rendering. `useDesktopSettings.save` applies
    * an edit at once and writes it behind, so this — not `desktop.toml` — is
    * the list "switch deck to …" has to resolve against, or a deck the selector
-   * already shows is refused until the write lands.
+   * already shows is refused until the write lands. `dictation` is the sixth
+   * (PRD #1260): the agent the panel is typing to while the dictation mode is
+   * on ({@link VoiceDictationTargetDto}), which keeps that utterance off the
+   * Commands backend entirely.
    */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void;
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void;
   /**
    * Take one utterance — transcribed from the microphone — to an outcome
    * carrying the sentence to show (PRD #802 M6).
@@ -1649,6 +1721,27 @@ export interface DeckBridge {
    * call itself could not be made.
    */
   resolveVoice(utterance: string): Promise<VoiceResultDto>;
+  /**
+   * PRD #1261 — answer a pending numbered choice (`desktop_voice_choice`):
+   * `offered` is the list on screen, `action` the row it completes. Judged
+   * against the declaration {@link declareVoiceScreen} last stated, so the
+   * panel declares immediately before, exactly as it does for a resolve.
+   *
+   * **No Commands backend call**: the answer is a cancel phrase, an ordinal or
+   * a name among the offered entries, decided by `voice::choice::answer`, and
+   * a selected entry is re-checked against what the app observes now. What
+   * runs is the panel's to dispatch, through the same checks a resolved
+   * dispatch meets.
+   */
+  answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto>;
+  /**
+   * PR #1451 round 3, change 3 — answer a bare number said against the
+   * numbered list on screen (`desktop_voice_number`): `heard` is the list as
+   * it stood when the user began to speak, `generation` the list's generation
+   * on screen now. **No Commands backend call**: `voice::numbers::answer`
+   * decides it, and what runs is the panel's to dispatch.
+   */
+  answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
@@ -1819,7 +1912,7 @@ function fixtureAcceptsPath(path: string): boolean {
 }
 
 /** The sentence the live crate's `newAgentReason` carries for a deck without `list-directories` (PRD #1223 U1), repeated by the fixture's older decks. */
-export const FIXTURE_NO_LISTING_REASON = "This daemon does not advertise list-directories, so it cannot be browsed for a directory to start in. Create agents on it from the TUI on its host, or upgrade the daemon.";
+export const FIXTURE_NO_LISTING_REASON = "This daemon is too old to let this app browse its folders, so new agents cannot be started on it from here. Start them from a terminal on its machine, or update the daemon.";
 
 /** What a fixture deck says about a path that names no directory it has, in the daemon's own `unresolved` wording. */
 /** The live crate's `CONFIGURED_ROLE_COMMAND_UNSUPPORTED`, repeated by the fixture's older and non-Unix decks (PRD #1223 M6). */
@@ -2002,15 +2095,22 @@ export function modeScopedKey(base: string): string {
  * for EVERY incompatible status, which is wrong for the far more common
  * build-stamp case and would have told a user to look at a protocol version
  * that matched (issue #801). It now says which of the two checks failed, using
- * the same flag the Connect anyway affordance is gated on.
+ * the same flag the Connect anyway affordance is gated on — in the user's terms
+ * (CLAUDE.md rule 21), with the numbers left to {@link fallbackConnectionDetail}.
  */
 function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
   if (connection.status === "connected") return "Daemon responding";
   if (connection.status !== "incompatible") return "Daemon unavailable";
   if (connection.buildStampMismatchOnly) {
-    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+    return "This daemon and this app are different versions. The app has not connected, because it could misread some of what this daemon reports. Run the same version of both.";
   }
-  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+  return "This daemon and this app are different versions and cannot work together. Run the same version of both.";
+}
+
+/** The technical half of {@link fallbackConnectionMessage}, for the Technical details disclosure. */
+function fallbackConnectionDetail(connection: DesktopSnapshotDto["connection"]): string | undefined {
+  if (connection.status !== "incompatible") return undefined;
+  return `Protocol: app ${connection.clientProtocolVersion}, daemon ${connection.serverProtocolVersion ?? "not reported"}. Builds: app ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion ?? "not reported"}.`;
 }
 
 /**
@@ -2183,6 +2283,9 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       deckId: dto.connection.deckId,
       socketPath: dto.connection.socketPath,
       message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
+      // Paired with the message it explains: the crate's own detail with the
+      // crate's sentence, the synthesised one only with the synthesised sentence.
+      detail: dto.connection.error === undefined ? fallbackConnectionDetail(dto.connection) : dto.connection.errorDetail,
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
       runningAgentCount: dto.connection.runningAgentCount,
       buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,
@@ -2221,7 +2324,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2230,6 +2333,7 @@ class FixtureDeckBridge implements DeckBridge {
    * every scenario but `fleet`, which is the three-deck one.
    */
   private fleet: DeckFleet;
+  private readonly fixtureState: FixtureState;
   private fleetListeners = new Set<FleetListener>();
   private terminalListeners = new Set<TerminalListener>();
   private fixtureStep = 0;
@@ -2271,6 +2375,7 @@ class FixtureDeckBridge implements DeckBridge {
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
     const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
+    this.fixtureState = state;
     this.fleet = createFixtureFleet(state);
     const older = new URLSearchParams(window.location.search).get("older");
     if (older === "1" || older === "all") this.olderDecks = "all";
@@ -2655,10 +2760,23 @@ class FixtureDeckBridge implements DeckBridge {
    */
   private voiceScreen: VoiceScreen = "deck";
 
-  /* The preview's vocabulary has no directory rows, so a declared browser is
-     accepted and has nothing to feed. */
-  declareVoiceScreen(screen: VoiceScreen): void {
+  /** PRD #1260 — the dictation mode declared with that screen, if it is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
+
+  /** Whether a directory listing was declared with that screen (PR #1451 round 3, change 5). */
+  private voiceDirectoryListing = false;
+
+  /** Whether the New agent dialog's live form was declared with it (PR #1451 round 4, D8). */
+  private voiceNewAgentForm = false;
+
+  /* The preview's directory rows (the Filter box's two) and its Command row
+     need only to know a listing or a live form is showing; the rows
+     themselves feed nothing here. */
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
+    this.voiceDirectoryListing = directories !== undefined;
+    this.voiceNewAgentForm = newAgent?.form !== undefined;
+    this.voiceDictation = dictation;
   }
 
   /**
@@ -2671,7 +2789,19 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm);
+  }
+
+  /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
+  async answerVoiceChoice(utterance: string, _action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    await Promise.resolve();
+    return answerChoiceLocally(utterance, offered);
+  }
+
+  /** PR #1451 round 3 — likewise for a spoken number, against the numbered list on screen. */
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    await Promise.resolve();
+    return answerNumberLocally(utterance, heard, generation);
   }
 
   /**
@@ -2682,9 +2812,9 @@ class FixtureDeckBridge implements DeckBridge {
    * run — which is fewer rows than a live build has, and saying so is the point
    * of a preview rather than a shortcoming of one.
    */
-  async voiceCommands(screen: VoiceScreen): Promise<VoiceCommandDto[]> {
+  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]> {
     await Promise.resolve();
-    return fixtureVoiceCommands(screen);
+    return fixtureVoiceCommands(screen, directories !== undefined, newAgent?.form !== undefined);
   }
 
   /**
@@ -2832,7 +2962,7 @@ class FixtureDeckBridge implements DeckBridge {
     if (path !== undefined && !fixtureAcceptsPath(path)) throw new Error(FIXTURE_PASTED_PATH_REFUSAL);
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
     const wanted = path === undefined ? home : path.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
-    const directory = fixtureDirectoryTree(home).get(wanted);
+    const directory = (this.fixtureState === "voice-pages" ? voicePagesDirectory(wanted) : undefined) ?? fixtureDirectoryTree(home).get(wanted);
     if (!directory) throw new Error(FIXTURE_UNRESOLVED_REFUSAL);
     return {
       kind: "listing",
@@ -2886,7 +3016,7 @@ class FixtureDeckBridge implements DeckBridge {
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = fixtureProjectOrchestrations(home, path);
+    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
@@ -4245,18 +4375,36 @@ export class TauriDeckBridge implements DeckBridge {
   private voiceDeckStep: VoiceDeckChoiceDto[] | undefined;
   /** PRD #1195 — the Deck selector's section as it was rendered. */
   private voiceEndpoints: EndpointSettingsDto | undefined;
+  /** PRD #1260 — the dictation mode's target, while the mode is on. */
+  private voiceDictation: VoiceDictationTargetDto | undefined;
 
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto): void {
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, deckStep?: VoiceDeckChoiceDto[], endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
     this.voiceDirectories = directories;
     this.voiceNewAgent = newAgent;
     this.voiceDeckStep = deckStep;
     this.voiceEndpoints = endpoints;
+    this.voiceDictation = dictation;
+  }
+
+  async answerVoiceChoice(utterance: string, action: string, offered: VoiceResolvedParamDto[]): Promise<VoiceChoiceAnswerDto> {
+    const invoke = await this.getInvoke();
+    const answer = await invoke<VoiceChoiceAnswerDto>("desktop_voice_choice", { utterance, action, offered, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null });
+    /* Rust hands back the entry exactly as offered; the offered one is
+       returned, so its identity keeps the keys it was given on the way in. */
+    if (answer.kind !== "selected") return answer;
+    const candidate = offered.find((entry) => entry.value === answer.candidate.value);
+    return candidate ? { kind: "selected", candidate } : { kind: "refused" };
+  }
+
+  async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
+    const invoke = await this.getInvoke();
+    return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     const invoke = await this.getInvoke();
-    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null }));
+    return withDeckIdentityKeys(await invoke<VoiceResultDto>("desktop_voice_resolve", { utterance, screen: this.voiceScreen, directories: this.voiceDirectories ?? null, newAgent: this.voiceNewAgent ?? null, deckStep: this.voiceDeckStep ?? null, endpoints: this.voiceEndpoints ?? null, dictation: this.voiceDictation ?? null }));
   }
 
   /**

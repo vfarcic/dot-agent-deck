@@ -85,7 +85,8 @@ pub const PARAM_KIND_RS: &str = "desktop/src-tauri/src/voice/table.rs";
 /// dictation MODE matched its exit phrases in the webview. The mode is gone and
 /// the two lists that replaced it sit ahead of the resolver in Rust instead, so
 /// the assertion moved with them rather than being deleted — which is the whole
-/// point of it existing.
+/// point of it existing. PRD #1260's mode added three more lists here, matched
+/// the same way and checked the same way.
 pub const DICTATION_RS: &str = "desktop/src-tauri/src/voice/dictation.rs";
 
 /// The row whose `description` has to name every phrase [`OPENER_LIST`] matches
@@ -96,6 +97,15 @@ const SUBMIT_ROW: &str = "submit_prompt";
 const OPENER_LIST: &str = "DICTATION_OPENERS";
 /// The whole-utterance phrases that press Enter.
 const SUBMIT_LIST: &str = "SUBMIT_PHRASES";
+/// The whole-utterance phrases that enter and leave the dictation mode (PRD
+/// #1260), and the ones that turn voice off while it is on — each backed by its
+/// own row.
+const DICTATION_ON_LIST: &str = "DICTATION_ON_PHRASES";
+const DICTATION_OFF_LIST: &str = "DICTATION_OFF_PHRASES";
+const VOICE_OFF_LIST: &str = "VOICE_OFF_PHRASES";
+const DICTATION_ON_ROW: &str = "dictation_on";
+const DICTATION_OFF_ROW: &str = "dictation_off";
+const VOICE_OFF_ROW: &str = "voice_off";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -104,8 +114,8 @@ const SUBMIT_LIST: &str = "SUBMIT_PHRASES";
 /// consistent, not that the app's capabilities are all in it.
 pub const VOICE_REGISTRY_RULE: &str = "PRD #802 rule 14: `desktop/src-tauri/src/voice/commands.toml` and `VOICE_ACTIONS` \
      (`desktop/src/lib/voiceActions.ts`) must resolve against each other, and every registry entry must carry either \
-     `voice: true` or a written `no_voice` reason, and the two locally-matched phrase lists in \
-     `desktop/src-tauri/src/voice/dictation.rs` must stay disjoint and covered by their own rows' \
+     `voice: true` or a written `no_voice` reason, and the locally-matched phrase lists in \
+     `desktop/src-tauri/src/voice/dictation.rs` must stay pairwise disjoint and covered by their own rows' \
      descriptions. WHAT THIS RULE DOES NOT SEE: a control wired with a bare `onClick` \
      that never reaches the registry — 80 such sites in non-test `.tsx` when this was written — so a green rule 14 is \
      NOT evidence that no capability was forgotten";
@@ -239,8 +249,8 @@ pub fn check(sources: &Sources) -> Vec<String> {
         }
     }
 
-    // Assertions 5 and 6 (PRD #802 D6, rebuilt): the two phrase lists matched
-    // ahead of the resolver.
+    // Assertions 5 and 6 (PRD #802 D6, rebuilt; PRD #1260): the phrase lists
+    // matched ahead of the resolver.
     //
     // **These are the only spoken words in the product the model is never asked
     // about**, and they exist for a stated reason: an utterance that opens with
@@ -263,10 +273,11 @@ pub fn check(sources: &Sources) -> Vec<String> {
 /// the fast path is only an OPTIMISATION rather than the vocabulary — the
 /// fallback has to be able to reach the same row for the same words.
 ///
-/// **6 — the two lists are disjoint.** The submit phrases are checked FIRST, so
-/// a phrase in both would silently make that order load-bearing: an utterance
-/// that was both an opener and a submit phrase would submit, and the list it
-/// was added to second would look like it had no effect.
+/// **6 — the lists are pairwise disjoint.** Each is checked in a fixed order —
+/// submit ahead of the openers, and while dictating (PRD #1260) voice off, then
+/// dictation off, then submit — so a phrase in two would silently make that
+/// order load-bearing: the list it was added to second would look like it had
+/// no effect.
 ///
 /// The check runs one way only. A phrasing in a row's `description` that no
 /// list matches is not an inconsistency at all — that is precisely the
@@ -297,15 +308,20 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
             BTreeSet::new()
         }
     };
-    let openers = list(OPENER_LIST, findings);
-    let submits = list(SUBMIT_LIST, findings);
+    let lists: Vec<(&str, BTreeSet<String>, &str)> = [
+        (OPENER_LIST, DICTATE_ROW),
+        (SUBMIT_LIST, SUBMIT_ROW),
+        (DICTATION_ON_LIST, DICTATION_ON_ROW),
+        (DICTATION_OFF_LIST, DICTATION_OFF_ROW),
+        (VOICE_OFF_LIST, VOICE_OFF_ROW),
+    ]
+    .into_iter()
+    .map(|(name, row_id)| (name, list(name, findings), row_id))
+    .collect();
 
     // Assertion 5, once per list against its own row.
-    for (list_name, phrases, row_id) in [
-        (OPENER_LIST, &openers, DICTATE_ROW),
-        (SUBMIT_LIST, &submits, SUBMIT_ROW),
-    ] {
-        match rows.iter().find(|row| row.id == row_id) {
+    for (list_name, phrases, row_id) in &lists {
+        match rows.iter().find(|row| row.id == *row_id) {
             Some(row) => {
                 // Whitespace-collapsed before the substring test, because a
                 // `"""…"""` description keeps its newlines: a phrase that
@@ -334,12 +350,16 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         }
     }
 
-    // Assertion 6.
-    for phrase in openers.intersection(&submits) {
-        findings.push(format!(
-            "{DICTATION_RS}: {phrase:?} is in both `{OPENER_LIST}` and `{SUBMIT_LIST}`. The submit list is checked \
-             first, so a shared phrase makes that precedence silently load-bearing"
-        ));
+    // Assertion 6, over every pair.
+    for (at, (left_name, left, _)) in lists.iter().enumerate() {
+        for (right_name, right, _) in &lists[at + 1..] {
+            for phrase in left.intersection(right) {
+                findings.push(format!(
+                    "{DICTATION_RS}: {phrase:?} is in both `{left_name}` and `{right_name}`. The lists are checked \
+                     in a fixed order, so a shared phrase makes that order silently load-bearing"
+                ));
+            }
+        }
     }
 }
 
@@ -350,7 +370,10 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
 /// assertions and a shared helper taking a delimiter reads worse than two that
 /// say which shape they are for.
 fn array_body(masked: &[char], name: &str) -> Option<Range<usize>> {
-    let at = find(masked, 0, name)?;
+    // Anchored on the declaration rather than the bare name, so a use of the
+    // list elsewhere in the file — the tests name every one — or a renamed
+    // declaration that still contains the name cannot stand in for it.
+    let at = find(masked, 0, &format!("pub const {name}:"))?;
     let equals = masked[at..].iter().position(|c| *c == '=')? + at;
     let open = skip_space(masked, equals + 1);
     if open >= masked.len() || masked[open] != '[' {
@@ -1144,8 +1167,10 @@ mod tests {
             [
                 "agent_ref",
                 "agent_type_ref",
+                "command_text",
                 "deck_ref",
                 "dir_ref",
+                "filter_text",
                 "mode_ref",
                 "orchestration_ref",
                 "spoken_prefix",
@@ -1423,6 +1448,69 @@ mod tests {
             );
         });
         assert_reports(&empty, "yielded no phrases");
+    }
+
+    /// Scenario: removing either local mode-switch list is a rule-14 finding,
+    /// rather than a vacuous pass that silently stops checking those phrases.
+    #[test]
+    fn a_missing_dictation_mode_phrase_list_is_a_finding() {
+        for list in [
+            "DICTATION_ON_PHRASES",
+            "DICTATION_OFF_PHRASES",
+            "VOICE_OFF_PHRASES",
+        ] {
+            let mut sources = checked_in();
+            let original = sources.dictation_rs.clone();
+            sources.dictation_rs = sources.dictation_rs.replace(
+                &format!("pub const {list}:"),
+                &format!("pub const REMOVED_{list}:"),
+            );
+            assert!(
+                sources.dictation_rs != original,
+                "the shipped {list} list is missing"
+            );
+            assert_reports(&check(&sources), &format!("holds no `{list} = ["));
+        }
+    }
+
+    /// Scenario: a new mode phrase absent from its row's description and a
+    /// phrase shared with submit are both caught using planted source text.
+    #[test]
+    fn a_planted_dictation_mode_phrase_drift_or_overlap_is_caught() {
+        fn insert_phrase(source: &mut String, list: &str, phrase: &str) {
+            let declaration = source
+                .find(&format!("pub const {list}:"))
+                .unwrap_or_else(|| panic!("the shipped {list} list is missing"));
+            let opening = source[declaration..]
+                .find("= [")
+                .unwrap_or_else(|| panic!("{list} is not an array"))
+                + declaration
+                + 3;
+            source.insert_str(opening, &format!("\"{phrase}\", "));
+        }
+        let mut unnamed = checked_in();
+        insert_phrase(
+            &mut unnamed.dictation_rs,
+            "DICTATION_ON_PHRASES",
+            "scribble forever",
+        );
+        assert_reports(&check(&unnamed), "scribble forever");
+
+        let mut overlap = checked_in();
+        insert_phrase(
+            &mut overlap.dictation_rs,
+            "DICTATION_OFF_PHRASES",
+            "send it",
+        );
+        assert_reports(&check(&overlap), "is in both");
+
+        let mut voice_off_overlap = checked_in();
+        insert_phrase(
+            &mut voice_off_overlap.dictation_rs,
+            "VOICE_OFF_PHRASES",
+            "type on",
+        );
+        assert_reports(&check(&voice_off_overlap), "is in both");
     }
 
     /// The masker is what makes every scan above safe, so it is pinned

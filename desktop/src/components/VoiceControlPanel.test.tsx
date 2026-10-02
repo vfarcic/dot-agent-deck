@@ -28,6 +28,7 @@ import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
+  VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
   VOICE_UNAVAILABLE,
   VOICE_UNDO_WINDOW_MS,
@@ -186,6 +187,13 @@ async function completeAutomaticUtterance(voice: VoiceControls) {
   expect(voice.voiceStop).toHaveBeenCalledTimes(1);
 }
 
+/** Let a held answer — one that ran nothing — be reported: it waits for the rest of its sentence first (PR #1451). */
+async function settleHeldAnswer() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS);
+  });
+}
+
 function automaticVoice(outcome: VoiceTranscriptionOutcomeDto, capped = false): VoiceControls {
   const voiceStart = vi.fn(async () => voiceStatus({ state: "recording", available: true, backend: "remote" }));
   let delivered = false;
@@ -208,6 +216,37 @@ function automaticVoice(outcome: VoiceTranscriptionOutcomeDto, capped = false): 
     voiceStop: vi.fn(async () => transcription(outcome)),
   });
 }
+
+/**
+ * Several recordings in a row: each `voiceStart` opens one, the next poll
+ * reports it done (with `status` merged in), and `voiceStop` answers with that
+ * step's outcome. A step with `capped` set is never stopped, only cancelled.
+ */
+function sequencedVoice(steps: Array<{ outcome: VoiceTranscriptionOutcomeDto; status?: Partial<VoiceStatusDto> }>): VoiceControls {
+  const voiceStart = vi.fn(async () => voiceStatus({ state: "recording", available: true, backend: "remote" }));
+  let delivered = 0;
+  let stopped = 0;
+  return voiceControls({
+    voiceStart,
+    voiceStatus: vi.fn(async () => {
+      const opened = voiceStart.mock.calls.length;
+      if (opened === 0) return voiceStatus({ available: true, backend: "remote" });
+      if (delivered < opened && opened <= steps.length) {
+        delivered = opened;
+        return voiceStatus({ state: "done", capturedMs: 1_240, available: true, backend: "remote", ...steps[opened - 1].status });
+      }
+      return voiceStatus({ state: "recording", available: true, backend: "remote" });
+    }),
+    voiceStop: vi.fn(async () => transcription(steps[Math.min(stopped++, steps.length - 1)].outcome)),
+  });
+}
+
+/** What `voice::transcribe::NOTHING_HEARD` says, as the crate sends it. */
+const SILENT: VoiceTranscriptionOutcomeDto = {
+  kind: "silent",
+  detail: "only 60 ms of speech inside the loudest 200 ms, where 120 ms is needed — the loudest moment reached 858 against a room at 64, where speech has to reach 192",
+  sentence: "I could not make out any words. Say that again; still listening.",
+};
 
 const DISPATCH = {
   kind: "dispatch" as const,
@@ -287,14 +326,8 @@ const TRANSCRIPTION_OUTCOMES: Array<{ name: string; outcome: VoiceTranscriptionO
     name: "capture-failure",
     outcome: { kind: "failed", detail: "the microphone did not produce audio", sentence: "Could not turn that recording into text (the microphone did not produce audio)." },
   },
-  // A noise ended a segment and there was nothing in it. Neither a failure nor
-  // an instruction, and no resolver call — the assertion below that
-  // `resolveVoice` was never called is the half that matters here, because a
-  // segment of room tone must cost nothing at all.
-  {
-    name: "silent",
-    outcome: { kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." },
-  },
+  // `silent` is deliberately not here: it renders NOTHING — see "says nothing
+  // about a segment with no speech in it".
 ];
 
 describe("voice control panel", () => {
@@ -390,36 +423,56 @@ describe("voice control panel", () => {
   });
 
   /**
-   * Scenario: a segment of room tone with a noise in it comes back `silent`.
-   * The row prints the measurement behind the refusal, keeps listening, and
-   * spends no resolver call — and it never blames the user's microphone.
+   * Scenario: PR #1451's hand test — voice is on, a command has just been
+   * reported, and the user types on the keyboard instead of talking. Each burst
+   * of keys ends a segment that comes back `silent`. The row says nothing about
+   * it: no "Heard …", no refusal with milliseconds and levels in it, the last
+   * report stays where it was, and no resolver call is spent.
    */
-  it("reports a segment with no speech in it without calling the resolver", async () => {
+  it("says nothing about a segment with no speech in it", async () => {
     vi.useFakeTimers();
-    const voice = automaticVoice({ kind: "silent", detail: "only 40 ms of speech inside the loudest 200 ms, where 120 ms is needed", sentence: "I did not hear enough to transcribe — 40 ms of speech inside the loudest 200 ms, where 120 ms is needed. Say that again; still listening." });
+    const voice = sequencedVoice([{ outcome: heard("show me every agent") }, { outcome: SILENT }, { outcome: SILENT }]);
     const resolveVoice = resolver(result(DISPATCH));
     render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
 
     await turnVoiceOn(voice);
-    await completeAutomaticUtterance(voice);
+    for (let utterance = 0; utterance < 3; utterance += 1) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    }
+    expect(voice.voiceStop).toHaveBeenCalledTimes(3);
 
     const report = screen.getByTestId("voice-report");
-    // The measurement, not "Nothing was said" — a user who DID speak has to be
-    // able to tell a quiet input from a short utterance from a bug, and the
-    // old wording told them they had imagined speaking (PRD #802).
-    expect(report).toHaveTextContent("I did not hear enough to transcribe");
-    expect(report).toHaveTextContent("40 ms of speech inside the loudest 200 ms");
-    expect(report).toHaveTextContent("still listening");
-    expect(report).not.toHaveTextContent(/nothing was said/i);
-    // The two readings the wording exists to avoid: a failure, and a fault in
-    // hardware that is working perfectly.
-    expect(report).not.toHaveTextContent(/could not/i);
-    expect(report).not.toHaveTextContent(/microphone/i);
-    expect(resolveVoice).not.toHaveBeenCalled();
-    // Still on, and the device was reopened for the next utterance, which is
-    // what makes "still listening" true rather than reassuring.
+    expect(report).toHaveTextContent("Opening the agent dashboard.");
+    expect(report).not.toHaveTextContent(SILENT.sentence);
+    expect(report).not.toHaveTextContent(/did not hear|make out|ms of speech|loudest/i);
+    expect(resolveVoice).toHaveBeenCalledTimes(1);
+    // Still on, and the device reopened after every segment.
     expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
-    expect(voice.voiceStart.mock.calls.length).toBeGreaterThan(1);
+    expect(voice.voiceStart).toHaveBeenCalledTimes(4);
+  });
+
+  /**
+   * Scenario: the microphone stays open for thirty seconds while the user
+   * types and never speaks, so the recording runs to the cap with nobody's
+   * speech in it. It is dropped without a word — no "ran to the 30 s limit" —
+   * and listening resumes. A capped recording somebody DID speak in still says
+   * so (the test below).
+   */
+  it("drops a capped recording nobody spoke in without a word", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: SILENT, status: { capped: true, capturedMs: 30_000, speech: false } }]);
+    const resolveVoice = resolver(result(DISPATCH));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+
+    expect(voice.voiceStop).not.toHaveBeenCalled();
+    expect(voice.voiceCancel).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(VOICE_CAP_DISCARDED)).not.toBeInTheDocument();
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(/30 s/);
+    expect(voice.voiceStart).toHaveBeenCalledTimes(2);
+    expect(voiceButton()).toHaveAttribute("aria-pressed", "true");
   });
 
   /**
@@ -548,6 +601,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText(outcome.sentence)).toBeVisible();
     if (outcome.kind === "dispatch") expect(screen.getByTestId("overview-table-region")).toBeVisible();
@@ -565,8 +619,172 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText(sentence).textContent).toBe(sentence);
+  });
+
+  /** Scenario: "Devbox run agent." is heard and matches nothing. The report quotes it once, in the no-match sentence, rather than once as heard and again as unmatched. */
+  it("reports what it heard once when the answer already quotes it (PR #1451 hand test)", async () => {
+    vi.useFakeTimers();
+    const utterance = "Devbox run agent.";
+    const sentence = `Heard: “${utterance}” — no matching action.`;
+    // The capture sentence exactly as Rust's `handle_audio` renders it.
+    const voice = automaticVoice({ kind: "heard", transcript: utterance, sentence: `Heard “${utterance}”` });
+    const resolveVoice = resolver(result({ kind: "no_match", transcript: utterance, sentence }));
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
+
+    const report = screen.getByTestId("voice-report").textContent ?? "";
+    expect(report.split(utterance).length - 1, report).toBe(1);
+    expect(screen.getByText(sentence)).toBeVisible();
+  });
+
+  /** Scenario: a command is heard and runs, and its report names the effect rather than the words. What was heard stays on screen beside it, once. */
+  it("keeps what it heard beside an answer that does not quote it", async () => {
+    vi.useFakeTimers();
+    const utterance = "show me every agent";
+    const voice = automaticVoice({ kind: "heard", transcript: utterance, sentence: `Heard “${utterance}”.` });
+    render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+
+    const report = screen.getByTestId("voice-report").textContent ?? "";
+    expect(report.split(utterance).length - 1, report).toBe(1);
+    expect(screen.getByText(DISPATCH.sentence)).toBeVisible();
+  });
+
+  /** Resolves "show me every agent" (however it is punctuated) to the dashboard, and anything else to a no-match. */
+  function joiningResolver() {
+    return vi.fn<(utterance: string) => Promise<VoiceResultDto>>(async (utterance) => (
+      /^show me every agent\.?$/i.test(utterance)
+        ? result({ ...DISPATCH, transcript: utterance })
+        : result({ kind: "no_match", transcript: utterance, sentence: `Heard: “${utterance}” — no matching action.` })
+    ));
+  }
+
+  /** Scenario: the user says "Show me", pauses long enough to end the utterance, then says "every agent". The halves are joined and the dashboard opens; "Show me" alone is never reported as matching nothing (PR #1451). */
+  it("joins a command that matched nothing with the words that follow a pause", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Show me.") },
+      { outcome: heard("every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    expect(screen.queryByText("Heard: “Show me.” — no matching action.")).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Show me.", "Show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: the user says something that matches no command and stops. The app waits briefly for more, then says it matched nothing. */
+  it("reports a command that matched nothing once nothing follows it", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: heard("Set the command to be.") }]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    const sentence = "Heard: “Set the command to be.” — no matching action.";
+    expect(screen.queryByText(sentence)).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
+
+    expect(screen.getByText(sentence)).toBeVisible();
+  });
+
+  /** Scenario: a command that matched nothing is followed by a sound that turns out not to be speech. The app says the command matched nothing rather than waiting on. */
+  it("reports a held command when what followed it was not speech", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: SILENT, status: { speech: true } },
+    ]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(voice.voiceStop).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Heard: “Set the command to be.” — no matching action.")).toBeVisible();
+  });
+
+  /** Scenario: something the user did not mean as a command is misheard, and straight after it they say a complete command. The command runs; the misheard words do not swallow it (Qodo on PR #1451). */
+  it("runs a complete command said straight after words that matched nothing", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Thanks for watching.") },
+      { outcome: heard("show me every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Thanks for watching.", "Thanks for watching show me every agent", "show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
+  });
+
+  /** Scenario: a command paused in the middle still matches nothing once joined. The whole sentence is reported at once rather than waiting for more (Qodo on PR #1451). */
+  it("reports a joined sentence that still matches nothing at once", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: heard("devbox run agent"), status: { speech: true } },
+    ]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 2); });
+
+    expect(screen.getByText("Heard: “Set the command to be devbox run agent” — no matching action.")).toBeVisible();
+  });
+
+  /** Scenario: after a joined sentence that matched nothing, the user goes on speaking. What they say next is worked out on its own, not joined onto the failed sentence (Qodo on PR #1451). */
+  it("does not join onto a joined sentence that matched nothing", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([
+      { outcome: heard("Set the command to be.") },
+      { outcome: heard("devbox run agent"), status: { speech: true } },
+      { outcome: heard("show me every agent"), status: { speech: true } },
+    ]);
+    const resolveVoice = joiningResolver();
+    render(<DeckShell runtime={runtime(resolveVoice, voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS * 4); });
+
+    expect(resolveVoice.mock.calls.map(([utterance]) => utterance)).toEqual(["Set the command to be.", "Set the command to be devbox run agent", "devbox run agent", "show me every agent"]);
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+  });
+
+  /** Scenario: the user says something that matches no command, then turns voice off before the app has said so. Nothing about it appears afterwards. */
+  it("drops a held command when voice is turned off", async () => {
+    vi.useFakeTimers();
+    const voice = sequencedVoice([{ outcome: heard("Set the command to be.") }]);
+    render(<DeckShell runtime={runtime(joiningResolver(), voice)} />);
+
+    await turnVoiceOn(voice);
+    await completeAutomaticUtterance(voice);
+    await act(async () => { fireEvent.click(voiceButton()); await Promise.resolve(); });
+    await settleHeldAnswer();
+
+    expect(screen.queryByText(/no matching action/)).not.toBeInTheDocument();
   });
 
   /** Scenario: a slow Claude result reports its backend and 4.2-second latency together beside the sentence. */
@@ -583,6 +801,7 @@ describe("voice control panel", () => {
 
     await turnVoiceOn(voice);
     await completeAutomaticUtterance(voice);
+    await settleHeldAnswer();
 
     expect(screen.getByText("claude, 4.2 s")).toBeVisible();
   });

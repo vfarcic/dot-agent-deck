@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { VoiceNumber } from "./VoiceNumber";
 import {
   AlertTriangle,
   BookOpenText,
@@ -104,6 +105,12 @@ function useTileClock(ticking: boolean): number {
 
 export interface AgentTileProps {
   agent: AgentSession;
+  /**
+   * PR #1451 round 3, change 3 — the number this tile shows while voice is
+   * on: first in its header and in its accessible name. The 1–4 keys focus
+   * the same tiles in the same order.
+   */
+  voiceNumber?: number;
   /**
    * PRD #1105 M1 — which of this component's two presentations to render.
    *
@@ -269,6 +276,7 @@ function formatTokens(tokens: number): string {
 
 export function AgentTile({
   agent,
+  voiceNumber,
   presentation,
   showDetails,
   mode,
@@ -373,6 +381,10 @@ export function AgentTile({
          `[data-presentation="overlay"]` can override the tile's own responsive
          rules with no stylesheet reordering. Nothing matches it yet. */
       data-presentation={presentation}
+      /* Its name, so the tile can be told apart without its contents — with
+         the voice number first while one is shown. */
+      aria-label={voiceNumber === undefined ? agent.role : `${voiceNumber}. ${agent.role}`}
+      data-voice-number={voiceNumber}
       onMouseDown={onSelect}
     >
       <header className="agent-header">
@@ -380,6 +392,7 @@ export function AgentTile({
           <span className={`agent-state-mark status-${agent.status}${held ? " is-held" : ""}`} aria-hidden="true" />
           <div>
             <div className="agent-title-line">
+              <VoiceNumber number={voiceNumber} hidden />
               <h2>{agent.role}</h2>
               {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">ORCHESTRATOR</span>}
               {/*
