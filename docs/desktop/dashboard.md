@@ -14,7 +14,7 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 
 Each daemon being shown gets its own section, headed with its name (**Local daemon** for this machine, the ssh user and host for a remote one) and its own **New agent** button, which creates the agent on that daemon. Inside a section, agents are grouped:
 
-- **Standalone agents** (kicker **NO TAB**): agents that belong to no orchestration.
+- **Standalone agents** (kicker **NO TAB**): agents that belong to no orchestration and no workspace mode.
 - One group per orchestration (kicker **ORCHESTRATION**), named after the run. Its rows are numbered in role order, and the start role, the one you message, carries an **ORCHESTRATOR** badge.
 - One group per workspace mode (kicker **MODE TAB**), named after the mode. You see one only while an agent started in a workspace mode by a release before 0.44.0 is still running; workspace modes were removed in 0.44.0, so neither client starts one.
 
