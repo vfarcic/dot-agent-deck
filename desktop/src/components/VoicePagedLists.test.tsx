@@ -363,6 +363,34 @@ describe("visible pages for voice-selected lists", () => {
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
   });
 
+  /** Scenario: two daemons without reported ids have no agent rows and fall on opposite sides of a crowded dashboard's page break. Each daemon's section appears only on its own voice page. */
+  it("shows each id-less row-less daemon on only its own dashboard page", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    const rowless = createFixtureSnapshot("disconnected");
+    const waiting = (name: string) => ({
+      ...rowless,
+      runId: `run_${name}`,
+      connection: { ...rowless.connection, deckKind: "remote" as const, name, socketPath: name },
+      agents: [],
+      totalNodes: 0,
+    });
+    deck.fleet = [waiting("Waiting Alpha"), deck.snapshot, waiting("Waiting Beta")];
+    const sections = () => screen.getAllByTestId("daemon-group")
+      .map((section) => within(section).getByTestId("daemon-identity").textContent);
+
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    expect(screen.getByTestId("overview-page")).toHaveTextContent("Page 1 of 2");
+    expect(sections()).toContain("Waiting Alpha");
+    expect(sections()).not.toContain("Waiting Beta");
+
+    await speak(voice, "next page");
+    expect(screen.getByTestId("overview-page")).toHaveTextContent("Page 2 of 2");
+    expect(sections()).toContain("Waiting Beta");
+    expect(sections()).not.toContain("Waiting Alpha");
+  });
+
   /** Scenario: two daemons have agents with the same id. Naming the one visible on page one opens it, even though its namesake on another daemon is on a later page. */
   it("opens a visible named agent despite an off-page agent with the same id", async () => {
     const voice = microphone();

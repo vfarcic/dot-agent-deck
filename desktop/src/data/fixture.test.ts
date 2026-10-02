@@ -202,3 +202,21 @@ describe("browser fixture Command row parity with Rust (PR #1451 round 4, D8)", 
     )).toEqual([undefined, undefined]);
   });
 });
+
+describe("browser fixture Filter text parity with Rust", () => {
+  /** Scenario: spoken leading joiners remain in the Filter box, while a final sentence stop or comma is removed. The preview reports the same applied value that the live Rust voice path should apply. */
+  it.each([
+    ["filter .git", ".git"],
+    ["filter -tmp", "-tmp"],
+    ["filter _build", "_build"],
+    ["filter docs.", "docs"],
+    ["filter docs,", "docs"],
+  ])("keeps spoken filter joiners and strips presentation: %s", (said, applied) => {
+    expect(resolveFixtureVoice(said, "overview", false, true).outcome).toMatchObject({
+      kind: "dispatch",
+      action: "filter_directories",
+      params: [{ name: "text", kind: "filter_text", value: applied }],
+      sentence: `Filtering by “${applied}”.`,
+    });
+  });
+});

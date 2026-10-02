@@ -17,7 +17,9 @@
 //! What may differ from the transcript is only presentation: the value is
 //! lowercased (the box matches case-insensitively, so case changes nothing it
 //! shows) and may join the words it was grounded on with `-`, `_` or `.` — the
-//! way "billing service" is written `billing-service` on screen. Any other
+//! way "billing service" is written `billing-service` on screen. A joiner in
+//! FRONT of the value is kept only where the user said it there ("filter
+//! .git" sets `.git`); one the model added is dropped. Any other
 //! character inside the value is refused: the box matches by containing the
 //! text, literally, and a `*` or `^` would only ever match nothing.
 
@@ -65,41 +67,88 @@ const JOINERS: [char; 3] = ['-', '_', '.'];
 /// the user did not say it (see the module docs). The `Some` is what the box
 /// is set to and what the report quotes.
 pub(super) fn grounded_filter_text(transcript: &str, value: &str) -> Option<String> {
-    // Quotes and a transcriber's full stop around the value are the model's
-    // presentation, not part of the text.
+    // Quotes, whitespace and sentence punctuation around the value are the
+    // model's presentation, not part of the text. A leading joiner is not:
+    // `.git`, `-tmp` and `_build` are what the user said, so the front keeps
+    // joiners and the back does not (a trailing `.` is the transcriber's full
+    // stop, and a trailing `-` or `_` is not how a name is said).
     let text = value
-        .trim_matches(|c: char| !c.is_alphanumeric())
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && !JOINERS.contains(&c))
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
         .to_lowercase();
-    if text.is_empty() {
+    let core = text.trim_start_matches(JOINERS);
+    if core.is_empty() {
         return None;
     }
+    let lead = &text[..text.len() - core.len()];
     // Inside the value: letters, digits, spaces and the joiners, nothing else.
-    if !text
+    if !core
         .chars()
         .all(|c| c.is_alphanumeric() || c == ' ' || JOINERS.contains(&c))
     {
         return None;
     }
-    let wanted = words(&text);
-    let said = words(transcript);
-    let adjacent = said
-        .windows(wanted.len())
-        .any(|window| window == wanted.as_slice());
-    if adjacent || spelled_letter(&said, &text) {
-        // One space between words, as the box would show them typed.
-        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
-    } else {
-        None
+    let wanted = words(core);
+    let said = spoken_words(transcript);
+    let mut grounded = false;
+    let mut lead_said = false;
+    for (at, window) in said.windows(wanted.len()).enumerate() {
+        if window.iter().map(|(_, word)| word).eq(wanted.iter()) {
+            grounded = true;
+            lead_said |= lead_before(transcript, said[at].0) == lead;
+        }
     }
+    let said_words: Vec<String> = said.into_iter().map(|(_, word)| word).collect();
+    if !grounded && !spelled_letter(&said_words, core) {
+        return None;
+    }
+    // A leading joiner stays only where the user said it before that word;
+    // one the model added would narrow the box to text nobody said.
+    let lead = if lead_said { lead } else { "" };
+    // One space between words, as the box would show them typed.
+    Some(format!(
+        "{lead}{}",
+        core.split_whitespace().collect::<Vec<_>>().join(" ")
+    ))
 }
 
 /// The lowercased words of `text`: runs of letters and digits, so punctuation,
 /// quotes and the joiners all separate words.
 fn words(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
+    spoken_words(text)
+        .into_iter()
+        .map(|(_, word)| word)
         .collect()
+}
+
+/// [`words`] with the byte offset each starts at in `text`.
+fn spoken_words(text: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let mut start = None;
+    for (at, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                found.push((from, text[from..at].to_lowercase()));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The joiners written straight before the word at byte `at` of `text`, when
+/// they open a token — after whitespace, a quote or the start, not after a
+/// letter: `.git` of "filter .git" has `.`, `service` of "billing-service"
+/// has none.
+fn lead_before(text: &str, at: usize) -> &str {
+    let before = &text[..at];
+    let run = before.trim_end_matches(JOINERS);
+    match run.chars().next_back() {
+        Some(c) if c.is_alphanumeric() => "",
+        _ => &before[run.len()..],
+    }
 }
 
 /// Whether `text` is one letter the user spelled by name straight after the
@@ -195,8 +244,9 @@ mod tests {
         assert_eq!(grounded("filter docs", "“.”"), None);
     }
 
-    /// Scenario: the model wraps the value in quotes or keeps the transcriber's
-    /// full stop; the box gets the bare text.
+    /// Scenario: quotes and sentence punctuation around a spoken filter are
+    /// presentation, but a leading dot, hyphen or underscore said as part of
+    /// the directory name stays in the Filter box.
     #[test]
     fn voice_filter_text_trims_quotes_and_punctuation_around_the_value() {
         assert_eq!(
@@ -204,6 +254,26 @@ mod tests {
             Some("docs")
         );
         assert_eq!(grounded("filter docs", "“docs”").as_deref(), Some("docs"));
+        assert_eq!(grounded("filter docs.", "docs.").as_deref(), Some("docs"));
+        assert_eq!(grounded("filter docs,", "docs,").as_deref(), Some("docs"));
+        assert_eq!(grounded("filter .git", ".git").as_deref(), Some(".git"));
+        assert_eq!(grounded("filter -tmp", "-tmp").as_deref(), Some("-tmp"));
+        assert_eq!(
+            grounded("filter _build", "_build").as_deref(),
+            Some("_build")
+        );
+    }
+
+    /// Scenario: the user says "filter git" and the model answers `.git`; the
+    /// dot was never said, so the box gets `git` rather than a narrower text.
+    #[test]
+    fn voice_filter_text_drops_a_leading_joiner_the_user_did_not_say() {
+        assert_eq!(grounded("filter git", ".git").as_deref(), Some("git"));
+        assert_eq!(grounded("filter my.git", ".git").as_deref(), Some("git"));
+        assert_eq!(
+            grounded("filter “.git” please", "“.git”").as_deref(),
+            Some(".git")
+        );
     }
 
     /// Scenario: several adjacent words the user said become the value, and the

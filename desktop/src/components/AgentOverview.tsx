@@ -659,7 +659,7 @@ const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>
 const DashboardPageContext = createContext<{ agents: ReadonlySet<string>; decks: ReadonlySet<string> } | undefined>(undefined);
 
 /** One thing the dashboard pages: an agent's row, or a daemon whose section has no rows (a note). */
-type DashboardUnit = { kind: "agent"; agent: OverviewAgent; deckId: string; group: string } | { kind: "deck"; deckId: string };
+type DashboardUnit = { kind: "agent"; agent: OverviewAgent; deckKey: string; group: string } | { kind: "deck"; deckKey: string };
 
 /** How many rows a page holds where nothing is laid out (jsdom) — the size the component tests page by. */
 const FALLBACK_DASHBOARD_PAGE = 10;
@@ -706,10 +706,10 @@ function paginateDashboard(units: readonly DashboardUnit[], costs: DashboardCost
   let group: string | undefined;
   return units.map((unit) => {
     const cost = () => {
-      const deckOpens = unit.deckId !== deck;
+      const deckOpens = unit.deckKey !== deck;
       const opening = deckOpens ? (used > 0 ? costs.deckGap : 0) : 0;
-      if (unit.kind === "deck") return opening + (costs.whole.get(unit.deckId) ?? wholeDefault);
-      const deckChrome = deckOpens ? costs.deck.get(unit.deckId) ?? deckDefault : 0;
+      if (unit.kind === "deck") return opening + (costs.whole.get(unit.deckKey) ?? wholeDefault);
+      const deckChrome = deckOpens ? costs.deck.get(unit.deckKey) ?? deckDefault : 0;
       const groupChrome = unit.group !== group ? (costs.group.get(unit.group) ?? groupDefault) + (deckOpens ? 0 : costs.groupGap) : 0;
       return opening + deckChrome + groupChrome + costs.row;
     };
@@ -722,7 +722,7 @@ function paginateDashboard(units: readonly DashboardUnit[], costs: DashboardCost
       add = cost();
     }
     used += add;
-    deck = unit.deckId;
+    deck = unit.deckKey;
     group = unit.kind === "agent" ? unit.group : undefined;
     return page;
   });
@@ -928,9 +928,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * agent is on, and merging the fleet before calling it would put two
    * machines' roles in one orchestration card.
    */
-  const decks = useMemo(() => fleet.map((deck) => {
+  const decks = useMemo(() => fleet.map((deck, at): FleetDeck => {
     const deckAgents = deck.agents.map(toOverviewAgent);
     return {
+      key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,
       agents: deckAgents,
       groups: groupAgents(deckAgents),
@@ -1177,9 +1178,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const voicePages = useVoiceOn() && rowsShown;
   const bodyRef = useRef<HTMLElement>(null);
   const units = useMemo<DashboardUnit[]>(() => decks.flatMap((deck): DashboardUnit[] => {
-    const deckId = deck.snapshot.connection.deckId ?? "";
-    if (!rendersAgentRows(deck.snapshot.connection) || deck.agents.length === 0) return [{ kind: "deck", deckId }];
-    return deck.groups.flatMap((group) => group.agents.map((agent): DashboardUnit => ({ kind: "agent", agent, deckId, group: `${deckId}\u0000${group.key}` })));
+    const deckKey = deck.key;
+    if (!rendersAgentRows(deck.snapshot.connection) || deck.agents.length === 0) return [{ kind: "deck", deckKey }];
+    // A card's measure key, as `OverviewGroupCard` writes `data-page-group`.
+    const cardDeck = deck.snapshot.connection.deckId ?? "";
+    return deck.groups.flatMap((group) => group.agents.map((agent): DashboardUnit => ({ kind: "agent", agent, deckKey, group: `${cardDeck}\u0000${group.key}` })));
   }), [decks]);
   const [costs, setCosts] = useState<DashboardCosts>();
   const [slack, setSlack] = useState({ height: 0, width: 0, by: 0 });
@@ -1202,7 +1205,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const shownDecks = new Set<string>();
     units.forEach((unit, at) => {
       if (unitPages[at] !== dashboardSlice.page) return;
-      shownDecks.add(unit.deckId);
+      shownDecks.add(unit.deckKey);
       if (unit.kind === "agent") agents.add(agentKey(unit.agent));
     });
     return { agents, decks: shownDecks };
@@ -1436,15 +1439,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             density and nothing else.
           */}
           {/* While voice pages the dashboard (change 4), the daemons with anything on the page showing. */}
-          {decks.filter((deck) => !pageFilter || pageFilter.decks.has(deck.snapshot.connection.deckId ?? "")).map((deck) => (
+          {decks.filter((deck) => !pageFilter || pageFilter.decks.has(deck.key)).map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
                 `Endpoint::describe()`, which two daemons on one host share — so
                 two sibling sections took one React key and React kept one of
-                them.
+                them. `deck.key`, because a daemon that has not reported an id
+                yet still needs a key of its own.
               */
-              key={deck.snapshot.connection.deckId ?? ""}
+              key={deck.key}
               deck={deck}
               now={now}
               columns={columns}
@@ -1494,11 +1498,22 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
 interface FleetDeck {
+  /** Distinct per fleet member ({@link fleetMemberKey}): the React key, and what the dashboard's voice pages are keyed by. */
+  key: string;
   snapshot: DeckRuntimeState["snapshot"];
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   counts: { status: AgentStatus; count: number }[];
   connected: boolean;
+}
+
+/**
+ * A fleet member's key: its daemon id, or — for a daemon that has not reported
+ * one — its place in the fleet, so two id-less daemons never share a page unit
+ * or a React key. The prefixes keep the two kinds from colliding.
+ */
+function fleetMemberKey(deckId: string | undefined, at: number): string {
+  return deckId === undefined ? `at:${at}` : `id:${deckId}`;
 }
 
 /**
@@ -1607,7 +1622,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
       */
       data-daemon-id={connection.deckId === undefined ? "" : domIdentity(connection.deckId)}
       data-deck-connected={deck.connected ? "yes" : "no"}
-      data-page-deck={connection.deckId ?? ""}
+      data-page-deck={deck.key}
       aria-labelledby={titleId}
     >
       <header className="daemon-group-header">

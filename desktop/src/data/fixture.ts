@@ -1407,7 +1407,10 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   }
   if (command.action === "filter_directories") {
     const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined);
-    const text = opener === undefined ? undefined : fixtureFilterText(utterance, fixtureOpening(utterance, opener)!);
+    // Not `fixtureOpening`'s text: that drops a leading `-`, and "filter -tmp"
+    // means `-tmp`. Only separators that cannot open a name are dropped here.
+    const rest = opener === undefined ? undefined : utterance.trim().slice(opener.length).replace(/^[\s:,]+/u, "");
+    const text = rest === undefined ? undefined : fixtureFilterText(utterance, rest);
     if (text === undefined) {
       return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
     }
@@ -1536,18 +1539,28 @@ function fixtureFilterText(utterance: string, rest: string): string | undefined 
 
 /**
  * `voice::filter::grounded_filter_text`: the value, trimmed of what is not a
- * letter or digit and lowercased, made only of letters, digits, spaces and the
- * joiners `-` `_` `.`, and said — its words adjacent in the transcript, or one
+ * letter or digit (but keeping joiners at the front) and lowercased, made only
+ * of letters, digits, spaces and the joiners `-` `_` `.`, and said — its words adjacent in the transcript, or one
  * letter named straight after "letter". Spelled letter names ("letter dee")
  * are Rust's alone; the preview has no model that would produce one.
  */
 function fixtureGroundedFilterText(transcript: string, value: string): string | undefined {
-  const text = value.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "").toLowerCase();
-  if (text === "" || !/^[\p{L}\p{N} ._-]+$/u.test(text)) return undefined;
-  const wanted = fixtureSpokenWords(text);
-  const said = fixtureSpokenWords(transcript);
-  const adjacent = said.some((_, at) => wanted.length > 0 && wanted.every((word, offset) => said[at + offset] === word));
-  return adjacent ? text.split(/\s+/u).join(" ") : undefined;
+  const text = value.replace(/^[^\p{L}\p{N}._-]+|[^\p{L}\p{N}]+$/gu, "").toLowerCase();
+  const core = text.replace(/^[._-]+/u, "");
+  const lead = text.slice(0, text.length - core.length);
+  if (core === "" || !/^[\p{L}\p{N} ._-]+$/u.test(core)) return undefined;
+  const wanted = fixtureSpokenWords(core);
+  const said = [...transcript.matchAll(/[\p{L}\p{N}]+/gu)].map((match) => ({ at: match.index, word: match[0].toLowerCase() }));
+  const windows = said.filter((_, at) => wanted.every((word, offset) => said[at + offset]?.word === word));
+  if (windows.length === 0) return undefined;
+  // A leading joiner stays only where the transcript opens that word's token
+  // with it, as `voice::filter::lead_before` reads it.
+  const leadBefore = (at: number) => {
+    const run = /[._-]*$/u.exec(transcript.slice(0, at))![0];
+    return /[\p{L}\p{N}]$/u.test(transcript.slice(0, at - run.length)) ? "" : run;
+  };
+  const kept = windows.some(({ at }) => leadBefore(at) === lead) ? lead : "";
+  return kept + core.split(/\s+/u).join(" ");
 }
 
 /**

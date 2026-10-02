@@ -934,6 +934,16 @@ action = "filter_directories"
 outcome = "dispatch"
 resolved_filter = "d"
 
+# A leading dot the user said is part of the name (`.git`), not presentation.
+[[fixtures]]
+name = "filter-directories-leading-dot"
+utterance = "filter .git"
+screen = "overview"
+listing = true
+action = "filter_directories"
+outcome = "dispatch"
+resolved_filter = ".git"
+
 [[fixtures]]
 name = "filter-directories-clear"
 utterance = "clear filter"
