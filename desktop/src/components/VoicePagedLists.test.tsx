@@ -69,6 +69,52 @@ function runtime(voice: ReturnType<typeof microphone>, crowded = false) {
   } as unknown as DeckRuntimeState;
 }
 
+function runtimeWithSharedProject(voice: ReturnType<typeof microphone>, hidden = false) {
+  const deck = runtime(voice);
+  const fleet = createFixtureFleet("voice-pages").slice(0, 2).map((item) => ({
+    ...item, connection: { ...item.connection, listingOptions: hidden },
+  }));
+  deck.snapshot = fleet[0];
+  deck.fleet = fleet;
+  deck.listDirectories = vi.fn(async (_deckId: string, path?: string, options?: { includeHidden?: boolean }) => ({
+    kind: "listing" as const, path: path ?? HOME, displayPath: path ?? HOME, parent: path && path !== HOME ? HOME : "/home",
+    entries: path && path !== HOME ? [] : [
+      ...NAMES.map((name) => ({ path: `${HOME}/${name}`, displayName: name, isProject: name === "docs" })),
+      ...(options?.includeHidden ? [{ path: `${HOME}/.hidden`, displayName: ".hidden", isProject: false }] : []),
+    ],
+    truncated: false,
+  }));
+  deck.newAgentOrchestrations = vi.fn(async (_deckId: string, path: string) => ({
+    kind: "project" as const,
+    path,
+    displayPath: path,
+    displayName: "docs",
+    orchestrations: voicePagesOrchestrations(path) ?? [],
+  }));
+  return deck;
+}
+
+async function chooseProject(deckIndex: number) {
+  fireEvent.click(within(screen.getByTestId("new-agent-deck-list")).getAllByRole("option")[deckIndex]);
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "docs" } });
+  fireEvent.click(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { name: /docs/i }));
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  fireEvent.click(screen.getByTestId("new-agent-use-directory"));
+  await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+  expect(screen.getByTestId("new-agent-dir")).toHaveTextContent(`${HOME}/docs`);
+}
+
+function expectSelectedModeVisible() {
+  expect(screen.getByTestId("new-agent-mode-page")).toHaveTextContent(/Page 1 of [2-9]\d*/i);
+  const modes = screen.getByTestId("new-agent-modes");
+  expect(within(modes).getByRole("button", { pressed: true })).toHaveAttribute("data-mode", "none");
+}
+
+function expectSelectedDirectoryVisible() {
+  expect(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { selected: true })).toBeVisible();
+}
+
 async function openBrowser() {
   fireEvent.click(screen.getByTestId("overview-new-agent"));
   await act(async () => { await Promise.resolve(); await Promise.resolve(); });
@@ -89,6 +135,119 @@ async function speak(voice: ReturnType<typeof microphone>, words: string) {
 describe("visible pages for voice-selected lists", () => {
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
+
+  /** Scenario: after Voice turns the Mode row to page two, using the same project directory again resets the form to No mode. The Mode row shows that selected chip on page one. */
+  it("shows No mode after reconfirming the same directory on a later mode page", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtimeWithSharedProject(voice)} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await turnOnVoice();
+    await chooseProject(0);
+    expectSelectedModeVisible();
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-mode-page")).toHaveTextContent(/Page 2 of \d+/i);
+    fireEvent.click(within(screen.getByTestId("new-agent-modes")).getAllByRole("button")[0]);
+    expect(within(screen.getByTestId("new-agent-modes")).getByRole("button", { pressed: true })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-agent-use-directory"));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expectSelectedModeVisible();
+  });
+
+  /** Scenario: after Voice turns the first daemon's Mode row to page two, switching to a second daemon with the same project and mode ids starts a fresh form. Its selected No mode chip is visible on page one. */
+  it("shows the second daemon's selected mode after switching decks on a later mode page", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtimeWithSharedProject(voice)} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await turnOnVoice();
+    await chooseProject(0);
+    expectSelectedModeVisible();
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-mode-page")).toHaveTextContent(/Page 2 of \d+/i);
+    await chooseProject(1);
+    expectSelectedModeVisible();
+  });
+
+  /** Scenario: after Voice turns to a later Mode page, toggling Voice off and on again shows the form's selected No mode chip. */
+  it("shows the selected mode after voice turns off and back on", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtimeWithSharedProject(voice)} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await turnOnVoice();
+    await chooseProject(0);
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-mode-page")).toHaveTextContent(/Page 2 of \d+/i);
+    await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); await Promise.resolve(); });
+    expect(screen.getByTestId("voice-trigger")).toHaveAttribute("aria-pressed", "false");
+    await turnOnVoice();
+    expectSelectedModeVisible();
+  });
+
+  /** Scenario: changing and clearing a directory filter after a spoken page turn keeps the browser's selected row on the visible page. */
+  it("keeps the selected directory visible when the filter changes", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtimeWithSharedProject(voice)} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    fireEvent.click(within(screen.getByTestId("new-agent-deck-list")).getAllByRole("option")[0]);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await turnOnVoice();
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 2 of \d+/i);
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "folder-01" } });
+    expectSelectedDirectoryVisible();
+    fireEvent.change(screen.getByTestId("new-agent-filter"), { target: { value: "" } });
+    expectSelectedDirectoryVisible();
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 1 of \d+/i);
+  });
+
+  /** Scenario: Show hidden refreshes a paged directory listing while keeping the highlighted row visible. Entering that row and returning to its parent also keeps the row visible. */
+  it("keeps the selected directory visible through Show hidden and parent navigation", async () => {
+    const voice = microphone();
+    render(<DeckShell runtime={runtimeWithSharedProject(voice, true)} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    fireEvent.click(within(screen.getByTestId("new-agent-deck-list")).getAllByRole("option")[0]);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await turnOnVoice();
+    await speak(voice, "next page");
+    expectSelectedDirectoryVisible();
+    const selectedPath = within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { selected: true }).getAttribute("data-path");
+    fireEvent.click(screen.getByTestId("new-agent-show-hidden"));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expectSelectedDirectoryVisible();
+    expect(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { selected: true })).toHaveAttribute("data-path", selectedPath);
+    fireEvent.click(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { selected: true }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent(selectedPath!);
+    expectSelectedDirectoryVisible();
+    fireEvent.click(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { name: /\.\./ }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("new-agent-current-path")).toHaveTextContent(HOME);
+    expectSelectedDirectoryVisible();
+    expect(within(screen.getByTestId("new-agent-directory-list")).getByRole("option", { selected: true })).toHaveAttribute("data-path", selectedPath);
+  });
+
+  /** Scenario: switching daemons while a directory list is paged gives the new daemon a visible selected directory row. If the highlighted daemon then disappears from the fleet, the remaining highlighted row is visible. */
+  it("keeps directory and daemon selections visible across deck and fleet changes", async () => {
+    const voice = microphone();
+    const deck = runtimeWithSharedProject(voice);
+    const view = render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    const deckRows = () => within(screen.getByTestId("new-agent-deck-list")).getAllByRole("option");
+    fireEvent.click(deckRows()[0]);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await turnOnVoice();
+    await speak(voice, "next page");
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 2 of \d+/i);
+    fireEvent.click(deckRows()[1]);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expectSelectedDirectoryVisible();
+    expect(screen.getByTestId("new-agent-directory-page")).toHaveTextContent(/Page 1 of \d+/i);
+    await speak(voice, "next page");
+    expectSelectedDirectoryVisible();
+    await act(async () => { view.rerender(<DeckShell runtime={{ ...deck, fleet: [deck.fleet[0]] }} initialView={{ kind: "overview" }} />); });
+    expect(deckRows()).toHaveLength(1);
+    expect(deckRows()[0]).toHaveAttribute("aria-selected", "true");
+    expectSelectedDirectoryVisible();
+  });
 
   /** Scenario: the browser's crowded voice fixture has six usable daemons, one disconnected daemon, a long home directory, overflowing project modes, and fifteen tiles on its selected daemon. */
   it("provides the crowded browser state for every paged list", () => {

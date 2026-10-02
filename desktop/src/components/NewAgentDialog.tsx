@@ -396,6 +396,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const [options, setOptions] = useState<NewAgentOptions>();
   const [optionsError, setOptionsError] = useState<string>();
   const [modeChoice, setModeChoice] = useState<ModeId>(NO_MODE.id);
+  /**
+   * A Mode page voice turned to since the Mode row last changed, with the row
+   * it was turned on. Every reset of the mode drops it, even one back to the
+   * chip already in force.
+   */
+  const [modeTurn, setModeTurn] = useState<{ key: string; page: number }>();
   const [name, setName] = useState("");
   const [command, setCommand] = useState("");
   const commandTouched = useRef(false);
@@ -495,6 +501,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
     setModeChoice(NO_MODE.id);
+    setModeTurn(undefined);
     setFormError(undefined);
     setFormCleanup(undefined);
     if (!keepEdits || !nameTouched.current) {
@@ -925,6 +932,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setTarget({ path, displayPath });
     if (!nameTouched.current) setName(directoryLabel(path));
     setModeChoice(NO_MODE.id);
+    setModeTurn(undefined);
     pendingMode.current = restoring && restoring.mode !== NO_MODE.id ? restoring.mode : undefined;
     setOrchestrations(undefined);
     setOrchestrationsError(undefined);
@@ -1323,7 +1331,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     their indexes in the whole list — the cursor, the row ids and the keyboard
     move over every row — and the page shown is the one holding the
     directory cursor, and the one holding the Mode chip in force unless voice
-    or an arrow has turned it since the Mode row last changed.
+    has turned it since the Mode row last changed.
   */
   const voiceOn = useVoiceOn();
   const directoryBox = useMeasuredBox(directoryListRef, voiceOn && listing !== undefined);
@@ -1341,12 +1349,15 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const chipsBox = useMeasuredBox(chipsRef, voiceOn);
   const modeFit = bodyBox && chipsBox ? gridFit(chipsBox.width, bodyBox.height - MODE_ROWS_RESERVE, MODE_CELL) : undefined;
   const modeCapacity = modeFit ? modeFit.columns * modeFit.rows : FALLBACK_MODE_PAGE;
-  /* A Mode page turned by voice or reached by an arrow is kept only while the
-     row, its page size and voice stay as they were; any change shows the page
-     of the chip in force, so the mode Create would use is never hidden. */
-  const modePageKey = `${target?.path ?? ""}\u0000${modes.map((candidate) => candidate.id).join("\u0000")}\u0000${modeCapacity}\u0000${voiceOn}`;
-  const [modePage, setModePage] = useState({ key: "", page: 1 });
-  const modeSlice = pageSlice(modes.length, modeCapacity, modePage.key === modePageKey ? modePage.page : pageOfIndex(Math.max(0, modes.findIndex((candidate) => candidate.id === mode)), modeCapacity));
+  /* The Mode page shown is the chip in force's, unless voice has turned it
+     since the row last changed. A turn is forgotten — not merely set aside —
+     the first render the deck, the chip in force, the chips offered, the page
+     size or voice differs from when it was made, and on every mode reset, so
+     the mode Create would use is never hidden, and coming back to the same
+     row never brings an old turn back. */
+  const modePageKey = [deck?.deckId ?? "", target?.path ?? "", mode, modeCapacity, voiceOn, ...modes.map((candidate) => candidate.id)].join("\u0000");
+  if (modeTurn !== undefined && modeTurn.key !== modePageKey) setModeTurn(undefined);
+  const modeSlice = pageSlice(modes.length, modeCapacity, modeTurn?.key === modePageKey ? modeTurn.page : pageOfIndex(Math.max(0, modes.findIndex((candidate) => candidate.id === mode)), modeCapacity));
   const modesPaged = voiceOn && modeSlice.pages > 1;
   const modeOffset = modesPaged ? modeSlice.start : 0;
   const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
@@ -1358,7 +1369,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const pagedList: "directories" | "modes" | undefined = modesPaged && target ? "modes" : directoriesPaged ? "directories" : modesPaged ? "modes" : undefined;
   const turnDirectories = (delta: 1 | -1) => setCursor(pageSlice(rows.length, directoryCapacity, directorySlice.page + delta).start);
-  const turnModes = (delta: 1 | -1) => setModePage({ key: modePageKey, page: modeSlice.page + delta });
+  const turnModes = (delta: 1 | -1) => setModeTurn({ key: modePageKey, page: modeSlice.page + delta });
   /* A paged Mode row is brought into the body's view, where its chips can be seen. */
   useEffect(() => {
     if (modesPaged && target) modeFieldRef.current?.scrollIntoView?.({ block: "nearest" });
@@ -1801,11 +1812,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     const next = modes[nextIndex];
     selectMode(next.id);
     const focusChip = () => chipsRef.current?.querySelector<HTMLButtonElement>(`[data-mode="${next.id}"]`)?.focus();
-    // A paged Mode row turns to the chip the arrow reached (change 4), which renders on the next frame.
-    if (modesPaged && (nextIndex < modeSlice.start || nextIndex >= modeSlice.end)) {
-      setModePage({ key: modePageKey, page: pageOfIndex(nextIndex, modeCapacity) });
-      window.requestAnimationFrame(focusChip);
-    } else focusChip();
+    // A paged Mode row shows the chip the arrow reached (change 4) — the
+    // selection changed, so the page is that chip's — and renders it on the next frame.
+    if (modesPaged && (nextIndex < modeSlice.start || nextIndex >= modeSlice.end)) window.requestAnimationFrame(focusChip);
+    else focusChip();
   };
 
   const onDialogKeyDown = (event: KeyboardEvent<HTMLElement>) => {
