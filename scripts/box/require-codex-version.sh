@@ -4,9 +4,11 @@
 # say how to upgrade it and exit 1.
 #
 # The devbox `codex-big` script runs this before starting Codex, and
-# scripts/box/bootstrap.sh runs it to decide whether an installed Codex needs
+# bootstrap.sh beside it runs it to decide whether an installed Codex needs
 # upgrading. Codex is installed with npm outside devbox, so nothing else pins
 # its version. The minimum lives here only, so the two callers cannot drift.
+# It sits in scripts/box/ because inmotion.sh ships only that directory to a
+# remote box, and bootstrap.sh must find it there too.
 #
 # 0.160.0 because `codex-big` runs gpt-6.1-sol, and Codex 0.156.1 refused that
 # model with a ChatGPT sign-in ("not supported when using Codex with a ChatGPT

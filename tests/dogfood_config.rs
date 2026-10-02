@@ -161,7 +161,7 @@ fn devbox_script_bodies() -> serde_json::Map<String, serde_json::Value> {
 ///
 /// For a multi-line script it is the LAST line: devbox runs the lines in order
 /// and stops at the first that fails, so earlier lines are preflight checks
-/// (`codex-big` runs `scripts/require-codex-version.sh` first) and the last is
+/// (`codex-big` runs `scripts/box/require-codex-version.sh` first) and the last is
 /// what launches the agent.
 fn launched_program(
     scripts: &serde_json::Map<String, serde_json::Value>,

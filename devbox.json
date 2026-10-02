@@ -62,7 +62,7 @@
       "oc-release":         ["opencode --model openai/gpt-6.1-sol"],
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"],
       "codex-big": [
-        "\"$DEVBOX_PROJECT_ROOT/scripts/require-codex-version.sh\"",
+        "\"$DEVBOX_PROJECT_ROOT/scripts/box/require-codex-version.sh\"",
         "codex --model gpt-6.1-sol --sandbox danger-full-access --ask-for-approval never -c model_reasoning_effort=high"
       ]
     }
