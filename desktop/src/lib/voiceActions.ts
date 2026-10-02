@@ -322,13 +322,15 @@ export type VoiceActionContext = {
    * so each re-checks {@link VoiceDispatchTarget.declaredForm} against the
    * live form first.
    *
-   * Command is never DICTATED: it is the field that executes, so the only
-   * thing voice puts there is a registry default (`commands.toml` has the
-   * argument).
+   * Command takes the user's own words since PR #1451 round 4 (decision D8):
+   * `setNewAgentCommand` sets it to {@link VoiceDispatchTarget.commandText},
+   * through the path a keystroke in the field takes, so it counts as an edit.
+   * Filling it starts nothing — Start is still a separate act.
    */
   chooseNewAgentMode: (target: VoiceDispatchTarget) => string | undefined;
   chooseNewAgentType: (target: VoiceDispatchTarget) => string | undefined;
   nameNewAgent: (target: VoiceDispatchTarget) => string | undefined;
+  setNewAgentCommand: (target: VoiceDispatchTarget) => string | undefined;
   /**
    * Issue #1263 — the New agent dialog's deck field, by voice: choose the deck
    * a `deck_ref` resolved to (`target.preselectDeckId`) through the function a
@@ -794,10 +796,10 @@ export const VOICE_ACTIONS = {
     },
   },
 
-  /* PRD #1223 — the three `new_agent_form` rows: Mode, Agent and Name. None
-     starts anything, so none is in PRD #802 D5's confirmation set; the manual
-     chips, picker and Name input are unchanged and call the same functions.
-     Command has no entry here on purpose. */
+  /* PRD #1223 — the `new_agent_form` rows: Mode, Agent and Name, and since
+     PR #1451 round 4 (D8) Command. None starts anything, so none is in PRD
+     #802 D5's confirmation set; the manual chips and the Name and Command
+     inputs are unchanged and call the same functions. */
   chooseNewAgentMode: {
     label: "Choose a Mode chip in the New agent form",
     voice: true,
@@ -824,6 +826,16 @@ export const VOICE_ACTIONS = {
     needs: ["nameNewAgent", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "nameNewAgent" | "reportRefused">, target: VoiceDispatchTarget) => {
       const refused = context.nameNewAgent(target);
+      if (refused !== undefined) context.reportRefused(refused);
+    },
+  },
+
+  setNewAgentCommand: {
+    label: "Set the New agent form's Command",
+    voice: true,
+    needs: ["setNewAgentCommand", "reportRefused"],
+    run: (context: Pick<VoiceActionContext, "setNewAgentCommand" | "reportRefused">, target: VoiceDispatchTarget) => {
+      const refused = context.setNewAgentCommand(target);
       if (refused !== undefined) context.reportRefused(refused);
     },
   },
@@ -986,6 +998,14 @@ export type VoiceDispatchTarget = AgentViewTarget & {
    */
   filterText?: string;
   /**
+   * The command line for the New agent form's Command field — what a row's
+   * `command_text` param resolved to (PR #1451 round 4, decision D8). Rust
+   * kept the model's value only because the transcript holds it, and this is
+   * the TRANSCRIPT's slice of it, as said, less surrounding quotes and a
+   * sentence's full stop.
+   */
+  commandText?: string;
+  /**
    * The directory browser the utterance was JUDGED against: the deck and the
    * listing `path` the webview declared with it (PRD #1223), or absent when it
    * declared none.
@@ -1145,7 +1165,7 @@ export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "swit
 export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
-export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "startNewAgent" | "discardNewAgent";
+export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";
 
 /**
  * What the New agent dialog publishes about its directory browser (PRD #1223),

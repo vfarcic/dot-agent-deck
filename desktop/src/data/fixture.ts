@@ -1069,11 +1069,12 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    */
   readonly openers?: readonly string[];
   /**
-   * `commands.toml`'s `requires = ["directory_listing"]`: callable only while
-   * the webview has declared a directory listing, and otherwise refused with
-   * the row's own hint — the same `Not here — <hint>.` Rust renders.
+   * `commands.toml`'s `requires = ["directory_listing"]` or `["new_agent_form"]`:
+   * callable only while the webview has declared a directory listing, or the
+   * New agent dialog's live form, and otherwise refused with the row's own
+   * hint — the same `Not here — <hint>.` Rust renders.
    */
-  readonly requires?: "directory_listing";
+  readonly requires?: "directory_listing" | "new_agent_form";
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -1233,6 +1234,22 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Filter cleared.",
   },
   {
+    // PR #1451 round 4, decision D8 — the New agent form's Command field.
+    // Matched by OPENER; the command is then the rest of the utterance, kept
+    // as said by {@link fixtureGroundedCommandText}, which is
+    // `voice::command_text::grounded_command_text`'s presentation rule. A live
+    // build has the model locate the command inside a longer sentence; the
+    // preview's stand-in for that is "everything after the opener".
+    phrases: [],
+    openers: ["set the command to", "change the command to", "make the command", "the command is"],
+    action: "set_new_agent_command",
+    invoke: "setNewAgentCommand",
+    screens: ["overview"],
+    requires: "new_agent_form",
+    unavailableHint: "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first",
+    report: "Command: “{command}”.",
+  },
+  {
     // PR #1451 round 3, change 4 — turning the page of a list voice shows a
     // page at a time. The app refuses a turn with nothing to turn to itself.
     phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
@@ -1265,11 +1282,11 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
  * honest about what this stand-in is — a matcher over a fixed list — and is
  * what a preview reader most needs to know.
  */
-export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false): VoiceCommandDto[] {
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false): VoiceCommandDto[] {
   return FIXTURE_VOICE_COMMANDS.map((command) => ({
     id: command.action,
     description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
-    callable: fixtureCallable(command, screen, directoryListing),
+    callable: fixtureCallable(command, screen, directoryListing, newAgentForm),
     unavailable_hint: command.unavailableHint,
     params: [],
   }));
@@ -1320,7 +1337,7 @@ const FIXTURE_VOICE_TIE = {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
@@ -1382,7 +1399,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
-  if (!fixtureCallable(command, screen, directoryListing)) {
+  if (!fixtureCallable(command, screen, directoryListing, newAgentForm)) {
     return {
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
@@ -1403,6 +1420,25 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
         invoke: command.invoke,
         params: [{ name: "text", kind: "filter_text", spoken: text, value: text, label: text }],
         sentence: command.report.replace("{text}", text),
+      },
+    };
+  }
+  if (command.action === "set_new_agent_command") {
+    const opener = command.openers!.find((candidate) => fixtureOpening(utterance, candidate) !== undefined)!;
+    const said = utterance.trim().slice(opener.length).trim();
+    const value = fixtureGroundedCommandText(utterance, said);
+    if (value === undefined) {
+      return { ...stub, outcome: { kind: "param_missing", transcript: utterance, action: command.action, param: "command", sentence: fixtureHeard(utterance, "I could not tell what command you said, so the command was not changed") } };
+    }
+    return {
+      ...stub,
+      outcome: {
+        kind: "dispatch",
+        transcript: utterance,
+        action: command.action,
+        invoke: command.invoke,
+        params: [{ name: "command", kind: "command_text", spoken: said, value, label: value }],
+        sentence: command.report.replace("{command}", value),
       },
     };
   }
@@ -1427,9 +1463,36 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   };
 }
 
-/** Whether `command` can run on `screen`, given whether a directory listing is declared. */
-function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean): boolean {
-  return command.screens.includes(screen) && (command.requires !== "directory_listing" || directoryListing);
+/** Whether `command` can run on `screen`, given whether a directory listing and a live New agent form are declared. */
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean): boolean {
+  if (!command.screens.includes(screen)) return false;
+  if (command.requires === "directory_listing") return directoryListing;
+  if (command.requires === "new_agent_form") return newAgentForm;
+  return true;
+}
+
+/** The quote pairs `voice::command_text` drops from around a command. */
+const FIXTURE_COMMAND_QUOTES: ReadonlyArray<readonly [string, string]> = [["\"", "\""], ["'", "'"], ["`", "`"], ["“", "”"], ["‘", "’"]];
+
+/**
+ * `voice::command_text::grounded_command_text`'s presentation rule: the
+ * command `value` without surrounding whitespace, a sentence's trailing full
+ * stop (a single `.` after a letter, digit or closing quote — `cd ..` keeps
+ * its dots) or one pair of surrounding quotes, and otherwise exactly as said.
+ * It must occur in `transcript` on word boundaries; the preview's value is
+ * always a slice of the utterance, so that half only refuses an empty one.
+ */
+export function fixtureGroundedCommandText(transcript: string, value: string): string | undefined {
+  const withoutFullStop = (text: string) => (/[\p{L}\p{N}”’"'`]\.$/u.test(text) ? text.slice(0, -1).trimEnd() : text);
+  let text = withoutFullStop(value.trim());
+  const pair = FIXTURE_COMMAND_QUOTES.find(([open, close]) => text.length >= 2 && text.startsWith(open) && text.endsWith(close) && !text.slice(1, -1).includes(open) && !text.slice(1, -1).includes(close));
+  if (pair) text = withoutFullStop(text.slice(1, -1).trim());
+  if (text === "" || /[\u0000-\u001f\u007f]/u.test(text)) return undefined;
+  const at = transcript.indexOf(text);
+  if (at < 0) return undefined;
+  const joins = (outside: string | undefined, inside: string | undefined) => outside !== undefined && inside !== undefined && /[\p{L}\p{N}]/u.test(outside) && /[\p{L}\p{N}]/u.test(inside);
+  if (joins(transcript[at - 1], text[0]) || joins(transcript[at + text.length], text[text.length - 1])) return undefined;
+  return text;
 }
 
 /**

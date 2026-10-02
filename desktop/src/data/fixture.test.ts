@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolveFixtureVoice } from "./fixture";
+import { fixtureGroundedCommandText, resolveFixtureVoice } from "./fixture";
 
 const dictationSource = readFileSync(resolve("src-tauri/src/voice/dictation.rs"), "utf8");
 const outcomeSource = readFileSync(resolve("src-tauri/src/voice/outcome.rs"), "utf8");
@@ -133,5 +133,52 @@ describe("browser fixture reserved phrase parity with Rust", () => {
         .map((utterance) => `${action}: ${utterance}`));
     });
     expect(wrong).toEqual([]);
+  });
+});
+
+/** A string field of one `commands.toml` row, read off the file Rust embeds. */
+function rowField(id: string, field: string): string {
+  const row = commandsSource.split("[[commands]]").find((block) => new RegExp(`^\\s*id\\s*=\\s*"${id}"`, "m").test(block));
+  if (!row) throw new Error(`commands.toml row ${id} was not found`);
+  const value = row.match(new RegExp(`^${field}\\s*=\\s*"([^"]*)"`, "m"));
+  if (!value) throw new Error(`commands.toml row ${id} has no ${field}`);
+  return value[1];
+}
+
+describe("browser fixture Command row parity with Rust (PR #1451 round 4, D8)", () => {
+  /** Scenario: the preview's Command row carries Rust's own invoke, hint and report, so a browser test reads the sentences a live build renders. */
+  it("has the same invoke, hint and report as commands.toml", () => {
+    expect(fixtureSource).toContain(`invoke: "${rowField("set_new_agent_command", "invoke")}"`);
+    expect(fixtureSource).toContain(`unavailableHint: "${rowField("set_new_agent_command", "unavailable_hint")}"`);
+    expect(fixtureSource).toContain(`report: "${rowField("set_new_agent_command", "report")}"`);
+  });
+
+  /** Scenario: with the New agent form live, the maintainer's sentence sets Command to the three words as said and reports them; with no form it is refused with the row's hint. */
+  it("sets the command the user said only while the form is live", () => {
+    expect(resolveFixtureVoice("Set the command to devbox run agent.", "overview", false, false, true).outcome).toMatchObject({
+      kind: "dispatch",
+      action: "set_new_agent_command",
+      invoke: "setNewAgentCommand",
+      params: [{ name: "command", kind: "command_text", value: "devbox run agent" }],
+      sentence: "Command: “devbox run agent”.",
+    });
+    expect(resolveFixtureVoice("Set the command to devbox run agent.", "overview", false, true, false).outcome).toMatchObject({
+      kind: "unavailable",
+      sentence: `Not here — ${rowField("set_new_agent_command", "unavailable_hint")}.`,
+    });
+  });
+
+  /** Scenario: the preview drops what `voice::command_text` drops — surrounding quotes and a sentence's full stop — and keeps everything else as said. */
+  it("keeps the command as said, as voice::command_text does", () => {
+    const cases: [string, string, string | undefined][] = [
+      ["Set the command to devbox run agent.", "devbox run agent.", "devbox run agent"],
+      ["Set the command to “npm run dev”.", "“npm run dev”.", "npm run dev"],
+      ["set the command to claude --model haiku.", "claude --model haiku.", "claude --model haiku"],
+      ["set the command to cd ..", "cd ..", "cd .."],
+      ["Set the command to devbox run agent.", "devbox run agent --verbose", undefined],
+      ["Set the command to devbox run agent.", "dev", undefined],
+      ["set the command", "“”.", undefined],
+    ];
+    expect(cases.map(([said, value]) => fixtureGroundedCommandText(said, value))).toEqual(cases.map(([, , expected]) => expected));
   });
 });

@@ -121,6 +121,17 @@ impl fmt::Display for Screen {
 /// applied. That is acceptable here where it is not for dictation because the
 /// value goes into a visible filter box, changes only which directories are
 /// listed, and is quoted back in the report.
+///
+/// [`ParamKind::CommandText`] is the third kind held to the transcript (PR
+/// #1451 round 4, decision D8): the New agent dialog's Command field. The
+/// model locates the command in the sentence — "Set the command to devbox run
+/// agent." is `devbox run agent` — and
+/// [`super::command_text::grounded_command_text`] accepts it only when it
+/// occurs in the transcript as written, on word boundaries, and returns the
+/// TRANSCRIPT's slice of it: a command the model added a flag to or
+/// corrected is not there, so it is refused. Only surrounding quotes and a
+/// sentence's trailing full stop are dropped. Unlike filter text it is not
+/// lowercased, because a command line is case-sensitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -132,10 +143,11 @@ pub enum ParamKind {
     OrchestrationRef,
     SpokenPrefix,
     FilterText,
+    CommandText,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 8] = [
+    pub const ALL: [ParamKind; 9] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -144,6 +156,7 @@ impl ParamKind {
         ParamKind::OrchestrationRef,
         ParamKind::SpokenPrefix,
         ParamKind::FilterText,
+        ParamKind::CommandText,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -156,6 +169,7 @@ impl ParamKind {
             ParamKind::OrchestrationRef => "orchestration_ref",
             ParamKind::SpokenPrefix => "spoken_prefix",
             ParamKind::FilterText => "filter_text",
+            ParamKind::CommandText => "command_text",
         }
     }
 
@@ -182,7 +196,7 @@ impl ParamKind {
             | ParamKind::OrchestrationRef => true,
             // The user's own words, verified against the transcript; nothing
             // observed is involved.
-            ParamKind::SpokenPrefix | ParamKind::FilterText => false,
+            ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
         }
     }
 }
@@ -1365,6 +1379,12 @@ mod tests {
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
                 ("choose_agent_type", "chooseNewAgentType", vec!["overview"]),
                 ("name_new_agent", "nameNewAgent", vec!["overview"]),
+                // The Command field (PR #1451 round 4, decision D8).
+                (
+                    "set_new_agent_command",
+                    "setNewAgentCommand",
+                    vec!["overview"]
+                ),
                 // The deck field once the dialog is open (#1263) — `overview`,
                 // plus `requires = ["new_agent_dialog"]`.
                 ("choose_deck", "chooseNewAgentDeck", vec!["overview"]),
@@ -1676,7 +1696,7 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains(
-                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`, `filter_text`"
+                "`agent_ref`, `deck_ref`, `dir_ref`, `mode_ref`, `agent_type_ref`, `orchestration_ref`, `spoken_prefix`, `filter_text`, `command_text`"
             ),
             "{message}"
         );
@@ -2484,6 +2504,14 @@ mod tests {
             !ParamKind::FilterText.names_something_observed(),
             "filter text is the user's own words, not an observed name"
         );
+        assert_eq!(
+            ParamKind::parse("command_text"),
+            Some(ParamKind::CommandText)
+        );
+        assert!(
+            !ParamKind::CommandText.names_something_observed(),
+            "a command is the user's own words, not an observed name"
+        );
         assert_eq!(ParamKind::parse("agentRef"), None);
         assert_eq!(ParamKind::parse("deckRef"), None);
         assert_eq!(ParamKind::parse("dirRef"), None);
@@ -2651,9 +2679,10 @@ mod tests {
         }
     }
 
-    /// PRD #1223: the three fill rows pinned by value. Command has no row of
-    /// its own — `voice_table_no_row_dictates_the_command` says so as a
-    /// property.
+    /// PRD #1223: the fill rows pinned by value — Mode, the agent and Name,
+    /// and since PR #1451 round 4 (decision D8) Command, whose value is the
+    /// user's own words held to the transcript
+    /// (`voice_table_the_command_row_takes_only_the_users_words`).
     #[test]
     fn voice_table_form_rows_are_pinned_by_value() {
         let table = super::table();
@@ -2696,6 +2725,13 @@ mod tests {
             ParamKind::SpokenPrefix,
             "Name set.",
         );
+        pinned(
+            "set_new_agent_command",
+            "setNewAgentCommand",
+            "command",
+            ParamKind::parse("command_text").expect("the command_text kind exists"),
+            "Command: \u{201c}{command}\u{201d}.",
+        );
     }
 
     /// The form rows run only while the form is live, and only on the
@@ -2706,7 +2742,12 @@ mod tests {
         let table = super::table();
         let live = form();
         let no_form = VoiceNewAgent { form: None };
-        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
+        for id in [
+            "choose_mode",
+            "choose_agent_type",
+            "name_new_agent",
+            "set_new_agent_command",
+        ] {
             let row = table.row(id).expect("present");
             assert!(!row.callable(Screen::Overview, None, None), "{id}");
             assert!(
@@ -3126,22 +3167,31 @@ mod tests {
         );
     }
 
-    /// The Command decision, as a property: no row DICTATES the command line,
-    /// and every fill row says so. It is the one field that executes, so the
-    /// only thing voice puts there is an agent's registry default
-    /// (`choose_agent_type`, since the Agent picker was removed) and anything
-    /// else stays typed by hand (see `commands.toml`).
+    /// The Command decision, as a property (PR #1451 round 4, decision D8 —
+    /// which reversed "no row dictates the command line"): exactly one row
+    /// sets Command to words, it takes them only through the transcript-held
+    /// `command_text` kind, and it starts nothing — a start stays the separate
+    /// `start_new_agent`. No form row tells the model any more that Command is
+    /// typed by hand, since that would steer "set the command to …" away
+    /// from the row that does it.
     #[test]
-    fn voice_table_no_row_dictates_the_command() {
+    fn voice_table_the_command_row_takes_only_the_users_words() {
         let table = super::table();
-        for id in ["choose_mode", "choose_agent_type", "name_new_agent"] {
-            let row = table.row(id).expect("present");
-            assert!(
-                row.description.contains("typed by hand"),
-                "{id} must keep the command line out of reach: {}",
-                row.description
-            );
-        }
+        let command_text = ParamKind::parse("command_text").expect("the command_text kind exists");
+        let takes_command_text: Vec<&str> = table
+            .rows()
+            .iter()
+            .filter(|row| row.params.iter().any(|param| param.kind == command_text))
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(takes_command_text, vec!["set_new_agent_command"]);
+        let row = table.row("set_new_agent_command").expect("present");
+        assert_ne!(row.invoke, "startNewAgent");
+        assert!(
+            !row.description.to_lowercase().contains("starts at once"),
+            "{}",
+            row.description
+        );
         let form_rows: Vec<&str> = table
             .rows()
             .iter()
@@ -3150,9 +3200,22 @@ mod tests {
             .collect();
         assert_eq!(
             form_rows,
-            vec!["choose_mode", "choose_agent_type", "name_new_agent"],
+            vec![
+                "choose_mode",
+                "choose_agent_type",
+                "name_new_agent",
+                "set_new_agent_command",
+            ],
             "a new form row is a decision about the Command field too — see commands.toml"
         );
+        for id in &form_rows {
+            let row = table.row(id).expect("present");
+            assert!(
+                !row.description.contains("typed by hand"),
+                "{id} still tells the model Command is typed by hand: {}",
+                row.description
+            );
+        }
     }
 
     /// PR #1451 round 3, change 4: turning the page of whatever list on screen

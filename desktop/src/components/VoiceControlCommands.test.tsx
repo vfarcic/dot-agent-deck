@@ -3576,7 +3576,20 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
         const rest = utterance.slice("call it ".length);
         return dispatch("name_new_agent", "nameNewAgent", "Name set.", utterance, [{ name: "prefix", kind: "spoken_prefix", spoken: "call it", value: rest, label: rest }]);
       }
-      /* No row fills Command: the model's escape, which renders "no matching action". */
+      /* PR #1451 round 4, D8 — the Command row. What Rust does: the model's
+         command is kept only when the transcript holds it, and the value is
+         the transcript's words less the sentence's full stop. "with flags"
+         stands for a model that added one: refused, nothing dispatched. */
+      const commandOpener = ["set the command to ", "make the command "].find((opener) => utterance.toLowerCase().startsWith(opener));
+      if (commandOpener !== undefined) {
+        if (!form && !options.forced) return unavailable("set_new_agent_command", "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first");
+        const said = utterance.slice(commandOpener.length).replace(/\.$/u, "");
+        if (said.endsWith(" with flags")) {
+          const invented = `${said.slice(0, -" with flags".length)} --verbose`;
+          return unresolved("set_new_agent_command", "command", invented, `Heard: “${utterance}” — you did not say “${invented}”, so the command was not changed.`);
+        }
+        return dispatch("set_new_agent_command", "setNewAgentCommand", `Command: “${said}”.`, utterance, [{ name: "command", kind: "command_text", spoken: said, value: said, label: said }]);
+      }
       return { resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: utterance, sentence: `Heard: “${utterance}” — no matching action.` } };
     });
   }
@@ -3802,22 +3815,120 @@ describe("the rest of the New agent form, by voice (PRD #1223)", () => {
   });
 
   /**
-   * Scenario: Command has no voice row. Saying something about the command
-   * reaches no fill member, and the Command field keeps what it had.
+   * Scenario: the maintainer's report — with the form live, say "Set the
+   * command to devbox run agent." Command reads exactly "devbox run agent", as
+   * if typed, the report quotes it, and nothing starts. Closing and reopening
+   * the dialog keeps it, because a spoken command counts as an edit.
    */
-  it("leaves Command manual", async () => {
+  it("sets Command to the command the user said, as if typed", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+
+    voice.deliver("Set the command to devbox run agent.");
+    await completeUtterance();
+
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("devbox run agent");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Command: “devbox run agent”.");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("no matching action");
+    expect(deck.runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByTestId("new-agent-dialog"), { key: "Escape" });
+    await flush();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+    await flush();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("devbox run agent");
+  });
+
+  /**
+   * Scenario: "make the command npm run dev" replaces what "use claude" put
+   * in Command, and "use claude" afterwards still fills Claude Code's registry
+   * default — the two rows set the same field and neither starts anything.
+   */
+  it("sets Command after and before choosing an agent type", async () => {
     const voice = microphone([]);
     const { deck } = formDeck(voice);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnVoiceOn();
     await openForm();
 
-    voice.deliver("set the command to rm -rf");
+    voice.deliver("use claude");
     await completeUtterance();
-    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_JOIN_WINDOW_MS); });
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
+    voice.deliver("make the command npm run dev");
+    await completeUtterance();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("npm run dev");
+    voice.deliver("use claude");
+    await completeUtterance();
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("claude --model haiku");
+    expect(deck.runAction).not.toHaveBeenCalled();
+  });
 
-    expect(screen.getByTestId("voice-report")).toHaveTextContent("no matching action");
+  /**
+   * Scenario: the model answers a command the user did not say (a flag
+   * added). Rust refuses it, so nothing reaches the dialog: Command keeps
+   * "bash" and the report says the command was not changed.
+   */
+  it("leaves Command alone when the command was not what the user said", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("set the command to devbox run agent with flags");
+    await completeUtterance();
+
     expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("so the command was not changed");
+  });
+
+  /**
+   * Scenario: with the review orchestration chosen, Command is hidden — its
+   * roles run their own commands — so a spoken command is refused rather than
+   * set behind the user's back, and No mode shows Command as it was.
+   */
+  it("refuses to set Command while an orchestration is selected", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openForm();
+
+    voice.deliver("mode orch: review");
+    await completeUtterance();
+    voice.deliver("set the command to devbox run agent");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(COMMAND_HIDDEN_BY_ORCHESTRATION);
+    fireEvent.click(screen.getByTestId("new-agent-mode-none"));
+    expect(screen.getByTestId("new-agent-command")).toHaveValue("bash");
+  });
+
+  /**
+   * Scenario: before a directory is chosen there is no live form, so "set the
+   * command to devbox run agent" is refused with the row's hint and Command is
+   * not filled.
+   */
+  it("refuses to set Command before the form is live", async () => {
+    const voice = microphone([]);
+    const { deck } = formDeck(voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    fireEvent.click(screen.getByTestId("overview-new-agent"));
+    await flush();
+    await flush();
+
+    voice.deliver("set the command to devbox run agent");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Not here — setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first.");
   });
 
   /**

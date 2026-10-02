@@ -67,6 +67,8 @@ If a project defines two orchestrations with the same name, both chips are shown
 - with **No mode**, it starts the daemon's default shell;
 - with **schedule**, **schedule: issues** or **dispatcher**, it starts the daemon's `default_command`, or `claude` when none is set. The field's placeholder names the command.
 
+With [voice](voice.md#setting-the-command) on, you can also say "set the command to" followed by the command. That only fills the field; the agent starts when you press **Create agent** or say "start it".
+
 ## Closing and discarding
 
 Closing the dialog (`Escape`, `q`, the close button, or a click outside it) keeps what you entered as a draft, and the next **New agent** brings it back until you quit the app. **Discard** closes the dialog and forgets the draft; a successful start forgets it too. While a start is waiting for the daemon to answer, the dialog cannot be closed.

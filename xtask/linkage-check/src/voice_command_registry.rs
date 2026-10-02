@@ -1167,6 +1167,7 @@ mod tests {
             [
                 "agent_ref",
                 "agent_type_ref",
+                "command_text",
                 "deck_ref",
                 "dir_ref",
                 "filter_text",

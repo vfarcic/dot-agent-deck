@@ -172,6 +172,11 @@ struct PhraseFixture {
     /// lowercases it, so it is written lowercase here and compared exactly.
     #[serde(default)]
     resolved_filter: Option<String>,
+    /// The command a `command_text` param must resolve to — what the New agent
+    /// form's Command field would be set to (PR #1451 round 4, decision D8).
+    /// It is the transcript's own slice, so it is compared exactly.
+    #[serde(default)]
+    resolved_command: Option<String>,
     #[serde(default)]
     pending_action: bool,
     /// The candidate values a `param_ambiguous` fixture must offer as a
@@ -600,6 +605,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.name
             );
         }
+        if fixture.resolved_command.is_some() {
+            assert!(
+                fixture.form,
+                "{}: a `resolved_command` needs `form = true`, since Command is the live form's",
+                fixture.name
+            );
+        }
         if let Some(expected) = fixture.resolved_dir.as_deref() {
             assert!(
                 fixture.listing || fixture.hostile_listing,
@@ -757,6 +769,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     }
                     None => true,
                 };
+                let command_matches = match fixture.resolved_command.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::CommandText) == Some(expected)
+                    }
+                    None => true,
+                };
                 let prefix_matches = match fixture.dictate_prefix.as_deref() {
                     Some(expected) => marked_prefix(&answer.outcome)
                         .is_some_and(|marked| normalise(marked) == normalise(expected)),
@@ -824,6 +842,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && orchestration_matches
                     && prefix_matches
                     && filter_matches
+                    && command_matches
                     && candidates_match
                     && deck_named
                     && deck_eligible
@@ -836,11 +855,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         "{}expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
                          resolved_orchestration={:?} dictate_prefix={:?} resolved_filter={:?} \
-                         candidates={:?}, \
+                         resolved_command={:?} candidates={:?}, \
                          got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
-                         resolved_filter={:?} candidates={:?} model_value={:?} sentence={:?}",
+                         resolved_filter={:?} resolved_command={:?} candidates={:?} model_value={:?} \
+                         sentence={:?}",
                         if !candidates_match {
                             "the tie does not offer the expected candidates; "
                         } else if !deck_named {
@@ -864,6 +884,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         fixture.resolved_orchestration,
                         fixture.dictate_prefix,
                         fixture.resolved_filter,
+                        fixture.resolved_command,
                         fixture.candidates,
                         actual_action,
                         resolved_deck(&answer.outcome),
@@ -873,6 +894,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         resolved_label(&answer.outcome, ParamKind::OrchestrationRef),
                         marked_prefix(&answer.outcome),
                         resolved_of(&answer.outcome, ParamKind::FilterText),
+                        resolved_of(&answer.outcome, ParamKind::CommandText),
                         offered_values(&answer.outcome),
                         model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal

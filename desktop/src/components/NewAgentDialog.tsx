@@ -237,6 +237,8 @@ export const AGENT_TYPE_NOT_OFFERED = "That agent is not offered on this daemon 
 export const COMMAND_HIDDEN_BY_ORCHESTRATION = "An orchestration is selected and each of its roles runs its own command, so the Command was not changed.";
 /** The words after "name it" were only punctuation. */
 export const NO_NAME_HEARD = "No name was heard after that, so the Name was not changed.";
+/** A Command dispatch arrived with no command in it (Rust refuses that first, so this is the dialog's own line). */
+export const NO_COMMAND_HEARD = "No command was heard, so the Command was not changed.";
 
 /*
   PRD #802 D5 — why a spoken start opened no confirmation. Each names what is
@@ -1131,23 +1133,25 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     return undefined;
   };
   /**
-   * PRD #1223 — the rest of the form by voice: Mode, the agent and Name. Mode
-   * and Name call what the control's own click or keystroke calls
-   * (`selectMode`, the Name input's setter) and nothing else, so a spoken Name
+   * PRD #1223 — the rest of the form by voice: Mode, the agent, Name and —
+   * since PR #1451 round 4 (decision D8) — Command. Mode, Name and Command call
+   * what the control's own click or keystroke calls (`selectMode`, the Name
+   * and Command inputs' setters) and nothing else, so a spoken Name or Command
    * is an edit exactly as a typed one is. The agent has no control of its own
    * any more — the Agent picker was removed, because every `default_command`
    * is the bare binary name and the picker saved one word of typing while its
    * `auto` meant nothing and its label went stale against an edited Command —
    * so "use claude" sets Command to that agent's default command
    * ({@link commandFromAgent}), resolved against the deck's own registry (or
-   * this app's fallback copy for a deck that reports none). Voice has no other
-   * way to choose what the agent runs, since Command is never dictated.
+   * this app's fallback copy for a deck that reports none).
    *
    * Each first re-checks that the form is still the one the utterance was
    * judged against — its deck and its chosen directory — for the browser's
    * reason, and refuses in the dialog's words when it is not.
    *
-   * Command has no move: it is the field that executes, and it stays typed.
+   * A spoken Command is the user's words as Rust held them to the transcript
+   * (`target.commandText`), and setting it starts nothing: the agent runs only
+   * on Start, with the field in front of the user.
    */
   const formMovedOn = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (!deck || !target || phase !== "idle") return NO_NEW_AGENT_FORM;
@@ -1181,6 +1185,15 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     if (!spoken) return NO_NAME_HEARD;
     nameTouched.current = true;
     setName(spoken);
+    return undefined;
+  };
+  const voiceSetCommand = (dispatch: VoiceDispatchTarget): string | undefined => {
+    const refused = formMovedOn(dispatch);
+    if (refused !== undefined) return refused;
+    if (selectedOrchestration) return COMMAND_HIDDEN_BY_ORCHESTRATION;
+    if (!dispatch.commandText) return NO_COMMAND_HEARD;
+    commandTouched.current = true;
+    setCommand(dispatch.commandText);
     return undefined;
   };
   /**
@@ -1269,6 +1282,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       chooseNewAgentMode: voiceChooseMode,
       chooseNewAgentType: voiceChooseAgentType,
       nameNewAgent: voiceNameNewAgent,
+      setNewAgentCommand: voiceSetCommand,
       startNewAgent: voiceStart,
       discardNewAgent: requestDiscard,
       instance: instanceId.current,

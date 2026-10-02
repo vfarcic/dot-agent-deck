@@ -749,6 +749,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     /* PR #1451 round 3, change 5 — the Filter box's text, which Rust accepted
        only because the user said it. */
     const filterText = outcome.params.find((param) => param.kind === "filter_text");
+    /* PR #1451 round 4, D8 — the Command field's text: the transcript's words,
+       which Rust accepted only because the model's command is among them. */
+    const commandText = outcome.params.find((param) => param.kind === "command_text");
     /* PRD #1223 — the Mode chip and the agent entry a `mode_ref` and an
        `agent_type_ref` resolved to, against the form AS DECLARED: `value` is
        the id the dialog selects by. */
@@ -788,6 +791,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         : {}),
       ...(namedDirectory ? { directoryPath: namedDirectory.value } : {}),
       ...(filterText ? { filterText: filterText.value } : {}),
+      ...(commandText ? { commandText: commandText.value } : {}),
       /* What the utterance was judged against, so a directory move can refuse
          a browser that has moved on since (see the member's own comment). */
       ...(declaredDirectories ? { declaredDirectories: { deckId: declaredDirectories.deckId, path: declaredDirectories.path } } : {}),

@@ -516,6 +516,7 @@ pub(crate) mod tests {
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "set_new_agent_command".to_string(),
                 "choose_deck".to_string(),
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
@@ -546,6 +547,7 @@ pub(crate) mod tests {
                 "text".to_string(),
                 "mode".to_string(),
                 "agent_type".to_string(),
+                "command".to_string(),
                 "orchestration".to_string(),
             ]
         );

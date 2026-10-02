@@ -68,7 +68,7 @@ fn kind_nouns(kind: ParamKind) -> &'static [&'static str] {
         ParamKind::OrchestrationRef => &["orchestration", "run"],
         ParamKind::ModeRef => &["mode", "chip"],
         ParamKind::AgentTypeRef => &["agent", "type"],
-        ParamKind::SpokenPrefix | ParamKind::FilterText => &[],
+        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => &[],
     }
 }
 
@@ -474,7 +474,7 @@ fn by_name(
                 resolve_agent_type_ref(utterance, &choices)
             })
         }
-        ParamKind::SpokenPrefix | ParamKind::FilterText => Found::None,
+        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => Found::None,
     };
     match found {
         Found::One(value) => match offered.iter().find(|candidate| candidate.value == value) {
@@ -561,7 +561,7 @@ pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<S
             .iter()
             .find(|choice| choice.id == value)
             .map(agent_type_names),
-        ParamKind::SpokenPrefix | ParamKind::FilterText => None,
+        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => None,
     };
     names.unwrap_or_default()
 }
@@ -644,7 +644,7 @@ fn names_something(
         ParamKind::ModeRef | ParamKind::AgentTypeRef => form_choices(kind, live)
             .iter()
             .any(|choice| is(&choice.label)),
-        ParamKind::SpokenPrefix | ParamKind::FilterText => false,
+        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
     }
 }
 
@@ -665,7 +665,7 @@ fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
         ParamKind::ModeRef | ParamKind::AgentTypeRef => form_choices(candidate.kind, live)
             .iter()
             .any(|choice| choice.id == value),
-        ParamKind::SpokenPrefix | ParamKind::FilterText => false,
+        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
     };
     if present {
         ChoiceAnswer::Selected(candidate.clone())

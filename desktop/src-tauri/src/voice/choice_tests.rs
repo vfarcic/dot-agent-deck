@@ -17,6 +17,7 @@ fn candidate(kind: ParamKind, value: &str, label: &str) -> ResolvedParam {
             ParamKind::AgentTypeRef => "agent_type",
             ParamKind::SpokenPrefix => panic!("a spoken prefix cannot be an offered choice"),
             ParamKind::FilterText => panic!("filter text cannot be an offered choice"),
+            ParamKind::CommandText => panic!("a command cannot be an offered choice"),
         }
         .to_string(),
         kind,

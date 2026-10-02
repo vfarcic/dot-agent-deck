@@ -1084,6 +1084,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       chooseNewAgentMode: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentMode(target)),
       chooseNewAgentType: (target: VoiceDispatchTarget) => fill((slot) => slot.chooseNewAgentType(target)),
       nameNewAgent: (target: VoiceDispatchTarget) => fill((slot) => slot.nameNewAgent(target)),
+      setNewAgentCommand: (target: VoiceDispatchTarget) => fill((slot) => slot.setNewAgentCommand(target)),
       /* #1263 and #1247 — callable whenever the dialog is open, so a slot that
          has gone during the round trip means the dialog closed, not that the
          form has no deck. The slot is tested, not the call's answer: a

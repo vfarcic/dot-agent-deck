@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::choice::{ChoiceLive, MAX_CHOICES};
+use super::command_text::grounded_command_text;
 use super::dictation::{
     DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
     TRAILING_SEND_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
@@ -1806,6 +1807,14 @@ fn resolve_param(
             Some(text) => Ok(param(text.clone(), text)),
             None => Err(Unmet::NoMatch),
         },
+        // PR #1451 round 4, decision D8 — the Command field. The model located
+        // the command in the sentence; what reaches the field is the
+        // TRANSCRIPT's slice of it, and only when the model's value is there:
+        // a command it corrected or extended is refused, never applied.
+        ParamKind::CommandText => match grounded_command_text(transcript.text(), spoken) {
+            Some(text) => Ok(param(text.clone(), text)),
+            None => Err(Unmet::NoMatch),
+        },
         ParamKind::AgentRef => match resolve_agent_ref(spoken, agents) {
             AgentRefMatch::One { id, label } => Ok(param(id, label)),
             AgentRefMatch::None => Err(Unmet::NoMatch),
@@ -2604,6 +2613,9 @@ impl ParamKind {
             ParamKind::FilterText => {
                 "I could not tell what to filter by, so the filter was not changed"
             }
+            ParamKind::CommandText => {
+                "I could not tell what command you said, so the command was not changed"
+            }
         }
     }
 
@@ -2656,6 +2668,11 @@ impl ParamKind {
             ParamKind::FilterText => {
                 format!("you did not say \u{201c}{spoken}\u{201d}, so the filter was not changed")
             }
+            // The same shape for the Command field: the model's command, quoted
+            // beside what was heard, and the field keeps what it had.
+            ParamKind::CommandText => {
+                format!("you did not say \u{201c}{spoken}\u{201d}, so the command was not changed")
+            }
         }
     }
 
@@ -2703,6 +2720,10 @@ impl ParamKind {
             ParamKind::FilterText => {
                 format!("\u{201c}{spoken}\u{201d} could be more than one filter: {listed}")
             }
+            // Unreachable too: a command is in the transcript or it is not.
+            ParamKind::CommandText => {
+                format!("\u{201c}{spoken}\u{201d} could be more than one command: {listed}")
+            }
         }
     }
 
@@ -2718,6 +2739,7 @@ impl ParamKind {
             ParamKind::OrchestrationRef => "orchestration",
             ParamKind::SpokenPrefix => "words",
             ParamKind::FilterText => "filter",
+            ParamKind::CommandText => "command",
         }
     }
 }
@@ -6269,6 +6291,120 @@ mod tests {
         );
     }
 
+    // -- the Command field (PR #1451 round 4, decision D8) ------------------
+
+    /// Scenario: the maintainer's report. With the New agent form live, the
+    /// user says "Set the command to devbox run agent." and the Command field
+    /// is set to exactly those three words — the transcript's, without the
+    /// sentence's full stop — and the report quotes them.
+    #[tokio::test]
+    async fn voice_outcome_set_new_agent_command_sets_the_words_the_user_said() {
+        let said = "Set the command to devbox run agent.";
+        let form = new_agent_form();
+        for model_value in [
+            "devbox run agent",
+            "devbox run agent.",
+            "\u{201c}devbox run agent\u{201d}",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("set_new_agent_command").with_param("command", model_value),
+            );
+            let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+            let VoiceOutcome::Dispatch {
+                action,
+                invoke,
+                params,
+                sentence,
+                ..
+            } = outcome
+            else {
+                panic!("{model_value}: a dispatch, got {outcome:?}");
+            };
+            assert_eq!(action, "set_new_agent_command");
+            assert_eq!(invoke, "setNewAgentCommand");
+            assert_eq!(params.len(), 1, "{params:?}");
+            assert_eq!(params[0].name, "command");
+            assert_eq!(params[0].kind.as_str(), "command_text");
+            assert_eq!(params[0].value, "devbox run agent", "{model_value}");
+            assert_eq!(sentence, "Command: \u{201c}devbox run agent\u{201d}.");
+        }
+    }
+
+    /// Scenario: the model "fixes" or invents the command — adds a flag,
+    /// corrects a word, or answers a command the user never said. Nothing is
+    /// dispatched, so the Command field keeps what it had, and the report
+    /// says the user did not say it.
+    #[tokio::test]
+    async fn voice_outcome_set_new_agent_command_refuses_a_command_the_user_did_not_say() {
+        let said = "Set the command to devbox run agent.";
+        let form = new_agent_form();
+        for invented in [
+            "devbox run agent --verbose",
+            "devbox run agents",
+            "npm run dev",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("set_new_agent_command").with_param("command", invented),
+            );
+            let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { action, param, .. }
+                    if action == "set_new_agent_command" && param == "command"),
+                "{invented}: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.sentence(),
+                format!(
+                    "Heard: \u{201c}{said}\u{201d} — you did not say \u{201c}{invented}\u{201d}, \
+                     so the command was not changed."
+                ),
+                "{invented}"
+            );
+        }
+    }
+
+    /// Scenario: the model picks the Command row and supplies no command;
+    /// nothing is set and the user is told the app could not tell what it was.
+    #[tokio::test]
+    async fn voice_outcome_set_new_agent_command_without_a_command_is_missing() {
+        let said = "set the command";
+        let resolver =
+            StubResolver::new().answering(said, IntentAnswer::new("set_new_agent_command"));
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamMissing { action, param, .. }
+                if action == "set_new_agent_command" && param == "command"),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: "make the command npm test" is grounded on the word
+    /// "command" and sets the field; the same words answered with
+    /// `start_new_agent` are refused, because nothing in them asks to start.
+    #[tokio::test]
+    async fn voice_outcome_setting_the_command_is_not_a_start() {
+        let said = "make the command npm test";
+        let form = new_agent_form();
+        let set = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("set_new_agent_command").with_param("command", "npm test"),
+        );
+        let outcome = run_form(&set, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { invoke, .. } if invoke == "setNewAgentCommand"),
+            "{outcome:?}"
+        );
+        let start = StubResolver::new().answering(said, IntentAnswer::new("start_new_agent"));
+        let outcome = run_form(&start, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ActionUngrounded { .. }),
+            "{outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn voice_outcome_form_rows_are_unavailable_without_a_live_form() {
         let no_form = VoiceNewAgent { form: None };
@@ -6294,6 +6430,13 @@ mod tests {
                 "prefix",
                 "name it",
                 "naming the new agent needs a daemon and a directory chosen in the New agent dialog; choose those first",
+            ),
+            (
+                "set the command to devbox run agent",
+                "set_new_agent_command",
+                "command",
+                "devbox run agent",
+                "setting the command needs a daemon and a directory chosen in the New agent dialog; choose those first",
             ),
         ] {
             let resolver = StubResolver::new()

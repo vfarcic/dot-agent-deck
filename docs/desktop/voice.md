@@ -35,7 +35,7 @@ What you can do by voice, by screen:
 | --- | --- |
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
 | Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
-| New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; start; discard |
+| New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
 While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). A list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
@@ -51,6 +51,10 @@ Nothing is typed or sent, and the app says why, if a confirmation is open, if th
 ## Filtering directories
 
 While the New agent dialog shows a directory, say "filter" followed by what to look for, such as "filter docs" or "filter by api". The app puts that text in the **Filter** box, exactly as if you had typed it, and the list shows only the directories whose names contain it, in upper or lower case. Longer requests work too: "show only those starting with letter D" sets the filter to `d`, which, as when you type it, also keeps names that have a `d` anywhere else. The app says what it applied, for example *Filtering by “d”.* It uses only words you said: if what you asked for is not in your words, the filter is left as it was and the app says so. Say "clear filter" to empty the box and show every directory again.
+
+## Setting the command
+
+Once the New agent dialog has a daemon and a directory chosen, say "set the command to" followed by the command, such as "set the command to devbox run agent" or "make the command npm run dev". The app puts exactly the words you said in the **Command** field, as if you had typed them, and says what it set, for example *Command: “devbox run agent”.* Only the full stop at the end of your sentence and any quotes around the command are left out. If what would go in the field is not what you said, the field is left as it was and the app says so. Setting the command starts nothing, even when the command contains words like "run": check the form, then say "start it" or press **Create agent**. Saying "use claude" (or another agent) still fills in that agent's usual command instead.
 
 ## Choosing by number
 

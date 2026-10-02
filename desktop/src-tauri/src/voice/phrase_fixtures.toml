@@ -1019,6 +1019,50 @@ action = "name_new_agent"
 outcome = "dispatch"
 dictate_prefix = "call it"
 
+# PR #1451 round 4, decision D8 — the Command field by voice. The model
+# locates the command and the app keeps the transcript's own words for it, so
+# `resolved_command` is exactly what the user said, less the sentence's full
+# stop. The first row is the maintainer's report, verbatim.
+[[fixtures]]
+name = "set-new-agent-command-devbox"
+utterance = "Set the command to devbox run agent."
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "dispatch"
+resolved_command = "devbox run agent"
+
+[[fixtures]]
+name = "set-new-agent-command-make-it"
+utterance = "make the command npm run dev"
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "dispatch"
+resolved_command = "npm run dev"
+
+# The negative: the transcript holds no command, so there is nothing of the
+# user's to put in the field and Command keeps what it had. (A model that
+# "fixed" or invented a command is refused by `voice::command_text`; that is
+# deterministic and pinned by the outcome tests with a stub model, since a
+# real model asked to copy the user's words copies them — even prose.)
+[[fixtures]]
+name = "set-new-agent-command-none-said"
+utterance = "set the command"
+screen = "overview"
+form = true
+action = "set_new_agent_command"
+outcome = "param_missing"
+
+# With no live form there is no Command field: the row's hint, not a guess.
+[[fixtures]]
+name = "set-new-agent-command-form-not-live"
+utterance = "Set the command to devbox run agent."
+screen = "overview"
+dialog = true
+action = "set_new_agent_command"
+outcome = "unavailable"
+
 [[fixtures]]
 name = "choose-mode-form-not-live"
 utterance = "make it a dispatcher"

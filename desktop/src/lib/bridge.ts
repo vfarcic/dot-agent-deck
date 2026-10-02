@@ -2766,11 +2766,16 @@ class FixtureDeckBridge implements DeckBridge {
   /** Whether a directory listing was declared with that screen (PR #1451 round 3, change 5). */
   private voiceDirectoryListing = false;
 
-  /* The preview's directory rows (the Filter box's two) need only to know a
-     listing is showing; the rows themselves feed nothing here. */
-  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, _newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
+  /** Whether the New agent dialog's live form was declared with it (PR #1451 round 4, D8). */
+  private voiceNewAgentForm = false;
+
+  /* The preview's directory rows (the Filter box's two) and its Command row
+     need only to know a listing or a live form is showing; the rows
+     themselves feed nothing here. */
+  declareVoiceScreen(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, _deckStep?: VoiceDeckChoiceDto[], _endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto): void {
     this.voiceScreen = screen;
     this.voiceDirectoryListing = directories !== undefined;
+    this.voiceNewAgentForm = newAgent?.form !== undefined;
     this.voiceDictation = dictation;
   }
 
@@ -2784,7 +2789,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm);
   }
 
   /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
@@ -2807,9 +2812,9 @@ class FixtureDeckBridge implements DeckBridge {
    * run — which is fewer rows than a live build has, and saying so is the point
    * of a preview rather than a shortcoming of one.
    */
-  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto): Promise<VoiceCommandDto[]> {
+  async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]> {
     await Promise.resolve();
-    return fixtureVoiceCommands(screen, directories !== undefined);
+    return fixtureVoiceCommands(screen, directories !== undefined, newAgent?.form !== undefined);
   }
 
   /**

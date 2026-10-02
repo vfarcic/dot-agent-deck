@@ -669,6 +669,7 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "set_new_agent_command",
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",

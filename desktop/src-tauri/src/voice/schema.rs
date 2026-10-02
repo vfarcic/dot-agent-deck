@@ -365,6 +365,7 @@ mod tests {
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
+                "set_new_agent_command".to_string(),
                 "choose_deck".to_string(),
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
@@ -442,6 +443,7 @@ mod tests {
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
+                "set_new_agent_command",
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
@@ -634,6 +636,7 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
@@ -674,6 +677,7 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
@@ -713,6 +717,7 @@ mod tests {
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
                 ("name_new_agent".to_string(), false),
+                ("set_new_agent_command".to_string(), false),
                 // `requires` the dialog open, and none is declared here (#1263, #1247).
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
