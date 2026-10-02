@@ -283,6 +283,14 @@ impl Opts {
     /// relative landed one directory above where it names. Lexical
     /// (`Path::join`) rather than `canonicalize`, because most of these paths
     /// do not exist yet, and an absolute path is kept exactly as given.
+    /// The standalone build clone: `--source-clone`, else
+    /// `<repo parent>/dot-agent-deck-xver-src`.
+    fn clone_path(&self, repo_parent: &Path) -> PathBuf {
+        self.source_clone
+            .clone()
+            .unwrap_or_else(|| repo_parent.join("dot-agent-deck-xver-src"))
+    }
+
     fn anchored_at(mut self, cwd: &Path) -> Self {
         for path in [
             &mut self.old_binary,
@@ -454,10 +462,10 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|a| a == "--") {
         args.remove(1);
     }
-    let opts = match std::env::current_dir() {
-        Ok(cwd) => Opts::parse_from(args).anchored_at(&cwd),
+    let opts = match parse_invocation(args) {
+        Ok(opts) => opts,
         Err(e) => {
-            eprintln!("xver: cannot read the current directory: {e}");
+            eprintln!("xver: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -469,6 +477,19 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the command line and anchor its path options to this process's
+/// working directory — the directory the command was run from (issue #1453).
+/// `main` and the regression test both go through here.
+fn parse_invocation<I, T>(args: I) -> Result<Opts, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
+    Ok(Opts::parse_from(args).anchored_at(&cwd))
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,10 +1336,7 @@ fn run_one(
         .parent()
         .ok_or_else(|| "the repository root has no parent".to_string())?
         .to_path_buf();
-    let clone = opts
-        .source_clone
-        .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-src"));
+    let clone = opts.clone_path(&parent);
     let target_dir = opts
         .target_dir
         .clone()
@@ -2749,18 +2767,21 @@ mod path_anchor_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The child half of [`a_relative_source_clone_lands_where_it_names`]: what
-    /// `main` and `new_binary` do with `--source-clone ../x`, from this
-    /// process's own working directory.
+    /// The child half of [`a_relative_source_clone_lands_where_it_names`]: the
+    /// command's own path for `--source-clone ../x`, from this process's
+    /// working directory — `main`'s [`parse_invocation`], `run_one`'s
+    /// [`Opts::clone_path`], and the [`create_clone`] that `new_binary` calls
+    /// for a clone that does not exist yet. The rest of `new_binary` fetches
+    /// from GitHub and builds, so it is not run here; the live `cargo xver`
+    /// run in PR #1498 covered it.
     #[test]
     fn a_relative_source_clone_child() {
         let Ok(url) = std::env::var(CHILD) else {
             return;
         };
-        let cwd = std::env::current_dir().expect("cwd");
-        let opts =
-            Opts::parse_from(["xver", "--branch", "b", "--source-clone", "../x"]).anchored_at(&cwd);
-        let clone = opts.source_clone.expect("--source-clone was given");
+        let opts = parse_invocation(["xver", "--branch", "b", "--source-clone", "../x"])
+            .expect("parse the invocation");
+        let clone = opts.clone_path(Path::new("/never/the/default"));
         create_clone(&url, &clone).expect("git clone");
     }
 }

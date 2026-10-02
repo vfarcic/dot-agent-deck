@@ -1569,7 +1569,7 @@ fn with_attached_tui(
             cast.pane_cli
         ),
     );
-    let mut refused = tui.grid().contains(ENTRY_REFUSED);
+    let mut refused = refused_by_lock(tui);
     focus_role(tui, plan, ROLE_ORCHESTRATOR)?;
     let feedback = format!("Worker {ROLE_REVIEWER} has completed their task");
     let work_done_arrived = tui.wait_for_grid(UI_TIMEOUT, |g| g.contains(&feedback));
@@ -1588,7 +1588,7 @@ fn with_attached_tui(
         tui,
         &format!("{} agent-event --type running", cast.pane_cli),
     );
-    refused |= tui.grid().contains(ENTRY_REFUSED);
+    refused |= refused_by_lock(tui);
     let client_cli = format!("{} CLI: daemon status", cast.client_side);
     let status_rows = wait_for_status(
         g,
@@ -2941,6 +2941,24 @@ pub(crate) fn entry_lock(grid: &str) -> Option<EntryLock> {
     } else {
         None
     }
+}
+
+/// How long after a command is typed [`refused_by_lock`] watches the footer for
+/// [`ENTRY_REFUSED`]. The deck paints it on the first dropped keystroke and
+/// holds it for its 15 s `STATUS_MESSAGE_TTL`, and [`type_into_pane`] has
+/// already spent 700 ms by the time this starts, so a redraw that lands later
+/// than this is not one this needs to wait for.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether the deck refused the command just typed into the focused pane:
+/// [`ENTRY_REFUSED`] on its footer within [`REFUSAL_WINDOW`]. The PTY is parsed
+/// on a reader thread, so a single read of the grid could come before the
+/// refusal's redraw (Qodo, PR #1498). An accepted command costs the whole
+/// window, which is bounded.
+fn refused_by_lock(deck: &pty::PtyDeck) -> bool {
+    deck.wait_for_grid(REFUSAL_WINDOW, |g| {
+        footer_row(g).is_some_and(|row| row.contains(ENTRY_REFUSED))
+    })
 }
 
 /// Unlock command entry into worker panes, proving it by the footer, so the
