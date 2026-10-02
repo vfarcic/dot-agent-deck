@@ -1,5 +1,5 @@
 {
-  "description": "Issue #1422: the editing shortcuts an agent's prompt gets from both clients, and the bytes each one sends. One table, every platform: neither client picks rows by platform. Read by the TUI's `keyevent_editing_chords_match_the_shared_table` (src/ui.rs) and by the desktop's terminalKeys.test.ts, TerminalViewport.keys.test.tsx and e2e/agent-terminal-input.spec.ts, so a row changed on one side fails the other. `translated` is the TUI's `editing_chord_bytes` and the desktop's `editingSequence`: each client checks that it translates exactly these chords and no others. `standard` is what both send with the ordinary terminal encoding (the TUI's `keyevent_to_bytes`, xterm.js on the desktop). Modifiers are `ctrl`, `alt`, `shift` and `super` (Cmd on a Mac, the Windows key on Windows); `key` is the DOM KeyboardEvent.key.",
+  "description": "Issues #1422 and #1477: the keys an agent's prompt gets from both clients, and the bytes each one sends. One table, every platform: neither client picks rows by platform. Read by the TUI's `keyevent_editing_chords_match_the_shared_table` and `keyevent_application_cursor_rows_match_the_shared_table` (src/ui.rs) and by the desktop's terminalKeys.test.ts, TerminalViewport.keys.test.tsx and e2e/agent-terminal-input.spec.ts, so a row changed on one side fails the other. `translated` is the TUI's `editing_chord_bytes` and the desktop's `editingSequence`: each client checks that it translates exactly these chords and no others. `standard` is what both send with the ordinary terminal encoding (the TUI's `keyevent_to_bytes`, xterm.js on the desktop), measured from xterm.js 6.0.0. `application_cursor` is what both send instead while the program in the pane has turned on application cursor mode (DECCKM, `ESC[?1h`), until it turns it off (`ESC[?1l`); a row of the other two lists that it does not name is sent unchanged in that mode. Modifiers are `ctrl`, `alt`, `shift` and `super` (Cmd on a Mac, the Windows key on Windows); `key` is the DOM KeyboardEvent.key.",
   "translated": [
     { "key": "ArrowLeft", "modifiers": ["super"], "bytes": "\u0001", "action": "start of line" },
     { "key": "ArrowRight", "modifiers": ["super"], "bytes": "\u0005", "action": "end of line" },
@@ -17,6 +17,29 @@
     { "key": "ArrowRight", "modifiers": ["alt"], "bytes": "\u001b[1;3C", "action": "next word" },
     { "key": "Backspace", "modifiers": ["alt"], "bytes": "\u001b\u007f", "action": "delete the previous word" },
     { "key": "Backspace", "modifiers": [], "bytes": "\u007f", "action": "delete one character" },
-    { "key": "Delete", "modifiers": [], "bytes": "\u001b[3~", "action": "delete the next character" }
+    { "key": "Delete", "modifiers": [], "bytes": "\u001b[3~", "action": "delete the next character" },
+    { "key": "ArrowUp", "modifiers": [], "bytes": "\u001b[A", "action": "previous line or history entry" },
+    { "key": "ArrowDown", "modifiers": [], "bytes": "\u001b[B", "action": "next line or history entry" },
+    { "key": "ArrowLeft", "modifiers": [], "bytes": "\u001b[D", "action": "one character left" },
+    { "key": "ArrowRight", "modifiers": [], "bytes": "\u001b[C", "action": "one character right" },
+    { "key": "Backspace", "modifiers": ["ctrl", "shift"], "bytes": "\b", "action": "delete one character" },
+    { "key": "Backspace", "modifiers": ["ctrl", "alt"], "bytes": "\u001b\b", "action": "delete the previous word" },
+    { "key": "Delete", "modifiers": ["shift"], "bytes": "\u001b[3;2~", "action": "Shift+Delete, whatever the agent binds it to" },
+    { "key": "Home", "modifiers": ["ctrl"], "bytes": "\u001b[1;5H", "action": "Ctrl+Home, whatever the agent binds it to" },
+    { "key": "End", "modifiers": ["ctrl"], "bytes": "\u001b[1;5F", "action": "Ctrl+End, whatever the agent binds it to" },
+    { "key": "Home", "modifiers": ["shift"], "bytes": "\u001b[1;2H", "action": "Shift+Home, whatever the agent binds it to" },
+    { "key": "End", "modifiers": ["shift"], "bytes": "\u001b[1;2F", "action": "Shift+End, whatever the agent binds it to" },
+    { "key": "Home", "modifiers": ["alt"], "bytes": "\u001b[1;3H", "action": "Alt+Home, whatever the agent binds it to" },
+    { "key": "End", "modifiers": ["alt"], "bytes": "\u001b[1;3F", "action": "Alt+End, whatever the agent binds it to" },
+    { "key": "Home", "modifiers": ["ctrl", "shift"], "bytes": "\u001b[1;6H", "action": "Ctrl+Shift+Home, whatever the agent binds it to" },
+    { "key": "End", "modifiers": ["ctrl", "shift"], "bytes": "\u001b[1;6F", "action": "Ctrl+Shift+End, whatever the agent binds it to" }
+  ],
+  "application_cursor": [
+    { "key": "ArrowUp", "modifiers": [], "bytes": "\u001bOA", "action": "previous line or history entry" },
+    { "key": "ArrowDown", "modifiers": [], "bytes": "\u001bOB", "action": "next line or history entry" },
+    { "key": "ArrowLeft", "modifiers": [], "bytes": "\u001bOD", "action": "one character left" },
+    { "key": "ArrowRight", "modifiers": [], "bytes": "\u001bOC", "action": "one character right" },
+    { "key": "Home", "modifiers": [], "bytes": "\u001bOH", "action": "start of line" },
+    { "key": "End", "modifiers": [], "bytes": "\u001bOF", "action": "end of line" }
   ]
 }

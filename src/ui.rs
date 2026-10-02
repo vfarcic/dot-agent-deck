@@ -6766,7 +6766,6 @@ fn ctrl_c0_byte(c: char) -> Option<u8> {
     }
 }
 
-/// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 /// Issue #1422: the platform line-editing chords, as the bytes the desktop
 /// app's agent terminal sends for them (`desktop/src/lib/terminalKeys.ts`), so
 /// the same shortcut does the same thing in an agent whichever client it was
@@ -6804,7 +6803,19 @@ fn editing_chord_bytes(key: &KeyEvent) -> Option<&'static [u8]> {
     }
 }
 
+/// The bytes a pane in the ordinary cursor mode receives for `key`: what
+/// [`keyevent_to_pane_bytes`] sends before the pane's program has asked for
+/// application cursor mode, or after it has turned it off.
+#[cfg(test)]
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    keyevent_to_pane_bytes(key, false)
+}
+
+/// Convert a crossterm `KeyEvent` into the bytes the focused pane's program
+/// receives for it. `application_cursor` is whether that program has turned on
+/// application cursor mode (DECCKM, `ESC[?1h`), read from the pane's own vt100
+/// parser by [`focused_pane_application_cursor`].
+fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     if let Some(bytes) = editing_chord_bytes(key) {
         return Some(bytes.to_vec());
     }
@@ -6827,25 +6838,36 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
     // submitted instead of inserting a newline.
     //
-    // Only SHIFT/CONTROL open this path, plus ALT on an arrow. ALT on its own
-    // otherwise keeps its historical ESC-prefix form (Alt+Enter → `ESC\r`),
-    // because a genuine Alt+Enter is meaningful to some agents; when ALT
-    // accompanies SHIFT/CONTROL it is folded into the modifier bitmask rather
-    // than dropped.
+    // Only SHIFT/CONTROL open this path, plus ALT on an arrow, Home, End or
+    // Delete (below). ALT on its own otherwise keeps its historical ESC-prefix
+    // form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is meaningful to
+    // some agents; when ALT accompanies SHIFT/CONTROL it is folded into the
+    // modifier bitmask rather than dropped.
     //
     // Issue #1422: Alt+arrow is `ESC[1;3<dir>`, what xterm, the desktop app
     // and most terminals send, rather than `ESC` + the bare arrow. Claude Code
     // and Pi read that ESC-prefixed form as a one-character move and Codex and
     // Devin type its `[D` into the draft, so Option+Left (Alt+Left) did not
     // move by a word.
-    let alt_arrow = key.modifiers.contains(KeyModifiers::ALT)
+    //
+    // Issue #1477: Home, End and Delete carry their modifiers the same way —
+    // `ESC[1;<m>H`, `ESC[1;<m>F`, `ESC[3;<m>~`, Alt alone included — because
+    // that is what xterm.js sends for them on the desktop. The deck used to
+    // drop Shift and Ctrl on them and put Alt in front as an ESC.
+    let alt_modifier_form = key.modifiers.contains(KeyModifiers::ALT)
         && matches!(
             key.code,
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Delete
         );
     if key.modifiers.contains(KeyModifiers::SHIFT)
         || key.modifiers.contains(KeyModifiers::CONTROL)
-        || alt_arrow
+        || alt_modifier_form
     {
         let m = csi_modifier_param(key.modifiers);
         match key.code {
@@ -6858,9 +6880,27 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
             KeyCode::Down => return Some(format!("\x1b[1;{m}B").into_bytes()),
             KeyCode::Right => return Some(format!("\x1b[1;{m}C").into_bytes()),
             KeyCode::Left => return Some(format!("\x1b[1;{m}D").into_bytes()),
+            KeyCode::Home => return Some(format!("\x1b[1;{m}H").into_bytes()),
+            KeyCode::End => return Some(format!("\x1b[1;{m}F").into_bytes()),
+            KeyCode::Delete => return Some(format!("\x1b[3;{m}~").into_bytes()),
             _ => {}
         }
     }
+
+    // Issue #1477: in application cursor mode (DECCKM) an unmodified arrow,
+    // Home or End is sent in its SS3 form, as xterm.js sends it; a modified
+    // one has already left above in its CSI form, as xterm does it too. Only
+    // these six keys change: xterm.js reads the mode for nothing else.
+    let cursor_key = |normal: &[u8], application: &[u8]| {
+        Some(
+            if application_cursor {
+                application
+            } else {
+                normal
+            }
+            .to_vec(),
+        )
+    };
 
     // Base key bytes (without Alt). Alt prefix is added at the end.
     let base: Option<Vec<u8>> = match key.code {
@@ -6870,14 +6910,18 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Tab => Some(vec![b'\t']),
+        // Issue #1477: BS whenever Ctrl is held, as xterm.js sends it
+        // (Ctrl+Shift+Backspace, and Ctrl+Alt+Backspace as `ESC BS`). The bare
+        // Ctrl+Backspace is a word delete, translated above.
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => Some(vec![0x08]),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::Up => cursor_key(b"\x1b[A", b"\x1bOA"),
+        KeyCode::Down => cursor_key(b"\x1b[B", b"\x1bOB"),
+        KeyCode::Right => cursor_key(b"\x1b[C", b"\x1bOC"),
+        KeyCode::Left => cursor_key(b"\x1b[D", b"\x1bOD"),
+        KeyCode::Home => cursor_key(b"\x1b[H", b"\x1bOH"),
+        KeyCode::End => cursor_key(b"\x1b[F", b"\x1bOF"),
         KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
         KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
@@ -6949,6 +6993,24 @@ pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bo
     const ESC: u8 = 0x1b;
 
     byte == b'\r' && preceding != Some(ESC)
+}
+
+/// Issue #1477: whether the program in the focused pane has turned on
+/// application cursor mode (DECCKM), read from the vt100 parser that already
+/// renders that pane, so the mode is tracked per pane and by the one parser
+/// that sees the pane's output. xterm.js keeps the same flag per terminal on
+/// the desktop. Anything other than a focused embedded pane is the ordinary
+/// mode.
+fn focused_pane_application_cursor(pane: &dyn PaneController) -> bool {
+    pane.as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .and_then(|embedded| {
+            let pane_id = embedded.focused_pane_id()?;
+            let screen = embedded.get_screen(&pane_id)?;
+            let parser = screen.lock().ok()?;
+            Some(parser.screen().application_cursor())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -7163,8 +7225,8 @@ fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -
     (start, end)
 }
 
-fn handle_pane_input_key(key: KeyEvent) -> Action {
-    if let Some(bytes) = keyevent_to_bytes(&key) {
+fn handle_pane_input_key(key: KeyEvent, application_cursor: bool) -> Action {
+    if let Some(bytes) = keyevent_to_pane_bytes(&key, application_cursor) {
         Action::ForwardToPane(bytes)
     } else {
         Action::Continue
@@ -10014,7 +10076,10 @@ pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) 
         return Some(action);
     }
     if mode == UiMode::PaneInput {
-        return match handle_pane_input_key(*key) {
+        // No pane is in scope here, so the ordinary cursor mode: what this
+        // helper answers is which keys reach a pane at all, and the cursor
+        // mode changes only the bytes of an arrow, Home or End, never that.
+        return match handle_pane_input_key(*key, false) {
             Action::Continue => None,
             forwarded => Some(forwarded),
         };
@@ -12638,7 +12703,7 @@ fn handle_key_event(
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
             UiMode::PaneInput => {
-                let candidate = handle_pane_input_key(key);
+                let candidate = handle_pane_input_key(key, focused_pane_application_cursor(pane));
                 // The gate needs live per-pane status for the
                 // `WaitingForInput` carve-out, and `UiState` caches none — so
                 // build the join from the `snapshot` already in scope here and
@@ -32876,10 +32941,11 @@ mod tests {
                 KeyModifiers::CONTROL.union(KeyModifiers::ALT),
                 b"\x1b[1;7D",
             ),
+            // Issue #1477: Ctrl with anything else is BS, as xterm.js sends it.
             (
                 KeyCode::Backspace,
                 KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
-                b"\x7f",
+                b"\x08",
             ),
             (KeyCode::Char('h'), KeyModifiers::CONTROL, b"\x08"),
             (KeyCode::Enter, KeyModifiers::ALT, b"\x1b\r"),
@@ -32893,14 +32959,9 @@ mod tests {
         }
     }
 
-    /// Issue #1422: the TUI's editing shortcuts are the shared table in
-    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
-    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
-    /// translates exactly the `translated` rows: a chord added on this side
-    /// only, or dropped from it, fails here instead of drifting from the
-    /// desktop.
-    #[test]
-    fn keyevent_editing_chords_match_the_shared_table() {
+    /// One list of the shared key table, `tests/fixtures/editing-shortcuts.json`,
+    /// which the desktop app's tests read too, as `(key, modifiers, bytes)`.
+    fn shared_key_rows(list: &str) -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
         let table: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/editing-shortcuts.json"
@@ -32924,29 +32985,37 @@ mod tests {
             "super" => KeyModifiers::SUPER,
             other => panic!("the shared table names a modifier this test cannot map: {other}"),
         };
-        let rows = |list: &str| -> Vec<(KeyCode, KeyModifiers, Vec<u8>)> {
-            table[list]
-                .as_array()
-                .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
-                .iter()
-                .map(|row| {
-                    let modifiers = row["modifiers"]
-                        .as_array()
-                        .expect("a row's modifiers are a list")
-                        .iter()
-                        .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
-                        .fold(KeyModifiers::NONE, KeyModifiers::union);
-                    let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
-                    (
-                        code_for(row["key"].as_str().expect("a row names its key")),
-                        modifiers,
-                        bytes.as_bytes().to_vec(),
-                    )
-                })
-                .collect()
-        };
-        let translated = rows("translated");
-        let standard = rows("standard");
+        table[list]
+            .as_array()
+            .unwrap_or_else(|| panic!("the shared table has a `{list}` list"))
+            .iter()
+            .map(|row| {
+                let modifiers = row["modifiers"]
+                    .as_array()
+                    .expect("a row's modifiers are a list")
+                    .iter()
+                    .map(|name| modifier_for(name.as_str().expect("a modifier is a name")))
+                    .fold(KeyModifiers::NONE, KeyModifiers::union);
+                let bytes = row["bytes"].as_str().expect("a row's bytes are a string");
+                (
+                    code_for(row["key"].as_str().expect("a row names its key")),
+                    modifiers,
+                    bytes.as_bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// Issue #1422: the TUI's editing shortcuts are the shared table in
+    /// `tests/fixtures/editing-shortcuts.json`, which the desktop app's tests
+    /// read too. Every row is sent as its bytes, and `editing_chord_bytes`
+    /// translates exactly the `translated` rows: a chord added on this side
+    /// only, or dropped from it, fails here instead of drifting from the
+    /// desktop.
+    #[test]
+    fn keyevent_editing_chords_match_the_shared_table() {
+        let translated = shared_key_rows("translated");
+        let standard = shared_key_rows("standard");
         assert!(!translated.is_empty() && !standard.is_empty());
 
         for (code, modifiers, bytes) in translated.iter().chain(&standard) {
@@ -32997,6 +33066,138 @@ mod tests {
         }
     }
 
+    /// Issue #1477: Backspace, Delete, Home and End with Shift, Ctrl or Alt held
+    /// reach a pane as the bytes xterm.js 6.0.0 sends for them on the desktop
+    /// (`Keyboard.ts`, measured there), every combination of the three, apart
+    /// from the bare editing chords both clients translate. Delete, Home and
+    /// End carry the modifier as `;<1 + Shift 1 | Alt 2 | Ctrl 4>`; Backspace
+    /// is BS whenever Ctrl is held, behind an ESC when Alt is too.
+    #[test]
+    fn keyevent_modified_editing_keys_match_xterm_js() {
+        let bits = [
+            (KeyModifiers::SHIFT, 1u8),
+            (KeyModifiers::ALT, 2),
+            (KeyModifiers::CONTROL, 4),
+        ];
+        for mask in 1u8..8 {
+            let (modifiers, param) = bits.iter().filter(|(_, bit)| mask & bit != 0).fold(
+                (KeyModifiers::NONE, 1u8),
+                |(held, param), (modifier, bit)| (held.union(*modifier), param + bit),
+            );
+            let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+            let alt = modifiers.contains(KeyModifiers::ALT);
+            let backspace: Vec<u8> = match (ctrl, alt) {
+                (true, true) => vec![0x1b, 0x08],
+                (true, false) => vec![0x08],
+                (false, true) => vec![0x1b, 0x7f],
+                (false, false) => vec![0x7f],
+            };
+            let cases = [
+                (KeyCode::Backspace, backspace),
+                (KeyCode::Delete, format!("\x1b[3;{param}~").into_bytes()),
+                (KeyCode::Home, format!("\x1b[1;{param}H").into_bytes()),
+                (KeyCode::End, format!("\x1b[1;{param}F").into_bytes()),
+            ];
+            for (code, xterm_js) in cases {
+                let key = KeyEvent::new(code, modifiers);
+                let expected = editing_chord_bytes(&key).map_or(xterm_js, <[u8]>::to_vec);
+                assert_eq!(
+                    keyevent_to_bytes(&key).as_deref(),
+                    Some(expected.as_slice()),
+                    "{code:?} with {modifiers:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1477: while the pane's program has application cursor mode on,
+    /// an unmodified arrow, Home or End reaches it in the SS3 form
+    /// (`ESC O A`…`ESC O F`), as xterm and the desktop's xterm.js send them;
+    /// the same keys with a modifier keep their CSI form, and every other key
+    /// is unchanged. With the mode off, the ordinary form.
+    #[test]
+    fn keyevent_application_cursor_mode_sends_ss3_cursor_keys() {
+        let cases: &[(KeyCode, KeyModifiers, &[u8], &[u8])] = &[
+            (KeyCode::Up, KeyModifiers::NONE, b"\x1b[A", b"\x1bOA"),
+            (KeyCode::Down, KeyModifiers::NONE, b"\x1b[B", b"\x1bOB"),
+            (KeyCode::Right, KeyModifiers::NONE, b"\x1b[C", b"\x1bOC"),
+            (KeyCode::Left, KeyModifiers::NONE, b"\x1b[D", b"\x1bOD"),
+            (KeyCode::Home, KeyModifiers::NONE, b"\x1b[H", b"\x1bOH"),
+            (KeyCode::End, KeyModifiers::NONE, b"\x1b[F", b"\x1bOF"),
+            // Modified: CSI in both modes.
+            (KeyCode::Up, KeyModifiers::SHIFT, b"\x1b[1;2A", b"\x1b[1;2A"),
+            (
+                KeyCode::Left,
+                KeyModifiers::CONTROL,
+                b"\x1b[1;5D",
+                b"\x1b[1;5D",
+            ),
+            (
+                KeyCode::Right,
+                KeyModifiers::ALT,
+                b"\x1b[1;3C",
+                b"\x1b[1;3C",
+            ),
+            (
+                KeyCode::End,
+                KeyModifiers::CONTROL,
+                b"\x1b[1;5F",
+                b"\x1b[1;5F",
+            ),
+            (
+                KeyCode::Home,
+                KeyModifiers::SHIFT,
+                b"\x1b[1;2H",
+                b"\x1b[1;2H",
+            ),
+            (KeyCode::Left, KeyModifiers::SUPER, b"\x01", b"\x01"),
+            // Not a cursor key: unchanged.
+            (KeyCode::Delete, KeyModifiers::NONE, b"\x1b[3~", b"\x1b[3~"),
+            (KeyCode::PageUp, KeyModifiers::NONE, b"\x1b[5~", b"\x1b[5~"),
+            (KeyCode::F(1), KeyModifiers::NONE, b"\x1bOP", b"\x1bOP"),
+            (KeyCode::Enter, KeyModifiers::NONE, b"\r", b"\r"),
+            (KeyCode::Char('a'), KeyModifiers::NONE, b"a", b"a"),
+        ];
+        for (code, modifiers, normal, application) in cases {
+            let key = KeyEvent::new(*code, *modifiers);
+            assert_eq!(
+                keyevent_to_pane_bytes(&key, false).as_deref(),
+                Some(*normal),
+                "{code:?} with {modifiers:?}, ordinary cursor mode"
+            );
+            assert_eq!(
+                keyevent_to_pane_bytes(&key, true).as_deref(),
+                Some(*application),
+                "{code:?} with {modifiers:?}, application cursor mode"
+            );
+        }
+    }
+
+    /// Issue #1477: in application cursor mode the TUI sends the shared table's
+    /// `application_cursor` rows, which the desktop app's tests read too, and
+    /// every row of the other two lists that those rows do not name unchanged.
+    #[test]
+    fn keyevent_application_cursor_rows_match_the_shared_table() {
+        let application = shared_key_rows("application_cursor");
+        assert!(!application.is_empty());
+        let others: Vec<_> = shared_key_rows("translated")
+            .into_iter()
+            .chain(shared_key_rows("standard"))
+            .filter(|(code, modifiers, _)| {
+                !application
+                    .iter()
+                    .any(|(c, m, _)| c == code && m == modifiers)
+            })
+            .collect();
+        for (code, modifiers, bytes) in application.iter().chain(&others) {
+            assert_eq!(
+                keyevent_to_pane_bytes(&KeyEvent::new(*code, *modifiers), true).as_deref(),
+                Some(bytes.as_slice()),
+                "{code:?} with {modifiers:?}, application cursor mode"
+            );
+        }
+    }
+
     #[test]
     fn keyevent_f_keys() {
         assert_eq!(
@@ -33040,7 +33241,7 @@ mod tests {
     #[test]
     fn handle_pane_input_forwards_printable() {
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
-        match handle_pane_input_key(key) {
+        match handle_pane_input_key(key, false) {
             Action::ForwardToPane(bytes) => assert_eq!(bytes, vec![b'l']),
             other => panic!("Expected ForwardToPane, got {:?}", other),
         }
