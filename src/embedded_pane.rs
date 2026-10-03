@@ -17,7 +17,9 @@ use crate::pane::{
     AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, PendingSubmit,
     RenameOutcome,
 };
-use crate::terminal_modes::{MouseEncoding, MouseModes, MouseProtocol, PrivateModeScanner};
+use crate::terminal_modes::{
+    ModeDirective, MouseEncoding, MouseModes, MouseProtocol, PrivateModeScanner,
+};
 
 /// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
 /// daemon-side agent that was successfully reconnected on TUI bootstrap; the
@@ -3394,7 +3396,14 @@ struct MouseModeScanner {
 fn scan_mouse_mode(data: &[u8], flag: &AtomicBool, state: &mut MouseModeScanner) {
     let MouseModeScanner { scanner, modes } = state;
     let mut touched = false;
-    scanner.scan(data, |mode, set| touched |= modes.apply(mode, set));
+    scanner.scan(data, |directive| match directive {
+        ModeDirective::Mode { mode, set } => touched |= modes.apply(mode, set),
+        // `vt100` rebuilds the screen on `ESC c`, mouse modes included.
+        ModeDirective::FullReset => {
+            *modes = MouseModes::default();
+            touched = true;
+        }
+    });
 
     if touched {
         // The question this flag answers is not "did any mouse mode ever appear"
@@ -5305,6 +5314,20 @@ mod tests {
             "crossterm's DisableMouseCapture shape must land as disabled"
         );
         assert!(feed_mouse(b"\x1b[?1000;1002;1003;1006h", &flag, &mut state));
+    }
+
+    /// Issue #1537 review: `ESC c` (RIS) makes `vt100` rebuild the screen, mouse
+    /// modes included, so the flag follows it — split across chunks too.
+    #[test]
+    fn scan_mouse_mode_turns_reporting_off_on_a_full_reset() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(feed_mouse(b"\x1b[?1000;1006h", &flag, &mut state));
+        assert!(feed_mouse(b"output \x1b", &flag, &mut state));
+        assert!(
+            !feed_mouse(b"c", &flag, &mut state),
+            "a full reset must withdraw mouse reporting"
+        );
+        assert_eq!(state.modes, MouseModes::default());
     }
 
     /// The terminal-managed shape PRD #611 measured: exact-height DECSTBM

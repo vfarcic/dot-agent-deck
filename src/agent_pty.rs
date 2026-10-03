@@ -19411,6 +19411,58 @@ mod spawn_tests {
         assert_fullscreen(&parse_snapshot(&snapshot), "after eviction");
     }
 
+    /// A clear or an eviction can fall inside `ESC[?1049h`; the replay must
+    /// still carry the whole sequence.
+    #[test]
+    fn replay_restores_a_mode_sequence_split_at_the_ring_boundary() {
+        let (head, tail) = FULLSCREEN_ENTRY.split_at(5); // `ESC[?10` | `49h…`
+
+        let cleared = AgentBus::new();
+        cleared.push(head.to_vec());
+        cleared.clear_scrollback();
+        cleared.push(tail.to_vec());
+        assert_fullscreen(&parse_snapshot(&cleared.snapshot()), "split by a clear");
+
+        let evicted = AgentBus::new();
+        evicted.push(FULLSCREEN_ENTRY.to_vec());
+        // Exactly enough filler that the cap evicts `head` and nothing more.
+        evicted.push(vec![
+            b'x';
+            SCROLLBACK_CAP_BYTES - FULLSCREEN_ENTRY.len()
+                + head.len()
+        ]);
+        let ring: Vec<u8> = evicted
+            .state
+            .lock()
+            .unwrap()
+            .scrollback
+            .iter()
+            .copied()
+            .collect();
+        assert!(
+            ring.starts_with(tail),
+            "test prerequisite: the ring itself must start inside the entry sequence"
+        );
+        let snapshot = evicted.snapshot();
+        assert_fullscreen(&parse_snapshot(&snapshot), "split by eviction");
+    }
+
+    /// `ESC c` resets every mode `vt100` tracks, so a replay after it must not
+    /// re-enable the modes set before it.
+    #[test]
+    fn replay_after_a_full_reset_restores_nothing() {
+        let bus = AgentBus::new();
+        bus.push(FULLSCREEN_ENTRY.to_vec());
+        bus.push(b"\x1bcplain again\r\n".to_vec());
+        bus.clear_scrollback();
+        let parser = parse_snapshot(&bus.snapshot());
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+    }
+
     #[test]
     fn replay_of_an_agent_that_left_the_alternate_screen_adds_nothing() {
         let bus = AgentBus::new();

@@ -285,7 +285,7 @@ fn launch_fullscreen_deck_against(
 fn run_listing_turn(deck: &TuiDeck, prefix: &str, sentinel: &str, lines: u32) {
     // The composer is ready when claude's footer hint is on screen.
     assert!(
-        deck.wait_for_grid_string_within(FULLSCREEN_COMPOSER_READY, Duration::from_secs(60)),
+        deck.wait_for_grid_string_within(FULLSCREEN_COMPOSER_READY, Duration::from_secs(30)),
         "claude's composer never became ready\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
@@ -294,7 +294,7 @@ fn run_listing_turn(deck: &TuiDeck, prefix: &str, sentinel: &str, lines: u32) {
     );
     deck.send_keys(prompt.as_bytes());
     assert!(
-        deck.wait_for_grid_string_within(prefix, Duration::from_secs(30)),
+        deck.wait_for_grid_string_within(prefix, Duration::from_secs(20)),
         "the typed directive never reached the real agent's prompt\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
@@ -303,7 +303,7 @@ fn run_listing_turn(deck: &TuiDeck, prefix: &str, sentinel: &str, lines: u32) {
     // its working hint; the sentinel alone can appear mid-turn, inside a tool
     // call claude is still running.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(180), |grid| {
+        deck.wait_for_grid_predicate_within(Duration::from_secs(90), |grid| {
             grid.contains(sentinel) && !grid.contains(FULLSCREEN_WORKING)
         }),
         "the real Haiku turn never finished having visibly listed the unique sentinel \
@@ -322,13 +322,18 @@ fn mode_live_003_reattached_fullscreen_claude_does_not_claim_nothing_to_scroll()
     // The daemon clears its environment, so an API key the host authenticates
     // with has to be handed over explicitly; a credentials file is imported
     // into the daemon's HOME below.
+    //
+    // The daemon outlives both decks, so it gets a longer self-exit cap than
+    // the harness's 300s: each deck's worst-case waits stay under its own 300s
+    // (start-up 90s, then per turn 30s composer + 20s typing + 90s turn), but
+    // the two together do not.
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
-    let extra_env: Vec<(&str, &str)> = api_key
-        .as_deref()
-        .map(|key| vec![("ANTHROPIC_API_KEY", key)])
-        .unwrap_or_default();
+    let mut extra_env: Vec<(&str, &str)> = vec![("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")];
+    if let Some(key) = api_key.as_deref() {
+        extra_env.push(("ANTHROPIC_API_KEY", key));
+    }
     let daemon = common::spawn_daemon_serve_with_env(None, "0", &extra_env);
 
     // The agent runs under the DAEMON's HOME, not either deck's, so that is
@@ -355,7 +360,7 @@ fn mode_live_003_reattached_fullscreen_claude_does_not_claim_nothing_to_scroll()
 
     let mut first = launch_fullscreen_deck_against(&daemon, 160, 45, Some(&command));
     assert!(
-        first.wait_for_grid_string_within(FULLSCREEN_READY, Duration::from_secs(120)),
+        first.wait_for_grid_string_within(FULLSCREEN_READY, Duration::from_secs(90)),
         "the full-screen claude never came up in the first deck\nFinal grid:\n{}",
         first.snapshot_grid()
     );

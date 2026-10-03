@@ -20,8 +20,20 @@
 /// the agent kept talking.
 pub(crate) const CARRY_MAX: usize = 64;
 
+/// One directive [`PrivateModeScanner`] found, in byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModeDirective {
+    /// `ESC [ ? <mode> h` (`set`) or `ESC [ ? <mode> l` (not `set`); a
+    /// combined `ESC[?1000;1006h` yields one per parameter.
+    Mode { mode: u32, set: bool },
+    /// `ESC c` — a full terminal reset (RIS). `vt100` rebuilds the whole screen
+    /// on it (`Screen::ris`), so every mode it tracks returns to its default.
+    FullReset,
+}
+
 /// Finds DEC private-mode directives — `ESC [ ? <params> h` (set) and
-/// `ESC [ ? <params> l` (reset) — in a stream delivered in arbitrary chunks.
+/// `ESC [ ? <params> l` (reset) — and full resets (`ESC c`) in a stream
+/// delivered in arbitrary chunks.
 ///
 /// A PTY read boundary falls wherever the kernel had bytes ready, so
 /// `ESC[?100` + `2h` is an ordinary pair of reads; the trailing bytes that could
@@ -43,8 +55,8 @@ impl PrivateModeScanner {
     }
 
     /// Scan this scanner's carry-over followed by `data`, calling
-    /// `on_mode(mode, set)` for every mode a directive names, **in byte order**.
-    pub(crate) fn scan(&mut self, data: &[u8], mut on_mode: impl FnMut(u32, bool)) {
+    /// `on_directive` for every directive found, **in byte order**.
+    pub(crate) fn scan(&mut self, data: &[u8], mut on_directive: impl FnMut(ModeDirective)) {
         const ESC: u8 = 0x1b;
 
         let carry = std::mem::take(&mut self.carry);
@@ -77,6 +89,11 @@ impl PrivateModeScanner {
             if i + 1 >= buf.len() {
                 partial_from = Some(seq_start);
                 break;
+            }
+            if buf[i + 1] == b'c' {
+                on_directive(ModeDirective::FullReset);
+                i += 2;
+                continue;
             }
             if buf[i + 1] != b'[' {
                 i += 1;
@@ -124,7 +141,7 @@ impl PrivateModeScanner {
                         .ok()
                         .and_then(|text| text.parse::<u32>().ok());
                     if let Some(mode) = mode {
-                        on_mode(mode, set);
+                        on_directive(ModeDirective::Mode { mode, set });
                     }
                 }
             }
@@ -297,17 +314,31 @@ impl ReplayModes {
             alternate_screen,
             mouse,
         } = self;
-        scanner.scan(data, |mode, set| match mode {
-            47 | 1049 => *alternate_screen = set,
-            _ => {
+        scanner.scan(data, |directive| match directive {
+            ModeDirective::Mode {
+                mode: 47 | 1049,
+                set,
+            } => *alternate_screen = set,
+            ModeDirective::Mode { mode, set } => {
                 mouse.apply(mode, set);
+            }
+            ModeDirective::FullReset => {
+                *alternate_screen = false;
+                *mouse = MouseModes::default();
             }
         });
     }
 
-    /// The bytes that put a fresh parser into the tracked state. Empty when
-    /// every tracked mode is at its default, so a replay of a plain stream is
-    /// byte-for-byte what it was.
+    /// The bytes that put a fresh parser into the tracked state, then the
+    /// scanner's carry. Empty when every tracked mode is at its default and
+    /// nothing is carried, so a replay of a plain stream is byte-for-byte what
+    /// it was.
+    ///
+    /// The carry is there for a boundary that cut a sequence in two: a ring
+    /// clear or eviction between `ESC[?10` and `49h` leaves the ring starting
+    /// with `49h`, and the opening half is exactly what this state holds over.
+    /// Emitting it last puts those bytes back in front of the ring's first one,
+    /// so a fresh parser reads the original stream.
     pub(crate) fn preamble(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if self.alternate_screen {
@@ -319,6 +350,7 @@ impl ReplayModes {
         {
             out.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
+        out.extend_from_slice(&self.scanner.carry);
         out
     }
 }
@@ -389,6 +421,20 @@ mod tests {
     fn a_directive_split_across_chunks_is_still_seen() {
         let modes = modes_after(&[b"text\x1b[?10", b"49h more"]);
         assert!(parsed(&modes.preamble()).screen().alternate_screen());
+    }
+
+    #[test]
+    fn a_full_reset_returns_every_tracked_mode_to_its_default() {
+        let modes = modes_after(&[b"\x1b[?1049h\x1b[?1000;1006h", b"\x1b", b"c"]);
+        assert!(modes.preamble().is_empty());
+    }
+
+    #[test]
+    fn a_sequence_still_open_at_the_end_is_replayed_in_front_of_its_rest() {
+        let modes = modes_after(&[b"text\x1b[?10"]);
+        let mut replay = modes.preamble();
+        replay.extend_from_slice(b"49h");
+        assert!(parsed(&replay).screen().alternate_screen());
     }
 
     #[test]
