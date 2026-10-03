@@ -638,7 +638,13 @@ export class Deck {
     });
     stream.on("data", () => undefined);
     stream.on("error", () => undefined);
-    (await request(socketPath, { op: "focus-gained", client_id: clientId })).destroy();
+    try {
+      (await request(socketPath, { op: "focus-gained", client_id: clientId })).destroy();
+    } catch (error) {
+      // A viewer left attached would keep sizing the agent for the rest of the scenario.
+      stream.destroy();
+      throw error;
+    }
     return { close: () => stream.destroy() };
   }
 

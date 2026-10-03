@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Terminal } from "@xterm/xterm";
 import { keepSelectionAcrossResize } from "./terminalSelection";
 
@@ -12,7 +12,8 @@ import { keepSelectionAcrossResize } from "./terminalSelection";
  *   clears the selection and abandons a drag in progress
  *   (`SelectionService`'s `onResize` listener);
  * - growing the grid pulls lines down from the scrollback, so a line keeps its
- *   buffer index while its row on screen moves — and a marker keeps its line.
+ *   buffer index while its row on screen moves — and a marker keeps its line;
+ * - `scrollLines` moves the viewport and leaves the selection alone.
  *
  * Cells are 10x20 px, and the screen starts at the host's top-left corner.
  */
@@ -23,7 +24,17 @@ class FakeXterm {
   rows: number;
   element: HTMLElement;
   screen: HTMLElement;
-  buffer = { active: { type: "normal" as "normal" | "alternate", baseY: 100, cursorY: 0, viewportY: 100 } };
+  /** Lines that continue the line above them, as a soft wrap leaves them. */
+  wrapped = new Set<number>();
+  buffer = {
+    active: {
+      type: "normal" as "normal" | "alternate",
+      baseY: 100,
+      cursorY: 0,
+      viewportY: 100,
+      getLine: (line: number) => ({ isWrapped: this.wrapped.has(line) }),
+    },
+  };
   modes = { mouseTrackingMode: "none" };
   selection: { column: number; line: number; length: number } | undefined;
   private resizeListeners = new Set<(size: { cols: number; rows: number }) => void>();
@@ -39,7 +50,14 @@ class FakeXterm {
     this.element.appendChild(this.screen);
     host.appendChild(this.element);
     this.screen.getBoundingClientRect = () =>
-      ({ left: 0, top: 0, width: this.cols * CELL.width, height: this.rows * CELL.height }) as DOMRect;
+      ({
+        left: 0,
+        top: 0,
+        width: this.cols * CELL.width,
+        height: this.rows * CELL.height,
+        right: this.cols * CELL.width,
+        bottom: this.rows * CELL.height,
+      }) as DOMRect;
     this.element.addEventListener("mousedown", (event) => {
       if (event.button !== 0) return;
       this.drag = this.cellAt(event);
@@ -111,6 +129,7 @@ class FakeXterm {
     return marker;
   }
 
+  scrollLines(amount: number) { this.buffer.active.viewportY = Math.max(0, this.buffer.active.viewportY + amount); }
   hasSelection() { return this.selection !== undefined; }
   clearSelection() { this.setSelection(undefined); }
   select(column: number, line: number, length: number) { this.setSelection({ column, line, length }); }
@@ -143,6 +162,8 @@ const release = (point: { clientX: number; clientY: number }) =>
   document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, ...point }));
 
 describe("keepSelectionAcrossResize", () => {
+  afterEach(() => vi.useRealTimers());
+
   it("carries on a drag whose grid gains rows while the button is down", async () => {
     for (const kept of [false, true]) {
       const { xterm, keeper } = mount(kept);
@@ -204,6 +225,66 @@ describe("keepSelectionAcrossResize", () => {
       expect(xterm.selection, name).toBeUndefined();
       keeper?.dispose();
     }
+  });
+
+  it("does not put back a finished Alt column selection", async () => {
+    const { xterm } = mount();
+    press(xterm, at(2, 4), { altKey: true });
+    release({ clientX: 9 * CELL.width, clientY: 6.5 * CELL.height });
+    expect(xterm.selection, "fixture: xterm made a selection").toBeDefined();
+    xterm.resize(80, 20);
+    await Promise.resolve();
+    expect(xterm.selection).toBeUndefined();
+  });
+
+  it("leaves soft-wrapped lines to xterm when the columns change too", async () => {
+    const { xterm } = mount();
+    xterm.wrapped.add(104);
+    press(xterm, at(2, 3));
+    release({ clientX: 9 * CELL.width, clientY: 3.5 * CELL.height });
+    xterm.resize(60, 20);
+    await Promise.resolve();
+    expect(xterm.selection, "a finished selection on a wrapped line is not put back").toBeUndefined();
+
+    press(xterm, at(0, 11));
+    xterm.resize(100, 12);
+    release({ clientX: 14 * CELL.width, clientY: 3.5 * CELL.height });
+    expect(xterm.selection, "a drag from a wrapped line is not carried on").toBeUndefined();
+
+    // The same resize with the columns unchanged is restored.
+    xterm.resize(100, 20);
+    press(xterm, at(2, 3));
+    release({ clientX: 9 * CELL.width, clientY: 3.5 * CELL.height });
+    const line = xterm.selection?.line;
+    xterm.resize(100, 12);
+    await Promise.resolve();
+    expect(xterm.selection).toEqual({ column: 2, line, length: 7 });
+  });
+
+  it("ends a carried-on drag whose release this page never saw", () => {
+    const { xterm } = mount();
+    press(xterm, at(0, 3));
+    xterm.resize(80, 20);
+    move(at(10, 11));
+    // The button came up over another window; the next move has it up.
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, buttons: 0, ...at(40, 15) }));
+    move(at(60, 15));
+    expect(xterm.selection).toEqual({ column: 0, line: 103, length: 10 });
+  });
+
+  it("scrolls a carried-on drag while the pointer is above the terminal", () => {
+    vi.useFakeTimers();
+    const { xterm } = mount();
+    press(xterm, at(4, 3));
+    xterm.resize(80, 20);
+    move({ clientX: 0.5 * CELL.width, clientY: -30 });
+    expect(xterm.selection, "from the top row's first cell").toEqual({ column: 0, line: 92, length: 11 * 80 + 4 });
+    vi.advanceTimersByTime(3 * 50);
+    expect(xterm.buffer.active.viewportY).toBe(89);
+    expect(xterm.selection, "three lines further up").toEqual({ column: 0, line: 89, length: 14 * 80 + 4 });
+    release({ clientX: 0.5 * CELL.width, clientY: -30 });
+    vi.advanceTimersByTime(200);
+    expect(xterm.buffer.active.viewportY, "the release stops the scrolling").toBe(89);
   });
 
   it("stops listening once disposed", () => {
