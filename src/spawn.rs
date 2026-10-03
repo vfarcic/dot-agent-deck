@@ -1677,11 +1677,13 @@ async fn deliver(
                 // for — is gone, or may be. On a retry, the one stop that is
                 // not evidence of that is a lagged event stream, which only
                 // lost the evidence; the box is clean, so that prompt is
-                // reported as lost. The notice stays bound to the conversation
-                // it was written for, so the daemon still drops it if that
-                // conversation or agent did change meanwhile.
+                // reported as lost — but only when the delivery is bound to a
+                // conversation. The notice carries that binding, so the daemon
+                // drops it if the conversation or agent did change in the lost
+                // frames; an unbound notice would be applied to whatever
+                // conversation owns the card now, a successor included.
                 log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
-                if attempt > 1 && reason == LAGGED_EVENT_STREAM {
+                if attempt > 1 && reason == LAGGED_EVENT_STREAM && generation.is_some() {
                     report_erased_first_write_lost(
                         registry,
                         pane_id,
@@ -6560,7 +6562,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered. A third pane's event bus overflows between the attempts: the retry stops, and the card says the prompt was not delivered.
+    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered. A third pane's event bus overflows between the attempts: the retry stops, and the card says the prompt was not delivered. A fourth pane, whose delivery was never bound to a conversation, overflows the same way and gets no notice.
     #[spec("scheduler/dispatch/027")]
     #[cfg(unix)]
     #[tokio::test]
@@ -6568,6 +6570,7 @@ mod tests {
         const CHANGED_PANE: &str = "issue-1455-generation-changed-pane";
         const SAME_PANE: &str = "issue-1455-same-generation-pane";
         const FLOODED_PANE: &str = "issue-1455-flooded-bus-pane";
+        const UNBOUND_PANE: &str = "issue-1455-flooded-unbound-pane";
         const PROMPT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -6583,12 +6586,26 @@ mod tests {
         let mut logs = Vec::new();
         // How many events land between the attempts. The bus holds 16, so 40
         // overflow it and the retry's drain finds the stream lagged.
-        for (pane, next_session, between) in [
-            (CHANGED_PANE, "a-new-conversation", 1),
-            (SAME_PANE, "the-ready-conversation", 1),
-            (FLOODED_PANE, "the-ready-conversation", 40),
+        // The last pane is OpenCode, which declares no pre-prompt readiness
+        // signal: nothing announces it, so its delivery is never bound to a
+        // conversation.
+        for (pane, agent_type, next_session, between) in [
+            (CHANGED_PANE, AgentType::ClaudeCode, "a-new-conversation", 1),
+            (
+                SAME_PANE,
+                AgentType::ClaudeCode,
+                "the-ready-conversation",
+                1,
+            ),
+            (
+                FLOODED_PANE,
+                AgentType::ClaudeCode,
+                "the-ready-conversation",
+                40,
+            ),
+            (UNBOUND_PANE, AgentType::OpenCode, "a-new-conversation", 40),
         ] {
-            let agent = spawn_typed_byte_target(&registry, pane, Some(AgentType::ClaudeCode));
+            let agent = spawn_typed_byte_target(&registry, pane, Some(agent_type.clone()));
             let (event_tx, event_rx) = broadcast::channel(16);
             let start = |session: &str| {
                 BroadcastMsg::Event(typed_prompt_watch_event(
@@ -6596,13 +6613,15 @@ mod tests {
                     &agent,
                     session,
                     EventType::SessionStart,
-                    AgentType::ClaudeCode,
+                    agent_type.clone(),
                     false,
                 ))
             };
-            event_tx
-                .send(start("the-ready-conversation"))
-                .expect("announce the ready conversation");
+            if agent_type == AgentType::ClaudeCode {
+                event_tx
+                    .send(start("the-ready-conversation"))
+                    .expect("announce the ready conversation");
+            }
             // Lands while the first attempt's bytes are being erased — after
             // that attempt's own pre-write drain and before the retry's.
             let between_attempts = start(next_session);
@@ -6646,6 +6665,10 @@ mod tests {
             "a flood that overflows the event bus between the attempts stops the retry before a \
              byte is written: the frames that might have said the conversation changed are lost"
         );
+        assert_eq!(
+            logs[3], erased_attempt,
+            "the unbound pane's flood stops its retry the same way"
+        );
         let lost: Vec<String> = notices
             .lock()
             .unwrap()
@@ -6660,7 +6683,9 @@ mod tests {
              lagged event stream stopped — that stop lost evidence, it did not find the target \
              gone, and the box is clean. The generation-changed stop is not reported, exactly as \
              a first write the drain stops is not: the conversation it was written for is over, \
-             and the daemon drops a notice addressed to it"
+             and the daemon drops a notice addressed to it. Nor is the UNBOUND pane's lag stop: \
+             its notice could carry no conversation, so the daemon could not drop it if the lost \
+             frames hid a change, and it would land on a successor's card"
         );
     }
 
