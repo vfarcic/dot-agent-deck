@@ -362,6 +362,10 @@ mod tests {
                 "clear_directory_filter".to_string(),
                 "next_page".to_string(),
                 "previous_page".to_string(),
+                "scroll_down".to_string(),
+                "scroll_up".to_string(),
+                "scroll_to_top".to_string(),
+                "scroll_to_bottom".to_string(),
                 "choose_mode".to_string(),
                 "choose_agent_type".to_string(),
                 "name_new_agent".to_string(),
@@ -440,6 +444,10 @@ mod tests {
                 "clear_directory_filter",
                 "next_page",
                 "previous_page",
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 "choose_mode",
                 "choose_agent_type",
                 "name_new_agent",
@@ -632,6 +640,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), true),
                 ("previous_page".to_string(), true),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), false),
+                ("scroll_up".to_string(), false),
+                ("scroll_to_top".to_string(), false),
+                ("scroll_to_bottom".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -673,6 +686,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), true),
                 ("previous_page".to_string(), true),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), true),
+                ("scroll_up".to_string(), true),
+                ("scroll_to_top".to_string(), true),
+                ("scroll_to_bottom".to_string(), true),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),
@@ -713,6 +731,11 @@ mod tests {
                 // Turning a page: on the two screens that show lists (PR #1451 round 3, change 4).
                 ("next_page".to_string(), false),
                 ("previous_page".to_string(), false),
+                // Scrolling the dashboard: `overview` with the New agent dialog closed (issue #1492).
+                ("scroll_down".to_string(), false),
+                ("scroll_up".to_string(), false),
+                ("scroll_to_top".to_string(), false),
+                ("scroll_to_bottom".to_string(), false),
                 // `requires` a live New agent form, and none is declared here.
                 ("choose_mode".to_string(), false),
                 ("choose_agent_type".to_string(), false),

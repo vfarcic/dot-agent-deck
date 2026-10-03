@@ -717,9 +717,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const paging = useMemo<VoicePaging>(() => ({
     publish: (layer, pager) => { pagerLayers.current[layer] = pager; },
   }), []);
+  /* Whether a dialog over the screen declares a numbered or paged list. */
+  const dialogLayerUp = useCallback(() => numberedLayers.current.dialog !== undefined || pagerLayers.current.dialog !== undefined, []);
   const readPager = useCallback((): VoicePager | undefined => (
-    numberedLayers.current.dialog !== undefined || pagerLayers.current.dialog !== undefined ? pagerLayers.current.dialog : pagerLayers.current.screen
-  ), []);
+    dialogLayerUp() ? pagerLayers.current.dialog : pagerLayers.current.screen
+  ), [dialogLayerUp]);
   const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
@@ -818,9 +820,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
-      /* The page of whichever list on screen pages (PR #1451 round 3, change 4). */
+      /* The page of whichever list on screen pages (PR #1451 round 3, change 4).
+         The agent dashboard scrolls instead of paging (issue #1492), so with
+         nothing over it, a page turn there scrolls it by about a screen. */
       turnPage: (delta) => {
         const pager = readPager();
+        const scrollDashboard = overviewVoiceContext.current?.scrollDashboard;
+        if (!pager && !dialogLayerUp() && scrollDashboard) return scrollDashboard(delta > 0 ? "down" : "up");
         const refused = pageTurnRefusal(pager, delta);
         if (refused === undefined) pager?.turn(delta);
         return refused;
@@ -835,8 +841,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        dispatch the host cannot serve, so the report says nothing ran. */
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     /* PR #1451 round 3, change 4 — voice acts only on what is on screen. An
-       answer naming an item a paged list shows on another page (an agent on
-       the dashboard's page 2, resolved by Rust against the whole deck) is
+       answer naming an item a paged list shows on another page (an agent
+       tile on the Daemons screen's page 2, resolved by Rust against the whole
+       deck) is
        refused with that page, and nothing runs. */
     const pager = readPager();
     const offPage = pager && offPageTarget(outcome.params, pager.elsewhere, selectedDeckId);
@@ -847,7 +854,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

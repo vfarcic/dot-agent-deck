@@ -1510,3 +1510,106 @@ utterance = "next page"
 screen = "agent"
 action = "next_page"
 outcome = "unavailable"
+
+# Issue #1492 — scrolling the agent dashboard, which no longer splits into
+# pages while voice is on. The four rows are `overview`-only and need the New
+# agent dialog closed. "go back to the top" is a scroll, not leaving the screen.
+# "page down" / "page up" are the page rows' words, which scroll the dashboard.
+[[fixtures]]
+name = "scroll-down"
+utterance = "scroll down"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-a-bit"
+utterance = "scroll down a bit"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-down-go-down"
+utterance = "go down"
+screen = "overview"
+action = "scroll_down"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-down-on-the-dashboard"
+utterance = "page down"
+screen = "overview"
+action = "next_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up"
+utterance = "scroll up"
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-go-up"
+utterance = "go up"
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-up-a-bit"
+utterance = "Scroll up a bit."
+screen = "overview"
+action = "scroll_up"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "page-up-on-the-dashboard"
+utterance = "page up"
+screen = "overview"
+action = "previous_page"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top"
+utterance = "scroll to the top"
+screen = "overview"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-top-go-back-to-the-top"
+utterance = "go back to the top"
+screen = "overview"
+action = "scroll_to_top"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom"
+utterance = "scroll to the bottom"
+screen = "overview"
+action = "scroll_to_bottom"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-to-the-bottom-the-end"
+utterance = "scroll to the end"
+screen = "overview"
+action = "scroll_to_bottom"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "scroll-negative-over-an-agent-pane"
+utterance = "scroll down"
+screen = "agent"
+action = "scroll_down"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "scroll-negative-under-the-new-agent-dialog"
+utterance = "scroll down"
+screen = "overview"
+dialog = true
+action = "scroll_down"
+outcome = "unavailable"

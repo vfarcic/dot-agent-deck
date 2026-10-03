@@ -1252,7 +1252,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   {
     // PR #1451 round 3, change 4 — turning the page of a list voice shows a
     // page at a time. The app refuses a turn with nothing to turn to itself.
-    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more", "page down"],
     action: "next_page",
     invoke: "nextPage",
     screens: ["deck", "overview"],
@@ -1260,12 +1260,47 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Next page.",
   },
   {
-    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back"],
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back", "page up"],
     action: "previous_page",
     invoke: "previousPage",
     screens: ["deck", "overview"],
     unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
     report: "Previous page.",
+  },
+  {
+    // Issue #1492 — scrolling the agent dashboard, which no longer pages. The
+    // live rows also need the New agent dialog closed; the preview's matcher
+    // does not model that, and a scroll under the dialog moves only the screen.
+    phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
+    action: "scroll_down",
+    invoke: "scrollDown",
+    screens: ["overview"],
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling down.",
+  },
+  {
+    phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
+    action: "scroll_up",
+    invoke: "scrollUp",
+    screens: ["overview"],
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling up.",
+  },
+  {
+    phrases: ["scroll to the top", "go to the top", "back to the top"],
+    action: "scroll_to_top",
+    invoke: "scrollToTop",
+    screens: ["overview"],
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the top.",
+  },
+  {
+    phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
+    action: "scroll_to_bottom",
+    invoke: "scrollToBottom",
+    screens: ["overview"],
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the bottom.",
   },
 ];
 

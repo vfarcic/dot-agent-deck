@@ -4942,6 +4942,84 @@ mod tests {
         }
     }
 
+    /// Scenario: "scroll down", "scroll up", "scroll to the top" and "scroll
+    /// to the bottom" on the agent dashboard dispatch the dashboard's scroll
+    /// (issue #1492). They are not available on the Daemons screen, over an
+    /// agent's pane, or while the New agent dialog covers the dashboard.
+    #[tokio::test]
+    async fn voice_outcome_scrolls_dispatch_on_the_dashboard_only() {
+        let dialog = VoiceNewAgent { form: None };
+        for (said, id, invoke, sentence) in [
+            (
+                "scroll down",
+                "scroll_down",
+                "scrollDown",
+                "Scrolling down.",
+            ),
+            ("scroll up a bit", "scroll_up", "scrollUp", "Scrolling up."),
+            (
+                "scroll to the top",
+                "scroll_to_top",
+                "scrollToTop",
+                "Scrolled to the top.",
+            ),
+            (
+                "go to the bottom",
+                "scroll_to_bottom",
+                "scrollToBottom",
+                "Scrolled to the bottom.",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(id));
+            assert_eq!(
+                run_with(&resolver, Screen::Overview, None, said).await,
+                VoiceOutcome::Dispatch {
+                    transcript: Transcript::new(said),
+                    action: id.to_string(),
+                    invoke: invoke.to_string(),
+                    params: Vec::new(),
+                    sentence: sentence.to_string(),
+                    then_submit: false,
+                },
+                "{said}"
+            );
+            for screen in [Screen::Deck, Screen::Agent] {
+                assert!(
+                    matches!(
+                        run_with(&resolver, screen, None, said).await,
+                        VoiceOutcome::Unavailable { .. }
+                    ),
+                    "{said} on {screen:?}"
+                );
+            }
+            let under_dialog = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Overview,
+                &fleet(),
+                &decks(),
+                None,
+                Some(&dialog),
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
+            assert!(
+                matches!(under_dialog, VoiceOutcome::Unavailable { .. }),
+                "{said} under the New agent dialog: {under_dialog:?}"
+            );
+        }
+        // A pick of the opposite direction is refused, not run the wrong way.
+        let resolver = StubResolver::new().answering("scroll up", IntentAnswer::new("scroll_down"));
+        assert!(
+            !matches!(
+                run_with(&resolver, Screen::Overview, None, "scroll up").await,
+                VoiceOutcome::Dispatch { .. }
+            ),
+            "scroll up must not ground a scroll down"
+        );
+    }
+
     /// Scenario: an ambiguous required directory offers dispatchable paths in
     /// the same order as the unchanged names and sentence shown to the user.
     #[tokio::test]

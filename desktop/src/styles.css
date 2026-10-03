@@ -1240,8 +1240,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    fleet view; the gap is what separates two decks' cards from each other now
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
-/* PR #1451 round 3, change 4: the dashboard's voice page, beside its title. */
-.overview-page { margin-left: 4px; color: var(--muted); font-size: 10px; font-weight: 650; white-space: nowrap; }
 .workspace-page { color: var(--ink); font-weight: 700; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather

@@ -34,11 +34,11 @@ What you can do by voice, by screen:
 | Where | You can |
 | --- | --- |
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
-| Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
-While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). A list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
+While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). The dashboard shows every daemon and agent whether voice is on or off, and you can scroll it by voice; see [Scrolling the dashboard](#scrolling-the-dashboard). In the New agent dialog and on the Daemons screen, a list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
 
 A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
 
@@ -60,7 +60,7 @@ Once the New agent dialog has a daemon and a directory chosen, say "set the comm
 
 While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the daemons in the **Daemon** selector while its menu is open. With voice off, they look as they always do.
 
-Each list is numbered from 1. When several lists are visible together, as in the New agent dialog, each has its own numbers: the daemons 1, 2…, the directories 1, 2… (with `..` for the folder above as 1), and the modes 1, 2…. On the dashboard the agents of every daemon are one list, numbered top to bottom. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
+Each list is numbered from 1. When several lists are visible together, as in the New agent dialog, each has its own numbers: the daemons 1, 2…, the directories 1, 2… (with `..` for the folder above as 1), and the modes 1, 2…. On the dashboard the agents of every daemon are one list, numbered top to bottom, and a number stays with its row wherever the dashboard is scrolled. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
 
 ![The agent dashboard with voice on: each agent row starts with a number, 1 to 6, counting on from one daemon's agents to the next](/img/voice-numbers-desktop.png)
 
@@ -75,14 +75,25 @@ If the number you said could also be an item's name, for example "one" with an a
 
 A spoken number, with or without its list, is worked out on your computer and is not sent to the Commands service. Anything else, such as "open number three", is a command like any other.
 
+## Scrolling the dashboard
+
+The dashboard looks the same with voice on as with voice off: nothing is left out, and when it is taller than the window, it scrolls. Voice only adds the numbers. You can scroll with the mouse, the trackpad or the keyboard as usual, or by voice:
+
+- **"scroll down"** or **"scroll up"** moves the dashboard about one window. "Scroll down a bit", "go down", "page down", "go up" and "page up" work too, and so do "next page" and "previous page".
+- **"scroll to the top"** or **"scroll to the bottom"** goes to the first or the last daemon.
+- When the dashboard is already at the top or the bottom, or fits the window, nothing moves and the app says so.
+- **Saying the number of a row you have scrolled past**, such as "open agent 12" or "twelve", opens that agent as usual and scrolls its row back into view behind the pane, so it is in front of you when you close the pane.
+
+Scrolling by voice works on the dashboard itself, not while the New agent dialog or an agent's pane is open over it.
+
 ## Long lists are shown in pages
 
-While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog, the agents on the dashboard and the agent tiles on the Daemons screen. A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.
+While voice is on, a list that does not fit in the window is shown a page at a time instead of scrolling, so everything you can choose by voice is on screen. This applies to the directories and the modes in the New agent dialog and the agent tiles on the Daemons screen. The dashboard is not split into pages; it scrolls (see [Scrolling the dashboard](#scrolling-the-dashboard)). A list that fits is shown whole, as before. With voice off, every list scrolls as it always has. The daemons in the New agent dialog are never split into pages: every daemon that can take a new agent is always shown in full.
 
 ![The New agent dialog with voice on: the daemons, the directories and the modes are each numbered from 1, the directories fill the dialog in five columns, and "Page 1 of 3" shows beside the Directory heading](/img/voice-pages-desktop.png)
 
-- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit. The dashboard shows as many agents as fit the window and works the pages out again when you resize it. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
-- **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, next to the dashboard's title, and above the tiles on the Daemons screen.
+- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
+- **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, and above the tiles on the Daemons screen.
 - **Say "next page" or "previous page"** to turn it ("go to the next page" and "go back a page" work too). On the last page, the first page, or a screen with no pages, nothing moves and the app says why. In the New agent dialog, the directories turn until you choose one, and then the modes do.
 - **Numbers start at 1 on every page** and refer to the page showing. Turning the page changes the numbers, so a number you began to say before the page turned chooses nothing and the app asks you to say it again.
 - **Voice works only on the page showing.** Naming something on another page, such as "open docs", chooses nothing; the app tells you where it is, for example *“docs” is on page 3: say “next page”*. Clicking, the keyboard and the **Filter** box work as usual: moving the selection with the arrow keys or `j` and `k` turns to the page it lands on.
