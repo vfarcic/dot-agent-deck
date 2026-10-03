@@ -218,7 +218,7 @@ const SUCCESSOR_SENTINEL: &str = "successor-report-7d1e";
 /// following it.
 const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that worker on record";
 
-/// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `quitter` and see the task pointer land, then let that worker EXIT ON ITS OWN without reporting. Start a different agent in the same pane through the daemon's real `StartAgent`, the request a TUI sends when it opens a pane, and have it run the real `work-done` from inside that pane. The orchestrator's pane must show the report labelled as one the deck has no delegation on record for, must not be told the role completed the delegated task, and no `work-done-quitter.md` may be written.
+/// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture, delegate to the `clear = false` worker `quitter`, and once the task pointer lands let that worker EXIT ON ITS OWN without reporting. Start a different agent in the same pane through the daemon's real `StartAgent` (what a TUI sends when it opens a pane) and have it run the real `work-done` from inside that pane. The orchestrator's pane must show that report labelled as one the deck has no delegation on record for, never "Worker quitter has completed their task", and no `work-done-quitter.md` may be written.
 #[spec("orchestration/work-done/015")]
 #[test]
 fn work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task() {

@@ -4884,6 +4884,42 @@ impl DelegationCommission {
         self.armed_at.pop_front();
     }
 
+    /// Issue #507: spend one commission on a `work-done` from `reporting_agent`
+    /// — the oldest one bound to that agent when there is one (Greptile,
+    /// #1525), otherwise the oldest.
+    fn credit(&mut self, reporting_agent: Option<&str>) {
+        let own = reporting_agent.and_then(|agent| {
+            self.armed_at
+                .iter()
+                .position(|c| c.worker_agent_id.as_deref() == Some(agent))
+        });
+        match own {
+            Some(index) => {
+                self.armed_at.remove(index);
+            }
+            None => self.pop_oldest(),
+        }
+        self.follow_newest_outstanding();
+    }
+
+    /// Issue #507 (Qodo, #1525): once the newest commission has been removed,
+    /// point [`Self::newest_arm_id`] and [`Self::worker_agent_id`] at the newest
+    /// one still outstanding. Otherwise they keep naming a commission that is
+    /// gone: a later bind for the surviving one is refused as "not the newest",
+    /// and [`AgentPtyRegistry::commission_owed_to_agent`] keeps answering for
+    /// the agent whose commission was spent, suppressing the waiting notice of
+    /// the agent that still owes one. A no-op while the newest is still here.
+    fn follow_newest_outstanding(&mut self) {
+        let Some(newest) = self.armed_at.back() else {
+            return;
+        };
+        if self.newest_arm_id == Some(newest.arm_id) {
+            return;
+        }
+        self.newest_arm_id = Some(newest.arm_id);
+        self.worker_agent_id = newest.worker_agent_id.clone();
+    }
+
     /// Issue #1447: remove the commission armed as `arm_id`, returning whether
     /// it was still here. The deque stays ordered by arm time, since removing
     /// an element keeps the order of the rest.
@@ -6913,18 +6949,7 @@ impl AgentPtyRegistry {
         // Issue #507 (Greptile, #1525): the reporting agent's own commission
         // goes first, when one is bound to it, so a successor's completion
         // never spends a commission it does not owe while its own stays owed.
-        let own = reporting_agent.as_deref().and_then(|agent| {
-            entry
-                .armed_at
-                .iter()
-                .position(|c| c.worker_agent_id.as_deref() == Some(agent))
-        });
-        match own {
-            Some(index) => {
-                entry.armed_at.remove(index);
-            }
-            None => entry.pop_oldest(),
-        }
+        entry.credit(reporting_agent.as_deref());
         WorkDoneProvenance::Solicited {
             remaining: entry.outstanding(),
         }
@@ -6972,6 +6997,7 @@ impl AgentPtyRegistry {
                     .is_none_or(|bound| bound == reporting_agent)
         });
         let retired = u32::try_from(before - entry.armed_at.len()).unwrap_or(u32::MAX);
+        entry.follow_newest_outstanding();
         if entry.outstanding() == 0 {
             tracker.commissions.remove(worker_pane_id);
         }
@@ -23575,6 +23601,46 @@ mod spawn_tests {
             .map(|c| c.worker_agent_id.clone())
             .collect();
         assert_eq!(kept, vec![Some("new-agent".to_string())]);
+    }
+
+    /// Issue #507 review (Qodo, #1525): crediting the reporting agent's own
+    /// commission when it is the NEWEST leaves an older, still-queued one owed;
+    /// once that one is bound to its worker, the ledger must say that worker
+    /// owes it — a ledger still naming the spent commission's worker suppresses
+    /// the waiting notice of the one that does.
+    #[test]
+    fn commission_ledger_follows_the_newest_outstanding_after_crediting_it() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let arm = |reg: &Arc<AgentPtyRegistry>| match reg
+            .arm_delegation_commission("worker", "orch", None, true)
+        {
+            CommissionArm::Armed { in_flight, .. } => in_flight,
+            other => panic!("the commission must arm: {other:?}"),
+        };
+        let queued = arm(&reg);
+        let newer = arm(&reg);
+        reg.bind_commission_worker_agent_id("worker", newer.arm_id(), "first-agent");
+        drop(newer);
+        reg.delegations
+            .lock()
+            .unwrap()
+            .commissions
+            .get_mut("worker")
+            .expect("two commissions owed")
+            .credit(Some("first-agent"));
+        // The queued dispatch now writes its pointer and binds its worker.
+        reg.bind_commission_worker_agent_id("worker", queued.arm_id(), "second-agent");
+        drop(queued);
+        assert!(
+            reg.commission_owed_to_agent("worker", "second-agent")
+                .is_some(),
+            "the surviving commission is owed by the agent it was bound to"
+        );
+        assert!(
+            reg.commission_owed_to_agent("worker", "first-agent")
+                .is_none(),
+            "the spent commission's agent owes nothing"
+        );
     }
 
     /// Issue #590 review (Qodo, #1285): past [`MAX_OUTSTANDING_COMMISSIONS`] the
