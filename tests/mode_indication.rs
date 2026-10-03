@@ -140,7 +140,6 @@ fn selected_card_fixture() -> SessionState {
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
-        wrapper_output_at: None,
     }
 }
 
