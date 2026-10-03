@@ -188,14 +188,17 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
     const input = await openShellPane(deck);
     await deck.traceTerminals();
     const [agent] = await deck.daemonAgents();
-    // The grid the pane fits, once the daemon has applied it. The window leaves
-    // and regains the focus first. On GitHub runners the grid has held at the
-    // spawn size, 80x24, until the window's first focus-in that the window
-    // itself saw — even with the page already reporting focus (PR #1505's
-    // first two CI runs) — and the control below would see that resize rather
-    // than none.
-    await deck.setWindowFocus(false);
-    await deck.setWindowFocus(true);
+    // The grid the pane fits, once the daemon has applied it: off the agent's
+    // spawn size, 80x24, which every pane in this window is larger than, and
+    // then still. The settle alone is not enough. The pane's own size has
+    // reached the daemon 1.9-2.0s after the attach, measured on a runner and
+    // locally, so a settle can finish at the spawn size and the control below
+    // would then see that late resize rather than none (PR #1505's first three
+    // CI runs).
+    await waitFor("the daemon to apply the pane's own size", async () => {
+      const [grid] = await deck.grids();
+      return grid !== undefined && !(grid[0] === 80 && grid[1] === 24);
+    });
     await deck.gridSettled();
     const [own] = await deck.grids();
 

@@ -677,12 +677,11 @@ export class Deck {
       if (code !== 0) throw new Error(`xdotool ${args.join(" ")} exited ${code}`);
       return stdout.trim().split("\n").filter(Boolean);
     };
-    // More than one window can carry the app's title. Measured once, in a run
-    // of the whole file: two, owned by different X clients, with the one listed
-    // first not the window this page's focus follows — most likely the app of
-    // the scenario before, not yet gone (not verified): the next run of that
-    // file needed a second try on each focus-in, the stale window first every
-    // time. Each is tried in turn, the one that worked last time first.
+    // More than one window can carry the app's title. Measured locally, in
+    // runs of the whole file: two, owned by different X clients, and which of
+    // them the page's focus follows varied — even within one scenario, the one
+    // that worked last time once did not. Why is not established. So each is
+    // tried in turn, the one that worked last time first.
     const found = await xdotool("search", "--onlyvisible", "--name", "Agent Deck");
     const apps = found.includes(this.appWindow ?? "")
       ? [this.appWindow as string, ...found.filter((window) => window !== this.appWindow)]
