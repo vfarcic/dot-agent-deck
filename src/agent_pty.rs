@@ -4790,11 +4790,13 @@ struct DelegationCommission {
     /// the pointer goes to — the pane's occupant for a `clear = false` delegate,
     /// the fresh agent once a `clear = true` respawn has resolved.
     ///
-    /// Read only by [`AgentPtyRegistry::commission_owed_to_agent`]. A worker
-    /// that exits naturally takes no path that sweeps its commission, so the
-    /// entry can outlive it by up to [`DELEGATION_COMMISSION_TTL`] (issue #507);
-    /// this is what stops a later agent in the same pane, which was never
-    /// delegated to, from being reported as the commissioned worker.
+    /// A worker that exits naturally takes no path that sweeps its commission,
+    /// so the entry can outlive it by up to [`DELEGATION_COMMISSION_TTL`]
+    /// (issue #507); this is what stops a later agent in the same pane, which
+    /// was never delegated to, from being reported as the commissioned worker
+    /// ([`AgentPtyRegistry::commission_owed_to_agent`]) and from having its
+    /// `work-done` credited as the delegated work
+    /// ([`AgentPtyRegistry::retire_delegation_commission`]).
     worker_agent_id: Option<String>,
     /// Issue #447 review (#1347, Qodo): the arm id
     /// ([`CommissionDispatchInFlight::arm_id`]) of the newest commission. A
@@ -6848,6 +6850,8 @@ impl AgentPtyRegistry {
     /// has ever been delegated to. Issue #590: expired commissions are dropped
     /// before the credit, so a completion arriving after
     /// [`DELEGATION_COMMISSION_TTL`] is not laundered into a solicited one.
+    /// Issue #507: so are commissions made to an agent that no longer holds the
+    /// pane — see [`Self::retire_commissions_of_a_previous_occupant`].
     pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
         self.retire_delegation_commission_at(worker_pane_id, Instant::now())
     }
@@ -6858,9 +6862,25 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         now: Instant,
     ) -> WorkDoneProvenance {
+        // Issue #507: read before the tracker lock, which this method never
+        // holds together with the registry's own.
+        let reporting_agent = self.pane_current_agent_id(worker_pane_id);
         let mut tracker = self.delegations.lock().unwrap();
         self.note_delegation_resolved(&mut tracker, worker_pane_id);
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
+        let retired = Self::retire_commissions_of_a_previous_occupant(
+            &mut tracker,
+            worker_pane_id,
+            reporting_agent.as_deref(),
+        );
+        if retired > 0 {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                retired,
+                "work-done: retired delegation commissions made to an agent that no longer holds \
+                 this pane, so they are not credited to its successor"
+            );
+        }
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
         };
@@ -6880,6 +6900,58 @@ impl AgentPtyRegistry {
         WorkDoneProvenance::Solicited {
             remaining: entry.outstanding(),
         }
+    }
+
+    /// Issue #507: retire the commissions on `worker_pane_id` that were made to
+    /// an agent other than `reporting_agent`, the pane's current occupant, and
+    /// return how many went. Caller holds the tracker lock.
+    ///
+    /// A worker that exits on its own takes no path that sweeps its commissions
+    /// ([`Self::sweep_delegations_on_exit`] deliberately leaves them), and the
+    /// pane id is then free for another agent. Without this, that agent's first
+    /// `work-done` spent the predecessor's commission: reported to the
+    /// orchestrator as the delegated work coming back, and filed over the
+    /// role's `work-done-<role>.md`. The binding
+    /// ([`DelegationCommission::worker_agent_id`]) names the agent the newest
+    /// commission's task pointer went to, and every arm resets it, so a binding
+    /// to someone else means no commission on the entry was made to the agent
+    /// reporting now.
+    ///
+    /// Commissions whose dispatch has not yet taken the pane's dispatch lock are
+    /// kept, as [`Self::retire_commissions_of_replaced_agent`] keeps them: their
+    /// pointers have not been written, and will go to whoever holds the pane.
+    /// Nothing is retired when the binding is unknown (`None`) or there is no
+    /// live occupant to compare it with — the credit then proceeds as before.
+    fn retire_commissions_of_a_previous_occupant(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        reporting_agent: Option<&str>,
+    ) -> u32 {
+        let Some(reporting_agent) = reporting_agent else {
+            return 0;
+        };
+        let in_flight = tracker
+            .commission_dispatches_in_flight
+            .get(worker_pane_id)
+            .map_or(0, |guards| u32::try_from(guards.len()).unwrap_or(u32::MAX));
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
+            return 0;
+        };
+        if entry
+            .worker_agent_id
+            .as_deref()
+            .is_none_or(|bound| bound == reporting_agent)
+        {
+            return 0;
+        }
+        let retired = entry.outstanding().saturating_sub(in_flight);
+        for _ in 0..retired {
+            entry.pop_oldest();
+        }
+        if entry.outstanding() == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        retired
     }
 
     /// Issue #448 review (finding 1): release ONE commission armed for
@@ -7769,17 +7841,14 @@ impl AgentPtyRegistry {
     /// genuine, still-owed commission, not an undelivered one, so there is
     /// nothing here for the ledger's no-delivery invariant to release. The
     /// same non-drain also applies to the ORCHESTRATOR side of a natural
-    /// exit, and that half is a known, accepted asymmetry rather than an
-    /// oversight: [`Self::drain_commissions_touching`] is only ever invoked
-    /// from the *deliberate*-close path (`begin_pane_close`/
-    /// `finish_pane_close`), so a naturally-exiting orchestrator's commission
-    /// entries — keyed by worker pane id — outlive the exit. If that worker
-    /// pane id is later reused, an unrelated agent's genuinely-uncommissioned
-    /// `work-done` is credited `Solicited` and overwrites the role's
-    /// `work-done-<role>.md`. Accepted for now because the reverse (draining
-    /// on natural exit here) is a larger, separately-scoped change; a
-    /// deliberate close already closes the gap for the case that goes through
-    /// it.
+    /// exit: [`Self::drain_commissions_touching`] is only ever invoked from
+    /// the *deliberate*-close path (`begin_pane_close`/`finish_pane_close`),
+    /// so a naturally-exiting agent's commission entries — keyed by worker
+    /// pane id — outlive the exit. Issue #507: what stops a later occupant of
+    /// that worker pane id from spending one is the crediting side, not this
+    /// sweep — [`Self::retire_delegation_commission`] retires the commissions
+    /// bound to an agent other than the pane's current one before it credits
+    /// anything.
     ///
     /// Idempotent by construction: [`Self::drain_delegations_touching_for_exit`]/
     /// [`Self::drain_silence_watches_touching_for_exit`] no-op on a pane with
@@ -9363,6 +9432,22 @@ impl AgentPtyRegistry {
             .iter()
             .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
             .map(|(id, _)| id.clone())
+    }
+
+    /// Issue #524: whether `pane_id_env`'s occupant has EXITED — the pane has a
+    /// registry entry that has not been handed over to a successor, and none of
+    /// them is live. A worker that crashed or quit on its own leaves exactly
+    /// this behind, because nothing on the natural-exit path removes the
+    /// entry. `false`
+    /// for a live pane and for a pane with no entry at all.
+    pub fn pane_occupant_has_exited(&self, pane_id_env: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let mut occupants = inner
+            .agents
+            .values()
+            .filter(|a| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
+            .peekable();
+        occupants.peek().is_some() && occupants.all(|a| a.exited.load(Ordering::SeqCst))
     }
 
     /// PRD #20 R20-003 (finding #4): whether a deck client is CURRENTLY attached
@@ -23337,6 +23422,59 @@ mod spawn_tests {
             !reg.cancel_watches_of_replaced_agent("worker"),
             "nothing left"
         );
+    }
+
+    /// Issue #507: a `work-done` from an agent that is not the one the pane's
+    /// commissions were made to retires those commissions instead of spending
+    /// one — except a commission whose dispatch is still queued, whose pointer
+    /// will go to whoever holds the pane.
+    #[test]
+    fn commission_ledger_retires_what_only_a_previous_occupant_owed() {
+        fn arm(reg: &Arc<AgentPtyRegistry>) -> CommissionDispatchInFlight {
+            match reg.arm_delegation_commission("worker", "orch", None, true) {
+                CommissionArm::Armed { in_flight, .. } => in_flight,
+                other => panic!("the commission must arm: {other:?}"),
+            }
+        }
+        let retire = |reg: &Arc<AgentPtyRegistry>, reporting: Option<&str>| {
+            let mut tracker = reg.delegations.lock().unwrap();
+            AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
+                &mut tracker,
+                "worker",
+                reporting,
+            )
+        };
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        // Two delegations made to `old-agent`, both dispatched.
+        for _ in 0..2 {
+            let dispatched = arm(&reg);
+            reg.bind_commission_worker_agent_id("worker", dispatched.arm_id(), "old-agent");
+            drop(dispatched);
+        }
+        assert_eq!(
+            retire(&reg, Some("old-agent")),
+            0,
+            "its own agent keeps them"
+        );
+        assert_eq!(retire(&reg, None), 0, "no live occupant to compare with");
+
+        // A third, bound to `old-agent` at delegate time and still queued
+        // behind the pane's dispatch lock when `new-agent` reports.
+        let queued = arm(&reg);
+        reg.bind_commission_worker_agent_id("worker", queued.arm_id(), "old-agent");
+        assert_eq!(
+            retire(&reg, Some("new-agent")),
+            2,
+            "the two dispatched to the previous occupant go"
+        );
+        assert!(
+            reg.owes_delegation_commission("worker"),
+            "the queued one is kept: its pointer has not been written yet"
+        );
+        drop(queued);
+        assert_eq!(retire(&reg, Some("new-agent")), 1);
+        assert!(!reg.owes_delegation_commission("worker"));
     }
 
     /// Issue #590 review (Qodo, #1285): past [`MAX_OUTSTANDING_COMMISSIONS`] the

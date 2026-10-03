@@ -1957,16 +1957,16 @@ pub struct DelegateResponse {
     ///
     /// "Queued to a pane that resolved at delegate time" is the exact claim —
     /// the fan-out is detached (see [`crate::state::AppState::handle_delegate`]),
-    /// so no synchronous reply can promise the worker read it. A role whose
-    /// worker exited WITHOUT going through the `StopAgent` close path also still
-    /// resolves here, because only that path calls `AppState::unregister_pane`
-    /// (greptile P1 on PR #466, deferred to issue #524 — the liveness of a
-    /// registered pane is not decidable here, since a `clear = true` role's dead
-    /// pane is legitimately respawned by the dispatch rather than being a miss).
+    /// so no synchronous reply can promise the worker read it. Issue #524: a
+    /// role whose worker exited without a close is still in the daemon's role
+    /// maps, and is listed here only when it is `clear = true` — the dispatch
+    /// respawns it and the fresh worker receives the task. Any other role whose
+    /// workers have all exited is reported in [`Self::unresolved_roles`].
     #[serde(default)]
     pub delivered: Vec<String>,
     /// Roles named by `--to` that resolved to no worker pane in this
-    /// orchestration.
+    /// orchestration, or (issue #524) only to panes whose worker has exited and
+    /// is not respawned on delegate.
     #[serde(default)]
     pub unresolved_roles: Vec<String>,
     /// Set when the delegate could not be routed at all.

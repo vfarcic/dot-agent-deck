@@ -1,0 +1,33 @@
+# Fixture for `orchestration/delegate/049` (issue #524).
+#
+# Two workers that end ON THEIR OWN — no `StopAgent`, no pane close — when the
+# test creates their trigger file. Each first reports `work-done` from inside
+# its own pane (so it owes nothing, and a later delegate cannot be refused as
+# busy for the wrong reason), then exits. The trigger is removed before the
+# report, so a `clear = true` replacement running the same command waits for a
+# NEW trigger instead of exiting at once.
+#
+# `steady` is `clear = false`: a delegate to it after the exit has no live
+# worker to reach, and must say so. `fresh` is `clear = true`: a delegate to it
+# after the exit respawns the role, so it must still be delivered — the half
+# that rules out simply refusing every dead pane.
+#
+# `$DAD_TEST_BIN` is the branch's own binary, passed in by the test so an
+# installed release on `PATH` cannot stand in for it.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "steady"
+command = "while [ ! -f ./steady-exit ]; do sleep 0.1; done; rm -f ./steady-exit; \"$DAD_TEST_BIN\" work-done --task steady-reported; exit 0"
+clear = false
+
+[[orchestrations.roles]]
+name = "fresh"
+command = "while [ ! -f ./fresh-exit ]; do sleep 0.1; done; rm -f ./fresh-exit; \"$DAD_TEST_BIN\" work-done --task fresh-reported; exit 0"
+clear = true
