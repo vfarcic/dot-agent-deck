@@ -130,6 +130,7 @@ fn card(orphaned: bool) -> SessionState {
         orchestration_orphaned: orphaned,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        wrapper_output_at: None,
     }
 }
 

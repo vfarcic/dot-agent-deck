@@ -273,9 +273,28 @@ struct Emitter {
     /// submitted prompt trusted for the agent it hosts. Decided once, before the first emit, by
     /// [`codex_spawn_prep`]; see [`CodexSpawnPrep::prompt_reports_unavailable`].
     prompt_reports_unavailable: bool,
+    /// Issue #1493: where this wrapper's output-classified frames go when it
+    /// hosts a Codex whose prompt hook is not running — the one mode in which
+    /// they move the card. `None` everywhere else, where they are sent inline as
+    /// before. See [`LatestSend`].
+    classified_sender: Option<Arc<LatestSend>>,
 }
 
 impl Emitter {
+    /// Send one frame derived from the child's output: through
+    /// [`Self::classified_sender`] when there is one, inline otherwise.
+    fn send_classified(&self, event: &AgentEvent) {
+        let Ok(json) = serde_json::to_string(event) else {
+            return;
+        };
+        match &self.classified_sender {
+            Some(sender) => sender.post(json),
+            None => {
+                let _ = crate::hook::send_to_socket(&json);
+            }
+        }
+    }
+
     /// Build an [`AgentEvent`] for `event_type` and send it to the daemon over
     /// the existing raw-`AgentEvent` hook socket. Send failures are ignored so
     /// the wrapper stays a transparent passthrough even with no daemon (the
@@ -2085,10 +2104,58 @@ impl<W: Write> Write for ActivityWriter<W> {
 /// state drives the card.
 fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emitter) {
     let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-    let ev = det.observe(line);
+    let Some(ev) = det.observe(line) else {
+        return;
+    };
+    // Issue #1493: stamped while the detector is held, so the producer
+    // timestamps of the tee's frames and `QuietOutputIdle`'s follow the order
+    // the two decided in — which is what the deck orders them by.
+    let event = emitter.build_event(ev.event_type(), output_classified_metadata());
     drop(det);
-    if let Some(ev) = ev {
-        emitter.emit_with_metadata(ev.event_type(), output_classified_metadata());
+    emitter.send_classified(&event);
+}
+
+/// Issue #1493: a sender that keeps only the NEWEST frame waiting, on one
+/// thread of its own. Used for a wrapped Codex's output-derived status frames
+/// while its prompt hook is not running: they come from the tee and from the
+/// supervisory loop, which must not wait on the daemon (see
+/// [`Emitter::emit_interface_ready`]), so they are handed here instead. One
+/// thread keeps them in order; keeping only the newest means a daemon that is
+/// not reading cannot make the wrapper hold a growing backlog of statuses
+/// nobody wants any more — the card only ever needs the latest.
+struct LatestSend {
+    slot: Mutex<Option<String>>,
+    ready: std::sync::Condvar,
+}
+
+impl LatestSend {
+    fn spawn() -> Arc<Self> {
+        let sender = Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+        });
+        let worker = Arc::clone(&sender);
+        std::thread::spawn(move || {
+            loop {
+                let json = {
+                    let mut slot = worker.slot.lock().unwrap_or_else(|p| p.into_inner());
+                    loop {
+                        if let Some(json) = slot.take() {
+                            break json;
+                        }
+                        slot = worker.ready.wait(slot).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
+            }
+        });
+        sender
+    }
+
+    /// Replace whatever is waiting with `json`.
+    fn post(&self, json: String) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
+        self.ready.notify_one();
     }
 }
 
@@ -2149,27 +2216,19 @@ fn quiet_output_transition(
 ///
 /// Ticked from the supervisory loop, the only thread awake when the output
 /// stops. It shares the tee's [`Detector`], so the two never report the same
-/// state twice. Its events are sent from a thread of their own with a bounded
-/// send, for the reason [`Emitter::emit_interface_ready`] gives: this loop
-/// forwards the user's signals and must not wait on the daemon.
+/// state twice, and in this mode both send through the emitter's
+/// [`LatestSend`], so their frames leave in order and this loop — which
+/// forwards the user's signals — never waits on the daemon.
 #[cfg(unix)]
 struct QuietOutputIdle {
     quiet_reported_at_output_ms: Option<i64>,
-    sender: std::sync::mpsc::Sender<String>,
 }
 
 #[cfg(unix)]
 impl QuietOutputIdle {
     fn new() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            for json in receiver {
-                crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
-            }
-        });
         Self {
             quiet_reported_at_output_ms: None,
-            sender,
         }
     }
 
@@ -2194,15 +2253,13 @@ impl QuietOutputIdle {
             return;
         };
         det.observe_detected(Some(next));
+        // Stamped under the detector, as in `classify_and_emit`.
+        let event = emitter.build_event(next.event_type(), output_classified_metadata());
         drop(det);
         if next == DetectedEvent::Idle {
             self.quiet_reported_at_output_ms = Some(last_output_ms);
         }
-        if let Ok(json) = serde_json::to_string(
-            &emitter.build_event(next.event_type(), output_classified_metadata()),
-        ) {
-            let _ = self.sender.send(json);
-        }
+        emitter.send_classified(&event);
     }
 }
 
@@ -2302,6 +2359,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         prompt_reports_unavailable,
     } = codex_spawn_prep(program, &agent_type, pane_id.as_deref());
 
+    let agent_type_is_codex = agent_type == AgentType::Codex;
     let emitter = Arc::new(Emitter {
         agent_type,
         session_id,
@@ -2310,6 +2368,10 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         cwd,
         live_target,
         prompt_reports_unavailable,
+        // Issue #1493: the quiet-output fallback's frames and the tee's must
+        // leave in the order they were decided, from one thread.
+        classified_sender: (agent_type_is_codex && prompt_reports_unavailable)
+            .then(LatestSend::spawn),
     });
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
