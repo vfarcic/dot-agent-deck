@@ -96,7 +96,7 @@ permissions:
 # `.git/config` for the life of the job, readable by anything the job runs.
 # `e2e-deterministic` is the sharp case and has its own note below — it executes
 # the PTY e2e tier, which is contributor-authored code — but the flag is on all
-# twelve checkouts rather than that one, because no job here needs the credential
+# thirteen checkouts rather than that one, because no job here needs the credential
 # after the fetch:
 #
 #   * none of them pushes, and the `permissions:` block above grants no write
@@ -112,8 +112,9 @@ permissions:
 #     subject. That survey is what picked the SET; the CI run on the PR that set
 #     the flag is what checked it. The COUNT in this note is maintained by hand
 #     and has drifted before — it read "nine" while there were already ten, and
-#     issue #1088's `notify-main-red` made it eleven and issue #953's
-#     `desktop-driver` twelve — so recount with
+#     issue #1088's `notify-main-red` made it eleven, issue #953's
+#     `desktop-driver` twelve and issue #1507's `cross-version` thirteen — so
+#     recount with
 #     `grep -cE '^ +- uses: actions/checkout@' .github/workflows/ci.yml` rather
 #     than trusting the number. The pattern is anchored to a step line on
 #     purpose: an unanchored one matches this comment too and reports more.
@@ -162,6 +163,7 @@ jobs:
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
       flake_only: ${{ steps.detect.outputs.flake_only }}
+      binary: ${{ steps.binary.outputs.binary }}
     steps:
       - id: detect
         env:
@@ -228,6 +230,49 @@ jobs:
           fi
           echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
           echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
+
+      # Does this PR change what the `dot-agent-deck` binary is built from? Read
+      # by `cross-version` alone, for every PR author — the step above returns
+      # early for anyone but Renovate, so it cannot answer this. The TUI and the
+      # daemon are one binary (CLAUDE.md rule 18), so any change under `src/` can
+      # move the contract between them; a docs-only PR cannot.
+      - id: binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # A dispatch is somebody asking for the run; give it to them.
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "binary=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `push` and `merge_group` carry no PR whose branch could be paired
+          # with the previous release.
+          if [ "$EVENT" != pull_request ]; then
+            echo "binary=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' || true)
+          # Fail safe, as above: no answer from the API is not "nothing changed".
+          if [ -z "$files" ]; then
+            echo "no files reported -> treating the binary as changed"
+            echo "binary=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          binary=false
+          while IFS= read -r f; do
+            case "$f" in
+              src/* | build.rs | Cargo.toml | Cargo.lock | xtask/cross-version/*)
+                echo "'$f' feeds the binary or the harness -> cross-version runs"
+                binary=true
+                break
+                ;;
+            esac
+          done <<< "$files"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
 
   # PR #416 review M2: the desktop web app's TypeScript tests and type-check
   # were previously run by no CI job anywhere (~800 lines of vitest invisible
@@ -707,7 +752,7 @@ jobs:
   # sitting in the tree for the life of the job while this lane drives the PTY
   # e2e tier — dozens of contributor-authored test binaries spawning the real
   # deck. The note above `jobs:` has the survey behind that flag and why it went
-  # on all twelve checkouts rather than only this one.
+  # on all thirteen checkouts rather than only this one.
   #
   # SCOPE is still the outer bound and still does the heavier lifting: this
   # workflow's top-level `permissions:` block grants `contents: read` and
@@ -819,6 +864,128 @@ jobs:
           name: nextest-e2e-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
+
+  # CLAUDE.md rule 12's cross-version check, `cargo xver`
+  # (docs/develop/cross-version-harness.md), run on a runner instead of a
+  # contributor's machine. It pairs the PREVIOUS RELEASE with this PR's branch
+  # in both directions — the old daemon under the branch's TUI and CLI
+  # (forward, the pairing rule 12 names) and the branch daemon under the old
+  # TUI and CLI (reverse) — and asserts that a delegate still routes and hooks
+  # still arrive. Its evidence files are uploaded as the run's artifact, which is
+  # the record rule 12 and `.github/pr-review-rubric.md` ask a PR to carry.
+  #
+  # Why here: the harness wants a disk-backed floor of free space and a host it
+  # can start unprivileged bubblewrap namespaces on, and a shared dev box
+  # running several units at once has neither to spare. A hosted runner is also
+  # the disposable VM the harness doc says unreviewed code belongs in. It holds
+  # no agent credential — every role is a stand-in — so it does not reopen rule
+  # 5's decision; the job token it uses is read-only and serves `gh release`.
+  #
+  # ADVISORY, as `desktop-browser` and `desktop-driver` are, until a run history
+  # shows its runner behaviour; requiring it is a `REQUIRED_CHECKS` change made
+  # with `scripts/apply-branch-protection.sh`, not something a PR can do.
+  cross-version:
+    needs: changes
+    if: needs.changes.outputs.binary == 'true'
+    runs-on: ubuntu-latest
+    # A cold build of one binary plus both directions' scenarios, each bounded
+    # by the harness's own `--run-timeout-secs` (1200 by default).
+    timeout-minutes: 75
+    steps:
+      # Full history and tags: the previous release is the nearest stable tag
+      # the PR's own head can reach, which needs both.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, and
+      # both of the harness's namespaces are unprivileged ones. The runner is a
+      # throwaway VM, so lifting that confinement for the job is the setting it
+      # is meant to change.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          df -h "$GITHUB_WORKSPACE/.."
+      # The branch under test, and the release to pair it with. A PR is fetched
+      # by `pull/<n>/head` from this repository, which also covers a fork's PR;
+      # a dispatch tests the ref it was dispatched on.
+      #
+      # The previous release is the nearest stable tag reachable from that head,
+      # not the Latest release: a branch cut before the newest release would
+      # otherwise face a daemon carrying changes it has never seen (the harness
+      # doc's "Which release is previous").
+      #
+      # And a branch that moves `PROTOCOL_VERSION` is not run at all. The two
+      # builds refuse each other by design across a bump — that refusal IS the
+      # outcome rule 12 asks to record, and the harness would report it as a
+      # failing `aborted` tell.
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            branch="pull/$PR_NUMBER/head"
+          else
+            branch="$REF_NAME"
+          fi
+          previous=$(git describe --tags --abbrev=0 --exclude '*-*' "$HEAD_SHA")
+          protocol() {
+            git show "$1:src/daemon_protocol.rs" \
+              | sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);$/\1/p'
+          }
+          old=$(protocol "$previous")
+          new=$(protocol "$HEAD_SHA")
+          echo "branch=$branch previous=$previous protocol $old -> $new"
+          if [ -z "$old" ] || [ -z "$new" ]; then
+            echo "::error::could not read PROTOCOL_VERSION at $previous or $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$old" != "$new" ]; then
+            echo "::notice::PROTOCOL_VERSION moves from $old ($previous) to $new on this branch, so the two builds refuse each other by design; no cross-version run. Record that refusal as the rule 12 outcome."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+      # `--min-free-gib 15`: the default floor of 100 GiB is sized for a dev box
+      # shared with other builds (CLAUDE.md rule 14). What a run writes is one
+      # debug build of the binary, its crates and one release asset — a few GiB —
+      # on a runner that builds nothing else.
+      #
+      # `--probe generic`: a reverse run otherwise derives its stimulus from a
+      # `dispatch-issue-<n>` branch name, which `pull/<n>/head` is not.
+      #
+      # `--allow-build-changes`: a branch that touches build-time code is built
+      # into a target dir of its own in the build namespace; on a laptop the flag
+      # asks for a human to review those files first, and on this throwaway VM
+      # there is nothing for them to reach.
+      - if: steps.plan.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+          PREVIOUS: ${{ steps.plan.outputs.previous }}
+          REPO: ${{ github.repository }}
+        run: |
+          cargo xver --repo "$REPO" --branch "$BRANCH" --previous "$PREVIOUS" \
+            --direction both --probe generic --allow-build-changes --min-free-gib 15
+      - name: Preserve the evidence
+        if: always() && steps.plan.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: xver-evidence-attempt-${{ github.run_attempt }}
+          path: .dot-agent-deck/xver-evidence/
+          if-no-files-found: warn
+          include-hidden-files: true
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
