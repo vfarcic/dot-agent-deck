@@ -552,6 +552,20 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'test(orchestration_012_real_agent_reflows_across_a_zoom_round_trip)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
+# Issue #1491: `voice_phrase_fixtures_match_the_default_backend` (desktop crate)
+# sends every fixture in `phrase_fixtures.toml` to the real Commands backend one
+# after another, at about a second each, so its wall clock grows with the
+# manifest. With 168 fixtures, three local runs took 166s, past 180s (killed by
+# the default 3 x 60s window, which cost that run its per-fixture summary) and
+# 181s for an all-green run the default window would also have killed. It reaches a model only with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and
+# a developer's key; otherwise it validates the manifest and returns at once.
+# 5 x 60s leaves room for the manifest to grow and is still bounded.
+#
+# The filter tracks the TEST FUNCTION name, so a rename must update it.
+[[profile.default.overrides]]
+filter = 'test(voice_phrase_fixtures_match_the_default_backend)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so
