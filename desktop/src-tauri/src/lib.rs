@@ -5950,6 +5950,50 @@ mod tests {
         );
     }
 
+    /// Scenario: a remote daemon is named `minipc`, and the transcriber writes
+    /// the user's "select minipc daemon" the way speech-to-text does — "Select
+    /// mini PC, Demon.": the one-word name split in two, a comma, and "daemon"
+    /// heard as its homophone. The model echoes "mini PC, Demon". The selector
+    /// switches to `minipc` all the same, and so it does for "Demon mini PC.",
+    /// where the homophone is the only word asking for a daemon. The control:
+    /// "switch daemon to minipc", said as configured, switches too.
+    #[tokio::test]
+    async fn a_switch_reaches_a_daemon_named_as_one_word_when_heard_as_two() {
+        let section: crate::settings::EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [
+                { "id": "rowminipc", "host": "10.0.0.7", "port": 22, "socket": "/run/deck.sock", "name": "minipc" },
+                { "id": "rowbuild", "host": "build-box", "port": 22, "socket": "/run/deck.sock" },
+            ],
+            "selection": "local",
+        }))
+        .expect("parses");
+        let switched_to = |result: &voice::VoiceResult| match &result.outcome {
+            voice::VoiceOutcome::Dispatch { invoke, params, .. } if invoke == "switchDeck" => {
+                Some(params[0].value.clone())
+            }
+            _ => None,
+        };
+        for (said, deck) in [
+            ("Select mini PC, Demon.", "mini PC, Demon"),
+            ("Demon mini PC.", "mini PC"),
+            ("switch daemon to minipc", "minipc"),
+        ] {
+            let result = resolve_with_section(
+                &section,
+                said,
+                voice::IntentAnswer::new("switch_deck").with_param("deck", deck),
+            )
+            .await
+            .expect("resolves");
+            assert_eq!(
+                switched_to(&result).as_deref(),
+                Some("rowminipc"),
+                "{said:?}: {:?}",
+                result.outcome
+            );
+        }
+    }
+
     /// Scenario: the Deck selector lists a build box and a staging box, and
     /// the user says "switch deck to build box or staging box". The tie is
     /// offered with each deck's selector token; "two" answers it with the

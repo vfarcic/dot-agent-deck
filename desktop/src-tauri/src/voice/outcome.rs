@@ -2995,6 +2995,7 @@ pub enum DeckRefMatch {
 /// never a derived shortening such as `daemon.example.com`'s "daemon", and
 /// never "the daemon" — and otherwise names no deck, as above.
 pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
+    let spoken = &without_edge_punctuation(spoken);
     let reference = deck_reference(spoken);
     if reference.is_empty() {
         return deck_ref_match(&decks_called(spoken, decks));
@@ -3002,10 +3003,14 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     let whole = normalize(spoken);
     let reference_words = words(&reference);
 
+    // Compared with the spaces taken out as well: speech-to-text splits a
+    // one-word name ("mini PC" for `minipc`) and joins a two-word one, and
+    // the word-subset pass below cannot see either.
     let named = |deck: &&VoiceDeck, reference: &str| {
+        let reference = joined(reference);
         deck_spoken_names(deck)
             .iter()
-            .any(|name| normalize(name) == reference)
+            .any(|name| joined(&normalize(name)) == reference)
     };
     let mut hits: Vec<&VoiceDeck> = decks.iter().filter(|deck| named(deck, &whole)).collect();
     if hits.is_empty() {
@@ -3737,8 +3742,33 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 }
 
 /// The words that say a reference IS to a deck without saying which one: the
-/// field's name, before and since issue #1045, and the articles around it.
-const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+/// field's name, before and since issue #1045, the articles around it, and
+/// "demon", which is how speech-to-text writes "daemon" ("Select mini PC,
+/// Demon."). A deck really called `demon` is still reached whole, by the
+/// exact pass that runs before these are dropped.
+const DECK_CATEGORY_WORDS: [&str; 9] = [
+    "daemon", "daemons", "deck", "decks", "demon", "demons", "the", "a", "an",
+];
+
+/// `spoken` with the punctuation speech-to-text writes at the edges of its
+/// words taken off — "mini PC, Demon." is "mini PC Demon" — and the
+/// characters inside a word kept, so `deploy@build-box.example.com:2222` is
+/// unchanged. For deck references only: [`normalize`] is shared with agent and
+/// directory names, where a leading `.` is part of the name.
+fn without_edge_punctuation(spoken: &str) -> String {
+    spoken
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A normalised name with its spaces taken out: "mini pc" and `minipc` are
+/// one name said two ways.
+fn joined(normalized: &str) -> String {
+    normalized.replace(' ', "")
+}
 
 /// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
 /// that names no deck.
@@ -10359,6 +10389,55 @@ mod tests {
             matches!(&closed, VoiceOutcome::Unavailable { action, .. } if action == "choose_deck"),
             "{closed:?}"
         );
+    }
+
+    /// Scenario: the New agent dialog is open on a fleet with a remote daemon
+    /// named `minipc`, and the transcriber writes the user's words the way
+    /// speech-to-text does: "Daemon mini PC." (the one-word name split in
+    /// two), and "Select mini PC, Demon." (a comma, and "daemon" heard as its
+    /// homophone), which the model answers with the app's selector row. Both
+    /// choose `minipc` in the dialog's Daemon field, echoing the user's words.
+    #[tokio::test]
+    async fn voice_outcome_the_dialog_chooses_a_daemon_named_as_one_word_when_heard_as_two() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: "deck-minipc".to_string(),
+            label: "minipc".to_string(),
+            address: Some("ops@10.0.0.7".to_string()),
+            local: false,
+            unavailable: None,
+        });
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            for (said, answer) in [
+                (
+                    "Daemon mini PC.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "mini PC"),
+                ),
+                (
+                    "Select mini PC, Demon.",
+                    IntentAnswer::new("switch_deck").with_param("deck", "mini PC, Demon"),
+                ),
+            ] {
+                let resolver = StubResolver::new().answering(said, answer);
+                let outcome = handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    Some(&declared),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { invoke, params, .. }
+                        if invoke == "chooseNewAgentDeck" && params[0].value == "deck-minipc"),
+                    "{said}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: the New agent dialog is open and the user says "use the build
