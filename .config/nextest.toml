@@ -550,3 +550,14 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 # `cargo test-e2e` invocations on one checkout aren't a real-world
 # workflow, and the per-test path with atomic writes means a
 # last-writer-wins outcome is fine for local debugging.
+
+# Issue #524: `orchestration/delegate/049` runs its waits one after another —
+# 20 s for the roles, 30 s for the first pointer, 20 s for each of two natural
+# exits, and 90 s for the respawned `clear = true` worker's pointer, which is
+# written only when the delegate's readiness wait gives up (measured 30.0 s).
+# Those bounds alone sum to the default 180 s kill window, so a run slow enough
+# to approach them would be killed before its last assertion could say which
+# pointer was missing (Qodo, #1525). Measured 32 s on a quiet box.
+[[profile.default.overrides]]
+filter = 'test(delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered)'
+slow-timeout = { period = "60s", terminate-after = 5 }
