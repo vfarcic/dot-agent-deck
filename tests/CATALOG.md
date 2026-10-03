@@ -3558,6 +3558,7 @@ without depending on the config struct API.
 - **Why it exists:** nothing on the natural-exit path takes a role pane out of the daemon's routing maps (a close does, as does a failed orchestration spawn's rollback), so a role whose worker crashed or quit still resolved and `delegate` exited 0 with nothing printed while the pointer write failed later inside the detached dispatch. Confirmed red on `main` at `c7ef92f9` (`exit=Some(0)` for the second `steady` delegate), and red again with only the daemon's exited-occupant check disabled. The `fresh` arm is the issue's own guard against the cheap fix: with the check applied to every exited pane regardless of `clear`, it fails at that arm with exit 1 (verified).
 - **Does not assert:** a worker whose registry entry is gone entirely rather than exited (a closed pane is unregistered, and a `clear = true` re-create is `orchestration/delegate/022`); `pane restart`, which the CLI names as the remedy; the busy refusal (#580), which this test deliberately keeps out of the way.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell roles).
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1539"]` (CLAUDE.md rule 6). Its control step, the first delegate to a live `clear = false` worker of this fixture, intermittently misses its 30 s wait for the pointer. It was met as FLAKY on CI's `e2e-deterministic` (#1535) and reproduced on the pre-#525 tree under contention; #1539 has the evidence, the command that runs it (`--run-ignored only`), and what lifts the quarantine.
 
 #### orchestration/work-done
 
@@ -3675,6 +3676,7 @@ without depending on the config struct API.
 - **Why it exists:** the L2 counterpart of `orchestration/work-done/014`, through the real daemon's `StartAgent`, hook socket and token gate (Qodo, #1525). Verified red with only the crediting-time retire disabled: the orchestrator was told `Worker quitter has completed their task. Read .dot-agent-deck/work-done-quitter.md …`.
 - **Does not assert:** the rendered TUI grid (the daemon's own PTY snapshot of the orchestrator pane is what it reads); a successor that is itself delegated to before it reports, which the ledger's unit tests own (`commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own`).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell roles).
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1539"]` (CLAUDE.md rule 6). Its control step, the first delegate to a live `clear = false` worker of this fixture, intermittently misses its 30 s wait for the pointer. It was met as FLAKY on CI's `e2e-deterministic` (#1535) and reproduced on the pre-#525 tree under contention; #1539 has the evidence, the command that runs it (`--run-ignored only`), and what lifts the quarantine.
 
 #### orchestration/provenance
 

@@ -139,6 +139,10 @@ fn let_worker_exit(deck: &TuiDeck, role: &str) {
 /// Scenario: Launch the real TUI and its lazy daemon on the `delegate-exited-worker` fixture and open its orchestration. Delegate to the `clear = false` worker `steady` and see the task pointer land, then let that worker report `work-done` and EXIT ON ITS OWN, and delegate to `steady` again: the real `delegate` CLI must exit non-zero naming `steady` as a role that reached no worker. Then let the `clear = true` worker `fresh` exit the same way and delegate to it: the CLI must exit 0 and a fresh `fresh` worker must come back holding the task pointer.
 #[spec("orchestration/delegate/049")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): the control step's first pointer intermittently
+// misses its 30 s wait, on CI and on the pre-#525 tree alike. #1539 has the
+// evidence, how to run it, and what lifts it.
+#[ignore = "quarantined: vfarcic, #1539"]
 fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered() {
     let deck = TuiDeck::builder()
         // The delegate is run from the test process as the orchestrator's pane,
@@ -221,6 +225,10 @@ const UNSOLICITED_NEEDLE: &str = "the deck has no outstanding delegation to that
 /// Scenario: Launch the real TUI on the `delegate-exited-worker` fixture, delegate to the `clear = false` worker `quitter`, and once the task pointer lands let that worker EXIT ON ITS OWN without reporting. Start a different agent in the same pane through the daemon's real `StartAgent` (what a TUI sends when it opens a pane) and have it run the real `work-done` from inside that pane. The orchestrator's pane must show that report labelled as one the deck has no delegation on record for, never "Worker quitter has completed their task", and no `work-done-quitter.md` may be written.
 #[spec("orchestration/work-done/015")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): the control step's first pointer intermittently
+// misses its 30 s wait, on CI and on the pre-#525 tree alike. #1539 has the
+// evidence, how to run it, and what lifts it.
+#[ignore = "quarantined: vfarcic, #1539"]
 fn work_done_015_a_successor_in_an_exited_worker_s_pane_is_not_credited_with_its_task() {
     use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 
