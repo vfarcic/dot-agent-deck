@@ -1615,7 +1615,9 @@ async fn deliver(
     // [`ERASED_FIRST_WRITE_ATTEMPTS`] in all — rather than dropped. Only that
     // case: an ambiguous write whose bytes may still be in the box stays a
     // refusal (below), and a retry runs every gate the first write did, the
-    // pre-write drain and the user's draft included.
+    // pre-write drain and the user's draft included. A retry that then ends
+    // any other way without writing is reported on the card too (below): the
+    // box is clean either way, so the prompt is simply not delivered.
     let mut attempt = 0;
     let first = loop {
         attempt += 1;
@@ -1669,10 +1671,25 @@ async fn deliver(
             }
             Err(reason) => {
                 log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
+                if attempt > 1 {
+                    report_erased_first_write_lost(
+                        registry,
+                        pane_id,
+                        agent_id,
+                        &delivery_id,
+                        generation.as_ref(),
+                    );
+                }
                 return;
             }
         }
     };
+    // Issue #1455: an earlier attempt of this delivery was cut off and erased,
+    // so a refusal or failure of this one leaves nothing of the prompt in the
+    // pane — except a stranded ambiguous write, which `write_guarded` has
+    // already reported on the card as a partial prompt that may be sitting
+    // there.
+    let retried_after_erase = attempt > 1;
     match first {
         GuardedOutcome::Written => {}
         // Issue #424 H3/H5: the FIRST write of this delivery was refused because
@@ -1714,14 +1731,32 @@ async fn deliver(
                 reason,
                 "scheduled prompt delivery refused"
             );
+            if retried_after_erase && reason != AMBIGUOUS_PARTIAL_WRITE {
+                report_erased_first_write_lost(
+                    registry,
+                    pane_id,
+                    agent_id,
+                    &delivery_id,
+                    generation.as_ref(),
+                );
+            }
             return;
         }
         GuardedOutcome::Failed(e) => {
             tracing::warn!(pane_id, error = %e, "scheduled prompt delivery failed");
+            if retried_after_erase {
+                report_erased_first_write_lost(
+                    registry,
+                    pane_id,
+                    agent_id,
+                    &delivery_id,
+                    generation.as_ref(),
+                );
+            }
             return;
         }
     }
-    log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, 1);
+    log_prompt_written(DELIVERY_LOG_PATH, pane_id, &delivery_id, attempt);
     // Issue #424: read from `observed_producer`, not from readiness. A launcher
     // that declares its boot provenance is skipped by the readiness gate but has
     // still named the producer, and that is the only question this answers —
@@ -1995,6 +2030,9 @@ enum FirstSubmit {
     Erased,
 }
 
+/// The refusal reason for a [`GuardedSend::Ambiguous`] write.
+const AMBIGUOUS_PARTIAL_WRITE: &str = "ambiguous partial write";
+
 fn classify_guarded_detail(detail: GuardedSendDetail) -> GuardedOutcome {
     match detail {
         GuardedSendDetail::RefusedUserInput => GuardedOutcome::RefusedUserInput,
@@ -2003,7 +2041,7 @@ fn classify_guarded_detail(detail: GuardedSendDetail) -> GuardedOutcome {
             GuardedSend::WrongSession => GuardedOutcome::Refused("agent-replaced"),
             GuardedSend::Stale => GuardedOutcome::Refused("target went stale"),
             GuardedSend::NoLiveTarget => GuardedOutcome::Refused("no live target"),
-            GuardedSend::Ambiguous => GuardedOutcome::Refused("ambiguous partial write"),
+            GuardedSend::Ambiguous => GuardedOutcome::Refused(AMBIGUOUS_PARTIAL_WRITE),
         },
     }
 }
@@ -2624,10 +2662,12 @@ fn report_user_input_stop(
     });
 }
 
-/// Issue #1455: report a prompt given up on after every one of its
-/// [`ERASED_FIRST_WRITE_ATTEMPTS`] writes stopped part-way and was erased
-/// again. Nothing of it is left in the input box, so the card says it was not
-/// delivered rather than that it may be sitting there.
+/// Issue #1455: report a prompt given up on after a write of it stopped
+/// part-way and was erased again, and no later attempt got it in — because
+/// every one of [`ERASED_FIRST_WRITE_ATTEMPTS`] was cut off the same way, or
+/// because the retry was refused or failed with nothing written. Nothing of it
+/// is left in the input box, so the card says it was not delivered rather than
+/// that it may be sitting there.
 fn report_erased_first_write_lost(
     registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
@@ -2639,16 +2679,16 @@ fn report_erased_first_write_lost(
         DELIVERY_LOG_PATH,
         pane_id,
         delivery_id,
-        "every write stopped part-way and was erased",
+        "a write stopped part-way and was erased, and no retry got the prompt in",
     );
     registry.publish_delivery_notice(DeliveryNotice {
         pane_id: pane_id.to_string(),
         agent_id: agent_id.to_string(),
         delivery_id: delivery_id.to_string(),
         session_id: generation.map(|(id, _)| id.clone()),
-        detail: "a spawn-time prompt could not be written into this pane: each attempt was cut \
-                 off and erased again, so nothing of it is left in the input box and it was not \
-                 delivered",
+        detail: "a spawn-time prompt could not be written into this pane: a write of it was cut \
+                 off and erased again, and writing it again did not get it in either, so nothing \
+                 of it is left in the input box and it was not delivered",
     });
 }
 
@@ -3743,6 +3783,50 @@ mod tests {
             AgentType::ClaudeCode,
             false,
         )
+    }
+
+    /// Issue #1455: a PTY writer that accepts every byte except a lone submit
+    /// CR, which it refuses every time — so every guarded submit stops
+    /// part-way with its payload in, and issue #876's drain can erase all of
+    /// it again. `after_erase` runs as each erase burst lands, and returns
+    /// whether the writer then fails every later write outright.
+    struct SubmitRefusingWriter {
+        log: Arc<Mutex<Vec<u8>>>,
+        after_erase: Box<dyn FnMut() -> bool + Send>,
+        dead: bool,
+    }
+
+    impl SubmitRefusingWriter {
+        fn new(after_erase: impl FnMut() -> bool + Send + 'static) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    log: log.clone(),
+                    after_erase: Box::new(after_erase),
+                    dead: false,
+                },
+                log,
+            )
+        }
+    }
+
+    impl std::io::Write for SubmitRefusingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.dead || buf == b"\r" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "submit refused",
+                ));
+            }
+            self.log.lock().unwrap().extend_from_slice(buf);
+            if !buf.is_empty() && buf.iter().all(|b| *b == 0x7f) {
+                self.dead = (self.after_erase)();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     fn typed_prompt_watch_event(
@@ -6193,7 +6277,7 @@ mod tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: Deliver a scheduled prompt into three panes whose first write goes differently: one stops part-way and its bytes are erased again, so the prompt is written again and submitted; one stops part-way and its bytes stay in the input box; and one goes through. After the user types into each, a later delivery of the same prompt goes through into the first and third, and is refused with a notice on the card in the second, where it would otherwise submit the leftover bytes with the user's draft. A fourth pane, whose every write is cut off and erased, gets a bounded number of attempts and a card notice that the prompt was not delivered.
+    /// Scenario: Deliver a scheduled prompt into three panes whose first write goes differently: one stops part-way and its bytes are erased again, so the prompt is written again and submitted; one stops part-way and its bytes stay in the input box; and one goes through. After the user types into each, a later delivery of the same prompt goes through into the first and third, and is refused with a notice on the card in the second, where it would otherwise submit the leftover bytes with the user's draft. A fourth pane, whose every write is cut off and erased, gets a bounded number of attempts and a card notice that the prompt was not delivered; a fifth, whose writer dies after the first erase, gets the same notice when its retry fails.
     #[spec("scheduler/dispatch/026")]
     #[cfg(unix)]
     #[tokio::test]
@@ -6204,32 +6288,8 @@ mod tests {
         const STRANDED_PANE: &str = "issue-547-stranded-pane";
         const APPLIED_PANE: &str = "issue-547-applied-pane";
         const REFUSING_PANE: &str = "issue-1455-refusing-pane";
+        const DYING_PANE: &str = "issue-1455-dying-pane";
 
-        /// Accepts every byte except a lone submit CR, which it refuses every
-        /// time — so every guarded write stops part-way with its payload in,
-        /// and the drain can erase it all again.
-        struct SubmitRefusingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl SubmitRefusingWriter {
-            fn new() -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
-                let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-                (Self(log.clone()), log)
-            }
-        }
-        impl std::io::Write for SubmitRefusingWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if buf == b"\r" {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "submit refused",
-                    ));
-                }
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         // Plain printable ASCII, so issue #876's drain can prove an exact undo —
         // and the same fixed text on both deliveries, which is the ordinary case
         // the issue names (a scheduled card fires the same prompt every time).
@@ -6339,7 +6399,7 @@ mod tests {
         // stops part-way and is erased again: the retry cannot succeed, and
         // the prompt that is lost must be reported on the card.
         let refusing_agent = spawn_byte_target(&registry, REFUSING_PANE);
-        let (refusing_writer, refusing_log) = SubmitRefusingWriter::new();
+        let (refusing_writer, refusing_log) = SubmitRefusingWriter::new(|| false);
         let _displaced_refusing = registry
             .replace_agent_writer_for_test(&refusing_agent, Box::new(refusing_writer))
             .await;
@@ -6372,6 +6432,42 @@ mod tests {
             vec![REFUSING_PANE.to_string()],
             "a scheduled prompt given up on after its erased retries must be reported on that \
              pane's card, and on no other (issue #1455)"
+        );
+
+        // A fifth pane whose writer dies outright once its first erase burst
+        // lands: the retry is a clean failure with nothing written. The box is
+        // clean, so that prompt is lost too and must be reported the same way.
+        let dying_agent = spawn_byte_target(&registry, DYING_PANE);
+        let (dying_writer, dying_log) = SubmitRefusingWriter::new(|| true);
+        let _displaced_dying = registry
+            .replace_agent_writer_for_test(&dying_agent, Box::new(dying_writer))
+            .await;
+        run_delivery(
+            &registry,
+            DYING_PANE.to_string(),
+            dying_agent.clone(),
+            None,
+            PROMPT.to_string(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            *dying_log.lock().unwrap(),
+            erased_attempt,
+            "the dying pane took one payload and its erases, and the retry wrote nothing"
+        );
+        let lost: Vec<String> = notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.detail.contains("was not delivered"))
+            .map(|n| n.pane_id.clone())
+            .collect();
+        assert_eq!(
+            lost,
+            vec![REFUSING_PANE.to_string(), DYING_PANE.to_string()],
+            "a retry after an erased write that fails with nothing written must be reported on \
+             that pane's card too, not dropped with only a log line (issue #1455)"
         );
         let partial_write_notices = |notices: &[DeliveryNotice]| -> Vec<String> {
             notices
@@ -6447,6 +6543,96 @@ mod tests {
             "control: an `Applied` first write is released at once, so the same user typing does \
              not refuse a later delivery here — the refusal above is a property of the stranded \
              outcome, not of the harness"
+        );
+    }
+
+    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing and the card says the prompt was not delivered; in the other, an event from the same conversation arrives instead, and the retry goes ahead.
+    #[spec("scheduler/dispatch/027")]
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_027_erased_first_write_retry_runs_the_pre_write_drain_again() {
+        const CHANGED_PANE: &str = "issue-1455-generation-changed-pane";
+        const SAME_PANE: &str = "issue-1455-same-generation-pane";
+        const PROMPT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notices = Arc::new(Mutex::new(Vec::<DeliveryNotice>::new()));
+        let recorded = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            recorded.lock().unwrap().push(notice);
+        }));
+        let encoded = crate::pane_input::encode_pane_payload(PROMPT).expect("encode");
+        let mut erased_attempt = encoded.clone();
+        erased_attempt.extend(std::iter::repeat_n(0x7f, encoded.len()));
+
+        let mut logs = Vec::new();
+        for (pane, next_session) in [
+            (CHANGED_PANE, "a-new-conversation"),
+            (SAME_PANE, "the-ready-conversation"),
+        ] {
+            let agent = spawn_typed_byte_target(&registry, pane, Some(AgentType::ClaudeCode));
+            let (event_tx, event_rx) = broadcast::channel(16);
+            let start = |session: &str| {
+                BroadcastMsg::Event(typed_prompt_watch_event(
+                    pane,
+                    &agent,
+                    session,
+                    EventType::SessionStart,
+                    AgentType::ClaudeCode,
+                    false,
+                ))
+            };
+            event_tx
+                .send(start("the-ready-conversation"))
+                .expect("announce the ready conversation");
+            // Lands while the first attempt's bytes are being erased — after
+            // that attempt's own pre-write drain and before the retry's.
+            let between_attempts = start(next_session);
+            let tx = event_tx.clone();
+            let (writer, log) = SubmitRefusingWriter::new(move || {
+                let _ = tx.send(between_attempts.clone());
+                false
+            });
+            let _displaced = registry
+                .replace_agent_writer_for_test(&agent, Box::new(writer))
+                .await;
+            run_delivery(
+                &registry,
+                pane.to_string(),
+                agent.clone(),
+                Some(event_rx),
+                PROMPT.to_string(),
+                false,
+            )
+            .await;
+            logs.push(log.lock().unwrap().clone());
+        }
+        registry.shutdown_all();
+
+        assert_eq!(
+            logs[0], erased_attempt,
+            "the conversation changed between the erased attempt and the retry, so the retry's \
+             pre-write drain must stop it before a byte is written: writing it would hand this \
+             prompt to a conversation it was not addressed to"
+        );
+        assert_eq!(
+            logs[1],
+            erased_attempt.repeat(ERASED_FIRST_WRITE_ATTEMPTS as usize),
+            "control: an event from the SAME conversation between the attempts does not stop the \
+             retry, so the stop above comes from the generation change, not from the event bus"
+        );
+        let lost: Vec<String> = notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.detail.contains("was not delivered"))
+            .map(|n| n.pane_id.clone())
+            .collect();
+        assert_eq!(
+            lost,
+            vec![CHANGED_PANE.to_string(), SAME_PANE.to_string()],
+            "both prompts are lost with nothing of them left in the box, so both cards say so — \
+             the stopped retry as much as the exhausted one (issue #1455)"
         );
     }
 
