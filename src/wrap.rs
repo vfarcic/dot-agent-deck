@@ -288,17 +288,25 @@ impl Emitter {
         }
     }
 
-    /// Send one frame derived from the child's output: through
-    /// [`Self::classified_sender`] when there is one, inline otherwise.
-    fn send_classified(&self, event: &AgentEvent) {
-        let Ok(json) = serde_json::to_string(event) else {
-            return;
-        };
-        match &self.classified_sender {
-            Some(sender) => sender.post(json),
-            None => {
+    /// Send one frame derived from the child's output, decided while `det` was
+    /// held. Through [`Self::classified_sender`] when there is one, POSTED BEFORE
+    /// `det` is released (Qodo on PR #1523): the sender keeps only the newest
+    /// frame, so posting after the release would let an older decision replace
+    /// a newer one that slipped in between. Posting is a slot write, so holding
+    /// the detector for it costs nothing. Inline otherwise — a socket write,
+    /// which must not happen under the detector lock.
+    fn send_classified(&self, event: &AgentEvent, det: std::sync::MutexGuard<'_, Detector>) {
+        let json = serde_json::to_string(event).ok();
+        match (&self.classified_sender, json) {
+            (Some(sender), Some(json)) => {
+                sender.post(json);
+                drop(det);
+            }
+            (None, Some(json)) => {
+                drop(det);
                 let _ = crate::hook::send_to_socket(&json);
             }
+            (_, None) => drop(det),
         }
     }
 
@@ -2118,8 +2126,7 @@ fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emit
     // timestamps of the tee's frames and `QuietOutputIdle`'s follow the order
     // the two decided in — which is what the deck orders them by.
     let event = emitter.build_event(ev.event_type(), output_classified_metadata());
-    drop(det);
-    emitter.send_classified(&event);
+    emitter.send_classified(&event, det);
 }
 
 /// Issue #1493: how long [`LatestSend`] waits on one send — the bound
@@ -2164,6 +2171,16 @@ impl LatestSend {
             }
         });
         sender
+    }
+
+    /// A sender with no worker thread, so a test can read what is waiting.
+    #[cfg(test)]
+    fn unspawned() -> Arc<Self> {
+        Arc::new(Self {
+            slot: Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            closed: AtomicBool::new(false),
+        })
     }
 
     /// Replace whatever is waiting with `json` — unless [`Self::close`] ran.
@@ -2274,11 +2291,12 @@ impl QuietOutputIdle {
         let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
         let changed = det.observe_detected(Some(DetectedEvent::Idle));
         self.quiet_reported_at_output_ms = Some(watch.last_output_ms.load(Ordering::SeqCst));
-        let event = changed
-            .map(|idle| emitter.build_event(idle.event_type(), output_classified_metadata()));
-        drop(det);
-        if let Some(event) = event {
-            emitter.send_classified(&event);
+        match changed {
+            Some(idle) => {
+                let event = emitter.build_event(idle.event_type(), output_classified_metadata());
+                emitter.send_classified(&event, det);
+            }
+            None => drop(det),
         }
     }
 
@@ -2297,11 +2315,10 @@ impl QuietOutputIdle {
         det.observe_detected(Some(next));
         // Stamped under the detector, as in `classify_and_emit`.
         let event = emitter.build_event(next.event_type(), output_classified_metadata());
-        drop(det);
         if next == DetectedEvent::Idle {
             self.quiet_reported_at_output_ms = Some(last_output_ms);
         }
-        emitter.send_classified(&event);
+        emitter.send_classified(&event, det);
     }
 }
 
@@ -3144,6 +3161,57 @@ mod tests {
         assert_eq!(DetectedEvent::Working.event_type(), EventType::Thinking);
         assert_eq!(DetectedEvent::Error.event_type(), EventType::Error);
         assert_eq!(DetectedEvent::Idle.event_type(), EventType::Idle);
+    }
+
+    /// Issue #1493 (Qodo on PR #1523): the latest-wins sender ends up holding
+    /// the LAST decision, whichever path made it — the tee classifying a line
+    /// or the settled-output Idle — because both post while still holding the
+    /// detector. Posting after the release let an older Idle replace a newer
+    /// Thinking that slipped in between, leaving a drawing pane Idle.
+    #[cfg(unix)]
+    #[test]
+    fn the_classified_sender_holds_the_last_decision() {
+        let waiting = |sender: &LatestSend| -> EventType {
+            let json = sender
+                .slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .expect("a frame is waiting");
+            serde_json::from_str::<AgentEvent>(&json)
+                .expect("a frame")
+                .event_type
+        };
+        for settled_last in [true, false] {
+            let sender = LatestSend::unspawned();
+            let emitter = Emitter {
+                agent_type: AgentType::Codex,
+                session_id: "wrap-test".to_string(),
+                pane_id: None,
+                agent_id: None,
+                cwd: None,
+                live_target: LiveTarget {
+                    kind: TargetKind::Process,
+                    writable: Writable::HistoryOnly,
+                },
+                prompt_reports_unavailable: true,
+                classified_sender: Some(Arc::clone(&sender)),
+            };
+            let detector = Arc::new(Mutex::new(Detector::with_rules(&CODEX)));
+            let watch = InterfaceWatch::new(None);
+            watch.note_output();
+            let mut quiet = QuietOutputIdle::new();
+            classify_and_emit("> Ask Codex to do anything", &detector, &emitter);
+            assert_eq!(waiting(&sender), EventType::Thinking);
+            if settled_last {
+                quiet.note_settled(&detector, &watch, &emitter);
+                assert_eq!(waiting(&sender), EventType::Idle);
+            } else {
+                quiet.note_settled(&detector, &watch, &emitter);
+                classify_and_emit("  gpt-test low  ~/work", &detector, &emitter);
+                assert_eq!(waiting(&sender), EventType::Thinking);
+            }
+        }
     }
 
     /// Issue #1493 (Qodo on PR #1523): once closed for the child's exit, the
