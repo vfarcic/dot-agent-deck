@@ -279,7 +279,7 @@ impl OldPeer {
                     .as_mut()
                     .unwrap()
                     .retain(|cap| cap != CAP_RESTART_DAEMON);
-                hello.daemon_version = Some("0.1.0".into());
+                hello.daemon_version = Some(OLD_VERSION.into());
                 let payload = serde_json::to_vec(&hello).unwrap();
                 header[0] = dot_agent_deck::daemon_protocol::KIND_RESP;
                 header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -322,7 +322,7 @@ fn remote_upgrade_004_old_capability_is_kept_without_restart_frame() {
     let cli_requests = old.requests.lock().unwrap().clone();
     assert_eq!(
         remote.hello().unwrap().daemon_version.as_deref(),
-        Some("0.1.0")
+        Some(OLD_VERSION)
     );
     assert!(!remote.successor.exists());
     let requests = old.requests.lock().unwrap().clone();

@@ -18,7 +18,10 @@ use tempfile::TempDir;
 
 pub(crate) const WAIT: Duration = Duration::from_secs(30);
 pub(crate) const DECK: &str = "upgrade-fixture";
-pub(crate) const OLD_BUILD: &str = "0.1.0-gupgradeold";
+/// The version the fixture's pre-upgrade install reports. Below every real
+/// build, including the `0.1.0` placeholder a tagless checkout reports.
+pub(crate) const OLD_VERSION: &str = "0.0.1";
+pub(crate) const OLD_BUILD: &str = "0.0.1-gupgradeold";
 pub(crate) const NEW_BUILD: &str = "0.2.0-gupgradenew";
 pub(crate) const LABELS: [&str; 3] = ["ordinary-live", "lead", "coder"];
 
@@ -79,7 +82,11 @@ impl Remote {
             .nth(1)
             .unwrap()
             .to_owned();
-        assert!(semver::Version::parse(&version).unwrap() > semver::Version::new(0, 1, 0));
+        assert!(
+            semver::Version::parse(&version).unwrap()
+                > semver::Version::parse(OLD_VERSION).unwrap(),
+            "the build under test ({version}) must be newer than the fixture's old install"
+        );
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let remote_env = vec![
             ("HOME".to_owned(), home.display().to_string()),
@@ -152,7 +159,7 @@ impl Remote {
         let wrapper = |old: bool| {
             format!(
                 "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'dot-agent-deck {}'; exit 0; fi\nif [ \"$1\" = hooks ]; then printf installed > {}; exit 0; fi\nif [ \"$1\" = daemon ] && [ \"$2\" = serve ]; then printf '%s\\n' \"$$\" > {}; fi\nexport DOT_AGENT_DECK_BUILD_ID_OVERRIDE={}\nexec {} \"$@\"\n",
-                if old { "0.1.0" } else { &version },
+                if old { OLD_VERSION } else { &version },
                 quoted(&root.join("hooks-installed")),
                 quoted(&successor),
                 if old { OLD_BUILD } else { NEW_BUILD },
@@ -163,7 +170,7 @@ impl Remote {
         let old_wrapper = wrapper(true);
         let registry = root.join("remotes.toml");
         fs::write(&registry, format!(
-            "[[remotes]]\nname = \"{DECK}\"\ntype = \"ssh\"\nhost = \"fixture.invalid\"\nport = 22\nversion = \"0.1.0\"\nadded_at = \"2026-10-03T00:00:00Z\"\n"
+            "[[remotes]]\nname = \"{DECK}\"\ntype = \"ssh\"\nhost = \"fixture.invalid\"\nport = 22\nversion = \"{OLD_VERSION}\"\nadded_at = \"2026-10-03T00:00:00Z\"\n"
         )).unwrap();
         let remote = Self {
             child,
