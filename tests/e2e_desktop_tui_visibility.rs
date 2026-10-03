@@ -33,6 +33,7 @@ use spec::spec;
 const PLAIN_LABEL: &str = "desktop-visible-agent";
 const SECOND_PLAIN_LABEL: &str = "second-desktop-agent";
 const THIRD_PLAIN_LABEL: &str = "third-desktop-agent";
+const TUI_AFTER_DESKTOP_LABEL: &str = "tui-made-agent";
 const TWO_CLIENT_LABEL: &str = "two-client-desktop-agent";
 const LAZY_SPAWN_LABEL: &str = "lazy-spawn-desktop-agent";
 const REFETCH_LABEL: &str = "refetch-desktop-agent";
@@ -352,8 +353,17 @@ fn launch_tui_against(daemon: &DaemonProc) -> TuiDeck {
 }
 
 fn launch_tui_against_sockets(attach_socket: &Path, hook_socket: &Path) -> TuiDeck {
+    launch_tui_against_sockets_sized(attach_socket, hook_socket, 120, 40)
+}
+
+fn launch_tui_against_sockets_sized(
+    attach_socket: &Path,
+    hook_socket: &Path,
+    cols: u16,
+    rows: u16,
+) -> TuiDeck {
     TuiDeck::builder()
-        .with_pty_size(120, 40)
+        .with_pty_size(cols, rows)
         .with_env(
             "DOT_AGENT_DECK_ATTACH_SOCKET",
             attach_socket.to_string_lossy().to_string(),
@@ -378,6 +388,26 @@ fn start_plain_from_tui(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // Name -> Command
     deck.send_keys(PLAIN_COMMAND.as_bytes());
     deck.send_keys(b"\r"); // submit
+}
+
+/// Issue #1507: the number on the card whose title carries `label`, read from
+/// the drawn grid (`┌ 3 third-desktop-agent …`, or `┏ ▸ 3 …` when selected).
+/// Matches the label's first ten characters so a title the narrowed sidebar
+/// cuts with `…` still matches.
+fn card_number(grid: &str, label: &str) -> Option<u32> {
+    let key = &label[..label.len().min(10)];
+    grid.lines().find_map(|line| {
+        let at = line.find(key)?;
+        let corner = line[..at].rfind(['┌', '┏'])?;
+        let title = &line[corner..at];
+        let digits: String = title
+            .chars()
+            .skip(1)
+            .skip_while(|c| *c == ' ' || *c == '▸')
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 /// Use the real TUI new-agent form to launch the fixture's orchestration. This
@@ -785,7 +815,9 @@ fn visibility_001_desktop_started_plain_agent_appears_without_selection() {
 /// agent; it must render as a dashboard card before selection, and a click must
 /// select that card without changing views. In a second untouched attachment,
 /// start two cards and then a third, requiring the dashboard to retain all
-/// three bordered cards, its three-session header, and its command-mode footer.
+/// three bordered cards, its three-session header, and its command-mode footer;
+/// then create a fourth agent in the TUI, and the cards must be numbered 1-4
+/// in the order the agents were created.
 #[spec("newagent/visibility/001")]
 #[test]
 fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard() {
@@ -835,8 +867,11 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
     drop(daemon);
 
     // The third start reaches a TUI that has never selected or focused a card.
+    // Wide enough that the dashboard sidebar still reads every card number once
+    // the TUI-created pane at the end of this section opens beside it.
     let daemon = common::spawn_daemon_serve(None, "0");
-    let deck = launch_tui_against(&daemon);
+    let deck =
+        launch_tui_against_sockets_sized(&daemon.attach_socket, &daemon.hook_socket, 200, 50);
     deck.wait_for_string("No active agents. Press Ctrl+n to create an agent.");
     start_plain_from_desktop(
         &daemon,
@@ -871,6 +906,38 @@ fn visibility_001_desktop_started_plain_agent_surfaces_into_attached_dashboard()
         third_records.len(),
         3,
         "all three starts must be registered"
+    );
+
+    // Issue #1507: then an agent created in the TUI itself. It is the newest,
+    // so it is card 4, and the three desktop cards keep 1-3 in the order they
+    // were started. The desktop cards are hookless stand-ins, so they carry no
+    // agent id of their own; only the daemon's id on their card-surfacing start
+    // places them. Without it they sorted after this TUI card, which has its id
+    // from the start, and before #1507 their order was `HashMap` order.
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // confirm the fixture cwd
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\r"); // Mode -> Name
+    deck.send_keys(TUI_AFTER_DESKTOP_LABEL.as_bytes());
+    deck.send_keys(b"\r"); // Name -> Command
+    deck.send_keys(PLAIN_COMMAND.as_bytes());
+    deck.send_keys(b"\r"); // submit
+    daemon.wait_for_agent_count(4, Duration::from_secs(10));
+    let in_creation_order = [
+        PLAIN_LABEL,
+        SECOND_PLAIN_LABEL,
+        THIRD_PLAIN_LABEL,
+        TUI_AFTER_DESKTOP_LABEL,
+    ];
+    deck.wait_until_grid(
+        "the four cards are numbered in the order their agents were created",
+        |grid| {
+            in_creation_order
+                .iter()
+                .enumerate()
+                .all(|(index, label)| card_number(grid, label) == Some(index as u32 + 1))
+        },
     );
 }
 
