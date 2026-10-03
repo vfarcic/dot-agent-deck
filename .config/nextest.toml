@@ -274,6 +274,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# `mode/live/003` runs two sequential real interactive Haiku turns on a
+# full-screen claude, one in each of two decks attached to the same daemon. Its
+# waits sum to about 490s at worst: the first deck's start-up (90s), a turn
+# (30s composer + 20s typing + 90s turn), the control and the detach (~45s);
+# then the second deck's attach and focus (~40s) and a second turn (140s).
+# Typical runs take about 20s; 10 x 60s leaves the worst case room to report.
+[[profile.default.overrides]]
+filter = 'test(mode_live_003_reattached_fullscreen_claude_does_not_claim_nothing_to_scroll)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # PRD #220: `orchestration/dispatch/002` dispatches an orchestration whose THREE
 # roles are all real interactive Haiku agents, then waits for every one of them to
 # reach live-agent state in the freshly created worktree. Three concurrent claude

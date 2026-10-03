@@ -5787,6 +5787,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that a wheel over the deck's card list scrolls the card grid (it is dropped, by decision — `UiState::scroll_offset` is written only in the render pass, so there is no card-grid scroll model to route to); real terminal mouse-report decoding; which pane the deck considers focused; or real-agent behavior.
 - **Platform coverage:** mac+linux+windows.
 
+##### mode/scroll/008 — A full-screen pane re-attached through the daemon's replay does not claim there is nothing to scroll.
+- **Layer:** L2 PTY (two real `dot-agent-deck` TUIs in the isolated `TuiDeck` harness, one after the other, against one external `daemon serve`; asserted on the rendered vt100 grid).
+- **Agent:** none (a bash stand-in for a full-screen agent, modelled on what claude with `"tui": "fullscreen"` was measured to emit: `ESC[?1049h` and SGR any-motion mouse tracking once at start-up, whole-screen repaints in place by cursor address, and on SIGWINCH the mouse modes again plus a clear and repaint but no `ESC[?1049h`). The real-agent counterpart is `mode/live/003`.
+- **Asserts:** the first deck, which saw the agent start, is resized (resizing the agent and clearing the daemon's replay ring) and, with the pane focused in command mode after twenty more whole-screen frames, PageUp shows no `Nothing to scroll` — the control; after a detach-quit the agent survives, a second deck at a third size attaches, Enter focuses the pane and Ctrl+D returns to command mode, and after twenty more frames PageUp still shows no `Nothing to scroll`. Pre-fix the second deck showed the notice (issue #1537); reverting either the alternate-screen half of the daemon's replay preamble or the ring-start reset on a clear turns it red again.
+- **Does not assert:** the 1 MiB eviction route or the mouse-mode half of the preamble (both covered by the `AgentBus` replay unit tests in `src/agent_pty.rs`); that the wheel reaches the agent in typing mode; the notice's render tiers or TTL (covered by `mode/scroll/005`); or real-agent behavior.
+- **Platform coverage:** mac+linux.
+
 #### mode/live
 
 ##### mode/live/001 — A real PTY-attached deck keeps the persistent mode chip after the command banner collapses.
@@ -5801,6 +5808,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--ax-screen-reader`, `--allowedTools Bash Read`, no `-p`), with isolated imported credentials plus onboarding/project trust seeded in the per-test HOME; the supported accessibility renderer keeps genuine interactive output in terminal scrollback instead of repainting it out of the vt100 history.
 - **Asserts:** the live prompt accepts typed keystrokes and exposes both cursor channels with ` TYPING `; the submitted prefix-glob directive makes Haiku inspect and visibly list a uniquely named fixture sentinel; Ctrl+D hides the hardware cursor and removes the painted block while retaining readable DIM output, the expanded banner, and ` COMMAND `; wheel-up reveals older real-agent filename output through deck scrollback rather than the child mouse path; Ctrl+D restores the cursor treatment and ` TYPING `.
 - **Does not assert:** exact model prose, tool-call wording, response timing, pixel-level DIM appearance, light-versus-dark terminal rendering, or command-mode indication on all three tab types (covered at L1 by the mode suites and manually validated across tabs).
+- **Platform coverage:** mac+linux.
+
+##### mode/live/003 — A re-attached real full-screen claude pane does not claim there is nothing to scroll.
+- **Layer:** L2 PTY (two real `dot-agent-deck` TUIs in the isolated `TuiDeck` harness, one after the other, against one external `daemon serve`; asserted on the rendered vt100 grid; flaky-tolerant lane-2 real-agent tier).
+- **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--settings '{"tui":"fullscreen"}'` with `CLAUDE_CODE_NO_FLICKER=1` forcing the full-screen renderer, `--allowedTools Bash Read`, no `-p`), running under the daemon's HOME with imported credentials and the work directory's trust seeded there.
+- **Asserts:** in the first deck, after a resize, a typed prefix-glob directive makes Haiku list a uniquely named fixture sentinel and write 120 numbered lines; once the turn has finished, PageUp in command mode on the focused pane shows no `Nothing to scroll` — the control; after a detach-quit claude survives, a second deck at another size attaches, Enter focuses the pane, a second turn lists a second sentinel and writes 400 lines, and PageUp in command mode still shows no `Nothing to scroll`. Pre-fix the second deck overlaid the notice on the pane (issue #1537).
+- **Does not assert:** exact model prose or tool-call wording, response timing, that the wheel or PageUp moves claude's own transcript in typing mode, or any scrolling of the deck's copy (a full-screen pane has none to move).
 - **Platform coverage:** mac+linux.
 
 ### Scheduled tasks (PRD #127)

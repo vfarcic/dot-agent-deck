@@ -97,6 +97,9 @@ pub mod submit_echo;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;
+// Issue #1537: the DEC private-mode parser shared by the TUI's mouse-mode scan
+// and the daemon's output ring, which restores those modes on replay.
+pub(crate) mod terminal_modes;
 pub mod terminal_widget;
 // Issue #322: test-only, and never part of the shipped library. Unit tests in
 // this crate do not link `tests/common/`, so before this they allocated scratch

@@ -17,6 +17,9 @@ use crate::pane::{
     AgentSpawnOptions, PaneController, PaneDirection, PaneError, PaneInfo, PendingSubmit,
     RenameOutcome,
 };
+use crate::terminal_modes::{
+    ModeDirective, MouseEncoding, MouseModes, MouseProtocol, PrivateModeScanner,
+};
 
 /// Result of [`EmbeddedPaneController::hydrate_from_daemon`]. One entry per
 /// daemon-side agent that was successfully reconnected on TUI bootstrap; the
@@ -3330,94 +3333,21 @@ async fn resize_worker(
     }
 }
 
-/// Which mouse-reporting protocol the child has selected, if any.
-///
-/// These four DEC private modes are **one mutually exclusive field**, not four
-/// independent switches — exactly as the repo's own `vt100` 0.16.2 models them
-/// (`Screen::set_mouse_mode` assigns `mouse_protocol_mode`, it does not or-in a
-/// bit). Setting 1003 after 1000 leaves the child reporting any-motion and
-/// nothing else, and a DECRST clears reporting only when it names the mode
-/// currently in force (`Screen::clear_mouse_mode`).
-///
-/// 1004 is deliberately absent, and is not a protocol at all: it is focus
-/// reporting, which codex sets on its own (PRD #611). Treating it as mouse would
-/// break the exact case this PRD exists for.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum MouseProtocol {
-    /// No reporting: nothing the child asked for will be sent to it.
-    #[default]
-    None,
-    /// `9` — X10 compatibility mode, press only.
-    Press,
-    /// `1000` — normal tracking (VT200): press and release.
-    PressRelease,
-    /// `1002` — button-event tracking: press, release and drag.
-    ButtonMotion,
-    /// `1003` — any-event tracking: every motion, button or not.
-    AnyMotion,
-}
-
-/// How the child expects a mouse report to be **encoded** — a separate field
-/// from [`MouseProtocol`], and one that enables no reporting on its own.
-///
-/// This is the second half of `vt100`'s model (`set_mouse_encoding` /
-/// `clear_mouse_encoding`), and the half a scanner that treats 1006 as "mouse is
-/// on" gets wrong: `ESC[?1006h` by itself asks for SGR-encoded reports of a
-/// protocol nobody has selected, which means no reports at all.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum MouseEncoding {
-    /// The original X10 encoding: `ESC[M` plus three offset-by-32 bytes.
-    #[default]
-    Default,
-    /// `1005` — UTF-8 extended coordinates.
-    Utf8,
-    /// `1006` — SGR extended: `ESC[<b;col;rowM`, the only encoding
-    /// [`EmbeddedPaneController::forward_mouse_scroll`] emits.
-    Sgr,
-}
-
-/// The protocol a DEC private mode number selects, if it selects one.
-fn mouse_protocol_for_mode(mode: u32) -> Option<MouseProtocol> {
-    match mode {
-        9 => Some(MouseProtocol::Press),
-        1000 => Some(MouseProtocol::PressRelease),
-        1002 => Some(MouseProtocol::ButtonMotion),
-        1003 => Some(MouseProtocol::AnyMotion),
-        _ => None,
-    }
-}
-
-/// The encoding a DEC private mode number selects, if it selects one.
-fn mouse_encoding_for_mode(mode: u32) -> Option<MouseEncoding> {
-    match mode {
-        1005 => Some(MouseEncoding::Utf8),
-        1006 => Some(MouseEncoding::Sgr),
-        _ => None,
-    }
-}
-
-/// Upper bound on the bytes [`MouseModeScanner`] carries between chunks. A
-/// real private-mode sequence is a handful of bytes — `ESC[?1000;1002;1003;1006h`,
-/// the longest shape any of these agents emits, is 24 — so 64 leaves room for
-/// roughly a dozen parameters while keeping the ceiling nowhere near a PTY read.
-/// It exists because the carry is driven by the child: without it, a stream that
-/// opens `ESC[?` and never terminates it would grow the buffer for as long as
-/// the agent kept talking.
-const MOUSE_SCAN_CARRY_MAX: usize = 64;
-
 /// Cross-chunk state for [`scan_mouse_mode`] (PRD #611 M3). Lives beside the
 /// stream's [`Osc8Filter`] and for the same reason: both hold the tail of a
 /// sequence a PTY read boundary cut in half, and neither means anything to a
 /// different stream.
+///
+/// The parser and the mouse model are shared with the daemon's output ring
+/// (issue #1537), which tracks the same modes to restore them on replay — see
+/// [`crate::terminal_modes`] for the semantics, which follow the repo's own
+/// `vt100` 0.16.2.
 #[derive(Debug, Default)]
 struct MouseModeScanner {
-    /// The trailing bytes of the previous chunk that could still be the prefix
-    /// of a private-mode sequence — never more than [`MOUSE_SCAN_CARRY_MAX`].
-    carry: Vec<u8>,
-    /// The one reporting protocol currently in force, if any.
-    protocol: MouseProtocol,
-    /// The encoding the child expects those reports in.
-    encoding: MouseEncoding,
+    /// Finds private-mode directives, carrying a split sequence across chunks.
+    scanner: PrivateModeScanner,
+    /// The reporting protocol and encoding currently in force.
+    modes: MouseModes,
 }
 
 /// Derive `mouse_mode_enabled` from a chunk of PTY output (PRD #611 M3).
@@ -3464,125 +3394,16 @@ struct MouseModeScanner {
 ///    mutually exclusive field and 1006 is an encoding selector that enables no
 ///    reporting at all — see [`MouseProtocol`] and [`MouseEncoding`].
 fn scan_mouse_mode(data: &[u8], flag: &AtomicBool, state: &mut MouseModeScanner) {
-    const ESC: u8 = 0x1b;
-
-    // Taken rather than borrowed so `state` stays free for the latch writes
-    // below; a new carry is stored at the end.
-    let carry = std::mem::take(&mut state.carry);
-    let joined: Vec<u8>;
-    let buf: &[u8] = if carry.is_empty() {
-        // The overwhelmingly common case, and the hot path: no copy at all.
-        data
-    } else {
-        let mut v = Vec::with_capacity(carry.len() + data.len());
-        v.extend_from_slice(&carry);
-        v.extend_from_slice(data);
-        joined = v;
-        &joined
-    };
-
+    let MouseModeScanner { scanner, modes } = state;
     let mut touched = false;
-    // Where a sequence that is still open when the buffer runs out began. Only
-    // that suffix is worth carrying — everything before it has been decided.
-    let mut partial_from: Option<usize> = None;
-    let mut i = 0usize;
-
-    while i < buf.len() {
-        if buf[i] != ESC {
-            i += 1;
-            continue;
+    scanner.scan(data, |directive| match directive {
+        ModeDirective::Mode { mode, set } => touched |= modes.apply(mode, set),
+        // `vt100` rebuilds the screen on `ESC c`, mouse modes included.
+        ModeDirective::FullReset => {
+            *modes = MouseModes::default();
+            touched = true;
         }
-        let seq_start = i;
-        // `ESC [ ?` — the private-mode introducer. Running out mid-introducer
-        // is a partial, not a miss; anything else here is some other escape
-        // sequence, so resume scanning after the ESC.
-        if i + 1 >= buf.len() {
-            partial_from = Some(seq_start);
-            break;
-        }
-        if buf[i + 1] != b'[' {
-            i += 1;
-            continue;
-        }
-        if i + 2 >= buf.len() {
-            partial_from = Some(seq_start);
-            break;
-        }
-        if buf[i + 2] != b'?' {
-            i += 1;
-            continue;
-        }
-
-        // Parameter list: `;`-separated decimal numbers, then a final byte.
-        let params_start = i + 3;
-        let mut j = params_start;
-        while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
-            j += 1;
-        }
-        if j >= buf.len() {
-            partial_from = Some(seq_start);
-            break;
-        }
-        if buf[j] == ESC {
-            // A fresh introducer aborted this one (malformed output). Resync ON
-            // it rather than consuming it, so a run of truncated sequences does
-            // not swallow every other one.
-            i = j;
-            continue;
-        }
-
-        let set = match buf[j] {
-            b'h' => Some(true),
-            b'l' => Some(false),
-            // Some other final byte: a private mode we do not care about, or a
-            // request/report (`ESC[?1000$p`). Skip past it.
-            _ => None,
-        };
-        if let Some(set) = set {
-            for param in buf[params_start..j].split(|&b| b == b';') {
-                // All-digit by construction; an empty or absurdly long
-                // parameter simply names no mode we track.
-                let mode = std::str::from_utf8(param)
-                    .ok()
-                    .and_then(|text| text.parse::<u32>().ok());
-                let Some(mode) = mode else { continue };
-                if let Some(protocol) = mouse_protocol_for_mode(mode) {
-                    // One field, overwritten by a SET. A RESET clears reporting
-                    // only when it names the protocol actually in force — an app
-                    // withdrawing 1000 after it moved on to 1002 has withdrawn
-                    // nothing (`vt100::Screen::clear_mouse_mode`).
-                    if set {
-                        state.protocol = protocol;
-                    } else if state.protocol == protocol {
-                        state.protocol = MouseProtocol::None;
-                    }
-                    touched = true;
-                } else if let Some(encoding) = mouse_encoding_for_mode(mode) {
-                    // Same shape, separate field: selecting an encoding turns no
-                    // reporting on, and withdrawing one that is not in force
-                    // turns none off.
-                    if set {
-                        state.encoding = encoding;
-                    } else if state.encoding == encoding {
-                        state.encoding = MouseEncoding::Default;
-                    }
-                    touched = true;
-                }
-            }
-        }
-        i = j + 1;
-    }
-
-    if let Some(from) = partial_from {
-        let tail = &buf[from..];
-        if tail.len() <= MOUSE_SCAN_CARRY_MAX {
-            state.carry = tail.to_vec();
-        }
-        // Over the cap the carry is simply dropped. No real private-mode
-        // sequence is anywhere near this long, so what is open is malformed or
-        // hostile, and refusing it costs at most one missed directive — never a
-        // mouse mode invented from bytes that were never seen whole.
-    }
+    });
 
     if touched {
         // The question this flag answers is not "did any mouse mode ever appear"
@@ -3590,7 +3411,7 @@ fn scan_mouse_mode(data: &[u8], flag: &AtomicBool, state: &mut MouseModeScanner)
         // this child?" — which needs a protocol in force AND SGR selected to
         // carry it. See the SGR paragraph on this function.
         flag.store(
-            state.protocol != MouseProtocol::None && state.encoding == MouseEncoding::Sgr,
+            modes.protocol != MouseProtocol::None && modes.encoding == MouseEncoding::Sgr,
             Ordering::Relaxed,
         );
     }
@@ -5154,13 +4975,13 @@ mod tests {
             "a reset that does NOT name the protocol in force withdraws nothing \
              (`vt100::Screen::clear_mouse_mode`)"
         );
-        assert_eq!(state.protocol, MouseProtocol::ButtonMotion);
+        assert_eq!(state.modes.protocol, MouseProtocol::ButtonMotion);
 
         let (flag, mut state) = mouse_scanner();
         assert!(!feed_mouse(b"\x1b[?1000h", &flag, &mut state));
         assert!(!feed_mouse(b"\x1b[?1003h", &flag, &mut state));
         assert_eq!(
-            state.protocol,
+            state.modes.protocol,
             MouseProtocol::AnyMotion,
             "the later SET supersedes: exactly one protocol is ever in force"
         );
@@ -5201,7 +5022,7 @@ mod tests {
             "a combined SET must enable — the modes are in the parameter list"
         );
         assert_eq!(
-            state.protocol,
+            state.modes.protocol,
             MouseProtocol::ButtonMotion,
             "parameters apply left to right, so the last protocol named wins"
         );
@@ -5216,8 +5037,8 @@ mod tests {
             "a combined RESET naming both the protocol in force and the \
              encoding leaves nothing reporting"
         );
-        assert_eq!(state.protocol, MouseProtocol::None);
-        assert_eq!(state.encoding, MouseEncoding::Default);
+        assert_eq!(state.modes.protocol, MouseProtocol::None);
+        assert_eq!(state.modes.encoding, MouseEncoding::Default);
     }
 
     /// A parameter list may mix tracked and untracked modes. What matters is
@@ -5243,8 +5064,8 @@ mod tests {
             !feed_mouse(b"\x1b[?1004h", &flag, &mut state),
             "1004 is focus reporting — it must not read as mouse reporting"
         );
-        assert_eq!(state.protocol, MouseProtocol::None);
-        assert_eq!(state.encoding, MouseEncoding::Default);
+        assert_eq!(state.modes.protocol, MouseProtocol::None);
+        assert_eq!(state.modes.encoding, MouseEncoding::Default);
     }
 
     /// Neighbouring mode numbers must not be matched by digit adjacency, and
@@ -5255,8 +5076,8 @@ mod tests {
         assert!(!feed_mouse(b"\x1b[?11000h", &flag, &mut state));
         assert!(!feed_mouse(b"\x1b[?10006h", &flag, &mut state));
         assert!(!feed_mouse(b"\x1b[?1049h\x1b[?2004h", &flag, &mut state));
-        assert_eq!(state.protocol, MouseProtocol::None);
-        assert_eq!(state.encoding, MouseEncoding::Default);
+        assert_eq!(state.modes.protocol, MouseProtocol::None);
+        assert_eq!(state.modes.encoding, MouseEncoding::Default);
     }
 
     /// Defect 2, one direction. The old scanner checked every enable pattern
@@ -5399,7 +5220,7 @@ mod tests {
             "an unterminated sequence decides nothing, so the flag is untouched"
         );
         assert_eq!(
-            state.carry.as_slice(),
+            state.scanner.carry(),
             b"\x1b[?1000".as_slice(),
             "only the open sequence is carried"
         );
@@ -5407,7 +5228,10 @@ mod tests {
         // Ordinary output after it resolves nothing and clears the carry: the
         // partial turned out not to be a private-mode sequence at all.
         assert!(feed_mouse(b"; hello world\r\n", &flag, &mut state));
-        assert!(state.carry.is_empty(), "nothing left that could still open");
+        assert!(
+            state.scanner.carry().is_empty(),
+            "nothing left that could still open"
+        );
     }
 
     /// The cap. A malformed or hostile stream can open a private-mode sequence
@@ -5421,9 +5245,9 @@ mod tests {
             assert!(!feed_mouse(b"1;", &flag, &mut state));
             fed += 2;
             assert!(
-                state.carry.len() <= MOUSE_SCAN_CARRY_MAX,
+                state.scanner.carry().len() <= crate::terminal_modes::CARRY_MAX,
                 "carry grew to {} after {fed} bytes of open parameter list",
-                state.carry.len()
+                state.scanner.carry().len()
             );
         }
     }
@@ -5436,9 +5260,9 @@ mod tests {
         for _ in 0..512 {
             assert!(!feed_mouse(b"\x1b[?", &flag, &mut state));
             assert!(
-                state.carry.len() <= MOUSE_SCAN_CARRY_MAX,
+                state.scanner.carry().len() <= crate::terminal_modes::CARRY_MAX,
                 "carry grew to {}",
-                state.carry.len()
+                state.scanner.carry().len()
             );
         }
     }
@@ -5450,9 +5274,12 @@ mod tests {
     fn scan_mouse_mode_does_not_enable_from_a_carry_it_had_to_drop() {
         let (flag, mut state) = mouse_scanner();
         let mut overlong = b"\x1b[?".to_vec();
-        overlong.extend_from_slice(&b"1;".repeat(MOUSE_SCAN_CARRY_MAX));
+        overlong.extend_from_slice(&b"1;".repeat(crate::terminal_modes::CARRY_MAX));
         assert!(!feed_mouse(&overlong, &flag, &mut state));
-        assert!(state.carry.is_empty(), "an over-cap partial is dropped");
+        assert!(
+            state.scanner.carry().is_empty(),
+            "an over-cap partial is dropped"
+        );
         assert!(
             !feed_mouse(b"1002;1006h", &flag, &mut state),
             "the tail of a dropped sequence must not complete one on its own — \
@@ -5487,6 +5314,20 @@ mod tests {
             "crossterm's DisableMouseCapture shape must land as disabled"
         );
         assert!(feed_mouse(b"\x1b[?1000;1002;1003;1006h", &flag, &mut state));
+    }
+
+    /// Issue #1537 review: `ESC c` (RIS) makes `vt100` rebuild the screen, mouse
+    /// modes included, so the flag follows it — split across chunks too.
+    #[test]
+    fn scan_mouse_mode_turns_reporting_off_on_a_full_reset() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(feed_mouse(b"\x1b[?1000;1006h", &flag, &mut state));
+        assert!(feed_mouse(b"output \x1b", &flag, &mut state));
+        assert!(
+            !feed_mouse(b"c", &flag, &mut state),
+            "a full reset must withdraw mouse reporting"
+        );
+        assert_eq!(state.modes, MouseModes::default());
     }
 
     /// The terminal-managed shape PRD #611 measured: exact-height DECSTBM
