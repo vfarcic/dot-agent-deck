@@ -186,10 +186,12 @@ fn delegate_042_retries_lost_pointer_in_the_same_worker_process() {
 }
 
 /// Issue #1381's worker: an OpenCode stand-in whose boot outlasts the
-/// production no-signal hold. It is deaf for `argv[2]` seconds from its own
-/// launch — the ~12 s a loaded box needs where the hold ships 8 s
-/// (`NO_SIGNAL_READINESS_BUFFER`'s own doc comment) — and consumes what arrives
-/// meanwhile without acting on it, as a TUI's terminal-mode switch does. It
+/// production no-signal hold. It is deaf for at least `argv[2]` seconds from
+/// its own launch — the ~12 s a loaded box needs where the hold ships 8 s
+/// (`NO_SIGNAL_READINESS_BUFFER`'s own doc comment) — and, so that a slow
+/// runner cannot hand it the first pointer after it is already listening, until
+/// 4 s after its first input arrives. What arrives meanwhile is consumed without
+/// being acted on, as a TUI's terminal-mode switch does. It
 /// then echoes typed bytes like OpenCode's composer, and on a submitted pointer
 /// sends what a real OpenCode sends once a prompt creates its session:
 /// `session.created` then `session.prompt`, through the real hook CLI.
@@ -209,25 +211,32 @@ with open('worker-launches.log', 'a', encoding='ascii') as log:
 fd = sys.stdin.fileno()
 tty.setraw(fd)
 deadline = started + float(sys.argv[2])
-while time.monotonic() < deadline:
+first_input = None
+while first_input is None or time.monotonic() < deadline:
     readable, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
     if readable:
         discarded = os.read(fd, 4096)
         if discarded:
+            if first_input is None:
+                first_input = time.monotonic()
+                deadline = max(deadline, first_input + 4)
+            # The wall-clock time first, so a reader that sees the bytes always
+            # finds when they arrived.
+            with open('worker-discarded-at.log', 'a', encoding='ascii') as log:
+                log.write(f'{time.time():.3f}\n')
             with open('worker-discarded.log', 'ab') as log:
                 log.write(discarded)
-            with open('worker-discarded-at.log', 'a', encoding='ascii') as log:
-                log.write(f'{time.monotonic() - started:.3f}\n')
 
 os.write(sys.stdout.fileno(), b'Ask anything\r\n')
 line = bytearray()
 accepted = 0
 while True:
     chunk = os.read(fd, 4096)
-    if accepted:
-        with open('worker-after-accept.log', 'ab') as log:
-            log.write(chunk)
     for byte in chunk:
+        if accepted:
+            with open('worker-after-accept.log', 'ab') as log:
+                log.write(bytes([byte]))
+            continue
         if byte not in (10, 13):
             line.append(byte)
             os.write(sys.stdout.fileno(), bytes([byte]))
@@ -264,7 +273,9 @@ fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot()
     );
     // The harness pins all three to off; an empty buffer and silence window
     // are not a number, so the daemon falls back to its production defaults
-    // for both. An empty schedule means "disabled", so the default is spelled.
+    // for both. An empty schedule means "disabled", so the default is spelled
+    // out from the shipped constant; that an unset variable resolves to it is
+    // pinned at L1 by `retry_schedule_unset_is_the_default`.
     let (deck, work, delivered_pid) = launch_retry_fixture_with_timings(
         LOADED_BOOT_WORKER,
         &command,
@@ -284,17 +295,25 @@ fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot()
         String::from_utf8_lossy(&std::fs::read(&discarded).unwrap_or_default()).into_owned(),
         deck.snapshot_grid()
     );
-    // The production hold was in force: the pointer arrived seconds into the
-    // boot, not at once as it would with the harness's zero pin.
+    // The production hold was in force: the hold starts after the delegate
+    // reached the daemon, so the swallowed pointer cannot arrive sooner than
+    // 8 s after it was sent. 7.5 s leaves room for clock granularity and
+    // rejects any shorter hold.
+    let delegated_at: f64 = std::fs::read_to_string(work.join("delegate-sent-at.log"))
+        .expect("fixture logged when it sent the delegate")
+        .trim()
+        .parse()
+        .expect("numeric delegate time");
     let lost_at: f64 = std::fs::read_to_string(work.join("worker-discarded-at.log"))
         .expect("worker logged when it discarded input")
         .lines()
         .next()
         .and_then(|line| line.parse().ok())
         .expect("numeric discard time");
+    let held = lost_at - delegated_at;
     assert!(
-        lost_at >= 4.0,
-        "precondition: the pointer arrived {lost_at:.3}s into the boot, so the 8 s no-signal hold was not in force"
+        held >= 7.5,
+        "precondition: the pointer arrived {held:.3}s after the delegate was sent, so the 8 s no-signal hold was not in force"
     );
 
     deck.send_bytes(b"\x04");
@@ -574,6 +593,12 @@ fn launch_retry_fixture_with_timings(
         })
         .expect("orchestrator role has a daemon record");
     let orchestrator_pane = orchestrator.pane_id_env.expect("orchestrator pane id");
+    let sent_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64();
+    std::fs::write(work.join("delegate-sent-at.log"), format!("{sent_at:.3}"))
+        .expect("record when the delegate was sent");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["delegate", "--to", "coder", "--task", "check the pointer"])
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
