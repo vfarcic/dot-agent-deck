@@ -44,7 +44,8 @@ export type NotRestartedReason =
   | { kind: "no-one-to-ask"; atStake: UpgradeStopSet }
   | { kind: "stale-confirmation"; atStake: UpgradeStopSet }
   | { kind: "another-restart-in-progress" }
-  | { kind: "no-daemon-running" };
+  | { kind: "no-daemon-running" }
+  | { kind: "installed-build-too-old" };
 
 /** `desktop_upgrade_daemon`'s answer — every arm of `UpgradeOutcome`. */
 export type UpgradeOutcome =
@@ -193,6 +194,15 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
             tone: "neutral",
             title: kind === "replace" ? "No daemon was running" : "Installed — no daemon was running",
             body: [kind === "replace" ? "There was no daemon to replace. Start daemon starts the one that came with this app." : `${installed}No daemon was running there, so nothing was restarted; the next one to start runs the new version.`],
+          };
+        case "installed-build-too-old":
+          return {
+            tone: "neutral",
+            title: "Installed — the daemon was not restarted",
+            body: [
+              `${installed}That version is too old to restart the daemon from this app, so ${keeps.charAt(0).toLowerCase()}${keeps.slice(1)}.`,
+              `To switch to ${outcome.installedVersion}, run \`dot-agent-deck connect ${deck}\` in a terminal: the TUI on that machine restarts the daemon onto it, asking first when agents are running.`,
+            ],
           };
       }
       break;

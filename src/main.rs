@@ -3396,19 +3396,23 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `restart-daemon` resolves "the build installed at my own path" from where
     // it started rather than from whatever `current_exe()` reports after an
     // upgrade replaced the file.
+    let restart_control = Arc::new(dot_agent_deck::daemon_restart::RestartControl::new(
+        dot_agent_deck::daemon_restart::InstallRecord::capture(),
+    ));
     let daemon = Daemon::with_attach(state, attach_path.clone())
         .with_legacy_aliases(
             dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
             dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
         )
-        .with_restart_control(Arc::new(
-            dot_agent_deck::daemon_restart::RestartControl::new(
-                dot_agent_deck::daemon_restart::InstallRecord::capture(),
-            ),
-        ));
+        .with_restart_control(restart_control.clone());
     if let Err(e) = run_daemon_with(&path, daemon).await {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;
+    }
+    // PRD #1487: a supervised daemon that accepted a restart started no
+    // successor; this status is what makes its service manager start one.
+    if restart_control.handed_to_supervisor() {
+        return ExitCode::from(dot_agent_deck::daemon_restart::SUPERVISED_RESTART_EXIT);
     }
     ExitCode::SUCCESS
 }
