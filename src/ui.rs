@@ -21628,6 +21628,7 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                output_set_status: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22421,6 +22422,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                output_set_status: false,
             },
         );
     }
@@ -24548,6 +24550,7 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                output_set_status: false,
             },
         );
         state
@@ -28035,6 +28038,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -30829,6 +30833,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31621,6 +31626,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         }
     }
 
@@ -32003,6 +32009,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         };
 
         // Spacious: get all 3
@@ -32042,6 +32049,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32072,6 +32080,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            output_set_status: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
