@@ -5862,6 +5862,83 @@ mod tests {
             control.outcome
         );
 
+        // A remote daemon NAMED like the entry (Qodo on PR #1504) never takes
+        // the switch silently: "all daemons" still names All daemons, a bare
+        // "all" beside a daemon called `all` asks which (or switches nothing),
+        // and a daemon called `all-daemons` makes "all daemons" ask which.
+        let named = |name: &str| -> crate::settings::EndpointSettings {
+            serde_json::from_value(serde_json::json!({
+                "remote": [
+                    { "id": "rownamed", "host": "named-box", "port": 22, "socket": "/run/deck.sock", "name": name },
+                    { "id": "rowstage", "host": "staging-box", "port": 22, "socket": "/run/deck.sock" },
+                ],
+                "selection": "local",
+            }))
+            .expect("a slug name parses")
+        };
+        let offered = |result: &voice::VoiceResult| match &result.outcome {
+            voice::VoiceOutcome::ParamAmbiguous { candidates, .. } => {
+                let mut tokens: Vec<String> = candidates
+                    .iter()
+                    .map(|candidate| candidate.value.clone())
+                    .collect();
+                tokens.sort();
+                Some(tokens)
+            }
+            _ => None,
+        };
+        let called_all = named("all");
+        let result = resolve_with_section(
+            &called_all,
+            "select all daemons",
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            switched_to(&result).map(|(token, ..)| token),
+            Some("all".to_string()),
+            "{:?}",
+            result.outcome
+        );
+        let said = "switch daemon to all";
+        let result = resolve_with_section(
+            &called_all,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "all"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            offered(&result),
+            Some(vec!["all".to_string(), "rownamed".to_string()]),
+            "{:?}",
+            result.outcome
+        );
+        // The model completing the bare "all" to the entry's label is words the
+        // user did not say, so nothing switches either way.
+        let result = resolve_with_section(
+            &called_all,
+            said,
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(switched_to(&result), None, "{:?}", result.outcome);
+        let result = resolve_with_section(
+            &named("all-daemons"),
+            "select all daemons",
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            offered(&result),
+            Some(vec!["all".to_string(), "rownamed".to_string()]),
+            "{:?}",
+            result.outcome
+        );
+
         // All daemons is a selection, not a daemon a new agent can start on:
         // named for the New agent dialog, it is refused with that reason.
         let mut decks = voice_decks(&[], None);

@@ -3835,6 +3835,16 @@ fn deck_reference(spoken: &str) -> String {
 /// Every name this deck answers to. See [`resolve_deck_ref`] for the rule.
 pub(super) fn deck_spoken_names(deck: &VoiceDeck) -> Vec<String> {
     let mut names = vec![deck.label.clone()];
+    if deck.id == super::ALL_DECKS_ID {
+        // Issue #1491: the Deck selector's All daemons entry also answers to
+        // a bare "all" EXACTLY, not only through the loose pass. A remote
+        // deck NAMED `all` then ties with it in the exact pass, so "switch
+        // daemon to all" asks which was meant instead of switching to that
+        // one deck; "all daemons" is still the entry's own label, so it
+        // names All daemons alone unless a deck is called that too.
+        names.push("all".to_string());
+        return names;
+    }
     if let Some(address) = &deck.address {
         // The label is the deck's name (issue #1426). A name may hold `.`,
         // which nobody says, so it also answers with those spoken as spaces;
