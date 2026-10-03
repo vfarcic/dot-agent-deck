@@ -26,15 +26,20 @@
 //! never read.
 
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Set once any override has ever been installed in this process, and never
 /// cleared. While it is `false`, [`var`] does not touch [`OVERRIDES`].
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// `(name, value)`, where a `None` value means "read as unset" rather than
-/// "defer to the environment". A name that is absent defers to the environment.
-static OVERRIDES: RwLock<Vec<(&'static str, Option<String>)>> = RwLock::new(Vec::new());
+/// Hands each [`Override`] an id of its own.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// One entry per live guard, `(name, guard id, value)`, oldest first. For each
+/// name the newest live entry wins, so guards may drop in any order: a guard
+/// removes its own entry and nobody else's. A `None` value reads as unset rather
+/// than deferring to the environment; a name with no entry defers to it.
+static OVERRIDES: RwLock<Vec<(&'static str, u64, Option<String>)>> = RwLock::new(Vec::new());
 
 /// Read `name`: an override when a test installed one, the process environment
 /// otherwise. Same result shape as `std::env::var(name).ok()`, which is what
@@ -42,63 +47,53 @@ static OVERRIDES: RwLock<Vec<(&'static str, Option<String>)>> = RwLock::new(Vec:
 pub(crate) fn var(name: &str) -> Option<String> {
     if ACTIVE.load(Ordering::Acquire) {
         let overrides = OVERRIDES.read().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, value)) = overrides.iter().find(|(key, _)| *key == name) {
+        if let Some((_, _, value)) = overrides.iter().rev().find(|(key, _, _)| *key == name) {
             return value.clone();
         }
     }
     std::env::var(name).ok()
 }
 
-/// Make [`var`] read `value` for `name` until the returned guard drops, which
-/// puts back whatever override was there before (or none). `None` reads as
-/// unset, whatever the environment says.
+/// Make [`var`] read `value` for `name` while the returned guard is the newest
+/// live one for that name. `None` reads as unset, whatever the environment says.
+/// When the guard drops, the next-newest live guard for the name decides again,
+/// or the environment does when there is none.
 ///
 /// Process-global, like the environment it stands in for: under plain
 /// `cargo test` a test that installs one serialises against its siblings with
 /// the same lock it would have used for `set_var`.
 #[doc(hidden)]
 pub fn override_for_tests(name: &'static str, value: Option<&str>) -> Override {
-    let previous = install(name, value.map(str::to_owned));
-    Override { name, previous }
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut overrides = OVERRIDES.write().unwrap_or_else(|e| e.into_inner());
+    ACTIVE.store(true, Ordering::Release);
+    overrides.push((name, id, value.map(str::to_owned)));
+    Override { id }
 }
 
 /// Guard returned by [`override_for_tests`].
 #[doc(hidden)]
 #[must_use = "the override is removed when this guard drops"]
 pub struct Override {
-    name: &'static str,
-    /// The entry this guard replaced: `None` when there was none.
-    previous: Option<Option<String>>,
+    id: u64,
 }
 
 impl Override {
-    /// Change the overridden value while the guard is alive, so a test can
-    /// compare two values against one running fixture.
+    /// Change this guard's value, so a test can compare two values against one
+    /// running fixture. It is what [`var`] reads only while this guard is the
+    /// newest live one for its name.
     pub fn repoint(&self, value: Option<&str>) {
-        install(self.name, value.map(str::to_owned));
+        let mut overrides = OVERRIDES.write().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, slot)) = overrides.iter_mut().find(|(_, id, _)| *id == self.id) {
+            *slot = value.map(str::to_owned);
+        }
     }
 }
 
 impl Drop for Override {
     fn drop(&mut self) {
         let mut overrides = OVERRIDES.write().unwrap_or_else(|e| e.into_inner());
-        overrides.retain(|(key, _)| *key != self.name);
-        if let Some(previous) = self.previous.take() {
-            overrides.push((self.name, previous));
-        }
-    }
-}
-
-/// Install `value` for `name`, returning the entry it replaced.
-fn install(name: &'static str, value: Option<String>) -> Option<Option<String>> {
-    let mut overrides = OVERRIDES.write().unwrap_or_else(|e| e.into_inner());
-    ACTIVE.store(true, Ordering::Release);
-    match overrides.iter_mut().find(|(key, _)| *key == name) {
-        Some((_, slot)) => Some(std::mem::replace(slot, value)),
-        None => {
-            overrides.push((name, value));
-            None
-        }
+        overrides.retain(|(_, id, _)| *id != self.id);
     }
 }
 
@@ -131,5 +126,45 @@ mod tests {
         );
         drop(outer);
         assert_eq!(var(NAME), None, "no guard left, so the environment decides");
+    }
+
+    /// Guards may drop out of order: the newest live guard decides, a guard
+    /// removes only its own entry, and an outer guard's `repoint` takes effect
+    /// once the inner guard is gone. Review finding on PR #1534.
+    #[test]
+    fn guards_dropped_out_of_order_leave_no_stale_value() {
+        const OTHER: &str = "DOT_AGENT_DECK_ENV_OVERRIDE_ORDER_SELF_TEST";
+        let outer = override_for_tests(OTHER, Some("outer"));
+        let inner = override_for_tests(OTHER, Some("inner"));
+        outer.repoint(Some("outer-repointed"));
+        assert_eq!(
+            var(OTHER).as_deref(),
+            Some("inner"),
+            "the newest guard decides"
+        );
+        drop(outer);
+        assert_eq!(
+            var(OTHER).as_deref(),
+            Some("inner"),
+            "dropping the outer guard first must leave the inner one in force"
+        );
+        drop(inner);
+        assert_eq!(
+            var(OTHER),
+            None,
+            "no guard left, so the environment decides"
+        );
+
+        let outer = override_for_tests(OTHER, Some("outer"));
+        let inner = override_for_tests(OTHER, Some("inner"));
+        outer.repoint(Some("outer-repointed"));
+        drop(inner);
+        assert_eq!(
+            var(OTHER).as_deref(),
+            Some("outer-repointed"),
+            "the outer guard's repoint must survive the inner guard's drop"
+        );
+        drop(outer);
+        assert_eq!(var(OTHER), None);
     }
 }

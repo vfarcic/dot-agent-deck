@@ -5448,6 +5448,13 @@ fn env_write_refuses_inside_a_runtime() {
 #[cfg(target_os = "linux")]
 #[test]
 fn env_write_refuses_while_runtime_threads_exist_and_not_after_the_runtime_drops() {
+    // Under plain `cargo test` a sibling test's runtime shares this process, so
+    // neither "no runtime threads yet" nor "none left after the drop" is this
+    // test's to assert, and the scan is off there anyway.
+    if !env_write::owns_the_process() {
+        eprintln!("SKIP: the runtime-thread scan needs nextest's process-per-test mode");
+        return;
+    }
     env_write::assert_no_tokio_runtime("before any runtime");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

@@ -6198,8 +6198,24 @@ mod tests {
     /// payload copy in the pane.
     #[spec("scheduler/dispatch/025")]
     #[cfg(unix)]
-    #[tokio::test]
-    async fn dispatch_025_session_start_during_draft_wait_does_not_duplicate_seed() {
+    #[test]
+    fn dispatch_025_session_start_during_draft_wait_does_not_duplicate_seed() {
+        // Held for the whole run, outside the runtime: the override below is
+        // process-global, and under plain `cargo test` it would otherwise shadow
+        // the values `session_start_wait_override_is_clamped_to_a_sane_range`
+        // sets.
+        let _g = SESSION_START_WAIT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(dispatch_025_session_start_during_draft_wait_body());
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_025_session_start_during_draft_wait_body() {
         const PANE_ID: &str = "spawn-seed-start-during-draft-pane";
         const DRAFT: &str = "spawn-seed-start-during-draft-544";
         const SEED: &str = "SPAWN-SEED-START-DURING-DRAFT-544";
@@ -8559,11 +8575,18 @@ mod tests {
     /// nor stretch it past the production fallback, and a non-numeric value falls
     /// back to the default rather than panicking. The e2e harness's 5000 ms pin
     /// must survive the clamp untouched.
+    /// Serializes the tests that set `DOT_AGENT_DECK_SESSION_START_WAIT_MS`, in
+    /// the environment or through `env_override`, against each other under
+    /// plain `cargo test`. An override shadows the environment, so the two
+    /// kinds of setter have to share one lock.
+    static SESSION_START_WAIT_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn session_start_wait_override_is_clamped_to_a_sane_range() {
-        // Serialize against any other test reading this process-global env var.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Serialize against any other test setting this knob.
+        let _g = SESSION_START_WAIT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
         let default = crate::state::SESSION_START_WAIT_TIMEOUT;
         for (raw, expected) in [

@@ -17,6 +17,13 @@
 //! this tree names its runtime threads); a worker started an instant before the
 //! check, which still carries its creator's name until it renames itself; and,
 //! on a host without `/proc`, anything but the in-runtime half.
+//!
+//! **The thread scan runs only when this process is this test's alone**, which
+//! is what nextest's process-per-test mode guarantees and what every gate here
+//! uses ([`owns_the_process`]). Under plain `cargo test` a sibling test's
+//! runtime shares the process, so the scan would refuse a write over threads
+//! this test does not own; that sibling race is issue #245's, and only the
+//! in-runtime half applies there.
 
 /// Panic, naming `site`, if the calling thread is inside a Tokio runtime or (on
 /// Linux) if any Tokio runtime thread is still alive in this process after
@@ -38,6 +45,9 @@ pub fn assert_no_tokio_runtime(site: &str) {
          Write it before the runtime is built, or change the knob through \
          `dot_agent_deck::env_override`"
     );
+    if !owns_the_process() {
+        return;
+    }
     let deadline = std::time::Instant::now() + EXITING_THREAD_GRACE;
     let mut live = tokio_runtime_threads();
     while !live.is_empty() && std::time::Instant::now() < deadline {
@@ -52,6 +62,14 @@ pub fn assert_no_tokio_runtime(site: &str) {
          through `dot_agent_deck::env_override`",
         live.join(", ")
     );
+}
+
+/// Whether this test runs in a process of its own, so that every thread in it
+/// belongs to this test: nextest sets `NEXTEST_EXECUTION_MODE=process-per-test`
+/// in each test process it starts. Plain `cargo test` sets nothing and runs the
+/// whole binary's tests as threads of one process.
+pub fn owns_the_process() -> bool {
+    std::env::var_os("NEXTEST_EXECUTION_MODE").is_some_and(|mode| mode == "process-per-test")
 }
 
 /// How long [`assert_no_tokio_runtime`] waits for a listed runtime thread to
