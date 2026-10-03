@@ -8,6 +8,7 @@ import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
+import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
 import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
@@ -429,6 +430,16 @@ export function useDeckRuntime(): DeckRuntimeState {
   const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
   const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
+  // PRD #1487 M5: Upgrade and Replace daemon. Their outcome — kept running,
+  // failed while installing — is the dialog's to show, not the global error
+  // toast's, so these bypass `runAction` too. A bridge without the verbs (some
+  // test doubles) leaves both absent, and the screens then offer no button.
+  const upgradeDaemon = useMemo(() => (typeof bridge.upgradeDaemon === "function"
+    ? (deckId: string, onEvent: (event: UpgradeEvent) => void) => bridge.upgradeDaemon(deckId, onEvent)
+    : undefined), [bridge]);
+  const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
+    ? (upgradeId: string, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, choice)
+    : undefined), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
@@ -478,6 +489,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     dismissCleanupWarning,
     clearError,
     runAction,
+    ...(upgradeDaemon ? { upgradeDaemon } : {}),
+    ...(decideUpgrade ? { decideUpgrade } : {}),
     terminalInputResults,
     sendTerminalInput,
     resizeTerminal,

@@ -12,15 +12,11 @@ export const CONNECT_ANYWAY_BODY = "This daemon and this app are different versi
  */
 export interface OfferedRemedies {
   replaceDaemon?: boolean;
+  /** PRD #1487 D9 — Upgrade, on a remote deck whose daemon is older than this app. */
+  upgrade?: boolean;
   connectAnyway?: boolean;
   openDaemons?: boolean;
   reconnect?: boolean;
-  /**
-   * The screen COULD offer Replace daemon for this daemon (a live, local deck)
-   * but withholds it because agents are running or their count is unknown.
-   * Said rather than left as a missing button.
-   */
-  replaceWithheld?: boolean;
 }
 
 /**
@@ -31,13 +27,14 @@ export interface OfferedRemedies {
  */
 export function incompatibleRemedy(connection: ConnectionView, offered: OfferedRemedies): string {
   const sentences: string[] = [];
+  if (offered.upgrade) {
+    sentences.push("Upgrade installs this app's version on that machine and restarts its daemon onto it; if agents are running there, you are asked before any is stopped.");
+  }
   if (offered.replaceDaemon) {
-    sentences.push("Replace daemon stops this daemon and starts the one that came with this app.");
-  } else if (offered.replaceWithheld) {
     const count = connection.runningAgentCount;
-    sentences.push(count === undefined
-      ? "Replace daemon is not offered because this daemon did not say how many agents it is running."
-      : `Replace daemon is not offered while ${count} ${count === 1 ? "agent is" : "agents are"} running on this daemon; close ${count === 1 ? "it" : "them"} first.`);
+    sentences.push(count !== undefined && count > 0
+      ? `Replace daemon stops this daemon and starts the one that came with this app; ${count} ${count === 1 ? "agent is" : "agents are"} running on it, and you are shown which before any is stopped.`
+      : "Replace daemon stops this daemon and starts the one that came with this app.");
   }
   if (offered.connectAnyway) {
     sentences.push("Connect anyway uses this daemon as it is until you quit the app, though some of what it shows may be wrong.");

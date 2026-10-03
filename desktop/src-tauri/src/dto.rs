@@ -327,6 +327,12 @@ pub struct DesktopConnection {
     /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
     /// on it to decide whether a control EXISTS.
     pub listing_options: bool,
+    /// Whether to offer **Upgrade** for this deck (PRD #1487 D8), from
+    /// `daemon_upgrade::upgrade_offer` over the handshake's daemon version —
+    /// the one place the newer-only rule lives, so the webview never compares
+    /// versions itself. `offered` only when the daemon's release is older than
+    /// this app's; `unknown` when nothing answered or the version is unreadable.
+    pub upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer,
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -742,7 +748,6 @@ pub enum DesktopAction {
         #[serde(default)]
         force: bool,
     },
-    RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
     /// hand back a freshly classified snapshot (issue #801). The allowance
     /// itself is an assertion by the user, not a parameter, and it can only
@@ -2505,6 +2510,7 @@ pub(crate) fn disconnected_snapshot(
             project_actions_reason: None,
             new_agent_reason: None,
             listing_options: false,
+            upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -4041,13 +4047,17 @@ mod tests {
         );
     }
 
+    /// PRD #1487 M5: Replace daemon is `desktop_upgrade_daemon` on the local
+    /// deck now, so the action it used to be is gone — refused at decode
+    /// rather than quietly running the old stop-and-respawn path.
     #[test]
-    fn restart_daemon_action_has_no_force_field() {
-        let action: DesktopAction = serde_json::from_value(serde_json::json!({
-            "type": "restart_daemon"
-        }))
-        .unwrap();
-        assert!(matches!(action, DesktopAction::RestartDaemon));
+    fn restart_daemon_is_no_longer_an_action() {
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "restart_daemon"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
