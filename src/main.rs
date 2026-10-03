@@ -2481,6 +2481,10 @@ fn spawn_event_subscriber(
                     loop {
                         match sub.next_event().await {
                             Ok(Some(BroadcastMsg::Event(event))) => {
+                                #[cfg(feature = "e2e")]
+                                if e2e_subscriber_drops(&event) {
+                                    continue;
+                                }
                                 state.write().await.apply_event(event);
                             }
                             // PRD #120: a daemon-spawned orchestration (issue
@@ -2538,6 +2542,29 @@ fn spawn_event_subscriber(
             delay = std::cmp::min(delay * 2, max_delay);
         }
     });
+}
+
+/// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
+/// way it does when they arrive while it is reconnecting — it resubscribes
+/// without replaying what it missed, so the daemon knows the conversation and
+/// the TUI never learns it. A reconnect cannot be timed against an agent's boot
+/// from a PTY test, so the test names a session-id prefix in
+/// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
+/// asserts the prompt is still delivered.
+///
+/// EVERY event of that conversation is dropped, not only its `SessionStart`:
+/// any later frame carrying the session id — the daemon's own `ShellIdle` for a
+/// pane that went quiet, measured arriving right behind the start — would
+/// establish the generation in the TUI's view on its own, so a gap that misses
+/// the start alone recovers by itself. The failure needs the gap to cover the
+/// boot, and this models exactly that.
+///
+/// Compiled only into the `e2e` build, like `effective_current_exe`'s seam in
+/// `platform/paths.rs`, so a shipped binary has no switch that discards events.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
+        .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an

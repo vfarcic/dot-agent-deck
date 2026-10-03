@@ -1914,6 +1914,18 @@ struct PromptDelivery {
     /// while the snapshot has none, which is the one place the snapshot's
     /// silence would otherwise read as the bound conversation having gone.
     refusal_generation: Option<String>,
+    /// Issue #621 (review): some request of this delivery ended in a transport
+    /// error, so it may have written although `attempts` is still 0 — a write
+    /// the daemon applied whose response was lost. A refusal's generation must
+    /// not be adopted then: binding it would treat the delivery as unwritten
+    /// and name a conversation the earlier bytes may never have entered, which
+    /// is the #424 H4 hazard the snapshot bind answers with the closure count
+    /// and a refusal cannot. The daemon's delivery ledger normally replays such
+    /// a write's `Applied` for the same wire id, so this is the fallback for when
+    /// it does not (an evicted record, a changed wire identity), not the common
+    /// path. Sticky: one uncertain request keeps the delivery on the old
+    /// behaviour for its lifetime.
+    write_unacknowledged: bool,
     /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
     /// instant of the FIRST write. `None` until then — nothing is written, so
     /// nothing can have been revoked.
@@ -4122,6 +4134,7 @@ fn process_pending_seed_prompts(
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
                     observed_generation: None,
                     refusal_generation: None,
+                    write_unacknowledged: false,
                     closures_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
@@ -4385,6 +4398,11 @@ fn apply_seed_send_outcome(
         }
         // Transport failure: retain for retry, back off, surface feedback.
         Err(e) => {
+            // Issue #621 (review): not proof that nothing was written — see
+            // [`PromptDelivery::write_unacknowledged`].
+            if let Some(delivery) = deliveries.get_mut(pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(backoff, pane_id, now);
             *feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
             true
@@ -4455,6 +4473,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             expected_session_id: None,
             observed_generation: None,
             refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
@@ -4740,9 +4759,12 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
     // write precondition either way; see [`PromptDelivery::refusal_generation`].
     if delivery.expected_session_id.is_none()
         && delivery.attempts == 0
-        && let Some(current) = snapshot
-            .pane_hook_session_id(pane_id)
-            .or_else(|| delivery.refusal_generation.clone())
+        && let Some(current) = snapshot.pane_hook_session_id(pane_id).or_else(|| {
+            delivery
+                .refusal_generation
+                .clone()
+                .filter(|_| !delivery.write_unacknowledged)
+        })
     {
         adopt_generation(delivery, current);
     }
@@ -4844,12 +4866,14 @@ fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
 /// [`bind_delivery_generation`] to bind on the next pass. Only for a delivery
 /// that is still unbound and has written nothing — the precondition the bind
 /// itself enforces, checked here too so the field never holds a value that
-/// could not be used. A newer refusal replaces an older one: until the
+/// could not be used — and none of whose requests ended in a transport error,
+/// which may have written regardless ([`PromptDelivery::write_unacknowledged`]). A newer refusal replaces an older one: until the
 /// delivery binds, the latest generation the daemon reported is the one the
 /// next attempt has to name.
 fn note_refusal_generation(delivery: &mut PromptDelivery, generation: Option<String>) {
     if delivery.expected_session_id.is_none()
         && delivery.attempts == 0
+        && !delivery.write_unacknowledged
         && let Some(generation) = generation
     {
         delivery.refusal_generation = Some(generation);
@@ -5677,6 +5701,10 @@ fn apply_orchestrator_send_outcome(
             ui.status_message = Some((msg, now));
         }
         Err(e) => {
+            // Issue #621 (review): the seed path's twin.
+            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             ui.status_message = Some((
                 format!("Orchestrator prompt not delivered ({e}); will retry"),
@@ -38462,6 +38490,7 @@ mod tests {
             expected_session_id: None,
             observed_generation: None,
             refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: Some(0),
             delivery_id: "refusal-policy".to_string(),
             epoch: 0,
@@ -38497,6 +38526,31 @@ mod tests {
             (written.refusal_generation, written.expected_session_id),
             (None, None),
             "a delivery that already wrote must not adopt a generation from a refusal"
+        );
+
+        // Greptile P1 on #1521: a request whose response was LOST may have
+        // written although `attempts` is 0, so a later refusal must not make
+        // the delivery look unwritten — whether the uncertainty came before the
+        // refusal or after it was recorded.
+        let mut lost_response = fresh();
+        lost_response.write_unacknowledged = true;
+        note_refusal_generation(&mut lost_response, Some("reported".to_string()));
+        bind_delivery_generation(&mut lost_response, &snapshot, PANE_ID);
+        assert_eq!(
+            (
+                lost_response.refusal_generation,
+                lost_response.expected_session_id
+            ),
+            (None, None),
+            "a delivery with an unacknowledged write must not adopt a refusal's generation"
+        );
+        let mut lost_after_refusal = fresh();
+        note_refusal_generation(&mut lost_after_refusal, Some("reported".to_string()));
+        lost_after_refusal.write_unacknowledged = true;
+        bind_delivery_generation(&mut lost_after_refusal, &snapshot, PANE_ID);
+        assert_eq!(
+            lost_after_refusal.expected_session_id, None,
+            "nor bind one recorded before the uncertain request"
         );
 
         let mut bound = fresh();
@@ -40761,6 +40815,7 @@ mod tests {
             expected_session_id: None,
             observed_generation: None,
             refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
@@ -40868,6 +40923,7 @@ mod tests {
             expected_session_id: None,
             observed_generation: None,
             refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,
