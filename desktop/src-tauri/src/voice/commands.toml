@@ -801,7 +801,8 @@ heard_as    = [
 id          = "go_to_parent"
 description = """In the New agent dialog's directory browser, go up one level to the parent
 directory — the `..` row. Use for go to parent, go to the parent dir, go up, up one level, one
-level up, parent directory, or cd dot dot. It moves the browser only and starts nothing."""
+level up, go back one directory, back up a level, parent directory, or cd dot dot. It moves the
+browser only and starts nothing."""
 invoke      = "goToParentDirectory"
 screens     = ["overview"]
 requires    = ["parent_directory"]
@@ -809,7 +810,7 @@ unavailable_hint = "going up needs the New agent dialog showing a directory belo
 report      = "Going up."
 asks_to     = "go up a directory"
 try_saying  = "go up"
-heard_as    = ["parent", "up", "dot dot"]
+heard_as    = ["parent", "up", "back", "dot dot"]
 
 [[commands]]
 id          = "use_this_directory"
