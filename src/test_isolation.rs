@@ -10,9 +10,8 @@
 //! That enforcement is `common::init_test_env()`, which lives under `tests/`.
 //! The lib target's own `#[cfg(test)]` unit tests do not link `tests/common/`,
 //! so nothing scrubbed the four variables for them. This module is that same
-//! scrub for this side of the wall. Same safety argument as the harness's:
-//! nextest gives every test its own process, so mutating this process's
-//! environment cannot affect another test.
+//! scrub for this side of the wall, and it is written the same way the
+//! harness's is: only before `main`, never at run time (issue #678).
 //!
 //! **Scrubbing alone was necessary, not sufficient.** Scrubbing THIS process
 //! only stops a child from *inheriting* an endpoint. With the variable absent,
@@ -120,8 +119,11 @@ ctor::declarative::ctor! {
             .into_iter()
             .filter(|v| std::env::var_os(v).is_some())
             .collect();
-        // SAFETY: a constructor runs before `main`, while this process has one
-        // thread, so nothing can observe the environment mid-write.
+        // SAFETY: a constructor runs before `main`, so before libtest or any
+        // code in this binary has started a thread, and nothing can observe
+        // the environment mid-write. The only place this module writes the
+        // environment:
+        // `detach_from_any_live_deck` checks and writes nothing (issue #678).
         unsafe {
             for var in DECK_ENDPOINT_VARS {
                 std::env::remove_var(var);
@@ -133,50 +135,39 @@ ctor::declarative::ctor! {
     }
 }
 
-/// Clear every inherited deck endpoint from this test process. Idempotent, and
-/// safe to call from any unit test that spawns a pane or posts synthetic hook
-/// events.
+/// Report what [`detach_before_main`] cleared. Idempotent, and safe to call
+/// from any unit test that spawns a pane or posts synthetic hook events.
+/// Writes nothing.
 ///
-/// [`detach_before_main`] has already done this — and redirected
-/// `XDG_RUNTIME_DIR` — before the test began, so in an ordinary run this only
-/// prints the note. It still scrubs the identity variables, for a test that
-/// set them itself, and leaves `XDG_RUNTIME_DIR` alone, so a test that chose
-/// its own runtime dir before calling it keeps it.
+/// [`detach_before_main`] has already cleared the inherited variables — and
+/// redirected `XDG_RUNTIME_DIR` — before the test began, so this only prints
+/// the note naming what it cleared. It used to re-scrub a variable set again at
+/// run time; that write raced any thread already reading the environment, which
+/// the SAFETY argument for it ("nextest runs one test per process") did not
+/// exclude — one process per test is not one thread per process (issue #678).
+///
+/// Unlike the integration harness's copy, it does not refuse a variable set
+/// again in-process. Unit tests in this crate set endpoint variables in their
+/// own process on purpose, under their own locks (`platform::paths`'s
+/// precedence tests, `agent_pty`'s stale-socket scrub test, `config`'s
+/// endpoint guard), and under plain `cargo test` those share a process with
+/// every caller of this function — so a refusal here would fail an unrelated
+/// test on a sibling's temporary value. A child spawned through
+/// `agent_pty::spawn` does not inherit such a value either way, because that
+/// path scrubs the named deck variables.
 pub fn detach_from_any_live_deck() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        // Set NOW: only what a test put back after `detach_before_main` ran.
-        let still_set: Vec<&str> = DECK_ENDPOINT_VARS
-            .into_iter()
-            .filter(|v| std::env::var_os(v).is_some())
-            .collect();
-        let mut leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
-        for var in &still_set {
-            if !leaked.contains(var) {
-                leaked.push(var);
-            }
-        }
+        let leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
         if !leaked.is_empty() {
-            // Loud on purpose, matching the harness: the run is now safe, but
-            // the contributor should know their shell was pointed at a live
-            // deck.
+            // Loud on purpose, matching the harness: the run is safe, but the
+            // contributor should know their shell was pointed at a live deck.
             eprintln!(
                 "note: detaching this test process from a live deck — cleared {}. \
                  The inherited values would have sent fixture hook events into \
                  your running dashboard.",
                 leaked.join(", ")
             );
-        }
-        for var in still_set {
-            // SAFETY: nextest runs one test per process and this is called from
-            // the test body before it spawns anything, via a `OnceLock` so it
-            // happens exactly once per process. Plain `cargo test` runs every
-            // test as a thread of ONE process, where that argument does not
-            // hold; there this writes only a variable that is set right now —
-            // which, since `detach_before_main` cleared the inherited ones,
-            // means one a test set itself — so an ordinary run never moves the
-            // environment under another test's thread.
-            unsafe { std::env::remove_var(var) };
         }
     });
 }

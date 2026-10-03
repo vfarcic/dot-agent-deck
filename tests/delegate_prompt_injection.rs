@@ -821,7 +821,7 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives. The test runs as it would from inside a developer's deck pane — with that deck's endpoints in its environment, stood in for by a decoy — and nothing it spawns may reach that deck: the user saw this test's `worker-pane` appear on their real dashboard (PR #1451).
+/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in whose wrapper surfaces a fork-time `SessionStart` before the child is genuinely ready. The prompt must remain absent after that card-surfacing event and appear only after a native Codex `SessionStart` for the replacement agent arrives. The test runs as it would from inside a developer's deck pane — with that deck's default endpoint reachable through its `XDG_RUNTIME_DIR`, stood in for by a decoy — and nothing it spawns may reach that deck: the user saw this test's `worker-pane` appear on their real dashboard (PR #1451).
 #[spec("orchestration/delegate/007")]
 #[test]
 #[cfg(unix)]
@@ -849,10 +849,20 @@ fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent() {
 
 /// The deck a developer runs this suite from, stood in for: a hook and an
 /// attach socket that nothing in a test may ever reach. [`DecoyDeck::ambient`]
-/// puts it where the developer's pane puts the real one — in
-/// `DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, and as the default
-/// endpoint under `XDG_RUNTIME_DIR` that a child with its endpoint scrubbed
-/// falls back to.
+/// puts it at the default endpoint under `XDG_RUNTIME_DIR` — the address a
+/// child with its endpoint scrubbed falls back to, which is how a socketless
+/// registry's wrapped worker reached the real deck before PR #1451.
+///
+/// Not also in `DOT_AGENT_DECK_SOCKET` / `DOT_AGENT_DECK_ATTACH_SOCKET`, though
+/// a developer's pane does put the real deck there. Inherited copies of those
+/// are cleared before `main` (`common::detach_before_main`), and since issue
+/// #678 the harness refuses to run with them set again in-process rather than
+/// scrubbing them at run time, which raced threads already reading the
+/// environment. They never reached a child here anyway: both callers run
+/// `common::init_test_env()` before spawning anything, and it used to remove
+/// them at that point. The inheritance shape itself is covered where it can be
+/// set up honestly, in a re-executed child's environment
+/// (`tests/harness_isolation.rs`).
 #[cfg(unix)]
 struct DecoyDeck {
     dir: tempfile::TempDir,
@@ -879,23 +889,7 @@ impl DecoyDeck {
 
     fn ambient(&self) -> EnvGuard {
         let runtime = self.dir.path().display().to_string();
-        let hook = self
-            .dir
-            .path()
-            .join("dot-agent-deck.sock")
-            .display()
-            .to_string();
-        let attach = self
-            .dir
-            .path()
-            .join("dot-agent-deck-attach.sock")
-            .display()
-            .to_string();
-        EnvGuard::set(&[
-            ("XDG_RUNTIME_DIR", &runtime),
-            ("DOT_AGENT_DECK_SOCKET", &hook),
-            ("DOT_AGENT_DECK_ATTACH_SOCKET", &attach),
-        ])
+        EnvGuard::set(&[("XDG_RUNTIME_DIR", &runtime)])
     }
 
     /// Fails with what reached the decoy, if anything did.
@@ -2525,10 +2519,10 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
 #[cfg(unix)]
 fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_flight() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    // Run as a developer runs it, from inside a deck pane with that deck's
-    // endpoints in the environment: this test's wrapped worker reached the
-    // real deck that way and showed up as a `worker-pane` ghost card on the
-    // user's dashboard (PR #1451).
+    // Run as a developer runs it, with that deck's default endpoint reachable
+    // through `XDG_RUNTIME_DIR`: this test's wrapped worker reached the real
+    // deck that way and showed up as a `worker-pane` ghost card on the user's
+    // dashboard (PR #1451).
     let real_deck = DecoyDeck::bind();
     let _real = real_deck.ambient();
     let _env = EnvGuard::set(&[
