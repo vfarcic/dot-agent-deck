@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.45.1] - 2026-10-03
+
+### Fixed
+
+- **Codex Hook Install Names the Deck Hooks You Turned Off, and Clears Its Stale Trust Records**
+  If you turn off one of the deck's Codex hooks in Codex's `/hooks` list, the deck keeps it off, and `dot-agent-deck hooks install --agent codex` now prints a note naming each deck hook that is turned off, so you can tell why its detail is missing from the card. The deck's log records the same as a warning.
+  The deck also removes the trust records it left in Codex's `config.toml` at hook positions its own hook no longer occupies, instead of letting them pile up. Records for your own hooks, for other Codex homes, and for positions Codex still lists are never touched.
+  See [Codex events not showing](https://agent-deck.devopstoolkit.ai/docs/troubleshooting.md#codex-events-not-showing).
+- **Concurrent scheduled runs of one orchestration get distinct names**
+  Two runs of the same orchestration in the same directory, both still running, used to get the same name, so their tabs in the TUI and their groups on the desktop Dashboard could not be told apart. This happened when two schedules started the same repository's orchestration, or when a schedule with `new_tab_per_fire = true` fired again before its previous run had finished.
+  The second run now gets the next free number after its usual name, for example `team · my-repo · 2`, then `· 3`. A run that collides with nothing keeps its usual name, and a run is never skipped because of its name. A name you type yourself when starting an orchestration is still refused when a running orchestration in that directory already uses it, including one of these numbered names.
+  See [Reuse one tab or open a new one per run](https://agent-deck.devopstoolkit.ai/docs/scheduled-tasks.md#reuse-one-tab-or-open-a-new-one-per-run).
+- **Worker-failure reports mark the worker's pane name as untrusted**
+  When a delegated worker exits without reporting, never comes up, fails to restart, or is blocked by a provider usage limit, the report the orchestrator receives now presents the worker's pane name as untrusted text copied from project config, so the orchestrator reads it as a name only and never as instructions.
+- **The deck keeps updating while a project config is slow to read**
+  When a project's `.dot-agent-deck.toml` lives on a slow or unresponsive filesystem, such as a network mount, a delegation, `pane restart` or `pane spawn` from that project no longer freezes the rest of the deck while it waits for the file. Other agents' cards keep updating their status as usual; only the command that needs the config waits for it.
+- **A Refused Re-delegation No Longer Hides an Earlier Worker That Went Quiet**
+  When an orchestrator delegates a second task to a worker that is still on its first one, and that second task cannot be handed over (for example because you were typing in the worker's pane), the deck still reports the worker if it goes quiet on the first task. Before, the refused task took the first task's "worker went quiet" report with it.
+- **The Orchestrator Hears Promptly When a Restarted Pi Worker Exits**
+  When an orchestration delegates to a Pi worker whose role restarts the agent for each task (`clear = true`), and that new Pi session then exits without reporting `work-done`, the orchestrator is now told straight away that the worker exited. Before, nothing was said until the worker-response timeout ran out, and then the orchestrator was told the worker had gone quiet rather than that it had exited.
+- **Scheduled Prompts No Longer Vanish After a Write That Is Cut Off**
+  When the deck writes a scheduled or dispatched prompt into an agent's pane and the write is cut off part-way, the deck erases what it typed and, if that leaves the input box exactly as it was, now writes the prompt again. Previously the prompt was dropped with nothing on the agent's card to say so. If writing it again does not get it in either, the card now says the prompt was not delivered, so you know to send it yourself. A write whose leftover text could not be erased is handled as before: the card says the input box may hold part of a prompt, and the deck does not write it again on top.
+- **Terminal Selections Survive the Desktop App Taking Focus**
+  In the desktop app, selecting text in an agent's terminal by dragging no longer selects nothing when the drag starts with the click that brings the window to the front. When a TUI attached to the same agent was the last thing you used, that click makes the desktop app claim the agent's size, the terminal reshapes under your pointer, and the drag used to end with an empty selection. The drag now carries on from where you pressed and selects up to where you release, and a selection you had already made is kept when the terminal reshapes.
+- **Directory names shown whole, and “go back” understood, in the New agent dialog with voice on**
+  With voice on, the desktop app's **New agent** dialog no longer cuts a few long directory names short while most of the list stands empty. A short list now uses only the columns it needs, so its names have the list's whole width; a long one still fills every column and splits into pages as before. The Mode chips likewise share the Mode row's width rather than leaving an empty column beside them. A name that is still cut short shows in full when you hover over it. Saying “go back one directory” in the dialog's directory browser now goes up a level, where it was refused with “nothing in that asks to go up a directory”. See [Voice Control](https://agent-deck.devopstoolkit.ai/docs/desktop/voice).
+- **No False "Nothing to Scroll" on Full-Screen Agents After Re-Attaching**
+  Scrolling a pane whose agent uses a full-screen interface — such as Claude Code with `"tui": "fullscreen"` — no longer shows `Nothing to scroll — this pane has no scrollback to move through` when the deck re-attaches to that agent. It happened after restarting the deck or reconnecting to a running agent, and when opening a dispatched agent's pane, once the agent had been resized or had produced a lot of output since it started. The deck now remembers that the agent is still showing a full-screen view, so scrolling in command mode behaves as it does for any full-screen program: nothing moves and no message appears. While you are typing in the pane, the wheel and scroll keys still go to the agent, which scrolls its own history.
+- **A New Agent in an Exited Worker's Pane No Longer Answers Its Delegations**
+  When a delegated worker exited on its own before reporting and a different agent later started in the same pane, that agent's first `work-done` was reported to the orchestrator as the delegated work coming back, and its report replaced the role's `.dot-agent-deck/work-done-<role>.md`. The orchestrator is now told the deck has no outstanding delegation to that worker on record, the report reaches it inline, and the last commissioned report stays in place.
+- **Delegating to a Worker That Has Exited Now Fails Instead of Reporting Success**
+  When a worker in an orchestration crashed or quit on its own, `dot-agent-deck delegate --to <role>` used to exit successfully even though nothing was left to receive the task. It now fails and names the role, and its message says the worker has exited and that `dot-agent-deck pane restart <role>` starts it again. A role set to `clear = true` is unchanged: delegating to it still starts a fresh worker, which receives the task.
+- **A pane that stops reading its input no longer stalls the deck**
+  When an agent stopped reading what is typed into its pane, for example because it hung or was suspended, a prompt, task or notice the deck sent to that pane could wait on it forever, and enough such deliveries could slow or stop the deck's work for every other pane too. A delivery into such a pane now gives up instead of waiting for it, and when part of it may already be sitting in the pane's input box, the pane's card says so, so you can clear or submit it once the agent responds. Other panes carry on as normal.
+- **Prompts reach wrapped Codex panes reliably**
+  Automatic prompts sent to a Codex pane, such as an orchestration role's starting prompt, were sometimes refused or abandoned after Codex had already started its conversation, leaving the agent without its instructions. They are now delivered to the conversation Codex is in. Starting a genuinely new conversation, for example with `/clear`, still stops a prompt meant for the previous one from being typed into the new one.
+- **Starting prompts survive a brief disconnect from the daemon**
+  The prompt an agent is started with from the deck — the starting prompt of a new agent, or an orchestration's opening instructions to its coordinator — is now delivered even if the deck briefly lost its connection to the daemon just as the agent came up. Previously the deck could miss the moment the agent announced itself, show "not delivered (stale target); will retry" until it gave up after 60 seconds, leaving the agent idle with no task. The prompt still goes only to the agent and conversation it was meant for.
+
+
+
 ## [0.45.0] - 2026-10-02
 
 ### Changed
