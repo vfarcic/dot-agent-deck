@@ -1539,6 +1539,25 @@ pub struct AppState {
     /// daemon's send guard and its own delivery latch agree on what the pane's
     /// conversation is.
     ///
+    /// **Rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
+    /// `CONTRACT_BREAKS` entry.** The wire is unchanged and each side computes
+    /// this value from the same event stream; what moved is when an ordinary
+    /// frame may move it, and every old/new pairing is today's behaviour or
+    /// fails closed. A newer TUI against an older daemon is refused exactly as
+    /// intermittently as today. An older TUI against a newer daemon can bind
+    /// the wrapper's id after the agent announced its own conversation, and
+    /// that send is now always refused rather than sometimes accepted; once it
+    /// has written, that TUI's own target check already abandoned such a
+    /// delivery at the next alternation. The desktop binds the session a
+    /// genuine `SessionStart` named, which a newer daemon now honours instead
+    /// of refusing intermittently. A newer daemon accepts a write the older one
+    /// refused only when an ordinary frame under another session id arrived
+    /// with no `SessionStart` for it — a second producer, or a producer that
+    /// rolls its session id without announcing the new one. Claude Code, Codex,
+    /// Devin and OpenCode each map a native session-start hook to
+    /// `SessionStart`, and Pi reports under one pane-derived id for its whole
+    /// life.
+    ///
     /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
     /// conversation, or because an ordinary frame carrying a pane id arrived. A
     /// `SessionStart` that announces nothing — the wrapper's boot provenance, the
