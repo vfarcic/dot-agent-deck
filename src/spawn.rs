@@ -1615,9 +1615,10 @@ async fn deliver(
     // [`ERASED_FIRST_WRITE_ATTEMPTS`] in all — rather than dropped. Only that
     // case: an ambiguous write whose bytes may still be in the box stays a
     // refusal (below), and a retry runs every gate the first write did, the
-    // pre-write drain and the user's draft included. A retry that then ends
-    // any other way without writing is reported on the card too (below): the
-    // box is clean either way, so the prompt is simply not delivered.
+    // pre-write drain and the user's draft included. A retry that is then
+    // refused or fails with nothing written is reported on the card too
+    // (below): the box is clean either way, so the prompt is simply not
+    // delivered. A retry the pre-write drain stops is not: its target is gone.
     let mut attempt = 0;
     let first = loop {
         attempt += 1;
@@ -1670,16 +1671,12 @@ async fn deliver(
                 return;
             }
             Err(reason) => {
+                // Not reported on the card, on a retry any more than on a first
+                // write: the drain stops a delivery whose target — the agent,
+                // or the conversation it was written for — is gone, and the
+                // daemon drops a notice addressed to a conversation that is no
+                // longer current.
                 log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
-                if attempt > 1 {
-                    report_erased_first_write_lost(
-                        registry,
-                        pane_id,
-                        agent_id,
-                        &delivery_id,
-                        generation.as_ref(),
-                    );
-                }
                 return;
             }
         }
@@ -6546,7 +6543,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing and the card says the prompt was not delivered; in the other, an event from the same conversation arrives instead, and the retry goes ahead.
+    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered.
     #[spec("scheduler/dispatch/027")]
     #[cfg(unix)]
     #[tokio::test]
@@ -6630,9 +6627,10 @@ mod tests {
             .collect();
         assert_eq!(
             lost,
-            vec![CHANGED_PANE.to_string(), SAME_PANE.to_string()],
-            "both prompts are lost with nothing of them left in the box, so both cards say so — \
-             the stopped retry as much as the exhausted one (issue #1455)"
+            vec![SAME_PANE.to_string()],
+            "the exhausted retry is reported on its card (issue #1455); the stopped one is not, \
+             exactly as a first write the drain stops is not — the conversation it was written \
+             for is over, and the daemon drops a notice addressed to it"
         );
     }
 
