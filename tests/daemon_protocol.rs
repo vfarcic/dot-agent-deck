@@ -2695,7 +2695,9 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
 
 /// Scenario: Queue prompts for paned agents, then omit or replace their agent or
 /// logical-session identity before delivery. The daemon must fail closed without
-/// writing, while exact identities and genuinely sessionless agents still deliver.
+/// writing — naming the current conversation when the request named none — while
+/// exact identities, a retry naming that conversation, and genuinely sessionless
+/// agents still deliver.
 #[spec("prompt/pane-input/009")]
 #[test]
 fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
@@ -2797,6 +2799,9 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             Some(SendResult::WrongSession | SendResult::Stale)
         ) && !old_prompt_reached_new_session;
         let same_agent_result = response.send_result;
+        // Issue #621: a `stale` for a request that NAMED a session is a lost
+        // target, so it names no generation to rebind to.
+        let same_agent_offered = response.current_session_id;
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
@@ -2896,18 +2901,22 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             Duration::from_millis(750),
         )
         .await;
-        let matching_response = issue_json_request(
-            &server,
-            serde_json::json!({
-                "op": "write-and-submit",
-                "pane_id": pane_id,
-                "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
-                "expected_agent_id": agent_id,
-                "expected_session_id": "current-required-session",
-                "delivery_id": "matching-identity-009"
-            }),
-        )
-        .await;
+        // Issue #621: the refusal names the generation it was refused against,
+        // and the retry names exactly that — the round trip a caller whose
+        // event stream dropped the `SessionStart` depends on, since it has no
+        // other source for the value.
+        let refused_against = unnamed_response.current_session_id.clone();
+        let mut matching_request = serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
+            "expected_agent_id": agent_id,
+            "delivery_id": "matching-identity-009"
+        });
+        if let Some(generation) = &refused_against {
+            matching_request["expected_session_id"] = serde_json::json!(generation);
+        }
+        let matching_response = issue_json_request(&server, matching_request).await;
         let matching_identity_reached = stream_contains_within(
             &mut attached,
             b"MATCHING-IDENTITY-DELIVERED",
@@ -2919,6 +2928,10 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             unnamed_session_leaked,
             matching_response.send_result,
             matching_identity_reached,
+        );
+        let offered_generations = (
+            refused_against,
+            matching_response.current_session_id.clone(),
         );
         server.registry.close_agent(&agent_id).unwrap();
 
@@ -2973,6 +2986,7 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                 .windows(unattached_marker.len())
                 .any(|window| window == unattached_marker),
         );
+        let unattached_offered = unattached_response.current_session_id.clone();
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
@@ -3016,6 +3030,19 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,
             missing_session_result
+        );
+        // Issue #621: an unnamed request refused `stale` is told the generation
+        // it was refused against, attached or not; a delivered request and a
+        // named-but-lost one are told nothing.
+        assert_eq!(
+            (offered_generations, unattached_offered, same_agent_offered),
+            (
+                (Some("current-required-session".to_string()), None),
+                Some("unattached-current-session".to_string()),
+                None,
+            ),
+            "a `stale` refusal of an unnamed request must name the pane's current generation, \
+             and nothing else may carry one"
         );
     });
 }

@@ -510,6 +510,61 @@ fn render_only_runtime() -> tokio::runtime::Handle {
     .clone()
 }
 
+/// Issue #1383 / #621: start a guarded write-and-submit on `runtime` and hand
+/// back a handle the render loop polls — the body of
+/// [`EmbeddedPaneController`]'s `begin_write_and_submit_to_pane_with_identity`,
+/// kept free-standing so a test can drive the TUI's delivery loops through the
+/// same call against an in-process daemon.
+///
+/// The reply keeps the generation a `stale` refusal names
+/// ([`crate::pane::SubmitReply::current_session_id`]), which is how a delivery
+/// whose `SessionStart` the event stream dropped learns the conversation to
+/// name.
+pub(crate) fn begin_guarded_submit(
+    runtime: &tokio::runtime::Handle,
+    client: DaemonClient,
+    pane_id: &str,
+    text: &str,
+    expected_agent_id: Option<&str>,
+    expected_session_id: Option<&str>,
+    delivery_id: Option<&str>,
+) -> PendingSubmit {
+    let (tx, pending) = PendingSubmit::channel();
+    let pane_id = pane_id.to_string();
+    let text = text.to_string();
+    let expected_agent_id = expected_agent_id.map(str::to_string);
+    let expected_session_id = expected_session_id.map(str::to_string);
+    let delivery_id = delivery_id.map(str::to_string);
+    runtime.spawn(async move {
+        let reply = match client
+            .write_and_submit_with_identity_reply(
+                &pane_id,
+                &text,
+                expected_agent_id.as_deref(),
+                expected_session_id.as_deref(),
+                delivery_id.as_deref(),
+            )
+            .await
+        {
+            Ok(reply) => crate::pane::SubmitReply {
+                result: Ok(reply.result),
+                current_session_id: reply.current_session_id,
+                may_have_written: false,
+            },
+            Err(failure) => crate::pane::SubmitReply {
+                result: Err(PaneError::CommandFailed(format!(
+                    "write_and_submit: {}",
+                    failure.error
+                ))),
+                current_session_id: None,
+                may_have_written: failure.may_have_written,
+            },
+        };
+        let _ = tx.send_reply(reply);
+    });
+    pending
+}
+
 /// Embedded terminal pane controller. Spawns agents on the daemon at
 /// [`Self::client`]'s socket path and renders their PTY output through a
 /// local vt100 parser. PRD #93 Phase 2 collapsed the historical
@@ -4322,27 +4377,15 @@ impl PaneController for EmbeddedPaneController {
         expected_session_id: Option<&str>,
         delivery_id: Option<&str>,
     ) -> PendingSubmit {
-        let (tx, pending) = PendingSubmit::channel();
-        let client = self.client.clone();
-        let pane_id = pane_id.to_string();
-        let text = text.to_string();
-        let expected_agent_id = expected_agent_id.map(str::to_string);
-        let expected_session_id = expected_session_id.map(str::to_string);
-        let delivery_id = delivery_id.map(str::to_string);
-        self.runtime.spawn(async move {
-            let outcome = client
-                .write_and_submit_with_identity(
-                    &pane_id,
-                    &text,
-                    expected_agent_id.as_deref(),
-                    expected_session_id.as_deref(),
-                    delivery_id.as_deref(),
-                )
-                .await
-                .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")));
-            let _ = tx.send(outcome);
-        });
-        pending
+        begin_guarded_submit(
+            &self.runtime,
+            self.client.clone(),
+            pane_id,
+            text,
+            expected_agent_id,
+            expected_session_id,
+            delivery_id,
+        )
     }
 
     fn name(&self) -> &str {
