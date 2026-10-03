@@ -3631,9 +3631,17 @@ fn answer_declared_choice(
 /// switch to a deck only the selector lists then matches nothing, and
 /// [`resolve_declared_utterance`] says why.
 ///
-/// **All Decks is not in here.** It is a selection rather than a deck, so a
-/// `deck_ref` naming it would also be a deck the New agent dialog is asked
-/// about; see `commands.toml`'s `switch_deck` row.
+/// # All daemons (issue #1491)
+///
+/// The selector's first entry is appended too, as [`voice::ALL_DECKS_ID`]
+/// labelled [`voice::ALL_DECKS_LABEL`] and mapped to the `all` token, so "select
+/// all daemons" switches to it through the same write a click makes. It is a
+/// selection rather than a deck, which is why it carries
+/// [`voice::DECK_IS_EVERY_DAEMON`]: the reason keeps it out of everything the
+/// New agent dialog is asked about — never shown to the model, never
+/// preselected, refused with that reason when named there — exactly as a deck
+/// the app is not connected to is. It is added past
+/// [`MAX_VOICE_SELECTOR_ROWS`] as well, since the selector always lists it.
 fn selector_voice_decks(
     endpoints: Option<&crate::settings::EndpointSettings>,
     decks: &mut Vec<voice::VoiceDeck>,
@@ -3646,8 +3654,8 @@ fn selector_voice_decks(
             .and_then(|choice| choice.reason.clone())
     };
     let local = crate::dto::deck_wire_id(&crate::local_deck::local_endpoint());
-    // The local deck carries no identity: it has no remote address that
-    // Settings can change under its token.
+    // All daemons and the local deck carry no identity: neither has a remote
+    // address that Settings can change under its token.
     let mut listed: Vec<(voice::VoiceDeck, voice::VoiceDeckSelection)> = vec![(
         voice::VoiceDeck {
             unavailable: Some(
@@ -3663,6 +3671,19 @@ fn selector_voice_decks(
             identity: None,
         },
     )];
+    listed.push((
+        voice::VoiceDeck {
+            id: voice::ALL_DECKS_ID.to_string(),
+            label: voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(voice::DECK_IS_EVERY_DAEMON.to_string()),
+        },
+        voice::VoiceDeckSelection {
+            token: crate::settings::ALL_SELECTION_TOKEN.to_string(),
+            identity: None,
+        },
+    ));
     for row in endpoints
         .map(|section| section.remote.as_slice())
         .unwrap_or_default()
@@ -3723,7 +3744,8 @@ fn selector_voice_decks(
     let adds_remote = selector_rows_beyond_voice(endpoints).is_none();
     let mut selections = HashMap::new();
     for (deck, selection) in listed {
-        if (deck.local || adds_remote) && !decks.iter().any(|known| known.id == deck.id) {
+        let always = deck.local || deck.id == voice::ALL_DECKS_ID;
+        if (always || adds_remote) && !decks.iter().any(|known| known.id == deck.id) {
             decks.push(deck.clone());
         }
         selections.entry(deck.id).or_insert(selection);
@@ -5674,7 +5696,7 @@ mod tests {
                 .iter()
                 .map(|deck| deck.label.as_str())
                 .collect::<Vec<_>>(),
-            ["Local daemon"],
+            ["Local daemon", "All daemons"],
             "an oversized section adds no remote deck to what voice resolves against"
         );
         assert_eq!(
@@ -5735,6 +5757,104 @@ mod tests {
             true,
         )
         .await
+    }
+
+    /// Scenario (issue #1491): the Daemon selector is on This machine with two
+    /// daemons configured, and the user says "select all daemons" — or
+    /// "switch to all daemons", "show all daemons", "switch daemon to all".
+    /// Each is a switch to the selector's All daemons entry, carrying the token
+    /// clicking that entry stores. The control: "switch daemon to build box"
+    /// still switches to that one daemon.
+    #[tokio::test]
+    async fn saying_all_daemons_switches_the_selector_to_all_daemons() {
+        let section: crate::settings::EndpointSettings = serde_json::from_value(serde_json::json!({
+            "remote": [
+                { "id": "rowbuild", "host": "build-box", "port": 22, "socket": "/run/deck.sock" },
+                { "id": "rowstage", "host": "staging-box", "port": 22, "socket": "/run/deck.sock" },
+            ],
+            "selection": "local",
+        }))
+        .expect("parses");
+        let switched_to = |result: &voice::VoiceResult| match &result.outcome {
+            voice::VoiceOutcome::Dispatch {
+                invoke,
+                params,
+                sentence,
+                ..
+            } if invoke == "switchDeck" => Some((
+                params[0].value.clone(),
+                params[0].deck_identity.is_some(),
+                sentence.clone(),
+            )),
+            _ => None,
+        };
+        for (said, deck) in [
+            ("select all daemons", "all daemons"),
+            ("switch to all daemons", "all daemons"),
+            ("show all daemons", "all daemons"),
+            ("switch daemon to all", "all"),
+        ] {
+            let result = resolve_with_section(
+                &section,
+                said,
+                voice::IntentAnswer::new("switch_deck").with_param("deck", deck),
+            )
+            .await
+            .expect("resolves");
+            assert_eq!(
+                switched_to(&result),
+                Some((
+                    crate::settings::ALL_SELECTION_TOKEN.to_string(),
+                    false,
+                    "Showing All daemons.".to_string()
+                )),
+                "{said:?}: {:?}",
+                result.outcome
+            );
+        }
+
+        let control = resolve_with_section(
+            &section,
+            "switch daemon to build box",
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            switched_to(&control).map(|(token, identity, _)| (token, identity)),
+            Some(("rowbuild".to_string(), true)),
+            "{:?}",
+            control.outcome
+        );
+
+        // All daemons is a selection, not a daemon a new agent can start on:
+        // named for the New agent dialog, it is refused with that reason.
+        let mut decks = voice_decks(&[], None);
+        selector_voice_decks(Some(&section), &mut decks, None);
+        let said = "new agent on all daemons";
+        let resolver = voice::StubResolver::new().answering(
+            said,
+            voice::IntentAnswer::new("open_new_agent").with_param("deck", "all daemons"),
+        );
+        let refused = voice::handle_utterance(
+            &resolver,
+            voice::table(),
+            voice::Screen::Overview,
+            &[],
+            &decks,
+            None,
+            None,
+            voice::Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            refused.sentence().contains(&format!(
+                "\u{201c}All daemons\u{201d} can't take a new agent: {}",
+                voice::DECK_IS_EVERY_DAEMON
+            )),
+            "{refused:?}"
+        );
     }
 
     /// Scenario: the Deck selector lists a build box and a staging box, and
@@ -5980,7 +6100,14 @@ mod tests {
         let mut decks = voice_decks(&observed, Some(&step));
         let selections = selector_voice_decks(Some(&endpoints), &mut decks, Some(&step));
         let find = |id: &str| decks.iter().find(|deck| deck.id == id).expect("listed");
-        assert_eq!(decks.len(), 3, "{decks:?}");
+        assert_eq!(decks.len(), 4, "{decks:?}");
+        // Issue #1491: the selector's All daemons entry, switchable and never
+        // a deck a new agent can start on.
+        assert_eq!(find(voice::ALL_DECKS_ID).label, "All daemons");
+        assert_eq!(
+            find(voice::ALL_DECKS_ID).unavailable.as_deref(),
+            Some(voice::DECK_IS_EVERY_DAEMON)
+        );
         assert_eq!(
             find(&local_key).unavailable,
             None,
@@ -6003,6 +6130,8 @@ mod tests {
         assert_eq!(token(&local_key), Some("local"));
         assert_eq!(token(&build_key), Some("buildbox01"));
         assert_eq!(token("unconfigured-newbox01"), Some("newbox01"));
+        assert_eq!(token(voice::ALL_DECKS_ID), Some("all"));
+        assert_eq!(selections[voice::ALL_DECKS_ID].identity, None);
         assert_eq!(
             selections[&local_key].identity, None,
             "local has no address"

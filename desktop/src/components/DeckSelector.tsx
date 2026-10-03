@@ -180,13 +180,13 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
   const current = choices.find((choice) => sameSelection(choice.selection, selection));
   const note = deckStateNote(connection);
   /*
-    PR #1451 round 3, change 4 — while the menu is open its daemons are a
+    PR #1451 round 3, change 4 — while the menu is open its entries are a
     numbered list, over whatever screen it opened on (the dialog layer), so
-    "two" switches to the second, as saying its name would. All daemons is a
-    view rather than a daemon and voice does not switch to it, so it carries
-    no number.
+    "two" switches to the second, as saying its name would. All daemons is
+    numbered like the rest (issue #1491): voice's `switch_deck` switches to it
+    by name, so its number dispatches the same switch with its `all` token.
   */
-  const numberedChoices = useMemo(() => (open ? choices.filter((choice) => choice.selection.kind !== "all") : undefined), [choices, open]);
+  const numberedChoices = useMemo(() => (open ? choices : undefined), [choices, open]);
   const numberedEntries = useMemo(() => numberedChoices?.map((choice): VoiceNumberedEntryDto => ({
     kind: "deck_switch",
     value: choice.token,

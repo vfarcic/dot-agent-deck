@@ -5220,6 +5220,83 @@ describe("switch deck by voice, against settings edited mid-flight", () => {
     expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("new-box");
   });
 
+  /** A settings document with two daemons configured and This machine shown (issue #1491). */
+  function storeWithTwoDaemons() {
+    let document: DesktopSettingsDto = {
+      ...DEFAULT_DESKTOP_SETTINGS,
+      endpoints: {
+        remote: [structuredClone(buildBox), { id: "deck0000000000bb", host: "staging-box", port: 22, socket: "/run/deck.sock" }],
+        selection: "local",
+      },
+    };
+    return {
+      get current() { return document; },
+      getSettings: vi.fn(async () => ({ settings: structuredClone(document), path: undefined })),
+      saveSettings: vi.fn(async (next: DesktopSettingsDto) => {
+        document = structuredClone(next);
+        return structuredClone(document);
+      }),
+    };
+  }
+
+  /**
+   * Scenario (issue #1491): the Daemon selector is on This machine with two
+   * daemons configured, and the user says "select all daemons". Rust answers
+   * with the switch it now resolves — the selector's `all` token — and the
+   * selector reads All daemons, stored through the same write a click makes.
+   * Saying it again is a no-op with the same report.
+   */
+  it("switches the selector to All daemons when the user says select all daemons", async () => {
+    const said = "select all daemons";
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => dispatch("switch_deck", "switchDeck", "Showing All daemons.", utterance, [{
+      name: "deck", kind: "deck_ref", spoken: "all daemons", value: "all", label: "All daemons",
+    }]));
+    const store = storeWithTwoDaemons();
+    render(<DeckShell runtime={runtime(resolveVoice, microphone([said, said]), { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await flush();
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("This machine");
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing All daemons.");
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
+    expect(store.current.endpoints?.selection).toBe("all");
+    expect(store.current.endpoints?.remote).toHaveLength(2);
+    const writes = store.saveSettings.mock.calls.length;
+
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing All daemons.");
+    expect(store.saveSettings).toHaveBeenCalledTimes(writes);
+  });
+
+  /**
+   * Scenario (issue #1491): with voice on and the Daemon selector's menu
+   * open, All daemons shows a number like the daemons below it, and saying
+   * "one" switches the selector to All daemons.
+   */
+  it("numbers All daemons in the open selector menu and switches to it by number", async () => {
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => ({ resolveMs: 21, backend: "stub", outcome: { kind: "no_match", transcript: utterance, sentence: "No match." } }) as VoiceResultDto);
+    const voice = microphone([]);
+    const store = storeWithTwoDaemons();
+    render(<DeckShell runtime={runtime(resolveVoice, voice, { getSettings: store.getSettings, saveSettings: store.saveSettings })} />);
+    await flush();
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    await turnVoiceOn();
+
+    const menu = screen.getByTestId("deck-selector-menu");
+    expect(within(menu).getAllByRole("radio").map((option) => option.textContent))
+      .toEqual(["1. All daemons", "2. This machine", "3. deploy@build-box", "4. staging-box"]);
+
+    voice.deliver("one");
+    await completeUtterance();
+
+    expect(screen.getByTestId("deck-selector-current")).toHaveTextContent("All daemons");
+    expect(store.current.endpoints?.selection).toBe("all");
+    expect(resolveVoice).not.toHaveBeenCalled();
+  });
+
   it("still shows the success sentence when a switch runs", async () => {
     const { store, answer } = await pendingSwitch();
 

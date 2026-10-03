@@ -30,6 +30,40 @@ action = "switch_deck"
 outcome = "dispatch"
 resolved_deck = "deck-local"
 
+# Issue #1491: the selector's All daemons entry, by the phrasings users say.
+# `open_overview` changes no selection, so none of these may route there.
+[[fixtures]]
+name = "switch-deck-select-all-daemons"
+utterance = "select all daemons"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-switch-to-all-daemons"
+utterance = "switch to all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-show-all-daemons"
+utterance = "show all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-daemon-to-all"
+utterance = "switch daemon to all"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
 [[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"

@@ -34,7 +34,7 @@ What you can do by voice, by screen:
 | Where | You can |
 | --- | --- |
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
-| Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
 
@@ -58,7 +58,7 @@ Once the New agent dialog has a daemon and a directory chosen, say "set the comm
 
 ## Choosing by number
 
-While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the daemons in the **Daemon** selector while its menu is open. With voice off, they look as they always do.
+While voice is on, the lists you can choose from by voice show a number before each item: the agents on the dashboard, the agent tiles on the Daemons screen, the daemons, directories and modes in the New agent dialog, and the entries of the **Daemon** selector while its menu is open, **All daemons** included. With voice off, they look as they always do.
 
 Each list is numbered from 1. When several lists are visible together, as in the New agent dialog, each has its own numbers: the daemons 1, 2…, the directories 1, 2… (with `..` for the folder above as 1), and the modes 1, 2…. On the dashboard the agents of every daemon are one list, numbered top to bottom. While an agent's pane, the New agent dialog or the **Daemon** menu is open, only what is in front is numbered. A list shown in pages is numbered from 1 on every page; see [Long lists are shown in pages](#long-lists-are-shown-in-pages).
 
