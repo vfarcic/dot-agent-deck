@@ -284,6 +284,8 @@ fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot()
             ("DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS", ""),
             ("DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS", &schedule),
             ("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", ""),
+            // The hold's own debug line names the interval it resolved.
+            ("RUST_LOG", "dot_agent_deck::state=debug"),
         ],
     );
 
@@ -295,10 +297,18 @@ fn delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot()
         String::from_utf8_lossy(&std::fs::read(&discarded).unwrap_or_default()).into_owned(),
         deck.snapshot_grid()
     );
-    // The production hold was in force: the hold starts after the delegate
-    // reached the daemon, so the swallowed pointer cannot arrive sooner than
-    // 8 s after it was sent. 7.5 s leaves room for clock granularity and
-    // rejects any shorter hold.
+    // The production hold was in force, by the daemon's own account: the
+    // declared-no-signal path logs the interval it resolved before it waits.
+    let daemon_log = std::fs::read_to_string(work.join("retry-loop.log")).unwrap_or_default();
+    assert!(
+        daemon_log.lines().any(|line| line
+            .contains("holding the task prompt for the no-signal readiness buffer")
+            && line.contains("buffer_ms=8000")),
+        "precondition: the daemon did not hold the pointer for the shipped 8000 ms no-signal buffer; daemon log:\n{daemon_log}"
+    );
+    // And the bytes really arrived that late. The baseline is taken just
+    // before the delegate CLI starts, so this is a sanity bound, not a
+    // measurement of the hold: 7.5 s leaves room for clock granularity.
     let delegated_at: f64 = std::fs::read_to_string(work.join("delegate-sent-at.log"))
         .expect("fixture logged when it sent the delegate")
         .trim()
