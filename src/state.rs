@@ -1637,10 +1637,10 @@ pub struct AppState {
     ///
     /// Read only by that seeding. A reconnecting TUI subscribes to events before
     /// it hydrates, so an announcement can reach it after the daemon built its
-    /// `ListAgents` snapshot; every announcement this state applies also reached
-    /// the daemon, in the same broadcast order, so this state's own latest one is
-    /// at least as current as the snapshot's and must not be overwritten by it.
-    /// Kept in step with the map at each site that writes it.
+    /// `ListAgents` snapshot, and must then not be overwritten by it. See
+    /// [`Self::adopt_hydrated_generation`] for the opposite ordering and why
+    /// keeping the local announcement still converges. Kept in step with the
+    /// map at each site that writes it.
     pane_generation_announced: HashSet<String>,
     /// Issue #915 (finding 4): how many of each AGENT's own hook generations
     /// have ended, keyed by the registry agent id the `SessionEnd` carried.
@@ -10855,9 +10855,20 @@ impl AppState {
     /// frames that reached it before hydration ran (the event subscriber starts
     /// first), because the daemon saw the whole history and this state saw only
     /// its tail. It does NOT replace one a genuine `SessionStart` set here
-    /// ([`Self::pane_generation_announced`]): that announcement also reached the
-    /// daemon, in the same order, so it is at least as current as the snapshot,
-    /// and newer than it when it landed between `ListAgents` and this call. The
+    /// ([`Self::pane_generation_announced`]), because neither side of that pair
+    /// can be ordered against the other from what this state holds: the
+    /// snapshot carries no position in the event stream, and a genuine start's
+    /// timestamp is not evidence of order (#424 D2). Of the two orderings,
+    /// keeping the local announcement is the one that converges by itself.
+    /// When it landed between `ListAgents` and this call it is the newer, and
+    /// replacing it would leave this state on a superseded id with nothing
+    /// left in flight to correct it. When it is the OLDER one — this state's
+    /// stream lags the daemon, which has already moved to a later announcement
+    /// — that later announcement is still in flight on the same ordered stream
+    /// and moves the pane when it is applied. What stays open is a stream that
+    /// drops that later announcement: this state then holds the older id until
+    /// the next one, and its guarded sends are refused rather than delivered,
+    /// as for any announcement a lagged or reconnected subscriber misses. The
     /// same generation keeps the later of the two timestamps either way, so a
     /// fresher frame already applied here is not rolled back.
     ///
