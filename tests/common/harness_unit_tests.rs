@@ -5301,3 +5301,85 @@ mod load_context_tests {
         assert!(report.contains("window:"), "{stderr}");
     }
 }
+
+// -----------------------------------------------------------------------
+// Issue #244 — the async content waiters poll content, not existence
+// -----------------------------------------------------------------------
+
+/// Scenario: Create the sentinel EMPTY — the state a shell redirect leaves it
+/// in before its write lands — and fill it 400ms later. An existence wait
+/// would already have returned and read `""`; the async content waiter must
+/// keep polling and return `Ok` only once the expected text is there.
+#[tokio::test]
+async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let trimmed = dir.path().join("trimmed.txt");
+    let containing = dir.path().join("containing.txt");
+    std::fs::write(&trimmed, "").expect("create empty sentinel");
+    std::fs::write(&containing, "").expect("create empty sentinel");
+    // Control: the race window is real — the file exists and reads empty.
+    assert!(wait_for_path_async(&trimmed, Duration::ZERO).await);
+    assert_eq!(std::fs::read_to_string(&trimmed).unwrap(), "");
+
+    let (t, c) = (trimmed.clone(), containing.clone());
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::write(&t, "SENTINEL_OK\n").expect("fill sentinel");
+        std::fs::write(&c, "prefix SENTINEL_OK suffix").expect("fill sentinel");
+    });
+
+    let started = std::time::Instant::now();
+    wait_for_file_trimmed_eq_async(&trimmed, "SENTINEL_OK", Duration::from_secs(10))
+        .await
+        .expect("trimmed waiter must see the late write");
+    wait_for_file_containing_async(&containing, "SENTINEL_OK", Duration::from_secs(10))
+        .await
+        .expect("containing waiter must see the late write");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "returned before the write landed: {:?}",
+        started.elapsed()
+    );
+    writer.await.expect("writer task");
+}
+
+/// Scenario: The sentinel exists but its expected content never arrives —
+/// empty for one waiter, a partial prefix for the other. Each must give up at
+/// its timeout with an `Err` describing what the file actually held, not
+/// return `Ok` because the file exists.
+#[tokio::test]
+async fn async_content_waiters_time_out_when_the_content_never_arrives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = dir.path().join("empty.txt");
+    let partial = dir.path().join("partial.txt");
+    std::fs::write(&empty, "").expect("create empty sentinel");
+    std::fs::write(&partial, "SENTINEL").expect("create partial sentinel");
+    let timeout = Duration::from_millis(500);
+
+    let started = std::time::Instant::now();
+    let err = wait_for_file_trimmed_eq_async(&empty, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("an empty file must not satisfy the trimmed waiter");
+    assert!(
+        started.elapsed() >= timeout,
+        "gave up early: {:?}",
+        started.elapsed()
+    );
+    assert!(err.contains("contains \"\""), "{err}");
+
+    let err = wait_for_file_trimmed_eq_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the trimmed waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let err = wait_for_file_containing_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the containing waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let missing = dir.path().join("missing.txt");
+    let err = wait_for_file_containing_async(&missing, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a missing file must not satisfy the containing waiter");
+    assert!(err.contains("does not exist"), "{err}");
+}
