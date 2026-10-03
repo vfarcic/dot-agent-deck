@@ -4865,6 +4865,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** what the deck does with the marker (`prompt/pane-input/041` for the TUI-owned delivery, `scheduler/dispatch/016` for the daemon-owned one); a trust record left by an earlier `hooks install`, which this spawn cannot see and which the marker therefore misreads in the safe direction; a launcher that re-exports `CODEX_HOME`, which the wrapper cannot detect and which stays a residual.
 - **Platform coverage:** mac+linux (unix-only test file).
 
+##### codex/trust/006 — Only the deck's own stale trust records are collected (issue #1027 item 1).
+- **Layer:** L1/fast real-binary subprocess integration: the real `hooks install --agent codex`, an isolated Codex home with a pre-seeded `config.toml`, a seeded durable deck, and a deterministic `codex app-server` stand-in.
+- **Agent:** synthetic `hooks/list` reply listing the deck's hook at `pre_tool_use:0:0` and a user's hook at `pre_tool_use:1:0`, both in the home's shared `hooks.json`; `[hooks.state]` seeded with the deck's current record, a deck-hash record at the user's listed position (the #1034 shape), two deck-hash records at unlisted positions (one table-shaped, one inline with `enabled = false`), a user's record at an unlisted position in the same file, an older deck build's record (different hash) at an unlisted position, a deck-hash record for another Codex home, and a key not shaped like a Codex position.
+- **Asserts:** with a clean listing, exactly the two unlisted deck-hash records in this home's `hooks.json` are removed and every other record survives, the user's other `config.toml` content included — so no one of the three conditions (unlisted position, the deck's current hash, this home's file) decides alone, which reverting each condition separately confirms; with the same seed and a listing carrying a `warnings` entry, nothing is removed.
+- **Does not assert:** that real Codex reports the hash this way (measured on codex-cli 0.149.0 in issue #1027, not re-derived here); an empty listing, which never reaches the sweep because it trusts nothing (the early return is unchanged); a position the listing missed but `hooks.json` still holds, which a concurrent deck process produces (`codex/trust/007`).
+- **Platform coverage:** mac+linux (unix-only test file).
+
+##### codex/trust/007 — A trust record whose position is still in `hooks.json` survives the sweep even when the listing missed it (Greptile P1 on PR #1519).
+- **Layer:** L1/fast real-binary subprocess integration: the real `hooks install --agent codex`, an isolated Codex home, a seeded durable deck, and a deterministic `codex app-server` stand-in.
+- **Agent:** `hooks.json` seeded with three user rules under `PreToolUse`; `[hooks.state]` seeded with two deck-hash records at positions the stand-in does not list — `pre_tool_use:2:0`, which the file holds, and `pre_tool_use:9:0`, which it does not; the listing names only the deck's hook, so the sweep runs.
+- **Asserts:** the record at `2:0` survives and the one at `9:0` is removed — the shape a listing taken before a concurrent deck process rewrote `hooks.json` and trusted a new position produces, where the listing alone would call the fresh record stale. RED with the file check reverted.
+- **Does not assert:** a real concurrent process (the ordering argument is on `sweep_stale_deck_trust_records`); the lost update any two concurrent `config.toml` writers have, which predates the sweep.
+- **Platform coverage:** mac+linux (unix-only test file).
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
@@ -4981,7 +4995,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast real-binary subprocess integration with isolated homes and a deterministic Codex app-server stand-in.
 - **Agent:** synthetic Codex installation environment, then a `PATH` with no `codex` on it at all so the trust step fails with `NotFound`.
 - **Asserts:** after a seeding install leaves exactly one scoped trust record, a re-install with no reachable `codex` exits 0, says on stderr that scoped hook trust could not be recorded, and prints no trust line on stdout; an uninstall under the same conditions exits 0, says on stderr that scoped hook trust could not be dropped, still removes every deck hook definition from `hooks.json`, and leaves the unreachable trust record behind — the orphan the warning names.
-- **Does not assert:** that the orphan record is ever collected (it is not today — issue #1027 item 1), or the three non-error trust outcomes (`codex/hooks/005`).
+- **Does not assert:** that the orphan record is collected — an uninstall never collects one, and the install-side collection that issue #1027 item 1 added runs only from a listing that still names the deck's hook (`codex/trust/006`); the three non-error trust outcomes (`codex/hooks/005`).
 - **Platform coverage:** mac+linux.
 
 ##### codex/hooks/007 — A deck install leaves a user's hook at the Codex trust key it was already at (issue #1034).
@@ -5016,6 +5030,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
 - **Asserts:** with a rule whose last two handlers are the deck's own surplus copies and nothing of the user's after them, one install removes both and leaves the user's handler at `handler_idx` 1 — so the tail-only rule is a real sweep rather than a blanket refusal to tidy, which is what keeps `codex/hooks/010` from being satisfied by doing nothing at all.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/012 — The install CLI names a deck hook the user turned off in Codex, and leaves it off (issue #1027 item 2).
+- **Layer:** L1/fast real-binary subprocess integration with isolated homes, a deterministic Codex app-server stand-in and `DOT_AGENT_DECK_LOG` pointed into the fixture.
+- **Agent:** synthetic Codex installation environment; two runs whose only difference is the deck `PreToolUse` entry's `enabled` (in the listing and in the seeded `[hooks.state]` record carrying a stale hash).
+- **Asserts:** with the hook turned off, the record keeps `enabled = false` while `trusted_hash` refreshes to the listed hash, the `Trusted hooks: 1` line stays a bare count, a separate stdout note says the deck's hook is turned off and names `PreToolUse`, and the log carries a WARN line saying so; with the hook on, no note appears.
+- **Does not assert:** the startup and wrapper paths' warn line (they share `trust_deck_hooks_in` with this one); that Codex itself honours `enabled = false` (measured on codex-cli 0.149.0 in issue #1027's thread, not here).
 - **Platform coverage:** mac+linux.
 
 #### codex/live
