@@ -5415,3 +5415,77 @@ async fn async_content_waiters_time_out_when_the_content_never_arrives() {
         .expect_err("a missing file must not satisfy the containing waiter");
     assert!(err.contains("does not exist"), "{err}");
 }
+
+/// Issue #1516: `env_write::assert_no_tokio_runtime` refuses an environment
+/// write made from inside a runtime — the shape `EnvGuard::repoint` had inside
+/// `block_on` in `delegate_prompt_injection.rs`.
+#[test]
+fn env_write_refuses_inside_a_runtime() {
+    let refused = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build current-thread runtime")
+        .block_on(async {
+            std::panic::catch_unwind(|| env_write::assert_no_tokio_runtime("inside block_on"))
+        });
+    let message = refused.expect_err("a write from inside block_on must be refused");
+    let message = message
+        .downcast_ref::<String>()
+        .expect("the refusal is a formatted message");
+    assert!(
+        message.contains("inside block_on") && message.contains("#1516"),
+        "{message}"
+    );
+}
+
+/// Issue #1516: the refusal also sees a multi-thread runtime's workers from
+/// outside `block_on`, which is where `delegate/027`'s second arm wrote while
+/// the first arm's runtime was still alive, and it stops refusing once that
+/// runtime has dropped. The last half is the premise every guard's SAFETY
+/// comment rests on: dropping a runtime joins its threads. The first half is
+/// also what fails if a Tokio upgrade renames those threads, which would leave
+/// the `/proc` scan matching nothing (Tokio 1.53 calls them `tokio-rt-worker`,
+/// and this test caught the scan looking for `tokio-runtime-worker`).
+#[cfg(target_os = "linux")]
+#[test]
+fn env_write_refuses_while_runtime_threads_exist_and_not_after_the_runtime_drops() {
+    // Under plain `cargo test` a sibling test's runtime shares this process, so
+    // neither "no runtime threads yet" nor "none left after the drop" is this
+    // test's to assert, and the scan is off there anyway.
+    if !env_write::owns_the_process() {
+        eprintln!("SKIP: the runtime-thread scan needs nextest's process-per-test mode");
+        return;
+    }
+    env_write::assert_no_tokio_runtime("before any runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("build multi-thread runtime");
+    // A new thread carries its creator's name until it renames itself, so a
+    // worker that has not run yet is listed under this test's name. Wait
+    // (bounded) for the workers to take theirs before looking for them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while env_write::tokio_runtime_threads().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !env_write::tokio_runtime_threads().is_empty(),
+        "a live multi-thread runtime must show up in /proc/self/task; threads: {:?}",
+        std::fs::read_dir("/proc/self/task")
+            .map(|tasks| tasks
+                .filter_map(Result::ok)
+                .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    let refused =
+        std::panic::catch_unwind(|| env_write::assert_no_tokio_runtime("beside a live runtime"));
+    assert!(
+        refused.is_err(),
+        "a write while runtime threads exist must be refused"
+    );
+    drop(runtime);
+    // Not `tokio_runtime_threads().is_empty()` directly: a joined thread can
+    // stay listed for a moment (see `assert_no_tokio_runtime`), and the
+    // assertion is what waits that out.
+    env_write::assert_no_tokio_runtime("after the runtime dropped");
+}

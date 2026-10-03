@@ -6321,7 +6321,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/003 — A zero worker-response timeout DISABLES the detector — from the config key and from the millisecond seam alike — rather than firing immediately (PRD #126 M1 audit finding 4).
-- **Layer:** fast integration (three delegations against one harness whose project config sets `worker_response_timeout_minutes = 0`, re-pointing the millisecond seam between them).
+- **Layer:** fast integration (three delegations against one harness whose project config sets `worker_response_timeout_minutes = 0`, re-pointing the millisecond seam between them; the first value is the environment variable, the later two go through `dot_agent_deck::env_override` so nothing writes the environment while the harness runs (issue #1516)).
 - **Agent:** none (`cat` stand-ins).
 - **Asserts:** with the seam at a positive value the detector fires (positive control, and proof the seam overrides a config that would have disabled it); re-pointing the same harness's seam to `0` produces no prompt; unsetting the seam so the config's own `0` is consulted produces no prompt either; exactly one prompt exists at the end.
 - **Does not assert:** that a *file* `0` is decisive against a file positive value — no config value below one minute exists, so that comparison is unobservable behaviorally and is covered at resolution level by `scheduler/idle-worker/007`.

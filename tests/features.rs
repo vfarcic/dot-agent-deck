@@ -32,6 +32,15 @@ use dot_agent_deck::features::{self, Features};
 /// `DOT_AGENT_DECK_EXPERIMENTAL` env var. Under `cargo nextest` each test is
 /// its own process so this is belt-and-suspenders, but it keeps plain
 /// `cargo test` (threads in one process) correct too.
+///
+/// **What the guards below can race** (issue #1516). `set_var` / `remove_var`
+/// race any thread reading the environment at the same moment, and holding this
+/// lock excludes sibling tests, not threads. The threads that exist when a guard
+/// writes: the test's own and libtest's runner thread, which waits for it.
+/// Nothing in this file starts a runtime or a thread, and it does not link the
+/// harness, so there is no `load-context` heartbeat either. Under plain
+/// `cargo test` a sibling test that takes no lock and reads the environment
+/// still races these writes (issue #245).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII guard: set/clear `DOT_AGENT_DECK_EXPERIMENTAL` and restore the prior
@@ -43,8 +52,8 @@ struct ExperimentalEnvGuard {
 impl ExperimentalEnvGuard {
     fn set(value: Option<&str>) -> Self {
         let prev = std::env::var(EXPERIMENTAL_ENV).ok();
-        // SAFETY: the caller holds ENV_LOCK for the guard's lifetime, which
-        // serializes all access to this env var across the test binary.
+        // SAFETY: a stated residual — see `ENV_LOCK` for the threads that exist
+        // here. The caller holds that lock for the guard's lifetime.
         unsafe {
             match value {
                 Some(v) => std::env::set_var(EXPERIMENTAL_ENV, v),
@@ -57,7 +66,7 @@ impl ExperimentalEnvGuard {
 
 impl Drop for ExperimentalEnvGuard {
     fn drop(&mut self) {
-        // SAFETY: see ExperimentalEnvGuard::set — ENV_LOCK is held.
+        // SAFETY: see `ENV_LOCK`; the caller still holds it.
         unsafe {
             match self.prev.take() {
                 Some(v) => std::env::set_var(EXPERIMENTAL_ENV, v),
@@ -79,8 +88,8 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: Option<&str>) -> Self {
         let prev = std::env::var(key).ok();
-        // SAFETY: the caller holds ENV_LOCK for the guard's lifetime, which
-        // serializes all access to this env var across the test binary.
+        // SAFETY: a stated residual — see `ENV_LOCK` for the threads that exist
+        // here. The caller holds that lock for the guard's lifetime.
         unsafe {
             match value {
                 Some(v) => std::env::set_var(key, v),
@@ -93,7 +102,7 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: see EnvVarGuard::set — ENV_LOCK is held.
+        // SAFETY: see `ENV_LOCK`; the caller still holds it.
         unsafe {
             match self.prev.take() {
                 Some(v) => std::env::set_var(self.key, v),

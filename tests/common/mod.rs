@@ -39,6 +39,10 @@ pub mod synthetic_agent;
 /// regression. The module header has the signals and what they do not prove.
 pub(crate) mod load_context;
 
+/// Issue #1516: the refusal an in-process environment write in a test makes
+/// while a Tokio runtime is alive. The module header has the rule.
+pub mod env_write;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

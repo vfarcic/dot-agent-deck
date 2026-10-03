@@ -37,6 +37,11 @@ pub mod embedded_docs;
 // read-only probe of the pre-#1121 endpoint spelling, and (issue #1211) the
 // daemon's best-effort alias bind of that same spelling.
 pub mod endpoint_resolve;
+// Issue #1516: an in-process stand-in for a few environment knobs, so a test can
+// change one while the deck's own tasks are reading it. Production never sets an
+// override; the environment variables stay the user-facing knobs.
+#[doc(hidden)]
+pub mod env_override;
 pub mod error;
 pub mod event;
 pub mod features;
