@@ -22345,7 +22345,9 @@ while True:
     /// predecessor's id on its own pane — has been refused since the handover.
     /// The untagged form must not be the way around that: it used to be owned,
     /// because the pane-only ownership arm matched any record still naming the
-    /// pane, and so it minted a session card for a defunct pane.
+    /// pane, and so it minted a session in the daemon's state for a defunct
+    /// pane. (Attached TUIs receive the broadcast before this admission runs,
+    /// so their cards are not what this test is about.)
     #[cfg(unix)]
     #[tokio::test]
     async fn an_untagged_report_for_a_handed_over_then_reaped_pane_drives_nothing() {
