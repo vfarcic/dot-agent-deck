@@ -121,6 +121,14 @@ pub struct Evidence {
     /// target dir: what is known about which commit that binary was built
     /// from. `None` means this run built the branch at `head_sha` itself.
     pub skip_build: Option<String>,
+    /// For a run that built the branch: the commit the binary's own build id
+    /// names, against `head_sha` (issue #1530). Empty with `--skip-build`,
+    /// which says the same in `skip_build`.
+    pub built_commit: String,
+    /// Set when the binary under test is not provably a build of `head_sha`.
+    /// It voids the run: the verdict is INCOMPLETE whatever the tells say,
+    /// because they measured some other commit.
+    pub build_mismatch: Option<String>,
     /// The build-time gate's answer (`buildgate.rs`): identical to the
     /// merge-base, or which build-time files the branch changes and why the run
     /// went ahead anyway. The outer half sets it; `merge_inner` leaves it.
@@ -270,6 +278,11 @@ impl Evidence {
         if let Some(why) = &self.isolation_failure {
             return RunVerdict::Incomplete(format!("an isolation check failed — {why}"));
         }
+        if let Some(why) = &self.build_mismatch {
+            return RunVerdict::Incomplete(format!(
+                "the binary under test is not a build of the branch HEAD the run fetched — {why}"
+            ));
+        }
         if !self.passed() {
             return RunVerdict::Fail;
         }
@@ -372,6 +385,9 @@ impl Evidence {
             );
         } else {
             let _ = writeln!(s, "| branch HEAD | `{}` |", self.head_sha);
+            if !self.built_commit.is_empty() {
+                let _ = writeln!(s, "| commit built | {} |", self.built_commit);
+            }
         }
         if !self.build_time.is_empty() {
             let _ = writeln!(s, "| build-time code | {} |", self.build_time);
