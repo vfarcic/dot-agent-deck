@@ -960,6 +960,7 @@ pub async fn handle_utterance_with_dictation(
                 directories,
                 new_agent,
                 row.id != SWITCH_DECK_ROW,
+                &row.id,
             )
         };
         match step {
@@ -1812,6 +1813,7 @@ fn resolve_param(
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
     for_new_agent: bool,
+    row: &str,
 ) -> Result<ResolvedParam, Unmet> {
     let param = |value: String, label: String| ResolvedParam {
         name: spec.name.clone(),
@@ -1841,6 +1843,10 @@ fn resolve_param(
             // transcript itself opens with one of the introductions the row
             // names, that is the boundary — found in OUR transcript, so what
             // is typed is still its own slice and never the model's string.
+            // Dictation's only: `name_new_agent` marks its own prefix, and a
+            // name marked whole is not one of these introductions (Qodo on
+            // PR #1529).
+            Some(_) if row != DICTATE_ROW => Err(Unmet::NoMatch),
             Some(_) => match opening_with(transcript.text(), &MARKED_WHOLE_INTRODUCTIONS)
                 .and_then(|opening| Some((opening, strip_opening(transcript.text(), opening)?)))
                 .filter(|(_, rest)| !rest.trim().is_empty())
@@ -1873,6 +1879,15 @@ fn resolve_param(
             Some(text) => Ok(param(text.clone(), text)),
             None => Err(Unmet::NoMatch),
         },
+        // Issue #1495 (Greptile on PR #1529): the model may drop the daemon
+        // the user named — "Codex" for "open the Codex agent on build box" —
+        // so the transcript is held to the same rule as the reference: naming
+        // a daemon these agents are not on reaches none of them.
+        ParamKind::AgentRef
+            if names_another_daemon(&word_sequence(transcript.text()), agents, decks) =>
+        {
+            Err(Unmet::NoMatch)
+        }
         ParamKind::AgentRef => match resolve_agent_ref_on(spoken, agents, decks) {
             AgentRefMatch::One { id, label } => Ok(param(id, label)),
             AgentRefMatch::None => Err(Unmet::NoMatch),
@@ -3058,9 +3073,16 @@ pub fn resolve_agent_ref_on(
     if !shown.is_empty() {
         return agent_ref_match(&shown, agents);
     }
+    // Facets are spelled by [`spoken_text`], so the reference is too: the
+    // model answers `work/api` the way it was shown it.
+    let spelled = normalize(&spoken_text(spoken));
     let known: Vec<&DesktopAgent> = agents
         .iter()
-        .filter(|agent| named_exactly(agent_facets(agent)))
+        .filter(|agent| {
+            agent_facets(agent)
+                .iter()
+                .any(|name| normalize(name) == reference || normalize(name) == spelled)
+        })
         .collect();
     if !known.is_empty() {
         return agent_ref_match(&known, agents);
@@ -3076,36 +3098,19 @@ pub fn resolve_agent_ref_on(
     // Spelled the way every name below is, so punctuation splits a reference
     // exactly where it splits a name ("deploy@build-box", "schedule: issues").
     let mut said = words(&normalize(&spoken_text(spoken)));
-    let every_name = |agent: &DesktopAgent| {
-        let mut names = spoken_names(agent);
-        names.extend(agent_facets(agent));
-        names
-    };
-    let explained = |name_words: &BTreeSet<String>| {
-        agents.iter().any(|agent| {
-            let mut all = BTreeSet::new();
-            for name in every_name(agent) {
-                all.extend(words(&normalize(&spoken_text(&name))));
-            }
-            name_words.is_subset(&all)
-        })
-    };
+    let sequence = word_sequence(spoken);
+    if names_another_daemon(&sequence, agents, decks) {
+        return AgentRefMatch::None;
+    }
     let mut daemon_named = false;
-    for deck in decks {
-        for name in deck_spoken_names(deck) {
-            let name_words: BTreeSet<String> = words(&normalize(&spoken_text(&name)))
-                .into_iter()
-                .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
-                .collect();
-            if name_words.is_empty() || !name_words.is_subset(&said) {
-                continue;
-            }
-            if deck.holds_agents {
-                said.retain(|word| !name_words.contains(word));
-                daemon_named = true;
-            } else if !explained(&name_words) {
-                return AgentRefMatch::None;
-            }
+    for name in decks
+        .iter()
+        .filter(|deck| deck.holds_agents)
+        .flat_map(daemon_names)
+    {
+        if name.said_of(&sequence, agents) {
+            said.retain(|word| !name.words.contains(word));
+            daemon_named = true;
         }
     }
     let recency = Recency::said(&mut said);
@@ -3160,6 +3165,92 @@ fn quotes_last_prompt(spoken: &str, agent: &DesktopAgent) -> bool {
 /// The fewest words of a last prompt that count as quoting it.
 const QUOTED_PROMPT_WORDS: usize = 3;
 
+/// `text` as the ordered words [`spoken_text`] and [`normalize`] make of it.
+fn word_sequence(text: &str) -> Vec<String> {
+    normalize(&spoken_text(text))
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// One spoken name of a daemon, as a reference to an agent reads it.
+struct DaemonName {
+    /// Its words, in order — "local daemon", or "daemon" for a host called
+    /// that.
+    ordered: Vec<String>,
+    /// Its words less the category words ("local" for "Local daemon"),
+    /// which is what an unqualified mention has to say. Empty for a name made
+    /// only of them, which then counts only as a qualifier.
+    words: BTreeSet<String>,
+}
+
+impl DaemonName {
+    /// Whether `said` puts this daemon in the reference.
+    ///
+    /// **A qualifier always does** — the name right after "on" or "from",
+    /// optionally with "the": "the Codex agent on build box". It says where
+    /// the agent is, whatever else the words could mean, so an agent whose
+    /// own name is "build box" does not cancel it, and a host called
+    /// `daemon` is still a daemon there (Qodo on PR #1529).
+    ///
+    /// **An unqualified mention does only when no agent's names explain it**:
+    /// "the agent in billing" next to a daemon also called `billing` is about
+    /// the directory, and "the staging reviewer" next to a daemon called
+    /// `staging` keeps the word that tells the staging run apart.
+    fn said_of(&self, said: &[String], agents: &[DesktopAgent]) -> bool {
+        const LEADS: [&[&str]; 4] = [&["on"], &["from"], &["on", "the"], &["from", "the"]];
+        let qualified = |lead: &[&str]| {
+            said.windows(lead.len() + self.ordered.len()).any(|window| {
+                window.iter().zip(lead).all(|(said, lead)| said == lead)
+                    && window[lead.len()..] == self.ordered[..]
+            })
+        };
+        if !self.ordered.is_empty() && LEADS.iter().any(|lead| qualified(lead)) {
+            return true;
+        }
+        let said: BTreeSet<String> = said.iter().cloned().collect();
+        !self.words.is_empty()
+            && self.words.is_subset(&said)
+            && !agents.iter().any(|agent| {
+                let mut all = BTreeSet::new();
+                for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
+                    all.extend(words(&normalize(&spoken_text(name))));
+                }
+                self.words.is_subset(&all)
+            })
+    }
+}
+
+/// Every spoken name of `deck` ([`deck_spoken_names`]) as a [`DaemonName`].
+fn daemon_names(deck: &VoiceDeck) -> Vec<DaemonName> {
+    deck_spoken_names(deck)
+        .iter()
+        .map(|name| {
+            let ordered = word_sequence(name);
+            let words = ordered
+                .iter()
+                .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
+                .cloned()
+                .collect();
+            DaemonName { ordered, words }
+        })
+        .collect()
+}
+
+/// Whether `said` (ordered words) names a daemon the agents here are NOT on
+/// ([`DaemonName::said_of`]). The agents voice reaches are one daemon's
+/// ([`VoiceDeck::holds_agents`]), so an agent reference naming another daemon
+/// names none of them: "the Codex agent on build box" is not this machine's
+/// Codex agent.
+fn names_another_daemon(said: &[String], agents: &[DesktopAgent], decks: &[VoiceDeck]) -> bool {
+    decks
+        .iter()
+        .filter(|deck| !deck.holds_agents)
+        .flat_map(daemon_names)
+        .any(|name| name.said_of(said, agents))
+}
+
 /// [`resolve_agent_ref_on`]'s answer for the agents a pass found.
 fn agent_ref_match(hits: &[&DesktopAgent], agents: &[DesktopAgent]) -> AgentRefMatch {
     match hits {
@@ -3210,18 +3301,22 @@ fn best_covered<'a>(
                 covered.extend(name_words.intersection(content).cloned());
             }
         }
-        covered.len()
+        covered
+    };
+    let every_name = |agent: &DesktopAgent| {
+        let mut every = spoken_names(agent);
+        every.extend(agent_facets(agent));
+        every
     };
     let mut best = (0, 0, false);
     let mut hits: Vec<&DesktopAgent> = Vec::new();
     for agent in agents {
         let shown = spoken_names(agent);
-        let mut every = shown.clone();
-        every.extend(agent_facets(agent));
+        let every = every_name(agent);
         let contains_all = every
             .iter()
             .any(|name| content.is_subset(&words(&normalize(&spoken_text(name)))));
-        let score = (covered(&every), covered(&shown), contains_all);
+        let score = (covered(&every).len(), covered(&shown).len(), contains_all);
         if score == (0, 0, false) {
             continue;
         }
@@ -3234,6 +3329,20 @@ fn best_covered<'a>(
             std::cmp::Ordering::Less => {}
         }
     }
+    // A best match that leaves out a word ANOTHER agent's names account for
+    // is a conflict, not a match: "the Codex agent in docs-site" names the
+    // Codex agent and the agent in docs-site, and when those are two agents,
+    // opening either one acts on something the user excluded. So it finds
+    // nothing, rather than the agent that happens to match more of it.
+    hits.retain(|hit| {
+        let left_out: BTreeSet<String> = content
+            .difference(&covered(&every_name(hit)))
+            .cloned()
+            .collect();
+        !agents
+            .iter()
+            .any(|other| other.id != hit.id && !covered(&every_name(other)).is_disjoint(&left_out))
+    });
     hits
 }
 
@@ -4199,6 +4308,18 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
     if let Some(directory) = agent.cwd.as_deref().and_then(directory_name) {
         add(directory);
     }
+    // The directory with the one above it — `work/api` — which is how the
+    // model is shown two agents whose directories share a name
+    // (`prompt::state`), and so how it may answer. A whole name, so it counts
+    // only when both words were said: the parent alone names nothing.
+    if let Some(path) = agent.cwd.as_deref()
+        && let Some(name) = directory_name(path)
+    {
+        let parent = path.trim().trim_end_matches(['/', '\\']);
+        if let Some(parent) = directory_name(&parent[..parent.len() - name.len()]) {
+            add(&format!("{parent}/{name}"));
+        }
+    }
     facets
 }
 
@@ -4373,7 +4494,7 @@ mod tests {
     use crate::voice::resolver::{IntentAnswer, StubResolver};
     use crate::voice::table::table;
 
-    use crate::voice::fixtures::{agent, facets_fleet, role_agent};
+    use crate::voice::fixtures::{agent, facets_fleet, in_titled_orchestration, role_agent};
 
     /// A row's first whole-utterance phrase over the New agent dialog, when it
     /// has a grounding that depends on it.
@@ -6804,6 +6925,25 @@ mod tests {
         );
     }
 
+    /// Scenario: the model marks all of "tell it to name it Bob" as
+    /// `name_new_agent`'s prefix. The dictation fallback that finds "tell it
+    /// to" in the transcript is `dictate_to_agent`'s only, so the Name field
+    /// is left alone rather than set to "name it Bob" (Qodo on PR #1529).
+    #[tokio::test]
+    async fn voice_outcome_a_name_marked_whole_names_nothing() {
+        let said = "tell it to name it Bob";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("name_new_agent").with_param("prefix", said),
+        );
+        let form = new_agent_form();
+        let outcome = run_form(&resolver, Screen::Overview, Some(&form), said).await;
+        assert!(
+            matches!(outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+    }
+
     // -- the Command field (PR #1451 round 4, decision D8) ------------------
 
     /// Scenario: the maintainer's report. With the New agent form live, the
@@ -7548,6 +7688,109 @@ mod tests {
                 id: "agent-juno".to_string(),
                 label: "Juno".to_string()
             }
+        );
+    }
+
+    /// Scenario: review findings on PR #1529. Two agents in directories that
+    /// share a name are told apart the way the model is shown them
+    /// (`work/api`); a reference whose facts belong to two different agents —
+    /// "the Codex agent in docs-site" — reaches neither; and a daemon the user
+    /// named that the model left out of its answer still refuses.
+    #[tokio::test]
+    async fn voice_outcome_a_reference_is_held_to_every_fact_it_names() {
+        let mut work = agent("1", Some("Atlas"), "codex");
+        work.cwd = Some("/home/dev/work/api".to_string());
+        let mut oss = agent("2", Some("Boreas"), "codex");
+        oss.cwd = Some("/home/dev/oss/api/".to_string());
+        let twins = vec![work, oss];
+        for (said, id) in [("work/api", "1"), ("the one in oss api", "2")] {
+            assert!(
+                matches!(resolve_agent_ref_on(said, &twins, &decks()),
+                    AgentRefMatch::One { id: found, .. } if found == id),
+                "{said:?}"
+            );
+        }
+        assert!(matches!(
+            resolve_agent_ref_on("the one in api", &twins, &decks()),
+            AgentRefMatch::Ambiguous(_)
+        ));
+
+        let agents = facets_fleet();
+        for conflicting in [
+            "the Codex agent in docs-site",
+            "reviewer in billing PRD 1487",
+        ] {
+            assert_eq!(
+                resolve_agent_ref_on(conflicting, &agents, &decks()),
+                AgentRefMatch::None,
+                "{conflicting:?}"
+            );
+        }
+        // The same facts on ONE agent still reach it.
+        assert!(matches!(
+            resolve_agent_ref_on("the Codex agent in billing", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-juno"
+        ));
+
+        let said = "open the Codex agent on build box";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // A qualifier ("on build box") constrains even when an agent here is
+        // itself called "build box", and a host literally called `daemon` is
+        // still a daemon there; said without "on", a name the deck shows wins.
+        let mut named_like_a_daemon = agent("9", Some("build box"), "codex");
+        named_like_a_daemon.cli_name = Some("codex".to_string());
+        let colliding = vec![named_like_a_daemon];
+        assert_eq!(
+            resolve_agent_ref_on("the Codex agent on build box", &colliding, &decks()),
+            AgentRefMatch::None
+        );
+        assert!(matches!(
+            resolve_agent_ref_on("build box", &colliding, &decks()),
+            AgentRefMatch::One { id, .. } if id == "9"
+        ));
+        let mut with_a_daemon_host = decks();
+        with_a_daemon_host.push(deck("deck-daemon", "ops@daemon", false));
+        assert_eq!(
+            resolve_agent_ref_on("the Codex agent on daemon", &agents, &with_a_daemon_host),
+            AgentRefMatch::None
+        );
+        // The daemon the agents ARE on keeps a word that is also a run's name
+        // unless it is said as the qualifier.
+        let staging = [VoiceDeck {
+            holds_agents: true,
+            ..deck("deck-staging", "ops@staging", false)
+        }];
+        let runs = vec![
+            in_titled_orchestration(role_agent("10", "reviewer"), "o1", "staging", "staging"),
+            in_titled_orchestration(role_agent("11", "reviewer"), "o2", "prod", "prod"),
+        ];
+        assert!(matches!(
+            resolve_agent_ref_on("the staging reviewer", &runs, &staging),
+            AgentRefMatch::One { id, .. } if id == "10"
+        ));
+        assert!(matches!(
+            resolve_agent_ref_on("the reviewer on staging", &runs, &staging),
+            AgentRefMatch::Ambiguous(_)
+        ));
+
+        // The daemon the agents ARE on is no obstacle.
+        let said = "open the Codex agent on the local deck";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
+            "{outcome:?}"
         );
     }
 
