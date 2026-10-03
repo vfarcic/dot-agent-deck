@@ -9,51 +9,90 @@
 //! already had that fix, through other spawn paths. Clearing the vars from the
 //! test process covers every spawn path at once, including ones added later.
 //!
-//! nextest runs each test in its own process, so mutating this process's
-//! environment cannot affect another test.
+//! The clearing happens before `main`, in a constructor in `tests/common/mod.rs`
+//! (issue #1473), and that is also the only place the harness writes these
+//! variables: a write at run time races any thread already reading the
+//! environment (issue #678). So the tests below put the "live deck" into a
+//! re-executed child's environment at exec rather than into this process's.
 
 mod common;
 
-/// Scenario: Set all four deck endpoint variables to values that mimic a live
-/// deck, call the harness setup hook, and assert every one of them is gone —
-/// so no child this process spawns can inherit a route to a real daemon.
+/// The five deck endpoint and identity variables, with values that mimic a live
+/// deck's.
+const LIVE_DECK_VARS: [(&str, &str); 5] = [
+    (
+        "DOT_AGENT_DECK_SOCKET",
+        "/run/user/1000/dot-agent-deck.sock",
+    ),
+    (
+        "DOT_AGENT_DECK_ATTACH_SOCKET",
+        "/run/user/1000/dot-agent-deck-attach.sock",
+    ),
+    ("DOT_AGENT_DECK_PANE_ID", "8"),
+    ("DOT_AGENT_DECK_AGENT_ID", "8"),
+    (
+        "DOT_AGENT_DECK_PANE_CAPABILITY",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ),
+];
+
+/// Set only on the re-executed child of
+/// [`harness_clears_inherited_deck_endpoints`].
+const CLEARS_CHILD_ENV: &str = "DAD_TEST_HARNESS_CLEARS_CHILD";
+
+/// What that child prints once both of its checks have passed, so the parent
+/// can tell a real pass from a filter that matched nothing.
+const CLEARS_CHILD_DONE: &str = "harness-clears-child-checked";
+
+/// Scenario: Start a fresh copy of this test binary with all five deck endpoint
+/// variables set to values that mimic a live deck, and in that child assert
+/// every one is already gone on the first line of the test body, call the
+/// harness setup hook, and assert they are still gone and the hook named them —
+/// so no child the process spawns can inherit a route to a real daemon.
 #[test]
 fn harness_clears_inherited_deck_endpoints() {
-    for (var, value) in [
-        (
-            "DOT_AGENT_DECK_SOCKET",
-            "/run/user/1000/dot-agent-deck.sock",
-        ),
-        (
-            "DOT_AGENT_DECK_ATTACH_SOCKET",
-            "/run/user/1000/dot-agent-deck-attach.sock",
-        ),
-        ("DOT_AGENT_DECK_PANE_ID", "8"),
-        ("DOT_AGENT_DECK_AGENT_ID", "8"),
-        (
-            "DOT_AGENT_DECK_PANE_CAPABILITY",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        ),
-    ] {
-        // SAFETY: single-threaded test body, before the harness starts anything.
-        unsafe { std::env::set_var(var, value) };
+    if std::env::var_os(CLEARS_CHILD_ENV).is_some() {
+        for (var, _) in LIVE_DECK_VARS {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} reached the test body — the before-main detach did not clear it"
+            );
+        }
+        common::init_test_env();
+        for (var, _) in LIVE_DECK_VARS {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} survived harness setup — a spawned child would inherit it and \
+                 could post hook events into a live deck"
+            );
+        }
+        println!("{CLEARS_CHILD_DONE}");
+        return;
     }
 
-    common::init_test_env();
-
-    for var in [
-        "DOT_AGENT_DECK_SOCKET",
-        "DOT_AGENT_DECK_ATTACH_SOCKET",
-        "DOT_AGENT_DECK_PANE_ID",
-        "DOT_AGENT_DECK_AGENT_ID",
-        "DOT_AGENT_DECK_PANE_CAPABILITY",
-    ] {
-        assert!(
-            std::env::var_os(var).is_none(),
-            "{var} survived harness setup — a spawned child would inherit it and \
-             could post hook events into a live deck"
-        );
-    }
+    let name = "harness_clears_inherited_deck_endpoints";
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CLEARS_CHILD_ENV, "1")
+        .envs(LIVE_DECK_VARS)
+        .output()
+        .expect("re-execute the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the harness left a deck variable behind:\n{stdout}\n{stderr}"
+    );
+    // libtest exits 0 when the filter matches nothing, so prove the child
+    // actually ran its half.
+    assert!(
+        stdout.contains(CLEARS_CHILD_DONE),
+        "the child did not run {name}:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("note: detaching this test process from a live deck"),
+        "the harness must report what it cleared:\n{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +489,11 @@ fn harness_source() -> String {
 fn a_runtime_skip_discards_the_previous_recording() {
     // The helper PANICS instead of skipping when this is set, which would make
     // the test's outcome depend on the developer's environment.
-    // SAFETY: single-threaded test body; nextest gives each test its own process.
+    // SAFETY: the first statement of a synchronous test body, so no thread this
+    // test or the harness starts exists yet. What else can exist is libtest's
+    // runner thread, waiting for this test to finish — and, under plain `cargo
+    // test` rather than the nextest every gate here uses, sibling tests sharing
+    // this process, which would make this a race (issues #245, #678).
     unsafe { std::env::remove_var("DOT_AGENT_DECK_REQUIRE_REAL_E2E") };
 
     let dir = common::current_test_recordings_dir();
@@ -503,7 +546,8 @@ fn a_runtime_skip_discards_the_previous_recording() {
 #[cfg(unix)]
 #[test]
 fn a_discard_that_cannot_delete_a_stale_artifact_fails_the_run() {
-    // SAFETY: single-threaded test body; nextest gives each test its own process.
+    // SAFETY: as in `a_runtime_skip_discards_the_previous_recording` — the first
+    // statement of a synchronous test body, with the same stated residual.
     unsafe { std::env::remove_var("DOT_AGENT_DECK_REQUIRE_REAL_E2E") };
 
     let dir = common::current_test_recordings_dir();

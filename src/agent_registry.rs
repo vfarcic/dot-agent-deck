@@ -305,7 +305,28 @@ fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), Str
              to stdout classification. Set DOT_AGENT_DECK_LOG to log the expected command.)",
             if listed == 1 { "entry" } else { "entries" }
         ),
-        Ok(TrustOutcome::Trusted { count, .. }) => println!("Trusted hooks: {count}"),
+        Ok(TrustOutcome::Trusted {
+            count, turned_off, ..
+        }) => {
+            println!("Trusted hooks: {count}");
+            // Issue #1027 item 2: the deck leaves a user's `/hooks` toggle alone,
+            // so a hook they turned off stays off — and says so, on its own line
+            // so the count above stays a bare number (`codex_hooks_005`).
+            if !turned_off.is_empty() {
+                let (noun, pronoun) = if turned_off.len() == 1 {
+                    ("hook", "it")
+                } else {
+                    ("hooks", "them")
+                };
+                println!(
+                    "Note: the deck's Codex {noun} for {} {} turned off in Codex's /hooks list, \
+                     so Codex reports nothing through {pronoun}. The deck leaves {pronoun} off; \
+                     turn {pronoun} back on in Codex's /hooks list to restore that detail.",
+                    turned_off.join(", "),
+                    if turned_off.len() == 1 { "is" } else { "are" },
+                );
+            }
+        }
         // Say it on stderr as well as in the log. This is the one arm that
         // printed nothing at all, so the user got no trust line whatsoever and
         // exit 0 — and the log half needs `DOT_AGENT_DECK_LOG` to have been set
@@ -333,7 +354,9 @@ fn codex_uninstall() -> Result<(), String> {
     // nothing else, so on a machine without `DOT_AGENT_DECK_LOG` set the whole
     // of what the user saw was exit 0 and silence — while the command went on to
     // delete the definitions regardless. That leaves `[hooks.state]` rows whose
-    // definitions are gone, which nothing in the deck currently collects.
+    // definitions are gone. Only a later install collects one, and only once
+    // Codex lists the deck's hook again somewhere else (issue #1027 item 1, the
+    // stale-record sweep in `trust_deck_hooks_in`); until then it stays.
     //
     // Not a failure, for the same reason the install arm is not: the primary
     // operation is the DEFINITIONS, and removing them still succeeds (or reports

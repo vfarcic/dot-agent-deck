@@ -1913,6 +1913,19 @@ struct PromptDelivery {
     /// [`delivery_target_changed`] reads it as the pane's current generation
     /// while the snapshot has none, which is the one place the snapshot's
     /// silence would otherwise read as the bound conversation having gone.
+    ///
+    /// How it sits beside issue #532's rule that, once a pane has a generation,
+    /// only a genuine `SessionStart` moves it. It is never written into
+    /// `AppState`, so it cannot move the TUI's generation at all: it is
+    /// per-delivery, and consulted only where the snapshot has NO generation.
+    /// The moment the snapshot holds one — a `SessionStart`, a first frame on
+    /// a pane that had none, or the daemon's `SessionSnapshot::hook_generation`
+    /// adopted at hydration — the snapshot wins in both places. On the daemon
+    /// side the value it carries IS the `pane_hook_session` entry that rule
+    /// governs, read by the guard that refused, so it is exactly what a named
+    /// retry is compared against. Hydration runs when the TUI starts or attaches
+    /// a pane, not when the event subscriber reconnects, which is why a running
+    /// TUI still needs this.
     refusal_generation: Option<String>,
     /// Issue #621 (review): some request of this delivery failed after it may
     /// have reached the daemon's write, so it may have written although
@@ -4655,17 +4668,13 @@ enum SubmissionEvidence {
 /// is the same one-handoff shape [`crate::state::latch_generation`] applies on
 /// the daemon side.
 ///
-/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
-/// producers under one registry agent id — `dot-agent-deck wrap` emits under
-/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
-/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
-/// "current generation" alternates between them. This check then reads that
-/// alternation as a lost target and abandons. The daemon's own send guard
-/// already refuses the same shape (it requires an EXACT match against the
-/// current generation), so this makes an existing intermittent refusal
-/// deterministic one frame earlier rather than introducing a new failure; the
-/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
-/// frame from a second producer as a generation.
+/// A pane hosting a wrapped agent has TWO producers under one registry agent
+/// id — `dot-agent-deck wrap` emits under `{pane}-session`, the wrapped agent's
+/// native hooks under their own id. Until issue #532 `AppState::pane_hook_session`
+/// followed whichever of them spoke last, so this check read the alternation as
+/// a lost target and abandoned. It now moves an established generation only on
+/// a genuine `SessionStart`, so the wrapper's ordinary frames leave the target
+/// this delivery bound alone (`prompt/pane-input/043`).
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
     // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
     // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
@@ -4742,10 +4751,10 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 ///   appears after the write is not that conversation — we never addressed it —
 ///   so adopting it retroactively claims a target this delivery never had, and
 ///   any later generation on that pane then reads as a lost target. That is not
-///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
-///   carrying a pane id, including one from a producer that never announced a
-///   session, so a pane whose events carry drifting session ids would abandon
-///   deliveries it never endangered (`prompt/pane-input/026`).
+///   hypothetical: the snapshot's `pane_hook_session` is ESTABLISHED by any
+///   event carrying a pane id, including one from a producer that never
+///   announced a session, so binding retroactively would claim a target this
+///   delivery never addressed (`prompt/pane-input/026`).
 ///
 /// A prompt written into a pane that had NO generation — the 10 s-fallback
 /// launcher case — therefore stays UNBOUND for as long as it is merely being
@@ -4838,10 +4847,9 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
 /// The `prompt/pane-input/026` counter-example that argued against binding late
 /// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
 /// session ids, and the daemon-side latch now treats only a `SessionStart` as an
-/// announcement. The residual that does remain is #532's wrapped-agent
-/// alternation, which `AppState::pane_hook_session` still tracks across two
-/// producers; that shows up as an abandoned delivery — the safe direction — and
-/// is already documented on [`delivery_target_changed`].
+/// announcement — and since issue #532 so does `AppState::pane_hook_session`
+/// once a pane has a generation, which is what ended the wrapped-agent
+/// alternation documented on [`delivery_target_changed`].
 fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
     if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
         return;
@@ -5030,12 +5038,11 @@ fn evidence_channel_is_unidentified(
 ///
 /// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
 /// `SessionStart` is self-describing and authoritative, and anything else is
-/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
-/// carrying a pane id — good for the send guard, useless as evidence that a
-/// conversation began — so reading it raw would make a pane whose ordinary
-/// events drift through session ids look like a rolling series of
-/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
-/// wrapped-agent alternation.
+/// inference. `AppState::pane_hook_session` deliberately lets ANY frame carrying
+/// a pane id ESTABLISH a generation on a pane that has none — good for the send
+/// guard, useless as evidence that a conversation began — so reading it raw
+/// would make an inferred generation look like an announced one. That pane is
+/// `prompt/pane-input/026`.
 ///
 /// Matched by TIMESTAMP rather than by session id, because the two are not the
 /// same string by the time they reach here: `AppState::apply_event`'s reuse
@@ -38272,9 +38279,9 @@ mod tests {
 
     /// Scenario: Start an agent whose daemon has recorded its conversation while the TUI's own view never received that `SessionStart` (the event stream dropped it across a reconnect), then let the seed and orchestrator prompts go out. Every unnamed write is refused `stale`, and the prompt must still reach the agent's pane, naming the conversation the daemon reported; a control where the TUI does see the start after one `stale` delivers too, without counting that refusal as an attempt.
     #[cfg(unix)]
-    #[spec("prompt/pane-input/043")]
+    #[spec("prompt/pane-input/045")]
     #[test]
-    fn pane_input_043_dropped_session_start_still_delivers_the_prompt() {
+    fn pane_input_045_dropped_session_start_still_delivers_the_prompt() {
         const GENERATION: &str = "daemon-only-generation-621";
 
         // The reported case: the daemon knows the generation, the TUI never will.

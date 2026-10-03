@@ -43,24 +43,6 @@ fn path_with_binary_dir() -> String {
     )
 }
 
-fn commit_fixture_repo(dir: &Path) {
-    // Through `common::fixture_git`, which clears the ambient git LOCATION
-    // variables — a bare `git commit` with only `.current_dir` commits into
-    // whatever an ambient `GIT_DIR` names (issue #834) — and supplies the
-    // identity by environment. `dir` is both the fixture repo and its own
-    // sandbox root: it is the harness tempdir, and nothing above it is this
-    // test's. The two `git config` writes this used to make are gone with it.
-    let run = |args: &[&str]| {
-        let out = common::fixture_git(dir, dir)
-            .args(args)
-            .output()
-            .expect("git available");
-        assert!(out.status.success(), "git {args:?} failed: {out:?}");
-    };
-    run(&["add", "-A"]);
-    run(&["commit", "-qm", "fixture baseline"]);
-}
-
 fn dispatch_worktree_of(deck: &TuiDeck, name: &str) -> PathBuf {
     deck.workdir()
         .parent()
@@ -625,7 +607,7 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
         .impersonating_pane_signals()
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
     let caller_pane = open_cat_caller_pane(&deck);
 
     // The first three announce themselves BEFORE the write — the control, and
@@ -892,7 +874,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
         )
         .expect("write real-agent sentinel");
     }
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let names: Vec<&str> = cases.iter().map(|(name, _)| *name).collect();
     let trust_paths = trust_paths_for_worktrees(&deck, &names);

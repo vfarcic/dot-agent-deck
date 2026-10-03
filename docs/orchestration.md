@@ -648,6 +648,7 @@ The pane is not part of a running orchestration in the daemon. If the orchestrat
 - The `--to` value must match a role `name` exactly, including case.
 - A role renamed in the file after the orchestration started keeps its old name until the orchestration is started again.
 - A role added after the orchestration started, or whose pane was closed, is not running: have the orchestrator run `dot-agent-deck pane spawn <role>`.
+- A worker that crashed or quit on its own is not running either, unless its role has `clear = true`, which starts a fresh worker for every task: have the orchestrator run `dot-agent-deck pane restart <role>`, then delegate again.
 - The orchestrator cannot delegate to itself.
 - Delegation does not cross orchestrations: the worker must be in the same orchestration as the orchestrator.
 
@@ -698,6 +699,7 @@ A `work-done` the deck cannot match to a task the orchestrator delegated reaches
 - the task never reached the worker (the orchestrator saw `⚠ delegated worker respawn failed` or `⚠ delegated worker never came up`);
 - the task was sent more than seven days ago;
 - `pane restart` dropped the task the worker owed.
+- the worker the task went to exited before reporting, and the report came from a different agent started in its pane since.
 
 ### The report went to a different file than `work-done-<role>.md`
 

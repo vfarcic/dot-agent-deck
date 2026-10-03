@@ -581,9 +581,13 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
     // `XDG_RUNTIME_DIR` — `RemoteTunnel::open`'s, which decides where the
     // reaping sweep points.
     //
-    // SAFETY: both e2e aliases run under nextest, which is process-per-test, so
-    // this process is this test and nothing else is touching the environment.
-    // It is also the first statement in the body, so no thread exists yet.
+    // SAFETY: a stated residual, not a proof (issue #678). Both e2e aliases run
+    // under nextest, which is process-per-test, so no sibling test shares this
+    // process — but that is not the same as no other thread. Two exist here:
+    // libtest's runner thread, waiting for this test, and the harness's
+    // `load-context` heartbeat, which `harness_temp_root()` just above starts
+    // and which sleeps and reads `/proc`, never the environment. Nothing this
+    // test drives has started yet.
     let runtime_dir = common::harness_temp_root().join("rt");
     std::fs::create_dir_all(&runtime_dir).expect("create the sandbox XDG_RUNTIME_DIR");
     unsafe {

@@ -107,6 +107,7 @@ struct AgentEventDaemon {
     attach_path: PathBuf,
     registry: Arc<AgentPtyRegistry>,
     event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+    state: SharedState,
     handle: JoinHandle<()>,
 }
 
@@ -127,7 +128,7 @@ async fn start_agent_event_daemon() -> AgentEventDaemon {
     let hook_path = dir.path().join("hook.sock");
     let attach_path = dir.path().join("attach.sock");
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-    let daemon = Daemon::with_attach(state, attach_path.clone())
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
         .with_idle_shutdown(None)
         .with_lock_dir_override(Some(dir.path().join("locks")));
     let registry = daemon.pty_registry.clone();
@@ -159,6 +160,7 @@ async fn start_agent_event_daemon() -> AgentEventDaemon {
         attach_path,
         registry,
         event_tx,
+        state,
         handle,
     }
 }
@@ -1771,7 +1773,7 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
 // stamped `display_title: None`; nothing persists a broadcast, so the live tab
 // read `mixed · issue-950` and the reattached one read bare `mixed`.
 //
-// Three orchestrations in one reattach, because the interesting claim is a
+// Four orchestration runs in one reattach, because the interesting claim is a
 // comparison rather than a single label:
 //   * `dispatch-team` — DISPATCHED into a worktree-shaped dir whose basename
 //     differs from the orchestration name. The defect's own case.
@@ -1779,6 +1781,12 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
 //     for a `Ctrl+n` orchestration, which has carried its title since #158. It
 //     passed before this fix and must keep passing, so a future regression says
 //     WHICH producer broke rather than just "titles are lost".
+//   * `dispatch-team` AGAIN, into the same dir while the first run is live —
+//     issue #1339: the derived title names only the orchestration and the
+//     directory, so the second run derived the first's label byte for byte.
+//     The daemon now admits it under the first free suffix. This leg is why
+//     the server here carries the daemon's REAL `AppState`, shared with the
+//     spawn primitive: the title record both consult lives there.
 //   * `bare-team` — DISPATCHED into a dir whose basename EQUALS the name, so
 //     there is genuinely no per-run identity to add. The canonical name is the
 //     right answer here, and this is the leg that fails if the fix ever stamps
@@ -1812,6 +1820,7 @@ fn dispatch_orchestration_config(name: &str) -> String {
 /// a config on disk at `dir` — the shape `dot-agent-deck dispatch` resolves.
 async fn dispatch_orchestration(
     registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
     event_tx: &tokio::sync::broadcast::Sender<BroadcastMsg>,
     dir: &Path,
     name: &str,
@@ -1841,7 +1850,9 @@ async fn dispatch_orchestration(
         // detached, so this returns as soon as every role is spawned and
         // registered.
         true,
-        None,
+        // The daemon's own state, as every production caller passes it: where
+        // the role maps and the run-title record live.
+        Some(state),
     )
     .await
     .unwrap_or_else(|e| panic!("the dispatch spawn primitive must bring `{name}` up: {e:?}"))
@@ -1852,9 +1863,11 @@ async fn dispatch_orchestration(
 /// detach and reattach by hydrating a fresh controller from the warm daemon.
 /// Asserts the rebuilt tab comes back under the run-identifying label the live
 /// broadcast painted (`dispatch-team · issue-960`) rather than the bare config
-/// name, alongside a `Ctrl+n`-shaped control that must keep its own title and a
-/// dispatch with genuinely no per-run identity that must still fall back to the
-/// canonical name.
+/// name, that a second live run of the same orchestration in the same directory
+/// comes back as a tab whose label can be told apart from the first's
+/// (`dispatch-team · issue-960 · 2`, issue #1339), alongside a `Ctrl+n`-shaped
+/// control that must keep its own title and a dispatch with genuinely no
+/// per-run identity that must still fall back to the canonical name.
 #[spec("orchestration/dispatch/005")]
 #[test]
 fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach() {
@@ -1869,8 +1882,16 @@ fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach()
 }
 
 async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reattach_inner() {
-    let server = start_real_server().await;
-    let client = DaemonClient::new(server.path.clone());
+    child_lifetime_bound::arm();
+    // Issue #1339: served with the daemon's REAL `AppState`, shared between the
+    // attach handler and the spawn primitive exactly as `run_daemon_with` shares
+    // it — the run-title record both paths consult lives there, and the empty
+    // dummy state `serve_attach` hands its handler would hide every interaction
+    // between them.
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let (dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;
+    let client = DaemonClient::new(path.clone());
 
     // The spawn primitive's own broadcast, subscribed BEFORE any spawn so the
     // live `OrchestrationSurface` cannot be missed. This is the transient
@@ -1880,20 +1901,29 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
 
     // ---- Producer 1: a DISPATCH whose cwd basename is its per-run identity.
     // `issue-960` stands in for the per-issue worktree issue dispatch creates.
-    let dispatch_cwd = server._dir.path().join("issue-960");
+    let dispatch_cwd = dir.path().join("issue-960");
     let dispatched =
-        dispatch_orchestration(&server.registry, &event_tx, &dispatch_cwd, "dispatch-team").await;
+        dispatch_orchestration(&registry, &state, &event_tx, &dispatch_cwd, "dispatch-team").await;
     let expected_dispatch_title = "dispatch-team · issue-960";
+
+    // ---- Producer 1 again (issue #1339): a SECOND run of the same
+    // orchestration into the same directory while the first is still live —
+    // two schedules firing one repo's orchestration, or one fresh-tab schedule
+    // firing again before its last run finished. Its derived title is
+    // byte-identical to the first's, so unless the daemon admits it under a
+    // title of its own the tab strip shows two tabs nobody can tell apart.
+    let rerun =
+        dispatch_orchestration(&registry, &state, &event_tx, &dispatch_cwd, "dispatch-team").await;
+    let expected_rerun_title = "dispatch-team · issue-960 · 2";
 
     // ---- Producer 2: a DISPATCH with nothing to add — the cwd basename IS the
     // orchestration name, so the canonical name is already the whole identity.
-    let bare_cwd = server._dir.path().join("bare-team");
-    let bare = dispatch_orchestration(&server.registry, &event_tx, &bare_cwd, "bare-team").await;
+    let bare_cwd = dir.path().join("bare-team");
+    let bare = dispatch_orchestration(&registry, &state, &event_tx, &bare_cwd, "bare-team").await;
 
     // ---- Producer 3 (the CONTROL): the membership shape `tab.rs` stamps on
     // every role pane of an interactive `Ctrl+n` orchestration, title included.
-    let interactive_cwd = server
-        ._dir
+    let interactive_cwd = dir
         .path()
         .join("interactive")
         .to_string_lossy()
@@ -1927,27 +1957,39 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
         interactive_ids.push(id);
     }
 
-    // ---- What the LIVE tab was labelled: the broadcast the spawn primitive
+    // ---- What the LIVE tabs were labelled: the broadcasts the spawn primitive
     // published, read through the same `validate_orchestration_surface` gate the
-    // TUI applies before painting it.
-    let mut surfaces: HashMap<String, Option<String>> = HashMap::new();
+    // TUI applies before painting them. Kept in arrival order, per run: two runs
+    // of one orchestration share its name.
+    let mut surfaces: Vec<(String, Option<String>)> = Vec::new();
     while let Ok(msg) = event_rx.try_recv() {
         if let BroadcastMsg::OrchestrationSurface(surface) = msg
             && let Some(surface) =
                 dot_agent_deck::agent_pty::validate_orchestration_surface(surface)
         {
-            surfaces.insert(surface.name.clone(), surface.display_title.clone());
+            surfaces.push((surface.name.clone(), surface.display_title.clone()));
         }
     }
+    let surfaced = |name: &str| -> Vec<Option<String>> {
+        surfaces
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, t)| t.clone())
+            .collect()
+    };
     assert_eq!(
-        surfaces.get("dispatch-team").cloned(),
-        Some(Some(expected_dispatch_title.to_string())),
-        "precondition: the live surface must carry the run-identifying label; \
-         surfaces = {surfaces:?}"
+        surfaced("dispatch-team"),
+        vec![
+            Some(expected_dispatch_title.to_string()),
+            Some(expected_rerun_title.to_string()),
+        ],
+        "the first run must carry the run-identifying label, and a second live run of the \
+         same orchestration in the same directory a label of its OWN — identical live labels \
+         are issue #1339; surfaces = {surfaces:?}"
     );
     assert_eq!(
-        surfaces.get("bare-team").cloned(),
-        Some(None),
+        surfaced("bare-team"),
+        vec![None],
         "a dispatch whose cwd basename equals its name has no per-run identity to \
          add, so the live surface must carry no title at all — an empty `Some` \
          would defeat the fallback rather than replace it; surfaces = {surfaces:?}"
@@ -1955,7 +1997,7 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
 
     // ---- Detach + reattach: a FRESH controller hydrating from the warm daemon.
     let ctrl = Arc::new(EmbeddedPaneController::new(
-        server.path.clone(),
+        path.clone(),
         tokio::runtime::Handle::current(),
     ));
     let hydrated = {
@@ -1966,34 +2008,38 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
     };
     assert_eq!(
         hydrated.len(),
-        6,
-        "all six role panes across the three orchestrations should hydrate; got {hydrated:?}"
+        8,
+        "all eight role panes across the four orchestration runs should hydrate; got {hydrated:?}"
     );
 
     // The field that actually survives the round trip, per pane: the daemon
     // echoed each role's `TabMembership` back through `ListAgents` and
     // `validate_tab_membership`. Pre-fix every DISPATCHED pane arrived here with
     // `None` — the producer bug, observed one layer below the label.
-    let dispatched_panes: Vec<String> = dispatched
-        .agents
-        .iter()
-        .map(|a| a.pane_id.clone())
-        .collect();
-    for pane_id in &dispatched_panes {
-        let pane = hydrated
-            .iter()
-            .find(|h| &h.pane_id == pane_id)
-            .unwrap_or_else(|| panic!("dispatched role pane {pane_id} did not hydrate"));
-        let Some(TabMembership::Orchestration { display_title, .. }) = &pane.tab_membership else {
-            panic!("dispatched role pane {pane_id} lost its Orchestration membership: {pane:?}");
-        };
-        assert_eq!(
-            display_title.as_deref(),
-            Some(expected_dispatch_title),
-            "EVERY role pane of a dispatched orchestration must carry the run title, not just \
-             whichever one happens to be alive: the partition keeps the first non-`None` value \
-             it sees, so a title on only some panes is lost as soon as those exit (pane {pane_id})"
-        );
+    for (run, expected) in [
+        (&dispatched, expected_dispatch_title),
+        (&rerun, expected_rerun_title),
+    ] {
+        for pane_id in run.agents.iter().map(|a| a.pane_id.clone()) {
+            let pane = hydrated
+                .iter()
+                .find(|h| h.pane_id == pane_id)
+                .unwrap_or_else(|| panic!("dispatched role pane {pane_id} did not hydrate"));
+            let Some(TabMembership::Orchestration { display_title, .. }) = &pane.tab_membership
+            else {
+                panic!(
+                    "dispatched role pane {pane_id} lost its Orchestration membership: {pane:?}"
+                );
+            };
+            assert_eq!(
+                display_title.as_deref(),
+                Some(expected),
+                "EVERY role pane of a dispatched orchestration must carry its run's title, not \
+                 just whichever one happens to be alive: the partition keeps the first \
+                 non-`None` value it sees, so a title on only some panes is lost as soon as \
+                 those exit (pane {pane_id})"
+            );
+        }
     }
 
     // ---- Partition: the reattach's tab-reconstruction decision.
@@ -2005,8 +2051,8 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
     );
     assert_eq!(
         partition.orchestration_buckets.len(),
-        3,
-        "the three orchestrations must rebuild as three buckets; got {:?}",
+        4,
+        "the four orchestration runs must rebuild as four buckets; got {:?}",
         partition
             .orchestration_buckets
             .iter()
@@ -2020,7 +2066,7 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
     // and the FALLBACK it guards is the harsher one here (the synthesised
     // config's name).
     let mut tab_manager = dot_agent_deck::tab::TabManager::new(ctrl.clone());
-    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut labels: Vec<(String, String)> = Vec::new();
     for bucket in &partition.orchestration_buckets {
         let orch_config = resolve_orch_config_for_hydration(None, bucket);
         let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
@@ -2036,31 +2082,54 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
                 bucket.orchestration_id.as_deref(),
             )
             .expect("rebuilding an orchestration tab from its bucket should succeed");
-        labels.insert(
+        labels.push((
             bucket.orchestration_name.clone(),
             tab_manager.tab_labels()[tab_index].clone(),
-        );
+        ));
     }
+    let labelled = |name: &str| -> Vec<String> {
+        let mut found: Vec<String> = labels
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, l)| l.clone())
+            .collect();
+        found.sort();
+        found
+    };
 
-    // ---- The user-visible claim, on the tab strip the user reads.
+    // ---- The user-visible claims, on the tab strip the user reads.
+    let dispatch_labels = labelled("dispatch-team");
     assert_eq!(
-        labels.get("dispatch-team").map(String::as_str),
-        Some(expected_dispatch_title),
-        "the label the live surface painted must survive a detach/reattach. Bare \
+        dispatch_labels.len(),
+        2,
+        "both live runs of `dispatch-team` must come back as tabs; labels = {labels:?}"
+    );
+    assert_ne!(
+        dispatch_labels[0], dispatch_labels[1],
+        "issue #1339: two live runs of one orchestration in one directory must not come back \
+         as two tabs whose labels cannot be told apart. labels = {labels:?}"
+    );
+    assert_eq!(
+        dispatch_labels,
+        vec![
+            expected_dispatch_title.to_string(),
+            expected_rerun_title.to_string()
+        ],
+        "the label each live surface painted must survive a detach/reattach. Bare \
          `dispatch-team` here is issue #960: with N concurrent dispatches every tab \
          reattaches under the SAME label and the tab strip stops saying which run is \
          which. labels = {labels:?}"
     );
     assert_eq!(
-        labels.get("interactive-team").map(String::as_str),
-        Some(interactive_title),
+        labelled("interactive-team"),
+        vec![interactive_title.to_string()],
         "the CONTROL: the interactive `Ctrl+n` producer has carried its title since #158 \
          and must keep doing so — a failure HERE means the hydration side broke, not the \
          dispatch producer. labels = {labels:?}"
     );
     assert_eq!(
-        labels.get("bare-team").map(String::as_str),
-        Some("bare-team"),
+        labelled("bare-team"),
+        vec!["bare-team".to_string()],
         "`resolve_orchestration_name` stays the FALLBACK: a dispatch with no per-run \
          identity to add is correctly labelled with its canonical name. labels = {labels:?}"
     );
@@ -2070,12 +2139,14 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
     for id in dispatched
         .agents
         .iter()
+        .chain(rerun.agents.iter())
         .chain(bare.agents.iter())
         .map(|a| a.id.clone())
         .chain(interactive_ids)
     {
-        let _ = server.registry.close_agent(&id);
+        let _ = registry.close_agent(&id);
     }
+    handle.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -2924,6 +2995,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         live_target: None,
         last_activity_ms: None,
         blocked: None,
+        hook_generation: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3071,6 +3143,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         live_target: None,
                         last_activity_ms: None,
                         blocked: None,
+                        hook_generation: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3487,6 +3560,145 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
         observed.agent_id,
         rebuilt.status,
         pane.live
+    );
+
+    drop(controller);
+}
+
+/// Scenario: A wrapped Codex pane runs under a real daemon, where Codex announced its conversation and the wrapper (reporting under `<pane>-session`) has spoken since; a fresh TUI hydrates through `ListAgents` after its event stream already delivered a wrapper frame. The reconnected TUI must hold the conversation the daemon's send guard holds, and must keep a genuine `SessionStart` it received after the daemon built its reply rather than roll back to the reply. Control: an older daemon's reply carries no generation, so the TUI keeps the id it built from events.
+#[spec("session/live/017")]
+#[test]
+fn live_017_reconnect_adopts_the_daemons_pane_generation() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wrapped-pane reconnect runtime");
+    rt.block_on(live_017_reconnect_adopts_the_daemons_pane_generation_inner());
+}
+
+async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
+    const PANE: &str = "pane-wrapped-reconnect";
+    let wrapper_session = format!("{PANE}-session");
+    let daemon = start_agent_event_daemon().await;
+    let cwd = test_temp::tempdir().expect("allocate wrapped-reconnect pane cwd");
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+            agent_type: Some(AgentType::Codex),
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("spawn the pane through the TUI's StartAgent attach path");
+    let base = Utc::now() - chrono::Duration::seconds(60);
+    let frame = |session: &str, event_type: EventType, secs: i64| AgentEvent {
+        session_id: session.to_string(),
+        agent_type: AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: base + chrono::Duration::seconds(secs),
+        user_prompt: None,
+        metadata: Default::default(),
+        pane_id: Some(PANE.to_string()),
+        agent_id: Some(agent_id.clone()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+
+    // The daemon sees the whole history: the wrapper, Codex's announcement,
+    // Codex working, and the wrapper again.
+    {
+        let mut state = daemon.state.write().await;
+        state.apply_event(frame(&wrapper_session, EventType::Thinking, 1));
+        state.apply_event(frame("codex-native", EventType::SessionStart, 2));
+        state.apply_event(frame("codex-native", EventType::ToolStart, 3));
+        state.apply_event(frame(&wrapper_session, EventType::Thinking, 4));
+        assert_eq!(
+            state.pane_hook_session_id(PANE).as_deref(),
+            Some("codex-native"),
+            "precondition: the daemon holds the conversation Codex announced"
+        );
+    }
+
+    // A fresh TUI hydrates over the real attach socket (`ListAgents`).
+    let controller = Arc::new(EmbeddedPaneController::new(
+        daemon.attach_path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let controller = controller.clone();
+        tokio::task::spawn_blocking(move || controller.hydrate_from_daemon())
+            .await
+            .expect("fresh TUI hydration task did not panic")
+    };
+    let pane = hydrated
+        .iter()
+        .find(|pane| pane.agent_id == agent_id)
+        .unwrap_or_else(|| panic!("the wrapped pane was not hydrated; hydrated={hydrated:?}"))
+        .clone();
+    assert!(
+        pane.live.is_some(),
+        "the daemon's reply must carry the pane's live snapshot"
+    );
+
+    // `before_seed` is what the TUI's event stream delivered between
+    // subscribing and seeding; `after_seed` is Codex working afterwards.
+    let reconnect = |live: Option<SessionSnapshot>, before_seed: Vec<AgentEvent>| {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE.to_string());
+        for event in before_seed {
+            tui.apply_event(event);
+        }
+        tui.seed_hydrated_session(
+            PANE.to_string(),
+            pane.cwd.clone(),
+            pane.agent_type.clone(),
+            Some(agent_id.clone()),
+            live.as_ref(),
+        );
+        tui.apply_event(frame("codex-native", EventType::ToolStart, 10));
+        tui.pane_hook_session_id(PANE)
+    };
+
+    assert_eq!(
+        reconnect(
+            pane.live.clone(),
+            vec![frame(&wrapper_session, EventType::Thinking, 5)]
+        )
+        .as_deref(),
+        Some("codex-native"),
+        "a wrapper frame that reached the TUI first must not outlast the daemon's generation (issue #532)"
+    );
+    assert_eq!(
+        reconnect(
+            pane.live.clone(),
+            vec![frame("codex-cleared", EventType::SessionStart, 6)]
+        )
+        .as_deref(),
+        Some("codex-cleared"),
+        "a genuine SessionStart the TUI received after the daemon built its reply must survive seeding"
+    );
+    let older_daemon = pane.live.clone().map(|mut live| {
+        assert!(
+            live.hook_generation.take().is_some(),
+            "a current daemon's reply carries the generation"
+        );
+        live
+    });
+    assert_eq!(
+        reconnect(
+            older_daemon,
+            vec![frame(&wrapper_session, EventType::Thinking, 5)]
+        )
+        .as_deref(),
+        Some(wrapper_session.as_str()),
+        "without the daemon's generation the TUI keeps the one it built from events"
     );
 
     drop(controller);

@@ -225,6 +225,29 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# Issue #1381: the two real-OpenCode `clear = true` delegates in
+# `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
+# well past the default 3 x 60s kill window. Being killed there costs each
+# phase's own failure message and grid. Measured on 2026-10-03, a passing
+# `/046` took 73-256s, and one run that was not starved (load-context
+# QUIET/CONTENDED) was killed at 180s with nothing reported. Each window
+# below is the test's phase bounds plus room for the preflight and teardown.
+# Scoped by name; still bounded. The filters track the test FUNCTION names,
+# so rename them in lockstep.
+#
+# `/015`: the OpenCode preflight probe (~60s), the composer paint (120s),
+# Thinking and Working (120s), the prompt event (90s) and the sentinel (90s):
+# ~480s, so 9 x 60s.
+[[profile.default.overrides]]
+filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
+# `/046`: the preflight (~60s), the delegate CLI (30s), the replacement's
+# record (20s) and the work-done report (240s): ~350s, so 7 x 60s.
+[[profile.default.overrides]]
+filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
+slow-timeout = { period = "60s", terminate-after = 7 }
+
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
 # An agent that answers instead of acting is re-nudged on a 70s cadence (up to 3
@@ -527,3 +550,14 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 # `cargo test-e2e` invocations on one checkout aren't a real-world
 # workflow, and the per-test path with atomic writes means a
 # last-writer-wins outcome is fine for local debugging.
+
+# Issue #524: `orchestration/delegate/049` runs its waits one after another —
+# 20 s for the roles, 30 s for the first pointer, 20 s for each of two natural
+# exits, and 90 s for the respawned `clear = true` worker's pointer, which is
+# written only when the delegate's readiness wait gives up (measured 30.0 s).
+# Those bounds alone sum to the default 180 s kill window, so a run slow enough
+# to approach them would be killed before its last assertion could say which
+# pointer was missing (Qodo, #1525). Measured 32 s on a quiet box.
+[[profile.default.overrides]]
+filter = 'test(delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered)'
+slow-timeout = { period = "60s", terminate-after = 5 }

@@ -302,8 +302,12 @@ fn codex_wrap_002_preserves_tty_resize_input_and_interrupt() {
         .launch_with_fixture("codex-tty-probe");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     let record = deck.workdir().join("tty-probe.log");
+    // Wait for the probe's traps, not its first output: the isatty lines are
+    // written BEFORE the traps are installed, and a resize landing in that gap
+    // is delivered to a shell that still ignores SIGWINCH, so the WINCH wait
+    // below failed under load.
     let started =
-        common::wait_for_file_substr_count(&record, "isatty(2)=", 1, Duration::from_secs(10));
+        common::wait_for_file_substr_count(&record, "TRAPS-READY", 1, Duration::from_secs(10));
 
     deck.resize(150, 50);
     let resized = common::wait_for_file_substr_count(&record, "WINCH", 1, Duration::from_secs(5));

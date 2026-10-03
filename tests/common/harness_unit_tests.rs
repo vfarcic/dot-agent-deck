@@ -33,6 +33,19 @@
 //! child filter from `module_path!()`, so they followed the move rather than
 //! naming a binary.
 //!
+//! **Environment writes.** A handful of tests below set or remove a process
+//! environment variable (`HOME`, an API key, a harness knob) and restore it
+//! before returning. `set_var` / `remove_var` race any thread concurrently
+//! reading the environment, so this states what can actually be running when
+//! they do, instead of the "single-threaded" their comments used to claim
+//! (issue #678): the test's own thread; libtest's runner thread, waiting for
+//! that test to finish; and, once anything has allocated a harness temp dir,
+//! the `load-context` heartbeat (`load_context::arm`), which sleeps and reads
+//! `/proc`, never the environment. None of those tests starts a runtime or a
+//! thread of its own. That is the argument under nextest, which every gate
+//! here uses; under plain `cargo test`, sibling tests share the process and
+//! these writes race them (issue #245).
+//!
 //! **Why so much of `mod.rs` is `pub(crate)`.** This module is a *sibling* of
 //! `common`, not a child of it, so `use super::*` no longer reaches the
 //! harness's private helpers. The helpers these tests cover therefore carry
@@ -62,8 +75,8 @@ const ROOT_MARKER: &str = "harness-temp-root=";
 #[test]
 fn claude_plugin_import_is_off_unless_explicitly_enabled() {
     let prev = std::env::var_os("DAD_E2E_IMPORT_CLAUDE_PLUGINS");
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS") };
     let off_by_default = import_claude_plugins_enabled();
     unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", "1") };
@@ -104,8 +117,8 @@ fn insufficient_space_message_names_the_cause_and_the_remedy() {
 #[cfg(unix)]
 #[test]
 fn zero_threshold_disables_the_preflight_check() {
-    // SAFETY: single-threaded test process (nextest runs one test per
-    // process); the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     let prev = std::env::var_os(MIN_FREE_ENV);
     unsafe { std::env::set_var(MIN_FREE_ENV, "0") };
     let verdict = temp_space_problem(Path::new("/"));
@@ -124,7 +137,8 @@ fn zero_threshold_disables_the_preflight_check() {
 #[test]
 fn an_unmeetable_threshold_trips_the_preflight_check() {
     let prev = std::env::var_os(MIN_FREE_ENV);
-    // SAFETY: as above — single-threaded, restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; restored before
+    // returning.
     unsafe { std::env::set_var(MIN_FREE_ENV, "1000000000") };
     let verdict = temp_space_problem(&std::env::temp_dir());
     match prev {
@@ -2481,8 +2495,7 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     // and `install_credential_redaction` seeds the global store with an
     // ambient value, either of which would make the assertions below depend
     // on the machine.
-    // SAFETY: single-threaded test body, and nextest gives each test its own
-    // process, so nothing else in this process observes the change.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2862,7 +2875,7 @@ fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
 /// publishes. Three field names is cheaper than accepting that.
 #[test]
 fn the_seeded_claude_json_registers_its_account_identity_fields() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2967,7 +2980,7 @@ fn the_seeded_claude_json_registers_its_account_identity_fields() {
 /// so never resolves itself — until the test's own timeout fired.
 #[test]
 fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -3061,7 +3074,7 @@ fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
 /// to cover the new one too.
 #[test]
 fn a_non_object_claude_json_in_the_test_home_falls_back_to_the_host() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -4715,8 +4728,8 @@ fn a_missing_or_malformed_response_block_is_rebuilt_rather_than_trusted() {
 #[test]
 fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
     let prev = std::env::var_os(ANTHROPIC_API_KEY_ENV);
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var(ANTHROPIC_API_KEY_ENV) };
     assert!(anthropic_api_key().is_none(), "unset must read as absent");
     unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, "") };
@@ -5300,4 +5313,105 @@ mod load_context_tests {
         // falling back to the unarmed wording.
         assert!(report.contains("window:"), "{stderr}");
     }
+}
+
+// -----------------------------------------------------------------------
+// Issue #244 — the async content waiters poll content, not existence
+// -----------------------------------------------------------------------
+
+/// Scenario: Create the sentinel EMPTY — the state a shell redirect leaves it
+/// in before its write lands — and fill it 400ms later. An existence wait
+/// would already have returned and read `""`; the async content waiter must
+/// keep polling and return `Ok` only once the expected text is there.
+#[tokio::test]
+async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
+    let dir = harness_tempdir().expect("harness tempdir");
+    let trimmed = dir.path().join("trimmed.txt");
+    let containing = dir.path().join("containing.txt");
+    std::fs::write(&trimmed, "").expect("create empty sentinel");
+    std::fs::write(&containing, "").expect("create empty sentinel");
+    // Control: the race window is real — the file exists and reads empty.
+    assert!(wait_for_path_async(&trimmed, Duration::ZERO).await);
+    assert_eq!(std::fs::read_to_string(&trimmed).unwrap(), "");
+
+    let (t, c) = (trimmed.clone(), containing.clone());
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::fs::write(&t, "SENTINEL_OK\n")
+            .await
+            .expect("fill sentinel");
+        tokio::fs::write(&c, "prefix SENTINEL_OK suffix")
+            .await
+            .expect("fill sentinel");
+    });
+
+    // Both waiters start BEFORE the write, so each has to poll the empty file.
+    async fn timed(
+        started: std::time::Instant,
+        wait: impl std::future::Future<Output = Result<(), String>>,
+    ) -> (Result<(), String>, Duration) {
+        let result = wait.await;
+        (result, started.elapsed())
+    }
+    let started = std::time::Instant::now();
+    let ((trimmed_result, trimmed_at), (containing_result, containing_at)) = tokio::join!(
+        timed(
+            started,
+            wait_for_file_trimmed_eq_async(&trimmed, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
+        timed(
+            started,
+            wait_for_file_containing_async(&containing, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
+    );
+    trimmed_result.expect("trimmed waiter must see the late write");
+    containing_result.expect("containing waiter must see the late write");
+    for (name, at) in [("trimmed", trimmed_at), ("containing", containing_at)] {
+        assert!(
+            at >= Duration::from_millis(400),
+            "{name} waiter returned before the write landed: {at:?}"
+        );
+    }
+    writer.await.expect("writer task");
+}
+
+/// Scenario: The sentinel exists but its expected content never arrives —
+/// empty for one waiter, a partial prefix for the other. Each must give up at
+/// its timeout with an `Err` describing what the file actually held, not
+/// return `Ok` because the file exists.
+#[tokio::test]
+async fn async_content_waiters_time_out_when_the_content_never_arrives() {
+    let dir = harness_tempdir().expect("harness tempdir");
+    let empty = dir.path().join("empty.txt");
+    let partial = dir.path().join("partial.txt");
+    std::fs::write(&empty, "").expect("create empty sentinel");
+    std::fs::write(&partial, "SENTINEL").expect("create partial sentinel");
+    let timeout = Duration::from_millis(500);
+
+    let started = std::time::Instant::now();
+    let err = wait_for_file_trimmed_eq_async(&empty, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("an empty file must not satisfy the trimmed waiter");
+    assert!(
+        started.elapsed() >= timeout,
+        "gave up early: {:?}",
+        started.elapsed()
+    );
+    assert!(err.contains("contains \"\""), "{err}");
+
+    let err = wait_for_file_trimmed_eq_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the trimmed waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let err = wait_for_file_containing_async(&partial, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a partial write must not satisfy the containing waiter");
+    assert!(err.contains("contains \"SENTINEL\""), "{err}");
+
+    let missing = dir.path().join("missing.txt");
+    let err = wait_for_file_containing_async(&missing, "SENTINEL_OK", timeout)
+        .await
+        .expect_err("a missing file must not satisfy the containing waiter");
+    assert!(err.contains("does not exist"), "{err}");
 }
