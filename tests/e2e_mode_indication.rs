@@ -240,3 +240,184 @@ fn mode_live_002_real_haiku_user_journey() {
         "returning to PaneInput must restore the same painted cursor treatment"
     );
 }
+
+const FULLSCREEN_PANE: &str = "fullscreen-claude";
+const FULLSCREEN_READY: &str = "Claude Code";
+const FULLSCREEN_COMPOSER_READY: &str = "? for shortcuts";
+const FULLSCREEN_WORKING: &str = "esc to interrupt";
+const NOTHING_TO_SCROLL: &str = "Nothing to scroll";
+const FIRST_TURN_SENTINEL: &str = "LIVE003A_SENTINEL_5D21C0.md";
+const SECOND_TURN_SENTINEL: &str = "LIVE003B_SENTINEL_5D21C0.md";
+
+/// In command mode the focused pane is drawn with a heavy border; PageUp scrolls
+/// only that pane, so "no notice" means nothing unless it held first.
+#[cfg(unix)]
+fn fullscreen_pane_focused_in_command_mode(grid: &str) -> bool {
+    grid.contains(&format!("┏{FULLSCREEN_PANE}")) && command_chip_is_left_anchored(grid)
+}
+
+#[cfg(unix)]
+fn launch_fullscreen_deck_against(
+    daemon: &common::DaemonProc,
+    cols: u16,
+    rows: u16,
+    command: Option<&str>,
+) -> TuiDeck {
+    let mut builder = TuiDeck::builder()
+        .with_pty_size(cols, rows)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        );
+    if let Some(command) = command {
+        builder = builder.with_continue_session(FULLSCREEN_PANE, command);
+    }
+    builder.launch_with_fixture("minimal")
+}
+
+/// Type a directive into the focused real agent and wait for the sentinel that
+/// only inspecting the fixture can produce, since the prompt names a prefix glob.
+#[cfg(unix)]
+fn run_listing_turn(deck: &TuiDeck, prefix: &str, sentinel: &str, lines: u32) {
+    // The composer is ready when claude's footer hint is on screen.
+    assert!(
+        deck.wait_for_grid_string_within(FULLSCREEN_COMPOSER_READY, Duration::from_secs(60)),
+        "claude's composer never became ready\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let prompt = format!(
+        "Use Bash to run ls -1 {prefix}* and nothing else. Then, without using any tool, write the integers from 1 to {lines} in your reply, one per line, and end your reply with the filename that ls returned, verbatim."
+    );
+    deck.send_keys(prompt.as_bytes());
+    assert!(
+        deck.wait_for_grid_string_within(prefix, Duration::from_secs(30)),
+        "the typed directive never reached the real agent's prompt\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_keys(b"\r");
+    // The turn is over when the sentinel is on screen AND claude has dropped
+    // its working hint; the sentinel alone can appear mid-turn, inside a tool
+    // call claude is still running.
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(180), |grid| {
+            grid.contains(sentinel) && !grid.contains(FULLSCREEN_WORKING)
+        }),
+        "the real Haiku turn never finished having visibly listed the unique sentinel \
+         {sentinel:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Run a real interactive Claude Haiku with its full-screen interface (`"tui": "fullscreen"`) under an external daemon, resize the deck, have it list a fixture and write 120 numbered lines, and press PageUp in command mode — no `Nothing to scroll`, the control. Then detach, attach a second deck to the same daemon, focus the pane with Enter, run a second turn that writes 400 lines and press PageUp in command mode: the second deck must not claim `Nothing to scroll` either, because claude is still a full-screen program.
+#[cfg(unix)]
+#[spec("mode/live/003")]
+#[test]
+fn mode_live_003_reattached_fullscreen_claude_does_not_claim_nothing_to_scroll() {
+    skip_unless!(common::check_claude_available());
+
+    // The daemon clears its environment, so an API key the host authenticates
+    // with has to be handed over explicitly; a credentials file is imported
+    // into the daemon's HOME below.
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+    let extra_env: Vec<(&str, &str)> = api_key
+        .as_deref()
+        .map(|key| vec![("ANTHROPIC_API_KEY", key)])
+        .unwrap_or_default();
+    let daemon = common::spawn_daemon_serve_with_env(None, "0", &extra_env);
+
+    // The agent runs under the DAEMON's HOME, not either deck's, so that is
+    // where its credentials and the trust for its working directory go.
+    let workdir = common::race_safe_tempdir();
+    let cwd = workdir
+        .path()
+        .to_str()
+        .expect("work dir is UTF-8")
+        .to_string();
+    common::seed_claude_worker_home(&daemon.home, std::slice::from_ref(&cwd))
+        .expect("seed the daemon HOME for claude");
+    for sentinel in [FIRST_TURN_SENTINEL, SECOND_TURN_SENTINEL] {
+        std::fs::write(workdir.path().join(sentinel), b"fullscreen sentinel\n")
+            .expect("write unique real-agent sentinel");
+    }
+    // `CLAUDE_CODE_NO_FLICKER=1` forces the full-screen renderer, which the
+    // setting alone does not: claude falls back to its classic renderer after
+    // a launch it thinks crashed, and records that in `.claude.json` — which the
+    // harness bases the test HOME's copy on.
+    let command = format!(
+        "cd '{cwd}' && CLAUDE_CODE_NO_FLICKER=1 exec claude --model {HAIKU_MODEL} --settings '{{\"tui\":\"fullscreen\"}}' --allowedTools Bash Read"
+    );
+
+    let mut first = launch_fullscreen_deck_against(&daemon, 160, 45, Some(&command));
+    assert!(
+        first.wait_for_grid_string_within(FULLSCREEN_READY, Duration::from_secs(120)),
+        "the full-screen claude never came up in the first deck\nFinal grid:\n{}",
+        first.snapshot_grid()
+    );
+    first.wait_until_grid(
+        "real agent live with TYPING chip",
+        typing_chip_is_left_anchored,
+    );
+
+    // Resizing the deck resizes claude, which redraws without re-entering the
+    // alternate screen it is still on.
+    first.resize(140, 40);
+    run_listing_turn(&first, "LIVE003A_", FIRST_TURN_SENTINEL, 120);
+
+    // Control: the deck that watched claude start knows it is full-screen.
+    first.send_keys(b"\x04"); // Ctrl+D -> command mode
+    first.wait_until_grid(
+        "first deck in command mode on the focused pane",
+        fullscreen_pane_focused_in_command_mode,
+    );
+    first.send_keys(b"\x1b[5~");
+    assert!(
+        !first.wait_for_grid_string_within(NOTHING_TO_SCROLL, Duration::from_secs(2)),
+        "control: the deck that saw full-screen claude start must not claim there is nothing \
+         to scroll.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+
+    first.send_bytes(b"\x03"); // Ctrl+C -> quit-confirm modal
+    first.wait_for_string("Quit dot-agent-deck?");
+    first.send_bytes(b"\r"); // Enter -> Detach (default)
+    assert_eq!(
+        first.wait_for_exit_within(Duration::from_secs(30)),
+        Some(true),
+        "the first deck did not detach cleanly.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    assert_eq!(records.len(), 1, "claude must survive the detach");
+
+    let second = launch_fullscreen_deck_against(&daemon, 150, 42, None);
+    assert!(
+        second.wait_for_grid_string_within(FULLSCREEN_PANE, Duration::from_secs(30)),
+        "the second deck never showed the re-attached pane\nFinal grid:\n{}",
+        second.snapshot_grid()
+    );
+    second.send_keys(b"\r"); // Enter -> focus the pane (typing mode)
+    second.wait_until_grid(
+        "second deck typing into claude",
+        typing_chip_is_left_anchored,
+    );
+    run_listing_turn(&second, "LIVE003B_", SECOND_TURN_SENTINEL, 400);
+
+    second.send_keys(b"\x04"); // Ctrl+D -> command mode
+    second.wait_until_grid(
+        "second deck in command mode on the focused pane",
+        fullscreen_pane_focused_in_command_mode,
+    );
+    second.send_keys(b"\x1b[5~");
+    assert!(
+        !second.wait_for_grid_string_within(NOTHING_TO_SCROLL, Duration::from_secs(2)),
+        "the re-attached deck claimed `{NOTHING_TO_SCROLL}` for real full-screen claude — the \
+         same agent the first deck (control) correctly said nothing about.\nGrid:\n{}",
+        second.snapshot_grid()
+    );
+}

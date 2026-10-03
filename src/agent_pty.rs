@@ -20,6 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 use crate::event::{AgentType, OrchestrationSurface};
 use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
 use crate::state::Ownership;
+use crate::terminal_modes::ReplayModes;
 
 /// Trigger flag the deck client honors to mean "the daemon is already
 /// running; attach over its stream socket instead of spawning one." The
@@ -2035,6 +2036,29 @@ pub struct AgentBus {
 
 struct AgentBusState {
     scrollback: VecDeque<u8>,
+    /// Issue #1537 — the terminal modes in force after the last byte pushed.
+    live_modes: ReplayModes,
+    /// Issue #1537 — the terminal modes in force at the ring's FIRST byte,
+    /// which every snapshot re-establishes before replaying the ring.
+    ///
+    /// The ring loses the bytes that set those modes: a resize clears it and
+    /// its cap drops its oldest bytes, and a full-screen agent enters the
+    /// alternate screen once at start-up and never says so again. Replayed
+    /// without them, a fresh parser sits on the normal screen while the agent
+    /// repaints the alternate one in place, and the TUI's cannot-scroll notice
+    /// then calls the pane one with nothing to scroll.
+    ring_start_modes: ReplayModes,
+}
+
+impl AgentBusState {
+    /// The replay a fresh reader parses: the modes in force at the ring's first
+    /// byte (issue #1537), then the ring. The preamble is empty for a stream
+    /// whose tracked modes are all at their defaults.
+    fn snapshot(&self) -> Vec<u8> {
+        let mut snapshot = self.ring_start_modes.preamble();
+        snapshot.extend(self.scrollback.iter().copied());
+        snapshot
+    }
 }
 
 impl Default for AgentBus {
@@ -2050,6 +2074,8 @@ impl AgentBus {
             tx,
             state: Mutex::new(AgentBusState {
                 scrollback: VecDeque::new(),
+                live_modes: ReplayModes::default(),
+                ring_start_modes: ReplayModes::default(),
             }),
         }
     }
@@ -2061,11 +2087,16 @@ impl AgentBus {
     fn push(&self, data: Vec<u8>) {
         let arc = Arc::new(data);
         let mut state = self.state.lock().unwrap();
+        state.live_modes.feed(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
-        while state.scrollback.len() > SCROLLBACK_CAP_BYTES {
-            state.scrollback.pop_front();
+        let excess = state.scrollback.len().saturating_sub(SCROLLBACK_CAP_BYTES);
+        if excess > 0 {
+            // The evicted bytes leave the replay, so the modes they set have to
+            // be carried by the ring's start state instead.
+            let evicted: Vec<u8> = state.scrollback.drain(..excess).collect();
+            state.ring_start_modes.feed(&evicted);
         }
         // Lossy on purpose: we don't block the reader thread on slow
         // subscribers. `send` returns Err only when there are zero
@@ -2078,7 +2109,7 @@ impl AgentBus {
     /// guarantee.
     pub fn subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Arc<Vec<u8>>>) {
         let state = self.state.lock().unwrap();
-        let snapshot: Vec<u8> = state.scrollback.iter().copied().collect();
+        let snapshot = state.snapshot();
         let rx = self.tx.subscribe();
         drop(state);
         (snapshot, rx)
@@ -2086,13 +2117,7 @@ impl AgentBus {
 
     /// Take just the scrollback snapshot, no subscription.
     pub fn snapshot(&self) -> Vec<u8> {
-        self.state
-            .lock()
-            .unwrap()
-            .scrollback
-            .iter()
-            .copied()
-            .collect()
+        self.state.lock().unwrap().snapshot()
     }
 
     /// Drop the scrollback ring on the floor, leaving live subscribers
@@ -2111,6 +2136,9 @@ impl AgentBus {
     fn clear_scrollback(&self) {
         let mut state = self.state.lock().unwrap();
         state.scrollback.clear();
+        // Issue #1537: the ring now starts where the stream is, so it starts in
+        // whatever modes the stream is in.
+        state.ring_start_modes = state.live_modes.clone();
     }
 
     /// Current number of live broadcast subscribers. Lets diagnostics and
@@ -19311,6 +19339,95 @@ mod spawn_tests {
         assert_eq!((rec.rows, rec.cols), (24, 80));
 
         registry.shutdown_all();
+    }
+
+    /// Issue #1537 — what a fresh reader makes of a snapshot: parsed into a
+    /// new `vt100` parser exactly as the TUI hydrates a pane.
+    fn parse_snapshot(snapshot: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(snapshot);
+        parser
+    }
+
+    /// What a full-screen agent (claude with `"tui": "fullscreen"`) sends once,
+    /// at start-up: the alternate screen and SGR any-motion mouse tracking.
+    const FULLSCREEN_ENTRY: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+
+    fn assert_fullscreen(parser: &vt100::Parser, route: &str) {
+        let screen = parser.screen();
+        assert!(
+            screen.alternate_screen(),
+            "{route}: the replay must put a fresh parser on the alternate screen the agent \
+             is still on"
+        );
+        assert_eq!(
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding()
+            ),
+            (
+                vt100::MouseProtocolMode::AnyMotion,
+                vt100::MouseProtocolEncoding::Sgr
+            ),
+            "{route}: the replay must restore the mouse reporting the agent asked for"
+        );
+    }
+
+    #[test]
+    fn replay_after_a_clear_restores_the_modes_the_cleared_bytes_set() {
+        let bus = AgentBus::new();
+        bus.push(FULLSCREEN_ENTRY.to_vec());
+        bus.push(b"\x1b[Hrepainted in place".to_vec());
+        assert_fullscreen(&parse_snapshot(&bus.snapshot()), "control, nothing cleared");
+
+        // A resize clears the ring; the agent redraws without re-entering.
+        bus.clear_scrollback();
+        bus.push(b"\x1b[2J\x1b[Hredrawn after SIGWINCH".to_vec());
+        assert_fullscreen(&parse_snapshot(&bus.snapshot()), "after a clear");
+        let (subscribed, _rx) = bus.subscribe();
+        assert_fullscreen(&parse_snapshot(&subscribed), "an attach's snapshot");
+    }
+
+    #[test]
+    fn replay_after_eviction_restores_the_modes_the_evicted_bytes_set() {
+        let bus = AgentBus::new();
+        bus.push(FULLSCREEN_ENTRY.to_vec());
+        // More in-place repaint than the ring holds, so the entry is evicted.
+        let frame = b"\x1b[H"
+            .iter()
+            .chain(&[b'x'; 4096])
+            .copied()
+            .collect::<Vec<u8>>();
+        for _ in 0..(SCROLLBACK_CAP_BYTES / frame.len() + 2) {
+            bus.push(frame.clone());
+        }
+        let snapshot = bus.snapshot();
+        assert!(
+            !snapshot
+                .windows(FULLSCREEN_ENTRY.len())
+                .any(|w| w == FULLSCREEN_ENTRY),
+            "test prerequisite: the entry sequence must have been evicted from the ring"
+        );
+        assert_fullscreen(&parse_snapshot(&snapshot), "after eviction");
+    }
+
+    #[test]
+    fn replay_of_an_agent_that_left_the_alternate_screen_adds_nothing() {
+        let bus = AgentBus::new();
+        bus.push(b"plain output\r\n".to_vec());
+        bus.clear_scrollback();
+        assert!(
+            bus.snapshot().is_empty(),
+            "no modes set, nothing to restore"
+        );
+
+        bus.push(FULLSCREEN_ENTRY.to_vec());
+        bus.push(b"\x1b[?1049l\x1b[?1003l\x1b[?1006l".to_vec());
+        bus.clear_scrollback();
+        assert!(
+            bus.snapshot().is_empty(),
+            "an agent back on the normal screen with no mouse reporting needs no preamble"
+        );
     }
 
     // ---------------------------------------------------------------------
