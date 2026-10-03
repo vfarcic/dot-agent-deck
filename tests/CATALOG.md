@@ -1352,7 +1352,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### prompt/pane-input/009 — A queued prompt cannot cross an agent or logical-session generation (PRD #20 finding #4).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex identities bound sequentially to the same pane.
-- **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against either an attached or unattached pane's current hook session return `stale`; all write no marker. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
+- **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against either an attached or unattached pane's current hook session return `stale` carrying that session as `current_session_id` (issue #621), and a retry naming it delivers; all refusals write no marker, and a delivered or named-but-lost request carries no `current_session_id`. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
 - **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
 - **Platform coverage:** mac+linux.
 
@@ -1587,6 +1587,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** real Claude Code pinned to Haiku with Bash, Read and Write allowed; runtime-skipped when the CLI or credential is unavailable.
 - **Asserts:** a typed draft remains visible and a unique task sentinel remains absent during the wait; Ctrl+U clears the draft, the separately submitted delegate task reaches Claude, and Claude creates the sentinel with expected content.
 - **Does not assert:** exact model prose, timing of a completed work-done report, or behavior on other agents' native input editors.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/043 — A seed or orchestrator prompt whose `SessionStart` the TUI's event stream dropped is still delivered, naming the conversation the daemon's `stale` refusal reported (issue #621).
+- **Layer:** L1 (in-process seed and orchestrator consumers driven through the production `begin_guarded_submit` against the production attach handler over a real socket, with a `/bin/cat` target whose PTY buffer is the delivery evidence; the daemon's `AppState` and the TUI's snapshot are separate, so they can disagree).
+- **Agent:** none (a synthetic Codex `SessionStart` applied to the daemon's state only).
+- **Asserts:** with the daemon holding a generation the TUI's snapshot never received, the first unnamed write is refused `stale`, the delivery binds the generation the refusal named, and the prompt reaches the pane on both TUI paths; on the pass after the write the delivery is still held for confirmation rather than abandoned as a changed conversation. Control: when the snapshot observes the start after one `stale`, the seed is delivered and the refusal did not count as an attempt. Reverting the daemon recording the generation, the client recording it, the bind using it, or the target check honouring it each turns the test red.
+- **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start — it does not bind from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`) and is still abandoned at the deadline; event-stream resynchronization after a reconnect, which this does not add; the wire field in isolation (`prompt/pane-input/009`).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit

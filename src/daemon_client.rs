@@ -798,6 +798,22 @@ pub async fn read_response<R: AsyncRead + Unpin>(
     }
 }
 
+/// Issue #621: a guarded `write-and-submit`'s answer as
+/// [`DaemonClient::write_and_submit_with_identity_reply`] reports it — the
+/// honest [`SendResult`], and on a `stale` refusal of a request that named no
+/// session, the hook-session generation the daemon refused it against
+/// ([`crate::daemon_protocol::AttachResponse::current_session_id`]).
+///
+/// That generation is how a caller whose own event stream never delivered the
+/// pane's `SessionStart` learns which conversation to name. It is advisory:
+/// the retry naming it goes back through the same guard. An older daemon never
+/// sends one, so `None` there means exactly what it always did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedSendReply {
+    pub result: SendResult,
+    pub current_session_id: Option<String>,
+}
+
 /// PRD #20 R20-011: translate a `WriteAndSubmit` [`AttachResponse`] into the
 /// honest [`SendResult`] a caller acts on, enforcing that `ok` AGREES with the
 /// delivered-vs-non-delivered outcome. Three cases:
@@ -1685,6 +1701,29 @@ impl DaemonClient {
         expected_session_id: Option<&str>,
         delivery_id: Option<&str>,
     ) -> Result<SendResult, ClientError> {
+        self.write_and_submit_with_identity_reply(
+            pane_id,
+            text,
+            expected_agent_id,
+            expected_session_id,
+            delivery_id,
+        )
+        .await
+        .map(|reply| reply.result)
+    }
+
+    /// Issue #621: [`Self::write_and_submit_with_identity`], keeping the
+    /// generation a `stale` refusal names — see [`GuardedSendReply`]. The two
+    /// send exactly the same request; only what is kept from the answer
+    /// differs.
+    pub async fn write_and_submit_with_identity_reply(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> Result<GuardedSendReply, ClientError> {
         // PRD #20 R20-006 (finding #6): an identity-bearing send DEPENDS on the
         // daemon's guarded-send guarantees (exact agent+session match, atomic
         // delivery-id dedup). If the daemon doesn't advertise that capability —
@@ -1719,7 +1758,18 @@ impl DaemonClient {
             request["delivery_id"] = serde_json::Value::String(v.to_string());
         }
         let resp = self.issue_json_command(&request).await?;
-        interpret_send_response(resp)
+        let current_session_id = resp.current_session_id.clone();
+        let result = interpret_send_response(resp)?;
+        // Kept only beside the outcome it explains, and only when this request
+        // named no session: a generation offered alongside anything else —
+        // including a `stale` for a request that DID name one, which is a lost
+        // target — is not an address this client should ever write to.
+        let current_session_id = current_session_id
+            .filter(|_| result == SendResult::Stale && expected_session_id.is_none());
+        Ok(GuardedSendReply {
+            result,
+            current_session_id,
+        })
     }
 
     /// One-shot request/response for a hand-built JSON request. Used by
