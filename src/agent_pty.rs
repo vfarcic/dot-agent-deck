@@ -4264,6 +4264,7 @@ impl PaneWriter {
             writer: self,
             stall,
             committed,
+            flushed: None,
         }
     }
 
@@ -4276,16 +4277,20 @@ impl PaneWriter {
     pub(crate) async fn write_user(&self, bytes: &[u8]) -> std::io::Result<()> {
         match self
             .pty
-            .run(PtyOp::WriteAll(bytes.to_vec(), ByteSource::User), None)
+            .run(
+                PtyOp::WriteAll(bytes.to_vec(), ByteSource::User, true),
+                None,
+            )
             .await
         {
+            // The flush rides in the same job; its result is ignored, as it
+            // always was here.
             PtyJobOutcome::Done(done) => done.result?,
             PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
             PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => {
                 unreachable!("an unbounded job is neither withdrawn nor stalled")
             }
         }
-        let _ = self.pty.run(PtyOp::Flush, None).await;
         Ok(())
     }
 
@@ -4348,8 +4353,12 @@ enum PtyOp {
     /// One `write` call, as [`std::io::Write::write`] makes it.
     Write(Vec<u8>, ByteSource),
     /// Every byte, retrying `Interrupted` and stopping at the first error —
-    /// [`write_all_tracked`]'s loop, run where the PTY can block.
-    WriteAll(Vec<u8>, ByteSource),
+    /// [`write_all_tracked`]'s loop, run where the PTY can block. With `true`,
+    /// the writer is flushed in the same job and the result reported in
+    /// [`PtyJobDone::flushed`]: every daemon write is followed by a flush, and
+    /// one round trip to this thread instead of two matters on a starved
+    /// machine, where each costs a scheduling delay.
+    WriteAll(Vec<u8>, ByteSource, bool),
     Flush,
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
@@ -4362,6 +4371,8 @@ enum PtyOp {
 struct PtyJobDone {
     accepted: usize,
     result: std::io::Result<()>,
+    /// The flush run after a [`PtyOp::WriteAll`] that asked for one.
+    flushed: Option<std::io::Result<()>>,
 }
 
 /// Issue #525: how a job that was handed to the thread ended for the caller
@@ -4552,21 +4563,28 @@ impl PtyWriterThread {
                                 PtyJobDone {
                                     accepted: n,
                                     result: Ok(()),
+                                    flushed: None,
                                 }
                             }
                             Err(e) => PtyJobDone {
                                 accepted: 0,
                                 result: Err(e),
+                                flushed: None,
                             },
                         },
-                        PtyOp::WriteAll(buf, source) => {
-                            write_all_recorded(inner.as_mut(), &buf, |accepted| {
+                        PtyOp::WriteAll(buf, source, flush) => {
+                            let mut done = write_all_recorded(inner.as_mut(), &buf, |accepted| {
                                 recorder.record(source, accepted)
-                            })
+                            });
+                            if flush {
+                                done.flushed = Some(inner.flush());
+                            }
+                            done
                         }
                         PtyOp::Flush => PtyJobDone {
                             accepted: 0,
                             result: inner.flush(),
+                            flushed: None,
                         },
                         #[cfg(test)]
                         PtyOp::Surrender(back) => {
@@ -4847,6 +4865,7 @@ fn write_all_recorded(
                         std::io::ErrorKind::WriteZero,
                         "writer accepted zero bytes",
                     )),
+                    flushed: None,
                 };
             }
             Ok(n) => {
@@ -4858,6 +4877,7 @@ fn write_all_recorded(
                 return PtyJobDone {
                     accepted: written,
                     result: Err(e),
+                    flushed: None,
                 };
             }
         }
@@ -4865,6 +4885,7 @@ fn write_all_recorded(
     PtyJobDone {
         accepted: written,
         result: Ok(()),
+        flushed: None,
     }
 }
 
@@ -4917,23 +4938,33 @@ struct DeckSink<'a> {
     /// Set once any write through this sink has reached the PTY — see
     /// [`UnfinishedDelivery`].
     committed: Arc<AtomicBool>,
+    /// The flush the last write ran in its own job, which the next
+    /// [`PtySink::flush_tracked`] reports instead of sending one of its own.
+    flushed: Option<std::io::Result<()>>,
 }
 
 impl PtySink for DeckSink<'_> {
     async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
-        let op = PtyOp::WriteAll(buf.to_vec(), ByteSource::Deck);
+        let op = PtyOp::WriteAll(buf.to_vec(), ByteSource::Deck, true);
+        self.flushed = None;
         match self
             .writer
             .pty
             .run_committing(op, Some(self.stall), Some(&self.committed))
             .await
         {
-            PtyJobOutcome::Done(PtyJobDone { result: Ok(()), .. }) => WriteProgress::Complete,
             PtyJobOutcome::Done(PtyJobDone {
-                accepted: 0,
-                result: Err(e),
-            }) => WriteProgress::NothingWritten(e.to_string()),
-            PtyJobOutcome::Done(PtyJobDone { accepted, .. }) => WriteProgress::Partial(accepted),
+                accepted,
+                result,
+                flushed,
+            }) => {
+                self.flushed = flushed;
+                match result {
+                    Ok(()) => WriteProgress::Complete,
+                    Err(e) if accepted == 0 => WriteProgress::NothingWritten(e.to_string()),
+                    Err(_) => WriteProgress::Partial(accepted),
+                }
+            }
             PtyJobOutcome::Withdrawn => WriteProgress::NothingWritten(format!(
                 "the PTY did not start taking this write within {:?}: an earlier write into it \
                  is still blocked",
@@ -4947,6 +4978,10 @@ impl PtySink for DeckSink<'_> {
     }
 
     async fn flush_tracked(&mut self) -> std::io::Result<()> {
+        // The write before this one already flushed, in its own job.
+        if let Some(flushed) = self.flushed.take() {
+            return flushed;
+        }
         match self.writer.pty.run(PtyOp::Flush, Some(self.stall)).await {
             PtyJobOutcome::Done(done) => done.result,
             PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => Err(std::io::Error::new(
@@ -21319,7 +21354,7 @@ mod spawn_tests {
             let committed = first_committed.clone();
             tokio::spawn(async move {
                 pty.run_committing(
-                    PtyOp::WriteAll(b"first".to_vec(), ByteSource::Deck),
+                    PtyOp::WriteAll(b"first".to_vec(), ByteSource::Deck, false),
                     None,
                     Some(&committed),
                 )
@@ -21335,7 +21370,7 @@ mod spawn_tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(
             pty.run_committing(
-                PtyOp::WriteAll(b"withdrawn".to_vec(), ByteSource::Deck),
+                PtyOp::WriteAll(b"withdrawn".to_vec(), ByteSource::Deck, false),
                 Some(Duration::from_millis(100)),
                 Some(&withdrawn_committed),
             )
@@ -21343,7 +21378,7 @@ mod spawn_tests {
             PtyJobOutcome::Withdrawn
         ));
         let dropped = pty.run_committing(
-            PtyOp::WriteAll(b"dropped".to_vec(), ByteSource::Deck),
+            PtyOp::WriteAll(b"dropped".to_vec(), ByteSource::Deck, false),
             None,
             Some(&dropped_committed),
         );
@@ -21368,7 +21403,8 @@ mod spawn_tests {
             first.await.unwrap(),
             PtyJobOutcome::Done(PtyJobDone {
                 accepted: 5,
-                result: Ok(())
+                result: Ok(()),
+                ..
             })
         ));
         tokio::time::timeout(Duration::from_secs(10), pty.until_idle())
@@ -21376,8 +21412,11 @@ mod spawn_tests {
             .expect("every job is finished or withdrawn");
         assert!(first_committed.load(Ordering::SeqCst));
         assert!(matches!(
-            pty.run(PtyOp::WriteAll(b"-last".to_vec(), ByteSource::Deck), None)
-                .await,
+            pty.run(
+                PtyOp::WriteAll(b"-last".to_vec(), ByteSource::Deck, false),
+                None
+            )
+            .await,
             PtyJobOutcome::Done(PtyJobDone { accepted: 5, .. })
         ));
         assert_eq!(log.lock().unwrap().as_slice(), b"first-last");
@@ -21397,7 +21436,7 @@ mod spawn_tests {
             },
         );
         let abandoned = pty.run_committing(
-            PtyOp::WriteAll(b"abandoned".to_vec(), ByteSource::Deck),
+            PtyOp::WriteAll(b"abandoned".to_vec(), ByteSource::Deck, false),
             None,
             Some(&abandoned_committed),
         );
