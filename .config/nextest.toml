@@ -519,6 +519,23 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'test(orchestration_012_real_agent_reflows_across_a_zoom_round_trip)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
+# Issue #1492: the voice phrase fixtures (`desktop/src-tauri/tests/
+# voice_phrase_fixtures.rs`, lane 2, needs `OPENAI_API_KEY`) are ONE test that
+# sends every fixture in `phrase_fixtures.toml` to the real default backend in
+# turn, so its wall clock grows with the manifest. Measured 2026-10-03 with 177
+# fixtures: 188.7s with plain `cargo test`, ~1.07s a fixture — past the default
+# 3 x 60s, and under nextest the suite was killed at 180s with 157 fixtures
+# answered and no summary of which had failed. A single slow answer costs up to
+# the backend's own 15s timeout on top. 8 x 60s = 480s is ~2.5x the measured
+# run; still bounded, so a backend that hangs on every fixture is killed.
+#
+# The filter tracks the TEST FUNCTION name, so it must be updated in lockstep
+# with any rename — a stale filter matches nothing and silently drops this test
+# back to the 3 x 60s default.
+[[profile.default.overrides]]
+filter = 'test(voice_phrase_fixtures_match_the_default_backend)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so
