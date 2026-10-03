@@ -87,45 +87,6 @@ while True:
     (config, dir.join("daemon.log"))
 }
 
-fn commit_fixture_repo(dir: &Path) {
-    // Through `common::fixture_git`, which clears the ambient git LOCATION
-    // variables — a bare `git commit` with only `.current_dir` commits into
-    // whatever an ambient `GIT_DIR` names (issue #834) — and supplies the
-    // identity by environment. `dir` is both the fixture repo and its own
-    // sandbox root: it is the harness tempdir, and nothing above it is this
-    // test's. The two `git config` writes this used to make are gone with it.
-    let run = |args: &[&str]| {
-        let out = common::fixture_git(dir, dir)
-            .args(args)
-            .output()
-            .expect("git available");
-        assert!(out.status.success(), "git {args:?} failed: {out:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    // The fixture repo is the harness tempdir, which also holds the per-test
-    // `home/`. An agent CLI the deck probes can be writing there while this
-    // runs — a `codex` on PATH creates `home/.codex/.tmp/plugins-clone-*`
-    // repositories — and `git add -A` then fails on a half-cloned one
-    // ("does not have a commit checked out"). Measured once in a full lane-1
-    // pass on the #692/#1137 branch, green 3/3 alone. HOME is not part of what
-    // any of these tests dispatch, so it is ignored rather than committed;
-    // ignored rather than pathspec-excluded, so it cannot read as untracked
-    // dirt either.
-    let exclude = PathBuf::from(run(&["rev-parse", "--git-path", "info/exclude"]));
-    let exclude = if exclude.is_absolute() {
-        exclude
-    } else {
-        dir.join(exclude)
-    };
-    std::fs::create_dir_all(exclude.parent().expect("info/exclude has a parent"))
-        .expect("create the fixture's info dir");
-    let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
-    ignored.push_str("\n/home/\n");
-    std::fs::write(&exclude, ignored).expect("ignore the per-test HOME");
-    run(&["add", "-A"]);
-    run(&["commit", "-qm", "fixture baseline"]);
-}
-
 fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
     deck.workdir()
         .parent()
@@ -464,7 +425,7 @@ fn dispatch_return_001_orchestration_completion_reaches_the_caller() {
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
     let worktree = dispatch_worktree_of(&deck, UNIT);
@@ -508,7 +469,7 @@ fn dispatch_return_002_callback_survives_caller_detach_and_reattach() {
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("orch-deck");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
     let worktree = dispatch_worktree_of(&deck, UNIT);
@@ -583,7 +544,7 @@ fn dispatch_return_003_single_completion_routes_while_unknown_pane_stays_inert()
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
     let worktree = dispatch_worktree_of(&deck, UNIT);
@@ -676,7 +637,7 @@ fn dispatch_return_008_cut_report_names_its_saved_full_copy_in_the_unit_worktree
         .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
-    commit_fixture_repo(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
 
     let caller = open_probe_caller(&deck);
     let worktree = dispatch_worktree_of(&deck, UNIT);

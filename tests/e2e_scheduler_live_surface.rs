@@ -465,3 +465,78 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
 
     drop(scratch);
 }
+
+/// Scenario: Launch the deck attached to a daemon with TWO enabled schedules
+/// (`review-nightly`, `review-hourly`) that both target the same directory,
+/// `shared-repo`, whose `.dot-agent-deck.toml` defines one orchestration
+/// (`team`, two `cat` roles). Fire both via `RunNow` without detaching, then
+/// read the tab strip: it must show two orchestration tabs a user can tell
+/// apart — `team · shared-repo` and `team · shared-repo · 2` — rather than two
+/// identical `team · shared-repo` labels (issue #1339).
+#[spec("scheduler/live/005")]
+#[test]
+fn live_005_two_schedules_firing_one_repo_get_tabs_with_distinct_labels() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let work = scratch.path().join("shared-repo");
+    std::fs::create_dir_all(&work).expect("create work dir");
+    // `cat` roles: what is under test is the label the DAEMON admits each run
+    // under and the attached TUI paints, which no agent participates in.
+    std::fs::write(
+        work.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"team\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"cat\"\n",
+    )
+    .expect("write the shared repo's orchestration config");
+
+    let work_dir = work.to_string_lossy();
+    let sched_path = scratch.path().join("schedules.toml");
+    std::fs::write(
+        &sched_path,
+        format!(
+            "{}\n{}",
+            single_task_toml("review-nightly", &work_dir, "cat", "NIGHTLY"),
+            single_task_toml("review-hourly", &work_dir, "cat", "HOURLY"),
+        ),
+    )
+    .expect("write fixture schedules.toml");
+
+    let deck = TuiDeck::builder()
+        // Wide enough that two run-identifying labels fit the strip whole, so
+        // neither is ellipsized into looking like the other.
+        .with_pty_size(220, 50)
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    run_now(&deck, "review-nightly");
+    // The first run's tab is up before the second fires, so the order — and
+    // therefore which run carries the number — is fixed.
+    deck.wait_until_grid("the first scheduled run's tab is in the strip", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|strip| strip.contains("team · shared-repo"))
+    });
+    run_now(&deck, "review-hourly");
+
+    let count = |strip: &str, needle: &str| strip.matches(needle).count();
+    deck.wait_until_grid(
+        "two orchestration tabs in the strip, the second numbered",
+        |grid| {
+            let strip = grid.lines().next().unwrap_or_default();
+            count(strip, "team · shared-repo") == 2 && count(strip, "team · shared-repo · 2") == 1
+        },
+    );
+    let strip = deck
+        .snapshot_grid()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !strip.contains("· 3"),
+        "two runs need exactly one number; strip: {strip:?}"
+    );
+
+    drop(scratch);
+}

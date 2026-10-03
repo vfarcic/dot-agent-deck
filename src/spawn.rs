@@ -809,7 +809,33 @@ pub async fn spawn(
             // exists to prevent. The broadcast now carries THIS value (see the
             // `surface_spawned_orchestration` call below), so the live label and
             // the reattached label cannot disagree by construction.
-            let display_title = dispatched_orchestration_display_title(&name, &req.working_dir);
+            //
+            // Issue #1339: and ADMITTED here, before the first role, through the
+            // same uniqueness check a client `StartAgent` passes (#555). The
+            // derived title names the orchestration and the directory, so two
+            // live runs of one orchestration in one directory — two schedules
+            // firing one repo, or a fresh-tab schedule firing again before its
+            // last run ended — derived byte-identical labels. A taken title is
+            // suffixed (`… · 2`) rather than refused; see
+            // `AppState::claim_dispatched_orchestration_title` for why. The
+            // claim is held until every role is registered (each registered
+            // pane then holds the title) and released on the rollback arm too.
+            let derived_title = dispatched_orchestration_display_title(&name, &req.working_dir);
+            // With no daemon state (tests) there is nothing to claim against,
+            // and every release below is gated on the same `state`.
+            let display_title = match state {
+                Some(state) => {
+                    let title_cwd =
+                        crate::state::orchestration_title_cwd_key(&req.working_dir).await;
+                    state.write().await.claim_dispatched_orchestration_title(
+                        &identity,
+                        derived_title.as_deref(),
+                        &title_cwd,
+                        registry,
+                    )
+                }
+                None => derived_title,
+            };
             for (idx, role) in roles.iter().enumerate() {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -867,6 +893,14 @@ pub async fn spawn(
                             &role.role_name,
                         )
                         .await;
+                        // Issue #1339: nothing is left running, so nothing
+                        // holds the title this spawn was admitted under.
+                        if let Some(state) = state {
+                            state
+                                .write()
+                                .await
+                                .release_orchestration_title_claim(&identity);
+                        }
                         return Err(e);
                     }
                 };
@@ -934,9 +968,8 @@ pub async fn spawn(
                     // Issue #962: the daemon holds the run title itself, beside
                     // the role maps, so a `clear = true` worker re-created later
                     // does not have to find a live sibling to read it from.
-                    // Recorded, not claimed: this path is not subject to the
-                    // `StartAgent` uniqueness check (issue #555) — see
-                    // `AppState::claim_orchestration_title`.
+                    // Already admitted before the loop (issue #1339), so this
+                    // keeps the claimed title rather than checking it again.
                     state.record_orchestration_title(
                         &identity,
                         display_title.as_deref(),
@@ -969,6 +1002,14 @@ pub async fn spawn(
                     pane_id,
                     role_name: Some(role.role_name.clone()),
                 });
+            }
+            // Issue #1339: every role is registered, so its panes hold the
+            // title from here on and the spawn's own claim ends.
+            if let Some(state) = state {
+                state
+                    .write()
+                    .await
+                    .release_orchestration_title_claim(&identity);
             }
             // PRD #120: surface this orchestration LIVE to any already-attached
             // TUI. Unlike the single-agent card above (a synthetic

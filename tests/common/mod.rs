@@ -784,6 +784,48 @@ pub fn fixture_git(dir: &Path, sandbox_root: &Path) -> std::process::Command {
     cmd
 }
 
+/// Give a `TuiDeck` fixture repo (`deck.workdir()`) an initial commit, so a
+/// `dispatch` in it can create its sibling worktree — the harness `git init`s
+/// the copied fixture but never commits, and `git worktree add` cannot branch
+/// from an unborn HEAD.
+///
+/// Through [`fixture_git`] (issue #834); `dir` is both the fixture repo and its
+/// own sandbox root, as it is the harness tempdir.
+///
+/// The per-test `home/` lives inside that same tempdir, and is **ignored**
+/// rather than committed. An agent CLI the deck probes can be writing there
+/// while this runs — a `codex` on `PATH` creates
+/// `home/.codex/.tmp/plugins-clone-*` repositories — and `git add -A` then
+/// fails on a half-cloned one ("does not have a commit checked out"). Ignored
+/// rather than pathspec-excluded, so it cannot read as untracked dirt either.
+/// This used to be three private copies of the helper, and only the one in
+/// `e2e_dispatch_return.rs` had learned this; `e2e_dispatcher_mode.rs`'s
+/// `dispatch_close_002` / `_003` then went red on it in a lane-2 pass on the
+/// #1339 branch with 22 `claude` and 6 `codex` processes on the box.
+pub fn commit_fixture_repo(dir: &Path) {
+    let run = |args: &[&str]| {
+        let out = fixture_git(dir, dir)
+            .args(args)
+            .output()
+            .expect("git available");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let exclude = PathBuf::from(run(&["rev-parse", "--git-path", "info/exclude"]));
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        dir.join(exclude)
+    };
+    std::fs::create_dir_all(exclude.parent().expect("info/exclude has a parent"))
+        .expect("create the fixture's info dir");
+    let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ignored.push_str("\n/home/\n");
+    std::fs::write(&exclude, ignored).expect("ignore the per-test HOME");
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "fixture baseline"]);
+}
+
 impl TuiDeck {
     /// One-line convenience: build a default deck and launch it.
     pub fn launch_with_fixture(fixture_name: &str) -> Self {

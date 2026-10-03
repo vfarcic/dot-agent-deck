@@ -1147,6 +1147,22 @@ fn spawn_context_removal(path: std::path::PathBuf) {
     }
 }
 
+/// Issue #1339: `<base> · <n>`, the label a daemon-spawned run takes when its
+/// own title is already held. The base is shortened at a character boundary
+/// when the whole would pass [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`], since
+/// `validate_tab_membership` drops an over-long title and the tab would then
+/// fall back to the canonical name — the very label the suffix was added to
+/// tell apart. The suffix is never the part cut.
+fn suffixed_run_title(base: &str, n: usize) -> String {
+    let suffix = format!(" · {n}");
+    let room = crate::agent_pty::DISPLAY_NAME_MAX_LEN.saturating_sub(suffix.len());
+    let mut end = base.len().min(room);
+    while !base.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &base[..end])
+}
+
 /// Issue #555: the directory half of an orchestration title's uniqueness key,
 /// resolved so that a symlink, a `..` component or any other alias of a
 /// directory is the SAME key as the directory itself — the same best-effort
@@ -10847,14 +10863,14 @@ impl AppState {
     /// alias of a live orchestration's directory is the same key.
     ///
     /// Called under the state write lock, so the check and the claim are one
-    /// step: two concurrent starts of one title cannot both pass. What this does
-    /// NOT cover, stated narrowly: the daemon's own spawn paths
-    /// ([`crate::spawn::spawn`] — dispatch, a scheduled fire, issue dispatch)
-    /// record their titles through [`Self::record_orchestration_title`] without
-    /// being checked, so a client start is refused against them but they are
-    /// never refused; and a legacy client that sends no per-tab token is scoped
-    /// by `(name, cwd)`, so two such tabs of one orchestration in one directory
-    /// read as one tab here exactly as they already do to `handle_delegate`.
+    /// step: two concurrent starts of one title cannot both pass. The daemon's
+    /// own spawn paths ([`crate::spawn::spawn`] — dispatch, a scheduled fire,
+    /// issue dispatch) are admitted through this same check by
+    /// [`Self::claim_dispatched_orchestration_title`], which suffixes a taken
+    /// title rather than refusing (issue #1339). What this does NOT cover: a
+    /// legacy client that sends no per-tab token is scoped by `(name, cwd)`, so
+    /// two such tabs of one orchestration in one directory read as one tab here
+    /// exactly as they already do to `handle_delegate`.
     pub fn claim_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -10907,6 +10923,65 @@ impl AppState {
         Ok(())
     }
 
+    /// Issue #1339: admit an orchestration the daemon spawns ITSELF (dispatch,
+    /// a scheduled fire, issue dispatch — [`crate::spawn::spawn`]) under a run
+    /// title no other live orchestration in `cwd` holds, and hold it for the
+    /// spawn until [`Self::release_orchestration_title_claim`]. Returns the
+    /// title the run must be stamped with (`None`: its canonical name).
+    ///
+    /// `derived` is the daemon-generated title
+    /// ([`crate::spawn`]'s `<name> · <cwd basename>`) and is tried first, so a
+    /// run that collides with nothing keeps exactly the label it always had.
+    /// When it is taken, the run gets the first free `<title> · 2`,
+    /// `<title> · 3`, … instead of being refused. That is the opposite of
+    /// [`Self::claim_orchestration_title`]'s answer for a client start, on
+    /// purpose: #555 refuses there because a person chose that name, and
+    /// renaming it would leave them a run under a name they do not know. Nobody
+    /// chose this one — the daemon derived it from the orchestration and the
+    /// directory — and `delegate` / `work-done` route by the
+    /// [`OrchestrationIdentity`] token rather than by the title. A refusal would
+    /// also have no form to send a scheduled fire back to, so it would turn a
+    /// label clash into a run that did not happen.
+    ///
+    /// Admission goes through [`Self::claim_orchestration_title`] itself, so
+    /// the key, the liveness rule and the atomicity are the client path's: two
+    /// concurrent spawns under the state write lock cannot pick the same
+    /// suffix, and a client start is refused against whichever title this
+    /// claimed. A derived title the registry would drop
+    /// ([`crate::agent_pty::is_valid_display_name`]) is treated as absent, as
+    /// the tab will show the canonical name.
+    pub fn claim_dispatched_orchestration_title(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        derived: Option<&str>,
+        cwd: &str,
+        registry: &AgentPtyRegistry,
+    ) -> Option<String> {
+        let derived = derived.filter(|t| crate::agent_pty::is_valid_display_name(t));
+        if self
+            .claim_orchestration_title(identity, derived, cwd, registry)
+            .is_ok()
+        {
+            return derived.map(str::to_string);
+        }
+        let base = derived.unwrap_or(identity.name()).to_string();
+        // Each held entry blocks at most one candidate, so `len() + 1`
+        // candidates always include a free one.
+        for n in 2..=self.orchestration_titles.len() + 2 {
+            let candidate = suffixed_run_title(&base, n);
+            if self
+                .claim_orchestration_title(identity, Some(&candidate), cwd, registry)
+                .is_ok()
+            {
+                return Some(candidate);
+            }
+        }
+        // Unreachable by the bound above; degrade to the pre-#1339 behaviour
+        // (an unchecked record) rather than panic inside the daemon.
+        self.record_orchestration_title(identity, derived, cwd);
+        derived.map(str::to_string)
+    }
+
     /// Issue #555: end one start's claim taken by
     /// [`Self::claim_orchestration_title`] — after its role is registered (the
     /// registered pane now holds the title) or after the spawn failed (the
@@ -10921,9 +10996,10 @@ impl AppState {
     /// Issue #962: record the title an orchestration the daemon spawned ITSELF
     /// is flying under (dispatch, a scheduled fire, issue dispatch — see
     /// [`crate::spawn::spawn`]), or restore it after a re-created pane put the
-    /// identity back. No uniqueness check and no claim: see
-    /// [`Self::claim_orchestration_title`] for what that leaves uncovered. Keeps
-    /// an existing non-`None` title.
+    /// identity back. No uniqueness check and no claim: a fresh spawn has
+    /// already been admitted by [`Self::claim_dispatched_orchestration_title`]
+    /// before its first role (issue #1339), and a restore puts back a title its
+    /// own run already held. Keeps an existing non-`None` title.
     pub fn record_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -14960,6 +15036,124 @@ mod tests {
         state
             .claim_orchestration_title(&instance("rival"), Some("respawning"), "/r", &registry)
             .expect("released once the re-create is done, with no live pane left");
+    }
+
+    /// Issue #1339: a daemon-spawned run is admitted through the same check
+    /// as a client start, and a taken title is SUFFIXED rather than refused —
+    /// in order, against client-typed titles as well as other runs, never past
+    /// the length the registry keeps, and freed with its holder like any other
+    /// claim. As above, every holder holds through an unreleased claim.
+    #[test]
+    fn a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title() {
+        let registry = AgentPtyRegistry::new();
+        let run = |id: &str| OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            name: "team".into(),
+        };
+        let mut state = AppState::default();
+
+        // Nothing collides: the derived title, unchanged.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r1"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+        // The second and third live runs get the next free suffixes.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r2"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 2".to_string())
+        );
+        // A client tab already holding `· 3` is skipped, not shared.
+        state
+            .claim_orchestration_title(&run("typed"), Some("team · repo · 3"), "/w", &registry)
+            .expect("a client may type any free title");
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r3"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 4".to_string())
+        );
+        // And a client start is refused against a suffixed run's title.
+        assert!(
+            state
+                .claim_orchestration_title(&run("late"), Some("team · repo · 2"), "/w", &registry)
+                .is_err(),
+            "a suffixed title is held exactly like any other"
+        );
+        // Another directory is another key: no suffix.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r4"),
+                Some("team · repo"),
+                "/elsewhere",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+
+        // A run under its canonical name (`None`) suffixes the name itself.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c1"), None, "/c", &registry),
+            None
+        );
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c2"), None, "/c", &registry),
+            Some("team · 2".to_string())
+        );
+        // A derived title the registry would drop is the canonical name the
+        // tab will show, so it collides with `c1` and gets `· 3`.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("c3"),
+                Some("bad\u{7}title"),
+                "/c",
+                &registry
+            ),
+            Some("team · 3".to_string())
+        );
+
+        // Never longer than the registry keeps: the BASE is shortened, the
+        // suffix survives, and the result is a valid display name.
+        let long = "é".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN / 2);
+        assert!(crate::agent_pty::is_valid_display_name(&long));
+        state
+            .claim_dispatched_orchestration_title(&run("l1"), Some(&long), "/l", &registry)
+            .expect("the full-length title is free");
+        let suffixed = state
+            .claim_dispatched_orchestration_title(&run("l2"), Some(&long), "/l", &registry)
+            .expect("a suffixed title");
+        assert!(suffixed.ends_with(" · 2"), "{suffixed:?}");
+        assert!(
+            crate::agent_pty::is_valid_display_name(&suffixed),
+            "an over-long title would be dropped and the tab fall back to the canonical name: \
+             {} bytes",
+            suffixed.len()
+        );
+
+        // Freed with its holder: once `r1` has no claim and no live pane, the
+        // next run takes the unsuffixed title back.
+        state.release_orchestration_title_claim(&run("r1"));
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r5"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
     }
 
     /// Issue #555 (PR #1336 review): the directory half of the title key is
