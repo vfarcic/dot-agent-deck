@@ -11011,10 +11011,16 @@ impl AgentPtyRegistry {
             // be held by an attach client's keystrokes waiting on a PTY that
             // stopped reading, and an unbounded wait here would make this
             // delivery as stuck as that pane.
+            let queued = target.writer.lock();
+            tokio::pin!(queued);
             let w = match within(deferred) {
-                Some(_) => before_write_deadline(within(deferred), target.writer.lock()).await?,
+                Some(_) => before_write_deadline(within(deferred), queued.as_mut()).await?,
                 None => loop {
-                    if let Some(w) = within_real_time(stall, target.writer.lock()).await {
+                    // One lock future for the whole wait, so this delivery
+                    // keeps its place in the writer's queue across the checks
+                    // below rather than rejoining at the back after each one
+                    // (Qodo, PR #1535).
+                    if let Some(w) = within_real_time(stall, queued.as_mut()).await {
                         break w;
                     }
                     // Only a PTY that has been inside one write for the whole
@@ -21201,21 +21207,41 @@ mod spawn_tests {
                     .await
             })
         };
-        tokio::time::sleep(STALL * 4).await;
+        // A second delivery joins the queue after the first one's wait has
+        // gone round at least once; it must not get ahead of it.
+        tokio::time::sleep(STALL + STALL / 2).await;
+        let later = {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_notice_guarded(PANE, "later notice", &agent, || async { true })
+                    .await
+            })
+        };
+        tokio::time::sleep(STALL * 3).await;
         assert!(
             !delivery.is_finished(),
             "the delivery keeps its place behind a busy writer"
         );
         drop(held);
+        for (name, task) in [("first", delivery), ("later", later)] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .unwrap_or_else(|_| panic!(
+                        "the {name} delivery finishes once the writer is free"
+                    ))
+                    .unwrap()
+                    .expect("delivered, not refused"),
+                GuardedSend::Applied
+            );
+        }
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(10), delivery)
-                .await
-                .expect("the delivery finishes once the writer is free")
-                .unwrap()
-                .expect("delivered, not refused"),
-            GuardedSend::Applied
+            log.lock().unwrap().as_slice(),
+            b"queued notice\nlater notice\n",
+            "the deliveries went in in the order they queued"
         );
-        assert_eq!(log.lock().unwrap().as_slice(), b"queued notice\n");
     }
 
     /// Issue #525 (Qodo, PR #1535): the other side of the test above. When the
