@@ -478,13 +478,19 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW, not setraw's default TCSAFLUSH: this worker announces no readiness,
+# so on a slow start the pointer can arrive before this line runs, and a flush
+# would throw it away while its echo stays on screen. That is not the scenario
+# under test (delegate_042's worker models a swallowed pointer on purpose), and
+# it failed this test on a starved machine with only the Enter probes received.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 while True:
     chunk = os.read(fd, 4096)

@@ -141,6 +141,7 @@ fn selected_card_fixture() -> SessionState {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
+        wrapper_output_at: None,
     }
 }
 

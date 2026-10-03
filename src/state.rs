@@ -1044,6 +1044,14 @@ pub struct SessionState {
     /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
     /// TUI learns it again from the producer's next event.
     pub prompt_reports_declared: bool,
+    /// Issue #1493: the producer timestamp of the newest frame `dot-agent-deck
+    /// wrap` sent about a Codex pane's OUTPUT — a classified frame, or one of
+    /// its interface starts, which say the output went quiet. The wrapper sends
+    /// those from more than one thread, each on its own connection, so they can
+    /// arrive out of order; a classified frame older than this is a status the
+    /// wrapper has already moved past, and asserts nothing. Process-local, like
+    /// [`Self::prompt_reports_unavailable`].
+    pub wrapper_output_at: Option<DateTime<Utc>>,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -11646,6 +11654,7 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                wrapper_output_at: None,
             },
         );
         session_id
@@ -16128,6 +16137,7 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                wrapper_output_at: None,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -16412,7 +16422,13 @@ impl AppState {
             // move a status that output itself could have set, so it never
             // repaints a hook's Needs Input, Working tool or Error.
             _ if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() => {
-                if !event.declares_prompt_reports_unavailable() {
+                let stale = session
+                    .wrapper_output_at
+                    .is_some_and(|newest| event.timestamp < newest);
+                if !stale {
+                    session.wrapper_output_at = Some(event.timestamp);
+                }
+                if stale || !event.declares_prompt_reports_unavailable() {
                     false
                 } else {
                     match event.event_type {
@@ -16463,6 +16479,17 @@ impl AppState {
                 true
             }
             EventType::SessionStart => {
+                // Issue #1493: the wrapper's start says its child's output went
+                // quiet (or that it took raw input), so a classified frame the
+                // wrapper produced before it must not repaint over it.
+                if event.agent_type == AgentType::Codex
+                    && event.is_wrapper_interface_session_start()
+                    && session
+                        .wrapper_output_at
+                        .is_none_or(|newest| event.timestamp > newest)
+                {
+                    session.wrapper_output_at = Some(event.timestamp);
+                }
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
                 true
@@ -16672,8 +16699,16 @@ impl AppState {
         // another route. A subagent event that DID assert (its `ToolEnd`
         // answering a `WaitingForInput`) wrote the current status, so it clears.
         let subagent_left_status = event.is_from_subagent() && !asserted_status;
+        // Issue #1493 (Qodo on PR #1523): and a Codex pane's output frame that
+        // asserted nothing, for the same reason — it is liveness, not evidence of
+        // what the agent is doing, so it must not turn the `ShellIdle` that ends
+        // a detached command into a no-op and strand the card on Working.
+        let codex_output_left_status = event.agent_type == AgentType::Codex
+            && event.is_wrapper_output_classified()
+            && !asserted_status;
         if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown)
             && !subagent_left_status
+            && !codex_output_left_status
         {
             session.shell_synthetic_working = false;
         }
@@ -24542,6 +24577,7 @@ while True:
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                wrapper_output_at: None,
             },
         );
 
@@ -25994,6 +26030,46 @@ while True:
         state.apply_event(codex_wrapper_frame(EventType::Idle, true, 6));
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 7));
         assert_eq!(pane_x_card(&state).status, SessionStatus::WaitingForInput);
+
+        // The wrapper's frames can arrive out of order (PR #1523 review): a
+        // quiet Idle stamped before a newer Thinking, or a Thinking stamped
+        // before the start that says the output settled, changes nothing.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 10));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut settled = codex_wrapper_frame(EventType::SessionStart, true, 20);
+        settled.metadata.insert(
+            crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN.to_string(),
+        );
+        state.apply_event(settled);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 19));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 21));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        // A detached command's Working (the shell monitor's) still ends with
+        // its `ShellIdle` when the wrapper reports output in between that
+        // asserts nothing (PR #1523 review).
+        for untrusted in [false, true] {
+            let mut state = AppState::default();
+            state.register_pane("pane-x".to_string());
+            state.apply_event(codex_wrapper_frame(EventType::SessionStart, untrusted, 1));
+            state.apply_event(codex_status_frame(EventType::ShellBusy, true, 2));
+            assert_eq!(pane_x_card(&state).status, SessionStatus::Working);
+            state.apply_event(codex_wrapper_frame(EventType::Thinking, untrusted, 3));
+            state.apply_event(codex_wrapper_frame(EventType::Idle, untrusted, 4));
+            state.apply_event(codex_status_frame(EventType::ShellIdle, true, 5));
+            assert_eq!(
+                pane_x_card(&state).status,
+                SessionStatus::Idle,
+                "untrusted={untrusted}: the command's end must still end its Working"
+            );
+        }
 
         // Control: an agent the wrapper hosts with no hooks at all keeps its
         // output-derived Working, as before.

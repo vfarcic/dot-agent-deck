@@ -744,7 +744,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/blocked/023 — A real OpenCode API failure ends as Error (issue #714).
 - **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
 - **Agent:** real interactive OpenCode with a listed model that this account's provider rejects with HTTP 400; developer credentials required.
-- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked.
+- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked. Then waits for the `Idle` events OpenCode sends as the failed run ends and requires the card to still read Error for 3 s afterwards (issue #1493 controls found them repainting it Idle; `status/blocked/027` pins the rule at L1).
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
@@ -3675,7 +3675,7 @@ without depending on the config struct API.
 
 ##### orchestration/delegate/045 — A hookless worker's acknowledgement retires retries and its silence watch (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real CLI and hook socket).
-- **Agent:** a Python stand-in declared as `opencode` that reads its real task file and invokes `dot-agent-deck ack` twice, emitting no agent hook events.
+- **Agent:** a Python stand-in declared as `opencode` that reads its real task file and invokes `dot-agent-deck ack` twice, emitting no agent hook events. It enters raw mode with `TCSANOW`: `tty.setraw`'s default `TCSAFLUSH` discarded a pointer that arrived before a slow start reached that line, failing the test on a starved machine with only the Enter probes received (reproduced by delaying the stand-in 3 s: red with the flush, green without).
 - **Asserts:** the task file names the pointer's delivery id in its ack header; both ack invocations exit zero; the raw PTY log contains one pointer after the full retry schedule; and the attached orchestrator pane receives no silent-worker notice.
 - **Does not assert:** an LLM following the task-file instruction or a real agent's hook delivery.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
