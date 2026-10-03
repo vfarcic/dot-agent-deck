@@ -70,7 +70,8 @@ use crate::probe::Probe;
 use crate::report::{Evidence, RunVerdict};
 use crate::sandbox::{Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 use crate::{
-    buildgate, buildns, ctl, inner, isolation, previous, probe, probes, proc, report, sandbox, stub,
+    buildgate, buildlock, buildns, ctl, inner, isolation, previous, probe, probes, proc, report,
+    sandbox, stub,
 };
 
 /// The hidden flag the outer half passes to the copy of this binary it starts
@@ -246,6 +247,15 @@ struct Opts {
     /// Kill the whole namespace if the inner half has not finished by then.
     #[arg(long, default_value_t = 1200)]
     run_timeout_secs: u64,
+
+    /// How long to wait for another `cargo xver` run to release the build
+    /// clone and target dir this run needs (issue #1530). A run holds both
+    /// from before its first `git` command in the clone until its branch
+    /// binary is staged into its sandbox, so the wait is for one fetch and
+    /// build, not for a whole run. `0` refuses at once. Either way the message
+    /// names the run holding them.
+    #[arg(long, default_value_t = 1200)]
+    lock_wait_secs: u64,
 
     /// Which pairing to run.
     ///
@@ -1180,6 +1190,20 @@ fn new_binary(
             run.report.pid_ns
         ));
         ev.build.push(buildns::LINK_POOL_NOTE.to_string());
+        let head_now = must_run(
+            git(&clone).args(["rev-parse", "HEAD"]),
+            "git rev-parse HEAD",
+        )?;
+        let status_now = must_run(
+            git(&clone).args(["status", "--porcelain", "--untracked-files=no"]),
+            "git status",
+        )?;
+        if let Some(moved) = clone_moved(&sha, &head_now, &status_now) {
+            return Err(moved);
+        }
+        ev.build.push(format!(
+            "the build clone was still at {sha}, with no tracked modification, after the build"
+        ));
     }
     let bin = target.join("debug").join("dot-agent-deck");
     if !bin.exists() {
@@ -1206,6 +1230,56 @@ fn new_binary(
 /// environment injected a `DAD_BUILD_ID` — so the note reports it as that
 /// rather than as a measurement, and says so plainly when there is none.
 fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
+    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
+                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
+                      independent measurement.";
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => format!(
+            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
+             from is NOT knowable from this run. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::NoCommit { build_id } => format!(
+            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
+             it was built from is NOT knowable. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::Other { build_id, short } => format!(
+            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
+             `{head_sha}`. This run tested another build, and its tells say nothing about that \
+             HEAD. {provenance}"
+        ),
+        BuiltFrom::DirtyHead { build_id } => format!(
+            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
+             built from that commit PLUS uncommitted changes in the build clone, which is not \
+             the commit under test. {provenance}"
+        ),
+        BuiltFrom::Head { build_id, short } => format!(
+            "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
+             the binary's own stamp it is a build of the commit under test. {provenance}"
+        ),
+    }
+}
+
+/// Which commit the branch binary says it was built from, against the HEAD
+/// the run fetched and checked out.
+#[derive(Debug, PartialEq, Eq)]
+enum BuiltFrom {
+    /// No `daemon hello` was recorded: the scenario stopped before it ran.
+    NoHello,
+    /// The build id carries no `-g<sha>` component.
+    NoCommit { build_id: String },
+    /// The build id names the HEAD, clean.
+    Head { build_id: String, short: String },
+    /// The build id names the HEAD, with `-dirty`.
+    DirtyHead { build_id: String },
+    /// The build id names another commit.
+    Other { build_id: String, short: String },
+}
+
+/// Read the commit out of the branch binary's own build id,
+/// `<version>-g<short-sha>[-dirty]` (`build.rs`), from its `daemon hello`.
+fn built_from(head_sha: &str, new_hello: &str) -> BuiltFrom {
     let build_id = serde_json::from_str::<serde_json::Value>(new_hello.trim())
         .ok()
         .and_then(|v| {
@@ -1214,11 +1288,7 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
                 .map(str::to_string)
         });
     let Some(build_id) = build_id else {
-        return format!(
-            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
-             from is NOT knowable from this run. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoHello;
     };
     let (stem, dirty) = match build_id.strip_suffix("-dirty") {
         Some(stem) => (stem, true),
@@ -1227,38 +1297,89 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
     let short = stem
         .rsplit_once("-g")
         .map(|(_, sha)| sha)
-        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string);
     let Some(short) = short else {
-        return format!(
-            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
-             it was built from is NOT knowable. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoCommit { build_id };
     };
-    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
-                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
-                      independent measurement.";
     if !head_sha
         .to_ascii_lowercase()
         .starts_with(&short.to_ascii_lowercase())
     {
-        return format!(
-            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
-             `{head_sha}`. This run tested another build, and its tells say nothing about that \
-             HEAD. {provenance}"
-        );
+        return BuiltFrom::Other { build_id, short };
     }
     if dirty {
-        return format!(
-            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
-             built from that commit PLUS uncommitted changes in the build clone, which is not \
-             the commit under test. {provenance}"
-        );
+        return BuiltFrom::DirtyHead { build_id };
     }
-    format!(
-        "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
-         the binary's own stamp it is a build of the commit under test. {provenance}"
-    )
+    BuiltFrom::Head { build_id, short }
+}
+
+/// For a run that built the branch itself (issue #1530): the evidence row
+/// naming the commit the binary was actually built from, and — when that is
+/// not provably the HEAD the run fetched — why the run cannot pass.
+///
+/// A missing `daemon hello` is recorded but not a mismatch of its own: the
+/// scenario stopped before it ran, and that already keeps the run from passing.
+fn built_commit_check(head_sha: &str, new_hello: &str) -> (String, Option<String>) {
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => (
+            "not recorded — the branch binary's `daemon hello` never ran in this run".to_string(),
+            None,
+        ),
+        BuiltFrom::Head { build_id, short } => (
+            format!(
+                "`{short}`, the branch HEAD it fetched, by the binary's own build id `{build_id}`"
+            ),
+            None,
+        ),
+        BuiltFrom::Other { build_id, short } => (
+            format!(
+                "**`{short}` — NOT the branch HEAD `{head_sha}` it fetched** (build id `{build_id}`)"
+            ),
+            Some(format!(
+                "its build id `{build_id}` names commit `{short}`, not the branch HEAD \
+                 `{head_sha}` the run fetched and checked out — something else checked out in \
+                 the build clone during the build, so the tells measured another commit"
+            )),
+        ),
+        BuiltFrom::DirtyHead { build_id } => (
+            format!("**the branch HEAD plus uncommitted changes** (build id `{build_id}`)"),
+            Some(format!(
+                "its build id `{build_id}` says it was built from the branch HEAD `{head_sha}` \
+                 plus uncommitted changes in the build clone, which is not the commit under test"
+            )),
+        ),
+        BuiltFrom::NoCommit { build_id } => (
+            format!("**not knowable** — the build id `{build_id}` names no commit"),
+            Some(format!(
+                "its build id `{build_id}` names no commit, so the run cannot confirm it built \
+                 the branch HEAD `{head_sha}` it fetched"
+            )),
+        ),
+    }
+}
+
+/// The build clone's HEAD and status after the build, against the commit the
+/// run checked out before it (issue #1530). Anything that checked out in the
+/// clone while Cargo read it — a run that ignored the build lock, such as one
+/// from a harness that predates it — shows here.
+fn clone_moved(fetched: &str, head_now: &str, status_now: &str) -> Option<String> {
+    if head_now.trim() != fetched {
+        return Some(format!(
+            "the build clone's HEAD moved during the build: it is now {}, but the run fetched, \
+             checked out and built {fetched}. Another process checked out in the clone while \
+             Cargo was reading it, so the binary may be a build of either commit or a mix of \
+             both. Give each concurrent run its own --source-clone and --target-dir",
+            head_now.trim()
+        ));
+    }
+    if !status_now.trim().is_empty() {
+        return Some(format!(
+            "the build clone has tracked modifications after the build of {fetched} — something \
+             other than this harness edited it while Cargo was reading it:\n{status_now}"
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,6 +1573,37 @@ fn run_one(
 
     println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
+    // One run at a time on this clone and target dir (issue #1530), held
+    // until the branch binary is staged into the sandbox below.
+    let holder = format!(
+        "pid {}, branch `{}` ({}), since {}, --source-clone {}, --target-dir {}",
+        std::process::id(),
+        opts.branch,
+        direction.name(),
+        utc_now(),
+        clone.display(),
+        target_dir.display()
+    );
+    let lock = buildlock::acquire(
+        &[
+            buildlock::Need {
+                what: "build clone",
+                flag: "--source-clone",
+                dir: &clone,
+            },
+            buildlock::Need {
+                what: "target dir",
+                flag: "--target-dir",
+                dir: &target_dir,
+            },
+        ],
+        &holder,
+        Duration::from_secs(opts.lock_wait_secs),
+        buildlock::POLL,
+        |m| println!("xver ({}): {m}", direction.name()),
+    )?;
+    ev.build.push(build_lock_note(&lock));
+    let mut build_lock = Some(lock);
     let (new_src, head_sha) =
         new_binary(opts, &clone, &target_dir, &cargo_cache, &runs_root, &mut ev)?;
     ev.head_sha = head_sha;
@@ -1490,6 +1642,13 @@ fn run_one(
         }
         for (src, dst) in staging {
             ev.preflight.push(sandbox::stage_binary(src, &dst)?);
+        }
+        if build_lock.take().is_some() {
+            ev.build.push(
+                "released the build lock once the branch binary was staged into the sandbox; \
+                 another run may check out in the clone and build into the target dir from here"
+                    .to_string(),
+            );
         }
         ev.old_binary = sb.old_bin();
         ev.new_binary = sb.new_bin(direction);
@@ -1572,6 +1731,11 @@ fn run_one(
         let note = skip_build_note(&ev.head_sha, &ev.new_hello);
         println!("xver ({}): --skip-build: {note}", direction.name());
         ev.skip_build = Some(note);
+    } else {
+        let (row, mismatch) = built_commit_check(&ev.head_sha, &ev.new_hello);
+        println!("xver ({}): commit built — {row}", direction.name());
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
     }
 
     println!("xver ({}): postconditions", direction.name());
@@ -1610,6 +1774,27 @@ fn run_one(
     );
     println!("xver ({}): {}", direction.name(), verdict.label());
     Ok(passed)
+}
+
+/// What the evidence says about the build lock a run took.
+fn build_lock_note(lock: &buildlock::BuildLock) -> String {
+    format!(
+        "held an exclusive lock on the build clone and the target dir ({}) from before the first \
+         `git` command in the clone until the branch binary was staged; {}",
+        lock.files()
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if lock.waited >= Duration::from_secs(1) {
+            format!(
+                "waited {:.0}s for another run to release them",
+                lock.waited.as_secs_f64()
+            )
+        } else {
+            "no other run held them".to_string()
+        }
+    )
 }
 
 /// Record an error the outer half hit before or around the namespace. With no
@@ -2249,6 +2434,29 @@ mod verdict_tests {
         assert!(!run_passed(&v, true, false), "a postcondition did not hold");
     }
 
+    /// Issue #1530: four passing tells measured on a binary that is not a
+    /// build of the fetched HEAD are not a pass for that HEAD.
+    #[test]
+    fn a_binary_built_from_another_commit_voids_even_four_passing_tells() {
+        let head = "e2bbb2050f00ba5eba11c0ffee00000000000000";
+        let hello = r#"{"ok":true,"server_version":10,"build_version":"0.41.0-g3715d563"}"#;
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        let (row, mismatch) = built_commit_check(head, hello);
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
+        let v = ev.verdict();
+        assert!(
+            matches!(v, RunVerdict::Incomplete(ref why) if why.contains("3715d563") && why.contains(head)),
+            "{v:?}"
+        );
+        assert!(!run_passed(&v, true, true));
+        let md = ev.render();
+        assert!(
+            md.contains("| commit built | **`3715d563` — NOT the branch HEAD"),
+            "{md}"
+        );
+    }
+
     #[test]
     fn an_isolation_failure_dominates_even_a_failing_tell_and_is_incomplete() {
         let mut ev = with_tells(&[Verdict::Pass, Verdict::Fail]);
@@ -2539,6 +2747,50 @@ mod skip_build_tests {
     fn a_prerelease_version_does_not_hide_the_commit() {
         let note = skip_build_note(HEAD, &hello("0.25.0-gamma.1-ge2bbb205"));
         assert!(note.contains("build of the commit under test"), "{note}");
+    }
+
+    /// Issue #1530: a run that built the branch records the commit its binary
+    /// was built from, and only the fetched HEAD itself, clean, is no mismatch.
+    #[test]
+    fn a_built_run_records_the_commit_built_and_flags_anything_but_the_fetched_head() {
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205"));
+        assert!(
+            row.contains("`e2bbb205`, the branch HEAD it fetched"),
+            "{row}"
+        );
+        assert_eq!(mismatch, None);
+
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-g3715d563"));
+        assert!(row.contains("NOT the branch HEAD"), "{row}");
+        let why = mismatch.expect("another commit is a mismatch");
+        assert!(why.contains("3715d563") && why.contains(HEAD), "{why}");
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205-dirty"));
+        assert!(mismatch.expect("dirty").contains("uncommitted changes"));
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-unknown"));
+        assert!(mismatch.expect("no commit").contains("cannot confirm"));
+
+        let (row, mismatch) = built_commit_check(HEAD, "");
+        assert!(row.contains("never ran"), "{row}");
+        assert_eq!(mismatch, None, "a run with no hello already cannot pass");
+    }
+
+    /// Issue #1530: the clone is re-read after the build, and a HEAD that moved
+    /// while Cargo read it — the reported interleaving — refuses the run.
+    #[test]
+    fn a_clone_that_moved_during_the_build_is_caught() {
+        assert_eq!(clone_moved(HEAD, &format!("{HEAD}\n"), ""), None);
+        let moved = clone_moved(HEAD, "3715d563aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "")
+            .expect("another HEAD is caught");
+        assert!(moved.contains("moved during the build"), "{moved}");
+        assert!(
+            moved.contains("3715d563") && moved.contains(HEAD),
+            "{moved}"
+        );
+        assert!(moved.contains("--source-clone"), "{moved}");
+        let edited = clone_moved(HEAD, HEAD, " M src/main.rs\n").expect("an edit is caught");
+        assert!(edited.contains("tracked modifications"), "{edited}");
     }
 
     #[test]
