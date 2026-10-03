@@ -120,6 +120,13 @@ pub static GENERIC: RuleSet = RuleSet {
 
 /// The Codex rule set: every non-blank line is activity, and nothing else.
 ///
+/// **Since issue #1493 that activity is not a Codex card's status.** While the
+/// deck's Codex hooks are trusted, the card follows those hooks and treats these
+/// events as liveness only (`crate::state::AppState::apply_event`); when the
+/// prompt hook is not running, the wrapper also reports the output going quiet
+/// as Idle ([`QuietOutputIdle`]), so the card reads Working only while Codex is
+/// drawing.
+///
 /// **It deliberately recognises no error and no idle line, and that is the
 /// whole of its content** (issue #540). What the wrapper spawns for Codex is
 /// the interactive `codex` TUI ([`wrap_launch_command`]), and that process
@@ -2086,16 +2093,121 @@ fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emit
     let ev = det.observe(line);
     drop(det);
     if let Some(ev) = ev {
-        // Issue #714: marked, because this classifier calls every printed line
-        // `Working` — a provider's quota-error line included — so what it emits
-        // proves output, not work, and must not clear a Blocked card. See
-        // `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
-            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
-        );
-        emitter.emit_with_metadata(ev.event_type(), metadata);
+        emitter.emit_with_metadata(ev.event_type(), output_classified_metadata());
+    }
+}
+
+/// Issue #714: the mark on every event this wrapper derives from the child's
+/// output, because those events prove output, not work, and must not clear a
+/// Blocked card. See `WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY`.
+fn output_classified_metadata() -> HashMap<String, String> {
+    HashMap::from([(
+        crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+        crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+    )])
+}
+
+/// Issue #1493: how long a wrapped Codex whose prompt hook is not running must
+/// draw nothing before the wrapper reports it Idle. Measured against Codex
+/// 0.160.0 on a pty: the idle TUI is silent once its boot paint ends (~3 s),
+/// while a running turn redraws its elapsed-time header at least once a second.
+#[cfg(unix)]
+const CODEX_QUIET_OUTPUT_IDLE: Duration = Duration::from_secs(3);
+
+/// Issue #1493: the classification output going quiet (or resuming) calls
+/// for, given the detector's last state, the monotonic time of the child's last
+/// byte (`0` = none yet), the time of the last byte before the wrapper last
+/// reported quiet, and now. Pure, so the rule is testable without a pty.
+fn quiet_output_transition(
+    last: Option<DetectedEvent>,
+    last_output_ms: i64,
+    quiet_reported_at_output_ms: Option<i64>,
+    now_ms: i64,
+    quiet: Duration,
+) -> Option<DetectedEvent> {
+    if last_output_ms <= 0 {
+        return None;
+    }
+    match last {
+        Some(DetectedEvent::Working)
+            if now_ms.saturating_sub(last_output_ms) >= quiet.as_millis() as i64 =>
+        {
+            Some(DetectedEvent::Idle)
+        }
+        // Bytes since the quiet report: drawing again. A TUI redraw seldom
+        // ends a line, so the line classifier cannot be relied on to notice.
+        Some(DetectedEvent::Idle)
+            if quiet_reported_at_output_ms.is_some_and(|at| last_output_ms > at) =>
+        {
+            Some(DetectedEvent::Working)
+        }
+        None => Some(DetectedEvent::Working),
+        _ => None,
+    }
+}
+
+/// Issue #1493: the degraded status a wrapped Codex gets when the deck could not
+/// get its prompt hook trusted — the case where nothing will ever announce a
+/// turn. Without it the card read Working from the first painted line until
+/// Codex exited. With it, the card reads Working while Codex is drawing and Idle
+/// once its output has been quiet for [`CODEX_QUIET_OUTPUT_IDLE`].
+///
+/// Ticked from the supervisory loop, the only thread awake when the output
+/// stops. It shares the tee's [`Detector`], so the two never report the same
+/// state twice. Its events are sent from a thread of their own with a bounded
+/// send, for the reason [`Emitter::emit_interface_ready`] gives: this loop
+/// forwards the user's signals and must not wait on the daemon.
+#[cfg(unix)]
+struct QuietOutputIdle {
+    quiet_reported_at_output_ms: Option<i64>,
+    sender: std::sync::mpsc::Sender<String>,
+}
+
+#[cfg(unix)]
+impl QuietOutputIdle {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for json in receiver {
+                crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
+            }
+        });
+        Self {
+            quiet_reported_at_output_ms: None,
+            sender,
+        }
+    }
+
+    /// The wrapper announced its child's output settled, which the card reads as
+    /// Idle: record the quiet without sending anything more.
+    fn note_settled(&mut self, detector: &Mutex<Detector>, watch: &InterfaceWatch) {
+        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+        det.observe_detected(Some(DetectedEvent::Idle));
+        self.quiet_reported_at_output_ms = Some(watch.last_output_ms.load(Ordering::SeqCst));
+    }
+
+    fn tick(&mut self, detector: &Mutex<Detector>, watch: &InterfaceWatch, emitter: &Emitter) {
+        let last_output_ms = watch.last_output_ms.load(Ordering::SeqCst);
+        let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(next) = quiet_output_transition(
+            det.last,
+            last_output_ms,
+            self.quiet_reported_at_output_ms,
+            monotonic_millis(),
+            CODEX_QUIET_OUTPUT_IDLE,
+        ) else {
+            return;
+        };
+        det.observe_detected(Some(next));
+        drop(det);
+        if next == DetectedEvent::Idle {
+            self.quiet_reported_at_output_ms = Some(last_output_ms);
+        }
+        if let Ok(json) = serde_json::to_string(
+            &emitter.build_event(next.event_type(), output_classified_metadata()),
+        ) {
+            let _ = self.sender.send(json);
+        }
     }
 }
 
@@ -2476,6 +2588,12 @@ fn run_wrap_pty(
     let mut last_size = (rows, cols);
     let mut output_gone_at: Option<Instant> = None;
     let mut fwd = SignalForwarder::new(child_pid);
+    // Issue #1493: only a Codex whose prompt hook this spawn could not vouch
+    // for; with the hooks running, they decide its status and output does not.
+    let mut quiet_output_idle = (has_tty_output
+        && emitter.agent_type == AgentType::Codex
+        && emitter.prompt_reports_unavailable)
+        .then(QuietOutputIdle::new);
     let status = loop {
         if let Some(size) = terminal_size(libc::STDIN_FILENO)
             .or_else(|| terminal_size(libc::STDOUT_FILENO))
@@ -2524,6 +2642,18 @@ fn run_wrap_pty(
                 "wrap: observed the child's interface; announcing pre-prompt readiness"
             );
             emitter.emit_interface_ready(fact);
+            // Issue #1493: that start reads Idle on the card, and it says the
+            // output went quiet, so the quiet-output detector agrees with it —
+            // or the next burst of drawing would find it still "working" and
+            // report nothing.
+            if fact == InterfaceFact::OutputSettled
+                && let Some(quiet) = quiet_output_idle.as_mut()
+            {
+                quiet.note_settled(&detector, &interface);
+            }
+        }
+        if let Some(quiet) = quiet_output_idle.as_mut() {
+            quiet.tick(&detector, &interface, emitter);
         }
 
         // R20-001: the terminal output pump ended while the child is still alive
@@ -2906,6 +3036,40 @@ mod tests {
         assert_eq!(DetectedEvent::Working.event_type(), EventType::Thinking);
         assert_eq!(DetectedEvent::Error.event_type(), EventType::Error);
         assert_eq!(DetectedEvent::Idle.event_type(), EventType::Idle);
+    }
+
+    /// Issue #1493: for a wrapped Codex with no prompt hook, output going quiet
+    /// for the window reports Idle exactly once, and only bytes drawn AFTER that
+    /// report bring Working back — so a quiet TUI cannot flap, and one that
+    /// starts drawing again is noticed even if it never ends a line.
+    #[test]
+    fn quiet_output_reports_idle_once_and_new_output_reports_working() {
+        let quiet = Duration::from_secs(3);
+        let w = Some(DetectedEvent::Working);
+        let i = Some(DetectedEvent::Idle);
+        // Nothing drawn yet: nothing to say.
+        assert_eq!(quiet_output_transition(None, 0, None, 10_000, quiet), None);
+        // Drawn, but no line classified yet: drawing is activity.
+        assert_eq!(quiet_output_transition(None, 500, None, 600, quiet), w);
+        // Drawing within the window: still working.
+        assert_eq!(quiet_output_transition(w, 1_000, None, 3_999, quiet), None);
+        // Quiet for the whole window: Idle.
+        assert_eq!(quiet_output_transition(w, 1_000, None, 4_000, quiet), i);
+        // Idle and still quiet: no repeat, however long it stays quiet.
+        assert_eq!(
+            quiet_output_transition(i, 1_000, Some(1_000), 60_000, quiet),
+            None
+        );
+        // A byte after the quiet report: drawing again.
+        assert_eq!(
+            quiet_output_transition(i, 1_001, Some(1_000), 1_002, quiet),
+            w
+        );
+        // An Error the wrapper did not derive from silence is never touched.
+        assert_eq!(
+            quiet_output_transition(Some(DetectedEvent::Error), 1_000, None, 60_000, quiet),
+            None
+        );
     }
 
     /// The detector debounces: a burst of activity lines yields exactly one

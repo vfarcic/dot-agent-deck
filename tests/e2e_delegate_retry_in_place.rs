@@ -453,14 +453,17 @@ while True:
                         log.write(f'{(timestamp - accepted_at) / 1_000_000:.3f} {received_byte:02x}\n')
                     log.write('ACCEPT 0\n')
                 before_accept.clear()
-                if sys.argv[2] == 'claude':
-                    turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
-                        input=json.dumps({'hook_event_name': 'UserPromptSubmit',
-                            'session_id': f'ready-composer-{pid}',
-                            'prompt': line.decode('utf-8', 'replace')}),
-                        text=True, capture_output=True, timeout=5)
-                    if turn.returncode:
-                        raise SystemExit(turn.stderr)
+                # Both agents report the submitted turn through their native
+                # prompt hook. The wrapper's reading of a Codex pane's output is
+                # not evidence of a turn (issue #1493), so the line printed below
+                # cannot stand in for it.
+                turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
+                    input=json.dumps({'hook_event_name': 'UserPromptSubmit',
+                        'session_id': f'ready-composer-{pid}',
+                        'prompt': line.decode('utf-8', 'replace')}),
+                    text=True, capture_output=True, timeout=5)
+                if turn.returncode:
+                    raise SystemExit(turn.stderr)
                 with open('worker-accepted-pid.log', 'w', encoding='ascii') as log:
                     log.write(str(pid))
                 os.write(sys.stdout.fileno(), b'\r\nREADY_COMPOSER_SUBMITTED_1383\r\n')
