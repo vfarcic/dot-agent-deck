@@ -17,6 +17,7 @@ pub mod daemon;
 pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
+pub mod daemon_restart;
 pub mod daemon_status;
 pub mod daemon_stop;
 pub mod deck_list;

@@ -505,6 +505,32 @@ enum DaemonCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Plumbing (PRD #1487): report whether a daemon is running at this host's
+    /// endpoint, and its `Hello` reply when one is. Never lazy-spawns. Run over
+    /// ssh by the laptop's `remote upgrade`, because `daemon hello` prints this
+    /// binary's own static hello rather than the running daemon's.
+    #[command(hide = true)]
+    Probe {
+        /// Print one JSON line (`{running, hello}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plumbing (PRD #1487): ask the running daemon at this host's endpoint to
+    /// restart onto the build installed at its own path. Run over ssh by the
+    /// laptop's `remote upgrade`, through the freshly installed binary.
+    #[command(hide = true)]
+    RestartInstalled {
+        /// Print one JSON line (`{running, reply, unsupported}`).
+        #[arg(long)]
+        json: bool,
+        /// The version the caller just installed; the daemon refuses if the
+        /// installed build reports anything else.
+        #[arg(long)]
+        expect_version: Option<String>,
+        /// The confirmed stop set, as hex-encoded JSON.
+        #[arg(long)]
+        confirm_hex: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -1887,6 +1913,12 @@ fn main() -> ExitCode {
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
             DaemonCmd::Status { json } => run_daemon_status_cli(json),
             DaemonCmd::Endpoint => run_daemon_endpoint_cli(),
+            DaemonCmd::Probe { json } => run_daemon_probe_cli(json),
+            DaemonCmd::RestartInstalled {
+                json,
+                expect_version,
+                confirm_hex,
+            } => run_daemon_restart_installed_cli(json, expect_version, confirm_hex),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -2883,6 +2915,174 @@ async fn run_daemon_endpoint_cli() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `dot-agent-deck daemon probe [--json]` (PRD #1487, hidden plumbing). One
+/// bounded `Hello` against the running daemon at this host's endpoint, through
+/// [`DaemonClient::probe_running`], which never lazy-spawns. "Nothing running"
+/// is an answer (exit 0, `running: false`); a probe that learned nothing — a
+/// transport error or no reply within [`ENDPOINT_RESOLVE_TIMEOUT`] — is a
+/// failure on stderr. Puts nothing new on the wire.
+#[tokio::main]
+async fn run_daemon_probe_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_restart::DaemonProbe;
+    let client = DaemonClient::new(client_attach_socket_path());
+    let hello = match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(e)) => {
+            eprintln!("daemon probe: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon probe: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let probe = DaemonProbe {
+        running: hello.is_some(),
+        hello,
+    };
+    if json {
+        match serde_json::to_string(&probe) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("daemon probe: could not encode the result: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match probe
+            .hello
+            .as_ref()
+            .and_then(|h| h.daemon_version.as_deref())
+        {
+            Some(v) => println!("running: {v}"),
+            None if probe.running => println!("running"),
+            None => println!("not running"),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon restart-installed [--json] [--expect-version V]
+/// [--confirm-hex H]` (PRD #1487, hidden plumbing). Asks the running daemon at
+/// this host's endpoint to restart onto the build installed at its own path,
+/// through [`DaemonClient::restart_daemon`] — the verb's only sender, which
+/// withholds it from a daemon that does not advertise it. Prints one
+/// [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
+/// the daemon too old for the verb, or the daemon's reply (accepted, needs
+/// confirmation, refused) — all exit 0, because each is an answer. A transport
+/// failure or a timeout is a failure on stderr.
+#[tokio::main]
+async fn run_daemon_restart_installed_cli(
+    json: bool,
+    expect_version: Option<String>,
+    confirm_hex: Option<String>,
+) -> ExitCode {
+    use dot_agent_deck::daemon_client::{GatedQuery, RestartDaemonRequest};
+    use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
+    use dot_agent_deck::daemon_restart::{RemoteRestartReport, decode_stop_set_hex};
+
+    let confirm = match confirm_hex.as_deref().map(decode_stop_set_hex).transpose() {
+        Ok(confirm) => confirm,
+        Err(e) => {
+            eprintln!("daemon restart-installed: --confirm-hex: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = DaemonClient::new(client_attach_socket_path());
+    match tokio::time::timeout(ENDPOINT_RESOLVE_TIMEOUT, client.probe_running()).await {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return print_restart_report(
+                json,
+                &RemoteRestartReport {
+                    running: false,
+                    reply: None,
+                    unsupported: false,
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon restart-installed: no handshake within {}s",
+                ENDPOINT_RESOLVE_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let request = RestartDaemonRequest {
+        confirm,
+        expected_version: expect_version,
+        successor: RestartSuccessor::Installed,
+    };
+    let report = match client.restart_daemon(request).await {
+        Ok(GatedQuery::Answered(reply)) => RemoteRestartReport {
+            running: true,
+            reply: Some(reply),
+            unsupported: false,
+        },
+        Ok(GatedQuery::Unsupported) => RemoteRestartReport {
+            running: true,
+            reply: None,
+            unsupported: true,
+        },
+        Err(e) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !json {
+        // A short human line; the JSON form is what callers parse.
+        let line = match &report.reply {
+            Some(RestartDaemonReply::Accepted { to_version, .. }) => format!(
+                "restart accepted{}",
+                to_version
+                    .as_deref()
+                    .map(|v| format!(" (onto {v})"))
+                    .unwrap_or_default()
+            ),
+            Some(RestartDaemonReply::NeedsConfirmation { at_stake, .. }) => format!(
+                "needs confirmation: {} agent(s), {} orchestration role(s) would be stopped",
+                at_stake.agents.len(),
+                at_stake.roles.len()
+            ),
+            Some(RestartDaemonReply::Refused { message, .. }) => format!("refused: {message}"),
+            None => "the running daemon is too old to restart this way".to_string(),
+        };
+        println!("{line}");
+        return ExitCode::SUCCESS;
+    }
+    print_restart_report(json, &report)
+}
+
+/// Print a [`dot_agent_deck::daemon_restart::RemoteRestartReport`] as one JSON
+/// line (or a short human line without `--json`).
+fn print_restart_report(
+    json: bool,
+    report: &dot_agent_deck::daemon_restart::RemoteRestartReport,
+) -> ExitCode {
+    if !json {
+        println!("no daemon running");
+        return ExitCode::SUCCESS;
+    }
+    match serde_json::to_string(report) {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("daemon restart-installed: could not encode the result: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// [`run_daemon_endpoint_cli`]: something is at the endpoint path and it failed
 /// a trust check, so the caller must **not** keep looking and must not forward
 /// it. Distinct from clap's `2` so an older build is never mistaken for one.
@@ -3117,10 +3317,21 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // fallback arm, so a client from before #1121 still finds this daemon and
     // gets the mismatch prompt instead of silently spawning a second one. A
     // failure to bind it is a warning, never a failure to start.
-    let daemon = Daemon::with_attach(state, attach_path.clone()).with_legacy_aliases(
-        dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
-        dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
-    );
+    //
+    // PRD #1487: record this daemon's own binary now, at startup, so a later
+    // `restart-daemon` resolves "the build installed at my own path" from where
+    // it started rather than from whatever `current_exe()` reports after an
+    // upgrade replaced the file.
+    let daemon = Daemon::with_attach(state, attach_path.clone())
+        .with_legacy_aliases(
+            dot_agent_deck::endpoint_resolve::legacy_hook_alias(),
+            dot_agent_deck::endpoint_resolve::legacy_attach_alias(),
+        )
+        .with_restart_control(Arc::new(
+            dot_agent_deck::daemon_restart::RestartControl::new(
+                dot_agent_deck::daemon_restart::InstallRecord::capture(),
+            ),
+        ));
     if let Err(e) = run_daemon_with(&path, daemon).await {
         eprintln!("Daemon error: {e}");
         return ExitCode::FAILURE;

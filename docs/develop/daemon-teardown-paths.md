@@ -1,6 +1,6 @@
 # Daemon teardown paths: which ones refuse, which ones only disclose
 
-There are four ways to ask a `dot-agent-deck` daemon to stop. Two of them can be refused and two cannot, and issue #1109 asked whether that asymmetry is a defect. **It is not, and this file is the decision.** The unrefusable paths stay unrefusable; what they gained is the obligation to say what they destroyed.
+There are five ways to ask a `dot-agent-deck` daemon to stop. Three of them can be refused or held for confirmation and two cannot, and issue #1109 asked whether that asymmetry is a defect. **It is not, and this file is the decision.** The unrefusable paths stay unrefusable; what they gained is the obligation to say what they destroyed. The fifth, PRD #1487's restart request, came later and is guarded by design.
 
 | how you ask | what runs in the daemon | guard | disclosure |
 | --- | --- | --- | --- |
@@ -8,10 +8,26 @@ There are four ways to ask a `dot-agent-deck` daemon to stop. Two of them can be
 | `AttachRequest::StopDaemon` | the wire verb's arm in `daemon_protocol.rs` (#1049) | the same refusal, carried back as `StopDaemonRefusal` | the refusal, over the wire |
 | a termination SIGNAL (`SIGTERM`/`SIGINT`, `CTRL_C` on Windows) | `daemon::spawn_termination_signal_watch` | **none, deliberately** | `daemon_stop::log_teardown_inventory`, at `warn!` |
 | the `KIND_SHUTDOWN` frame (the TUI's Ctrl+C → `Stop`) | `daemon_protocol::handle_connection` | **none, deliberately** | the same call |
+| `AttachRequest::RestartDaemon` (PRD #1487 — `remote upgrade`, the desktop's Upgrade and Replace) | `daemon_protocol::handle_restart_daemon`, policy in `daemon_restart` | asks first: `NeedsConfirmation` naming every agent and role at stake, and stops only when the same set comes back as `confirm`; an idle daemon restarts without asking | `log_teardown_inventory(…, "restart-daemon")`, then one `warn!` naming the successor target, both before the drain |
 
 Note the first row and the third are the same handler at the daemon end: `daemon stop` refuses in the *client*, before it signals, so `--force` — the documented way to abandon a run — now leaves a record of what it abandoned.
 
 Three further things reach that same graceful-shutdown signal with nobody asking, and none of them is in scope here. The idle-shutdown timer fires only with no clients, no agents and no pending schedules, so it has nothing to disclose. The orphan watchdog and the max-lifetime backstop are env-gated test safety nets, off in production. (A crash, an `OOM` kill or a `SIGKILL` ends a daemon too, of course, and reaches no code of ours at all.)
+
+## The restart request (PRD #1487)
+
+`AttachRequest::RestartDaemon` stops the daemon in order to replace it, so it is a teardown path and carries both halves: a guard and the disclosure. Its guard is a confirmation rather than a refusal — the same live set the #770 refusal reads (`AppState::live_orchestration_roles` and `AgentPtyRegistry::agent_records`, read the same way as the `StopDaemon` arm) is sent back as `NeedsConfirmation`, and the daemon proceeds only when a later request carries that exact set, compared order-insensitively by identity (`RestartStopSet::same_targets`). A set that changed in between is answered with `NeedsConfirmation { stale: true }` and the new full set; nothing is stopped. With nothing live there is no question to answer, so an idle daemon restarts straight away.
+
+The handler's order is load-bearing (`handle_restart_daemon`'s doc lists it):
+
+1. A per-daemon lock (`RestartControl`), held until acceptance, so a second concurrent request gets `Refused { InProgress }` immediately. An accepted restart latches, and a daemon already shutting down is also `InProgress`.
+2. In `Installed` mode, the successor is resolved from the path the daemon recorded at `daemon serve` start (`resolve_restart_target`: ` (deleted)` stripped, a Homebrew keg mapped to `<prefix>/bin`) and verified (`verify_restart_target`: a regular executable file whose `--version` answers `dot-agent-deck X.Y.Z` within 10 s, matching the client's `expected_version`). A failure is `Refused` with nothing touched — checked before the live set, so nobody is asked to confirm a restart that cannot happen.
+3. The live-set snapshot and the confirmation policy above.
+4. `Accepted` is written before any teardown, with `?`: a failed write aborts the restart, as on `StopDaemon`.
+5. **Disclosure:** `log_teardown_inventory(&state, &registry, "restart-daemon")`, then `RestartDaemon accepted — restarting onto the installed build; every agent and orchestration role named above was confirmed by the client` with the target, version and successor mode. Both before the drain, for the reason property 1 below gives.
+6. The same `shutdown_all_graceful(3 s)` drain as the other paths, then the shutdown signal. `run_daemon_with` spawns the verified successor only after its serve loop has returned and its sockets are released, because the successor's bind refuses while the old socket is alive; it logs `successor daemon spawned` with the pid, or an `error!` if the spawn failed, in which case no daemon is running until a client lazy-spawns one.
+
+In `ClientSpawns` mode (the desktop's local Replace) steps 1 and 3–6 are the same, but nothing is resolved or spawned by the daemon: the client starts its own build after the drain.
 
 ## What is actually at stake
 
@@ -39,9 +55,9 @@ What this does **not** claim: the TUI's secondary confirmation names an agent *c
 
 ## What was implemented instead: disclosure
 
-`daemon_stop::log_teardown_inventory` runs on both unguarded paths, **before** the registry drain, and logs one `warn!` line naming:
+`daemon_stop::log_teardown_inventory` runs on both unguarded paths — and on the restart request once it is accepted — **before** the registry drain, and logs one `warn!` line naming:
 
-- which teardown path emitted it (`signal`, `shutdown-frame`);
+- which teardown path emitted it (`signal`, `shutdown-frame`, or `restart-daemon` for the guarded restart above);
 - how many managed agents are being terminated and how many role registrations destroyed;
 - every live agent, as `id pane=… label=… cwd=…`;
 - every orchestration role, rendered by the *same* helper the #770 refusal uses, so the two cannot describe one role differently;

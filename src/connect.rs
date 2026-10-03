@@ -33,6 +33,7 @@ use crate::daemon_protocol::AttachResponse;
 use crate::remote::{
     RemoteConfigError, RemoteEntry, RemotesFile, SshError, SshExecutor, SshTarget,
 };
+use crate::version::parse_version_output;
 
 /// Marker `kind` for entries the user added with `--type=kubernetes`. M2.4
 /// rejects these explicitly so the message clearly points the user at PRD #81
@@ -363,36 +364,6 @@ pub fn probe_timeout_secs() -> u64 {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(PROBE_TIMEOUT_SECS_DEFAULT)
         .clamp(1, PROBE_TIMEOUT_SECS_MAX)
-}
-
-/// Pull the version number out of `dot-agent-deck --version` output.
-///
-/// Stricter than `remote::parse_version_output` (which is happy with any
-/// second whitespace token) because the connect probe uses the parse to
-/// distinguish "remote really is dot-agent-deck" from "remote is some
-/// other binary at the same path." Requires:
-///
-/// 1. The first whitespace token to be exactly `dot-agent-deck`.
-/// 2. The second token to be at least one digit followed by a dot — a
-///    cheap-but-sufficient sanity check that catches "hello world" while
-///    accepting both `0.24.5` and `v0.24.5-rc.1`.
-fn parse_version_output(stdout: &str) -> Option<String> {
-    let mut parts = stdout.split_whitespace();
-    let prog = parts.next()?;
-    if prog != "dot-agent-deck" {
-        return None;
-    }
-    let version = parts.next()?;
-    let stripped = version.strip_prefix('v').unwrap_or(version);
-    let mut chars = stripped.chars();
-    let first = chars.next()?;
-    if !first.is_ascii_digit() {
-        return None;
-    }
-    if !stripped.contains('.') {
-        return None;
-    }
-    Some(version.to_string())
 }
 
 /// Maximum bytes the binary-version probe keeps from either stream.

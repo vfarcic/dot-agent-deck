@@ -48,7 +48,29 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
+    /// PRD #1487: a request that got no answer within its bound, where it is
+    /// unknown whether the daemon saw it — see
+    /// [`DaemonClient::restart_daemon`].
+    #[error("no answer from the daemon within {0:?}; unknown whether it acted on the request")]
+    TimedOut(std::time::Duration),
 }
+
+/// PRD #1487: what [`DaemonClient::restart_daemon`] asks for. Mirrors the
+/// fields of [`crate::daemon_protocol::AttachRequest::RestartDaemon`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestartDaemonRequest {
+    /// The set the user confirmed; `None` on the first ask.
+    pub confirm: Option<crate::daemon_protocol::RestartStopSet>,
+    /// The version the client just installed.
+    pub expected_version: Option<String>,
+    /// Who starts the successor.
+    pub successor: crate::daemon_protocol::RestartSuccessor,
+}
+
+/// PRD #1487: the bound on one `restart-daemon` round trip. The daemon may
+/// spend up to [`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`] checking the
+/// installed build before it answers, so this leaves that plus slack.
+pub const RESTART_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a daemon lives, from a client's point of view (PRD #741 M2).
 ///
@@ -2489,6 +2511,99 @@ impl DaemonClient {
                     .to_string(),
             )),
         }
+    }
+
+    /// PRD #1487: ask the daemon to restart — onto the build installed at its
+    /// own path, or for this client to spawn its own build — under the daemon's
+    /// live-agent policy. **The only sender of
+    /// [`AttachRequest::RestartDaemon`]**; every production path reaches the
+    /// verb through here, so no call site carries its own capability check.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_RESTART_DAEMON`]**: answers
+    /// [`GatedQuery::Unsupported`] and sends nothing. The decision is taken from
+    /// THIS call's own `Hello` (as [`Self::start_authoring_agent`] does), never
+    /// from the cache — the whole point of the verb is that the daemon behind
+    /// the endpoint gets replaced, so a set captured earlier may describe a
+    /// different process.
+    ///
+    /// The round trip is bounded by [`RESTART_REQUEST_TIMEOUT`]; running out is
+    /// [`ClientError::TimedOut`], because "unknown whether the daemon saw it" is
+    /// the honest reading. An `ok = false` reply with no `restart` field is
+    /// [`ClientError::Server`]. The cached capability set is dropped after any
+    /// answer, since an accepted restart replaces the daemon.
+    pub async fn restart_daemon(
+        &self,
+        req: RestartDaemonRequest,
+    ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, ClientError> {
+        if !self
+            .fresh_capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_RESTART_DAEMON)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let frame = AttachRequest::RestartDaemon {
+            confirm: req.confirm,
+            expected_version: req.expected_version,
+            successor: req.successor,
+        };
+        let exchange = async {
+            let (mut rd, mut wr) = self.connect().await?;
+            issue_command(&mut rd, &mut wr, &frame).await
+        };
+        let resp = tokio::time::timeout(RESTART_REQUEST_TIMEOUT, exchange)
+            .await
+            .map_err(|_| ClientError::TimedOut(RESTART_REQUEST_TIMEOUT))??;
+        self.invalidate_capabilities();
+        match resp.restart {
+            Some(reply) => Ok(GatedQuery::Answered(reply)),
+            None if !resp.ok => Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "restart-daemon failed".into()),
+            )),
+            None => Err(ClientError::Malformed(
+                "restart-daemon ok but no restart reply".into(),
+            )),
+        }
+    }
+
+    /// PRD #1487: the running daemon's `Hello` reply, or `Ok(None)` when no
+    /// daemon is listening at this endpoint. **Never lazy-spawns** — a client
+    /// connect never does — so it is safe for "is one running, and which build"
+    /// questions before and after a restart. Unbounded; callers bound it.
+    ///
+    /// "Not running" is a connect that finds no endpoint or is refused; any
+    /// other transport failure, or an `ok = false` handshake, is `Err`.
+    pub async fn probe_running(&self) -> Result<Option<AttachResponse>, ClientError> {
+        let (mut rd, mut wr) = match self.connect().await {
+            Ok(halves) => halves,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "handshake failed while probing".into()),
+            ));
+        }
+        self.store_capabilities_from_hello(&resp);
+        Ok(Some(resp))
     }
 
     /// Issue #1049: stop the deck this client is pointed at, over the wire, with
@@ -5233,6 +5348,133 @@ start = true
             "guarded send must fail safe before submission when capability is absent; result={result:?}, submissions={}",
             submissions.load(Ordering::SeqCst)
         );
+    }
+
+    /// PRD #1487: a synthetic daemon that answers `hello` with `hello` and
+    /// counts every other frame by op, answering `restart-daemon` with an idle
+    /// `Accepted`. Returns the socket, the server task and the op log.
+    #[cfg(unix)]
+    async fn restart_fake_daemon(
+        hello: AttachResponse,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("restart-fake.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_ops = ops.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream).await.expect("read frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                let op = request["op"].as_str().unwrap_or_default().to_string();
+                server_ops.lock().unwrap().push(op.clone());
+                let response = if op == "hello" {
+                    hello.clone()
+                } else {
+                    let mut r = AttachResponse::ok();
+                    r.restart = Some(crate::daemon_protocol::RestartDaemonReply::Accepted {
+                        from_version: "0.0.1".into(),
+                        to_version: None,
+                        successor: crate::daemon_protocol::RestartSuccessor::ClientSpawns,
+                        stopping: Default::default(),
+                    });
+                    r
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write response");
+            }
+        });
+        (dir, path, server, ops)
+    }
+
+    /// PRD #1487: a daemon whose `Hello` does not name `restart-daemon` — one
+    /// advertising other verbs, and one advertising nothing at all — is sent no
+    /// restart frame; the helper answers `Unsupported`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_withholds_without_the_capability() {
+        for hello in [
+            hello_advertising(&[crate::daemon_protocol::CAP_STOP_DAEMON]),
+            AttachResponse::hello(PROTOCOL_VERSION),
+        ] {
+            let (dir, path, server, ops) = restart_fake_daemon(hello).await;
+            let client = DaemonClient::new(path);
+            let result = client
+                .restart_daemon(RestartDaemonRequest::default())
+                .await
+                .expect("a withheld request is an outcome, not an error");
+            server.await.unwrap();
+            drop(dir);
+            assert_eq!(result, GatedQuery::Unsupported);
+            assert_eq!(
+                *ops.lock().unwrap(),
+                vec!["hello".to_string()],
+                "only the handshake may reach a daemon without the capability"
+            );
+        }
+    }
+
+    /// PRD #1487: with the capability, the helper decides from its own fresh
+    /// `Hello` — a stale cached set saying otherwise does not stop it — sends the
+    /// frame, and returns the daemon's reply.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_sends_when_this_calls_hello_advertises_it() {
+        let (dir, path, server, ops) = restart_fake_daemon(hello_advertising(&[
+            crate::daemon_protocol::CAP_RESTART_DAEMON,
+        ]))
+        .await;
+        let client = DaemonClient::new(path);
+        // A cache captured from some earlier daemon that lacked the verb.
+        client.store_capabilities_from_hello(&AttachResponse::hello(PROTOCOL_VERSION));
+        let result = client
+            .restart_daemon(RestartDaemonRequest {
+                successor: crate::daemon_protocol::RestartSuccessor::ClientSpawns,
+                ..Default::default()
+            })
+            .await
+            .expect("restart round trip");
+        server.await.unwrap();
+        drop(dir);
+        assert!(matches!(
+            result,
+            GatedQuery::Answered(crate::daemon_protocol::RestartDaemonReply::Accepted { .. })
+        ));
+        assert_eq!(
+            *ops.lock().unwrap(),
+            vec!["hello".to_string(), "restart-daemon".to_string()]
+        );
+        assert!(
+            client.cached_capabilities().is_none(),
+            "an answered restart drops the cache, since the daemon is being replaced"
+        );
+    }
+
+    /// PRD #1487: `probe_running` reports "nothing running" for an endpoint
+    /// with no listener, rather than an error — and never starts one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_running_reports_none_when_no_daemon_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.sock");
+        let client = DaemonClient::new(path.clone());
+        assert!(client.probe_running().await.unwrap().is_none());
+        assert!(!path.exists(), "a probe must not lazy-spawn a daemon");
     }
 
     // -----------------------------------------------------------------------
