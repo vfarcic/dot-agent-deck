@@ -6562,7 +6562,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered. A third pane's event bus overflows between the attempts: the retry stops, and the card says the prompt was not delivered. A fourth pane, whose delivery was never bound to a conversation, overflows the same way and gets no notice.
+    /// Scenario: Deliver a prompt, with the hook-event bus attached, into four panes whose writes are cut off and erased, with something arriving between the attempts. When a new conversation starts, the retry stops before writing, as a first write would; when an event from the same conversation arrives, the retry goes ahead and, cut off again, the card says the prompt was not delivered. When the event bus overflows, the retry stops and the card says so too, unless the delivery was never bound to a conversation, which gets no notice.
     #[spec("scheduler/dispatch/027")]
     #[cfg(unix)]
     #[tokio::test]
