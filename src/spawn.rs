@@ -1618,7 +1618,8 @@ async fn deliver(
     // pre-write drain and the user's draft included. A retry that is then
     // refused or fails with nothing written is reported on the card too
     // (below): the box is clean either way, so the prompt is simply not
-    // delivered. A retry the pre-write drain stops is not: its target is gone.
+    // delivered. A retry the pre-write drain stops is reported only when the
+    // stop was a lagged event stream rather than a sign its target is gone.
     let mut attempt = 0;
     let first = loop {
         attempt += 1;
@@ -1671,12 +1672,24 @@ async fn deliver(
                 return;
             }
             Err(reason) => {
-                // Not reported on the card, on a retry any more than on a first
-                // write: the drain stops a delivery whose target — the agent,
-                // or the conversation it was written for — is gone, and the
-                // daemon drops a notice addressed to a conversation that is no
-                // longer current.
+                // On a first write, never reported: the drain stops a delivery
+                // whose target — the agent, or the conversation it was written
+                // for — is gone, or may be. On a retry, the one stop that is
+                // not evidence of that is a lagged event stream, which only
+                // lost the evidence; the box is clean, so that prompt is
+                // reported as lost. The notice stays bound to the conversation
+                // it was written for, so the daemon still drops it if that
+                // conversation or agent did change meanwhile.
                 log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
+                if attempt > 1 && reason == LAGGED_EVENT_STREAM {
+                    report_erased_first_write_lost(
+                        registry,
+                        pane_id,
+                        agent_id,
+                        &delivery_id,
+                        generation.as_ref(),
+                    );
+                }
                 return;
             }
         }
@@ -2027,6 +2040,10 @@ enum FirstSubmit {
     Erased,
 }
 
+/// The pre-write drain's stop reason when the event stream overflowed and
+/// frames were lost.
+const LAGGED_EVENT_STREAM: &str = "lagged-event-stream";
+
 /// The refusal reason for a [`GuardedSend::Ambiguous`] write.
 const AMBIGUOUS_PARTIAL_WRITE: &str = "ambiguous partial write";
 
@@ -2141,7 +2158,7 @@ fn drain_pre_write_events(
             // writing a spawn prompt into a conversation that may already have
             // been revoked is not recoverable.
             Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                return Some("lagged-event-stream");
+                return Some(LAGGED_EVENT_STREAM);
             }
             Err(broadcast::error::TryRecvError::Empty) => return None,
             Err(broadcast::error::TryRecvError::Closed) => return Some("event-stream-closed"),
@@ -6543,13 +6560,14 @@ mod tests {
         );
     }
 
-    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered.
+    /// Scenario: Deliver a prompt, with the hook-event bus attached, into two panes whose writes are cut off and erased. In one, a new conversation starts while the first attempt is erased, so the retry stops before writing, as a first write would; in the other, an event from the same conversation arrives instead, the retry goes ahead, and when it is cut off too the card says the prompt was not delivered. A third pane's event bus overflows between the attempts: the retry stops, and the card says the prompt was not delivered.
     #[spec("scheduler/dispatch/027")]
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_027_erased_first_write_retry_runs_the_pre_write_drain_again() {
         const CHANGED_PANE: &str = "issue-1455-generation-changed-pane";
         const SAME_PANE: &str = "issue-1455-same-generation-pane";
+        const FLOODED_PANE: &str = "issue-1455-flooded-bus-pane";
         const PROMPT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
 
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -6563,9 +6581,12 @@ mod tests {
         erased_attempt.extend(std::iter::repeat_n(0x7f, encoded.len()));
 
         let mut logs = Vec::new();
-        for (pane, next_session) in [
-            (CHANGED_PANE, "a-new-conversation"),
-            (SAME_PANE, "the-ready-conversation"),
+        // How many events land between the attempts. The bus holds 16, so 40
+        // overflow it and the retry's drain finds the stream lagged.
+        for (pane, next_session, between) in [
+            (CHANGED_PANE, "a-new-conversation", 1),
+            (SAME_PANE, "the-ready-conversation", 1),
+            (FLOODED_PANE, "the-ready-conversation", 40),
         ] {
             let agent = spawn_typed_byte_target(&registry, pane, Some(AgentType::ClaudeCode));
             let (event_tx, event_rx) = broadcast::channel(16);
@@ -6587,7 +6608,9 @@ mod tests {
             let between_attempts = start(next_session);
             let tx = event_tx.clone();
             let (writer, log) = SubmitRefusingWriter::new(move || {
-                let _ = tx.send(between_attempts.clone());
+                for _ in 0..between {
+                    let _ = tx.send(between_attempts.clone());
+                }
                 false
             });
             let _displaced = registry
@@ -6618,6 +6641,11 @@ mod tests {
             "control: an event from the SAME conversation between the attempts does not stop the \
              retry, so the stop above comes from the generation change, not from the event bus"
         );
+        assert_eq!(
+            logs[2], erased_attempt,
+            "a flood that overflows the event bus between the attempts stops the retry before a \
+             byte is written: the frames that might have said the conversation changed are lost"
+        );
         let lost: Vec<String> = notices
             .lock()
             .unwrap()
@@ -6627,10 +6655,12 @@ mod tests {
             .collect();
         assert_eq!(
             lost,
-            vec![SAME_PANE.to_string()],
-            "the exhausted retry is reported on its card (issue #1455); the stopped one is not, \
-             exactly as a first write the drain stops is not — the conversation it was written \
-             for is over, and the daemon drops a notice addressed to it"
+            vec![SAME_PANE.to_string(), FLOODED_PANE.to_string()],
+            "the exhausted retry is reported on its card (issue #1455), and so is the retry a \
+             lagged event stream stopped — that stop lost evidence, it did not find the target \
+             gone, and the box is clean. The generation-changed stop is not reported, exactly as \
+             a first write the drain stops is not: the conversation it was written for is over, \
+             and the daemon drops a notice addressed to it"
         );
     }
 
