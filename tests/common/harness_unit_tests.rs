@@ -33,6 +33,19 @@
 //! child filter from `module_path!()`, so they followed the move rather than
 //! naming a binary.
 //!
+//! **Environment writes.** A handful of tests below set or remove a process
+//! environment variable (`HOME`, an API key, a harness knob) and restore it
+//! before returning. `set_var` / `remove_var` race any thread concurrently
+//! reading the environment, so this states what can actually be running when
+//! they do, instead of the "single-threaded" their comments used to claim
+//! (issue #678): the test's own thread; libtest's runner thread, waiting for
+//! that test to finish; and, once anything has allocated a harness temp dir,
+//! the `load-context` heartbeat (`load_context::arm`), which sleeps and reads
+//! `/proc`, never the environment. None of those tests starts a runtime or a
+//! thread of its own. That is the argument under nextest, which every gate
+//! here uses; under plain `cargo test`, sibling tests share the process and
+//! these writes race them (issue #245).
+//!
 //! **Why so much of `mod.rs` is `pub(crate)`.** This module is a *sibling* of
 //! `common`, not a child of it, so `use super::*` no longer reaches the
 //! harness's private helpers. The helpers these tests cover therefore carry
@@ -62,8 +75,8 @@ const ROOT_MARKER: &str = "harness-temp-root=";
 #[test]
 fn claude_plugin_import_is_off_unless_explicitly_enabled() {
     let prev = std::env::var_os("DAD_E2E_IMPORT_CLAUDE_PLUGINS");
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS") };
     let off_by_default = import_claude_plugins_enabled();
     unsafe { std::env::set_var("DAD_E2E_IMPORT_CLAUDE_PLUGINS", "1") };
@@ -104,8 +117,8 @@ fn insufficient_space_message_names_the_cause_and_the_remedy() {
 #[cfg(unix)]
 #[test]
 fn zero_threshold_disables_the_preflight_check() {
-    // SAFETY: single-threaded test process (nextest runs one test per
-    // process); the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     let prev = std::env::var_os(MIN_FREE_ENV);
     unsafe { std::env::set_var(MIN_FREE_ENV, "0") };
     let verdict = temp_space_problem(Path::new("/"));
@@ -124,7 +137,8 @@ fn zero_threshold_disables_the_preflight_check() {
 #[test]
 fn an_unmeetable_threshold_trips_the_preflight_check() {
     let prev = std::env::var_os(MIN_FREE_ENV);
-    // SAFETY: as above — single-threaded, restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; restored before
+    // returning.
     unsafe { std::env::set_var(MIN_FREE_ENV, "1000000000") };
     let verdict = temp_space_problem(&std::env::temp_dir());
     match prev {
@@ -2481,8 +2495,7 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     // and `install_credential_redaction` seeds the global store with an
     // ambient value, either of which would make the assertions below depend
     // on the machine.
-    // SAFETY: single-threaded test body, and nextest gives each test its own
-    // process, so nothing else in this process observes the change.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2862,7 +2875,7 @@ fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
 /// publishes. Three field names is cheaper than accepting that.
 #[test]
 fn the_seeded_claude_json_registers_its_account_identity_fields() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -2967,7 +2980,7 @@ fn the_seeded_claude_json_registers_its_account_identity_fields() {
 /// so never resolves itself — until the test's own timeout fired.
 #[test]
 fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -3061,7 +3074,7 @@ fn a_second_trust_seeding_keeps_the_paths_the_first_one_trusted() {
 /// to cover the new one too.
 #[test]
 fn a_non_object_claude_json_in_the_test_home_falls_back_to_the_host() {
-    // SAFETY: single-threaded test body in its own nextest process.
+    // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
@@ -4715,8 +4728,8 @@ fn a_missing_or_malformed_response_block_is_rebuilt_rather_than_trusted() {
 #[test]
 fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
     let prev = std::env::var_os(ANTHROPIC_API_KEY_ENV);
-    // SAFETY: nextest runs one test per process, so this is single-threaded;
-    // the var is restored before returning.
+    // SAFETY: see "Environment writes" in this file's header; the var is
+    // restored before returning.
     unsafe { std::env::remove_var(ANTHROPIC_API_KEY_ENV) };
     assert!(anthropic_api_key().is_none(), "unset must read as absent");
     unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, "") };
