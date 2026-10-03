@@ -3480,17 +3480,18 @@ async fn run_hook_loop_with_idle_timeout(
                                         } => Some(agent_id.clone()),
                                         _ => None,
                                     };
-                                    let resp = state
-                                        .read()
-                                        .await
-                                        .handle_attested_delegate(
-                                            signal,
-                                            &pty_registry,
-                                            &event_tx,
-                                            Some(&state),
-                                            sender_agent_id.as_deref(),
-                                        )
-                                        .await;
+                                    // Issue #1387: the free function, which
+                                    // reads the project config with no guard
+                                    // held, so a read that hangs cannot stall
+                                    // hook ingestion behind it.
+                                    let resp = crate::state::handle_attested_delegate(
+                                        signal,
+                                        &state,
+                                        &pty_registry,
+                                        &event_tx,
+                                        sender_agent_id.as_deref(),
+                                    )
+                                    .await;
                                     // Answer on the same connection, like
                                     // `GetSeed` / `ListTargets`. Delegate used to
                                     // be fire-and-forget, so a delegation that
@@ -7299,7 +7300,9 @@ mod hook_ingestion_tests {
     /// and a worker pane, both `cat`, with the role maps the delegate path
     /// routes on.
     struct ProvenanceFixture {
-        _cwd: tempfile::TempDir,
+        /// The directory both panes run in, and so the one whose
+        /// `.dot-agent-deck.toml` every orchestration verb resolves roles from.
+        cwd: tempfile::TempDir,
         _dir: tempfile::TempDir,
         sock: std::path::PathBuf,
         registry: Arc<AgentPtyRegistry>,
@@ -7307,6 +7310,8 @@ mod hook_ingestion_tests {
         worker_token: String,
         worker_agent: String,
         orchestrator_agent: String,
+        /// The loop's own state, so a test can watch hook ingestion land.
+        state: SharedState,
         handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
     }
 
@@ -7405,6 +7410,7 @@ mod hook_ingestion_tests {
             let shutdown = Arc::new(Notify::new());
             let handle = tokio::spawn({
                 let registry = registry.clone();
+                let state = state.clone();
                 let wtr = crate::issue_dispatch_run::new_worktree_registry();
                 async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
             });
@@ -7418,8 +7424,9 @@ mod hook_ingestion_tests {
                 orchestrator_agent,
                 registry,
                 sock,
-                _cwd: cwd,
+                cwd,
                 _dir: dir,
+                state,
                 handle,
             }
         }
@@ -8069,6 +8076,239 @@ mod hook_ingestion_tests {
             "the hook loop answered but stopped handling after the unread acks"
         );
         fx.stop().await;
+    }
+
+    /// Write one message line to the hook socket at `sock`, half-close, and read
+    /// the whole reply. A free function so it can run on its own task.
+    async fn send_hook_message(sock: PathBuf, msg: crate::event::DaemonMessage) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        let mut stream = UnixStream::connect(&sock).await.expect("connect");
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// Issue #1387: a `.dot-agent-deck.toml` whose read never completes — a FIFO
+    /// nobody writes to, standing in for a hung network mount. Opening it for
+    /// reading blocks until a writer appears, which here is a watchdog thread
+    /// the test releases, or that releases itself after [`Self::WATCHDOG`] if
+    /// the test never gets the chance to.
+    struct BlockedConfig {
+        release: std::sync::mpsc::Sender<()>,
+        released: Arc<std::sync::atomic::AtomicBool>,
+        watchdog: std::thread::JoinHandle<bool>,
+    }
+
+    impl BlockedConfig {
+        /// How long the read is left hanging when the test cannot release it —
+        /// which is what happens when the read blocks the test's own runtime
+        /// thread. Long enough that a working daemon ingests an event well
+        /// inside it, short enough that the failing case fails promptly.
+        const WATCHDOG: Duration = Duration::from_secs(5);
+
+        fn plant(dir: &std::path::Path) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = dir.join(crate::project_config::CONFIG_FILE_NAME);
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `c_path` is a valid NUL-terminated path for the call.
+            let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+            assert_eq!(
+                rc,
+                0,
+                "mkfifo {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (release, rx) = std::sync::mpsc::channel::<()>();
+            let watchdog = std::thread::spawn({
+                let released = released.clone();
+                move || {
+                    let _ = rx.recv_timeout(Self::WATCHDOG);
+                    released.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // Every later read finds an ordinary (empty) file…
+                    let parked = path.with_extension("parked-fifo");
+                    std::fs::rename(&path, &parked).expect("move the FIFO aside");
+                    std::fs::write(&path, "").expect("write an ordinary config");
+                    // …and every read already parked on the FIFO is let go: a
+                    // writer's open wakes the blocked readers, and its close
+                    // hands them EOF. A non-blocking open for writing fails with
+                    // ENXIO when no reader holds the FIFO, which is how this
+                    // reports whether a read was actually parked on it.
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&parked)
+                    {
+                        Ok(writer) => {
+                            std::thread::sleep(Duration::from_millis(200));
+                            drop(writer);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+            });
+            Self {
+                release,
+                released,
+                watchdog,
+            }
+        }
+
+        fn released(&self) -> bool {
+            self.released.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Let the parked reads go, and report whether any read was parked.
+        fn release(self) -> bool {
+            let _ = self.release.send(());
+            self.watchdog.join().expect("FIFO watchdog panicked")
+        }
+    }
+
+    /// Write one `session_start` for `session` on its own connection and wait,
+    /// bounded, for its card to reach the daemon's `AppState`.
+    async fn ingest_session(fx: &ProvenanceFixture, session: &str, label: &str) {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
+        let line = format!("{}\n", padded_session_start(session, 0));
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !fx.state.read().await.sessions.contains_key(session) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label}: the session_start never reached the daemon's AppState"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn ingest_006_delegate(token: String) -> crate::event::DaemonMessage {
+        crate::event::DaemonMessage::Delegate(crate::event::DelegateSignal {
+            pane_id: PROV_ORCH_PANE.to_string(),
+            task: "INGEST-006-TASK".to_string(),
+            to: vec!["worker".to_string()],
+            supersede: false,
+            timestamp: chrono::Utc::now(),
+            token: Some(token),
+        })
+    }
+
+    /// Scenario: issue #1387 — run the real hook loop against a two-role
+    /// orchestration whose `.dot-agent-deck.toml` is a FIFO nobody writes to, and
+    /// make each daemon path that resolves a role from that file hang reading it:
+    /// the `delegate`, `restart-role` and `spawn-role` handlers, and a delegate's
+    /// detached dispatch task. While each hangs, a `session_start` written on
+    /// another connection must still become a card.
+    #[spec("hooks/ingest/006")]
+    #[tokio::test]
+    async fn ingest_006_a_verb_stuck_reading_the_project_config_does_not_stall_ingest() {
+        use crate::event::DaemonMessage;
+
+        type Verb = fn(String) -> DaemonMessage;
+        let verbs: [(&str, Verb); 3] = [
+            ("delegate", ingest_006_delegate),
+            ("restart-role", |token| {
+                DaemonMessage::RestartRole(crate::event::RestartRoleSignal {
+                    pane_id: PROV_ORCH_PANE.to_string(),
+                    role: "worker".to_string(),
+                    force: false,
+                    token: Some(token),
+                    timestamp: chrono::Utc::now(),
+                })
+            }),
+            ("spawn-role", |token| {
+                DaemonMessage::SpawnRole(crate::event::SpawnRoleSignal {
+                    pane_id: PROV_ORCH_PANE.to_string(),
+                    role: "worker".to_string(),
+                    token: Some(token),
+                    timestamp: chrono::Utc::now(),
+                })
+            }),
+        ];
+
+        for (verb, message) in verbs {
+            let fx = ProvenanceFixture::start().await;
+            let blocked = BlockedConfig::plant(fx.cwd.path());
+            let reply = tokio::spawn(send_hook_message(
+                fx.sock.clone(),
+                message(fx.orchestrator_token.clone()),
+            ));
+            // Long enough for the verb to reach its read of the config and park
+            // on the FIFO there.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ingest_session(&fx, &format!("ingest-006-{verb}"), verb).await;
+            let ingested_while_blocked = !blocked.released();
+            let verb_was_still_waiting = !reply.is_finished();
+
+            let a_read_was_parked = blocked.release();
+            let reply = tokio::time::timeout(Duration::from_secs(20), reply)
+                .await
+                .unwrap_or_else(|_| panic!("{verb}: no reply once the config read was released"))
+                .expect("the verb's sender task panicked");
+            fx.stop().await;
+
+            assert!(
+                a_read_was_parked,
+                "{verb}: nothing was reading the FIFO when it was released, so this run never \
+                 put a blocked config read in the verb's way and proves nothing"
+            );
+            assert!(
+                ingested_while_blocked,
+                "{verb}: hook ingestion made progress only once the blocked config read was \
+                 released — the verb held the AppState lock (or the runtime's thread) across \
+                 a read of .dot-agent-deck.toml"
+            );
+            assert!(
+                verb_was_still_waiting,
+                "{verb}: the verb had already answered ({reply:?}) when the event landed, so its \
+                 config read was not what the event had to get past"
+            );
+        }
+
+        // The delegate's detached dispatch task reads the file again once it
+        // holds the worker pane's dispatch locks. Hold the order lock so the
+        // delegate is answered while the config is still absent, put the FIFO
+        // there, then let the queued dispatch run into it.
+        let label = "delegate dispatch";
+        let fx = ProvenanceFixture::start().await;
+        let order = fx.registry.pane_dispatch_order_lock(PROV_WORKER_PANE);
+        let held = order.lock().await;
+        let reply = send_hook_message(
+            fx.sock.clone(),
+            ingest_006_delegate(fx.orchestrator_token.clone()),
+        )
+        .await;
+        let reply: crate::event::DelegateResponse = serde_json::from_str(reply.trim())
+            .unwrap_or_else(|e| {
+                panic!("delegate reply was not a DelegateResponse ({e}): {reply:?}")
+            });
+        assert_eq!(reply.delivered, vec!["worker".to_string()], "{reply:?}");
+        let blocked = BlockedConfig::plant(fx.cwd.path());
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ingest_session(&fx, "ingest-006-dispatch", label).await;
+        let ingested_while_blocked = !blocked.released();
+        let a_read_was_parked = blocked.release();
+        fx.stop().await;
+        assert!(
+            a_read_was_parked,
+            "{label}: nothing was reading the FIFO when it was released, so the dispatch never \
+             reached its config read and this case proves nothing"
+        );
+        assert!(
+            ingested_while_blocked,
+            "{label}: hook ingestion made progress only once the dispatch task's blocked config \
+             read was released — it read .dot-agent-deck.toml on the runtime's thread"
+        );
     }
 
     /// Scenario: issue #530 — an attested `dispatch` that its handler then

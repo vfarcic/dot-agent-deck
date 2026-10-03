@@ -2181,6 +2181,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the wording of any of those lines beyond the fragment used to locate it; the `WarnOnly` provenance branch, which needs a token genuinely issued to the claimed pane and so cannot be reached with a hostile pane id at all; `delegate_targets`' two producer-supplied `role` warnings, which a delegate from an unattested pane never reaches because `refuse_unless_orchestrator_caller` refuses one check earlier (`state::tests::delegate_targets_cannot_be_made_to_forge_a_log_line` covers those); the bound chosen for the raw-line sites (`hook_line_for_log_keeps_the_event_type_the_value_bound_would_cut`); the escaper itself (`config_validation::tests::a_producer_supplied_field_cannot_forge_or_reorder_a_log_line`).
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### hooks/ingest/006 — A daemon verb stuck reading `.dot-agent-deck.toml` does not stall hook ingestion (issue #1387).
+- **Layer:** L1 (the real `run_hook_loop` driven against a real Unix hook socket in-process, with two `cat` panes as a two-role orchestration; no deck binary, no agent).
+- **Agent:** none (`cat` stand-ins for the orchestrator and the worker; a FIFO nobody writes to stands in for a config on a hung filesystem).
+- **Asserts:** for each verb that resolves a role from the project config — `delegate`, `restart-role`, `spawn-role` — sent while that config is a FIFO whose open never returns, a `session_start` written on another connection still becomes a card *before* the FIFO is released; the verb had not yet answered when it did, and a read really was parked on the FIFO at release time, so the event had the blocked read in its way rather than slipping past a verb that never reached it. The test runs on a single-threaded runtime, so it catches the read blocking the runtime's thread as well as the `AppState` guard being held across it. Before the fix each verb read the file synchronously under the `AppState` read guard, so the event's write lock waited for the read.
+- **Does not assert:** that the verb itself makes progress while the read hangs — it waits for the config, by design, since what the config says decides what it does; that the config is re-read on every delegate (`orchestration/delegate` and the `#704`/`#705` tests own that); the scheduler-fire, `dispatch` and `list-targets` paths, which read the config holding no `AppState` guard.
+- **Platform coverage:** mac+linux (Unix-domain socket, `mkfifo`).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
