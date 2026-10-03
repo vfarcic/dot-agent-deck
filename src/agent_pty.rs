@@ -2622,6 +2622,13 @@ fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WritePr
     WriteProgress::Complete
 }
 
+/// Issue #876: what a pane's card says when a daemon write may have left part
+/// of a prompt in its input box.
+const STRANDED_WRITE_NOTICE: &str = "a daemon write into this pane stopped part-way and its bytes \
+                                     could not be erased again, so the input box may hold a \
+                                     partial prompt above whatever you had typed: clear or \
+                                     submit it before typing on";
+
 /// Issue #525: how long a guarded delivery waits on a single PTY write.
 pub const PTY_WRITE_STALL_BOUND: Duration = Duration::from_secs(10);
 
@@ -4334,7 +4341,7 @@ enum PtyOp {
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
     #[cfg(test)]
-    Surrender(std::sync::mpsc::Sender<(Box<dyn std::io::Write + Send>, InputRecorder)>),
+    Surrender(oneshot::Sender<(Box<dyn std::io::Write + Send>, InputRecorder)>),
 }
 
 /// Issue #525: what the thread did with a job — how many bytes the PTY
@@ -4675,6 +4682,66 @@ fn real_time_alarm(after: Duration) -> oneshot::Receiver<()> {
         let _ = alarms.send((Instant::now() + after, tx));
     }
     rx
+}
+
+/// Issue #525 (Qodo, PR #1535): the accounting of a guarded delivery whose
+/// future was dropped after its payload was handed to the PTY.
+///
+/// [`AgentPtyRegistry::write_guarded`] records what its write left in the box
+/// once the write is classified, and that needs the future to run to the end.
+/// Dropped part-way — at the wait for a write job, the echo wait, the submit
+/// delay — it would leave bytes that [`PtyWriterThread`] still writes with no
+/// payload record (#424/#715) and no notice (#876). This makes the
+/// conservative call the `Ambiguous` arm makes for bytes it cannot account
+/// for: the payload is recorded as in the box and, for a submit, the pane is
+/// reported. A delivery dropped after its CR went in is then reported in vain;
+/// one dropped before it is not lost silently, which is the error worth
+/// preventing.
+struct UnfinishedDelivery<'a> {
+    registry: &'a AgentPtyRegistry,
+    state: Arc<Mutex<PaneInputState>>,
+    retired: Arc<AtomicBool>,
+    pane_id: &'a str,
+    agent_id: &'a str,
+    mode: SubmitMode,
+    payload: &'a [u8],
+    armed: bool,
+}
+
+impl Drop for UnfinishedDelivery<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            // Issue #542: checked under `state`'s lock — see [`PaneWriter::retired`].
+            if !self.retired.load(Ordering::SeqCst) {
+                state.note_automatic_write(self.pane_id, self.mode, self.payload);
+            }
+        }
+        if !matches!(self.mode, SubmitMode::Submit) || self.payload.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            pane_id = %self.pane_id,
+            agent_id = %self.agent_id,
+            payload_len = self.payload.len(),
+            "guarded submit was dropped after its payload went to the PTY; the payload record is \
+             kept and the pane reported"
+        );
+        // The notice sink spawns onto the runtime, which a future dropped
+        // outside one cannot reach.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.registry.publish_delivery_notice(DeliveryNotice {
+                pane_id: self.pane_id.to_string(),
+                agent_id: self.agent_id.to_string(),
+                delivery_id: crate::prompt_delivery::mint_delivery_id(self.pane_id),
+                session_id: None,
+                detail: STRANDED_WRITE_NOTICE,
+            });
+        }
+    }
 }
 
 /// Issue #525: [`write_all_tracked`]'s loop, reporting each accepted slice to
@@ -10733,6 +10800,24 @@ impl AgentPtyRegistry {
         }
         // Encode before locking so a bad payload doesn't pin the writer.
         let payload = encode_pane_payload(text)?;
+        // Issue #525: how long this delivery waits on the pane's PTY, and the
+        // refusal it gives when the pane is not reading. Nothing has been
+        // handed to the PTY when this is returned.
+        let stall = self.pty_write_stall_bound();
+        let not_reading = |agent_id: &str| {
+            tracing::warn!(
+                pane_id = %pane_id,
+                agent_id = %agent_id,
+                payload_len = payload.len(),
+                "guarded write refused: an earlier write into this pane's PTY has not gone in, \
+                 so the agent is not reading its input; nothing was written"
+            );
+            Err(AgentPtyError::Writer(
+                "an earlier write into this pane's PTY has not gone in; the agent is not reading \
+                 its input"
+                    .to_string(),
+            ))
+        };
         // Issue #544: the draft gate, for a first write of a non-empty SUBMIT
         // payload with the cap switched on. A Notice submits nothing, and an
         // empty payload is a probe that #424 already governs.
@@ -10821,7 +10906,36 @@ impl AgentPtyRegistry {
             }
             // Acquire the EXACT target writer, THEN re-validate — this is the
             // barrier the TOCTOU test holds open by locking the writer externally.
-            let w = before_write_deadline(within(deferred), target.writer.lock()).await?;
+            //
+            // Issue #525 (Qodo, PR #1535): a caller with no deadline still
+            // waits at most the stall bound, measured on the wall clock. The
+            // writer can be held by an attach client's keystrokes waiting on a
+            // PTY that stopped reading, and an unbounded wait here would make
+            // this delivery as stuck as that pane.
+            let w = match within(deferred) {
+                Some(_) => before_write_deadline(within(deferred), target.writer.lock()).await?,
+                None => match within_real_time(stall, target.writer.lock()).await {
+                    Some(w) => w,
+                    None => return not_reading(&target.agent_id),
+                },
+            };
+            // Issue #525: a write an earlier holder of this writer stopped
+            // waiting for — or a cancelled attach handler's keystrokes — may
+            // still be inside the PTY, and ours would only queue behind it on
+            // the writer's thread. Waited out HERE, before every guard below
+            // reads the pane's clocks (Qodo, PR #1535): those bytes are
+            // recorded when the PTY takes them, so a decision made before
+            // they land could read a draft or a keystroke as absent. Bounded
+            // like the lock: by the caller's deadline, or — for a caller with
+            // none — by the stall bound, so a pane that has stopped reading
+            // refuses the write with nothing written instead of holding it.
+            let idle = match within(deferred) {
+                Some(_) => Some(before_write_deadline(within(deferred), w.until_idle()).await?),
+                None => within_real_time(stall, w.until_idle()).await,
+            };
+            if idle.is_none() {
+                return not_reading(&target.agent_id);
+            }
             // Re-resolve identity: the pane may have rebound to a new agent, or the
             // target may have exited, while we waited for the writer.
             if let Some(refusal) = ownership_lost(&target) {
@@ -10972,33 +11086,6 @@ impl AgentPtyRegistry {
                 detail: crate::draft_deferral::DRAFT_CAP_NOTICE,
             });
         }
-        // Issue #525: a write an earlier holder of this writer stopped waiting
-        // for may still be inside the PTY, and ours would only queue behind it
-        // on the writer's thread. Wait for it here, where nothing of ours has
-        // been handed over: within the caller's deadline, or — for a caller
-        // with none — within the stall bound, so a pane that has stopped
-        // reading refuses the write cleanly instead of holding it forever. The
-        // idle wait comes before the echo watch so the watch's snapshot is
-        // taken after whatever that earlier write makes the agent paint.
-        let stall = self.pty_write_stall_bound();
-        let idle = match within(deferred) {
-            Some(_) => Some(before_write_deadline(within(deferred), w.until_idle()).await?),
-            None => within_real_time(stall, w.until_idle()).await,
-        };
-        if idle.is_none() {
-            tracing::warn!(
-                pane_id = %pane_id,
-                agent_id = %target.agent_id,
-                payload_len = payload.len(),
-                "guarded write refused: an earlier write into this pane's PTY has not gone in, \
-                 so the agent is not reading its input; nothing was written"
-            );
-            return Err(AgentPtyError::Writer(
-                "an earlier write into this pane's PTY has not gone in; the agent is not reading \
-                 its input"
-                    .to_string(),
-            ));
-        }
         // Issue #1243: subscribed before the payload is written, so no byte of
         // its echo is missed. The writer is held, so nothing else is typed
         // into this pane in between.
@@ -11034,6 +11121,20 @@ impl AgentPtyRegistry {
         // turn on the user's just-submitted draft, typically — as caused by
         // bytes not yet written.
         before_payload();
+        // Issue #525 (Qodo, PR #1535): from here the payload is handed to the
+        // PTY, and the accounting below runs only if this future is polled to
+        // the end. A caller dropped in between — an outer timeout, an aborted
+        // task — would leave bytes going in with no record and no notice.
+        let mut unfinished = UnfinishedDelivery {
+            registry: self,
+            state: w.state.clone(),
+            retired: w.retired.clone(),
+            pane_id,
+            agent_id: &target.agent_id,
+            mode,
+            payload: &payload,
+            armed: true,
+        };
         let delivery = match mode {
             SubmitMode::Submit => {
                 let (delivery, echoed) =
@@ -11045,6 +11146,7 @@ impl AgentPtyRegistry {
             }
             SubmitMode::Notice => deliver_payload_as_notice(&mut w.daemon(stall), &payload).await,
         };
+        unfinished.armed = false;
         match delivery {
             // Issue #424 F1: bytes of OURS are now in this pane, which is what
             // makes a later submit-only probe meaningful and a later repeat of
@@ -11110,10 +11212,7 @@ impl AgentPtyRegistry {
                         agent_id: target.agent_id.clone(),
                         delivery_id: crate::prompt_delivery::mint_delivery_id(pane_id),
                         session_id: None,
-                        detail: "a daemon write into this pane stopped part-way and its bytes \
-                                 could not be erased again, so the input box may hold a partial \
-                                 prompt above whatever you had typed: clear or submit it before \
-                                 typing on",
+                        detail: STRANDED_WRITE_NOTICE,
                     });
                 } else if erased {
                     // `is_submit` matters: a NOTICE reaching this arm was never
@@ -13828,7 +13927,9 @@ impl AgentPtyRegistry {
         let mut guard = writer.lock().await;
         // Issue #525: the PTY writer lives on its own thread, so the swap is the
         // old thread handing its writer back and a new thread for `inner`.
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Awaited, not received blocking: the old thread may first be finishing
+        // a write the PTY is slow to take (Qodo, PR #1535).
+        let (tx, rx) = oneshot::channel();
         guard
             .pty
             .submit(
@@ -13836,7 +13937,7 @@ impl AgentPtyRegistry {
                 PtyReply::Blocking(std::sync::mpsc::sync_channel(1).0),
             )
             .expect("the displaced writer's thread is running");
-        let (displaced, recorder) = rx.recv().expect("the displaced writer comes back");
+        let (displaced, recorder) = rx.await.expect("the displaced writer comes back");
         guard.pty = PtyWriterThread::spawn(inner, recorder);
         displaced
     }
@@ -20533,7 +20634,14 @@ mod spawn_tests {
     /// outcome must also stay truthful: the payload went to the kernel, so
     /// bytes of it may sit in the box, and the write is reported ambiguous,
     /// not erased, with the pane named on its card.
-    #[cfg(unix)]
+    ///
+    /// Linux only: it needs a kernel that blocks the master's writer once a
+    /// raw-mode slave's input queue is full, which is Linux's line discipline.
+    /// On the macOS runner the filler's writes never stopped being taken within
+    /// the test's 20 s, so the precondition was never reached there. The
+    /// portable gated-writer tests below pin the same accounting on every
+    /// platform.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_guarded_write_into_a_pty_that_never_reads_leaves_the_runtime_worker_free() {
         let seen = guarded_write_into_a_raw_pty(true);
@@ -20709,6 +20817,186 @@ mod spawn_tests {
             log.lock().unwrap().as_slice(),
             encode_pane_payload(TEXT).unwrap().as_slice(),
             "exactly the stalled payload went in: no CR after it, and none of the refused writes"
+        );
+    }
+
+    /// Issue #525 (Qodo, PR #1535): a registry with one pane whose PTY writer
+    /// takes nothing until the returned gate opens, and a log of what it took.
+    /// With `real`, the pane is a `/bin/cat` spawned with its pane id, so its
+    /// writer records what lands into that pane's clocks; otherwise it is a
+    /// synthetic agent, portable, whose writer records nothing.
+    async fn gated_pane(
+        pane: &str,
+        real: bool,
+    ) -> (
+        Arc<AgentPtyRegistry>,
+        String,
+        Arc<WedgeGate>,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<Mutex<Vec<DeliveryNotice>>>,
+        Box<dyn std::io::Write + Send>,
+    ) {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notices: Arc<Mutex<Vec<DeliveryNotice>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_notices = notices.clone();
+        registry.set_delivery_notice_sink(Arc::new(move |notice| {
+            sink_notices.lock().unwrap().push(notice);
+        }));
+        let agent = if real {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        } else {
+            registry.insert_test_agent_for_pane(
+                Box::new(WedgedChild::new(None, Arc::new(WedgeGate::default()))),
+                Some(pane),
+            )
+        };
+        let gate = Arc::new(WedgeGate::default());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let displaced = registry
+            .replace_agent_writer_for_test(
+                &agent,
+                Box::new(GatedWriter {
+                    gate: gate.clone(),
+                    log: log.clone(),
+                }),
+            )
+            .await;
+        (registry, agent, gate, log, notices, displaced)
+    }
+
+    /// Wait until `writer` has a job in its PTY thread, as a test's precondition.
+    async fn until_a_pty_job_is_in_flight(writer: &Arc<AsyncMutex<PaneWriter>>) {
+        let pty_in_flight = writer.lock().await.pty.in_flight.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pty_in_flight.count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("precondition: a job reached the PTY thread");
+        // In flight is counted from submission; give the thread its start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Issue #525 (Qodo, PR #1535): an attach handler cancelled while its
+    /// keystrokes were inside a PTY that stopped reading releases the writer
+    /// with those bytes still going in. A guarded first write that takes the
+    /// writer next must read the pane's draft AFTER they land — so it defers
+    /// behind the user's draft, as it would had the keystrokes gone in at once,
+    /// rather than deciding on a clock they had not reached yet and typing its
+    /// prompt onto the end of the draft.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_guarded_first_write_reads_the_draft_after_a_stalled_keystroke_lands() {
+        const PANE: &str = "issue-525-draft-pane";
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, true).await;
+        let writer = registry.agent_writer(&agent).unwrap();
+
+        let typing = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let w = writer.lock().await;
+                let _ = w.write_user(b"half a thought").await;
+            })
+        };
+        until_a_pty_job_is_in_flight(&writer).await;
+        typing.abort();
+        let _ = typing.await;
+        assert!(
+            !registry.draft_pending(PANE),
+            "precondition: the keystrokes have not reached the pane's clock yet"
+        );
+
+        let delivery = {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_and_submit_guarded_first_write_within(
+                        PANE,
+                        "Read the task file for your task.",
+                        &agent,
+                        || async { true },
+                        Instant::now(),
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        gate.release();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(registry.draft_pending(PANE), "the keystrokes landed");
+        assert!(
+            !delivery.is_finished(),
+            "the delivery is waiting for the user's draft, not written over it"
+        );
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            b"half a thought",
+            "nothing of the prompt followed the user's draft into the box"
+        );
+        delivery.abort();
+    }
+
+    /// Issue #525 (Qodo, PR #1535): a guarded delivery whose future is dropped
+    /// after its payload went to the PTY — here an aborted task, while the
+    /// payload is stuck in a PTY that is not reading — keeps the payload record
+    /// and reports the pane, exactly as an `Ambiguous` write it could not
+    /// account for would. Before, the record and the notice were made only
+    /// when the future ran to the end, and these bytes went in later with
+    /// neither.
+    #[tokio::test]
+    async fn a_guarded_delivery_dropped_mid_write_keeps_its_record_and_reports_the_pane() {
+        const PANE: &str = "issue-525-dropped-pane";
+        const TEXT: &str = "Read .dot-agent-deck/worker-task-coder.md for your task.";
+        let (registry, agent, gate, log, notices, _displaced) = gated_pane(PANE, false).await;
+        let writer = registry.agent_writer(&agent).unwrap();
+
+        let delivery = {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_and_submit_guarded(PANE, TEXT, &agent, || async { true })
+                    .await
+            })
+        };
+        until_a_pty_job_is_in_flight(&writer).await;
+        delivery.abort();
+        assert!(delivery.await.unwrap_err().is_cancelled());
+
+        registry.note_user_input(PANE);
+        assert!(
+            registry.user_typed_since_writing_payload(PANE, TEXT),
+            "the dropped delivery's payload record is kept"
+        );
+        assert_eq!(
+            notices
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|n| n.pane_id.clone())
+                .collect::<Vec<_>>(),
+            vec![PANE.to_string()],
+            "the pane is told its box may hold a partial prompt"
+        );
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            writer.lock().await.until_idle().await
+        })
+        .await
+        .expect("the dropped write finishes once the PTY takes it");
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            encode_pane_payload(TEXT).unwrap().as_slice(),
+            "the payload went in and nothing after it"
         );
     }
 

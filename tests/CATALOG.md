@@ -1610,6 +1610,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start, or one whose earlier request's response was lost — neither binds from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`), and both are still abandoned at the deadline (#1520); event-stream resynchronization after a reconnect, which this does not add; the wire field in isolation (`prompt/pane-input/009`); the spawned binary (`prompt/pane-input/044`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/046 — A send into a pane that stopped reading comes back as possibly delivered instead of hanging, and does not hold up other panes (issue #525).
+- **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; no LLM).
+- **Agent:** none — a `sh` that puts its terminal in raw mode with echo off and then `sleep`s without reading, and a plain `cat`.
+- **Asserts:** an identified `WriteAndSubmit` of a 200 KB line into the stuck pane returns `ambiguous` within 30 s rather than never; a send to the `cat` pane made while that one is pending returns `applied` within 8 s and its text reaches the pane; and the dashboard shows `Error` once the stuck send is reported. Before #525 the stuck send never came back, because its `write(2)` blocked the daemon's runtime worker until the pane read.
+- **Does not assert:** which card carries the `Error` (the grid is searched as a whole); the exact stall bound; a real agent that stops reading (no agent can be made to on demand); the unit-level accounting of a stalled write (`a_stalled_guarded_write_is_ambiguous_and_later_writes_add_nothing_behind_it` and the other issue #525 tests in `src/agent_pty.rs`).
+- **Platform coverage:** linux (the stuck-pane shape needs a kernel that blocks the master's writer on a full raw-mode input queue, which the macOS runner's did not).
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
