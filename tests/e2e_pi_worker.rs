@@ -185,10 +185,14 @@ fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
     // `get-seed` pull — making the `seed_delivered_native` assertion a clean
     // native-vs-fallback discriminator (the fallback can't race in and win).
     //
-    // SAFETY: set here, at the very top of the sync test entry point — BEFORE the
-    // tokio runtime (and therefore any daemon worker thread) is created below —
-    // so no concurrent `getenv` can race this `setenv`. nextest runs each test in
-    // its own process, so this never leaks to another test.
+    // SAFETY: a stated residual, not a proof (issue #1516). Set at the top of
+    // the sync test entry point, before the tokio runtime (and so any daemon
+    // worker thread) is created below, and never written again. The threads
+    // that exist here: this test's own and libtest's runner thread, which waits
+    // for it. The availability check above only runs `pi --version` to
+    // completion and allocates no harness temp dir, so the `load-context`
+    // heartbeat has not started. nextest runs each test in its own process, so
+    // this never leaks to another test.
     unsafe {
         std::env::set_var(
             dot_agent_deck::agent_pty::DOT_AGENT_DECK_SEED_FALLBACK_SECS,

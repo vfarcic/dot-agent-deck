@@ -646,7 +646,9 @@ pub(crate) fn no_signal_readiness_buffer() -> std::time::Duration {
 /// is a setting, and it means zero (the e2e harness and the toggle test's control
 /// arm both rely on that).
 fn explicit_delegate_readiness_buffer() -> Option<std::time::Duration> {
-    let raw = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS).ok()?;
+    // Issue #1516: through `env_override`, so a test can change the buffer
+    // between two delegates without writing the environment under live workers.
+    let raw = crate::env_override::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS)?;
     parse_bounded_ms_override(
         DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS,
         &raw,
@@ -2097,8 +2099,9 @@ fn worker_response_timeout_in(
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
-    if let Some(ms) = std::env::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
-        .ok()
+    // Issue #1516: through `env_override`, for the same reason as
+    // `explicit_delegate_readiness_buffer`.
+    if let Some(ms) = crate::env_override::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         if ms == 0 {
@@ -4586,7 +4589,9 @@ fn delegate_no_event_window(
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
-    if let Ok(raw) = std::env::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS)
+    // Issue #1516: through `env_override`, for the same reason as
+    // `explicit_delegate_readiness_buffer`.
+    if let Some(raw) = crate::env_override::var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS)
         && let Some(window) = parse_bounded_ms_override(
             DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS,
             &raw,

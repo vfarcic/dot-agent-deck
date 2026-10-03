@@ -1298,7 +1298,9 @@ const SESSION_START_WAIT_MIN: Duration = Duration::from_millis(100);
 /// falls back to the default (also with a `warn!`).
 fn session_start_wait_timeout() -> Duration {
     let default = crate::state::SESSION_START_WAIT_TIMEOUT;
-    let Ok(raw) = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS") else {
+    // Issue #1516: through `env_override`, so `scheduler/dispatch/025` can
+    // shorten it without writing the environment inside its runtime.
+    let Some(raw) = crate::env_override::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS") else {
         return default;
     };
     let Ok(ms) = raw.trim().parse::<u64>() else {
@@ -6207,10 +6209,14 @@ mod tests {
         type_user_draft(&registry, &agent_id, PANE_ID, DRAFT, 0).await;
         let (event_tx, event_rx) = broadcast::channel(16);
 
-        let previous_wait = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
-        // SAFETY: nextest runs this test in its own process. The previous value
-        // is restored after the delivery task passes its readiness wait.
-        unsafe { std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", "100") };
+        // Issue #1516: an `env_override`, not `set_var`. This body runs inside
+        // the test's runtime, with this pane's PTY reader thread alive, and a
+        // `set_var` here would race every thread reading the environment. The
+        // override is dropped after the delivery task passes its readiness wait.
+        let session_start_wait = crate::env_override::override_for_tests(
+            "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
+            Some("100"),
+        );
         run_delivery_with_deadline(
             &registry,
             PANE_ID.to_string(),
@@ -6222,12 +6228,7 @@ mod tests {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(350)).await;
-        unsafe {
-            match previous_wait {
-                Some(value) => std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", value),
-                None => std::env::remove_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS"),
-            }
-        }
+        drop(session_start_wait);
         let before_start = registry.snapshot(&agent_id).expect("seed target snapshot");
         assert_eq!(
             payload_echoes(&before_start, SEED),

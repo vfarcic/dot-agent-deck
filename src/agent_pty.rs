@@ -17859,7 +17859,8 @@ mod spawn_tests {
         let expected =
             crate::platform::paths::executable_path().expect("the test binary has a usable path");
         let prior = std::env::var(key).ok();
-        // SAFETY: serialized by ENV_TEST_LOCK and restored before asserting.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. Restored
+        // before asserting.
         unsafe {
             std::env::set_var(key, "/an/enclosing/deck/dot-agent-deck");
         }
@@ -17912,6 +17913,16 @@ mod spawn_tests {
     /// Test mutex covering temporary process-env mutation. `std::env::set_var`
     /// is process-global, so any test that pokes at the environment must run
     /// serialized to avoid leaking the value into a sibling test's spawn.
+    ///
+    /// **What it does not cover** (issue #1516). `set_var` / `remove_var` also
+    /// race any *thread* reading the environment at that moment, and this lock
+    /// excludes sibling tests, not threads. The tests that write under it build
+    /// no runtime and start no thread: [`spawn`] forks the child and starts no
+    /// reader, and the child's own environment is fixed at exec. So under
+    /// nextest the threads that exist at each write are the test's own and
+    /// libtest's runner thread, which waits for it. Under plain `cargo test`
+    /// every other test of this binary shares the process, and one that takes no
+    /// lock and reads the environment races these writes (issue #245).
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -17923,9 +17934,9 @@ mod spawn_tests {
         // `dot-agent-deck` would itself try to act as a stream client).
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: tests in this module are serialized by ENV_TEST_LOCK and
-        // we restore the prior value before releasing the lock, so the
-        // process-global env mutation is invisible to other tests.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released, so other tests
+        // that take the lock never see this one.
         let prior = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
@@ -17965,8 +17976,8 @@ mod spawn_tests {
         // pane (so hooks would route events to the wrong tab).
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
@@ -18009,8 +18020,8 @@ mod spawn_tests {
         // `SessionStart` and drew a card for it on the real dashboard.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
@@ -18049,8 +18060,8 @@ mod spawn_tests {
         // fixing the leak above would break every legitimate producer.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
@@ -18091,8 +18102,8 @@ mod spawn_tests {
         // happens to carry a stale one.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");

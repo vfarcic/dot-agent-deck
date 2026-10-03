@@ -30,6 +30,8 @@ use tokio::sync::broadcast;
 use dot_agent_deck::agent_pty::{
     AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, GuardedSend, SpawnOptions, TabMembership,
 };
+#[cfg(unix)]
+use dot_agent_deck::env_override;
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
 };
@@ -86,6 +88,22 @@ const OBSERVED_READINESS_DELIVERY_CEILING: Duration = Duration::from_secs(10);
 
 /// Serializes process-environment changes when this integration-test binary is
 /// run through plain `cargo test`; nextest already gives each test a process.
+///
+/// **What the lock does not cover** (issue #1516). `set_var` / `remove_var` race
+/// any *thread* reading the environment at that moment, and this lock excludes
+/// sibling tests, not threads. So [`EnvGuard`] writes only while no Tokio
+/// runtime exists, and refuses otherwise (`common::env_write`): every test sets
+/// its guards before building its runtime and drops them after the runtime has
+/// dropped, which joins the runtime's threads. A test that changes a knob
+/// between two delegates does it through `dot_agent_deck::env_override`, which
+/// is behind a lock of its own. At a guard's write, the threads that can exist
+/// are the test's own, libtest's runner thread waiting for it, and the harness's
+/// `load-context` heartbeat once a harness temp dir exists, which sleeps and
+/// reads `/proc`, never the environment. When a guard drops, the detached PTY
+/// reader of an agent whose PTY has not reached EOF can still be running
+/// (`agent_pty::pump_reader`); it reads its PTY and updates the registry, and
+/// reads no environment variable. Under plain `cargo test` a sibling test that
+/// takes no lock and reads the environment races these writes (issue #245).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
@@ -94,11 +112,12 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set(values: &[(&'static str, &str)]) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let mut previous = Vec::with_capacity(values.len());
         for (key, value) in values {
             previous.push((*key, std::env::var_os(key)));
-            // SAFETY: every env-mutating test in this integration-test binary
-            // holds ENV_LOCK for the guard's full lifetime.
+            // SAFETY: a stated residual — see `ENV_LOCK` for the threads that
+            // exist here. The caller holds that lock for the guard's lifetime.
             unsafe { std::env::set_var(key, value) };
         }
         Self { previous }
@@ -116,29 +135,25 @@ impl EnvGuard {
     /// skip the caller is measuring.
     #[cfg(unix)]
     fn unset(keys: &[&'static str]) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::unset");
         let mut previous = Vec::with_capacity(keys.len());
         for key in keys {
             previous.push((*key, std::env::var_os(key)));
-            // SAFETY: the caller holds ENV_LOCK for the guard's full lifetime.
+            // SAFETY: as in `EnvGuard::set`.
             unsafe { std::env::remove_var(key) };
         }
         Self { previous }
-    }
-
-    fn repoint(&self, key: &'static str, value: &str) {
-        assert!(
-            self.previous.iter().any(|(saved, _)| *saved == key),
-            "cannot repoint an environment key this guard does not own: {key}"
-        );
-        // SAFETY: the caller still holds ENV_LOCK while this guard is alive.
-        unsafe { std::env::set_var(key, value) };
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvGuard::drop");
+        }
         for (key, previous) in self.previous.drain(..).rev() {
-            // SAFETY: the caller still holds ENV_LOCK while this guard drops.
+            // SAFETY: as in `EnvGuard::set`, and the caller still holds
+            // ENV_LOCK. `ENV_LOCK` names what can still run at a drop.
             unsafe {
                 match previous {
                     Some(value) => std::env::set_var(key, value),
@@ -1197,7 +1212,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
 #[cfg(unix)]
 fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (
             DELEGATE_READINESS_BUFFER_ENV,
             &DELEGATE_READINESS_BUFFER_MS.to_string(),
@@ -1212,11 +1227,15 @@ fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer() {
         .expect("build timeout-fallback readiness runtime")
         .block_on(async {
             delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1");
+            // Issue #1516: the later arms change the buffer through
+            // `env_override`, not the environment. Each value still goes through
+            // the deck's own parser, so " 1 \t" and the overflow arm test what
+            // they did; the first arm above is the one that reads the variable.
+            let buffer = env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1"));
             delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, " 1 \t");
+            buffer.repoint(Some(" 1 \t"));
             delegate_011_one_millisecond_buffer_is_a_real_wait_inner().await;
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "18446744073709551616");
+            buffer.repoint(Some("18446744073709551616"));
             delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner().await;
         });
 }
@@ -1435,7 +1454,7 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
 #[cfg(unix)]
 fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -1454,9 +1473,11 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
                 String::from_utf8_lossy(&zero.snapshot)
             );
 
-            env.repoint(
+            // Issue #1516: through `env_override`, because the zero arm's daemon
+            // tasks are still on this runtime's workers.
+            let _buffer = env_override::override_for_tests(
                 DELEGATE_READINESS_BUFFER_ENV,
-                &DELEGATE_READINESS_BUFFER_MS.to_string(),
+                Some(&DELEGATE_READINESS_BUFFER_MS.to_string()),
             );
             let buffered = run_slow_readiness_delegate(DELEGATE_READINESS_BUFFER_MS).await;
             eprintln!(
@@ -2375,21 +2396,7 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let wait_ms = REPRICE_FIXTURE_WAIT_MS.to_string();
     let buffer_ms = REPRICE_FIXTURE_BUFFER_MS.to_string();
-    let _env = EnvGuard::set(&[
-        (SESSION_START_WAIT_ENV, &wait_ms),
-        (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
-    ]);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("build re-pricing readiness runtime")
-        .block_on(spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner());
-}
-
-#[cfg(unix)]
-async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner() {
-    let daemon = common::spawn_inprocess_daemon().await;
+    common::init_test_env();
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create wrapped-agent bin dir");
@@ -2406,11 +2413,30 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
     );
     // The spawn primitive gives a scheduled pane no per-spawn environment of its
     // own beyond its pane id, so the child finds the stand-in (and the wrapper
-    // finds the built deck) through THIS process's `PATH`. The ENV_LOCK the
-    // caller holds covers it.
+    // finds the built deck) through THIS process's `PATH`. Set here, before the
+    // runtime and the in-process daemon exist (issue #1516); it used to be set
+    // inside the runtime, after the daemon's tasks had started.
     let path = path_with_built_deck(&bin_dir);
-    let _path = EnvGuard::set(&[("PATH", &path)]);
+    let _env = EnvGuard::set(&[
+        (SESSION_START_WAIT_ENV, &wait_ms),
+        (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
+        ("PATH", &path),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build re-pricing readiness runtime")
+        .block_on(
+            spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner(&cwd),
+        );
+}
 
+#[cfg(unix)]
+async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_inner(
+    cwd: &tempfile::TempDir,
+) {
+    let daemon = common::spawn_inprocess_daemon().await;
     let collector = EventCollector::start(&daemon.event_tx);
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
@@ -2739,11 +2765,17 @@ impl dot_agent_deck::scheduler::Notifier for SpawnTestNotifier {
 #[cfg(unix)]
 fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("build raw-input readiness runtime");
+    // One runtime per arm, built after that arm's guards and dropped before
+    // them (issue #1516): a runtime shared by both arms would still hold arm 1's
+    // threads, and any of its tasks still running, while arm 2's guard writes
+    // the environment.
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("build raw-input readiness runtime")
+    };
     let script = raw_input_agent_script();
 
     {
@@ -2758,7 +2790,7 @@ fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
         let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
-        runtime.block_on(delegate_027_raw_input_fact_pays_the_interface_buffer_inner(
+        runtime().block_on(delegate_027_raw_input_fact_pays_the_interface_buffer_inner(
             &script,
         ));
     }
@@ -2774,7 +2806,7 @@ fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
             (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
-        runtime.block_on(
+        runtime().block_on(
             delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner(&script),
         );
     }
@@ -3878,7 +3910,7 @@ fn write_generation_sentinel_worker(path: &std::path::Path, generation_marker: &
 #[cfg(unix)]
 fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -3997,7 +4029,10 @@ fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
                 String::from_utf8_lossy(&generation_a_delivered)
             );
 
-            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1400");
+            // Issue #1516: through `env_override`, because generation A's tasks
+            // are still alive on this runtime's workers.
+            let _buffer =
+                env_override::override_for_tests(DELEGATE_READINESS_BUFFER_ENV, Some("1400"));
             state
                 .handle_delegate(
                     DelegateSignal {
@@ -5451,7 +5486,7 @@ fn delegate_startup_idle_does_not_suppress_silence_notice() {
 #[cfg(unix)]
 fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(&[
+    let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
@@ -5462,8 +5497,13 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
         .build()
         .expect("build no-event parser runtime")
         .block_on(async {
+            // Issue #1516: each value goes through `env_override`, not the
+            // environment: an earlier harness's tasks and PTY reader threads
+            // are still alive when the next value is set. The deck's own parser
+            // reads it either way, which is what this test is about.
+            let window = env_override::override_for_tests(DELEGATE_NO_EVENT_WINDOW_ENV, None);
             for raw in ["1", " 1 \t"] {
-                env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, raw);
+                window.repoint(Some(raw));
                 let harness = SilenceHarness::new(64).await;
                 harness.delegate_and_wait_for_pointer().await;
                 let notice = wait_for_silence_notice(
@@ -5479,7 +5519,7 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
                 );
             }
 
-            env.repoint(DELEGATE_NO_EVENT_WINDOW_ENV, "18446744073709551616");
+            window.repoint(Some("18446744073709551616"));
             let harness = SilenceHarness::new(64).await;
             harness.delegate_and_wait_for_pointer().await;
             tokio::time::pause();

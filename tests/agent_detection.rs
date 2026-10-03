@@ -30,8 +30,9 @@ const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// file stays empty forever. That is precisely how `codex/spawn/005` and
 /// `codex/spawn/006` failed on CI while passing locally under nextest (PRD
 /// #225). Holding the lock across the whole set-env → spawn → observe window
-/// makes the override honest under both runners, and is also what makes the
-/// `set_var` calls sound: no sibling test is running while it is held.
+/// makes the override honest under both runners. It excludes sibling tests, and
+/// only sibling tests: it does not make the `set_var` calls sound on its own
+/// (issue #1516), which is what the SAFETY comments below are about.
 #[cfg(unix)]
 static WRAP_BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -49,11 +50,17 @@ impl WrapBinOverride {
         let exclusive = WRAP_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Issue #668: every spawning test in this file goes through this
         // constructor, so this is the file's single arming point for the
-        // wrapped-child lifetime bound. Under the exclusion guard, which is
-        // also what makes its `set_var` sound.
+        // wrapped-child lifetime bound.
         common::init_test_env();
-        // SAFETY: the guard above excludes every other test in this binary, so
-        // nothing else reads or writes the environment while this runs.
+        common::env_write::assert_no_tokio_runtime("WrapBinOverride::pointing_at");
+        // SAFETY: a stated residual, not a proof (issue #1516). Every caller
+        // takes this guard before it builds a runtime or spawns an agent, which
+        // the assertion above checks for the runtime half. The threads that can
+        // exist: this test's own, libtest's runner thread waiting for it, and
+        // the harness's `load-context` heartbeat once a harness temp dir exists,
+        // which sleeps and reads `/proc`, never the environment. The guard
+        // above keeps the sibling tests of this binary out under plain
+        // `cargo test`.
         unsafe {
             std::env::set_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN, recorder);
         }
@@ -66,8 +73,17 @@ impl WrapBinOverride {
 #[cfg(unix)]
 impl Drop for WrapBinOverride {
     fn drop(&mut self) {
-        // Leave no override pointing at a deleted fixture. SAFETY: as above —
-        // the exclusion guard is still held.
+        // Leave no override pointing at a deleted fixture.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("WrapBinOverride::drop");
+        }
+        // SAFETY: as in `pointing_at`, and the exclusion guard is still held.
+        // The guard is declared before any runtime in its test, so the runtime
+        // has already dropped and joined its threads. What can still be running
+        // besides the threads named there is the detached PTY reader of an
+        // agent whose PTY has not reached EOF (`agent_pty::pump_reader`), which
+        // reads its PTY and updates the registry, and reads no environment
+        // variable.
         unsafe {
             std::env::remove_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN);
         }

@@ -39,6 +39,7 @@ use dot_agent_deck::agent_pty::{
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
+use dot_agent_deck::env_override;
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
 use dot_agent_deck::state::{
     AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
@@ -187,6 +188,23 @@ enum OrchestratorStub {
 
 /// Serializes process-environment changes when these tests are run with plain
 /// `cargo test`; nextest already runs each test in its own process.
+///
+/// **What the lock does not cover** (issue #1516). `set_var` / `remove_var` race
+/// any *thread* reading the environment at that moment, and this lock excludes
+/// sibling tests, not threads. So [`EnvGuard`] and [`DebounceEnvGuard`] write
+/// only while no Tokio runtime exists, and refuse otherwise
+/// (`common::env_write`): every test sets them before building its runtime and
+/// drops them after the runtime has dropped, which joins the runtime's threads.
+/// `scheduler/idle-worker/003`, which changes the timeout between delegates on
+/// one running harness, does it through `dot_agent_deck::env_override`. At a
+/// guard's write, the threads that can exist are the test's own, libtest's
+/// runner thread waiting for it, and the harness's `load-context` heartbeat once
+/// a harness temp dir exists, which sleeps and reads `/proc`, never the
+/// environment. When a guard drops, the detached PTY reader of an agent whose
+/// PTY has not reached EOF can still be running (`agent_pty::pump_reader`); it
+/// reads its PTY and updates the registry, and reads no environment variable.
+/// Under plain `cargo test` a sibling test that takes no lock and reads the
+/// environment races these writes (issue #245).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
@@ -195,9 +213,10 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set(value: Option<&str>) -> Self {
+        common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let previous = std::env::var(TIMEOUT_ENV).ok();
-        // SAFETY: every test in this integration-test binary holds ENV_LOCK for
-        // the guard's full lifetime, so this environment mutation is serialized.
+        // SAFETY: a stated residual — see `ENV_LOCK` for the threads that exist
+        // here. The caller holds that lock for the guard's lifetime.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -207,12 +226,12 @@ impl EnvGuard {
         Self { previous }
     }
 
-    /// Re-point the seam mid-test. Used by `003`, whose whole contract is that
-    /// the SAME harness and cwd behave differently for `0` and a positive
-    /// value — the timeout is resolved per delegate, so flipping it between
-    /// delegates is the decisive comparison.
+    /// Re-point the seam mid-test, between calls to the resolver. Used by
+    /// `007`, which runs no runtime. `003` flips the timeout between delegates
+    /// on a running harness, so it uses `env_override` instead (issue #1516).
     fn repoint(&self, value: Option<&str>) {
-        // SAFETY: the caller still holds ENV_LOCK.
+        common::env_write::assert_no_tokio_runtime("EnvGuard::repoint");
+        // SAFETY: as in `EnvGuard::set`.
         unsafe {
             match value {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -224,7 +243,11 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: the caller still holds ENV_LOCK while this guard is dropped.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvGuard::drop");
+        }
+        // SAFETY: as in `EnvGuard::set`, and the caller still holds ENV_LOCK.
+        // `ENV_LOCK` names what can still run at a drop.
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(TIMEOUT_ENV, value),
@@ -795,7 +818,7 @@ fn idle_worker_002_work_done_cancels_idle_prompt() {
 #[test]
 fn idle_worker_003_zero_disables_the_detector_from_either_source() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let env = EnvGuard::set(Some("500"));
+    let _env = EnvGuard::set(Some("500"));
     runtime().block_on(async {
         let harness = IdleHarness::with_workers(
             &[
@@ -821,7 +844,10 @@ fn idle_worker_003_zero_disables_the_detector_from_either_source() {
 
         // Same harness, same cwd, same worker shape — only the seam changes.
         // A prompt here would therefore be attributable to nothing but the 0.
-        env.repoint(Some("0"));
+        // Through `env_override` rather than the environment (issue #1516): the
+        // positive control's tasks are still on this runtime's workers. The
+        // value goes through the resolver's own parse either way.
+        let timeout = env_override::override_for_tests(TIMEOUT_ENV, Some("0"));
         harness.delegate(&["env-zero-worker"]).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let after_env_zero = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
@@ -831,8 +857,9 @@ fn idle_worker_003_zero_disables_the_detector_from_either_source() {
              not fire immediately; snapshot = {after_env_zero:?}"
         );
 
-        // Seam unset: resolution now reads the config's own 0.
-        env.repoint(None);
+        // Seam unset: resolution now reads the config's own 0. A `None`
+        // override reads as unset whatever the environment holds.
+        timeout.repoint(None);
         harness.delegate(&["file-zero-worker"]).await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let after_file_zero = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
@@ -1694,8 +1721,9 @@ struct DebounceEnvGuard {
 
 impl DebounceEnvGuard {
     fn set(value: &str) -> Self {
+        common::env_write::assert_no_tokio_runtime("DebounceEnvGuard::set");
         let previous = std::env::var(WAITING_DEBOUNCE_ENV).ok();
-        // SAFETY: the caller holds ENV_LOCK, serializing environment mutation.
+        // SAFETY: as in `EnvGuard::set`; the caller holds ENV_LOCK.
         unsafe { std::env::set_var(WAITING_DEBOUNCE_ENV, value) };
         Self { previous }
     }
@@ -1703,7 +1731,10 @@ impl DebounceEnvGuard {
 
 impl Drop for DebounceEnvGuard {
     fn drop(&mut self) {
-        // SAFETY: the caller still holds ENV_LOCK while this guard is dropped.
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("DebounceEnvGuard::drop");
+        }
+        // SAFETY: as in `EnvGuard::drop`.
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(WAITING_DEBOUNCE_ENV, value),
