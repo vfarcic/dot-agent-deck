@@ -214,6 +214,13 @@ export interface ConnectionView {
    */
   clientBuildVersion?: string;
   daemonBuildVersion?: string;
+  /**
+   * PRD #1487 D8 — whether to offer **Upgrade** for this deck, worked out by
+   * the desktop crate from the daemon's version (`daemon_upgrade::upgrade_offer`)
+   * so nothing here compares versions. Read it through `upgradeOffered`.
+   * Absent in fixture scenarios that do not play an older daemon.
+   */
+  upgradeOffer?: import("./lib/upgrade").UpgradeOffer;
 }
 
 /**
@@ -863,7 +870,6 @@ export type DeckAction =
   | { type: "advance_fixture" }
   | { type: "start_daemon" }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "restart_daemon" }
   /**
    * Connect anyway (issue #801). `deckId` names the deck whose refusal the
    * user pressed it on (issue #1472); the crate connects to THAT deck and
@@ -1168,6 +1174,19 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /**
+   * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
+   * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the
+   * stages and the live-agent question for THIS run; the promise resolves with
+   * the outcome (including "kept running" and "failed while …", which are
+   * answers, not errors) and rejects only when the upgrade could not start.
+   *
+   * Optional, and absence is a real state: a render-only test runtime offers
+   * no upgrade rather than a button that does nothing.
+   */
+  upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
+  /** Answer the restart question `upgradeId` is waiting on. */
+  decideUpgrade?: (upgradeId: string, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /**
    * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
    * returned, per agent id. An agent with no entry has nothing unresolved.

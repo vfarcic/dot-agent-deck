@@ -1,0 +1,135 @@
+import { describe, expect, it } from "vitest";
+
+import type { ConnectionView } from "../types";
+import { incompatibleRemedy } from "./connectionRemedy";
+import { outcomeView, stageLabel, stopSetCount, stopSetLines, upgradeOffered, type UpgradeOffer, type UpgradeOutcome, type UpgradeStopSet } from "./upgrade";
+
+const AT_STAKE: UpgradeStopSet = {
+  agents: [
+    { id: "1", label: "coder", paneId: "4", cwd: "/work/app" },
+    { id: "2", label: "scratch" },
+  ],
+  roles: [{ paneId: "3", role: "orchestrator", orchestration: "tdd", isOrchestrator: true }],
+};
+
+const connection = (deckKind: "local" | "remote", upgradeOffer?: UpgradeOffer): ConnectionView => ({
+  status: "connected",
+  socketPath: "dev@build-box",
+  deckKind,
+  ...(upgradeOffer ? { upgradeOffer } : {}),
+});
+
+describe("upgradeOffered (PRD #1487 D8)", () => {
+  /**
+   * The visibility table. The crate decides older/current/newer/unknown; the
+   * webview only reads its answer, and offers Upgrade for exactly one cell.
+   */
+  it.each([
+    ["remote", { kind: "offered", from: "0.44.0", to: "0.45.0" }, true],
+    ["remote", { kind: "current" }, false],
+    ["remote", { kind: "daemon-newer", daemon: "0.46.0" }, false],
+    ["remote", { kind: "unknown" }, false],
+    ["remote", undefined, false],
+    // The local deck's remedy is Replace daemon, never Upgrade.
+    ["local", { kind: "offered", from: "0.44.0", to: "0.45.0" }, false],
+  ] as const)("a %s deck with offer %j is offered: %s", (deckKind, offer, offered) => {
+    expect(upgradeOffered(connection(deckKind, offer))).toBe(offered);
+  });
+});
+
+describe("the restart question's list", () => {
+  it("names every agent and every orchestration role", () => {
+    expect(stopSetLines(AT_STAKE)).toEqual([
+      "Agent coder (pane 4, in /work/app)",
+      "Agent scratch",
+      "Role orchestrator of tdd, pane 3 (the orchestrator)",
+    ]);
+    expect(stopSetCount(AT_STAKE)).toBe("2 agents and 1 orchestration role");
+    expect(stopSetCount({ agents: [AT_STAKE.agents[0]], roles: [] })).toBe("1 agent");
+  });
+});
+
+describe("stage labels", () => {
+  it("say installing for an upgrade and preparing for a Replace", () => {
+    expect(stageLabel("installing", "upgrade")).toBe("Installing the new version");
+    expect(stageLabel("installing", "replace")).toBe("Preparing this app's daemon");
+    expect(stageLabel("restarting", "upgrade")).toBe("Restarting the daemon");
+    expect(stageLabel("verifying", "replace")).toBe("Checking the new daemon answers");
+  });
+});
+
+describe("outcomeView (CLAUDE.md rule 21)", () => {
+  const outcomes: [string, UpgradeOutcome][] = [
+    ["restarted, idle", { outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: { agents: [], roles: [] } }],
+    ["restarted, stopping agents", { outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: AT_STAKE }],
+    ["kept by the user", { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } }],
+    ["no one to ask", { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "no-one-to-ask", atStake: AT_STAKE } }],
+    ["stale confirmation", { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "stale-confirmation", atStake: AT_STAKE } }],
+    ["another restart running", { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "another-restart-in-progress" } }],
+    ["no daemon running", { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } }],
+    ["daemon too old", { outcome: "installed-daemon-too-old", installedVersion: "0.45.0", daemonVersion: "0.30.0", remedy: "Connect with `dot-agent-deck connect build-box` and accept its restart prompt." }],
+    ["failed installing", { outcome: "failed", stage: "installing", reason: "ssh: connection timed out" }],
+    ["failed restarting", { outcome: "failed", stage: "restarting", reason: "the installed build did not answer", installedVersion: "0.45.0" }],
+    ["failed verifying", { outcome: "failed", stage: "verifying", reason: "the new daemon did not answer within 20s", installedVersion: "0.45.0" }],
+  ];
+
+  it.each(outcomes)("%s renders a title and at least one sentence, with no internals", (_name, outcome) => {
+    for (const kind of ["upgrade", "replace"] as const) {
+      const view = outcomeView(outcome, "build-box", kind);
+      expect(view.title.length).toBeGreaterThan(0);
+      expect(view.body.length).toBeGreaterThan(0);
+      expect(view.body.every((sentence) => sentence.trim().length > 0)).toBe(true);
+      expect(view.body.join(" ")).not.toMatch(/capability|protocol|RestartDaemon|NeedsConfirmation|ClientSpawns|stop set/i);
+    }
+  });
+
+  it("says what was stopped, and only when something was", () => {
+    const idle = outcomeView(outcomes[0][1], "build-box", "upgrade");
+    expect(idle.tone).toBe("success");
+    expect(idle.body.join(" ")).toContain("The daemon on build-box now runs 0.45.0 (it was 0.44.0).");
+    expect(idle.body.join(" ")).toContain("nothing was stopped");
+    expect(idle.list).toBeUndefined();
+    const busy = outcomeView(outcomes[1][1], "build-box", "upgrade");
+    expect(busy.list).toEqual(stopSetLines(AT_STAKE));
+  });
+
+  it("names what keeps running when the user kept the daemon, and how to finish later", () => {
+    const view = outcomeView(outcomes[2][1], "build-box", "upgrade");
+    expect(view.tone).toBe("neutral");
+    expect(view.body[0]).toBe("0.45.0 is installed on build-box. The daemon keeps running 0.44.0, as you chose, so these keep running:");
+    expect(view.list).toEqual(stopSetLines(AT_STAKE));
+    expect(view.body.join(" ")).toContain("Press Upgrade again");
+    expect(outcomeView(outcomes[2][1], "this machine", "replace").body.join(" ")).toContain("Press Replace daemon again");
+  });
+
+  it("carries the crate's remedy for a daemon too old to restart itself", () => {
+    const view = outcomeView(outcomes[7][1], "build-box", "upgrade");
+    expect(view.body[0]).toContain("the daemon running there (0.30.0) is too old to be restarted from this app");
+    expect(view.body[1]).toContain("dot-agent-deck connect build-box");
+  });
+
+  it("says which stage failed and what is still running", () => {
+    const installing = outcomeView(outcomes[8][1], "build-box", "upgrade");
+    expect(installing.tone).toBe("failure");
+    expect(installing.body).toEqual([
+      "It failed while installing the new version: ssh: connection timed out",
+      "Nothing was changed; the daemon that was running keeps running.",
+    ]);
+    expect(outcomeView(outcomes[9][1], "build-box", "upgrade").body[1]).toBe("0.45.0 is installed; the daemon that was running keeps running.");
+    expect(outcomeView(outcomes[10][1], "build-box", "upgrade").body[0]).toBe("It failed while checking the restarted daemon: the new daemon did not answer within 20s");
+  });
+});
+
+describe("incompatibleRemedy (PRD #1487 D9, D10)", () => {
+  it("names Upgrade beside Connect anyway", () => {
+    const text = incompatibleRemedy(connection("remote"), { upgrade: true, connectAnyway: true, reconnect: true });
+    expect(text).toMatch(/^Upgrade installs this app's version on that machine and restarts its daemon onto it; if agents are running there, you are asked before any is stopped\. Connect anyway uses /);
+  });
+
+  it("no longer withholds Replace daemon for running agents; it says it will ask", () => {
+    const busy = { ...connection("local"), runningAgentCount: 3 };
+    expect(incompatibleRemedy(busy, { replaceDaemon: true })).toBe("Replace daemon stops this daemon and starts the one that came with this app; 3 agents are running on it, and you are shown which before any is stopped.");
+    expect(incompatibleRemedy({ ...busy, runningAgentCount: 0 }, { replaceDaemon: true })).toBe("Replace daemon stops this daemon and starts the one that came with this app.");
+    expect(incompatibleRemedy(busy, { replaceDaemon: true })).not.toMatch(/not offered/);
+  });
+});

@@ -1063,12 +1063,17 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         server_protocol_version: handshake.server_protocol_version,
         client_build_version: dot_agent_deck::build_id::local_build_id(),
         daemon_build_version: handshake.daemon_build_version,
-        daemon_version: handshake.daemon_version,
         running_agent_count: handshake.running_agent_count,
         build_stamp_mismatch_only: handshake.build_stamp_mismatch_only,
         project_actions_reason: handshake.project_actions_reason,
         new_agent_reason: handshake.new_agent_reason,
         listing_options: handshake.listing_options,
+        // PRD #1487 D8: computed here, from the version the daemon reported,
+        // so no client compares versions on its own.
+        upgrade_offer: dot_agent_deck::daemon_upgrade::upgrade_offer(
+            handshake.daemon_version.as_deref(),
+        ),
+        daemon_version: handshake.daemon_version,
     }
 }
 
@@ -1555,6 +1560,23 @@ fn resolve_daemon_executable() -> Result<PathBuf, String> {
     )
 }
 
+/// Start this app's own daemon build, detached, under `state_dir` — the
+/// process half of [`bootstrap`]'s lazy-spawn.
+fn spawn_daemon_with_state_dir(state_dir: &Path) -> io::Result<()> {
+    let executable = resolve_daemon_executable()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    spawn_daemon_serve_detached_with_exe(state_dir, &executable).map(|_| ())
+}
+
+/// PRD #1487 M5: the local Replace daemon's successor — the same build and the
+/// same detached spawn [`bootstrap`] starts when nothing is answering. Called
+/// by `daemon_upgrade::WireDaemonPort` only once the old daemon has released
+/// the endpoint; it verifies the new one answers afterwards.
+pub(crate) fn spawn_local_daemon() -> Result<(), String> {
+    spawn_daemon_with_state_dir(&dot_agent_deck::config::state_dir())
+        .map_err(|error| safe_message(error.to_string()))
+}
+
 /// Snapshot the selected deck, and lazy-spawn a daemon for it if nothing is
 /// answering.
 ///
@@ -1588,11 +1610,7 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
     let start_result = ensure_daemon_running(
         local,
         &state_dir,
-        move || {
-            let executable = resolve_daemon_executable()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            spawn_daemon_serve_detached_with_exe(&state_dir_for_spawn, &executable).map(|_| ())
-        },
+        move || spawn_daemon_with_state_dir(&state_dir_for_spawn),
         DAEMON_POLL_INTERVAL,
         DAEMON_START_POLL_TIMEOUT,
     )
@@ -3245,6 +3263,47 @@ mod tests {
             .expect_err("nothing may be held after a failed establishment");
         assert!(err.contains("refusing to connect"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// PRD #1487 D8: every deck's connection carries the Upgrade offer, worked
+    /// out here from the version the daemon reported, so the webview never
+    /// compares versions. An older release is offered, the app's own release
+    /// is current, and a daemon that reported nothing offers nothing.
+    #[test]
+    fn the_connection_carries_the_upgrade_offer_from_the_handshake() {
+        use dot_agent_deck::daemon_upgrade::{CLIENT_VERSION, UpgradeOffer};
+        let offer = |daemon_version: Option<&str>| {
+            let connection = connection_from_handshake(
+                &Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock")),
+                HandshakeInfo {
+                    status: ConnectionStatus::Connected,
+                    error: None,
+                    error_detail: None,
+                    server_protocol_version: Some(PROTOCOL_VERSION),
+                    daemon_build_version: None,
+                    daemon_version: daemon_version.map(str::to_string),
+                    running_agent_count: Some(0),
+                    build_stamp_mismatch_only: false,
+                    project_actions_reason: None,
+                    new_agent_reason: None,
+                    listing_options: false,
+                },
+            );
+            assert_eq!(connection.daemon_version.as_deref(), daemon_version);
+            serde_json::to_value(&connection).unwrap()["upgradeOffer"].clone()
+        };
+        assert_eq!(
+            offer(Some("0.0.1")),
+            serde_json::to_value(UpgradeOffer::Offered {
+                from: "0.0.1".into(),
+                to: CLIENT_VERSION.into(),
+            })
+            .unwrap()
+        );
+        assert_eq!(offer(Some("0.0.1"))["kind"], "offered");
+        assert_eq!(offer(Some(CLIENT_VERSION))["kind"], "current");
+        assert_eq!(offer(Some("999.0.0"))["kind"], "daemon-newer");
+        assert_eq!(offer(None)["kind"], "unknown");
     }
 
     /// The revalidation backstop, at the predicate rather than through a

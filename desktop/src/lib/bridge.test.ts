@@ -718,13 +718,38 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  it("sends restart_daemon through the live bridge", async () => {
+  /**
+   * PRD #1487 M5: Upgrade and Replace daemon are one command, scoped to the
+   * deck they were pressed on, and the restart answer goes back by the run's
+   * id. No `restart_daemon` action exists any more.
+   */
+  it("upgrades a daemon through desktop_upgrade_daemon and answers the question with desktop_upgrade_decide", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
+    const outcome = { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } };
+    invoke.mockImplementation(async (command: string) => {
+      if (command !== "desktop_upgrade_daemon") return undefined;
+      // Another deck's run on the same events must not reach this one's dialog.
+      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-other", upgradeId: "upgrade-9", progress: { stage: "installing" } } });
+      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", progress: { stage: "restarting" } } });
+      listeners.get("desktop://upgrade-decision")?.({ payload: { deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", atStake: { agents: [], roles: [] }, stale: false } });
+      return outcome;
+    });
+    const heard: unknown[] = [];
 
-    await bridge.runAction({ type: "restart_daemon" });
+    await expect(bridge.upgradeDaemon("deck-000000000000dec1", (event) => heard.push(event))).resolves.toEqual(outcome);
+    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_daemon", { deckId: "deck-000000000000dec1" });
+    expect(heard).toEqual([
+      { type: "progress", deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", progress: { stage: "restarting" } },
+      { type: "decision", deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", atStake: { agents: [], roles: [] }, stale: false },
+    ]);
+    // The run's listeners go with it.
+    expect(listeners.has("desktop://upgrade-progress")).toBe(false);
+    expect(listeners.has("desktop://upgrade-decision")).toBe(false);
 
-    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "restart_daemon" } });
+    await bridge.decideUpgrade("upgrade-3", "keep-current");
+    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_decide", { upgradeId: "upgrade-3", choice: "keep-current" });
+    expect(invoke).not.toHaveBeenCalledWith("desktop_run_action", expect.objectContaining({ action: expect.objectContaining({ type: "restart_daemon" }) }));
     await bridge.dispose();
   });
 

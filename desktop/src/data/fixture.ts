@@ -44,7 +44,18 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "upgrade" | "upgrade-error";
+
+/**
+ * PRD #1487 M5 — the versions the `upgrade` scenarios play: this app's, and the
+ * older one their remote daemons run. Live mode reads both from the crate
+ * (`daemon_upgrade::upgrade_offer`); the fixture only has to be consistent.
+ */
+export const FIXTURE_APP_VERSION = "0.45.0";
+export const FIXTURE_DAEMON_VERSION = "0.44.0";
+/** How long each fixture upgrade stage lasts — long enough to see, short enough for a browser test. */
+export const FIXTURE_UPGRADE_STEP_MS = 250;
+const FIXTURE_OLDER: { kind: "offered"; from: string; to: string } = { kind: "offered", from: FIXTURE_DAEMON_VERSION, to: FIXTURE_APP_VERSION };
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -886,6 +897,8 @@ function fleetDeck(
 export function createFixtureFleet(state: FixtureState = "connected"): DeckSnapshot[] {
   if (state === "docs-fleet") return docsFleet();
   if (state === "voice-pages") return voicePagesFleet(createFixtureSnapshot("crowded"));
+  if (state === "upgrade") return upgradeFleet();
+  if (state === "upgrade-error") return [upgradeIncompatibleDeck()];
   if (state !== "fleet") return [createFixtureSnapshot(state)];
   return [
     fleetDeck(
@@ -946,11 +959,61 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
   ];
 }
 
+/**
+ * PRD #1487 M5 — a remote deck whose daemon is older than this app AND across
+ * a compatibility break, so it is refused: the version-mismatch banner, with
+ * Upgrade beside Connect anyway. Nothing runs on it, so its upgrade restarts
+ * without asking.
+ */
+function upgradeIncompatibleDeck(): DeckSnapshot {
+  return fleetDeck(
+    FIXTURE_UNREACHABLE_DAEMON_ID,
+    {
+      status: "error",
+      deckId: FIXTURE_UNREACHABLE_DAEMON_ID,
+      socketPath: FIXTURE_UNREACHABLE_DAEMON_ID,
+      daemonDetected: true,
+      buildStampMismatchOnly: true,
+      runningAgentCount: 0,
+      message: "This daemon is older than this app, and a change between the two versions means it may be read wrongly.",
+      deckKind: "remote",
+      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      upgradeOffer: FIXTURE_OLDER,
+    },
+    [],
+    "/home/ci/code/dot-agent-deck",
+  );
+}
+
+/**
+ * PRD #1487 M5 — the Upgrade scenario: this machine's deck at the app's own
+ * version (nothing to offer), a connected remote deck on an older version with
+ * agents running (Upgrade asks before stopping them), and the refused remote
+ * deck above.
+ */
+function upgradeFleet(): DeckSnapshot[] {
+  return [
+    fleetDeck(
+      FIXTURE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local", upgradeOffer: { kind: "current" } },
+      agents,
+      "/home/dev/code/dot-agent-deck-gui",
+    ),
+    fleetDeck(
+      FIXTURE_REMOTE_DAEMON_ID,
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
+      remoteAgents,
+      "/home/dev/code/dot-agent-deck",
+    ),
+    upgradeIncompatibleDeck(),
+  ];
+}
+
 export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
   // `fleet` is a THREE-deck scenario and has no single snapshot, so a caller
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
-  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages") return createFixtureFleet(state)[0];
+  if (state === "fleet" || state === "docs-fleet" || state === "voice-pages" || state === "upgrade" || state === "upgrade-error") return createFixtureFleet(state)[0];
   const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
