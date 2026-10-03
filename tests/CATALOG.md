@@ -3475,7 +3475,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 ##### orchestration/delegate/042 — A task pointer swallowed by a silent worker's boot is retried into the same process (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real deck TUI, daemon, delegate CLI, and managed worker PTY; no model or credential).
-- **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path.
+- **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path. Enters raw mode with `TCSANOW` rather than `tty.setraw`'s flushing default, so a pointer that beats a slow start is not silently dropped before the scenario begins (see `orchestration/delegate/045`).
 - **Asserts:** the first pointer actually appears in the stand-in's discarded-byte log during boot; after its ready point a retry delivers the pointer, and a unique proof renders in the attached worker pane. The accepting PID equals the replacement worker's PID, the launch log contains only the initial spawn and the one `clear = true` replacement, and that replacement remains alive.
 - **Does not assert:** a real OpenCode boot distribution, model execution of the task file, or acknowledgement protocol details.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
@@ -3489,7 +3489,7 @@ without depending on the config struct API.
 
 ##### orchestration/delegate/044 — A visible composer gets submit-only retries (issues #1383 and #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
-- **Agent:** a Python stand-in declared as `opencode` that renders typed bytes but temporarily ignores Enter, with no hook events.
+- **Agent:** a Python stand-in declared as `opencode` that renders typed bytes but temporarily ignores Enter, with no hook events. Enters raw mode with `TCSANOW` rather than `tty.setraw`'s flushing default, so a pointer that beats a slow start is not silently dropped before the scenario begins (see `orchestration/delegate/045`).
 - **Asserts:** the worker eventually renders proof of accepting the task in its attached pane; its raw PTY log contains the task pointer exactly once after the complete retry schedule; the accepting PID is the same replacement worker and no further process launches.
 - **Does not assert:** a real agent's composer layout or model execution.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).

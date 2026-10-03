@@ -20,6 +20,7 @@ const WORKER: &str = r#"import os
 import select
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
@@ -27,7 +28,8 @@ with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 deadline = time.monotonic() + 3.5
 while time.monotonic() < deadline:
     readable, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
@@ -197,13 +199,15 @@ while True:
 const COMPOSER_WORKER: &str = r#"import os
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 first_submit = None
 while True:
