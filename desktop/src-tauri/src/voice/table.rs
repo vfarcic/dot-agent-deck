@@ -1374,6 +1374,12 @@ mod tests {
                 // voice is on (PR #1451 round 3, change 4).
                 ("next_page", "nextPage", vec!["deck", "overview"]),
                 ("previous_page", "previousPage", vec!["deck", "overview"]),
+                // Scrolling the agent dashboard, which no longer pages (issue
+                // #1492) — `overview`, plus `requires = ["new_agent_dialog_closed"]`.
+                ("scroll_down", "scrollDown", vec!["overview"]),
+                ("scroll_up", "scrollUp", vec!["overview"]),
+                ("scroll_to_top", "scrollToTop", vec!["overview"]),
+                ("scroll_to_bottom", "scrollToBottom", vec!["overview"]),
                 // The rest of the New agent form — `overview`, plus
                 // `requires = ["new_agent_form"]` (PRD #1223).
                 ("choose_mode", "chooseNewAgentMode", vec!["overview"]),
@@ -2410,6 +2416,11 @@ mod tests {
                 "open_new_agent",
                 "next_page",
                 "previous_page",
+                // Scrolling the dashboard (issue #1492): met by no dialog declared.
+                "scroll_down",
+                "scroll_up",
+                "scroll_to_top",
+                "scroll_to_bottom",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -3219,8 +3230,9 @@ mod tests {
     }
 
     /// PR #1451 round 3, change 4: turning the page of whatever list on screen
-    /// is split into pages while voice is on — the dashboard's agents, the
-    /// Daemons screen's tiles, the New agent dialog's directories and modes.
+    /// is split into pages while voice is on — the Daemons screen's tiles, the
+    /// New agent dialog's directories and modes. On the agent dashboard, which
+    /// scrolls instead (issue #1492), the app scrolls it by a screen.
     /// Pinned by value; neither takes a param or needs a declaration, because
     /// the app answers "nothing here has pages" itself, and neither is
     /// callable over an agent's pane, where nothing pages.
@@ -3256,6 +3268,60 @@ mod tests {
         assert!(
             matches!(&back.grounding, ActionGrounding::HeardAs(heard_as) if heard_as.iter().any(|heard| heard == "back"))
         );
+    }
+
+    /// Issue #1492: scrolling the agent dashboard, which no longer splits into
+    /// pages while voice is on. Pinned by value: no params, `overview` only,
+    /// and callable only while the New agent dialog is closed, since the
+    /// dashboard is what they scroll and the dialog covers it. Each is grounded
+    /// by its direction's word, so "scroll up" never grounds a scroll down.
+    #[test]
+    fn voice_table_scroll_rows_are_pinned_by_value() {
+        let table = super::table();
+        let dialog = VoiceNewAgent { form: None };
+        for (id, invoke, report, word, opposite) in [
+            ("scroll_down", "scrollDown", "Scrolling down.", "down", "up"),
+            ("scroll_up", "scrollUp", "Scrolling up.", "up", "down"),
+            (
+                "scroll_to_top",
+                "scrollToTop",
+                "Scrolled to the top.",
+                "top",
+                "bottom",
+            ),
+            (
+                "scroll_to_bottom",
+                "scrollToBottom",
+                "Scrolled to the bottom.",
+                "bottom",
+                "top",
+            ),
+        ] {
+            let row = table
+                .row(id)
+                .unwrap_or_else(|| panic!("{id} is in the table"));
+            assert_eq!(row.invoke, invoke, "{id}");
+            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            assert_eq!(
+                row.requires,
+                vec![Requirement::NewAgentDialogClosed],
+                "{id}"
+            );
+            assert!(row.params.is_empty(), "{id}");
+            assert_eq!(row.report, report, "{id}");
+            let ActionGrounding::HeardAs(heard_as) = &row.grounding else {
+                panic!("{id} is grounded by `heard_as`");
+            };
+            assert!(heard_as.iter().any(|heard| heard == word), "{id}");
+            assert!(!heard_as.iter().any(|heard| heard == opposite), "{id}");
+            assert!(row.callable(Screen::Overview, None, None), "{id}");
+            assert!(
+                !row.callable(Screen::Overview, None, Some(&dialog)),
+                "{id}: under the New agent dialog"
+            );
+            assert!(!row.callable(Screen::Deck, None, None), "{id}");
+            assert!(!row.callable(Screen::Agent, None, None), "{id}");
+        }
     }
 
     #[test]

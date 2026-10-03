@@ -1074,7 +1074,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    * New agent dialog's live form, and otherwise refused with the row's own
    * hint — the same `Not here — <hint>.` Rust renders.
    */
-  readonly requires?: "directory_listing" | "new_agent_form";
+  readonly requires?: "directory_listing" | "new_agent_form" | "new_agent_dialog_closed";
 }> = [
   {
     phrases: ["show me every agent", "show me all the agents", "show me everything"],
@@ -1252,7 +1252,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   {
     // PR #1451 round 3, change 4 — turning the page of a list voice shows a
     // page at a time. The app refuses a turn with nothing to turn to itself.
-    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more"],
+    phrases: ["next page", "go to the next page", "the next page", "page forward", "forward a page", "show more", "page down"],
     action: "next_page",
     invoke: "nextPage",
     screens: ["deck", "overview"],
@@ -1260,12 +1260,50 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Next page.",
   },
   {
-    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back"],
+    phrases: ["previous page", "go to the previous page", "go back a page", "back a page", "the page before", "page back", "page up"],
     action: "previous_page",
     invoke: "previousPage",
     screens: ["deck", "overview"],
     unavailableHint: "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed",
     report: "Previous page.",
+  },
+  {
+    // Issue #1492 — scrolling the agent dashboard, which no longer pages. Like
+    // the live rows, only while the New agent dialog is closed.
+    phrases: ["scroll down", "scroll down a bit", "go down", "move down"],
+    action: "scroll_down",
+    invoke: "scrollDown",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling down.",
+  },
+  {
+    phrases: ["scroll up", "scroll up a bit", "go up", "move up"],
+    action: "scroll_up",
+    invoke: "scrollUp",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolling up.",
+  },
+  {
+    phrases: ["scroll to the top", "go to the top", "back to the top"],
+    action: "scroll_to_top",
+    invoke: "scrollToTop",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the top.",
+  },
+  {
+    phrases: ["scroll to the bottom", "go to the bottom", "scroll to the end"],
+    action: "scroll_to_bottom",
+    invoke: "scrollToBottom",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Scrolled to the bottom.",
   },
 ];
 
@@ -1282,11 +1320,11 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
  * honest about what this stand-in is — a matcher over a fixed list — and is
  * what a preview reader most needs to know.
  */
-export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false): VoiceCommandDto[] {
+export function fixtureVoiceCommands(screen: VoiceScreen, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceCommandDto[] {
   return FIXTURE_VOICE_COMMANDS.map((command) => ({
     id: command.action,
     description: `Say ${command.phrases.map((phrase) => `“${phrase}”`).join(", ")}.`,
-    callable: fixtureCallable(command, screen, directoryListing, newAgentForm),
+    callable: fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog),
     unavailable_hint: command.unavailableHint,
     params: [],
   }));
@@ -1337,7 +1375,7 @@ const FIXTURE_VOICE_TIE = {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
@@ -1399,7 +1437,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
   }
-  if (!fixtureCallable(command, screen, directoryListing, newAgentForm)) {
+  if (!fixtureCallable(command, screen, directoryListing, newAgentForm, newAgentDialog)) {
     return {
       ...stub,
       outcome: { kind: "unavailable", transcript: utterance, action: command.action, hint: command.unavailableHint, sentence: `Not here — ${command.unavailableHint}.` },
@@ -1467,8 +1505,9 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
 }
 
 /** Whether `command` can run on `screen`, given whether a directory listing and a live New agent form are declared. */
-function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean): boolean {
+function fixtureCallable(command: (typeof FIXTURE_VOICE_COMMANDS)[number], screen: VoiceScreen, directoryListing: boolean, newAgentForm: boolean, newAgentDialog = false): boolean {
   if (!command.screens.includes(screen)) return false;
+  if (command.requires === "new_agent_dialog_closed") return !newAgentDialog;
   if (command.requires === "directory_listing") return directoryListing;
   if (command.requires === "new_agent_form") return newAgentForm;
   return true;

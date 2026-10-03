@@ -1,9 +1,9 @@
-import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
-import { VOICE_ACTIONS, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -14,10 +14,7 @@ import { DeckSelector } from "./DeckSelector";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
-import { usePager } from "../hooks/useVoicePages";
-import { useVoiceOn } from "../hooks/useVoiceOn";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
-import { pageMarker, pageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank } from "../lib/displayText";
 
 /**
@@ -650,136 +647,46 @@ const StopControlsContext = createContext<OverviewStopControls | undefined>(unde
  */
 const RowNumbersContext = createContext<ReadonlyMap<string, number> | undefined>(undefined);
 
-/**
- * PR #1451 round 3, change 4 — what the dashboard's current voice page shows,
- * while voice splits the rows into pages: the rows by {@link agentKey}, and
- * the daemons with anything on the page. Absent while the dashboard is not
- * paged, which renders everything.
- */
-const DashboardPageContext = createContext<{ agents: ReadonlySet<string>; decks: ReadonlySet<string> } | undefined>(undefined);
+/** Overlap kept between two screens of a spoken scroll, so the row at the edge stays in sight (issue #1492). */
+const DASHBOARD_SCROLL_OVERLAP = 48;
 
-/** One thing the dashboard pages: an agent's row, or a daemon whose section has no rows (a note). */
-type DashboardUnit = { kind: "agent"; agent: OverviewAgent; deckKey: string; group: string } | { kind: "deck"; deckKey: string };
+/** The least a spoken scroll moves, for a window too short to measure a screen from. */
+const DASHBOARD_SCROLL_MIN = 120;
 
-/** How many rows a page holds where nothing is laid out (jsdom) — the size the component tests page by. */
-const FALLBACK_DASHBOARD_PAGE = 10;
-
-/**
- * What the dashboard's pieces cost in height, measured from what last
- * rendered: a row, each daemon section's own chrome (its header and the
- * table's legend), each group card's chrome (its header), each row-less
- * daemon section whole, and the gaps between them; and the height a page has.
- */
-interface DashboardCosts {
-  budget: number;
-  row: number;
-  deckGap: number;
-  groupGap: number;
-  deck: ReadonlyMap<string, number>;
-  group: ReadonlyMap<string, number>;
-  whole: ReadonlyMap<string, number>;
-}
+/** Already at the bottom, for "scroll down". */
+export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
+/** Already at the top, for "scroll up". */
+export const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
+/** A menu or dialog is in front of the dashboard, such as the open Daemon selector. */
+export const DASHBOARD_COVERED = "Something is open over the dashboard, so it was not scrolled. Close it first.";
+/** Nothing to scroll: every daemon and agent fits in the window. */
+export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 
 /**
- * The page (from 1) each unit is on: units in screen order, a page taking
- * units while their rows, and the headers of the cards and sections they
- * open, fit its height. A piece not measured yet costs as much as the
- * largest of its kind that has been, so a page errs short rather than long.
- * Without costs (nothing laid out) a page is {@link FALLBACK_DASHBOARD_PAGE}
- * rows, and a row-less section rides with the page before it.
+ * Issue #1492 — scroll the dashboard by voice. The dashboard is the page:
+ * the window scrolls it, under a sticky top bar and above the voice row. A
+ * screen is the window's height less those two and a little overlap, so the
+ * row that was at the bottom edge is still in sight at the top after "scroll
+ * down". Answers `undefined` when it scrolled, or why it did not.
  */
-function paginateDashboard(units: readonly DashboardUnit[], costs: DashboardCosts | undefined): number[] {
-  if (!costs) {
-    let rows = 0;
-    return units.map((unit) => {
-      if (unit.kind === "agent") rows += 1;
-      return Math.max(1, Math.ceil(rows / FALLBACK_DASHBOARD_PAGE));
-    });
+function scrollDashboard(main: HTMLElement | null, move: DashboardScroll): string | undefined {
+  const page = document.scrollingElement ?? document.documentElement;
+  const room = page.scrollHeight - window.innerHeight;
+  if (room <= 1) return DASHBOARD_FITS;
+  const behavior: ScrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  const at = window.scrollY;
+  if ((move === "down" || move === "bottom") && at >= room - 1) return DASHBOARD_AT_BOTTOM;
+  if ((move === "up" || move === "top") && at <= 1) return DASHBOARD_AT_TOP;
+  if (move === "top" || move === "bottom") {
+    window.scrollTo({ top: move === "top" ? 0 : room, behavior });
+    return undefined;
   }
-  const most = (costsOf: ReadonlyMap<string, number>, fallback: number) => Math.max(fallback, ...costsOf.values());
-  const deckDefault = most(costs.deck, 60);
-  const groupDefault = most(costs.group, 50);
-  const wholeDefault = most(costs.whole, 90);
-  let page = 1;
-  let used = 0;
-  let deck: string | undefined;
-  let group: string | undefined;
-  return units.map((unit) => {
-    const cost = () => {
-      const deckOpens = unit.deckKey !== deck;
-      const opening = deckOpens ? (used > 0 ? costs.deckGap : 0) : 0;
-      if (unit.kind === "deck") return opening + (costs.whole.get(unit.deckKey) ?? wholeDefault);
-      const deckChrome = deckOpens ? costs.deck.get(unit.deckKey) ?? deckDefault : 0;
-      const groupChrome = unit.group !== group ? (costs.group.get(unit.group) ?? groupDefault) + (deckOpens ? 0 : costs.groupGap) : 0;
-      return opening + deckChrome + groupChrome + costs.row;
-    };
-    let add = cost();
-    if (used > 0 && used + add > costs.budget) {
-      page += 1;
-      used = 0;
-      deck = undefined;
-      group = undefined;
-      add = cost();
-    }
-    used += add;
-    deck = unit.deckKey;
-    group = unit.kind === "agent" ? unit.group : undefined;
-    return page;
-  });
-}
-
-/** Measure {@link DashboardCosts} from the dashboard body as rendered, or `undefined` where nothing is laid out. */
-function measureDashboard(body: HTMLElement, previous: DashboardCosts | undefined, slack: number): DashboardCosts | undefined {
-  const box = body.getBoundingClientRect();
-  if (box.width === 0 && box.height === 0) return undefined;
-  const px = (value: string) => Number.parseFloat(value) || 0;
-  const height = (element: Element) => element.getBoundingClientRect().height;
-  const style = getComputedStyle(body);
-  const firstRow = body.querySelector(".overview-row");
-  const row = firstRow ? height(firstRow) : previous?.row ?? 34;
-  const groups = body.querySelector(".overview-groups");
-  const groupGap = groups ? px(getComputedStyle(groups).rowGap) : previous?.groupGap ?? 9;
-  const deckGap = px(style.rowGap);
-  const deck = new Map(previous?.deck);
-  const group = new Map(previous?.group);
-  const whole = new Map(previous?.whole);
-  let others = 0;
-  let otherCount = 0;
-  for (const child of Array.from(body.children)) {
-    const deckId = child.getAttribute("data-page-deck");
-    if (deckId === null) {
-      others += height(child);
-      otherCount += 1;
-      continue;
-    }
-    const cards = Array.from(child.querySelectorAll("[data-page-group]"));
-    if (cards.length === 0) {
-      whole.set(deckId, height(child));
-      continue;
-    }
-    let inCards = 0;
-    for (const card of cards) {
-      const cardHeight = height(card);
-      inCards += cardHeight;
-      group.set(card.getAttribute("data-page-group") ?? "", cardHeight - card.querySelectorAll(".overview-row").length * row);
-    }
-    deck.set(deckId, height(child) - inCards - (cards.length - 1) * groupGap);
-  }
-  /* The page is what the window shows below the body's top, less the voice
-     row the screen keeps clear at the bottom and anything above the daemons. */
-  const main = body.closest(".deck-main");
-  const reserved = main ? px(getComputedStyle(main).paddingBottom) : 0;
-  const top = box.top + window.scrollY;
-  const budget = window.innerHeight - top - px(style.paddingTop) - px(style.paddingBottom) - reserved - others - otherCount * deckGap - slack;
-  return { budget, row, deckGap, groupGap, deck, group, whole };
-}
-
-/** Whether two measurements would page alike. */
-function sameCosts(left: DashboardCosts | undefined, right: DashboardCosts | undefined): boolean {
-  if (!left || !right) return left === right;
-  const sameMap = (a: ReadonlyMap<string, number>, b: ReadonlyMap<string, number>) => a.size === b.size && [...a].every(([key, value]) => Math.abs((b.get(key) ?? NaN) - value) < 0.5);
-  return Math.abs(left.budget - right.budget) < 0.5 && Math.abs(left.row - right.row) < 0.5 && left.deckGap === right.deckGap && left.groupGap === right.groupGap
-    && sameMap(left.deck, right.deck) && sameMap(left.group, right.group) && sameMap(left.whole, right.whole);
+  const header = main?.querySelector(".topbar");
+  const below = header ? Math.max(0, header.getBoundingClientRect().bottom) : 0;
+  const reserved = main ? Number.parseFloat(getComputedStyle(main).paddingBottom) || 0 : 0;
+  const screen = Math.max(DASHBOARD_SCROLL_MIN, window.innerHeight - below - reserved - DASHBOARD_SCROLL_OVERLAP);
+  window.scrollBy({ top: move === "down" ? screen : -screen, behavior });
+  return undefined;
 }
 
 /**
@@ -1050,6 +957,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     },
   };
   /*
+    Issue #1492 — the dashboard scrolls (the window does), and a row acted on
+    by number or by name is scrolled into view first, so it is on screen
+    behind the pane that opens over it, and on screen when that pane closes.
+  */
+  const mainRef = useRef<HTMLElement>(null);
+  const revealAgent = useCallback((deckId: string, agentId: string) => {
+    const testId = `overview-agent-${agentDomKey({ daemonId: deckId, id: agentId })}`;
+    const row = Array.from(mainRef.current?.querySelectorAll(".overview-row") ?? []).find((candidate) => candidate.getAttribute("data-testid") === testId);
+    row?.scrollIntoView?.({ block: "nearest" });
+  }, []);
+  /*
     PRD #1223 U5 — publish `closeNewAgent` only while the dialog is open, so
     `closeTopmost` can read its presence the way it reads the voice overlay's.
     And `openNewAgent` — the `open_new_agent` row — only while it is CLOSED and
@@ -1106,13 +1024,18 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         return slot ? slot.startNewAgent(target) : NO_NEW_AGENT_DIALOG;
       },
       ...voiceStops,
+      /* Issue #1492 — the dashboard's own scroll, served always: Rust offers
+         the scroll rows only while the New agent dialog is closed, and a
+         scroll that lands under a pane moves only the screen behind it. */
+      scrollDashboard: (move: DashboardScroll) => scrollDashboard(mainRef.current, move),
+      revealAgent,
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
       : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
     return () => { voiceChannel.current = undefined; };
   });
-  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent }), [onNavigate, openNewAgent]);
+  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent }), [onNavigate, openNewAgent, revealAgent]);
   /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
      door on this screen exists only while it is shown. `undefined` removes
      the top bar's button and each deck group's alike. */
@@ -1167,78 +1090,18 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    */
   const rowsShown = !agentPaneOpen && !newAgent;
   /*
-    PR #1451 round 3, change 4 — while voice is on and the rows are on screen,
-    a dashboard taller than the window is split into pages that each fit it
-    without scrolling, so every row voice can act on is visible. A page is
-    worked out from what the rows, cards and daemon sections measured when
-    they last rendered (`paginateDashboard`), and again whenever the window is
-    resized; "Page N of M" shows beside the title, and the numbers restart at
-    1 on every page.
+    Issue #1492 — every row is drawn and numbered, voice on or off: the
+    dashboard scrolls rather than splitting into pages, so a daemon or an
+    orchestration is never missing because voice is on, and a row's number
+    means the same row wherever the dashboard is scrolled. (PR #1451 round 3,
+    change 4 used to page it while voice was on and draw only the page
+    showing.)
   */
-  const voicePages = useVoiceOn() && rowsShown;
-  const bodyRef = useRef<HTMLElement>(null);
-  const units = useMemo<DashboardUnit[]>(() => decks.flatMap((deck): DashboardUnit[] => {
-    const deckKey = deck.key;
-    if (!rendersAgentRows(deck.snapshot.connection) || deck.agents.length === 0) return [{ kind: "deck", deckKey }];
-    // A card's measure key, as `OverviewGroupCard` writes `data-page-group`.
-    const cardDeck = deck.snapshot.connection.deckId ?? "";
-    return deck.groups.flatMap((group) => group.agents.map((agent): DashboardUnit => ({ kind: "agent", agent, deckKey, group: `${cardDeck}\u0000${group.key}` })));
-  }), [decks]);
-  const [costs, setCosts] = useState<DashboardCosts>();
-  const [slack, setSlack] = useState({ height: 0, width: 0, by: 0 });
-  const [viewport, setViewport] = useState({ height: window.innerHeight, width: window.innerWidth });
-  useEffect(() => {
-    if (!voicePages) return;
-    const resized = () => setViewport({ height: window.innerHeight, width: window.innerWidth });
-    window.addEventListener("resize", resized);
-    return () => window.removeEventListener("resize", resized);
-  }, [voicePages]);
-  const slackNow = slack.height === viewport.height && slack.width === viewport.width ? slack.by : 0;
-  const unitPages = useMemo(() => paginateDashboard(units, voicePages ? costs : undefined), [costs, units, voicePages]);
-  // voice-registry-exempt: which page of the dashboard is showing — turned by `nextPage` / `previousPage` through the shell's pager registry
-  const [dashboardPage, setDashboardPage] = useState(1);
-  const dashboardSlice = pageSlice(unitPages.at(-1) ?? 1, 1, dashboardPage);
-  const paged = voicePages && dashboardSlice.pages > 1;
-  const pageFilter = useMemo(() => {
-    if (!paged) return undefined;
-    const agents = new Set<string>();
-    const shownDecks = new Set<string>();
-    units.forEach((unit, at) => {
-      if (unitPages[at] !== dashboardSlice.page) return;
-      shownDecks.add(unit.deckKey);
-      if (unit.kind === "agent") agents.add(agentKey(unit.agent));
-    });
-    return { agents, decks: shownDecks };
-  }, [dashboardSlice.page, paged, unitPages, units]);
-  /* Measured after every render while voice pages, and settled once a render
-     measures what the last one did; a page that still overflows the window
-     takes that much less height until the window is resized. */
-  useLayoutEffect(() => {
-    if (!voicePages || !bodyRef.current) return;
-    const measured = measureDashboard(bodyRef.current, costs, slackNow);
-    if (!sameCosts(measured, costs)) {
-      setCosts(measured);
-      return;
-    }
-    const over = document.documentElement.scrollHeight - window.innerHeight;
-    if (paged && measured && over > 1 && slackNow < measured.budget) setSlack({ ...viewport, by: slackNow + over });
-  });
   const numberedAgents = useMemo(() => (
     !rowsShown
       ? undefined
-      : units.flatMap((unit, at) => (unit.kind === "agent" && (!paged || unitPages[at] === dashboardSlice.page) ? [unit.agent] : []))
-  ), [dashboardSlice.page, paged, rowsShown, unitPages, units]);
-  const dashboardPager = useMemo<VoicePager | undefined>(() => (paged
-    ? {
-      page: dashboardSlice.page,
-      pages: dashboardSlice.pages,
-      turn: (delta) => setDashboardPage(dashboardSlice.page + delta),
-      elsewhere: units.flatMap((unit, at): VoiceOffPageItem[] => (unit.kind === "agent" && unitPages[at] !== dashboardSlice.page
-        ? [{ kind: "agent", value: unit.agent.id, deckId: unit.agent.daemonId, label: unit.agent.displayName, page: unitPages[at] }]
-        : [])),
-    }
-    : undefined), [dashboardSlice.page, dashboardSlice.pages, paged, unitPages, units]);
-  usePager("screen", dashboardPager);
+      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.groups.flatMap((group) => group.agents) : []))
+  ), [decks, rowsShown]);
   const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
     kind: "agent",
     value: agent.id,
@@ -1383,10 +1246,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const overviewScreen = (
     <div className="control-deck overview-screen">
       {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
-      <main className="deck-main">
+      <main className="deck-main" ref={mainRef}>
         <header className="topbar">
           <div className="repo-context">
-            <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong>{paged && <span className="overview-page" data-testid="overview-page">{pageMarker(dashboardSlice)}</span>}</div>
+            <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
@@ -1423,7 +1286,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           </div>
         )}
 
-        <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef}>
+        <section className="overview-body" aria-label="Agent dashboard">
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
@@ -1438,8 +1301,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             `.map`, and `DaemonBody` below took a `fleetSize` for its note
             density and nothing else.
           */}
-          {/* While voice pages the dashboard (change 4), the daemons with anything on the page showing. */}
-          {decks.filter((deck) => !pageFilter || pageFilter.decks.has(deck.key)).map((deck) => (
+          {decks.map((deck) => (
             <DeckGroup
               /*
                 PRD #742 M5: the KEY, not the label. `socketPath` is
@@ -1493,12 +1355,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       )}
     </div>
   );
-  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}><DashboardPageContext.Provider value={pageFilter}>{overviewScreen}</DashboardPageContext.Provider></RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
+  return <OpenAgentContext.Provider value={openAgent}><StopControlsContext.Provider value={stopControls}><RowNumbersContext.Provider value={rowNumbers}>{overviewScreen}</RowNumbersContext.Provider></StopControlsContext.Provider></OpenAgentContext.Provider>;
 }
 
 /** One deck of the fleet, as {@link AgentOverview} prepares it for rendering. */
 interface FleetDeck {
-  /** Distinct per fleet member ({@link fleetMemberKey}): the React key, and what the dashboard's voice pages are keyed by. */
+  /** Distinct per fleet member ({@link fleetMemberKey}): the React key. */
   key: string;
   snapshot: DeckRuntimeState["snapshot"];
   agents: OverviewAgent[];
@@ -1622,7 +1484,6 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
       */
       data-daemon-id={connection.deckId === undefined ? "" : domIdentity(connection.deckId)}
       data-deck-connected={deck.connected ? "yes" : "no"}
-      data-page-deck={deck.key}
       aria-labelledby={titleId}
     >
       <header className="daemon-group-header">
@@ -1718,7 +1579,6 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   onNewAgent?: () => void;
 }) {
   const noteClass = compactNote ? "overview-note is-compact" : "overview-note";
-  const pageFilter = useContext(DashboardPageContext);
   /*
     PRD #742 M14, and BEFORE the `loading` branch below because it is a narrower
     case of the same status. That one is the APP establishing its control
@@ -1871,7 +1731,7 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
           {columns.map((column) => <span key={column}>{OVERVIEW_COLUMNS[column].legend}</span>)}
         </div>
         <div className="overview-groups">
-          {groups.filter((group) => !pageFilter || group.agents.some((agent) => pageFilter.agents.has(agentKey(agent)))).map((group) => <OverviewGroupCard key={group.key} group={group} now={now} columns={columns} />)}
+          {groups.map((group) => <OverviewGroupCard key={group.key} group={group} now={now} columns={columns} />)}
         </div>
       </div>
     </div>
@@ -2047,12 +1907,9 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
   const subtitle = group.subtitle ? displayText(group.subtitle, DISPLAY_LIMITS.name) : undefined;
   const stopControls = useContext(StopControlsContext);
   const groupName = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
-  const pageFilter = useContext(DashboardPageContext);
   return (
     <article
       className="overview-group"
-      /* What the dashboard's pages measure a card by (change 4). */
-      data-page-group={`${group.agents[0]?.daemonId ?? ""}\u0000${group.key}`}
       data-testid={`overview-group-${group.key}`}
       data-group-id={group.id === undefined ? undefined : domIdentity(group.id)}
       data-group-kind={group.kind}
@@ -2112,7 +1969,7 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
           </tr>
         </thead>
         <tbody className="overview-rows" role="rowgroup">
-          {group.agents.filter((agent) => !pageFilter || pageFilter.agents.has(agentKey(agent))).map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} columns={columns} />)}
+          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} columns={columns} />)}
         </tbody>
       </table>
     </article>

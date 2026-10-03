@@ -148,21 +148,38 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText(selectedPath!);
   });
 
-  /** Scenario: on a crowded dashboard, Voice exposes only agents that fit the current page. A page marker changes when the window gains enough height to fit more rows. */
-  test("crowded dashboard recomputes its voice page after resize", async ({ page }) => {
+  /** Scenario: in a short window with Voice on, the crowded dashboard draws every daemon section and agent row with no page marker, and a spoken “scroll down” scrolls the window down by most of its height. */
+  test("crowded dashboard scrolls with voice on and draws every row", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 480 });
-    await open(page, "voice-pages");
+    await open(page, "voice-pages", "scroll down");
+    const rows = await page.locator(".overview-row").count();
+    const sections = await page.getByTestId("daemon-group").count();
     await turnOnVoice(page);
-    const marker = page.getByText(/Page \d+ of \d+/i);
-    await expect(marker).toBeVisible();
-    const smallPage = (await marker.textContent())!;
-    const smallCount = await page.locator(".overview-row:visible").count();
-    expect(smallCount).toBeLessThan(25);
+    await expect(page.getByText(/Page \d+ of \d+/i)).toHaveCount(0);
+    await expect(page.locator(".overview-row")).toHaveCount(rows);
+    await expect(page.getByTestId("daemon-group")).toHaveCount(sections);
+    expect(rows).toBe(25);
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(200);
+    expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(480);
+  });
 
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await expect.poll(async () => marker.textContent()).not.toBe(smallPage);
-    const tallCount = await page.locator(".overview-row:visible").count();
-    expect(tallCount).toBeGreaterThan(smallCount);
+  /** Scenario: in a short window with Voice on, saying “twenty five” for the crowded dashboard's last row, scrolled out of view, opens its agent and leaves that row fully in view between the top bar and the voice row. */
+  test("a row opened by its number is scrolled clear of the top bar and the voice row", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 480 });
+    await open(page, "voice-pages", "twenty five");
+    // The 25th and last row: numbers follow DOM order, and the pane hides them.
+    const row = page.locator(".overview-row").last();
+    await turnOnVoice(page);
+    await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
+    const geometry = await row.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      const top = document.querySelector(".topbar")!.getBoundingClientRect().bottom;
+      const voice = document.querySelector("[data-testid='voice-row']")!.getBoundingClientRect().top;
+      return { rowTop: box.top, rowBottom: box.bottom, top, voice, scrolled: window.scrollY };
+    });
+    expect(geometry.scrolled).toBeGreaterThan(0);
+    expect(geometry.rowTop).toBeGreaterThanOrEqual(geometry.top);
+    expect(geometry.rowBottom).toBeLessThanOrEqual(geometry.voice);
   });
 
   /** Scenario: in a short New agent window, every mode is either in the visible dialog or reached through a visible page indicator while Voice is on. */

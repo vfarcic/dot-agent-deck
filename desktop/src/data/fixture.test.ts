@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { fixtureGroundedCommandText, resolveFixtureVoice } from "./fixture";
+import { fixtureGroundedCommandText, fixtureVoiceCommands, resolveFixtureVoice } from "./fixture";
 
 const dictationSource = readFileSync(resolve("src-tauri/src/voice/dictation.rs"), "utf8");
 const outcomeSource = readFileSync(resolve("src-tauri/src/voice/outcome.rs"), "utf8");
@@ -219,4 +219,12 @@ describe("browser fixture Filter text parity with Rust", () => {
       sentence: `Filtering by “${applied}”.`,
     });
   });
+});
+
+/** Scenario: the preview's scroll rows are callable on the dashboard and refused while the New agent dialog is declared open, as the live table refuses them (issue #1492). */
+it("refuses a preview scroll while the New agent dialog is open", () => {
+  expect(resolveFixtureVoice("scroll down", "overview").outcome).toMatchObject({ kind: "dispatch", invoke: "scrollDown" });
+  expect(resolveFixtureVoice("scroll down", "overview", false, false, false, true).outcome).toMatchObject({ kind: "unavailable", action: "scroll_down" });
+  expect(fixtureVoiceCommands("overview", false, false, true).find((command) => command.id === "scroll_up")?.callable).toBe(false);
+  expect(fixtureVoiceCommands("overview").find((command) => command.id === "scroll_up")?.callable).toBe(true);
 });

@@ -4,8 +4,9 @@
  *
  * While voice is on, a list voice selects from that does not fit where it is
  * shown is split into pages instead of scrolling: the New agent dialog's
- * directories and Mode chips, the agent dashboard's agents and the Daemons
- * screen's tiles. Each page fills the space the list has (directories and
+ * directories and Mode chips and the Daemons screen's tiles. The agent
+ * dashboard is not paged: it scrolls, voice on or off, so nothing on it is
+ * hidden (issue #1492). Each page fills the space the list has (directories and
  * modes in as many columns as fit), "Page N of M" is shown beside it, and
  * "next page" / "previous page" turn it. A list that fits is shown whole, with
  * no marker, and with voice off every list scrolls as it always has. The New
