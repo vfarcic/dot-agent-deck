@@ -1044,6 +1044,13 @@ pub struct SessionState {
     /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
     /// TUI learns it again from the producer's next event.
     pub prompt_reports_declared: bool,
+    /// Issue #1493: the current status is a Thinking that `dot-agent-deck wrap`
+    /// read off a Codex pane's output (the mode where its prompt hook is not
+    /// running), not one a hook reported. Only such a Thinking may be ended by
+    /// the wrapper's quiet-output Idle: a prompt hook that does run after all
+    /// (trust left by an earlier install) still outranks output. Process-local,
+    /// like [`Self::prompt_reports_unavailable`].
+    pub output_set_status: bool,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -11646,6 +11653,7 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
         session_id
@@ -16128,6 +16136,7 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                output_set_status: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -16433,10 +16442,18 @@ impl AppState {
                         {
                             session.status = SessionStatus::Thinking;
                             session.active_tool = None;
+                            session.output_set_status = true;
                             true
                         }
-                        EventType::Idle if session.status == SessionStatus::Thinking => {
+                        // Only a Thinking output itself set (Qodo on PR #1523):
+                        // a prompt hook's Thinking is the turn, and quiet is
+                        // not its end.
+                        EventType::Idle
+                            if session.status == SessionStatus::Thinking
+                                && session.output_set_status =>
+                        {
                             session.status = SessionStatus::Idle;
+                            session.output_set_status = false;
                             true
                         }
                         _ => false,
@@ -16697,9 +16714,14 @@ impl AppState {
         // asserted nothing, for the same reason — it is liveness, not evidence of
         // what the agent is doing, so it must not turn the `ShellIdle` that ends
         // a detached command into a no-op and strand the card on Working.
-        let codex_output_left_status = event.agent_type == AgentType::Codex
-            && event.is_wrapper_output_classified()
-            && !asserted_status;
+        let codex_output =
+            event.agent_type == AgentType::Codex && event.is_wrapper_output_classified();
+        let codex_output_left_status = codex_output && !asserted_status;
+        // Issue #1493: any other frame that wrote the status took it over from
+        // output, so the wrapper's quiet Idle may no longer end it.
+        if asserted_status && !codex_output {
+            session.output_set_status = false;
+        }
         if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown)
             && !subagent_left_status
             && !codex_output_left_status
@@ -24571,6 +24593,7 @@ while True:
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
+                output_set_status: false,
             },
         );
 
@@ -26058,6 +26081,21 @@ while True:
         );
         state.apply_event(exited);
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        // A prompt hook that does run on such a pane (trust left by an earlier
+        // install) owns its Thinking: the wrapper's quiet Idle, however new,
+        // does not end it (Qodo on PR #1523). Output's own Thinking still ends.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 3));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(codex_status_frame(EventType::Idle, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 7));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
 
         // A wrapper interface start that arrives after frames it predates — an
