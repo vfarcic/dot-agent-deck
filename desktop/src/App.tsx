@@ -818,11 +818,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       closeOverlays: railContext.closeOverlays,
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
-      /* Issue #1492 — the dashboard's scroll, refused while a dialog layer
-         (the open Daemon selector's menu) is in front of it, as a page turn
-         would be: voice acts on what is in front. */
+      /* Issue #1492 — the dashboard's scroll, refused while anything is in
+         front of it: a dialog layer (the open Daemon selector's menu), the
+         Settings sheet or a stop confirmation. Voice acts on what is in front,
+         and a dashboard moved behind an overlay is somewhere unexpected when
+         the overlay closes. */
       ...(overviewVoiceContext.current?.scrollDashboard
-        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
         : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
@@ -831,7 +833,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          nothing over it, a page turn there scrolls it by about a screen. */
       turnPage: (delta) => {
         const pager = readPager();
-        const scrollDashboard = overviewVoiceContext.current?.scrollDashboard;
+        const scrollDashboard = context.scrollDashboard;
         if (!pager && !dialogLayerUp() && scrollDashboard) return scrollDashboard(delta > 0 ? "down" : "up");
         const refused = pageTurnRefusal(pager, delta);
         if (refused === undefined) pager?.turn(delta);
@@ -860,7 +862,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

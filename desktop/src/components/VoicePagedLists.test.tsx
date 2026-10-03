@@ -521,6 +521,33 @@ describe("the agent dashboard scrolls while voice is on", () => {
     expect(page.at()).toBe(0);
   });
 
+  /** Scenario: with the Settings sheet open, or a stop confirmation open, over a tall dashboard, “scroll down” and “next page” leave the dashboard where it is and say something is open over it. */
+  it("does not scroll the dashboard behind Settings or a stop confirmation", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableDashboard(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+
+    fireEvent.click(screen.getByTestId("open-settings"));
+    expect(screen.getByTestId("settings-panel")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    await speak(voice, "next page");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByTestId("settings-panel")).getByRole("button", { name: /^close/i }));
+    expect(screen.queryByTestId("settings-panel")).toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]);
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(page.at()).toBe(0);
+  });
+
   /** Scenario: control — with the New agent dialog open over a tall dashboard, “next page” turns the directory browser's page and leaves the dashboard behind it where it was. */
   it("turns the directory page, not the dashboard, while the New agent dialog is open", async () => {
     const voice = microphone();
