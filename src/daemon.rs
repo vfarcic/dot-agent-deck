@@ -8106,9 +8106,10 @@ mod hook_ingestion_tests {
     impl BlockedConfig {
         /// How long the read is left hanging when the test cannot release it —
         /// which is what happens when the read blocks the test's own runtime
-        /// thread. Long enough that a working daemon ingests an event well
-        /// inside it, short enough that the failing case fails promptly.
-        const WATCHDOG: Duration = Duration::from_secs(5);
+        /// thread. Past [`INGEST_DEADLINE`] on purpose: an event a loaded
+        /// runner is slow to ingest fails that deadline, rather than landing
+        /// after this release and reading as "only ingested once released".
+        const WATCHDOG: Duration = Duration::from_secs(30);
 
         fn plant(dir: &std::path::Path) -> Self {
             use std::os::unix::ffi::OsStrExt;
@@ -8165,28 +8166,41 @@ mod hook_ingestion_tests {
             self.released.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        /// Let the parked reads go, and report whether any read was parked.
-        fn release(self) -> bool {
+        /// Let the parked reads go, and report whether any read was parked. The
+        /// join waits out the watchdog's own file work, so it runs on the
+        /// blocking pool rather than on the test's runtime thread.
+        async fn release(self) -> bool {
             let _ = self.release.send(());
-            self.watchdog.join().expect("FIFO watchdog panicked")
+            let watchdog = self.watchdog;
+            tokio::task::spawn_blocking(move || watchdog.join().expect("FIFO watchdog panicked"))
+                .await
+                .expect("joining the FIFO watchdog")
         }
     }
 
+    /// How long [`ingest_session`] waits for the card. Inside
+    /// [`BlockedConfig::WATCHDOG`], so a card that is merely slow is reported
+    /// as missing rather than as ingested only after the release.
+    const INGEST_DEADLINE: Duration = Duration::from_secs(20);
+
     /// Write one `session_start` for `session` on its own connection and wait,
-    /// bounded, for its card to reach the daemon's `AppState`.
-    async fn ingest_session(fx: &ProvenanceFixture, session: &str, label: &str) {
+    /// up to [`INGEST_DEADLINE`], for its card to reach the daemon's
+    /// `AppState`. Whether it did.
+    async fn ingest_session(fx: &ProvenanceFixture, session: &str) -> bool {
         use tokio::io::AsyncWriteExt;
         let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
         let line = format!("{}\n", padded_session_start(session, 0));
         stream.write_all(line.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
         drop(stream);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !fx.state.read().await.sessions.contains_key(session) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{label}: the session_start never reached the daemon's AppState"
-            );
+        let deadline = tokio::time::Instant::now() + INGEST_DEADLINE;
+        loop {
+            if fx.state.read().await.sessions.contains_key(session) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
@@ -8220,7 +8234,9 @@ mod hook_ingestion_tests {
                 DaemonMessage::RestartRole(crate::event::RestartRoleSignal {
                     pane_id: PROV_ORCH_PANE.to_string(),
                     role: "worker".to_string(),
-                    force: false,
+                    // The worker is healthy, and without `--force` the restart
+                    // is refused before it ever reads the config.
+                    force: true,
                     token: Some(token),
                     timestamp: chrono::Utc::now(),
                 })
@@ -8245,11 +8261,11 @@ mod hook_ingestion_tests {
             // Long enough for the verb to reach its read of the config and park
             // on the FIFO there.
             tokio::time::sleep(Duration::from_millis(300)).await;
-            ingest_session(&fx, &format!("ingest-006-{verb}"), verb).await;
-            let ingested_while_blocked = !blocked.released();
+            let ingested = ingest_session(&fx, &format!("ingest-006-{verb}")).await;
+            let ingested_while_blocked = ingested && !blocked.released();
             let verb_was_still_waiting = !reply.is_finished();
 
-            let a_read_was_parked = blocked.release();
+            let a_read_was_parked = blocked.release().await;
             let reply = tokio::time::timeout(Duration::from_secs(20), reply)
                 .await
                 .unwrap_or_else(|_| panic!("{verb}: no reply once the config read was released"))
@@ -8263,9 +8279,9 @@ mod hook_ingestion_tests {
             );
             assert!(
                 ingested_while_blocked,
-                "{verb}: hook ingestion made progress only once the blocked config read was \
-                 released — the verb held the AppState lock (or the runtime's thread) across \
-                 a read of .dot-agent-deck.toml"
+                "{verb}: hook ingestion made no progress while the config read was blocked \
+                 (ingested at all: {ingested}) — the verb held the AppState lock (or the \
+                 runtime's thread) across a read of .dot-agent-deck.toml"
             );
             assert!(
                 verb_was_still_waiting,
@@ -8295,9 +8311,9 @@ mod hook_ingestion_tests {
         let blocked = BlockedConfig::plant(fx.cwd.path());
         drop(held);
         tokio::time::sleep(Duration::from_millis(300)).await;
-        ingest_session(&fx, "ingest-006-dispatch", label).await;
-        let ingested_while_blocked = !blocked.released();
-        let a_read_was_parked = blocked.release();
+        let ingested = ingest_session(&fx, "ingest-006-dispatch").await;
+        let ingested_while_blocked = ingested && !blocked.released();
+        let a_read_was_parked = blocked.release().await;
         fx.stop().await;
         assert!(
             a_read_was_parked,
@@ -8306,8 +8322,9 @@ mod hook_ingestion_tests {
         );
         assert!(
             ingested_while_blocked,
-            "{label}: hook ingestion made progress only once the dispatch task's blocked config \
-             read was released — it read .dot-agent-deck.toml on the runtime's thread"
+            "{label}: hook ingestion made no progress while the dispatch task's config read was \
+             blocked (ingested at all: {ingested}) — it read .dot-agent-deck.toml on the \
+             runtime's thread"
         );
     }
 

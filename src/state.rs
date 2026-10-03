@@ -11497,6 +11497,18 @@ impl AppState {
     /// this has decided the targets, so a test of this function is a test of
     /// where a delegate actually lands (M5.0).
     pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        self.route_delegate(sender_pane_id, to, true)
+    }
+
+    /// [`Self::delegate_targets`], logging the roles it drops only when
+    /// `log_dropped` is set — so a caller that needs the routing before the delegate is
+    /// handled (issue #1387's config read) does not log those warnings twice.
+    fn route_delegate(
+        &self,
+        sender_pane_id: &str,
+        to: &[String],
+        log_dropped: bool,
+    ) -> Vec<(String, String)> {
         let orchestration = self.pane_orchestration_map.get(sender_pane_id);
         let mut targets: Vec<(String, String)> = Vec::new();
         let mut seen_roles: HashSet<&str> = HashSet::new();
@@ -11513,10 +11525,12 @@ impl AppState {
                 // own note treats `signal.to` as already safe because the daemon
                 // logs the whole array with `?`-Debug; that holds for the array
                 // and not for an element interpolated with `%` here.
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: duplicate target role in one signal; ignored"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: duplicate target role in one signal; ignored"
+                    );
+                }
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -11530,10 +11544,12 @@ impl AppState {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
             if role_panes.is_empty() {
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: no worker pane found for role"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: no worker pane found for role"
+                    );
+                }
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -11636,30 +11652,27 @@ impl AppState {
         .await
     }
 
-    /// Issue #1387: every directory a delegate from `signal` may resolve a
-    /// project config from — the orchestration's, and the cwd of each pane in
-    /// the sender's orchestration. That is a superset of the panes it routes to,
-    /// rather than [`Self::delegate_targets`]' own answer, so its per-role
-    /// warnings are still logged once per delegate.
+    /// Issue #1387: every directory a delegate from `signal` resolves a project
+    /// config from — the orchestration's, and the cwd of each pane it routes
+    /// to — and none at all for a sender it is about to refuse, so neither a
+    /// refused caller nor a pane the delegate does not reach can make it wait
+    /// on a slow file.
     fn delegate_config_dirs(
         &self,
         signal: &DelegateSignal,
         registry: &AgentPtyRegistry,
     ) -> Vec<String> {
+        if !self.is_orchestrator_caller(&signal.pane_id) {
+            return Vec::new();
+        }
         let mut dirs: Vec<String> = self
             .orchestration_cwd_of(&signal.pane_id, registry)
             .into_iter()
             .collect();
-        // The same "same orchestration" test `delegate_targets` routes by,
-        // including its `None == None` for a sender with no identity.
-        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
         dirs.extend(
-            self.pane_cwd_map
-                .iter()
-                .filter(|(pane_id, _)| {
-                    self.pane_orchestration_map.get(pane_id.as_str()) == orchestration
-                })
-                .map(|(_, cwd)| cwd.clone()),
+            self.route_delegate(&signal.pane_id, &signal.to, false)
+                .into_iter()
+                .filter_map(|(_, pane_id)| self.pane_cwd_map.get(&pane_id).cloned()),
         );
         dirs
     }
@@ -12096,6 +12109,14 @@ impl AppState {
         }
     }
 
+    /// Whether [`Self::refuse_unless_orchestrator_caller`] would let `pane_id`
+    /// through, without its warnings. Issue #1387: a verb asks this before
+    /// reading the project config, so a caller about to be refused waits on no
+    /// file read.
+    fn is_orchestrator_caller(&self, pane_id: &str) -> bool {
+        self.pane_role_map.contains_key(pane_id) && self.orchestrator_pane_ids.contains(pane_id)
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -12265,8 +12286,23 @@ pub async fn handle_restart_role_with_state(
     }
 
     let resolved = {
-        // Issue #1387: the role's config is read with no guard held.
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a request one of the checks below refuses before it gets to
+        // the role's config.
         let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            let targets =
+                s.route_delegate(&signal.pane_id, std::slice::from_ref(&signal.role), false);
+            let [(_, pane_id)] = targets.as_slice() else {
+                return Vec::new();
+            };
+            if restart_refusal_for_crashed_pane(registry, pane_id, &signal.role, signal.force)
+                .is_some()
+            {
+                return Vec::new();
+            }
             s.orchestration_cwd_of(&signal.pane_id, registry)
                 .into_iter()
                 .collect()
@@ -12547,8 +12583,12 @@ pub async fn handle_spawn_role_with_state(
     }
 
     let resolved = {
-        // Issue #1387: the role's config is read with no guard held.
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a caller the first check below refuses.
         let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
             s.orchestration_cwd_of(&signal.pane_id, registry)
                 .into_iter()
                 .collect()
@@ -17687,6 +17727,49 @@ mod tests {
             registry.retire_delegation_commission("A_coder"),
             crate::agent_pty::WorkDoneProvenance::Solicited { remaining: 1 },
             "--supersede adds a commission rather than replacing the earlier one"
+        );
+    }
+
+    /// Issue #1387 (Greptile, Qodo, #1514): a delegate reads the configs of the
+    /// orchestration and of the workers it routes to — not of another worker in
+    /// the same orchestration, whose slow file would otherwise hold up a
+    /// handoff it plays no part in — and none at all for a sender it refuses.
+    #[test]
+    fn delegate_config_dirs_names_only_the_routed_workers() {
+        let mut state = AppState::default();
+        let identity = instance("orch-1387");
+        state.register_orchestration_role(
+            "orch",
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some("/o"),
+        );
+        state.register_orchestration_role("coder", "coder", false, identity.clone(), Some("/c"));
+        state.register_orchestration_role("tester", "tester", false, identity, Some("/t"));
+        let registry = AgentPtyRegistry::new();
+        let signal = |from: &str| DelegateSignal {
+            pane_id: from.to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let mut dirs = state.delegate_config_dirs(&signal("orch"), &registry);
+        dirs.sort();
+        assert_eq!(dirs, vec!["/c".to_string(), "/o".to_string()]);
+        assert!(
+            state
+                .delegate_config_dirs(&signal("tester"), &registry)
+                .is_empty(),
+            "a worker's delegate is refused, so it must read nothing first"
+        );
+        assert!(
+            state
+                .delegate_config_dirs(&signal("stranger"), &registry)
+                .is_empty()
         );
     }
 
