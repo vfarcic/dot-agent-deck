@@ -21281,38 +21281,62 @@ mod spawn_tests {
     /// recorded exactly like any other, however late that makes it. A deadline
     /// that cancelled it mid-write would leave our bytes in the box unsubmitted
     /// and with no #424 record that they are there.
+    ///
+    /// The setup is retried when it did not hold: on a starved box the
+    /// deadline can pass before the first byte, and the call then correctly
+    /// refuses with nothing written — which is not the case under test. A
+    /// write cancelled mid-way fails every attempt, the last one included, so
+    /// the retries tolerate starvation without hiding that regression.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
         const PANE: &str = "issue-544-mid-write";
         const TEXT: &str = "MIDWRITE-SENTINEL";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn stand-in");
+        const ATTEMPTS: usize = 5;
+        let mut attempt = 0;
+        let (registry, agent, deadline, sent) = loop {
+            attempt += 1;
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in");
 
-        // No draft and a free writer, so everything up to the first byte takes
-        // well under a millisecond — and the deadline then falls inside the
-        // write's own `SUBMIT_DELAY`, after the payload and before the CR.
-        let started = Instant::now();
-        let deadline = started + SUBMIT_DELAY / 2;
-        let sent = tokio::time::timeout(
-            Duration::from_secs(5),
-            registry.write_and_submit_guarded_first_write_within(
-                PANE,
-                TEXT,
-                &agent,
-                || async { true },
-                started,
-                deadline,
-            ),
-        )
-        .await
-        .expect("bounded");
+            // No draft and a free writer, so everything up to the first byte
+            // normally takes well under a millisecond — and the deadline then
+            // falls inside the write's own `SUBMIT_DELAY`, after the payload
+            // and before the CR.
+            let started = Instant::now();
+            let deadline = started + SUBMIT_DELAY / 2;
+            let sent = tokio::time::timeout(
+                Duration::from_secs(5),
+                registry.write_and_submit_guarded_first_write_within(
+                    PANE,
+                    TEXT,
+                    &agent,
+                    || async { true },
+                    started,
+                    deadline,
+                ),
+            )
+            .await
+            .expect("bounded");
+            match sent {
+                // Starved before the first byte (issue #1494's `cargo
+                // test-fast` at load ~40 on 16 cores): the precondition did
+                // not hold, so set it up again.
+                Err(AgentPtyError::DeadlineElapsed) if attempt < ATTEMPTS => {
+                    eprintln!(
+                        "attempt {attempt}: the deadline passed before the first byte; retrying"
+                    );
+                    registry.shutdown_all();
+                }
+                sent => break (registry, agent, deadline, sent),
+            }
+        };
         assert!(
             Instant::now() >= deadline,
             "precondition: the write must outlive its deadline"

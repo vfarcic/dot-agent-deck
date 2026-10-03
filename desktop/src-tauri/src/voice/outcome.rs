@@ -8775,6 +8775,10 @@ mod tests {
             ("submit_prompt", Screen::Agent, "go ahead"),
             ("go_to_parent", Screen::Overview, "go up one level"),
             ("go_to_parent", Screen::Overview, "cd dot dot"),
+            // Said to the New agent dialog's browser and refused as "nothing
+            // in that asks to go up a directory" while "back" was not one of
+            // the row's words.
+            ("go_to_parent", Screen::Overview, "Go back one directory."),
             (
                 "use_this_directory",
                 Screen::Overview,

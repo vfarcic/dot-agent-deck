@@ -93,9 +93,13 @@ test.describe("visible pages for voice-selected lists", () => {
       const rows = [...element.querySelectorAll<HTMLElement>("[role='option']")];
       const boxes = rows.map((row) => row.getBoundingClientRect());
       const bottom = Math.max(...boxes.map((box) => box.bottom));
+      const style = getComputedStyle(element);
+      const width = element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
       return {
         count: rows.length,
         columns: new Set(boxes.map((box) => Math.round(box.left))).size,
+        // Every column a 160px-minimum cell with 2px gaps can have (`DIRECTORY_CELL`).
+        fitColumns: Math.floor((width + 2) / 162),
         scrolls: element.scrollHeight > element.clientHeight + 1,
         spare: element.getBoundingClientRect().bottom - bottom,
         rowHeight: boxes[0]?.height ?? 0,
@@ -103,9 +107,38 @@ test.describe("visible pages for voice-selected lists", () => {
     });
     expect(geometry.count).toBeLessThan(31);
     expect(geometry.columns).toBeGreaterThanOrEqual(2);
+    expect(geometry.columns).toBe(geometry.fitColumns);
     expect(geometry.scrolls).toBe(false);
     expect(geometry.spare).toBeGreaterThanOrEqual(0);
     expect(geometry.spare).toBeLessThan(geometry.rowHeight);
+  });
+
+  /** Scenario: with Voice on in a wide window, opening a folder that holds only three long-named directories shows them in one column across the list's width, each name whole rather than cut short with an ellipsis, with its full name as a tooltip and no page marker (issue #1494). */
+  test("voice-on directory shows a few long names whole in one column", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const decks = await openCrowdedDialog(page, true);
+    await decks.first().click();
+    const list = page.getByTestId("new-agent-directory-list");
+    await list.getByRole("option").filter({ hasText: "folder-01" }).click();
+    await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev/folder-01");
+    await expect(list.getByRole("option")).toHaveCount(4);
+    await expect(page.getByTestId("new-agent-directory-page")).toHaveCount(0);
+    const geometry = await list.evaluate((element) => {
+      const rows = [...element.querySelectorAll<HTMLElement>("[role='option']")];
+      const names = rows.map((row) => row.querySelector<HTMLElement>(".new-agent-row-name")!);
+      return {
+        cut: names.filter((name) => name.scrollWidth > name.clientWidth).map((name) => name.textContent),
+        columns: new Set(rows.map((row) => Math.round(row.getBoundingClientRect().left))).size,
+        titles: names.slice(1).map((name) => name.title),
+      };
+    });
+    expect(geometry.cut).toEqual([]);
+    expect(geometry.columns).toBe(1);
+    expect(geometry.titles).toEqual([
+      "customer-onboarding-service-integration-tests",
+      "payments-reconciliation-batch-worker-archive",
+      "observability-dashboards-and-alerting-rules",
+    ]);
   });
 
   /** Scenario: after a spoken page turn, the directory choices change and the visible numbering starts again at one. */
@@ -219,14 +252,26 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(pressed).toBeVisible();
   });
 
-  /** Scenario: a short dialog pages the crowded project's modes, while a small set of ordinary modes fits without any marker. */
+  /** Scenario: a short dialog pages the crowded project's modes, while a small set of ordinary modes fits without any marker. Those few chips share the Mode row's whole width rather than leaving an empty column beside them, and each carries its label as a tooltip (issue #1494). */
   test("fitting modes have no page marker", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
     const decks = await openCrowdedDialog(page, true);
     await decks.first().click();
     await page.getByTestId("new-agent-use-directory").click();
-    await expect(page.getByTestId("new-agent-modes").getByRole("button")).toHaveCount(3);
+    const modes = page.getByTestId("new-agent-modes");
+    await expect(modes.getByRole("button")).toHaveCount(3);
     await expect(page.getByTestId("new-agent-mode-page")).toHaveCount(0);
+    const geometry = await modes.evaluate((element) => {
+      const chips = [...element.querySelectorAll<HTMLElement>("button")];
+      const style = getComputedStyle(element);
+      const contentRight = element.getBoundingClientRect().right - parseFloat(style.paddingRight) - parseFloat(style.borderRightWidth);
+      return {
+        unused: contentRight - Math.max(...chips.map((chip) => chip.getBoundingClientRect().right)),
+        titles: chips.map((chip) => chip.title),
+      };
+    });
+    expect(geometry.unused).toBeLessThan(1);
+    expect(geometry.titles.every((title) => title.length > 0)).toBe(true);
   });
 
   /** Scenario: the Daemons screen pages its fifteen tiles with Voice on, and the four tiles on page one bear the same numbers as their focus keys. */
