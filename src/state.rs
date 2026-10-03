@@ -1244,7 +1244,7 @@ pub struct OrchestrationRoleRecord {
 /// | event `(pane_id, agent_id)` | admitted when |
 /// |---|---|
 /// | `(Some(P), Some(A))` | generation `A` claims pane `P`, **and** `A` is live, or `A` is retired and no other generation claims `P` |
-/// | `(Some(P), None)` | some generation claims `P` — the producer named none, so the pane is all there is to go on |
+/// | `(Some(P), None)` | some generation that the first row would admit for `P` claims it — the producer named none, so the pane is all there is to go on, but a retired generation's grace ends here exactly where it ends in the first row (issue #698) |
 /// | `(None, Some(A))` | `A` is a genuinely pane-less generation (live or retired) |
 /// | `(None, None)` | never — [`AppState`] falls back to its historical rule |
 ///
@@ -22275,6 +22275,125 @@ while True:
              still be admitted after its PTY EOF — otherwise the SessionEnd is \
              dropped, the pane's session state is never removed, and every \
              short-lived agent leaves one behind; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698, the control at the admission layer: the test above with the
+    /// producer naming NO generation — a pre-F9 hook script, or a wrapper that
+    /// lost `DOT_AGENT_DECK_AGENT_ID` (PRD #110 / issue #398). Its final
+    /// `SessionEnd`, read after the PTY EOF, must still remove the pane's
+    /// session when nothing has taken the pane over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_late_untagged_final_report_lands_after_the_pty_eof() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "untagged-farewell-pane-698";
+        let agent_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )],
+                ..Default::default()
+            })
+            .expect("spawn a short-lived agent onto the pane");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let untagged = |event_type| {
+            let mut event = report_454(pane, &agent_id, event_type);
+            event.agent_id = None;
+            event
+        };
+        state.apply_event(untagged(EventType::SessionStart));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "precondition: the untagged SessionStart must be admitted"
+        );
+        let farewell = untagged(EventType::SessionEnd);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        state.apply_event(farewell);
+
+        assert!(
+            state.sessions.is_empty(),
+            "an untagged final report for a pane whose generation exited with no \
+             successor must still land after the PTY EOF; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698: an untagged report naming a pane whose retired generation
+    /// was handed over, and whose successor was then reaped, drives nothing.
+    ///
+    /// Both generations are gone, and the keyed form of the same report — the
+    /// predecessor's id on its own pane — has been refused since the handover.
+    /// The untagged form must not be the way around that: it used to be owned,
+    /// because the pane-only ownership arm matched any record still naming the
+    /// pane, and so it minted a session card for a defunct pane.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untagged_report_for_a_handed_over_then_reaped_pane_drives_nothing() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "handed-over-reaped-pane-698";
+        let opts = |command| crate::agent_pty::SpawnOptions {
+            command: Some(command),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane.to_string(),
+            )],
+            ..Default::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once its child is gone");
+        registry.close_agent(&new).expect("close the successor");
+
+        let keyed = report_454(pane, &old, EventType::Thinking);
+        let mut untagged = report_454(pane, &old, EventType::Thinking);
+        untagged.agent_id = None;
+
+        state.apply_event(keyed);
+        assert!(
+            state.sessions.is_empty(),
+            "precondition: the handed-over predecessor's own report is refused"
+        );
+        state.apply_event(untagged);
+        assert!(
+            state.sessions.is_empty(),
+            "the same report with its generation stripped must be refused too — \
+             nothing is left on the pane to speak for it; sessions={:?}",
             state.sessions.keys().collect::<Vec<_>>()
         );
         registry.shutdown_all();

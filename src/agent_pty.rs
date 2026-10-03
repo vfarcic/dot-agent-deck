@@ -12300,18 +12300,7 @@ impl AgentPtyRegistry {
                 match inner.agents.get(agent) {
                     // Published, and this really is its pane.
                     Some(a) if a.pane_id_env.as_deref() == Some(pane) => {
-                        // Round 3 (auditor finding 4): `pane_handed_over` is the
-                        // MONOTONE half of the retirement rule and has to be
-                        // read first. `pane_claimed_by_other` looks at who holds
-                        // the pane NOW, which un-answers itself the moment the
-                        // successor exits too — so a retired generation got its
-                        // pane back once both records were dead. The flag is set
-                        // as the pane changes hands and is never cleared, so the
-                        // handover is permanent no matter what becomes of the
-                        // successor. See [`RunningAgent::pane_handed_over`].
-                        let disowned =
-                            a.pane_handed_over || Self::pane_claimed_by_other(&inner, pane, agent);
-                        if !a.exited.load(Ordering::SeqCst) || !disowned {
+                        if Self::generation_speaks_for_pane(&inner, agent, a, pane) {
                             Ownership::Owned
                         } else {
                             Ownership::Unclaimed
@@ -12326,17 +12315,26 @@ impl AgentPtyRegistry {
             // A producer that named no generation: a pre-F9 hook script, or any
             // wrapper that lost `DOT_AGENT_DECK_AGENT_ID` on the way (PRD #110 /
             // issue #398 keep this shape working deliberately). There is nothing
-            // to bind to, so the pane is the whole answer — any generation
-            // claiming it, live or retired, admits. Unchanged from round 1.
+            // to bind to, so the pane is the whole answer — any generation that
+            // the keyed arm above would let speak for it admits: an in-flight
+            // spawn, a live generation, or a retired one still inside its grace.
+            //
+            // Issue #698: the SAME retirement rule as the keyed arm, not "any
+            // record still naming the pane". A retired generation whose pane was
+            // handed over may not speak for it under its own id, and dropping
+            // the id must not be the way around that — with its successor reaped
+            // too, the pane has nobody left to answer for it. The lone retiree
+            // with no successor still admits, which is what lets a late
+            // token-less final `Idle`/`SessionEnd` land after the PTY EOF.
             (Some(pane), None) => {
                 let claimed = inner
                     .pending_spawns
                     .values()
                     .any(|reserved| reserved.as_deref() == Some(pane))
-                    || inner
-                        .agents
-                        .values()
-                        .any(|a| a.pane_id_env.as_deref() == Some(pane));
+                    || inner.agents.iter().any(|(id, a)| {
+                        a.pane_id_env.as_deref() == Some(pane)
+                            && Self::generation_speaks_for_pane(&inner, id, a, pane)
+                    });
                 if claimed {
                     Ownership::Owned
                 } else {
@@ -12529,6 +12527,31 @@ impl AgentPtyRegistry {
             .expect("registry lock poisoned in a test seam")
             .pending_spawns
             .insert(agent_id.to_string(), Some(pane_id.to_string()));
+    }
+
+    /// The retirement rule, shared by both pane-naming arms of
+    /// [`Self::generation_ownership`]: may the published generation `id`,
+    /// whose record `a` names `pane`, still speak for that pane?
+    ///
+    /// A live generation always may. A retired one may until its pane changes
+    /// hands — the grace that lets a final `Idle`/`SessionEnd` written just
+    /// before exit land after the PTY EOF was observed.
+    ///
+    /// Round 3 (auditor finding 4): `pane_handed_over` is the MONOTONE half of
+    /// the rule and has to be read first. `pane_claimed_by_other` looks at who
+    /// holds the pane NOW, which un-answers itself the moment the successor
+    /// exits too — so a retired generation got its pane back once both records
+    /// were dead. The flag is set as the pane changes hands and is never
+    /// cleared, so the handover is permanent no matter what becomes of the
+    /// successor. See [`RunningAgent::pane_handed_over`].
+    fn generation_speaks_for_pane(
+        inner: &RegistryInner,
+        id: &str,
+        a: &RunningAgent,
+        pane: &str,
+    ) -> bool {
+        !a.exited.load(Ordering::SeqCst)
+            || !(a.pane_handed_over || Self::pane_claimed_by_other(inner, pane, id))
     }
 
     /// Issue #454 (round-2 audit): does any generation OTHER than `excluded`
@@ -15763,6 +15786,129 @@ mod spawn_tests {
             "the newest retired generation keeps its own grace period, exactly \
              as the sibling test above pins for a lone retiree — nothing has \
              claimed the pane after it"
+        );
+        assert!(
+            owns(&registry, Some("handback-pane-454"), None),
+            "and so does an untagged producer naming the pane: the successor's \
+             grace period is still open, so its late token-less final report \
+             must land (PRD #110 / issue #398)"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698, the control: the token-less (`(Some(P), None)`) arm keeps
+    /// the retirement grace a lone retired generation gets from the keyed arm.
+    ///
+    /// A pre-F9 hook script, or any wrapper that lost
+    /// `DOT_AGENT_DECK_AGENT_ID`, writes its final `Idle`/`SessionEnd` and exits
+    /// — and the PTY EOF can be observed before those bytes are read. With no
+    /// successor on the pane, that report must still be owned, or it is dropped
+    /// and the pane's session state leaks. This is the case directly adjacent to
+    /// the one #698 closes, and losing it is what broke the first round of the
+    /// #318 work, so it is pinned on its own.
+    #[tokio::test]
+    async fn a_lone_retired_generation_still_owns_its_pane_for_an_untagged_producer() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "lone-retiree-pane-698".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry
+                .agent_record_any(&id)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some("lone-retiree-pane-698"),
+            "precondition: the retired record must still be in the registry"
+        );
+
+        assert!(
+            owns(&registry, Some("lone-retiree-pane-698"), None),
+            "a retired generation with no successor still answers for its pane \
+             when the producer named no generation — that is what lets a late \
+             token-less final Idle/SessionEnd land after the PTY EOF"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698: the token-less arm applies the SAME retirement rule as the
+    /// keyed arm, so a pane whose retired generation was handed over and whose
+    /// successor was then reaped answers for nobody.
+    ///
+    /// `A` exits on `P` and lingers unreaped; `B` takes `P` (setting `A`'s
+    /// `pane_handed_over`); `B` is closed, and `close_agent` removes only `B`.
+    /// `A` still stands as `{exited, pane_handed_over}`. The keyed arm has said
+    /// `A` may not speak for `P` since the handover, and the pane-only arm used
+    /// to answer `Owned` anyway because it matched any record still naming `P`.
+    /// Both generations are gone, so nothing may speak for the pane.
+    #[tokio::test]
+    async fn a_handed_over_then_reaped_pane_owns_nothing_for_an_untagged_producer() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "handed-over-reaped-pane-698";
+        let opts = |command| SpawnOptions {
+            command: Some(command),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..SpawnOptions::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once the first child is gone");
+        registry.close_agent(&new).expect("close the successor");
+
+        assert!(
+            registry.agent_record_any(&new).is_none(),
+            "precondition: the successor's record must be reaped"
+        );
+        assert_eq!(
+            registry
+                .agent_record_any(&old)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some(pane),
+            "precondition: the handed-over predecessor must still be in the \
+             registry, or this test proves nothing about the pane-only arm"
+        );
+        assert_eq!(
+            registry.generation_ownership(Some(pane), Some(&old)),
+            Ownership::Unclaimed,
+            "precondition: the keyed arm already disowns the handed-over \
+             predecessor"
+        );
+
+        assert_eq!(
+            registry.generation_ownership(Some(pane), None),
+            Ownership::Unclaimed,
+            "an untagged producer naming a pane whose only remaining record was \
+             handed over must not be owned — the keyed arm refuses that \
+             generation, and the pane-only arm has to apply the same retirement \
+             rule rather than matching any record that still names the pane"
         );
         registry.shutdown_all();
     }
