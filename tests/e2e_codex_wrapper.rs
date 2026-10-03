@@ -137,8 +137,15 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         deck.snapshot_grid()
     );
 
+    // Issue #1493: a wrapper that could not get Codex's hooks trusted (no
+    // `codex` on this host's PATH) also reports quiet output as a classified
+    // Idle, so wait for the hook's.
     let idle = events.wait_for(
-        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.event_type == EventType::Idle
+                && !event.is_wrapper_output_classified()
+        },
         Duration::from_secs(15),
     );
     // Issue #540: the turn ends through Codex's native `Stop` hook, as it does

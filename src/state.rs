@@ -4905,7 +4905,17 @@ pub(crate) fn compose_respawn_failed_notice(worker_pane_id: &str) -> String {
 /// agent-specific evidence (a `Stop`-derived `Idle` from Claude *does* imply a
 /// turn; OpenCode's identically-typed startup `session.idle` does not) without
 /// another signature change.
+///
+/// Issue #1493: except a Codex pane's wrapper-classified frames. Codex's own
+/// hooks report its turns; what the wrapper reads off its output is drawing,
+/// and once the deck could not get those hooks trusted the wrapper reports
+/// drawing that RESUMES — which includes the echo of the very pointer being
+/// typed into the composer, submitted or not. Counting it would stop a submit
+/// recovery for a pointer still sitting unsubmitted.
 pub(crate) fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
+    if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() {
+        return false;
+    }
     match event.event_type {
         // Lifecycle: emitted by a booting or dying agent that never saw the prompt.
         EventType::SessionStart | EventType::SessionEnd => false,
@@ -14380,6 +14390,46 @@ impl AppState {
                 }
                 asserted
             }
+            // Issue #1493: what `dot-agent-deck wrap` reads off a Codex pane's
+            // output is NOT a status. The interactive Codex TUI paints its
+            // screen on boot and redraws it while idle, and the wrapper calls
+            // every printed line activity, so a freshly started Codex read as
+            // busy with no prompt sent. Its native hooks are what say a turn
+            // started, ran a tool, asked for permission and ended, the way
+            // Claude Code's do, so they decide the card and the wrapper's frame
+            // is journalled as liveness only.
+            //
+            // Unless the wrapper declared that the deck's prompt hook is not
+            // running (`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`): then
+            // nothing will ever announce a turn, and output is the only sign of
+            // one. The wrapper then reports output going quiet as a classified
+            // `Idle`, so the card reads Working while Codex is drawing and Idle
+            // once it stops, rather than Working forever. Each frame may only
+            // move a status that output itself could have set, so it never
+            // repaints a hook's Needs Input, Working tool or Error.
+            _ if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() => {
+                if !event.declares_prompt_reports_unavailable() {
+                    false
+                } else {
+                    match event.event_type {
+                        EventType::Thinking
+                            if matches!(
+                                session.status,
+                                SessionStatus::Idle | SessionStatus::Unknown
+                            ) =>
+                        {
+                            session.status = SessionStatus::Thinking;
+                            session.active_tool = None;
+                            true
+                        }
+                        EventType::Idle if session.status == SessionStatus::Thinking => {
+                            session.status = SessionStatus::Idle;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            }
             EventType::QuotaBlocked => {
                 // The daemon normalised the keys on arrival
                 // (`admit_producer_event`); the detail is scrubbed again here
@@ -14483,6 +14533,18 @@ impl AppState {
                 };
                 session.status = SessionStatus::WaitingForInput;
                 true
+            }
+            // OpenCode ends every run with `session.idle`, a failed one
+            // included, milliseconds after its `session.error`; repainting Idle
+            // there erased every OpenCode Error (`status/blocked/023`). The card
+            // stays Error until OpenCode works again — its next prompt or busy
+            // status. An interrupted turn arrives as `Idle` instead of `Error`
+            // (`crate::hook::build_opencode_event`).
+            EventType::Idle
+                if event.agent_type == AgentType::OpenCode
+                    && session.status == SessionStatus::Error =>
+            {
+                false
             }
             EventType::Idle => {
                 session.status = SessionStatus::Idle;
@@ -19032,6 +19094,18 @@ mod tests {
                 "{no_proof:?} can be emitted by an agent that never saw the prompt"
             );
         }
+        // Issue #1493: a Codex pane's painted output proves no turn, while a
+        // hookless wrapped agent's still does — it has no other evidence.
+        let mut codex_output = event(EventType::Thinking);
+        codex_output.agent_type = AgentType::Codex;
+        codex_output.metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        assert!(!worker_event_proves_delivery(&codex_output));
+        let mut generic_output = codex_output.clone();
+        generic_output.agent_type = AgentType::None;
+        assert!(worker_event_proves_delivery(&generic_output));
         for turn in [
             // Every supported agent maps "a user prompt was submitted" here.
             EventType::Thinking,
@@ -23325,6 +23399,187 @@ while True:
         state.apply_event(quota_blocked_event(BlockedKind::UsageLimit, "x", 15));
         let stats = state.aggregate_stats();
         assert_eq!((stats.blocked, stats.errors, stats.idle), (1, 0, 0));
+    }
+
+    /// Scenario: An OpenCode card gets a provider failure and then the
+    /// `session.idle` OpenCode sends as every run ends. The card stays Error
+    /// until the next prompt starts a turn; a Claude Code card whose Error is
+    /// followed by Idle still goes Idle (the control).
+    #[spec("status/blocked/027")]
+    #[test]
+    fn status_blocked_027_an_opencode_error_survives_the_idle_that_ends_its_run() {
+        let frame = |agent_type: AgentType, event_type: EventType, secs: i64| {
+            let mut event = codex_status_frame(event_type, false, secs);
+            event.agent_type = agent_type;
+            event
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(frame(AgentType::OpenCode, EventType::Thinking, 1));
+        state.apply_event(frame(AgentType::OpenCode, EventType::Error, 2));
+        for secs in 3..7 {
+            state.apply_event(frame(AgentType::OpenCode, EventType::Idle, secs));
+        }
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Error);
+        state.apply_event(frame(AgentType::OpenCode, EventType::Thinking, 8));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(frame(AgentType::OpenCode, EventType::Idle, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(frame(AgentType::ClaudeCode, EventType::Error, 1));
+        state.apply_event(frame(AgentType::ClaudeCode, EventType::Idle, 2));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+    }
+
+    /// Issue #1493: one frame on the Codex pane `pane-x`, from the wrapper
+    /// (`wrap-x`, the wrapper's own session) or from Codex's native hooks
+    /// (`codex-x`).
+    fn codex_status_frame(event_type: EventType, from_wrapper: bool, secs: i64) -> AgentEvent {
+        AgentEvent {
+            session_id: if from_wrapper { "wrap-x" } else { "codex-x" }.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("pane-x".to_string()),
+            agent_id: Some("agent-x".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// The wrapper's fork-time start, then output it classified, each declaring
+    /// the prompt hook unavailable when `untrusted`.
+    fn codex_wrapper_frame(event_type: EventType, untrusted: bool, secs: i64) -> AgentEvent {
+        let mut event = codex_status_frame(event_type.clone(), true, secs);
+        if event_type == EventType::SessionStart {
+            event.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+        } else {
+            event.metadata.insert(
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+            );
+        }
+        if untrusted {
+            event.metadata.insert(
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+            );
+        }
+        event
+    }
+
+    fn pane_x_card(state: &AppState) -> SessionState {
+        let cards: Vec<_> = state
+            .sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some("pane-x"))
+            .collect();
+        assert_eq!(cards.len(), 1, "one Codex pane keeps one card: {cards:#?}");
+        cards[0].clone()
+    }
+
+    /// Scenario: Feed one deck-launched Codex card the wrapper's start and its
+    /// classified output, interleaved with a whole turn of Codex's native
+    /// hooks. With the hooks trusted the card reads Idle before any prompt,
+    /// Thinking, Working with the tool, Needs Input, Idle after Stop, and stays
+    /// Idle through the redraws that follow; with the prompt hook declared
+    /// unavailable, output reads Working until it goes quiet, never forever.
+    #[spec("codex/status/002")]
+    #[test]
+    fn codex_status_002_hooks_decide_a_codex_card_and_output_only_when_they_cannot() {
+        // Trusted hooks.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 2));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "started, no prompt yet: the boot paint is not work"
+        );
+
+        state.apply_event(codex_status_frame(EventType::SessionStart, false, 3));
+        let mut prompt = codex_status_frame(EventType::Thinking, false, 4);
+        prompt.user_prompt = Some("list the files".to_string());
+        state.apply_event(prompt);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        let mut tool = codex_status_frame(EventType::ToolStart, false, 5);
+        tool.tool_name = Some("Bash".to_string());
+        tool.tool_detail = Some("ls".to_string());
+        state.apply_event(tool);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 6));
+        let card = pane_x_card(&state);
+        assert_eq!(card.status, SessionStatus::Working, "tool running");
+        assert_eq!(card.active_tool.map(|t| t.name).as_deref(), Some("Bash"));
+
+        state.apply_event(codex_status_frame(EventType::PermissionRequest, false, 7));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, false, 8));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::WaitingForInput,
+            "permission prompt on screen"
+        );
+        state.apply_event(codex_status_frame(EventType::ToolEnd, false, 9));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        state.apply_event(codex_status_frame(EventType::Idle, false, 10));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "turn finished"
+        );
+        for secs in 11..14 {
+            state.apply_event(codex_wrapper_frame(EventType::Thinking, false, secs));
+            state.apply_event(codex_wrapper_frame(EventType::Idle, false, secs));
+        }
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "redraws after Stop must leave the finished turn Idle"
+        );
+
+        // Prompt hook not running: output is the only sign of a turn.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 3));
+        assert_eq!(
+            pane_x_card(&state).status,
+            SessionStatus::Idle,
+            "output gone quiet ends the Working, rather than it lasting until exit"
+        );
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        // A hook that does run (trust from an earlier install) still outranks
+        // output: silence does not end a permission prompt.
+        state.apply_event(codex_status_frame(EventType::PermissionRequest, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 6));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 7));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::WaitingForInput);
+
+        // Control: an agent the wrapper hosts with no hooks at all keeps its
+        // output-derived Working, as before.
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        let mut generic = codex_wrapper_frame(EventType::Thinking, false, 1);
+        generic.agent_type = AgentType::None;
+        state.apply_event(generic);
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
     }
 
     /// Scenario: Block a card with a quota event, then send it the tool
