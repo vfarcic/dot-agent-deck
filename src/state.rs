@@ -11855,6 +11855,7 @@ impl AppState {
             // same `cwd` and orchestration, before anything is armed.
             if registry.pane_occupant_has_exited(&pane_id)
                 && !delegate_respawns_worker(
+                    configs,
                     self.pane_cwd_map.get(&pane_id).map(String::as_str),
                     orchestration.as_ref(),
                     &target_role,

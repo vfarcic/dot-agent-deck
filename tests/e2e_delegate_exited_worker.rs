@@ -195,8 +195,11 @@ fn delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_de
          still be delivered — refusing it would turn a working delivery into a failure\n{}",
         describe(&third)
     );
+    // The replacement is a shell, which reports no `SessionStart`, so the
+    // dispatch writes its pointer only once the delegate's readiness wait gives
+    // up — measured at 30.0 s. 90 s clears that with room for a busy box.
     assert!(
-        common::wait_until(Duration::from_secs(30), || role_has_pointer(&deck, FRESH)),
+        common::wait_until(Duration::from_secs(90), || role_has_pointer(&deck, FRESH)),
         "the respawned `fresh` worker never received its task pointer; records = {:?}",
         common::agent_records_on(deck.attach_socket_path())
     );
