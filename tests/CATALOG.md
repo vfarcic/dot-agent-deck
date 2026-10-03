@@ -2585,6 +2585,50 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/wire-restart
+
+##### lifecycle/wire-restart/001 — An idle daemon restarts onto its installed target without confirmation.
+- **Layer:** L2 (lane 1, real headless `daemon serve` at an isolated endpoint).
+- **Agent:** none.
+- **Asserts:** Hello advertises `restart-daemon`; the production client helper returns Accepted with an empty stopping set and a verified target version; the original process exits cleanly; a wrapper atomically installed at the daemon's captured startup path launches a different successor PID that answers Hello at the same endpoint.
+- **Does not assert:** two independently compiled release versions, SSH installation, CLI prompts, desktop or TUI rendering; the wrapper executes a retained copy of the same test build.
+- **Platform coverage:** linux+mac (Unix sockets and executable install fixtures).
+
+##### lifecycle/wire-restart/002 — Live agents and orchestration roles require explicit confirmation and remain untouched.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** three synthetic `cat` stand-ins, one ordinary agent and two orchestration roles.
+- **Asserts:** repeated unconfirmed requests return NeedsConfirmation with stale false and every stable agent identity, label, pane and cwd, plus both roles and the orchestrator marker; the original daemon stays alive, no successor launches, ListAgents retains the same identities and both roles, and each stand-in PID remains running.
+- **Does not assert:** confirmation UI, real-agent work or installed release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/003 — Returning the matching confirmed set stops the disclosed work and replaces the daemon.
+- **Layer:** L2 (lane 1, real headless daemon and installed-target fixture).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** returning the daemon's disclosed set with reversed agent and role order yields Accepted naming the full stop set; the original daemon exits, every named stand-in PID stops, and a different successor PID answers Hello with empty agent and role inventories.
+- **Does not assert:** UI consent, real-agent behavior, two-release handover or client-spawned successor mode.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/004 — A newly spawned identity makes an earlier confirmation stale without stopping work.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** four synthetic `cat` stand-ins, including two roles and two ordinary agents sharing a display name.
+- **Asserts:** after one extra agent starts, returning the earlier set yields NeedsConfirmation with stale true and all four identities plus both roles; the original daemon, each stand-in PID and the role map remain alive, and no successor launches.
+- **Does not assert:** removed or reassigned roles, perpetual mutation retry limits, UI consent or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/005 — Failed install-target verification preserves the daemon and all live work.
+- **Layer:** L2 (lane 1, owned startup executable atomically replaced under a real headless daemon).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** a non-executable target yields Refused/TargetMissing; an executable whose version probe exits 23 yields Refused/TargetDidNotAnswer; verification refuses before asking for consent, with an explanation, while the original daemon PID, agent identities, live stand-in PIDs and role map remain unchanged.
+- **Does not assert:** Homebrew resolution, verification timeout, wrong architecture, expected-version mismatch, UI or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/006 — Concurrent restart requests accept exactly one handover.
+- **Layer:** L2 (lane 1, two production clients against a real headless daemon).
+- **Agent:** none.
+- **Asserts:** while the first request is inside a filesystem-gated installed-target version probe, a second returns Refused/InProgress before the gate opens; the first then returns Accepted, the original daemon exits, and one recorded successor PID answers Hello at the original endpoint.
+- **Does not assert:** client UI deduplication, real-agent teardown or cross-release compatibility.
+- **Platform coverage:** linux+mac.
+
 #### lifecycle/wire-stop
 
 ##### lifecycle/wire-stop/001 — `StopDaemon` REFUSES over the wire while orchestration roles are live, and carries the panes, the roles and both renderings back (issue #1049).
@@ -2788,11 +2832,12 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/008 — A daemon whose `Hello` omits `capabilities` makes a project-aware client WITHHOLD the project verbs, and the withheld verb never reaches the wire (PRD #819 M5 capability negotiation).
+##### lifecycle/handshake/008 — Capability-absent project and restart verbs are withheld before the wire.
 - **Layer:** L2 (lane 1 — a real `DaemonClient` against a protocol-faithful synthetic daemon on its own Unix socket; no binary is spawned).
 - **Agent:** none (a scripted in-process daemon thread; the production `Hello` handler calls `AttachResponse::with_capabilities()` unconditionally and takes no argument, so no real daemon can be asked to omit the field, and a production env knob on the `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` model would fake the thing being measured).
 - **Asserts:** against a `Hello` with no `capabilities` key, `DaemonCapabilities::is_advertised()` is false, `require_capability` declines all three of `list-projects` / `resolve-project` / `prepare-orchestration` with a `ClientError::Server` naming the capability, the real M6 call sites `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration` each fail with that same decline, and — the core claim — the scripted daemon's own request log holds the single `hello` and nothing else, so no project verb reached the wire and the `unknown variant …` refusal text was never read. Against a second scripted daemon that DOES advertise, the same `DaemonClient::list_projects` proceeds: all three capabilities are permitted, `list-projects` appears in that daemon's log after one handshake, and the scripted listing comes back.
 - **Does not assert:** any TUI or desktop surface (PRD #819 leaves the TUI's project-resolution sites out of scope, so the client methods are driven directly rather than through a UI); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
+- **Also asserts:** the production `DaemonClient::restart_daemon` returns Unsupported against both an omitted capabilities field and a present set lacking `restart-daemon`; two calls on the same handle each add exactly one fresh Hello to the peer's request log, with no restart or fallback stop frame.
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/handshake/009 — A daemon on a different attach protocol with a live agent: declining the restart prompt refuses to attach, names both protocol numbers, and leaves the daemon and its agent running (issue #405).
@@ -4893,6 +4938,82 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** after `remote remove` removes a second row, the first row still has its `id`, `user`, `jump_host`, `socket`, and unknown `some_future_field` values in valid TOML.
 - **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
 - **Platform coverage:** mac+linux+windows.
+
+### Remote upgrade and connect (PRD #1487)
+
+#### remote/upgrade
+
+##### remote/upgrade/001 — TTY upgrades restart idle daemons without a question.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, real sandboxed daemon, SSH shell shim and deterministic download).
+- **Agent:** none.
+- **Asserts:** idle upgrade installs and restarts without asking; restarted summary names from/to versions; a different installed successor PID answers on the same endpoint.
+- **Does not assert:** independently compiled releases, SSH authentication, real-agent work or desktop UI. Old/new debug build stamps distinguish processes executing one retained Cargo build; synthetic PTY coverage is not reel-eligible.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/002 — Piped live upgrades install and keep the current daemon.
+- **Layer:** L2 (lane 1, real CLI with piped stdout and sandboxed SSH installer/daemon).
+- **Agent:** three synthetic cat stand-ins.
+- **Asserts:** no question or hang; exit 0 after installation; live work keeps the original daemon and role map, with a visible installed-not-restarted explanation naming blockers.
+- **Does not assert:** real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/003 — JSON upgrades emit structured outcomes with correct exit codes.
+- **Layer:** L2 (lane 1, real CLI and sandboxed installer/daemon).
+- **Agent:** synthetic cat stand-ins in the live case.
+- **Asserts:** stdout parses as one UpgradeOutcome with kebab-case restarted, installed-not-restarted and failed tags; restarted carries from/to versions; live no-one-to-ask reason contains every agent and role; installation failure names the installing stage and download reason; process outcomes and exit codes agree.
+- **Does not assert:** exact JSON whitespace, every shared outcome variant, real SSH or release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/004 — An older daemon is installed over without receiving a restart frame.
+- **Layer:** L2 (lane 1, real CLI/installer and protocol-faithful Unix-socket old peer).
+- **Agent:** none.
+- **Asserts:** installation succeeds and CLI exits 0; output explains that the daemon is too old to restart itself and gives a remedy; the old peer remains reachable, receives only Hello frames and no successor starts.
+- **Does not assert:** genuine previous-release compatibility (cargo xver owns that), real SSH or TTY rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/005 — Installation failure identifies its stage and preserves live work.
+- **Layer:** L2 (lane 1, real CLI/daemon and deterministic failing download).
+- **Agent:** three synthetic cat stand-ins, including two orchestration roles.
+- **Asserts:** exit nonzero; visible installing-stage reason; installed bytes, original daemon PID/build, agent identities/PIDs and role map remain unchanged.
+- **Does not assert:** restart/verification-stage failures (wire-restart/005 and shared-function coverage own those), real SSH or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/006 — A TTY restart question discloses live agents and roles and honors both choices.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, sandboxed SSH installer and real daemon).
+- **Agent:** three synthetic cat stand-ins, including an orchestrator and coder role.
+- **Asserts:** installation finishes before the question; prompt names all labels, panes, roles, orchestration and orchestrator; Enter preserves the original daemon, agent identities/PIDs and role map; r stops the named work and replaces the daemon.
+- **Does not assert:** real SSH, release compatibility or real-agent work; no reel marker for stand-ins.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/007 — An idle daemon restarts without a TTY.
+- **Layer:** L2 (lane 1, real CLI with piped stdout, sandboxed SSH installer and real daemon).
+- **Agent:** none.
+- **Asserts:** installation and silent restart complete with exit 0 and from/to versions despite no TTY; successor has a new PID/build and answers on the same endpoint (D6 ruling).
+- **Does not assert:** real SSH or independently compiled releases.
+- **Platform coverage:** linux+mac.
+
+#### remote/connect
+
+##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, SSH shell shim, real daemon).
+- **Agent:** three synthetic cat stand-ins in the live cases.
+- **Asserts:** y at Upgrade and connect installs; live restart question names all agents and roles; Enter connects to the old daemon with preserved live work and renders its upgrade-team tab with lead and coder cards; r connects to a different successor at the installed build and renders its empty dashboard; neither asks a second remote handshake question and the shared outcome is visible.
+- **Does not assert:** private shared-function routing, independently compiled releases, SSH authentication, real-agent work or desktop UI; no reel marker for synthetic coverage.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/002 — Declining the upgrade still connects to the existing daemon.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty and sandboxed SSH).
+- **Agent:** none.
+- **Asserts:** N and Enter at Upgrade and connect reach the empty dashboard, preserving original daemon PID/build and installed bytes; hooks/install and restart questions do not run.
+- **Does not assert:** live-work decline policy, real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/003 — An idle upgrade-and-connect reaches the new daemon without a second question.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, sandboxed SSH and real daemon).
+- **Agent:** none.
+- **Asserts:** y installs and restarts the idle remote, a different PID/build answers, the empty dashboard renders, the shared restarted outcome is visible and no second handshake consent appears.
+- **Does not assert:** real SSH, independently compiled releases, real-agent work or desktop UI.
+- **Platform coverage:** linux+mac.
 
 ### Remote diagnostics (PRD #345)
 
