@@ -284,6 +284,13 @@ struct Emitter {
 }
 
 impl Emitter {
+    /// Discard any output-derived frame still waiting and send no more.
+    fn close_classified(&self) {
+        if let Some(sender) = &self.classified_sender {
+            sender.close();
+        }
+    }
+
     /// Send one frame derived from the child's output: through
     /// [`Self::classified_sender`] when there is one, inline otherwise.
     fn send_classified(&self, event: &AgentEvent) {
@@ -2136,6 +2143,7 @@ const CLASSIFIED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 struct LatestSend {
     slot: Mutex<Option<String>>,
     ready: std::sync::Condvar,
+    closed: AtomicBool,
 }
 
 impl LatestSend {
@@ -2143,6 +2151,7 @@ impl LatestSend {
         let sender = Arc::new(Self {
             slot: Mutex::new(None),
             ready: std::sync::Condvar::new(),
+            closed: AtomicBool::new(false),
         });
         let worker = Arc::clone(&sender);
         std::thread::spawn(move || {
@@ -2162,10 +2171,22 @@ impl LatestSend {
         sender
     }
 
-    /// Replace whatever is waiting with `json`.
+    /// Replace whatever is waiting with `json` — unless [`Self::close`] ran.
     fn post(&self, json: String) {
-        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        *slot = Some(json);
+        drop(slot);
         self.ready.notify_one();
+    }
+
+    /// Drop whatever is waiting, and every later [`Self::post`].
+    fn close(&self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        self.closed.store(true, Ordering::SeqCst);
+        *slot = None;
     }
 }
 
@@ -2779,6 +2800,11 @@ fn run_wrap_pty(
         Some(s) => (s.success(), s.code().unwrap_or(1) as u8),
         None => (false, 1),
     };
+    // Issue #1493 (Qodo on PR #1523): nothing derived from the child's output
+    // may follow its exit status — a frame still waiting would repaint a
+    // finished pane. One already on the wire is stamped before this one and
+    // the deck drops it as stale.
+    emitter.close_classified();
     emitter.emit(if success {
         EventType::Idle
     } else {
@@ -2914,6 +2940,11 @@ fn run_wrap_pipe(
         Ok(s) => (s.success(), s.code().unwrap_or(1) as u8),
         Err(_) => (false, 1),
     };
+    // Issue #1493 (Qodo on PR #1523): nothing derived from the child's output
+    // may follow its exit status — a frame still waiting would repaint a
+    // finished pane. One already on the wire is stamped before this one and
+    // the deck drops it as stale.
+    emitter.close_classified();
     emitter.emit(if success {
         EventType::Idle
     } else {
@@ -3103,6 +3134,23 @@ mod tests {
         assert_eq!(DetectedEvent::Working.event_type(), EventType::Thinking);
         assert_eq!(DetectedEvent::Error.event_type(), EventType::Error);
         assert_eq!(DetectedEvent::Idle.event_type(), EventType::Idle);
+    }
+
+    /// Issue #1493 (Qodo on PR #1523): once closed for the child's exit, the
+    /// output-derived sender holds nothing and takes nothing more, so no stale
+    /// Thinking can follow the exit status.
+    #[test]
+    fn a_closed_classified_sender_keeps_nothing() {
+        let sender = LatestSend::spawn();
+        sender.close();
+        sender.post("{}".to_string());
+        assert!(
+            sender
+                .slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
     }
 
     /// Issue #1493: for a wrapped Codex with no prompt hook, output going quiet

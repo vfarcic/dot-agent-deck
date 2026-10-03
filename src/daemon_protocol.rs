@@ -9052,7 +9052,6 @@ mod tests {
             subagent_wait: None,
             prompt_reports_unavailable: false,
             prompt_reports_declared: false,
-            wrapper_output_at: None,
         };
         let snap = session.live_snapshot();
         assert_eq!(

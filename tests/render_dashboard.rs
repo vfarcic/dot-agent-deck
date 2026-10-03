@@ -103,7 +103,6 @@ fn pane_004_card_title_row() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     // The 80-cell buffer leaves ample room for the full bottom-border stats
     // title. Height comes from the density tier itself so the snapshot's
@@ -154,7 +153,6 @@ fn card_stats_session(cwd: &str) -> SessionState {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     }
 }
 
@@ -636,7 +634,6 @@ fn placeholder_card(selected: bool) -> ratatui::buffer::Buffer {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     let width: u16 = 40;
     let density = CardDensityKind::Normal;
@@ -831,7 +828,6 @@ fn pane_007_pi_card_shows_pi_identity() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -898,7 +894,6 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     let width: u16 = 80;
     let density = CardDensityKind::Normal;
@@ -1158,7 +1153,6 @@ fn palette_session(status: SessionStatus) -> SessionState {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     }
 }
 
@@ -2047,7 +2041,6 @@ fn pane_005_highlight_follows_selected_session_id() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     let s1 = make("sess-alpha", "pane-1", "1", "/home/dev/alpha");
     let s2 = make("sess-beta", "pane-2", "2", "/home/dev/beta");
@@ -2252,7 +2245,6 @@ fn filled_session() -> SessionState {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     }
 }
 
@@ -3016,7 +3008,6 @@ fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     };
     let density = CardDensityKind::Normal;
     let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
@@ -3364,7 +3355,6 @@ fn role_session(index: usize, role: &str) -> SessionState {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
-        wrapper_output_at: None,
     }
 }
 

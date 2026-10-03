@@ -1044,14 +1044,6 @@ pub struct SessionState {
     /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
     /// TUI learns it again from the producer's next event.
     pub prompt_reports_declared: bool,
-    /// Issue #1493: the producer timestamp of the newest frame `dot-agent-deck
-    /// wrap` sent about a Codex pane's OUTPUT — a classified frame, or one of
-    /// its interface starts, which say the output went quiet. The wrapper sends
-    /// those from more than one thread, each on its own connection, so they can
-    /// arrive out of order; a classified frame older than this is a status the
-    /// wrapper has already moved past, and asserts nothing. Process-local, like
-    /// [`Self::prompt_reports_unavailable`].
-    pub wrapper_output_at: Option<DateTime<Utc>>,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -11654,7 +11646,6 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
-                wrapper_output_at: None,
             },
         );
         session_id
@@ -16137,7 +16128,6 @@ impl AppState {
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
-                wrapper_output_at: None,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -16166,7 +16156,7 @@ impl AppState {
         // with the newest frame OBSERVED for the session and never regresses
         // (`status/supersede/004`).
         // Issue #1493 (Qodo on PR #1523): the newest frame seen BEFORE this
-        // one, for the wrapper-start arm below.
+        // one: a Codex wrapper frame stamped before it is stale (the arms below).
         let newest_before = session.last_activity;
         if event.timestamp > session.last_activity {
             session.last_activity = event.timestamp;
@@ -16425,12 +16415,12 @@ impl AppState {
             // move a status that output itself could have set, so it never
             // repaints a hook's Needs Input, Working tool or Error.
             _ if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() => {
-                let stale = session
-                    .wrapper_output_at
-                    .is_some_and(|newest| event.timestamp < newest);
-                if !stale {
-                    session.wrapper_output_at = Some(event.timestamp);
-                }
+                // Out of order: the wrapper sends these from more than one
+                // thread, each on its own connection, so one can land after a
+                // frame it predates — its own quiet Idle or settled start, a
+                // native hook, the exit status. Stamped older than anything the
+                // card has already seen, it is a status the pane has moved past.
+                let stale = event.timestamp < newest_before;
                 if stale || !event.declares_prompt_reports_unavailable() {
                     false
                 } else {
@@ -16494,17 +16484,6 @@ impl AppState {
                 false
             }
             EventType::SessionStart => {
-                // Issue #1493: the wrapper's start says its child's output went
-                // quiet (or that it took raw input), so a classified frame the
-                // wrapper produced before it must not repaint over it.
-                if event.agent_type == AgentType::Codex
-                    && event.is_wrapper_interface_session_start()
-                    && session
-                        .wrapper_output_at
-                        .is_none_or(|newest| event.timestamp > newest)
-                {
-                    session.wrapper_output_at = Some(event.timestamp);
-                }
                 session.status = SessionStatus::Idle;
                 session.active_tool = None;
                 true
@@ -24592,7 +24571,6 @@ while True:
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
                 prompt_reports_declared: false,
-                wrapper_output_at: None,
             },
         );
 
@@ -26066,6 +26044,21 @@ while True:
         assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 21));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        // A classified Thinking still in flight when the wrapper reported the
+        // child's exit lands after it and is older: the finished pane stays
+        // Idle (Qodo on PR #1523).
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        let mut exited = codex_status_frame(EventType::Idle, true, 7);
+        exited.metadata.insert(
+            crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY.to_string(),
+            crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE.to_string(),
+        );
+        state.apply_event(exited);
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
 
         // A wrapper interface start that arrives after frames it predates — an
         // untrusted Thinking, or a native prompt — does not reset the card
