@@ -603,8 +603,12 @@ fn check_self_contained(root: &Path) -> Vec<String> {
 /// harness, or `child_lifetime_bound::arm()` for the ones that deliberately do
 /// not (`tests/common/child_lifetime_bound.rs` is `#[path]`-includable on its
 /// own, because `tests/common/mod.rs` is ~420 KB of PTY harness and pulling it
-/// into a fast-tier crate to reach one `set_var` is a real compile cost). Either
-/// marker anywhere in the file clears it.
+/// into a fast-tier crate to reach one variable is a real compile cost). Either
+/// marker anywhere in the file clears it. Since issue #678 neither call writes
+/// anything — the cap is pinned by a constructor in
+/// `tests/common/child_lifetime_bound.rs` that runs before `main` — so what a
+/// marker really proves is that the file includes the module carrying that
+/// constructor, because neither call compiles without it.
 ///
 /// **The view both halves are matched over** is comment-stripped AND
 /// literal-blanked ([`blank_string_literal_contents`]), so prose about either
@@ -618,13 +622,14 @@ fn check_self_contained(root: &Path) -> Vec<String> {
 /// **Its false-negative surface, stated rather than hidden.** This is a line
 /// scan, not a parser, so it is a belt: the load-bearing protection is the fd
 /// fix in `src/wrap.rs`, which makes a stranded child die of its own hangup with
-/// no env var involved. Three things it cannot see. It checks *presence*, not
-/// *ordering*, so an `arm()` call placed after the spawn passes. It is
-/// file-granular, so one armed test clears a second unarmed one in the same
-/// file. And it keys on the module being included under its own name, so
-/// `#[path = "common/child_lifetime_bound.rs"] mod bound;` defeats the marker.
-/// All three are review-visible in a way the original gap was not, which is the
-/// bar this rule is aiming at.
+/// no env var involved. Two things it cannot see. It is file-granular, so one
+/// marked test clears a second unmarked one in the same file — harmless since
+/// issue #678, because the constructor arms the whole binary either way, and
+/// the reason it used to also miss an `arm()` placed *after* the spawn is gone
+/// for the same reason. And it keys on the module being included under its own
+/// name, so `#[path = "common/child_lifetime_bound.rs"] mod bound;` defeats the
+/// marker. Both are review-visible in a way the original gap was not, which is
+/// the bar this rule is aiming at.
 const UNARMED_SPAWN_RULE: &str = "agent spawn path with no lifetime bound armed — this file \
      builds an `AgentPtyRegistry` or runs a daemon in-process, so the agents it spawns inherit \
      THIS process's environment, and `dot-agent-deck wrap` leaves both its self-defence and \

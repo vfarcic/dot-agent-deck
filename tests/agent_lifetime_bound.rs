@@ -18,13 +18,15 @@
 //! Measured on a live wrapper spawned by `delegate_007`: zero `MAX_LIFETIME`
 //! matches anywhere in its `/proc/<pid>/environ`. So #661 was mis-armed rather
 //! than unreachable, and the fix is one variable pinned once by
-//! `tests/common/child_lifetime_bound.rs`'s `arm()` — `agent_pty::spawn` scrubs
-//! named deck vars but does not `env_clear`, so a single value in the test
-//! process reaches every child of every spawn shape, present and future.
+//! `tests/common/child_lifetime_bound.rs` — `agent_pty::spawn` scrubs named deck
+//! vars but does not `env_clear`, so a single value in the test process reaches
+//! every child of every spawn shape, present and future. Since issue #678 that
+//! pin is written by a constructor before `main`, while the process has only
+//! its initial thread; `arm()` checks it ran and writes nothing.
 //!
-//! This file reaches it through `common::init_test_env()`, which calls the same
-//! `arm()`. The three spawning files that deliberately do not link the harness
-//! (`rehydration.rs`, `daemon_protocol.rs`, `shell_activity.rs`)
+//! This file links `common`, which declares that module and so carries the
+//! constructor. The three spawning files that deliberately do not link the
+//! harness (`rehydration.rs`, `daemon_protocol.rs`, `shell_activity.rs`)
 //! `#[path]`-include that one small file instead, and linkage-check rule 10
 //! fails the build when a file under `tests/` builds an `AgentPtyRegistry` or
 //! calls `run_daemon_with` without arming either way.
@@ -359,6 +361,86 @@ fn ambient_lifetime_caps_are_clamped_to_the_reapers_ceiling() {
     assert_eq!(clamped(Some("-1")).as_deref(), Some(ceiling.as_str()));
 }
 
+/// Set only on the re-executed child of
+/// [`the_cap_is_pinned_before_any_test_code_runs`]; its presence is what makes
+/// that test take its child half.
+const PRE_MAIN_CHILD_ENV: &str = "DAD_TEST_LIFETIME_PRE_MAIN_CHILD";
+
+/// What the child half prints before the value it found, so the parent can
+/// tell a real report from a child that ran nothing.
+const PRE_MAIN_MARKER: &str = "cap-seen-by-the-first-line-of-the-test=";
+
+/// Scenario: Re-execute this test binary with an over-long, a shorter and no
+/// ambient `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, and have the child read the
+/// variable on the first line of its test body — before it calls any harness
+/// function at all. Assert it already reads the clamped value (`300`, `120`,
+/// `300`), and that `arm()` then finds the constructor ran.
+///
+/// Issue #678: the cap used to be written by `arm()` from test setup, which
+/// raced any thread already reading the environment — and several callers ran
+/// it inside a multi-threaded Tokio runtime whose workers existed. It is now
+/// written by a constructor before `main`. Reading it before calling anything
+/// is how this test tells the two apart: under the old shape the first line of
+/// an un-armed test saw the raw ambient `3600`. The ambient value has to reach
+/// the child through its environment at exec, because that is what "inherited"
+/// means, and setting it in this process instead would itself be the kind of
+/// run-time write this issue removed.
+#[test]
+fn the_cap_is_pinned_before_any_test_code_runs() {
+    if std::env::var_os(PRE_MAIN_CHILD_ENV).is_some() {
+        let seen = std::env::var(MAX_LIFETIME_VAR).unwrap_or_else(|_| UNSET_MARKER.to_string());
+        println!("{PRE_MAIN_MARKER}{seen}");
+        common::child_lifetime_bound::arm();
+        return;
+    }
+
+    let name = "the_cap_is_pinned_before_any_test_code_runs";
+    let ceiling = MAX_LIFETIME_CEILING_SECS.to_string();
+    for (ambient, expected) in [
+        (Some("3600"), ceiling.as_str()),
+        (Some("120"), "120"),
+        (None, ceiling.as_str()),
+    ] {
+        let mut child = Command::new(std::env::current_exe().expect("test binary path"));
+        child
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(PRE_MAIN_CHILD_ENV, "1");
+        match ambient {
+            Some(value) => child.env(MAX_LIFETIME_VAR, value),
+            None => child.env_remove(MAX_LIFETIME_VAR),
+        };
+        let output = child.output().expect("re-execute the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child failed with ambient {ambient:?}:\n{stdout}\n{stderr}"
+        );
+        // libtest exits 0 when the filter matches nothing, so prove the child
+        // actually ran its half.
+        let seen = stdout
+            .lines()
+            // Anywhere in the line, not as a prefix: under `--nocapture` libtest
+            // prints `test <name> ... ` on the same line before the child's own
+            // output.
+            .find_map(|line| {
+                line.split_once(PRE_MAIN_MARKER)
+                    .map(|(_, seen)| seen.trim())
+            })
+            .unwrap_or_else(|| {
+                panic!("the child did not run {name} (ambient {ambient:?}):\n{stdout}\n{stderr}")
+            });
+        assert_eq!(
+            seen, expected,
+            "with ambient {MAX_LIFETIME_VAR}={ambient:?}, the first line of a test that \
+             called nothing saw {seen:?}. The cap must already be pinned and clamped \
+             before any test code runs — by the constructor in \
+             `tests/common/child_lifetime_bound.rs` — because writing it any later \
+             races threads that already exist (issue #678)."
+        );
+    }
+}
+
 /// The cap the SIGKILL probes below arm, in seconds.
 ///
 /// **3, not the parser's 1 s floor, and the difference is what keeps a starved
@@ -605,7 +687,7 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
 /// SIGHUP and reads nothing cannot be hung up, and this repo really spawns that
 /// shape (`tests/idle_worker_detector.rs`'s `trap '' TERM; exec cat`). For those,
 /// the only thing left is #661's forked reaper, and the only thing that arms it
-/// is the variable `common::init_test_env` now pins.
+/// is the variable `tests/common/child_lifetime_bound.rs` now pins.
 #[test]
 fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
     // Control: nothing armed, so nothing can end it. Run beside the armed probe

@@ -13,7 +13,8 @@ use crate::event::{
     RestartRoleSignal, SpawnRoleSignal, WorkDoneSignal, Writable,
 };
 use crate::project_config::{
-    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, ProjectConfig,
+    load_project_config,
 };
 /// Issue #714: the quota-block reason types live in [`crate::quota_block`], and
 /// are re-exported here beside the [`SessionStatus::Blocked`] they explain.
@@ -1178,6 +1179,22 @@ fn spawn_context_removal(path: std::path::PathBuf) {
     }
 }
 
+/// Issue #1339: `<base> · <n>`, the label a daemon-spawned run takes when its
+/// own title is already held. The base is shortened at a character boundary
+/// when the whole would pass [`crate::agent_pty::DISPLAY_NAME_MAX_LEN`], since
+/// `validate_tab_membership` drops an over-long title and the tab would then
+/// fall back to the canonical name — the very label the suffix was added to
+/// tell apart. The suffix is never the part cut.
+fn suffixed_run_title(base: &str, n: usize) -> String {
+    let suffix = format!(" · {n}");
+    let room = crate::agent_pty::DISPLAY_NAME_MAX_LEN.saturating_sub(suffix.len());
+    let mut end = base.len().min(room);
+    while !base.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &base[..end])
+}
+
 /// Issue #555: the directory half of an orchestration title's uniqueness key,
 /// resolved so that a symlink, a `..` component or any other alias of a
 /// directory is the SAME key as the directory itself — the same best-effort
@@ -1275,7 +1292,7 @@ pub struct OrchestrationRoleRecord {
 /// | event `(pane_id, agent_id)` | admitted when |
 /// |---|---|
 /// | `(Some(P), Some(A))` | generation `A` claims pane `P`, **and** `A` is live, or `A` is retired and no other generation claims `P` |
-/// | `(Some(P), None)` | some generation claims `P` — the producer named none, so the pane is all there is to go on |
+/// | `(Some(P), None)` | some generation that the first row would admit for `P` claims it — the producer named none, so the pane is all there is to go on, but a retired generation's grace ends here exactly where it ends in the first row (issue #698) |
 /// | `(None, Some(A))` | `A` is a genuinely pane-less generation (live or retired) |
 /// | `(None, None)` | never — [`AppState`] falls back to its historical rule |
 ///
@@ -2049,6 +2066,10 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 /// the file per delegation (as `lookup_orchestration_role` already does) means
 /// an edited timeout takes effect on the next delegate without a respawn.
 ///
+/// Reads the file on the calling thread. A request handler resolves the same
+/// value through [`worker_response_timeout_in`], from configs read with no state
+/// guard held (issue #1387).
+///
 /// PRD #126 M1 audit (finding 4) — bounds, for BOTH sources:
 ///
 /// * **`0` means "detector disabled"**, explicitly and for either source. The
@@ -2063,6 +2084,16 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 ///   file/default, an out-of-range file value falls back to
 ///   [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`]. Nothing is clamped silently.
 pub fn worker_response_timeout(
+    orchestration_cwd: Option<&str>,
+    worker_cwd: Option<&str>,
+) -> Option<std::time::Duration> {
+    let configs = ProjectConfigs::load_blocking(orchestration_cwd.into_iter().chain(worker_cwd));
+    worker_response_timeout_in(&configs, orchestration_cwd, worker_cwd)
+}
+
+/// [`worker_response_timeout`], resolved from configs the caller already read.
+fn worker_response_timeout_in(
+    configs: &ProjectConfigs,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
@@ -2091,9 +2122,8 @@ pub fn worker_response_timeout(
         .into_iter()
         .chain(worker_cwd)
         .find_map(|cwd| {
-            load_project_config(std::path::Path::new(cwd))
-                .ok()
-                .flatten()
+            configs
+                .get(cwd)
                 .map(|cfg| cfg.worker_response_timeout_minutes)
         })
         .unwrap_or(DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES);
@@ -3419,7 +3449,7 @@ fn release_reserved_silence_watch(
     }
 }
 
-/// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
+/// PRD #126: take the resolved timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
 /// three ways it legitimately does nothing stay legible:
@@ -3434,10 +3464,11 @@ fn release_reserved_silence_watch(
 /// * **the pane is mid-close** — [`AgentPtyRegistry::arm_outstanding_delegation`]
 ///   refuses, closing the arm-after-cancel race.
 ///
-/// PRD #140 integration: `orchestration` is the daemon's routing identity, whose
-/// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
-/// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
-/// than read back out of the identity.
+/// `timeout` is [`worker_response_timeout`]'s answer for this delegate, `None`
+/// for a disabled detector. The caller resolves it from project configs it read
+/// with no state guard held (issue #1387), and from the orchestration's cwd,
+/// which PRD #140's routing identity does not carry (see
+/// [`AppState::orchestration_cwd_of`]).
 ///
 /// Returns the armed record's generation (`Some(seq)`) when a
 /// watch was armed, `None` on any of the three no-op paths above. The caller
@@ -3450,10 +3481,9 @@ fn arm_idle_worker_watch_for_delegation(
     role: &str,
     orchestrator_pane_id: &str,
     orchestration: Option<&OrchestrationIdentity>,
-    orchestration_cwd: Option<&str>,
-    worker_cwd: Option<&str>,
+    timeout: Option<std::time::Duration>,
 ) -> Option<u64> {
-    let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
+    let Some(timeout) = timeout else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -4552,6 +4582,7 @@ pub const DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS: &str =
 /// the derived default — off. That is deliberate: the two questions are
 /// independently switchable in both directions.
 fn delegate_no_event_window(
+    configs: &ProjectConfigs,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
@@ -4571,7 +4602,7 @@ fn delegate_no_event_window(
         }
         return Some(window);
     }
-    worker_response_timeout(orchestration_cwd, worker_cwd)
+    worker_response_timeout_in(configs, orchestration_cwd, worker_cwd)
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
 
@@ -6041,17 +6072,144 @@ pub fn compose_worker_task_file(
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
+/// Issue #1387: the `.dot-agent-deck.toml` of each directory a request resolves
+/// role config from, as one request read them.
+///
+/// Every daemon verb that resolves a role — `delegate`, `restart-role`,
+/// `spawn-role` — used to read the file synchronously while holding the
+/// [`AppState`] read guard. A read that hung (a network mount, a FIFO at the
+/// config path) then parked a runtime thread and, behind that guard, every
+/// writer: hook ingestion stopped until the read returned. The verbs now read
+/// through [`read_guard_with_project_configs`], which reads on the blocking pool
+/// with no guard held, and resolve from this.
+///
+/// Read once per request and never kept past it: an edit to the file takes
+/// effect on the next delegate (#704/#705).
+#[derive(Debug, Default)]
+pub(crate) struct ProjectConfigs {
+    /// `None` for a directory with no config or one that does not parse — both
+    /// resolve as "no role config", as they always have.
+    by_dir: HashMap<String, Option<ProjectConfig>>,
+}
+
+impl ProjectConfigs {
+    /// Read `dirs` on the calling thread. Only for a caller that is not on a
+    /// request path: tests, and [`worker_response_timeout`].
+    pub(crate) fn load_blocking<S: Into<String>>(dirs: impl IntoIterator<Item = S>) -> Self {
+        let by_dir = dirs
+            .into_iter()
+            .map(Into::into)
+            .map(|dir| {
+                let config = load_project_config(std::path::Path::new(&dir))
+                    .ok()
+                    .flatten();
+                (dir, config)
+            })
+            .collect();
+        Self { by_dir }
+    }
+
+    /// Read `dirs` on the blocking pool. This frees the runtime thread, not a
+    /// state guard the caller holds — a request handler reads through
+    /// [`read_guard_with_project_configs`], which holds none.
+    pub(crate) async fn load(dirs: Vec<String>) -> Self {
+        let mut configs = Self::default();
+        configs.read_more(dirs).await;
+        configs
+    }
+
+    /// Read whichever of `dirs` this set has not read yet, on the blocking pool.
+    async fn read_more(&mut self, dirs: Vec<String>) {
+        let unread = self.unread(dirs);
+        if unread.is_empty() {
+            return;
+        }
+        match tokio::task::spawn_blocking(move || Self::load_blocking(unread)).await {
+            Ok(read) => self.by_dir.extend(read.by_dir),
+            Err(e) => warn!(
+                error = %e,
+                "reading the project config failed; the directories it named resolve as \
+                 having none for this request"
+            ),
+        }
+    }
+
+    /// Which of `dirs` this set has not read, each named once.
+    fn unread(&self, dirs: Vec<String>) -> Vec<String> {
+        let mut unread: Vec<String> = dirs
+            .into_iter()
+            .filter(|dir| !self.by_dir.contains_key(dir))
+            .collect();
+        unread.sort();
+        unread.dedup();
+        unread
+    }
+
+    /// The config `dir` holds, or `None` when it holds none. A directory this
+    /// set never read answers `None` too, and says so in the log — see
+    /// [`read_guard_with_project_configs`] for the one way that can happen.
+    pub(crate) fn get(&self, dir: &str) -> Option<&ProjectConfig> {
+        match self.by_dir.get(dir) {
+            Some(config) => config.as_ref(),
+            None => {
+                warn!(
+                    dir = %escape_id_for_log(dir),
+                    "the project config of this directory was not read for this request; \
+                     resolving it as having none"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// How many times [`read_guard_with_project_configs`] drops its guard to read a
+/// directory the state names. One round is the ordinary case; a further one is
+/// needed only when the state changed while the first was reading.
+const PROJECT_CONFIG_READ_ROUNDS: usize = 3;
+
+/// Issue #1387: a read guard on `state`, with the project config of every
+/// directory `dirs_of` names under that same guard — read while no guard was
+/// held.
+///
+/// `dirs_of` runs under a short guard, which is dropped while those files are
+/// read on the blocking pool; then the guard is taken again and `dirs_of` asked
+/// once more, because the state may have moved in between (a pane registered
+/// with another cwd). A directory it names that was not read is read the same
+/// way, with the guard dropped again. After [`PROJECT_CONFIG_READ_ROUNDS`] such
+/// rounds the guard is returned anyway, and a directory still unread resolves
+/// as having no config ([`ProjectConfigs::get`] logs it) — the state would have
+/// had to change during every round.
+async fn read_guard_with_project_configs<'a>(
+    state: &'a SharedState,
+    dirs_of: impl Fn(&AppState) -> Vec<String>,
+) -> (tokio::sync::RwLockReadGuard<'a, AppState>, ProjectConfigs) {
+    let mut configs = ProjectConfigs::default();
+    let mut rounds = 0;
+    loop {
+        let guard = state.read().await;
+        let unread = configs.unread(dirs_of(&guard));
+        if unread.is_empty() || rounds == PROJECT_CONFIG_READ_ROUNDS {
+            return (guard, configs);
+        }
+        drop(guard);
+        rounds += 1;
+        configs.read_more(unread).await;
+    }
+}
+
 /// Issue #447: whether a delegate to `role` will replace the worker's agent
 /// (`clear = true`) — the same decision `dispatch_one_owned` makes, from the
 /// same inputs. `false` when the role config cannot be resolved, as there.
 fn delegate_respawns_worker(
+    configs: &ProjectConfigs,
     cwd: Option<&str>,
     orchestration: Option<&OrchestrationIdentity>,
     role: &str,
 ) -> bool {
     match (cwd, orchestration) {
         (Some(cwd), Some(identity)) => {
-            lookup_orchestration_role_indexed(cwd, identity.name(), role)
+            lookup_orchestration_role_indexed(configs, cwd, identity.name(), role)
                 .is_some_and(|(_, role_config)| role_config.clear)
         }
         _ => false,
@@ -6059,8 +6217,8 @@ fn delegate_respawns_worker(
 }
 
 /// Look up the role config for `role_name` inside the orchestration
-/// named `orchestration_name`, by parsing the project config file at
-/// `cwd`, together with the role's INDEX within that orchestration.
+/// named `orchestration_name`, in the project config of `cwd` as `configs`
+/// read it, together with the role's INDEX within that orchestration.
 /// Returns `None` when any layer is missing (no project config,
 /// no matching orchestration, no matching role) — the caller treats
 /// "no config" as "no template, no clear" and falls through to the
@@ -6072,11 +6230,12 @@ fn delegate_respawns_worker(
 /// re-create a worker pane from nothing — the card would otherwise land outside
 /// the orchestration's tab, or in the wrong column of it.
 fn lookup_orchestration_role_indexed(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig)> {
-    lookup_orchestration_role_seated(cwd, orchestration_name, role_name)
+    lookup_orchestration_role_seated(configs, cwd, orchestration_name, role_name)
         .map(|(index, role, _)| (index, role))
 }
 
@@ -6087,13 +6246,12 @@ fn lookup_orchestration_role_indexed(
 /// read of the file, so the role and its seat cannot come from two versions of
 /// it.
 fn lookup_orchestration_role_seated(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig, bool)> {
-    let cfg = load_project_config(std::path::Path::new(cwd))
-        .ok()
-        .flatten()?;
+    let cfg = configs.get(cwd)?;
     let Some(orch) = cfg
         .orchestrations
         .iter()
@@ -7944,9 +8102,13 @@ async fn dispatch_one_owned(
     // Issue #606: the role's INDEX comes back too, so that a `clear = true`
     // respawn which has to re-create the pane from nothing can rebuild the
     // pane's `TabMembership` and keep the card on its orchestration's tab.
+    //
+    // Issue #1387: read on the blocking pool, so a config whose read hangs parks
+    // this dispatch (it holds no state guard) and not a runtime thread.
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
-            lookup_orchestration_role_indexed(c, identity.name(), &target_role)
+            let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
+            lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
     };
@@ -10993,14 +11155,14 @@ impl AppState {
     /// alias of a live orchestration's directory is the same key.
     ///
     /// Called under the state write lock, so the check and the claim are one
-    /// step: two concurrent starts of one title cannot both pass. What this does
-    /// NOT cover, stated narrowly: the daemon's own spawn paths
-    /// ([`crate::spawn::spawn`] — dispatch, a scheduled fire, issue dispatch)
-    /// record their titles through [`Self::record_orchestration_title`] without
-    /// being checked, so a client start is refused against them but they are
-    /// never refused; and a legacy client that sends no per-tab token is scoped
-    /// by `(name, cwd)`, so two such tabs of one orchestration in one directory
-    /// read as one tab here exactly as they already do to `handle_delegate`.
+    /// step: two concurrent starts of one title cannot both pass. The daemon's
+    /// own spawn paths ([`crate::spawn::spawn`] — dispatch, a scheduled fire,
+    /// issue dispatch) are admitted through this same check by
+    /// [`Self::claim_dispatched_orchestration_title`], which suffixes a taken
+    /// title rather than refusing (issue #1339). What this does NOT cover: a
+    /// legacy client that sends no per-tab token is scoped by `(name, cwd)`, so
+    /// two such tabs of one orchestration in one directory read as one tab here
+    /// exactly as they already do to `handle_delegate`.
     pub fn claim_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -11053,6 +11215,65 @@ impl AppState {
         Ok(())
     }
 
+    /// Issue #1339: admit an orchestration the daemon spawns ITSELF (dispatch,
+    /// a scheduled fire, issue dispatch — [`crate::spawn::spawn`]) under a run
+    /// title no other live orchestration in `cwd` holds, and hold it for the
+    /// spawn until [`Self::release_orchestration_title_claim`]. Returns the
+    /// title the run must be stamped with (`None`: its canonical name).
+    ///
+    /// `derived` is the daemon-generated title
+    /// ([`crate::spawn`]'s `<name> · <cwd basename>`) and is tried first, so a
+    /// run that collides with nothing keeps exactly the label it always had.
+    /// When it is taken, the run gets the first free `<title> · 2`,
+    /// `<title> · 3`, … instead of being refused. That is the opposite of
+    /// [`Self::claim_orchestration_title`]'s answer for a client start, on
+    /// purpose: #555 refuses there because a person chose that name, and
+    /// renaming it would leave them a run under a name they do not know. Nobody
+    /// chose this one — the daemon derived it from the orchestration and the
+    /// directory — and `delegate` / `work-done` route by the
+    /// [`OrchestrationIdentity`] token rather than by the title. A refusal would
+    /// also have no form to send a scheduled fire back to, so it would turn a
+    /// label clash into a run that did not happen.
+    ///
+    /// Admission goes through [`Self::claim_orchestration_title`] itself, so
+    /// the key, the liveness rule and the atomicity are the client path's: two
+    /// concurrent spawns under the state write lock cannot pick the same
+    /// suffix, and a client start is refused against whichever title this
+    /// claimed. A derived title the registry would drop
+    /// ([`crate::agent_pty::is_valid_display_name`]) is treated as absent, as
+    /// the tab will show the canonical name.
+    pub fn claim_dispatched_orchestration_title(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        derived: Option<&str>,
+        cwd: &str,
+        registry: &AgentPtyRegistry,
+    ) -> Option<String> {
+        let derived = derived.filter(|t| crate::agent_pty::is_valid_display_name(t));
+        if self
+            .claim_orchestration_title(identity, derived, cwd, registry)
+            .is_ok()
+        {
+            return derived.map(str::to_string);
+        }
+        let base = derived.unwrap_or(identity.name()).to_string();
+        // Each held entry blocks at most one candidate, so `len() + 1`
+        // candidates always include a free one.
+        for n in 2..=self.orchestration_titles.len() + 2 {
+            let candidate = suffixed_run_title(&base, n);
+            if self
+                .claim_orchestration_title(identity, Some(&candidate), cwd, registry)
+                .is_ok()
+            {
+                return Some(candidate);
+            }
+        }
+        // Unreachable by the bound above; degrade to the pre-#1339 behaviour
+        // (an unchecked record) rather than panic inside the daemon.
+        self.record_orchestration_title(identity, derived, cwd);
+        derived.map(str::to_string)
+    }
+
     /// Issue #555: end one start's claim taken by
     /// [`Self::claim_orchestration_title`] — after its role is registered (the
     /// registered pane now holds the title) or after the spawn failed (the
@@ -11067,9 +11288,10 @@ impl AppState {
     /// Issue #962: record the title an orchestration the daemon spawned ITSELF
     /// is flying under (dispatch, a scheduled fire, issue dispatch — see
     /// [`crate::spawn::spawn`]), or restore it after a re-created pane put the
-    /// identity back. No uniqueness check and no claim: see
-    /// [`Self::claim_orchestration_title`] for what that leaves uncovered. Keeps
-    /// an existing non-`None` title.
+    /// identity back. No uniqueness check and no claim: a fresh spawn has
+    /// already been admitted by [`Self::claim_dispatched_orchestration_title`]
+    /// before its first role (issue #1339), and a restore puts back a title its
+    /// own run already held. Keeps an existing non-`None` title.
     pub fn record_orchestration_title(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -11497,6 +11719,18 @@ impl AppState {
     /// this has decided the targets, so a test of this function is a test of
     /// where a delegate actually lands (M5.0).
     pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        self.route_delegate(sender_pane_id, to, true)
+    }
+
+    /// [`Self::delegate_targets`], logging the roles it drops only when
+    /// `log_dropped` is set — so a caller that needs the routing before the delegate is
+    /// handled (issue #1387's config read) does not log those warnings twice.
+    fn route_delegate(
+        &self,
+        sender_pane_id: &str,
+        to: &[String],
+        log_dropped: bool,
+    ) -> Vec<(String, String)> {
         let orchestration = self.pane_orchestration_map.get(sender_pane_id);
         let mut targets: Vec<(String, String)> = Vec::new();
         let mut seen_roles: HashSet<&str> = HashSet::new();
@@ -11513,10 +11747,12 @@ impl AppState {
                 // own note treats `signal.to` as already safe because the daemon
                 // logs the whole array with `?`-Debug; that holds for the array
                 // and not for an element interpolated with `%` here.
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: duplicate target role in one signal; ignored"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: duplicate target role in one signal; ignored"
+                    );
+                }
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -11530,10 +11766,12 @@ impl AppState {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
             if role_panes.is_empty() {
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: no worker pane found for role"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: no worker pane found for role"
+                    );
+                }
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -11624,23 +11862,59 @@ impl AppState {
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
-        self.handle_attested_delegate(signal, registry, event_tx, state, None)
-            .await
+        // Issue #1387: read off the runtime's thread, but with `&self` — which
+        // may be a guard on the daemon's state — still held, so this is for a
+        // caller holding no shared guard (a bare `AppState` in a fixture). The
+        // daemon goes through the free [`handle_attested_delegate`], which
+        // reads with no guard held at all.
+        let configs = ProjectConfigs::load(self.delegate_config_dirs(&signal, registry)).await;
+        self.handle_attested_delegate_with_configs(
+            signal, registry, event_tx, state, None, &configs,
+        )
+        .await
     }
 
-    /// [`Self::handle_delegate_with_state`] for a delegate whose sender the hook
-    /// provenance gate attested: `sender_agent_id` is the registry agent id its
-    /// capability token was minted for. The daemon's hook loop calls this; see
-    /// [`record_delegation_commission`] for what the identity decides (issue #580
-    /// review, Qodo, #1285). `None` behaves exactly as
-    /// [`Self::handle_delegate_with_state`].
-    pub async fn handle_attested_delegate(
+    /// Issue #1387: every directory a delegate from `signal` resolves a project
+    /// config from — the orchestration's, and the cwd of each pane it routes
+    /// to — and none at all for a sender it is about to refuse, so neither a
+    /// refused caller nor a pane the delegate does not reach can make it wait
+    /// on a slow file.
+    fn delegate_config_dirs(
+        &self,
+        signal: &DelegateSignal,
+        registry: &AgentPtyRegistry,
+    ) -> Vec<String> {
+        if !self.is_orchestrator_caller(&signal.pane_id) {
+            return Vec::new();
+        }
+        let mut dirs: Vec<String> = self
+            .orchestration_cwd_of(&signal.pane_id, registry)
+            .into_iter()
+            .collect();
+        dirs.extend(
+            self.route_delegate(&signal.pane_id, &signal.to, false)
+                .into_iter()
+                .filter_map(|(_, pane_id)| self.pane_cwd_map.get(&pane_id).cloned()),
+        );
+        dirs
+    }
+
+    /// The body of [`Self::handle_delegate_with_state`] and of the free
+    /// [`handle_attested_delegate`], resolving every project config it needs
+    /// from `configs` — it reads no file itself (issue #1387).
+    ///
+    /// `sender_agent_id` is the registry agent id the sender's capability token
+    /// was minted for, when the hook provenance gate attested it; see
+    /// [`record_delegation_commission`] for what the identity decides (issue
+    /// #580 review, Qodo, #1285).
+    async fn handle_attested_delegate_with_configs(
         &self,
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
         sender_agent_id: Option<&str>,
+        configs: &ProjectConfigs,
     ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
@@ -11815,7 +12089,12 @@ impl AppState {
             // pointer is actually written to, and to the fresh agent on a
             // `clear = true` respawn.
             if let Some(in_flight) = commission_in_flight.as_ref()
-                && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
+                && !delegate_respawns_worker(
+                    configs,
+                    cwd.as_deref(),
+                    orchestration.as_ref(),
+                    &target_role,
+                )
             {
                 if let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) {
                     registry.bind_commission_worker_agent_id(
@@ -11856,8 +12135,7 @@ impl AppState {
                 &target_role,
                 &orchestrator_pane_id,
                 orchestration.as_ref(),
-                orchestration_cwd.as_deref(),
-                cwd.as_deref(),
+                worker_response_timeout_in(configs, orchestration_cwd.as_deref(), cwd.as_deref()),
             );
             // Issue #544 (PR #1398 review): the guard that ends the "queued"
             // mark the arm just set, built before anything else can fail and
@@ -11877,8 +12155,8 @@ impl AppState {
             // while the delegate is still live, not on the dispatch task's first
             // poll, which can land after the pane changed hands.
             let silence_watch =
-                delegate_no_event_window(orchestration_cwd.as_deref(), cwd.as_deref()).map(
-                    |window| SilenceWatch {
+                delegate_no_event_window(configs, orchestration_cwd.as_deref(), cwd.as_deref())
+                    .map(|window| SilenceWatch {
                         window,
                         target: SilenceReportTarget {
                             pane_id: orchestrator_pane_id.clone(),
@@ -11887,8 +12165,7 @@ impl AppState {
                         },
                         redeliveries: None,
                         retry_done: None,
-                    },
-                );
+                    });
 
             // Issue #962: read NOW, under the guard this delegate is being handled
             // with — see `dispatch_one_owned`'s `recorded_title`.
@@ -12054,6 +12331,14 @@ impl AppState {
         }
     }
 
+    /// Whether [`Self::refuse_unless_orchestrator_caller`] would let `pane_id`
+    /// through, without its warnings. Issue #1387: a verb asks this before
+    /// reading the project config, so a caller about to be refused waits on no
+    /// file read.
+    fn is_orchestrator_caller(&self, pane_id: &str) -> bool {
+        self.pane_role_map.contains_key(pane_id) && self.orchestrator_pane_ids.contains(pane_id)
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -12083,6 +12368,37 @@ impl AppState {
         }
         None
     }
+}
+
+/// The daemon's `delegate` verb: [`AppState::handle_delegate_with_state`] for a
+/// delegate whose sender the hook provenance gate attested, `sender_agent_id`
+/// being the registry agent id its capability token was minted for. `None`
+/// behaves exactly as an unattested delegate.
+///
+/// Issue #1387: a FREE function taking the [`SharedState`] handle rather than an
+/// `AppState` method called through the caller's read guard, so the project
+/// configs the delegate resolves roles and timeouts from are read with no guard
+/// held — see [`read_guard_with_project_configs`]. The routing that follows
+/// runs under one guard, as before.
+pub async fn handle_attested_delegate(
+    signal: DelegateSignal,
+    state: &SharedState,
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    sender_agent_id: Option<&str>,
+) -> crate::event::DelegateResponse {
+    let (guard, configs) =
+        read_guard_with_project_configs(state, |s| s.delegate_config_dirs(&signal, registry)).await;
+    guard
+        .handle_attested_delegate_with_configs(
+            signal,
+            registry,
+            event_tx,
+            Some(state),
+            sender_agent_id,
+            &configs,
+        )
+        .await
 }
 
 /// Shared by [`handle_restart_role_with_state`]'s early (pre-lock) crash
@@ -12192,7 +12508,28 @@ pub async fn handle_restart_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a request one of the checks below refuses before it gets to
+        // the role's config.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            let targets =
+                s.route_delegate(&signal.pane_id, std::slice::from_ref(&signal.role), false);
+            let [(_, pane_id)] = targets.as_slice() else {
+                return Vec::new();
+            };
+            if restart_refusal_for_crashed_pane(registry, pane_id, &signal.role, signal.force)
+                .is_some()
+            {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "restart a role")
         {
@@ -12251,7 +12588,7 @@ pub async fn handle_restart_role_with_state(
         let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
         let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+                lookup_orchestration_role_indexed(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
@@ -12468,7 +12805,17 @@ pub async fn handle_spawn_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a caller the first check below refuses.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "spawn a role")
         {
@@ -12483,7 +12830,7 @@ pub async fn handle_spawn_role_with_state(
 
         let role_config_seated = match (cwd.as_deref(), identity.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_seated(c, identity.name(), &signal.role)
+                lookup_orchestration_role_seated(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
@@ -15147,6 +15494,124 @@ mod tests {
             .expect("released once the re-create is done, with no live pane left");
     }
 
+    /// Issue #1339: a daemon-spawned run is admitted through the same check
+    /// as a client start, and a taken title is SUFFIXED rather than refused —
+    /// in order, against client-typed titles as well as other runs, never past
+    /// the length the registry keeps, and freed with its holder like any other
+    /// claim. As above, every holder holds through an unreleased claim.
+    #[test]
+    fn a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title() {
+        let registry = AgentPtyRegistry::new();
+        let run = |id: &str| OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            name: "team".into(),
+        };
+        let mut state = AppState::default();
+
+        // Nothing collides: the derived title, unchanged.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r1"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+        // The second and third live runs get the next free suffixes.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r2"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 2".to_string())
+        );
+        // A client tab already holding `· 3` is skipped, not shared.
+        state
+            .claim_orchestration_title(&run("typed"), Some("team · repo · 3"), "/w", &registry)
+            .expect("a client may type any free title");
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r3"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo · 4".to_string())
+        );
+        // And a client start is refused against a suffixed run's title.
+        assert!(
+            state
+                .claim_orchestration_title(&run("late"), Some("team · repo · 2"), "/w", &registry)
+                .is_err(),
+            "a suffixed title is held exactly like any other"
+        );
+        // Another directory is another key: no suffix.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r4"),
+                Some("team · repo"),
+                "/elsewhere",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+
+        // A run under its canonical name (`None`) suffixes the name itself.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c1"), None, "/c", &registry),
+            None
+        );
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(&run("c2"), None, "/c", &registry),
+            Some("team · 2".to_string())
+        );
+        // A derived title the registry would drop is the canonical name the
+        // tab will show, so it collides with `c1` and gets `· 3`.
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("c3"),
+                Some("bad\u{7}title"),
+                "/c",
+                &registry
+            ),
+            Some("team · 3".to_string())
+        );
+
+        // Never longer than the registry keeps: the BASE is shortened, the
+        // suffix survives, and the result is a valid display name.
+        let long = "é".repeat(crate::agent_pty::DISPLAY_NAME_MAX_LEN / 2);
+        assert!(crate::agent_pty::is_valid_display_name(&long));
+        state
+            .claim_dispatched_orchestration_title(&run("l1"), Some(&long), "/l", &registry)
+            .expect("the full-length title is free");
+        let suffixed = state
+            .claim_dispatched_orchestration_title(&run("l2"), Some(&long), "/l", &registry)
+            .expect("a suffixed title");
+        assert!(suffixed.ends_with(" · 2"), "{suffixed:?}");
+        assert!(
+            crate::agent_pty::is_valid_display_name(&suffixed),
+            "an over-long title would be dropped and the tab fall back to the canonical name: \
+             {} bytes",
+            suffixed.len()
+        );
+
+        // Freed with its holder: once `r1` has no claim and no live pane, the
+        // next run takes the unsuffixed title back.
+        state.release_orchestration_title_claim(&run("r1"));
+        assert_eq!(
+            state.claim_dispatched_orchestration_title(
+                &run("r5"),
+                Some("team · repo"),
+                "/w",
+                &registry
+            ),
+            Some("team · repo".to_string())
+        );
+    }
+
     /// Issue #555 (PR #1336 review): the directory half of the title key is
     /// the directory the start will actually run in. An alias resolves to its
     /// target, a start that names no directory is keyed under the daemon's own
@@ -16316,27 +16781,18 @@ mod tests {
         )
         .expect("write project config");
         let cwd = dir.path().to_str().expect("utf8 cwd");
+        let configs = ProjectConfigs::load_blocking([cwd]);
         let identity = OrchestrationIdentity::Instance {
             id: "tab-1".to_string(),
             name: "orch".to_string(),
         };
-        assert!(delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "fresh"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "kept"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "unknown-role"
-        ));
-        assert!(!delegate_respawns_worker(None, Some(&identity), "fresh"));
-        assert!(!delegate_respawns_worker(Some(cwd), None, "fresh"));
+        let respawns =
+            |cwd, identity, role| delegate_respawns_worker(&configs, cwd, identity, role);
+        assert!(respawns(Some(cwd), Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), Some(&identity), "kept"));
+        assert!(!respawns(Some(cwd), Some(&identity), "unknown-role"));
+        assert!(!respawns(None, Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), None, "fresh"));
     }
 
     /// Issue #447: the waiting-for-input notice is one line, fences both
@@ -17653,6 +18109,49 @@ mod tests {
         );
     }
 
+    /// Issue #1387 (Greptile, Qodo, #1514): a delegate reads the configs of the
+    /// orchestration and of the workers it routes to — not of another worker in
+    /// the same orchestration, whose slow file would otherwise hold up a
+    /// handoff it plays no part in — and none at all for a sender it refuses.
+    #[test]
+    fn delegate_config_dirs_names_only_the_routed_workers() {
+        let mut state = AppState::default();
+        let identity = instance("orch-1387");
+        state.register_orchestration_role(
+            "orch",
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some("/o"),
+        );
+        state.register_orchestration_role("coder", "coder", false, identity.clone(), Some("/c"));
+        state.register_orchestration_role("tester", "tester", false, identity, Some("/t"));
+        let registry = AgentPtyRegistry::new();
+        let signal = |from: &str| DelegateSignal {
+            pane_id: from.to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let mut dirs = state.delegate_config_dirs(&signal("orch"), &registry);
+        dirs.sort();
+        assert_eq!(dirs, vec!["/c".to_string(), "/o".to_string()]);
+        assert!(
+            state
+                .delegate_config_dirs(&signal("tester"), &registry)
+                .is_empty(),
+            "a worker's delegate is refused, so it must read nothing first"
+        );
+        assert!(
+            state
+                .delegate_config_dirs(&signal("stranger"), &registry)
+                .is_empty()
+        );
+    }
+
     /// Issue #580 review (Qodo, #1285): the busy check reads the ATTESTED sender,
     /// not the orchestrator pane's current occupant. Here the pane has no live
     /// agent at all, so a re-resolving check would see no identity and refuse;
@@ -17660,7 +18159,7 @@ mod tests {
     /// attested predecessor identity is what keeps its own refusal.
     #[tokio::test]
     async fn handle_attested_delegate_decides_on_the_attested_sender() {
-        let state = two_same_name_cwd_tabs(true);
+        let state: SharedState = Arc::new(RwLock::new(two_same_name_cwd_tabs(true)));
         let registry = Arc::new(AgentPtyRegistry::new());
         match registry.arm_delegation_commission("A_coder", "A_orch", Some("orch-agent-1"), false) {
             crate::agent_pty::CommissionArm::Armed { .. } => {}
@@ -17676,18 +18175,18 @@ mod tests {
             token: None,
         };
 
-        let predecessor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-1"))
-            .await;
+        let predecessor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-1"))
+                .await;
         assert_eq!(
             predecessor.busy.len(),
             1,
             "the delegating orchestrator is refused: {predecessor:?}"
         );
 
-        let successor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-2"))
-            .await;
+        let successor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-2"))
+                .await;
         assert_eq!(
             successor.delivered,
             vec!["coder".to_string()],
@@ -17743,7 +18242,9 @@ mod tests {
         let seat = |toml: &str, role: &str| -> Option<(usize, bool)> {
             let cwd = tempfile::tempdir().expect("tempdir");
             std::fs::write(cwd.path().join(".dot-agent-deck.toml"), toml).expect("write toml");
-            lookup_orchestration_role_seated(cwd.path().to_str().expect("utf8"), "team", role)
+            let cwd = cwd.path().to_str().expect("utf8");
+            let configs = ProjectConfigs::load_blocking([cwd]);
+            lookup_orchestration_role_seated(&configs, cwd, "team", role)
                 .map(|(index, _, is_orchestrator)| (index, is_orchestrator))
         };
         let unflagged = "[[orchestrations]]\nname = \"team\"\n\n\
@@ -18911,7 +19412,11 @@ mod tests {
 
         let disabled = config_dir("0");
         assert_eq!(
-            delegate_no_event_window(disabled.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(disabled.path().to_str()),
+                disabled.path().to_str(),
+                None
+            ),
             None,
             "a disabled idle detector must not produce a silent-worker watch either"
         );
@@ -18919,7 +19424,11 @@ mod tests {
         // Two minutes of "owes an answer" is 30 s of "has said nothing at all".
         let long = config_dir("2");
         assert_eq!(
-            delegate_no_event_window(long.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(long.path().to_str()),
+                long.path().to_str(),
+                None
+            ),
             Some(MAX_DELEGATE_NO_EVENT_WINDOW),
         );
     }
@@ -18964,7 +19473,7 @@ mod tests {
             // SAFETY: lock held for the duration; restored below.
             unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS, raw) };
             assert_eq!(
-                delegate_no_event_window(cwd, None),
+                delegate_no_event_window(&ProjectConfigs::load_blocking(cwd), cwd, None),
                 expected,
                 "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS}={raw:?} must resolve to {expected:?}"
             );
@@ -22715,6 +23224,127 @@ while True:
              still be admitted after its PTY EOF — otherwise the SessionEnd is \
              dropped, the pane's session state is never removed, and every \
              short-lived agent leaves one behind; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698, the control at the admission layer: the test above with the
+    /// producer naming NO generation — a pre-F9 hook script, or a wrapper that
+    /// lost `DOT_AGENT_DECK_AGENT_ID` (PRD #110 / issue #398). Its final
+    /// `SessionEnd`, read after the PTY EOF, must still remove the pane's
+    /// session when nothing has taken the pane over.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_late_untagged_final_report_lands_after_the_pty_eof() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "untagged-farewell-pane-698";
+        let agent_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )],
+                ..Default::default()
+            })
+            .expect("spawn a short-lived agent onto the pane");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let untagged = |event_type| {
+            let mut event = report_454(pane, &agent_id, event_type);
+            event.agent_id = None;
+            event
+        };
+        state.apply_event(untagged(EventType::SessionStart));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "precondition: the untagged SessionStart must be admitted"
+        );
+        let farewell = untagged(EventType::SessionEnd);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        state.apply_event(farewell);
+
+        assert!(
+            state.sessions.is_empty(),
+            "an untagged final report for a pane whose generation exited with no \
+             successor must still land after the PTY EOF; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698: an untagged report naming a pane whose retired generation
+    /// was handed over, and whose successor was then reaped, drives nothing.
+    ///
+    /// Both generations are gone, and the keyed form of the same report — the
+    /// predecessor's id on its own pane — has been refused since the handover.
+    /// The untagged form must not be the way around that: it used to be owned,
+    /// because the pane-only ownership arm matched any record still naming the
+    /// pane, and so it minted a session in the daemon's state for a defunct
+    /// pane. (Attached TUIs receive the broadcast before this admission runs,
+    /// so their cards are not what this test is about.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untagged_report_for_a_handed_over_then_reaped_pane_drives_nothing() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "handed-over-reaped-pane-698";
+        let opts = |command| crate::agent_pty::SpawnOptions {
+            command: Some(command),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane.to_string(),
+            )],
+            ..Default::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once its child is gone");
+        registry.close_agent(&new).expect("close the successor");
+
+        let keyed = report_454(pane, &old, EventType::Thinking);
+        let mut untagged = report_454(pane, &old, EventType::Thinking);
+        untagged.agent_id = None;
+
+        state.apply_event(keyed);
+        assert!(
+            state.sessions.is_empty(),
+            "precondition: the handed-over predecessor's own report is refused"
+        );
+        state.apply_event(untagged);
+        assert!(
+            state.sessions.is_empty(),
+            "the same report with its generation stripped must be refused too — \
+             nothing is left on the pane to speak for it; sessions={:?}",
             state.sessions.keys().collect::<Vec<_>>()
         );
         registry.shutdown_all();

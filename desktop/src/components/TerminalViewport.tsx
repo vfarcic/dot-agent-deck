@@ -7,6 +7,7 @@ import { writeClipboardText } from "../lib/clipboard";
 import { isTerminalCopyChord } from "../lib/terminalCopy";
 import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
+import { keepSelectionAcrossResize } from "../lib/terminalSelection";
 
 interface TerminalViewportProps {
   agentId: string;
@@ -211,6 +212,10 @@ export function TerminalViewport({
     registerTerminal(deckId, agentId, terminal);
     terminal.write(transcriptRef.current);
 
+    // Issue #1457 — a selection, or a drag still in progress, survives the
+    // daemon reshaping this grid; see `keepSelectionAcrossResize`.
+    const selectionKeeper = keepSelectionAcrossResize(terminal, host);
+
     const inputDisposable = terminal.onData((data) => {
       if (!readOnlyRef.current) onInputRef.current(data);
     });
@@ -342,6 +347,7 @@ export function TerminalViewport({
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      selectionKeeper.dispose();
       wrapper?.removeEventListener("keydown", onCopyKey, true);
       wrapper?.removeEventListener("mousedown", onPress, true);
       unregisterRefit(deckId, agentId, fit);
