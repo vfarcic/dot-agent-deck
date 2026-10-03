@@ -1167,10 +1167,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // fails no daemon is left running: the agents were stopped by consent, and
     // the next client lazy-spawns from its own binary.
     if let Some(target) = restart_control.take_successor() {
-        match crate::daemon_attach::spawn_daemon_serve_detached_with_exe(
-            &crate::config::state_dir(),
-            &target,
-        ) {
+        match crate::daemon_attach::spawn_restart_successor(&crate::config::state_dir(), &target) {
             Ok(pid) => info!(pid, target = %target.display(), "successor daemon spawned"),
             Err(e) => error!(
                 target = %target.display(),

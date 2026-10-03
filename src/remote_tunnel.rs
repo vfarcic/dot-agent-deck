@@ -664,6 +664,7 @@ impl SshDestination {
             user: self.user.as_ref().map(|user| user.to_string()),
             port: self.port,
             key: self.key.as_ref().map(|key| key.as_path().to_path_buf()),
+            jump: self.jump.as_ref().map(|jump| jump.as_str().to_string()),
         }
     }
 }

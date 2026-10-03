@@ -361,6 +361,22 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
     crate::platform::detach::spawn_daemon_serve_detached_with_exe(state_dir, exe)
 }
 
+/// PRD #1487: spawn the daemon that replaces this one after an accepted
+/// `restart-daemon`, detached as [`spawn_daemon_serve_detached_with_exe`] does
+/// and inheriting this daemon's environment so it binds the same endpoint —
+/// except the test-only orphan watchdog. That watchdog ties a daemon's life to
+/// the process that started it, and the successor's starter is the daemon it
+/// replaces, which exits by design; inherited, it shuts the successor down
+/// about a second after the old daemon is gone. The test max-lifetime backstop
+/// is still inherited.
+pub fn spawn_restart_successor(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
+    crate::platform::detach::spawn_daemon_serve_detached_without_env(
+        state_dir,
+        exe,
+        &[crate::agent_pty::DOT_AGENT_DECK_EXIT_WHEN_ORPHANED],
+    )
+}
+
 /// Returns true if `DOT_AGENT_DECK_VIA_DAEMON` is set to a truthy value
 /// (`1`, `true`, `yes`, case-insensitive). Pre-PRD-93 this controlled the
 /// in-process-vs-external decision directly; now (PRD #93 M1.1) the default
