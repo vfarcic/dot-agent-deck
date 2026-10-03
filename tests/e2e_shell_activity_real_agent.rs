@@ -460,10 +460,12 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_wor
     // concurrently running e2e test's own ping or MCP servers can never be
     // mistaken for this one's.
     // Issue #862: the sample reads command lines only for detached descendants
-    // of the roots it is given. This test's own pid is the right root: the deck
-    // binary, its daemon and the agent all `setsid` out of the test's session,
-    // so every process this assertion cares about is a detached descendant of it
-    // and gets its argv read, while nothing outside this test's tree does.
+    // of the roots it is given. This test's own pid is the right root: the
+    // Bash-tool shell this assertion cares about `setsid`s off the agent's
+    // terminal, so it is a detached descendant of it and gets its argv read,
+    // while nothing outside this test's tree does. (The agent itself leads a
+    // session on the pane's terminal, which since issue #1493 is not a
+    // boundary, so its own argv is not read — this test does not need it.)
     let root_pid = std::process::id() as i32;
     let table = process_table(&[root_pid]).expect("process_table() must enumerate on unix");
     let shell_row = descendants(&table, root_pid)
@@ -586,6 +588,14 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     // that finally succeeds.
     let claude_pid_cell: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
     let children_argv_cell: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    // Only a child seen in two samples at least `LASTING` apart counts. Claude
+    // Code starts short-lived processes at boot (`ssh … git@github.com`,
+    // `dpkg-query --search`, `git` fetches), and a precondition satisfied by one
+    // of those died before the sample below, ~3 s and a dashboard switch later,
+    // and failed the run about half the time.
+    const LASTING: Duration = Duration::from_secs(5);
+    let earlier_children: std::cell::RefCell<Option<(std::time::Instant, Vec<i32>)>> =
+        std::cell::RefCell::new(None);
     let found_children = common::wait_until(Duration::from_secs(30), || {
         // Issue #862: this test's own pid as the sample's root — see the same
         // note in `status/shell-activity/006` above for why that is the root
@@ -593,35 +603,70 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
         let Some(table) = process_table(&[root_pid]) else {
             return false;
         };
-        let Some(claude_row) = descendants(&table, root_pid).into_iter().find(|p| {
-            p.command_line
-                .read()
-                .is_some_and(|argv| argv.contains("claude") && argv.contains("--allowedTools"))
-        }) else {
+        // Read every descendant's argv here rather than through the sampler,
+        // which reads only session-boundary descendants of its root. The pane's
+        // Claude leads a session on the pane's own terminal, and since issue
+        // #1493 such a nested terminal is not a boundary, so the sampler no
+        // longer reads its command line.
+        let descendant_pids: Vec<i32> = descendants(&table, root_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        let Some(claude_row_pid) = command_lines_of(&descendant_pids)
+            .into_iter()
+            .find(|(_, argv)| argv.contains("claude") && argv.contains("--allowedTools"))
+            .map(|(pid, _)| pid)
+        else {
             return false;
         };
         // Same as in `006`: the agent's own children share its session, so they
         // are below its boundary and the sampler never read their argv.
-        let children: Vec<String> = command_lines_of(
-            &descendants(&table, claude_row.pid)
-                .into_iter()
-                .map(|p| p.pid)
-                .collect::<Vec<_>>(),
-        )
-        .into_values()
-        .collect();
+        let child_pids: Vec<i32> = descendants(&table, claude_row_pid)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        let now = std::time::Instant::now();
+        let lasting: Vec<i32> = match earlier_children.borrow().as_ref() {
+            Some((at, earlier)) if now.duration_since(*at) >= LASTING => child_pids
+                .iter()
+                .copied()
+                .filter(|pid| earlier.contains(pid))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if lasting.is_empty() {
+            let mut earlier = earlier_children.borrow_mut();
+            if earlier
+                .as_ref()
+                .is_none_or(|(at, _)| now.duration_since(*at) >= LASTING)
+            {
+                *earlier = Some((now, child_pids));
+            }
+            return false;
+        }
+        let children: Vec<String> = command_lines_of(&lasting).into_values().collect();
         if children.is_empty() {
             return false;
         }
-        claude_pid_cell.set(Some(claude_row.pid));
+        claude_pid_cell.set(Some(claude_row_pid));
         *children_argv_cell.borrow_mut() = children;
         true
     });
-    assert!(
-        found_children,
-        "the real Claude pane never grew any live children (MCP servers, caffeinate) within \
-         30s — an agent with no children proves nothing about the no-false-positive claim"
-    );
+    // A precondition of the host, not an assertion about the deck: an agent
+    // with no lasting children proves nothing about the no-false-positive
+    // claim, and where Claude Code has no MCP server configured (and, on Linux,
+    // no `caffeinate`) it often has none. `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`
+    // turns this skip into a failure.
+    skip_unless!(if found_children {
+        Ok(())
+    } else {
+        Err(
+            "the real Claude pane grew no child that lasted 5 s within 30 s (no MCP server \
+             configured, no caffeinate) — an agent with no children proves nothing about the \
+             no-false-positive claim"
+                .to_string(),
+        )
+    });
     let claude_pid = claude_pid_cell
         .get()
         .expect("wait_until reported success so claude_pid_cell must be set");
@@ -674,11 +719,15 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
     )
     .into_values()
     .collect();
-    assert!(
-        !still_alive.is_empty(),
-        "the real Claude agent's children died out between the liveness check and the sample — \
-         rerun; this run proves nothing about the no-false-positive claim"
-    );
+    skip_unless!(if still_alive.is_empty() {
+        Err(
+            "the real Claude agent's children died out between the liveness check and the \
+             sample — this run proves nothing about the no-false-positive claim"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    });
     eprintln!(
         "shell-activity-007: {} children still alive at the sample point: {still_alive:?}",
         still_alive.len()

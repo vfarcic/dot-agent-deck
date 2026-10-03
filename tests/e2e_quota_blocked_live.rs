@@ -172,6 +172,27 @@ fn status_blocked_023_real_opencode_api_error_is_forwarded_not_blocked() {
         Duration::from_secs(90),
     );
     assert_error_card(&viewer, name);
+    // OpenCode ends the failed run with `session.idle` right after the error
+    // (four `Idle`s within 4 ms, measured with 1.18.34). The card must still
+    // read Error once they have landed — they used to repaint it Idle.
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(agent_id.as_str())
+                && event.agent_type == AgentType::OpenCode
+                && event.event_type == EventType::Idle
+        },
+        Duration::from_secs(30),
+    );
+    let left_error = viewer.wait_for_grid_predicate_within(Duration::from_secs(3), |grid| {
+        !grid
+            .lines()
+            .any(|line| line.contains(name) && line.contains("Error"))
+    });
+    assert!(
+        !left_error,
+        "{name} left Error after OpenCode's trailing idle:\n{}",
+        viewer.snapshot_grid()
+    );
 }
 
 /// Codex's empty-composer placeholder — see `CODEX_COMPOSER_READY` in

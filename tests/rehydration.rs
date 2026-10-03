@@ -392,6 +392,7 @@ fn make_session(
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        output_set_status: false,
     }
 }
 
@@ -3280,6 +3281,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        output_set_status: false,
     };
     let (buffer, _) =
         render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
@@ -3396,6 +3398,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        output_set_status: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as
