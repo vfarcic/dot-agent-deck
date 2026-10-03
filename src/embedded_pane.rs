@@ -549,8 +549,16 @@ pub(crate) fn begin_guarded_submit(
             Ok(reply) => crate::pane::SubmitReply {
                 result: Ok(reply.result),
                 current_session_id: reply.current_session_id,
+                may_have_written: false,
             },
-            Err(e) => Err(PaneError::CommandFailed(format!("write_and_submit: {e}"))).into(),
+            Err(failure) => crate::pane::SubmitReply {
+                result: Err(PaneError::CommandFailed(format!(
+                    "write_and_submit: {}",
+                    failure.error
+                ))),
+                current_session_id: None,
+                may_have_written: failure.may_have_written,
+            },
         };
         let _ = tx.send_reply(reply);
     });

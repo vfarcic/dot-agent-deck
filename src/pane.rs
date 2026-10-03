@@ -36,11 +36,17 @@ pub struct PendingSubmit {
 pub struct SubmitReply {
     pub result: Result<crate::event::SendResult, PaneError>,
     pub current_session_id: Option<String>,
+    /// For a failed submit, whether it could nonetheless have written — see
+    /// [`crate::daemon_client::GuardedSendFailure`]. A controller that cannot
+    /// tell says so by leaving it `true` for every error, which is what the
+    /// `From` conversion does; it is never consulted for an `Ok`.
+    pub may_have_written: bool,
 }
 
 impl From<Result<crate::event::SendResult, PaneError>> for SubmitReply {
     fn from(result: Result<crate::event::SendResult, PaneError>) -> Self {
         Self {
+            may_have_written: result.is_err(),
             result,
             current_session_id: None,
         }

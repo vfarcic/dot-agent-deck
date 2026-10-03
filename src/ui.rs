@@ -1914,9 +1914,11 @@ struct PromptDelivery {
     /// while the snapshot has none, which is the one place the snapshot's
     /// silence would otherwise read as the bound conversation having gone.
     refusal_generation: Option<String>,
-    /// Issue #621 (review): some request of this delivery ended in a transport
-    /// error, so it may have written although `attempts` is still 0 — a write
-    /// the daemon applied whose response was lost. A refusal's generation must
+    /// Issue #621 (review): some request of this delivery failed after it may
+    /// have reached the daemon's write, so it may have written although
+    /// `attempts` is still 0 — a write the daemon applied whose response was
+    /// lost. A failure the controller knows came before the request (a failed
+    /// capability probe or connection) does not set it. A refusal's generation must
     /// not be adopted then: binding it would treat the delivery as unwritten
     /// and name a conversation the earlier bytes may never have entered, which
     /// is the #424 H4 hazard the snapshot bind answers with the closure count
@@ -4297,6 +4299,7 @@ fn apply_seed_send_outcome(
     let SubmitReply {
         result: outcome,
         current_session_id,
+        may_have_written,
     } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this
@@ -4399,8 +4402,10 @@ fn apply_seed_send_outcome(
         // Transport failure: retain for retry, back off, surface feedback.
         Err(e) => {
             // Issue #621 (review): not proof that nothing was written — see
-            // [`PromptDelivery::write_unacknowledged`].
-            if let Some(delivery) = deliveries.get_mut(pane_id) {
+            // [`PromptDelivery::write_unacknowledged`] — unless the controller
+            // knows the failure came before the request could reach the
+            // daemon (a failed capability probe or connection), which is.
+            if may_have_written && let Some(delivery) = deliveries.get_mut(pane_id) {
                 delivery.write_unacknowledged = true;
             }
             schedule_send_retry(backoff, pane_id, now);
@@ -5604,6 +5609,7 @@ fn apply_orchestrator_send_outcome(
     let SubmitReply {
         result: outcome,
         current_session_id,
+        may_have_written,
     } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this means. The
@@ -5702,7 +5708,7 @@ fn apply_orchestrator_send_outcome(
         }
         Err(e) => {
             // Issue #621 (review): the seed path's twin.
-            if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
+            if may_have_written && let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
                 delivery.write_unacknowledged = true;
             }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
@@ -38564,6 +38570,199 @@ mod tests {
             ),
             (None, Some("original")),
             "a bound delivery must never be redirected by a refusal's generation"
+        );
+    }
+
+    /// Issue #621 (Qodo on #1521): a controller that answers each submit from a
+    /// script of whole replies, and records the session each one named.
+    struct ScriptedReplyPaneController {
+        replies: std::sync::Mutex<std::collections::VecDeque<SubmitReply>>,
+        named: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedReplyPaneController {
+        fn new(replies: Vec<SubmitReply>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                named: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for ScriptedReplyPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some("scripted-agent".to_string())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            self.named
+                .lock()
+                .unwrap()
+                .push(expected_session_id.map(str::to_string));
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SubmitReply {
+                    result: Ok(SendResult::Stale),
+                    current_session_id: None,
+                    may_have_written: false,
+                });
+            crate::pane::PendingSubmit::ready_reply(reply)
+        }
+        fn name(&self) -> &str {
+            "scripted-reply"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #621 (Qodo on #1521): a failure that provably wrote nothing — a
+    /// failed capability probe or connection — must not cost a delivery its
+    /// recovery from a later `stale` that names the conversation, on either
+    /// TUI path; a failure after the request may have reached the daemon must.
+    #[test]
+    fn an_unsent_failure_keeps_refusal_recovery_and_a_maybe_written_one_does_not() {
+        const GENERATION: &str = "refused-against-621";
+        let failure = |may_have_written| SubmitReply {
+            result: Err(PaneError::CommandFailed(
+                "write_and_submit: injected".into(),
+            )),
+            current_session_id: None,
+            may_have_written,
+        };
+        let stale = || SubmitReply {
+            result: Ok(SendResult::Stale),
+            current_session_id: Some(GENERATION.to_string()),
+            may_have_written: false,
+        };
+        let applied = || SubmitReply {
+            result: Ok(SendResult::Applied),
+            current_session_id: None,
+            may_have_written: false,
+        };
+
+        let seed_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-seed-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let mut ui = default_ui();
+            ui.pending_seed_prompts
+                .push(aged_seed_prompt(PANE_ID, "scripted seed"));
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            for _ in 0..3 {
+                process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let role_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-role-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let tab_id: TabId = 62101;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(
+                tab_id,
+                std::time::Instant::now()
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
+                    .expect("aged anchor timestamp"),
+            );
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            let role_panes = [PANE_ID.to_string()];
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut role_prompt = Some("scripted role prompt".to_string());
+            for _ in 0..3 {
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    pane.as_ref(),
+                    &snapshot,
+                    std::time::Instant::now(),
+                    tab_id,
+                    &role_panes,
+                    0,
+                    &mut role_statuses,
+                    &mut role_prompt,
+                );
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let recovered = vec![None, None, Some(GENERATION.to_string())];
+        let held_back = vec![None, None, None];
+        assert_eq!(
+            (seed_named(false), role_named(false)),
+            (recovered.clone(), recovered),
+            "after a failure that wrote nothing, the attempt after the `stale` names the \
+             conversation it reported, on both paths"
+        );
+        assert_eq!(
+            (seed_named(true), role_named(true)),
+            (held_back.clone(), held_back),
+            "after a failure that may have written, a refusal's generation is never adopted"
         );
     }
 
