@@ -2949,21 +2949,70 @@ fn dashboard_restore_pane_dims(
     )
 }
 
+/// Order an orchestration tab's cards by role config order (`role_pane_ids`),
+/// not by creation order, so a recreated pane (a `clear = true` respawn, which
+/// gets a new, newer daemon agent id) keeps its original card position. The
+/// sort is stable, so cards sharing a position keep [`filter_sessions`]'s
+/// creation order.
+fn sort_by_role_order(sessions: &mut [(&String, &SessionState)], role_pane_ids: &[String]) {
+    sessions.sort_by_key(|(_, s)| {
+        s.pane_id
+            .as_ref()
+            .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// The dashboard's creation-order sort key for one session (issue #1507).
+///
+/// First the daemon's agent id, compared as a number: the daemon mints it from
+/// a monotonic counter for every spawn, whatever started it (the TUI, the
+/// desktop app, `dispatch`, a schedule, an orchestration), and sorts its own
+/// `ListAgents` reply by it — the order the desktop app renders. So both
+/// clients list the same agents in the same order. The pane id cannot serve:
+/// only a TUI-created pane's is numeric, and every daemon-minted one
+/// (`desktop-<nonce>-<n>`, `sched-…-<n>`) used to tie and fall back to
+/// `HashMap` order.
+///
+/// Sessions with no numeric agent id (a hook from outside any pane, a legacy
+/// hook script) come after every agent that has one, ordered as before: by
+/// numeric pane id, paned before paneless, then start time. The pane id and
+/// session id as strings close the key, so equal keys cannot occur and the
+/// order never depends on the map's iteration order.
+#[allow(clippy::type_complexity)]
+fn creation_order_key<'a>(
+    session_id: &'a str,
+    session: &'a SessionState,
+) -> (
+    (bool, u64),
+    bool,
+    (bool, u64),
+    DateTime<Utc>,
+    &'a str,
+    &'a str,
+) {
+    // `(is_none, value)`: a present number sorts by value, ahead of every
+    // absent one (a bare `Option` would put `None` first).
+    fn numeric_last_if_absent(id: Option<&str>) -> (bool, u64) {
+        match id.and_then(|id| id.parse::<u64>().ok()) {
+            Some(n) => (false, n),
+            None => (true, 0),
+        }
+    }
+    (
+        numeric_last_if_absent(session.agent_id.as_deref()),
+        session.pane_id.is_none(),
+        numeric_last_if_absent(session.pane_id.as_deref()),
+        session.started_at,
+        session.pane_id.as_deref().unwrap_or(""),
+        session_id,
+    )
+}
+
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by(|(_, a), (_, b)| {
-        // Sort by pane ID (numeric creation order) when available,
-        // falling back to started_at for sessions without a pane.
-        match (&a.pane_id, &b.pane_id) {
-            (Some(pa), Some(pb)) => {
-                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                na.cmp(&nb)
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.started_at.cmp(&b.started_at),
-        }
+    sessions.sort_by(|(a_id, a), (b_id, b)| {
+        creation_order_key(a_id, a).cmp(&creation_order_key(b_id, b))
     });
 
     if ui.filter_text.is_empty() {
@@ -13839,14 +13888,7 @@ pub fn run_tui(
                             .is_some_and(|pid| role_pane_ids.contains(pid))
                     })
                     .collect();
-                // Sort by role config order, not numeric pane ID, so recreated
-                // panes (clear=true) keep their original card position.
-                orch_filtered.sort_by_key(|(_, s)| {
-                    s.pane_id
-                        .as_ref()
-                        .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
-                        .unwrap_or(usize::MAX)
-                });
+                sort_by_role_order(&mut orch_filtered, role_pane_ids);
                 orch_filtered
             }
         };
@@ -21573,8 +21615,9 @@ pub fn render_orchestration_frame_to_buffer(
     let role_names = &role_names[..role_names.len().min(RENDER_SEAM_ROLES_MAX)];
     let focused_role_index = focused_role_index.min(role_names.len() - 1);
 
-    // Numeric pane ids so `filter_sessions`' pane-id sort reproduces role order
-    // and the rendered card column is deterministic.
+    // Numeric pane ids so `filter_sessions`' pane-id fallback (these sessions
+    // carry no daemon agent id) reproduces role order and the rendered card
+    // column is deterministic.
     let pane_ids: Vec<String> = (0..role_names.len()).map(|i| i.to_string()).collect();
 
     // One inert pane per role, the focused one focused. The seed geometry is a
@@ -42147,6 +42190,270 @@ mod tests {
             dot-agent-deck — 0/2 agent(s)
             No agents match filter.
             "
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1507 — the dashboard lists agents in creation order, whatever
+    // produced the pane id. The key is the daemon's agent id, a monotonic
+    // counter the daemon mints for every spawn and sorts its own `ListAgents`
+    // reply by, so the TUI and the desktop app agree on the order.
+    // -----------------------------------------------------------------------
+
+    /// Draw one full dashboard frame for `state` / `ui` into a `width` x
+    /// `height` `TestBackend` and return every row, right-trimmed.
+    fn order_frame_rows(
+        state: &AppState,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Seed one daemon agent the way the TUI's startup hydration does
+    /// (`seed_hydrated_session` with the daemon's agent id), and name its card.
+    fn order_seed_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+    ) {
+        state.register_pane(pane_id.to_string());
+        state.seed_hydrated_session(
+            pane_id.to_string(),
+            Some("/home/dev/dot-agent-deck".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some(agent_id.to_string()),
+            None,
+        );
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the hydrated agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// The names in `expected`, in the top-to-bottom order the frame draws
+    /// their cards. Each name is matched on a card title row, so a name that
+    /// is missing from the frame fails loudly rather than being skipped.
+    fn order_drawn_names<'a>(rows: &[String], expected: &[&'a str]) -> Vec<&'a str> {
+        let mut found: Vec<(usize, &str)> = expected
+            .iter()
+            .map(|name| {
+                let row = rows
+                    .iter()
+                    .position(|row| row.contains(&format!(" {name} ")))
+                    .unwrap_or_else(|| {
+                        panic!("`{name}` has no card in the frame:\n{}", rows.join("\n"))
+                    });
+                (row, *name)
+            })
+            .collect();
+        found.sort_by_key(|(row, _)| *row);
+        found.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Scenario: Start the TUI against a daemon that already runs a dispatcher
+    /// created from the desktop app (`desktop-…-0`) and eleven units started by
+    /// `dispatch` (`sched-dispatch-…-N`), none of which has a numeric pane id,
+    /// then draw the dashboard. The cards must read top to bottom in the order
+    /// the daemon created the agents — dispatcher first — as the desktop does.
+    #[spec("dashboard/order/001")]
+    #[test]
+    fn order_001_daemon_spawned_agents_are_listed_in_creation_order() {
+        // In creation order: the daemon minted agent ids 1..=12 for them in
+        // this sequence. Twelve agents, so the old code's `HashMap` order
+        // matches this one with odds of 1 in 12! — the failure it reproduces is
+        // deterministic in practice.
+        let agents: [(&str, &str); 12] = [
+            ("desktop-9ff5ffc73955d0fe-0", "dispatcher"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            (
+                "sched-dispatch-issue-1492-dashboard-voice-scroll-13",
+                "unit-1492",
+            ),
+            ("sched-dispatch-issue-1493-a-14", "unit-1493"),
+            ("sched-dispatch-issue-1494-b-15", "unit-1494"),
+            ("sched-dispatch-issue-1495-c-16", "unit-1495"),
+            ("sched-dispatch-issue-1496-d-17", "unit-1496"),
+            ("sched-dispatch-issue-1498-e-18", "unit-1498"),
+            ("sched-dispatch-issue-1499-f-19", "unit-1499"),
+            ("sched-dispatch-issue-1500-g-20", "unit-1500"),
+            ("sched-dispatch-issue-1501-h-21", "unit-1501"),
+            ("sched-dispatch-issue-1502-i-22", "unit-1502"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // The TUI learns of them newest first, so the stamps it gives them
+        // itself (`started_at`) run against creation order: only the daemon's
+        // agent id can put them right.
+        for (index, (pane_id, name)) in agents.iter().enumerate().rev() {
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 120);
+        let drawn = order_drawn_names(&rows, &names);
+        insta::assert_snapshot!(drawn.join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        unit-1493
+        unit-1494
+        unit-1495
+        unit-1496
+        unit-1498
+        unit-1499
+        unit-1500
+        unit-1501
+        unit-1502
+        ");
+
+        // Stable across renders: the order is a function of the agents, not of
+        // the map they sit in.
+        let again = order_frame_rows(&state, &mut ui, 60, 120);
+        assert_eq!(order_drawn_names(&again, &names), drawn);
+    }
+
+    /// Scenario: Start the TUI against a daemon running agents created from
+    /// the TUI (numeric pane ids `0`, `1`), from the desktop app and by
+    /// `dispatch`, interleaved in time, then draw the dashboard. The cards must
+    /// follow creation order across all three, not put every TUI-created pane
+    /// first.
+    #[spec("dashboard/order/002")]
+    #[test]
+    fn order_002_mixed_numeric_and_daemon_pane_ids_follow_creation_order() {
+        // Agent ids 1..=5 in this sequence. Before the fix the two numeric
+        // panes sorted first (`tui-two` jumped ahead of `desktop-one`), which is
+        // wrong for any `HashMap` order — this case fails deterministically.
+        let agents: [(&str, &str); 5] = [
+            ("0", "tui-one"),
+            ("desktop-9ff5ffc73955d0fe-0", "desktop-one"),
+            ("1", "tui-two"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            ("desktop-9ff5ffc73955d0fe-1", "desktop-two"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // Learned in an order that is not creation order, as above.
+        for index in [4, 1, 3, 0, 2] {
+            let (pane_id, name) = agents[index];
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        tui-one
+        desktop-one
+        tui-two
+        unit-1491
+        desktop-two
+        ");
+
+        // Agent ids compare as numbers, as the daemon's own list does: agent
+        // `10` was created after agent `9`, though it sorts first as a string.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-1", "10", "tenth");
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-0", "9", "ninth");
+        let rows = order_frame_rows(&state, &mut ui, 60, 40);
+        assert_eq!(
+            order_drawn_names(&rows, &["ninth", "tenth"]),
+            ["ninth", "tenth"]
+        );
+    }
+
+    /// Scenario: An orchestration whose orchestrator was respawned in place
+    /// (`clear = true`), so it now carries the NEWEST daemon agent id of its
+    /// three roles, is scoped to its tab the way the deck's main loop does it.
+    /// Its cards must stay in role config order — orchestrator first — rather
+    /// than following creation order.
+    #[spec("dashboard/order/003")]
+    #[test]
+    fn order_003_orchestration_roles_keep_role_order() {
+        let roles = [
+            ("sched-orch-7-r0", "orchestrator", "9"),
+            ("sched-orch-7-r1", "coder", "4"),
+            ("sched-orch-7-r2", "reviewer", "5"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        for (pane_id, name, agent_id) in roles {
+            order_seed_agent(&mut state, &mut ui, pane_id, agent_id, name);
+        }
+        let role_pane_ids: Vec<String> =
+            roles.iter().map(|(pane, _, _)| pane.to_string()).collect();
+
+        let mut scoped = filter_sessions(&state, &ui);
+        // Precondition: creation order alone would put the orchestrator last,
+        // so the role-order sort is what this test is measuring.
+        assert_eq!(
+            scoped.last().and_then(|(_, s)| s.pane_id.as_deref()),
+            Some("sched-orch-7-r0"),
+            "the respawned orchestrator is the newest agent"
+        );
+        sort_by_role_order(&mut scoped, &role_pane_ids);
+        let order: Vec<&str> = scoped
+            .iter()
+            .filter_map(|(_, s)| s.pane_id.as_deref())
+            .collect();
+        assert_eq!(
+            order,
+            ["sched-orch-7-r0", "sched-orch-7-r1", "sched-orch-7-r2"]
         );
     }
 

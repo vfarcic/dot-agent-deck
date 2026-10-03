@@ -197,6 +197,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** which key scrolls the grid (selection movement does, via `dashboard/selection/*`); the indicator's format, pinned by the `scroll_indicator_reports_only_what_is_hidden` unit test shared with the scheduled-tasks modal.
 - **Platform coverage:** mac+linux+windows.
 
+#### dashboard/order
+
+##### dashboard/order/001 — Agents the desktop app or `dispatch` created are listed in creation order (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (twelve synthetic agents seeded through the TUI's startup hydration path, `AppState::seed_hydrated_session`, with daemon agent ids `1`..`12`).
+- **Asserts:** a desktop-created dispatcher (`desktop-9ff5ffc73955d0fe-0`) and eleven dispatched units (`sched-dispatch-…-N`), none with a numeric pane id, are drawn top to bottom in the order the daemon created them — dispatcher first — and a second render draws the same order. Before the fix every non-numeric pane id sorted as `u64::MAX`, so all twelve tied and took `HashMap` order; with twelve agents that matches creation order with odds of 1 in 12!.
+- **Does not assert:** the desktop app's own order (it renders the daemon's `ListAgents` order, which is sorted by the same numeric agent id); live-surfaced agents that reach the TUI by `SessionStart` rather than hydration (they carry the same daemon agent id on the event); filtering (`dashboard/filter/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/002 — TUI-created panes and daemon-spawned agents interleave in creation order (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (five synthetic hydrated agents).
+- **Asserts:** agents created from the TUI (numeric pane ids `0`, `1`), the desktop app and `dispatch`, interleaved in time, are drawn in creation order rather than with every numeric pane first; and daemon agent id `10` is drawn after `9`, i.e. ids compare as numbers, as the daemon's own list does.
+- **Does not assert:** sessions with no daemon agent id (hook-only sessions from a legacy hook script), which keep the old pane-id / start-time fallback after every agent that has one.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/003 — An orchestration tab keeps role order even when a role was respawned (issue #1507 control).
+- **Layer:** L1 (in-module `src/ui.rs` test on `filter_sessions` + `sort_by_role_order`, the same two steps the main loop scopes an orchestration tab with).
+- **Agent:** none (three synthetic role sessions).
+- **Asserts:** with an orchestrator that carries the newest daemon agent id of its three roles (a `clear = true` respawn), creation order alone puts it last, and the tab's role-order sort still puts it first, followed by the other roles in config order.
+- **Does not assert:** the rendered orchestration tab (`tabs/orchestration/*`); the respawn itself.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/card-stats
 
 ##### dashboard/card-stats/001 — A wide card renders its full Last/Tools stats at the bottom-right border.
