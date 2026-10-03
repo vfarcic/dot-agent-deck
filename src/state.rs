@@ -10425,6 +10425,9 @@ fn overlay_snapshot_onto_kept_card(
 /// differently (see that function's doc comment).
 fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     session.status = snap.status.clone();
+    // Issue #1493 (Qodo on PR #1523): the daemon's status is not one this
+    // card's output set, so the wrapper's quiet Idle may not end it.
+    session.output_set_status = false;
     // Issue #714: the reason travels with the status it explains, and only with
     // it. The detail is agent-derived text arriving over the wire, so it gets the
     // same scrub `apply_event` gives it rather than trusting the daemon's, and
@@ -26097,6 +26100,24 @@ while True:
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 6));
         state.apply_event(codex_wrapper_frame(EventType::Idle, true, 7));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
+
+        // The same after a reconnect overlays the daemon's status onto a card
+        // whose Thinking this TUI had from output (Qodo on PR #1523).
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 2));
+        let key = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some("pane-x"))
+            .map(|(k, _)| k.clone())
+            .expect("the card");
+        let snap = state.sessions[&key].live_snapshot();
+        assert_eq!(snap.status, SessionStatus::Thinking);
+        overlay_snapshot_fields(state.sessions.get_mut(&key).expect("the card"), &snap);
+        state.apply_event(codex_wrapper_frame(EventType::Idle, true, 4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
 
         // A wrapper interface start that arrives after frames it predates — an
         // untrusted Thinking, or a native prompt — does not reset the card
