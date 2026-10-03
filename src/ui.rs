@@ -4595,17 +4595,13 @@ enum SubmissionEvidence {
 /// is the same one-handoff shape [`crate::state::latch_generation`] applies on
 /// the daemon side.
 ///
-/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
-/// producers under one registry agent id — `dot-agent-deck wrap` emits under
-/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
-/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
-/// "current generation" alternates between them. This check then reads that
-/// alternation as a lost target and abandons. The daemon's own send guard
-/// already refuses the same shape (it requires an EXACT match against the
-/// current generation), so this makes an existing intermittent refusal
-/// deterministic one frame earlier rather than introducing a new failure; the
-/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
-/// frame from a second producer as a generation.
+/// A pane hosting a wrapped agent has TWO producers under one registry agent
+/// id — `dot-agent-deck wrap` emits under `{pane}-session`, the wrapped agent's
+/// native hooks under their own id. Until issue #532 `AppState::pane_hook_session`
+/// followed whichever of them spoke last, so this check read the alternation as
+/// a lost target and abandoned. It now moves an established generation only on
+/// a genuine `SessionStart`, so the wrapper's ordinary frames leave the target
+/// this delivery bound alone (`prompt/pane-input/043`).
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
     // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
     // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
@@ -4675,10 +4671,10 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 ///   appears after the write is not that conversation — we never addressed it —
 ///   so adopting it retroactively claims a target this delivery never had, and
 ///   any later generation on that pane then reads as a lost target. That is not
-///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
-///   carrying a pane id, including one from a producer that never announced a
-///   session, so a pane whose events carry drifting session ids would abandon
-///   deliveries it never endangered (`prompt/pane-input/026`).
+///   hypothetical: the snapshot's `pane_hook_session` is ESTABLISHED by any
+///   event carrying a pane id, including one from a producer that never
+///   announced a session, so binding retroactively would claim a target this
+///   delivery never addressed (`prompt/pane-input/026`).
 ///
 /// A prompt written into a pane that had NO generation — the 10 s-fallback
 /// launcher case — therefore stays UNBOUND for as long as it is merely being
@@ -4762,10 +4758,9 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
 /// The `prompt/pane-input/026` counter-example that argued against binding late
 /// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
 /// session ids, and the daemon-side latch now treats only a `SessionStart` as an
-/// announcement. The residual that does remain is #532's wrapped-agent
-/// alternation, which `AppState::pane_hook_session` still tracks across two
-/// producers; that shows up as an abandoned delivery — the safe direction — and
-/// is already documented on [`delivery_target_changed`].
+/// announcement — and since issue #532 so does `AppState::pane_hook_session`
+/// once a pane has a generation, which is what ended the wrapped-agent
+/// alternation documented on [`delivery_target_changed`].
 fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
     if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
         return;
@@ -4936,12 +4931,11 @@ fn evidence_channel_is_unidentified(
 ///
 /// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
 /// `SessionStart` is self-describing and authoritative, and anything else is
-/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
-/// carrying a pane id — good for the send guard, useless as evidence that a
-/// conversation began — so reading it raw would make a pane whose ordinary
-/// events drift through session ids look like a rolling series of
-/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
-/// wrapped-agent alternation.
+/// inference. `AppState::pane_hook_session` deliberately lets ANY frame carrying
+/// a pane id ESTABLISH a generation on a pane that has none — good for the send
+/// guard, useless as evidence that a conversation began — so reading it raw
+/// would make an inferred generation look like an announced one. That pane is
+/// `prompt/pane-input/026`.
 ///
 /// Matched by TIMESTAMP rather than by session id, because the two are not the
 /// same string by the time they reach here: `AppState::apply_event`'s reuse

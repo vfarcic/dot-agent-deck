@@ -1526,12 +1526,18 @@ pub struct AppState {
     /// generation is refused with no bytes. Cleared on `SessionEnd`.
     ///
     /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
-    /// `(session_id, established_at)` pair, NOT just the id. The generation only
-    /// advances on a genuinely newer session (an incoming id different from the
-    /// current one whose event timestamp is `>=` the established one); an
-    /// out-of-order / older-generation event is IGNORED so a delayed prior-event
-    /// can neither restore a stale id nor clear a newer one, and a delayed
+    /// `(session_id, established_at)` pair, NOT just the id. A frame naming the
+    /// current generation only refreshes its timestamp, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
+    ///
+    /// Issue #532: once a pane HAS a generation, only a genuine `SessionStart`
+    /// naming a different session moves it (issue #424 D2: whatever its
+    /// timestamp). An ordinary frame naming another session — a delayed
+    /// straggler, or a second producer on the same pane such as the
+    /// `dot-agent-deck wrap` host beside a wrapped agent's native hooks —
+    /// changes nothing. That is the rule [`latch_generation`] applies, so the
+    /// daemon's send guard and its own delivery latch agree on what the pane's
+    /// conversation is.
     ///
     /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
     /// conversation, or because an ordinary frame carrying a pane id arrived. A
@@ -13961,13 +13967,13 @@ impl AppState {
         // continuity, but the generation tracked here rolls forward, so the send
         // guard refuses an old queued prompt against the new conversation.
         //
-        // Greptile finding #4 (monotonic): the generation only ADVANCES; it never
-        // regresses. Advance to the incoming id when it is a genuinely newer
-        // generation — a different id whose event timestamp is at least the
-        // established one (or a fresher timestamp for the same id). A delayed
-        // event from a PRIOR generation (older timestamp, different id) is
-        // IGNORED, so it can neither restore a stale generation nor overwrite the
-        // current one.
+        // Greptile finding #4 (monotonic): the generation never regresses. A
+        // frame naming the current generation refreshes its timestamp; a delayed
+        // event from a PRIOR generation is IGNORED, so it can neither restore a
+        // stale generation nor overwrite the current one. Issue #532 narrowed the
+        // ordinary-frame half further: a non-start frame naming a DIFFERENT
+        // session never moves a pane that already has a generation, however new
+        // it is (see the `Some` arm below).
         //
         // Issue #424 D2 (both reviewers): the monotonic rule above has ONE
         // exception, and it is the same policy `latch_generation` applies. A
@@ -13978,14 +13984,15 @@ impl AppState {
         // future pins this pane's generation permanently, every real
         // announcement afterwards is discarded as a straggler, and the TUI keeps
         // reporting — and authorizing sends against — a conversation that no
-        // longer exists. Ordinary frames keep the monotonic rule, so a delayed
-        // `Thinking` still cannot restore a superseded generation.
+        // longer exists. Ordinary frames cannot move an established generation
+        // at all (issue #532), so a delayed `Thinking` still cannot restore a
+        // superseded generation.
         //
         // A LAUNCHER-ORIGIN start is excluded from the carve-out on purpose: it
         // is explicitly not a conversation announcing itself (PRD #225 M3), and a
         // wrapped pane legitimately has two producers under one registry agent,
         // so letting the wrapper's fork-time start win unconditionally would make
-        // the #532 alternation worse rather than better.
+        // the pane alternate between them (issue #532).
         //
         // Issue #424 F3 (auditor HIGH): that exclusion has to cut BOTH ways. A
         // launcher-origin start naming a DIFFERENT generation used to fall
@@ -14006,9 +14013,10 @@ impl AppState {
         // writes, so a generation established by something that announced no
         // conversation became the target the prompt claimed, and the real agent's
         // announcement then read as that target being lost. See `provisional_start`
-        // below. That also strictly improves
-        // #532: the wrapper's fork-time start can no longer take the generation
-        // off the wrapped agent's native session.
+        // below. That closed the boot-provenance half of #532: the wrapper's
+        // fork-time start can no longer take the generation off the wrapped
+        // agent's native session. Issue #532 itself closed the ordinary-frame
+        // half.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
@@ -14060,13 +14068,36 @@ impl AppState {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
-                    } else if provisional_start {
-                        // Boot provenance never replaces a live conversation.
-                        false
                     } else {
-                        // Different generation: an announcement always wins; any
-                        // other frame must not be older.
-                        announces_generation || incoming_ts >= *current_ts
+                        // Different generation: only an ANNOUNCEMENT moves a pane
+                        // that already has one, and it moves it whatever its
+                        // producer clock says (#424 D2). Boot provenance never
+                        // replaces a live conversation (#424 F3), and neither
+                        // does an ordinary frame (issue #532).
+                        //
+                        // An ordinary frame naming another session is either a
+                        // straggler from a superseded generation or a SECOND
+                        // PRODUCER on the same pane, and neither is a
+                        // conversation beginning. The second producer is the
+                        // normal shape of a wrapped agent: `dot-agent-deck wrap`
+                        // reports under `{pane}-session` while the agent's native
+                        // hooks report under their own id, so letting the newer
+                        // frame win made the pane's generation alternate with
+                        // whichever producer spoke last, and the daemon's send
+                        // guard (an exact match against this value) refused
+                        // deliveries into the very conversation the agent had
+                        // announced. This is the rule `latch_generation` already
+                        // applies on the daemon's own delivery path, so the two
+                        // now agree.
+                        //
+                        // What it gives up: a producer whose session id rolls
+                        // over WITHOUT a `SessionStart` keeps the pane on its
+                        // first generation. Claude Code, Codex, Devin and
+                        // OpenCode each map a native session-start hook to
+                        // `SessionStart`, Pi reports under one pane-derived id
+                        // for its whole life, and such a producer was already
+                        // invisible to `latch_generation`.
+                        announces_generation
                     }
                 }
             };
@@ -14079,12 +14110,14 @@ impl AppState {
                 // Two exclusions, both the discriminator [`latch_generation`] and
                 // `crate::ui`'s witness already apply, for their reasons:
                 //
-                // * only an ANNOUNCEMENT counts. This map advances on any frame
-                //   carrying a pane id, so a pane whose ordinary events drift
-                //   through session ids (`prompt/pane-input/026`, and the #532
-                //   wrapped-agent alternation) would otherwise report a rolling
-                //   series of ended conversations and abandon deliveries nothing
-                //   endangered.
+                // * only an ANNOUNCEMENT counts. An ordinary frame can still
+                //   ESTABLISH a generation on a pane that has none, and that is
+                //   not a closure either (next point). Since issue #532 it can
+                //   no longer replace one, so this guard is now belt and braces
+                //   for the `advance` rule above rather than the only thing
+                //   keeping a pane whose ordinary events drift through session
+                //   ids (`prompt/pane-input/026`) from reporting a rolling series
+                //   of ended conversations.
                 // * establishing a generation where the pane had NONE is not a
                 //   closure. That is the launcher case #424 exists for: the first
                 //   genuine announcement after our write is the conversation we

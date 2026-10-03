@@ -1515,7 +1515,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none (synthetic ClaudeCode generations).
 - **Asserts:** for BOTH provisional establishing events — the daemon's card-surfacing `SessionStart` (`CARD_SURFACE_SESSION_START_ORIGIN`, whose `session_id` is the pane id) and a wrapper's boot-provenance `SessionStart` — the pane's hook generation stays unestablished; a seed the 10-second launcher fallback writes while that card is all there is survives the agent's genuine `SessionStart`; the retry is delivered naming that genuine generation; and the pane's generation-closure count stays 0, since the closure counter abandons the delivery on its own even when the bound id happens to match.
 - **The door is the FALLBACK, and that changed with issue #1005.** This entry used to say a seed "written while that card is all there is" survives the announcement, without saying how it got written — and on the fast path it no longer can be: the readiness gate now requires an announced conversation, so a card-only pane is not written into at all (`prompt/pane-input/036`). The subject is untouched and still load-bearing — a provisional start is not a conversation a delivery can be LOST from — but the only route that still reaches it is the 10-second `timeout_ready` slow path, i.e. the `devbox run claude …` launcher case issue #424 exists for. The fixture is aged accordingly.
-- **Does not assert:** that `spawn::surface_spawned_pane` stamps the marker (this test replays the event rather than calling it — pinned by `surface_spawned_pane_emits_session_start_for_attached_tuis` in `src/spawn.rs`); that the FAST path refuses a card-only pane (`prompt/pane-input/036`); the #532 residual, where a second producer's NON-announcing frames move the generation; or the daemon-owned delivery paths, which route through `latch_generation` and were never affected.
+- **Does not assert:** that `spawn::surface_spawned_pane` stamps the marker (this test replays the event rather than calling it — pinned by `surface_spawned_pane_emits_session_start_for_attached_tuis` in `src/spawn.rs`); that the FAST path refuses a card-only pane (`prompt/pane-input/036`); that a second producer's NON-announcing frames leave an established generation alone (`prompt/pane-input/043`); or the daemon-owned delivery paths, which route through `latch_generation` and were never affected.
 - **Platform coverage:** mac+linux.
 
 
@@ -1587,6 +1587,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** real Claude Code pinned to Haiku with Bash, Read and Write allowed; runtime-skipped when the CLI or credential is unavailable.
 - **Asserts:** a typed draft remains visible and a unique task sentinel remains absent during the wait; Ctrl+U clears the draft, the separately submitted delegate task reaches Claude, and Claude creates the sentinel with expected content.
 - **Does not assert:** exact model prose, timing of a completed work-done report, or behavior on other agents' native input editors.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/043 — A wrapped pane's second producer cannot move the guarded-send generation with ordinary frames; only a genuine `SessionStart` does (issue #532).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell.
+- **Agent:** synthetic wrapped Codex — the `dot-agent-deck wrap` host's fork-time start and stdout-classifier frames under `<pane>-session`, and Codex's native hook frames under their own session — sharing one pane and one registry agent id.
+- **Asserts:** after Codex announces its conversation, newer wrapper `Thinking`/`Idle` frames leave `pane_hook_session_id` on Codex's session, and a guarded `write-and-submit` naming that session is `Applied` and reaches the PTY (before the fix the wrapper's frames took the pane and the send came back `Stale` with no bytes). Control: a genuine `SessionStart` for a new session moves the pane, a wrapper frame after it does not move it back, the old conversation's prompt is refused with no bytes and the new one's is delivered.
+- **Does not assert:** the real `wrap` binary or real Codex hooks (the frames are applied directly to the daemon's state); the TUI-side `delivery_target_changed` path, which reads the same `pane_hook_session_id` value; or a producer whose session id rolls over without a `SessionStart`, which now keeps the pane on its first generation (no supported agent does that).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit

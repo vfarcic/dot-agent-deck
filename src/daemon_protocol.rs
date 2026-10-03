@@ -466,6 +466,25 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the capability is the desktop, which bounds its preparation call against a
 /// deck naming it and keeps waiting an older one out.
 ///
+/// **Issue #532 contributes no bump and no [`CONTRACT_BREAKS`] entry** for
+/// changing how the pane generation a guarded write's `expected_session_id` is
+/// compared against moves: an ordinary frame naming a different session no
+/// longer moves an established generation, so a wrapped agent's two producers
+/// stop trading it. Each side computes the value from the same event stream, and
+/// every pairing is today's behaviour or fails closed. A newer TUI against an
+/// older daemon is refused exactly as intermittently as today. An older TUI
+/// against a newer daemon can bind the wrapper's id after the agent announced
+/// its own conversation, and that send is now always refused rather than
+/// sometimes accepted; once it has written, that TUI's own target check already
+/// abandoned such a delivery at the next alternation. The desktop binds the session a genuine
+/// `SessionStart` named, which a newer daemon now honours instead of refusing
+/// intermittently. A newer daemon accepts a write the older one refused only
+/// when an ordinary frame under another session id arrived with no
+/// `SessionStart` for it — a second producer, or a producer that rolls its
+/// session id without announcing the new one. Claude Code, Codex, Devin and
+/// OpenCode each map a native session-start hook to `SessionStart`, and Pi
+/// reports under one pane-derived id for its whole life.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**

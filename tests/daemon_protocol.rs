@@ -3409,6 +3409,175 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
     });
 }
 
+/// Scenario: A wrapped Codex pane carries two producers under one agent id — the `dot-agent-deck wrap` host reporting under `<pane>-session` and Codex's native hooks under their own session. After Codex announces its conversation, the wrapper keeps reporting ordinary frames; a guarded prompt naming Codex's conversation must still be delivered. Only a genuine new `SessionStart` (a `/clear`) moves the pane, after which the old conversation's prompt is refused with no bytes and the new one's is delivered.
+#[spec("prompt/pane-input/043")]
+#[test]
+fn pane_input_043_second_producer_ordinary_frames_do_not_move_generation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wrapped-pane generation runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-wrapped-codex";
+        // What `dot-agent-deck wrap` names its own events on a managed pane
+        // (`wrap::session_id_for`).
+        let wrapper_session = format!("{pane_id}-session");
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let now = chrono::Utc::now();
+        let at = |secs: i64| now + chrono::Duration::seconds(secs);
+        let event = |session_id: &str, event_type, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            // The wrapper's fork-time start, then its stdout classifier reporting
+            // the child as busy, both under the wrapper's own session id.
+            let mut fork = event(&wrapper_session, EventType::SessionStart, at(0));
+            fork.metadata.insert(
+                dot_agent_deck::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                dot_agent_deck::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+            state.apply_event(fork);
+            state.apply_event(event(&wrapper_session, EventType::Thinking, at(1)));
+            // Codex's native hooks announce the conversation.
+            state.apply_event(event("codex-native", EventType::SessionStart, at(2)));
+            state.apply_event(event("codex-native", EventType::ToolStart, at(3)));
+            // The wrapper keeps reporting what it sees on stdout. These frames
+            // are NEWER than anything Codex has sent and name a different
+            // session, but they announce nothing.
+            state.apply_event(event(&wrapper_session, EventType::Thinking, at(4)));
+            state.apply_event(event(&wrapper_session, EventType::Idle, at(5)));
+        }
+        let generation_after_wrapper_frames = server
+            .state
+            .read()
+            .await
+            .pane_hook_session_id(pane_id);
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let to_conversation = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'WRAPPED-PANE-PROMPT-DELIVERED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native",
+                "delivery_id": "wrapped-pane-current"
+            }),
+        )
+        .await;
+        let (delivered, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"WRAPPED-PANE-PROMPT-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+
+        // Control: a GENUINE new conversation (a `/clear`) still moves the pane,
+        // so the guard keeps refusing the conversation that is over.
+        server.state.write().await.apply_event(event(
+            "codex-native-cleared",
+            EventType::SessionStart,
+            at(6),
+        ));
+        server.state.write().await.apply_event(event(
+            &wrapper_session,
+            EventType::Thinking,
+            at(7),
+        ));
+        let generation_after_clear = server
+            .state
+            .read()
+            .await
+            .pane_hook_session_id(pane_id);
+        let stale = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'CLEARED-CONVERSATION-PROMPT-LEAKED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native",
+                "delivery_id": "wrapped-pane-stale"
+            }),
+        )
+        .await;
+        let (stale_leaked, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"CLEARED-CONVERSATION-PROMPT-LEAKED",
+            Duration::from_millis(500),
+        )
+        .await;
+        let to_successor = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'SUCCESSOR-PROMPT-DELIVERED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "codex-native-cleared",
+                "delivery_id": "wrapped-pane-successor"
+            }),
+        )
+        .await;
+        let (successor_delivered, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"SUCCESSOR-PROMPT-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert_eq!(
+            (
+                generation_after_wrapper_frames.as_deref(),
+                to_conversation.send_result,
+                delivered,
+            ),
+            (Some("codex-native"), Some(SendResult::Applied), true),
+            "the wrapper's ordinary frames must not take the pane off the conversation Codex announced, \
+             so a prompt naming that conversation is delivered (issue #532)"
+        );
+        assert_eq!(
+            generation_after_clear.as_deref(),
+            Some("codex-native-cleared"),
+            "the control: a genuine SessionStart still moves the pane, and the wrapper frame after it \
+             does not move it back"
+        );
+        assert!(
+            !matches!(
+                stale.send_result,
+                Some(SendResult::Applied | SendResult::Queued)
+            ) && !stale_leaked
+                && to_successor.send_result == Some(SendResult::Applied)
+                && successor_delivered,
+            "after a genuine new conversation the old one's prompt is refused with no bytes and the \
+             new one's is delivered; stale={:?} leaked={stale_leaked}, successor={:?} delivered={successor_delivered}",
+            stale.send_result,
+            to_successor.send_result
+        );
+    });
+}
+
 /// Scenario: Send guarded prompts to pane-less agents through the no-pane sentinel. A missing agent identity and declared history-only targets must reject without bytes, including after the writer lock, while an identified live target still receives its prompt.
 #[spec("prompt/pane-input/020")]
 #[test]
