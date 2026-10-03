@@ -302,7 +302,7 @@ fn prompt_pane_input_046_a_pane_that_stops_reading_does_not_hang_its_send_or_sta
     let deck = TuiDeck::builder()
         .with_continue_session(
             "wedged-046",
-            "sh -c 'stty raw -echo; printf WEDGE-READY; exec sleep 600'",
+            "sh -c 'stty raw; printf WEDGE-READY; exec sleep 600'",
         )
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -401,8 +401,20 @@ fn prompt_pane_input_046_a_pane_that_stops_reading_does_not_hang_its_send_or_sta
     });
 
     // While that send is stuck on the wedged pane, the other pane still takes
-    // input at once.
-    std::thread::sleep(Duration::from_secs(1));
+    // input at once. The stuck pane's terminal echoes what it receives (raw
+    // mode, echo left on), so its first bytes showing is the observable that
+    // the send has reached the PTY — and the send cannot finish until the
+    // queue behind them would take all 200 KB.
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            String::from_utf8_lossy(&common::pane_snapshot_on(
+                deck.attach_socket_path(),
+                &wedged.id,
+            ))
+            .contains(&"x".repeat(256))
+        }),
+        "precondition: the stuck send never reached the stuck pane's PTY"
+    );
     let healthy_started = std::time::Instant::now();
     let healthy_result = tokio::runtime::Builder::new_current_thread()
         .enable_all()

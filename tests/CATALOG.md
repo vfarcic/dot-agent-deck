@@ -1612,7 +1612,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 
 ##### prompt/pane-input/046 — A send into a pane that stopped reading comes back as possibly delivered instead of hanging, and does not hold up other panes (issue #525).
 - **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; no LLM).
-- **Agent:** none — a `sh` that puts its terminal in raw mode with echo off and then `sleep`s without reading, and a plain `cat`.
+- **Agent:** none — a `sh` that puts its terminal in raw mode (echo left on, so the send's first bytes show it has reached the PTY) and then `sleep`s without reading, and a plain `cat` started on the same daemon.
 - **Asserts:** an identified `WriteAndSubmit` of a 200 KB line into the stuck pane returns `ambiguous` within 30 s rather than never; a send to the `cat` pane made while that one is pending returns `applied` within 8 s and its text reaches the pane; and the dashboard shows `Error` once the stuck send is reported. Before #525 the stuck send never came back, because its `write(2)` blocked the daemon's runtime worker until the pane read.
 - **Does not assert:** which card carries the `Error` (the grid is searched as a whole); the exact stall bound; a real agent that stops reading (no agent can be made to on demand); the unit-level accounting of a stalled write (`a_stalled_guarded_write_is_ambiguous_and_later_writes_add_nothing_behind_it` and the other issue #525 tests in `src/agent_pty.rs`).
 - **Platform coverage:** linux (the stuck-pane shape needs a kernel that blocks the master's writer on a full raw-mode input queue, which the macOS runner's did not).
