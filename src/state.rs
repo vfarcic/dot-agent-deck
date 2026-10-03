@@ -11809,7 +11809,7 @@ impl AppState {
         // Issue #580: "resolved" is no longer "delivered". A resolved role whose
         // worker still owes a `work-done` is refused below and reported in `busy`
         // instead, so `delivered` is filled by the fan-out loop itself.
-        let unresolved_roles: Vec<String> = {
+        let mut unresolved_roles: Vec<String> = {
             let mut missing: Vec<String> = Vec::new();
             for role in &signal.to {
                 if !targets.iter().any(|(r, _)| r == role) && !missing.iter().any(|r| r == role) {
@@ -11822,6 +11822,7 @@ impl AppState {
         let mut busy: Vec<crate::event::BusyWorker> = Vec::new();
         let mut superseded: Vec<crate::event::BusyWorker> = Vec::new();
         let mut blocked: Vec<crate::event::BlockedWorker> = Vec::new();
+        let mut exited_roles: Vec<String> = Vec::new();
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -11844,6 +11845,33 @@ impl AppState {
         // the per-pane dispatch mutex acquired inside the task body —
         // see [`AgentPtyRegistry::pane_dispatch_lock`].
         for (target_role, pane_id) in targets {
+            // Issue #524: a worker that crashed or quit on its own is still in
+            // the role maps — nothing on the natural-exit path takes it out — so
+            // the role resolved to its pane. A `clear = true` role is respawned by the
+            // dispatch below and really does get the task. Any other role has
+            // nothing left to receive it: the pointer write would fail inside the
+            // detached dispatch, long after this reply said "delivered". Decided
+            // the way `dispatch_one_owned` decides whether to respawn, from the
+            // same `cwd` and orchestration, before anything is armed.
+            if registry.pane_occupant_has_exited(&pane_id)
+                && !delegate_respawns_worker(
+                    configs,
+                    self.pane_cwd_map.get(&pane_id).map(String::as_str),
+                    orchestration.as_ref(),
+                    &target_role,
+                )
+            {
+                warn!(
+                    pane_id = %pane_id,
+                    role = %target_role,
+                    "delegate: the worker in this pane has exited and the role is not respawned \
+                     on delegate; reporting the role as unreached"
+                );
+                if !exited_roles.contains(&target_role) {
+                    exited_roles.push(target_role);
+                }
+                continue;
+            }
             // Issue #714: note a worker whose card reads `Blocked`, whether it is
             // delivered to or refused as busy below. A warning and never a
             // refusal: the status is reported by the agent's own hooks or session
@@ -12044,6 +12072,17 @@ impl AppState {
                 )
                 .await;
             });
+        }
+
+        // Issue #524: a role whose every pane held an exited worker reached no
+        // worker, and is reported exactly like a role that resolved to no pane.
+        for role in exited_roles {
+            if !delivered.contains(&role)
+                && !busy.iter().any(|worker| worker.role == role)
+                && !unresolved_roles.contains(&role)
+            {
+                unresolved_roles.push(role);
+            }
         }
 
         // Issue #580: nothing was dispatched and at least one worker was refused

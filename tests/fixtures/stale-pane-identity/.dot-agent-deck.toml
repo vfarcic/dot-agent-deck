@@ -1,0 +1,30 @@
+# Fixture for `orchestration/provenance/002` (issue #712).
+#
+# The test opens this orchestration TWICE in one directory, so there are two
+# live orchestrators, A and B. Issue #712 is an orchestrator whose environment
+# names ANOTHER orchestrator's pane: `DOT_AGENT_DECK_PANE_ID` and
+# `DOT_AGENT_DECK_AGENT_ID` from a different dispatch, in a process the daemon
+# spawned for this one. So the orchestrator's command reproduces exactly that,
+# inside its OWN pane: when the test drops `./stale-go-<this pane id>` (a shell
+# fragment naming A's pane id and agent id), it runs the branch's real
+# `delegate` with those two variables rewritten and everything else — the hook
+# capability token the daemon gave THIS pane included — left as spawned. Only
+# B's trigger is ever written; A's orchestrator just waits.
+#
+# Then, on `./own-go-<this pane id>`, the same pane delegates with its own
+# untouched environment: the control, and the later round trip that makes the
+# absence in A's worker an assertion rather than a fixed sleep. Each exit code
+# is echoed into the pane for the test to read. `$DAD_TEST_BIN` is the branch's
+# own binary, passed in by the test so an installed release on `PATH` cannot
+# stand in for it.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "while [ ! -f \"./stale-go-$DOT_AGENT_DECK_PANE_ID\" ]; do sleep 0.1; done; . \"./stale-go-$DOT_AGENT_DECK_PANE_ID\"; DOT_AGENT_DECK_PANE_ID=\"$STALE_PANE\" DOT_AGENT_DECK_AGENT_ID=\"$STALE_AGENT\" \"$DAD_TEST_BIN\" delegate --to worker --task stale-identity-task; echo \"STALE-DELEGATE-EXIT=$?\"; while [ ! -f \"./own-go-$DOT_AGENT_DECK_PANE_ID\" ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" delegate --to worker --task own-identity-task; echo \"OWN-DELEGATE-EXIT=$?\"; exec cat"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
