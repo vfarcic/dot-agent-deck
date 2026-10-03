@@ -118,8 +118,8 @@ struct RealDelegateCase<'a> {
     declared_launcher: Option<&'a str>,
 }
 
-/// `/015`'s bound on delegate release → task pointer submitted: the 8000 ms
-/// no-signal hold this test pins, the first two waits of the shipped re-send
+/// `/015`'s bound on delegate release → task pointer submitted: the no-signal
+/// hold in force ([`opencode_hold_ms`]), the first two waits of the shipped re-send
 /// schedule, and 10 s of slack for the probe grace, the echo gate and OpenCode
 /// posting `session.prompt`.
 ///
@@ -143,7 +143,17 @@ struct RealDelegateCase<'a> {
 /// oversubscription.
 fn opencode_delegate_to_submit_budget() -> Duration {
     let [first, second, _] = DEFAULT_RETRY_SCHEDULE_MS;
-    Duration::from_millis(8000 + first + second + 10_000)
+    Duration::from_millis(opencode_hold_ms() + first + second + 10_000)
+}
+
+/// The no-signal hold `/015` runs with: its 8000 ms pin, mirroring
+/// `state::NO_SIGNAL_READINESS_BUFFER`, or the value
+/// [`E2E_READINESS_BUFFER_OVERRIDE`] forwards in its place.
+fn opencode_hold_ms() -> u64 {
+    std::env::var(E2E_READINESS_BUFFER_OVERRIDE)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(8000)
 }
 
 /// The shipped re-send schedule, spelled out because the harness base pins the
@@ -502,10 +512,7 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     // buffer, and the 30 s `SessionStart` fallback never ran.
     let daemon_log = std::fs::read_to_string(&daemon_log_path)
         .unwrap_or_else(|error| format!("<daemon log unavailable: {error}>"));
-    let expected_buffer = format!(
-        "buffer_ms={}",
-        std::env::var(E2E_READINESS_BUFFER_OVERRIDE).unwrap_or_else(|_| "8000".to_string())
-    );
+    let expected_buffer = format!("buffer_ms={}", opencode_hold_ms());
     assert!(
         daemon_log.lines().any(|line| line
             .contains("holding the task prompt for the no-signal readiness buffer")

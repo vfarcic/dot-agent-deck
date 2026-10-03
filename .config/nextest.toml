@@ -227,19 +227,26 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Issue #1381: the two real-OpenCode `clear = true` delegates in
 # `tests/e2e_delegate_respawn_readiness.rs` wait in phases whose own bounds sum
-# well past the default 3 x 60s kill window. `/046` is the OpenCode preflight
-# probe, the delegate CLI (30s), the replacement's record (20s) and the
-# work-done report (240s). `/015` is the preflight, the composer paint (120s),
-# Thinking and Working (120s), the prompt event (90s) and the sentinel (90s),
-# with a submit budget that now allows for two in-place re-sends. Measured on
-# 2026-10-03, a passing `/046` took 73-103s, and one run that was not starved
-# (load-context QUIET/CONTENDED) was killed at 180s, so it reported nothing:
-# its own 240s wait never got to say whether work-done arrived. 6 x 60s lets
-# each phase fail with its own message. Scoped by name; still bounded. The
-# filters track the test FUNCTION names, so rename them in lockstep.
+# well past the default 3 x 60s kill window. Being killed there costs each
+# phase's own failure message and grid. Measured on 2026-10-03, a passing
+# `/046` took 73-256s, and one run that was not starved (load-context
+# QUIET/CONTENDED) was killed at 180s with nothing reported. Each window
+# below is the test's phase bounds plus room for the preflight and teardown.
+# Scoped by name; still bounded. The filters track the test FUNCTION names,
+# so rename them in lockstep.
+#
+# `/015`: the OpenCode preflight probe (~60s), the composer paint (120s),
+# Thinking and Working (120s), the prompt event (90s) and the sentinel (90s):
+# ~480s, so 9 x 60s.
 [[profile.default.overrides]]
-filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate) | test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
-slow-timeout = { period = "60s", terminate-after = 6 }
+filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
+# `/046`: the preflight (~60s), the delegate CLI (30s), the replacement's
+# record (20s) and the work-done report (240s): ~350s, so 7 x 60s.
+[[profile.default.overrides]]
+filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 # PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
 # dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
