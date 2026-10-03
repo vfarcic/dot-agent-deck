@@ -5312,7 +5312,7 @@ mod load_context_tests {
 /// keep polling and return `Ok` only once the expected text is there.
 #[tokio::test]
 async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = harness_tempdir().expect("harness tempdir");
     let trimmed = dir.path().join("trimmed.txt");
     let containing = dir.path().join("containing.txt");
     std::fs::write(&trimmed, "").expect("create empty sentinel");
@@ -5324,22 +5324,41 @@ async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
     let (t, c) = (trimmed.clone(), containing.clone());
     let writer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        std::fs::write(&t, "SENTINEL_OK\n").expect("fill sentinel");
-        std::fs::write(&c, "prefix SENTINEL_OK suffix").expect("fill sentinel");
+        tokio::fs::write(&t, "SENTINEL_OK\n")
+            .await
+            .expect("fill sentinel");
+        tokio::fs::write(&c, "prefix SENTINEL_OK suffix")
+            .await
+            .expect("fill sentinel");
     });
 
+    // Both waiters start BEFORE the write, so each has to poll the empty file.
+    async fn timed(
+        started: std::time::Instant,
+        wait: impl std::future::Future<Output = Result<(), String>>,
+    ) -> (Result<(), String>, Duration) {
+        let result = wait.await;
+        (result, started.elapsed())
+    }
     let started = std::time::Instant::now();
-    wait_for_file_trimmed_eq_async(&trimmed, "SENTINEL_OK", Duration::from_secs(10))
-        .await
-        .expect("trimmed waiter must see the late write");
-    wait_for_file_containing_async(&containing, "SENTINEL_OK", Duration::from_secs(10))
-        .await
-        .expect("containing waiter must see the late write");
-    assert!(
-        started.elapsed() >= Duration::from_millis(400),
-        "returned before the write landed: {:?}",
-        started.elapsed()
+    let ((trimmed_result, trimmed_at), (containing_result, containing_at)) = tokio::join!(
+        timed(
+            started,
+            wait_for_file_trimmed_eq_async(&trimmed, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
+        timed(
+            started,
+            wait_for_file_containing_async(&containing, "SENTINEL_OK", Duration::from_secs(10)),
+        ),
     );
+    trimmed_result.expect("trimmed waiter must see the late write");
+    containing_result.expect("containing waiter must see the late write");
+    for (name, at) in [("trimmed", trimmed_at), ("containing", containing_at)] {
+        assert!(
+            at >= Duration::from_millis(400),
+            "{name} waiter returned before the write landed: {at:?}"
+        );
+    }
     writer.await.expect("writer task");
 }
 
@@ -5349,7 +5368,7 @@ async fn async_content_waiters_ride_out_an_empty_file_until_the_write_lands() {
 /// return `Ok` because the file exists.
 #[tokio::test]
 async fn async_content_waiters_time_out_when_the_content_never_arrives() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = harness_tempdir().expect("harness tempdir");
     let empty = dir.path().join("empty.txt");
     let partial = dir.path().join("partial.txt");
     std::fs::write(&empty, "").expect("create empty sentinel");
