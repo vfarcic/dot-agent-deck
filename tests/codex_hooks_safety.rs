@@ -1216,8 +1216,9 @@ fn codex_hooks_006_unreachable_trust_is_reported_on_both_arms() {
     );
     // The residue the warning exists to name: definitions gone, trust row still
     // there. Asserted because it is why the message is worth printing, not
-    // because it is desirable — if the orphan collection #1027's first item
-    // describes ever lands, this is the assertion to change.
+    // because it is desirable. Issue #1027 item 1's collection does not reach
+    // it: that sweep runs only from an install whose listing names the deck's
+    // current hook, and an uninstall has none (`codex_trust_006` covers it).
     assert_eq!(
         trust_state_keys(home.path()),
         vec![deck_key],
@@ -1703,4 +1704,251 @@ fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
             );
         }
     }
+}
+
+/// A `hooks/list` reply like [`hook_list_response`], but carrying `warnings`.
+///
+/// Codex reports a hook it could not load through `warnings` (and `errors`)
+/// while still answering successfully, so a listing that carries one may be
+/// missing positions that are really in the file (issue #1027).
+fn hook_list_response_with_warnings(entries: Vec<Value>, warnings: Vec<&str>) -> String {
+    json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/workspace",
+                "hooks": entries,
+                "warnings": warnings,
+                "errors": []
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// Every `[hooks.state]` record in `home`'s `config.toml`, as `key -> trusted_hash`
+/// (an empty hash for a record that carries none).
+fn trust_state_hashes(home: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let contents =
+        std::fs::read_to_string(home.join("config.toml")).expect("read Codex config.toml");
+    let root: toml::Value = toml::from_str(&contents).expect("parse Codex config.toml");
+    root.get("hooks")
+        .and_then(|value| value.get("state"))
+        .and_then(toml::Value::as_table)
+        .expect("config.toml has [hooks.state] entries")
+        .iter()
+        .map(|(key, record)| {
+            let hash = record
+                .get("trusted_hash")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (key.clone(), hash)
+        })
+        .collect()
+}
+
+/// Scenario: Seed a Codex home whose `config.toml` already holds trust records left behind at positions the deck's hook no longer occupies, next to records belonging to the user, to an older deck build and to another Codex home, then run `dot-agent-deck hooks install --agent codex` against a stand-in listing the deck's hook and one user hook. Only the deck's own stale records — at an unlisted position, in this home's `hooks.json`, carrying the hash of the deck's current hook — must be removed; every other record must survive, and nothing at all is removed when the listing carries a warning.
+#[spec("codex/trust/006")]
+#[test]
+fn codex_trust_006_only_the_decks_own_stale_trust_records_are_collected() {
+    let deck_hash = "sha256:deck";
+    let run = |warnings: Vec<&str>| {
+        let fixture = test_temp::tempdir().expect("create CLI fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        write_fake_codex(fixture.path());
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let ours = format!("{}/hooks.json", home.path().display());
+        let key = |position: &str| format!("{ours}:{position}");
+        // The user's hook is in the SAME shared hooks.json as the deck's, which is
+        // why neither position alone nor hash alone may decide a deletion.
+        let user_entry = hook_entry(
+            "__CODEX_HOME__/hooks.json:pre_tool_use:1:0",
+            "/usr/bin/env USER_HOOK=1",
+            "__CODEX_HOME__/hooks.json",
+            "sha256:user",
+            false,
+        );
+        let seeded = format!(
+            "model = \"gpt-user-choice\"\n\n\
+             [hooks.state.\"{current}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{listed_with_deck_hash}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{stale_table}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state.\"{users_own}\"]\ntrusted_hash = \"sha256:user-earlier\"\n\n\
+             [hooks.state.\"{older_deck}\"]\ntrusted_hash = \"sha256:older-deck-build\"\n\n\
+             [hooks.state.\"{other_home}\"]\ntrusted_hash = \"{deck_hash}\"\n\n\
+             [hooks.state]\n\"{stale_inline}\" = {{ enabled = false, trusted_hash = \"{deck_hash}\" }}\n\
+             \"not-a-codex-key\" = {{ trusted_hash = \"{deck_hash}\" }}\n",
+            current = key("pre_tool_use:0:0"),
+            listed_with_deck_hash = key("pre_tool_use:1:0"),
+            stale_table = key("pre_tool_use:2:0"),
+            users_own = key("pre_tool_use:0:1"),
+            older_deck = key("stop:4:0"),
+            other_home = "/elsewhere/.codex/hooks.json:pre_tool_use:2:0",
+            stale_inline = key("stop:3:0"),
+        );
+        std::fs::write(home.path().join("config.toml"), &seeded).expect("seed Codex config");
+        let response = hook_list_response_with_warnings(
+            vec![own_home_entry(&deck_command, 0, deck_hash), user_entry],
+            warnings,
+        );
+
+        let output = run_cli_install(
+            home.path(),
+            deck_home.path(),
+            &fixture_path(fixture.path()),
+            &response,
+        );
+        assert!(
+            output.status.success(),
+            "hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after = trust_state_hashes(home.path());
+        let keys: Vec<String> = after.keys().cloned().collect();
+        let names = [
+            ("current", key("pre_tool_use:0:0")),
+            ("listed_with_deck_hash", key("pre_tool_use:1:0")),
+            ("stale_table", key("pre_tool_use:2:0")),
+            ("stale_inline", key("stop:3:0")),
+            ("users_own", key("pre_tool_use:0:1")),
+            ("older_deck", key("stop:4:0")),
+            (
+                "other_home",
+                "/elsewhere/.codex/hooks.json:pre_tool_use:2:0".to_string(),
+            ),
+            ("not_a_codex_key", "not-a-codex-key".to_string()),
+        ];
+        let present: Vec<&str> = names
+            .iter()
+            .filter(|(_, key)| keys.contains(key))
+            .map(|(name, _)| *name)
+            .collect();
+        let config = std::fs::read_to_string(home.path().join("config.toml"))
+            .expect("read Codex config.toml");
+        (present, config)
+    };
+
+    // A clean listing: the deck's two stale records go, everything else stays.
+    let (present, config) = run(Vec::new());
+    assert_eq!(
+        present,
+        vec![
+            "current",
+            "listed_with_deck_hash",
+            "users_own",
+            "older_deck",
+            "other_home",
+            "not_a_codex_key",
+        ],
+        "only the deck's own stale records may be collected — a user's record in the same \
+         file, a deck-hash record at a position Codex still lists, an older deck build's record \
+         and another home's record must all survive:\n{config}"
+    );
+    assert!(
+        config.starts_with("model = \"gpt-user-choice\"\n"),
+        "the rest of the user's config must be left alone:\n{config}"
+    );
+
+    // Control: the same seed, but Codex reported a warning, so the listing may be
+    // missing positions that are really in the file. Nothing is collected.
+    let (present, config) = run(vec!["hooks.json: unsupported handler type"]);
+    assert_eq!(
+        present,
+        vec![
+            "current",
+            "listed_with_deck_hash",
+            "stale_table",
+            "stale_inline",
+            "users_own",
+            "older_deck",
+            "other_home",
+            "not_a_codex_key",
+        ],
+        "a listing that carries a warning is not evidence a position is gone, so no record may \
+         be collected from it:\n{config}"
+    );
+}
+
+/// Scenario: A user has turned the deck's own Codex `PreToolUse` hook off in Codex's `/hooks` list (`enabled = false` on its trust record), then runs `dot-agent-deck hooks install --agent codex`. The hook must stay off while its trust is refreshed, and the command must tell the user, by event name, that the deck's hook is turned off in Codex; with the hook on, no such note appears.
+#[spec("codex/hooks/012")]
+#[test]
+fn codex_hooks_012_install_names_a_deck_hook_the_user_turned_off() {
+    let run = |enabled: bool| {
+        let fixture = test_temp::tempdir().expect("create CLI fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        write_fake_codex(fixture.path());
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        let deck_key = format!("{}/hooks.json:pre_tool_use:0:0", home.path().display());
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[hooks.state.\"{deck_key}\"]\nenabled = {enabled}\ntrusted_hash = \"sha256:stale\"\n"
+            ),
+        )
+        .expect("seed Codex config");
+        let mut entry = own_home_entry(&deck_command, 0, "sha256:deck");
+        entry["enabled"] = json!(enabled);
+        let log = fixture.path().join("deck.log");
+        let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args(["hooks", "install", "--agent", "codex"])
+            .env("PATH", fixture_path(fixture.path()))
+            .env("HOME", deck_home.path())
+            .env("CODEX_HOME", home.path())
+            .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(vec![entry]))
+            .env("DOT_AGENT_DECK_LOG", &log)
+            .output()
+            .expect("install Codex hooks from CLI");
+        assert!(
+            output.status.success(),
+            "hook install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config = std::fs::read_to_string(home.path().join("config.toml"))
+            .expect("read Codex config.toml");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        (config, stdout, log)
+    };
+
+    let (config, stdout, log) = run(false);
+    assert!(
+        config.contains("enabled = false") && config.contains("trusted_hash = \"sha256:deck\""),
+        "the user's `enabled = false` must survive while the hash is refreshed:\n{config}"
+    );
+    let note = stdout
+        .lines()
+        .find(|line| line.contains("turned off"))
+        .unwrap_or_else(|| {
+            panic!("install must tell the user the deck's hook is turned off:\n{stdout}")
+        });
+    assert!(
+        note.contains("PreToolUse"),
+        "the note must name the hook by its event: {note:?}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "Trusted hooks: 1"),
+        "the trust count line must stay a bare count: {stdout}"
+    );
+    assert!(
+        log.contains("WARN") && log.contains("turned off"),
+        "a warn-level log line must record the turned-off deck hook:\n{log}"
+    );
+
+    // Control: the same install with the hook switched on says nothing about it.
+    let (_, stdout, _) = run(true);
+    assert!(
+        !stdout.contains("turned off"),
+        "no note may appear when the deck's hooks are on:\n{stdout}"
+    );
 }

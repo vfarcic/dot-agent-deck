@@ -199,6 +199,17 @@ If a Codex card shows only coarse status with no tool or prompt detail, check in
 
 Trust is tied to each hook's exact content. If a hook definition changes after trust was recorded, Codex refuses to run it and the card falls back to coarse status; running the install again records trust for the new content.
 
+Codex keeps those trust records under `[hooks.state]` in its `config.toml`, one per hook position in `hooks.json`. When the deck's hook moves to a different position, the deck removes the record it left at the old one the next time it records trust. It never removes a record for one of your own hooks, for another Codex home's hooks, or for a position Codex still lists, and it removes nothing while Codex reports a warning or an error about your hook files.
+
+**If you turn off one of the deck's hooks** in Codex's `/hooks` list, the deck leaves it off: it keeps recording trust for it, but Codex reports nothing through it, so the agent's card (TUI) or row (desktop) is missing that hook's detail. This is the same in the TUI and the desktop app. `dot-agent-deck hooks install --agent codex` names every deck hook that is turned off, for example:
+
+```text
+Trusted hooks: 10
+Note: the deck's Codex hook for PreToolUse is turned off in Codex's /hooks list, so Codex reports nothing through it. The deck leaves it off; turn it back on in Codex's /hooks list to restore that detail.
+```
+
+The deck's log also records a warning naming those hooks each time the deck records trust. To get the detail back, turn the hook on again in Codex's `/hooks` list.
+
 While Codex's hooks are not trusted, or if you turn off the deck's `UserPromptSubmit` hook in Codex's `/hooks` list, Codex cannot confirm to the deck that it received an automatic prompt (the first prompt of a dispatcher or a schedule-authoring agent, an orchestration role's first task, a dispatched unit's task). The deck then types such a prompt once and does not retype it, so the prompt can go missing. Fixing trust fixes that as well.
 
 ### Codex as a role or worker: allow sandbox network access

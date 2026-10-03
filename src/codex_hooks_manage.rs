@@ -56,7 +56,10 @@
 //! - [`trust_deck_hooks_in`] records `[hooks.state."<key>"] { trusted_hash }` in
 //!   `<home>/config.toml` for exactly those keys — `trusted_hash` and nothing
 //!   else, because the sibling `enabled` key is a USER knob and not part of
-//!   trust at all (see [`upsert_trust_record`]).
+//!   trust at all (see [`upsert_trust_record`]). The same write removes the
+//!   deck's OWN records left at positions its hook no longer occupies, under
+//!   three conditions that must all hold (see
+//!   [`sweep_stale_deck_trust_records`], issue #1027).
 //!
 //! The result is strictly narrower than the old bypass and launch-method
 //! agnostic: trust lives in the home (not argv), so `codex`, `devbox run
@@ -858,6 +861,25 @@ impl CodexHookEntry {
     }
 }
 
+/// One `hooks/list` reply: the entries Codex enumerated, and how many
+/// `warnings` and `errors` it reported beside them (issue #1027).
+///
+/// Codex answers successfully even when it could not load part of a hooks file
+/// — measured on codex-cli 0.149.0, invalid JSON, a malformed handler or an
+/// unsupported handler type drop entries from `hooks` while the reply still
+/// succeeds — and says so through `warnings`/`errors`. So a listing whose
+/// `diagnostics` is non-zero may be missing positions that really are in the
+/// file, which is exactly what [`trust_deck_hooks_in`]'s stale-record sweep must
+/// not mistake for "that position is gone". The count is all a caller needs;
+/// the messages themselves are Codex's, not ours to interpret.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HooksListing {
+    /// Every hook Codex enumerated, in the order it reported them.
+    pub entries: Vec<CodexHookEntry>,
+    /// How many `warnings` plus `errors` the reply carried, across every group.
+    pub diagnostics: usize,
+}
+
 /// Ask Codex itself for every hook it would load for `cwd` under `home`.
 ///
 /// Mechanism (Codex 0.144.4, verified): `codex app-server` speaks line-delimited
@@ -881,7 +903,7 @@ impl CodexHookEntry {
 /// the wait is bounded by [`HOOKS_LIST_TIMEOUT`], and the child is killed before
 /// returning. EVERY failure — codex absent, non-zero exit, protocol drift, timeout
 /// — is an `Err` so the caller degrades quietly (no spawn is ever blocked).
-pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<Vec<CodexHookEntry>> {
+pub fn list_hooks_in(home: &Path, cwd: &Path) -> std::io::Result<HooksListing> {
     let mut child = Command::new("codex")
         .arg("app-server")
         .env("CODEX_HOME", home)
@@ -1029,7 +1051,7 @@ fn read_hooks_list_reply(
     rx: &mpsc::Receiver<String>,
     to_server: &mut dyn io::Write,
     deadline: Instant,
-) -> std::io::Result<Vec<CodexHookEntry>> {
+) -> std::io::Result<HooksListing> {
     let mut skipped = SkippedLog::default();
     let mut declines = 0_usize;
     loop {
@@ -1236,7 +1258,7 @@ fn decline_server_request(value: &Value, to_server: &mut dyn io::Write) -> bool 
 /// flat `result.hooks[]`. An entry missing `key` or `currentHash` is DROPPED
 /// rather than guessed at — a trust record without Codex's own hash is worthless.
 /// A JSON-RPC `error` reply, or a reply with no recognizable hook array, is `Err`.
-fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
+fn parse_hooks_list(response: &Value) -> std::io::Result<HooksListing> {
     if let Some(error) = response.get("error") {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -1255,11 +1277,23 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
     };
     let mut found_array = false;
     let mut entries = Vec::new();
+    let mut diagnostics = 0;
     for group in groups {
         let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
             continue;
         };
         found_array = true;
+        // Counted per group, beside the entries they qualify. A field that is
+        // present but not an array is counted as one diagnostic rather than
+        // none: it is a shape we do not understand, and the one consumer of
+        // this count only ever uses it to decline a deletion (issue #1027).
+        for field in ["warnings", "errors"] {
+            diagnostics += match group.get(field) {
+                None | Some(Value::Null) => 0,
+                Some(Value::Array(items)) => items.len(),
+                Some(_) => 1,
+            };
+        }
         for hook in hooks {
             let string = |field: &str| {
                 hook.get(field)
@@ -1291,7 +1325,10 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<Vec<CodexHookEntry>> {
             "codex app-server: hooks/list reply carried no hooks array",
         ));
     }
-    Ok(entries)
+    Ok(HooksListing {
+        entries,
+        diagnostics,
+    })
 }
 
 /// How closely a listed entry's command must match for the entry to count as the
@@ -1391,8 +1428,8 @@ pub fn deck_owned_entries<'a>(
     entries
         .iter()
         .filter(|entry| {
-            let same_file = entry.source_path == ours
-                || (ours_real.is_some() && entry.source_path.canonicalize().ok() == ours_real);
+            let same_file =
+                is_this_homes_hooks_json(&entry.source_path, &ours, ours_real.as_deref());
             // `managed_if_absent` is condition 3's answer when the listing did
             // not carry `isManaged` at all, and it differs BY DIRECTION (issue
             // #730). A grant must assume the entry IS managed — fail closed,
@@ -1424,12 +1461,22 @@ pub fn deck_owned_entries<'a>(
 /// collapsing the two there printed the first cause's sentence on the second
 /// cause's branch — the exact diagnostic dead end
 /// [`warn_if_our_own_entry_was_unrecognisable`] exists to break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustOutcome {
     /// `count` entries were trusted, `count >= 1`. `reports_prompts` says
     /// whether one of them is the deck's `UserPromptSubmit` hook with the user's
     /// toggle not off — see [`Self::reports_prompts`].
-    Trusted { count: usize, reports_prompts: bool },
+    ///
+    /// `turned_off` names, by Codex event (`PreToolUse`, …), every trusted deck
+    /// hook the user has switched off in Codex's `/hooks` list (issue #1027
+    /// item 2). The trust write leaves that toggle alone, so the hook stays off;
+    /// this is what lets `hooks install` say so instead of reporting a count
+    /// that reads as "all working". Empty in the ordinary case.
+    Trusted {
+        count: usize,
+        reports_prompts: bool,
+        turned_off: Vec<String>,
+    },
     /// Nothing in Codex's listing was ELIGIBLE for a trust write — which is
     /// wider than "Codex enumerated no entry of the deck's" and must not be
     /// reported as that (Greptile P2 on PR #1029). Three ways in: the deck's
@@ -1452,9 +1499,9 @@ pub enum TrustOutcome {
 impl TrustOutcome {
     /// How many entries were trusted — zero for both zero causes, so a caller
     /// that only wants the count does not have to match.
-    pub fn trusted(self) -> usize {
+    pub fn trusted(&self) -> usize {
         match self {
-            Self::Trusted { count, .. } => count,
+            Self::Trusted { count, .. } => *count,
             Self::NothingListed | Self::Unrecognised { .. } => 0,
         }
     }
@@ -1468,7 +1515,7 @@ impl TrustOutcome {
     /// `enabled = false` on the prompt hook, so "some deck hook is trusted" is
     /// not "prompts will be reported". `crate::wrap` stamps every event it emits
     /// as unable to report when this is `false`.
-    pub fn reports_prompts(self) -> bool {
+    pub fn reports_prompts(&self) -> bool {
         matches!(
             self,
             Self::Trusted {
@@ -1507,6 +1554,10 @@ impl TrustOutcome {
 /// under [`INSTALL_LOCK`], so a concurrent deck writer can't interleave and the
 /// user's comments/settings survive byte-intact.
 ///
+/// In the same edit it removes the deck's own trust records left at positions
+/// its hook no longer occupies ([`sweep_stale_deck_trust_records`], issue
+/// #1027), and only from a listing Codex reported without warnings or errors.
+///
 /// This REPLACES the old invocation-global `--dangerously-bypass-hook-trust`:
 /// it is launch-method agnostic (trust lives in the home, not argv), never trusts
 /// a hook the deck didn't author, and fails closed (any error ⇒ the hooks stay
@@ -1517,11 +1568,38 @@ pub fn trust_deck_hooks_in(
     binary_path: &str,
 ) -> std::io::Result<TrustOutcome> {
     let expected = expected_hook_command(binary_path);
-    let entries = list_hooks_in(home, cwd)?;
-    let eligible = deck_owned_entries(&entries, home, DeckCommandMatch::Exact(&expected));
+    let listing = list_hooks_in(home, cwd)?;
+    let entries = &listing.entries;
+    let eligible = deck_owned_entries(entries, home, DeckCommandMatch::Exact(&expected));
     // Issue #559: taken from the same eligible set the records are, so it can
     // only name an entry this call is about to trust.
     let reports_prompts = eligible.iter().any(|entry| entry.is_enabled_prompt_hook());
+    // Issue #1027 item 2: the user's `/hooks` toggle is respected (the write
+    // below touches `trusted_hash` only), so a deck hook they switched off stays
+    // off. Respected is not the same as invisible: say so, by event, here — this
+    // is the one place every install path (startup, wrapper, CLI) passes — and
+    // hand the names out so the CLI can print them.
+    let mut turned_off: Vec<String> = eligible
+        .iter()
+        .filter(|entry| entry.enabled == Some(false))
+        .filter_map(|entry| entry.event_snake().map(event_display_name))
+        .collect();
+    turned_off.sort();
+    turned_off.dedup();
+    if !turned_off.is_empty() {
+        tracing::warn!(
+            events = turned_off.join(", "),
+            "codex: the deck's own hooks for these events are turned off in Codex's /hooks list; \
+             the deck keeps them trusted but leaves them off, so Codex reports nothing through \
+             them until they are turned back on there"
+        );
+    }
+    // Issue #1027 item 1: the hashes the deck's own CURRENT hook definitions
+    // carry, which is condition (b) of the stale-record sweep below.
+    let deck_hashes: Vec<String> = eligible
+        .iter()
+        .map(|entry| entry.current_hash.clone())
+        .collect();
     let records: Vec<(String, String)> = eligible
         .into_iter()
         .map(|entry| (entry.key.clone(), entry.current_hash.clone()))
@@ -1530,7 +1608,7 @@ pub fn trust_deck_hooks_in(
         // The warn is the diagnosis; its count is what tells the two causes of
         // zero apart, so the caller gets it too rather than having to read a log
         // that may not even have a subscriber (issue #730, auditor S-C).
-        let listed = warn_if_our_own_entry_was_unrecognisable(&entries, home, &expected);
+        let listed = warn_if_our_own_entry_was_unrecognisable(entries, home, &expected);
         return Ok(if listed == 0 {
             TrustOutcome::NothingListed
         } else {
@@ -1538,15 +1616,164 @@ pub fn trust_deck_hooks_in(
         });
     }
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut swept = 0;
     edit_trust_state(home, |state| {
         for (key, hash) in &records {
             upsert_trust_record(state, key, hash);
         }
+        // Only from a listing Codex reported as complete. A warning or an error
+        // means it could not load part of a hooks file and may have dropped
+        // positions that are really there, so their absence proves nothing.
+        // The other half of "the listing is evidence" is already established by
+        // reaching this line at all: `records` is non-empty, so Codex enumerated
+        // at least one of the deck's own hooks out of this home's `hooks.json`
+        // — which an empty listing (`features.hooks = false`, a whole file
+        // dropped as invalid JSON) never does.
+        if listing.diagnostics == 0 {
+            swept = sweep_stale_deck_trust_records(state, entries, &deck_hashes, home);
+        }
     })?;
+    if swept > 0 {
+        tracing::info!(
+            swept,
+            "codex: removed the deck's own trust records left at hook positions that no longer \
+             exist"
+        );
+    } else if listing.diagnostics > 0 {
+        tracing::debug!(
+            diagnostics = listing.diagnostics,
+            "codex: hooks/list reported warnings or errors, so no stale trust record was removed"
+        );
+    }
     Ok(TrustOutcome::Trusted {
         count: records.len(),
         reports_prompts,
+        turned_off,
     })
+}
+
+/// The name a user sees for a Codex event, from the `<event_snake>` segment of
+/// a trust key: `pre_tool_use` → `PreToolUse`, the spelling `hooks.json` and
+/// Codex's `/hooks` list use. An event the deck does not install (it can still
+/// be named by a key) is converted the same way rather than dropped.
+fn event_display_name(event_snake: &str) -> String {
+    event_snake
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Split a Codex trust key `<sourcePath>:<event_snake>:<group_idx>:<handler_idx>`
+/// into its source path and its `<event_snake>:<group_idx>:<handler_idx>`
+/// position, or `None` for anything not shaped like one.
+///
+/// **Right-anchored**, because a `:` inside the source path is neither rejected
+/// nor escaped by Codex, so the first `:` is not a separator. Both indices must
+/// be decimal integers and the event and path non-empty, so an arbitrary key a
+/// user put in `[hooks.state]` is not mistaken for a Codex position.
+fn split_trust_key(key: &str) -> Option<(&str, &str)> {
+    let mut parts = key.rsplitn(4, ':');
+    let handler = parts.next()?;
+    let group = parts.next()?;
+    let event = parts.next()?;
+    let source = parts.next()?;
+    let is_index = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_index(handler) || !is_index(group) || event.is_empty() || source.is_empty() {
+        return None;
+    }
+    Some((source, &key[source.len() + 1..]))
+}
+
+/// Is `path` this home's own `hooks.json` — verbatim, or through a symlinked
+/// spelling of the same real file? Condition 1 of [`deck_owned_entries`] and
+/// condition (c) of [`sweep_stale_deck_trust_records`] ask the same question.
+fn is_this_homes_hooks_json(path: &Path, ours: &Path, ours_real: Option<&Path>) -> bool {
+    path == ours || ours_real.is_some_and(|real| path.canonicalize().ok().as_deref() == Some(real))
+}
+
+/// Remove the deck's own trust records left at hook positions that no longer
+/// exist, returning how many went (issue #1027 item 1).
+///
+/// Codex keys a grant by POSITION (`<sourcePath>:<event>:<group>:<handler>`), so
+/// whenever the deck's hook moves, the record at its old key is left behind, and
+/// nothing removed one except `hooks uninstall`. A record is removed only when
+/// **all three** of these hold, and never on any one of them alone:
+///
+/// - **(a) its position is not in the listing.** Neither its key verbatim nor
+///   its `<event>:<group>:<handler>` under any listed entry from this home's
+///   `hooks.json` — the second spelling so a record written under a symlinked
+///   path to the same file is not mistaken for a vanished position. A position
+///   Codex still lists keeps its record whatever hash it carries: that is the
+///   shape issue #1034 measured, a user's handler moved onto a key still holding
+///   the deck's hash.
+/// - **(b) its `trusted_hash` is the hash of one of the deck's own current hook
+///   definitions** (`deck_hashes`, from the entries this run trusted). Codex's
+///   hash covers the command, matcher and `async`, not the position or the
+///   path, so a user's record — same file, different command — never matches,
+///   and neither does a record left by an older deck build (a different command,
+///   so a different hash). Those older records are left in place on purpose.
+/// - **(c) its source path is this home's own `hooks.json`.** That file is shared
+///   with the user's own hooks, which is why (a) and (b) must hold as well; a
+///   record for any other file is not the deck's to touch.
+///
+/// The caller supplies the remaining preconditions: it runs this only after
+/// Codex listed at least one of the deck's own hooks (so the listing really is
+/// reading this file) and reported no warnings or errors (so an absent position
+/// is absent, not unloadable).
+///
+/// Why an orphan is worth removing although it is inert: an orphan's hash is
+/// the deck's own, so it can only ever authorise the deck's own command — but it
+/// is still an entry in a grant table that grew without bound.
+///
+/// **What this does not cover.** The listing is taken before the edit, and
+/// [`INSTALL_LOCK`] serialises only this process: a second deck process that
+/// rewrites `hooks.json` and trusts a new position in between could have that
+/// fresh record removed here. That costs the hook its trust until the next spawn
+/// or startup re-records it — fail-closed, never a wider grant.
+fn sweep_stale_deck_trust_records(
+    state: &mut toml_edit::Table,
+    listed: &[CodexHookEntry],
+    deck_hashes: &[String],
+    home: &Path,
+) -> usize {
+    use toml_edit::{Item, Value as TomlValue};
+
+    let ours = home.join("hooks.json");
+    let ours_real = ours.canonicalize().ok();
+    let listed_positions: Vec<&str> = listed
+        .iter()
+        .filter(|entry| is_this_homes_hooks_json(&entry.source_path, &ours, ours_real.as_deref()))
+        .filter_map(|entry| split_trust_key(&entry.key).map(|(_, position)| position))
+        .collect();
+    let stale: Vec<String> = state
+        .iter()
+        .filter_map(|(key, record)| {
+            let hash = match record {
+                Item::Table(table) => table.get("trusted_hash").and_then(Item::as_str),
+                Item::Value(TomlValue::InlineTable(table)) => {
+                    table.get("trusted_hash").and_then(TomlValue::as_str)
+                }
+                _ => None,
+            }?;
+            let (source, position) = split_trust_key(key)?;
+            let unlisted = !listed.iter().any(|entry| entry.key == key)
+                && !listed_positions.contains(&position);
+            let deck_hash = deck_hashes.iter().any(|deck| deck == hash);
+            let our_file = is_this_homes_hooks_json(Path::new(source), &ours, ours_real.as_deref());
+            (unlisted && deck_hash && our_file).then(|| key.to_string())
+        })
+        .collect();
+    for key in &stale {
+        state.remove(key);
+    }
+    stale.len()
 }
 
 /// Say something when a trust write recorded NOTHING even though the listing
@@ -1663,7 +1890,7 @@ fn agreeing_prefix_bytes(a: &str, b: &str) -> usize {
 /// not be managed.
 pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-    let entries = list_hooks_in(home, &cwd)?;
+    let entries = list_hooks_in(home, &cwd)?.entries;
     let keys: Vec<String> = deck_owned_entries(&entries, home, DeckCommandMatch::Signature)
         .into_iter()
         .map(|entry| entry.key.clone())
@@ -2186,6 +2413,84 @@ mod tests {
         );
     }
 
+    /// Issue #1027 item 3, pinned at the DECODER: a listing entry that omits
+    /// `isManaged` must reach `deck_owned_entries` as `None`, not as `false`,
+    /// so a trust write refuses it. `codex_trust_an_absent_is_managed_field_\
+    /// resolves_per_direction` covers the predicate from a hand-built entry;
+    /// this covers the half before it, where the old `.unwrap_or(false)` was.
+    #[test]
+    fn a_listing_without_is_managed_decodes_to_an_entry_no_grant_can_select() {
+        let home = Path::new("/h");
+        let command = "/abs/dot-agent-deck hook --agent codex";
+        let response = json!({
+            "id": 2,
+            "result": {"data": [{
+                "cwd": "/w",
+                "warnings": [],
+                "errors": [],
+                "hooks": [{
+                    "key": "/h/hooks.json:pre_tool_use:0:0",
+                    "command": command,
+                    "sourcePath": "/h/hooks.json",
+                    "currentHash": "sha256:deck",
+                    "trustStatus": "untrusted"
+                }]
+            }]}
+        });
+        let listing = parse_hooks_list(&response).expect("a well-formed reply parses");
+        assert_eq!(
+            listing.entries[0].is_managed, None,
+            "an absent isManaged must stay absent rather than default to unmanaged"
+        );
+        assert!(
+            deck_owned_entries(&listing.entries, home, DeckCommandMatch::Exact(command)).is_empty(),
+            "a grant must not select an entry whose isManaged the listing did not carry"
+        );
+    }
+
+    /// Issue #1027 item 1: the diagnostics count is what stops the stale-record
+    /// sweep trusting a listing Codex said was incomplete, so it must count
+    /// both fields, across groups, and not count an empty array.
+    #[test]
+    fn a_listings_warnings_and_errors_are_counted_across_groups() {
+        let group = |warnings: Value, errors: Value| json!({"cwd": "/w", "hooks": [], "warnings": warnings, "errors": errors});
+        let parse = |groups: Vec<Value>| {
+            parse_hooks_list(&json!({"id": 2, "result": {"data": groups}}))
+                .expect("a well-formed reply parses")
+                .diagnostics
+        };
+        assert_eq!(parse(vec![group(json!([]), json!([]))]), 0);
+        assert_eq!(
+            parse(vec![
+                group(json!(["w1"]), json!([])),
+                group(json!([]), json!([{"message": "e1"}, {"message": "e2"}])),
+            ]),
+            3
+        );
+        assert_eq!(
+            parse(vec![group(json!("not an array"), Value::Null)]),
+            1,
+            "a field of a shape we do not understand counts against the listing"
+        );
+    }
+
+    /// Issue #1027 item 1: a trust key is parsed from the RIGHT, since Codex
+    /// neither rejects nor escapes a `:` in the source path, and anything not
+    /// shaped like `<path>:<event>:<n>:<n>` is not a position at all.
+    #[test]
+    fn a_trust_key_is_split_from_the_right() {
+        assert_eq!(
+            split_trust_key("/home/a:b/.codex/hooks.json:pre_tool_use:2:0"),
+            Some(("/home/a:b/.codex/hooks.json", "pre_tool_use:2:0"))
+        );
+        assert_eq!(split_trust_key("not-a-codex-key"), None);
+        assert_eq!(split_trust_key("/h/hooks.json:stop:x:0"), None);
+        assert_eq!(split_trust_key("/h/hooks.json::0:0"), None);
+        assert_eq!(split_trust_key(":stop:0:0"), None);
+        assert_eq!(event_display_name("pre_tool_use"), "PreToolUse");
+        assert_eq!(event_display_name("stop"), "Stop");
+    }
+
     #[test]
     fn reinstall_is_idempotent_and_preserves_user_hooks() {
         let dir = tempfile::tempdir().expect("codex home tempdir");
@@ -2453,7 +2758,8 @@ mod tests {
 
         let mut sent = Vec::new();
         let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
-            .expect("the genuine hooks/list reply sits behind the stray request and must be read");
+            .expect("the genuine hooks/list reply sits behind the stray request and must be read")
+            .entries;
         assert_eq!(
             entries.len(),
             1,
@@ -2529,7 +2835,8 @@ mod tests {
 
         let mut sent = Vec::new();
         let entries = read_hooks_list_reply(&rx, &mut sent, Instant::now() + HOOKS_LIST_TIMEOUT)
-            .expect("a plain reply must be read");
+            .expect("a plain reply must be read")
+            .entries;
         assert_eq!(entries.len(), 1);
         assert!(
             sent.is_empty(),

@@ -200,7 +200,7 @@ dot-agent-deck hooks install --agent codex
 dot-agent-deck hooks install --agent devin
 ```
 
-`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex. On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
+`--agent` accepts `claude-code` (default), `opencode`, `codex` and `devin`; Pi has no hooks to install. Unlike the automatic install, these commands write the configuration even when the agent's directory does not exist yet. On success they print what they installed, for example `Installed hooks: SessionStart, SessionEnd, …` and `Settings file: /home/you/.claude/settings.json` for Claude Code, or `Trusted hooks: <n>` for Codex, followed by a note naming any of the deck's hooks you have turned off in Codex's `/hooks` list ([Codex events not showing](troubleshooting.md#codex-events-not-showing)). On failure they print `Failed to install <agent> hooks: <reason>` and exit non-zero. `dot-agent-deck hooks uninstall --agent <agent>` removes them.
 
 An agent that was already running when the hooks were installed may need a restart to load them. If a card stays on its first status while the agent works, see [Troubleshooting → Hooks](troubleshooting.md#hooks).
 
