@@ -2115,6 +2115,11 @@ fn classify_and_emit(line: &str, detector: &Arc<Mutex<Detector>>, emitter: &Emit
     emitter.send_classified(&event);
 }
 
+/// Issue #1493: how long [`LatestSend`] waits on one send — the bound
+/// `INTERFACE_READY_SEND_TIMEOUT` uses, for the same reason; not shared with
+/// it because that one exists only where the interface watch does (Unix).
+const CLASSIFIED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Issue #1493: a sender that keeps only the NEWEST frame waiting, on one
 /// thread of its own. Used for a wrapped Codex's output-derived status frames
 /// while its prompt hook is not running: they come from the tee and from the
@@ -2146,7 +2151,7 @@ impl LatestSend {
                         slot = worker.ready.wait(slot).unwrap_or_else(|p| p.into_inner());
                     }
                 };
-                crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
+                crate::hook::send_to_socket_bounded(&json, CLASSIFIED_SEND_TIMEOUT);
             }
         });
         sender
