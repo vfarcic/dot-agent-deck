@@ -168,6 +168,24 @@ pub const DECK_NOT_CONNECTED: &str = "the app is not connected to it; switch to 
 /// yet — `DECK_SHORT_REASON.unconfigured` in `desktop/src/lib/newAgent.ts`.
 pub const DECK_NO_ADDRESS: &str = "it has no address yet";
 
+/// Issue #1491 — the key voice gives the Deck selector's **All daemons**
+/// entry among its decks. Never a fleet key: those are `deck-<16 hex>` or
+/// `unconfigured-<row id>`, so it cannot collide with a deck the app observes.
+/// A switch to it is addressed to the selector's `all` token
+/// (`crate::settings::ALL_SELECTION_TOKEN`) like any other switch.
+pub const ALL_DECKS_ID: &str = "all-daemons";
+
+/// What the Deck selector calls that entry (`deckChoices` in
+/// `desktop/src/lib/endpoints.ts`), so a report names it the way the screen
+/// does: "Showing All daemons."
+pub const ALL_DECKS_LABEL: &str = "All daemons";
+
+/// Why All daemons cannot take a new agent: it is a selection rather than one
+/// deck. It keeps it out of everything the New agent dialog is asked about —
+/// a deck with a reason is never offered to the model nor preselected — while
+/// `switch_deck`, which ignores the reason, switches to it.
+pub const DECK_IS_EVERY_DAEMON: &str = "it is every daemon at once; name one daemon";
+
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken
 /// [`ParamKind::DirRef`] resolves against.

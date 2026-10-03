@@ -184,8 +184,10 @@ heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch
 
 [[commands]]
 id          = "open_overview"
-description = """Leave the Daemons screen and show the agent dashboard: every agent across every
-connected daemon in one list, with each one's status and activity. Use when the user asks to see
+description = """Leave the Daemons screen and show the agent dashboard: every agent of the daemons
+the Daemon selector is showing, in one list, with each one's status and activity. It changes no
+selection — with the selector on one daemon it shows that daemon's agents only — so a request to
+select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
 button) or the overview, or asks which agents are running or what needs attention."""
 invoke      = "openOverview"
@@ -408,9 +410,21 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # can start on (a disabled deck is withheld from every row, which this row
 # cannot change without a second list in the prompt), so the description tells
 # it that the deck may be one `decks` does not list; the app resolves the
-# user's words against the full list either way. **All Decks is not
-# voice-reachable**: it is a selection rather than a deck, and "show every
-# agent" is `open_overview`'s.
+# user's words against the full list either way.
+#
+# **All daemons is voice-reachable through THIS row (issue #1491).** It used to
+# be excluded as "a selection rather than a deck, and 'show every agent' is
+# `open_overview`'s" — but `open_overview` only navigates and never changes the
+# selection, so under This machine "show everything" still showed one daemon
+# and no spoken command reached All daemons. It is one more entry of the
+# selector's list (`selector_voice_decks` appends it, labelled "All daemons"
+# and addressed to the `all` token), rather than a row of its own, because
+# that keeps the existing guards: the same resolver, the same two-sided
+# grounding of the deck against the transcript, the same report, the same
+# write as the click, and the open menu's numbers, which dispatch this row,
+# reach it with no second path. It carries a reason a new agent cannot start
+# on it, so the New agent dialog neither offers nor preselects it — the same mechanism
+# that keeps a disconnected deck out of the dialog.
 #
 # **Switching to the deck already shown is a no-op with the same report**,
 # which is still true — it IS showing that deck — and no settings write
@@ -432,9 +446,13 @@ choose daemon build box. Users who knew the selector by its older name say deck 
 switch deck to the build box, switch to the build box deck, change the deck to local, select the
 build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the words the user
 used for the daemon. It may name a configured daemon that `decks` does not list, because `decks`
-lists only the daemons a new agent can start on; answer with the user's words all the same. This is
+lists only the daemons a new agent can start on; answer with the user's words all the same. The
+selector's first entry, All daemons, shows every configured daemon at once, and THIS row switches to
+it too: for select all daemons, switch to all daemons, show all daemons or switch daemon to all, set
+`deck` to the user's words for it, such as "all daemons" or "all". Speech-to-text often writes daemon
+as demon ("select mini PC, demon"); demon means daemon here too. This is
 not `open_deck`, which only moves from the agent dashboard to the Daemons screen without changing
-which daemon is shown, and it is not `open_overview`. While the New agent dialog is open this cannot
+which daemon is shown, and it is not `open_overview`, which changes no selection. While the New agent dialog is open this cannot
 run: a request that names a daemon then means the dialog's Daemon field, which is `choose_deck`. It
 changes which daemon is shown and nothing else — it starts, stops and closes nothing."""
 invoke      = "switchDeck"
@@ -444,7 +462,7 @@ unavailable_hint = "switching daemon works from the Daemons screen or the agent 
 report      = "Showing {deck}."
 asks_to     = "switch daemon"
 try_saying  = "switch daemon to {deck}"
-heard_as    = ["switch", "daemon", "deck", "change", "select", "choose"]
+heard_as    = ["switch", "daemon", "deck", "demon", "change", "select", "choose"]
 unavailable_redirects = "choose_deck"
 
   [[commands.params]]
@@ -1130,6 +1148,11 @@ heard_as    = ["command"]
 # (`docs/develop/voice-first-design.md`, section 6), and what it reaches is
 # another deck on screen, visibly, with the typed fields kept.
 #
+# **"demon" is the same word, as speech-to-text writes it** ("Select mini PC,
+# Demon."), so it grounds this row and `switch_deck` as "daemon" does and is
+# dropped from a reference like it. It widens the vocabulary by a homophone,
+# not by a verb, so the user still has to have talked about a daemon.
+#
 # **The grounding word is not a deck name.** "daemon" is also a word of the
 # local deck's label, "Local daemon", so `resolve_deck_ref` drops "daemon",
 # "deck" and articles from the reference before matching: a bare "daemon" —
@@ -1145,8 +1168,8 @@ Daemon field. Use for daemon build box, use the local daemon, switch to the buil
 the daemon to local, pick the remote daemon, put it on the local daemon, choose daemon ci — and for a
 daemon's own name said with the word daemon, like "Local daemon". Users who knew the field by its
 older name say deck in the same places — deck build box, use the local deck, pick the remote deck —
-and those mean THIS one too. Set `deck` to the words the user used for the daemon; it must be one of
-`decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
+and those mean THIS one too, as does demon, which is how speech-to-text often writes daemon. Set
+`deck` to the words the user used for the daemon; it must be one of `decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
 or Command. While the New agent dialog is open, a request that names WHICH daemon the new agent goes
 on is THIS one — never `open_deck`, which leaves the agent dashboard for the Daemons screen, and
 never `open_new_agent`, since the dialog is already open. It starts nothing, and never touches the
@@ -1158,7 +1181,7 @@ unavailable_hint = "choosing the daemon this way works while the New agent dialo
 report      = "Daemon: {deck}."
 asks_to     = "choose the new agent's daemon"
 try_saying  = "daemon {deck}"
-heard_as    = ["daemon", "deck"]
+heard_as    = ["daemon", "deck", "demon"]
 
   [[commands.params]]
   name = "deck"
