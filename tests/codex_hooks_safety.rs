@@ -1952,3 +1952,61 @@ fn codex_hooks_012_install_names_a_deck_hook_the_user_turned_off() {
         "no note may appear when the deck's hooks are on:\n{stdout}"
     );
 }
+
+/// Scenario: Seed a Codex home whose `hooks.json` holds three user rules under `PreToolUse` and whose `config.toml` holds two records carrying the deck's hash at positions the `hooks/list` stand-in does not report — one at a position that exists in `hooks.json` (as when another deck process wrote and trusted it after this run took its listing) and one at a position that does not — then run `dot-agent-deck hooks install --agent codex`. Only the record at the position missing from the file must be removed.
+#[spec("codex/trust/007")]
+#[test]
+fn codex_trust_007_a_position_still_in_hooks_json_keeps_its_record() {
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+    write_fake_codex(fixture.path());
+    let deck_command = expected_hook_command(
+        seed_durable_binary(deck_home.path())
+            .to_str()
+            .expect("durable path is UTF-8"),
+    );
+    let user_rule = |n: u8| json!({"hooks": [{"type": "command", "command": format!("/usr/bin/env USER_HOOK={n}")}]});
+    write_hooks(
+        home.path(),
+        &json!({"hooks": {"PreToolUse": [user_rule(1), user_rule(2), user_rule(3)]}}),
+    );
+    let key = |position: &str| format!("{}/hooks.json:{position}", home.path().display());
+    let in_file = key("pre_tool_use:2:0");
+    let gone = key("pre_tool_use:9:0");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[hooks.state.\"{in_file}\"]\ntrusted_hash = \"sha256:deck\"\n\n\
+             [hooks.state.\"{gone}\"]\ntrusted_hash = \"sha256:deck\"\n"
+        ),
+    )
+    .expect("seed Codex config");
+    // The listing names the deck's hook (so the sweep runs) but not position
+    // `2:0` — the shape a listing taken before a concurrent deck process
+    // rewrote `hooks.json` has.
+    let response = hook_list_response(vec![own_home_entry(&deck_command, 0, "sha256:deck")]);
+
+    let output = run_cli_install(
+        home.path(),
+        deck_home.path(),
+        &fixture_path(fixture.path()),
+        &response,
+    );
+    assert!(
+        output.status.success(),
+        "hook install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let keys = trust_state_keys(home.path());
+    assert!(
+        keys.contains(&in_file),
+        "a record at a position hooks.json still holds must survive even when the listing \
+         missed it: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&gone),
+        "a deck-hash record at a position neither listed nor in hooks.json must still go: \
+         {keys:?}"
+    );
+}

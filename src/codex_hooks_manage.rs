@@ -1279,14 +1279,14 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<HooksListing> {
     let mut entries = Vec::new();
     let mut diagnostics = 0;
     for group in groups {
-        let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
-            continue;
-        };
-        found_array = true;
-        // Counted per group, beside the entries they qualify. A field that is
-        // present but not an array is counted as one diagnostic rather than
-        // none: it is a shape we do not understand, and the one consumer of
-        // this count only ever uses it to decline a deletion (issue #1027).
+        // Counted per group, BEFORE the group's hooks are looked at, so a group
+        // that carries no `hooks` array still has its warnings counted (Qodo and
+        // Greptile on PR #1519). A field that is present but not an array is
+        // counted as one diagnostic rather than none: it is a shape we do not
+        // understand, and the one consumer of this count only ever uses it to
+        // decline a deletion (issue #1027). For the same reason, a group with
+        // no `hooks` array and every entry dropped below count as one each:
+        // each is something the listing does not report.
         for field in ["warnings", "errors"] {
             diagnostics += match group.get(field) {
                 None | Some(Value::Null) => 0,
@@ -1294,6 +1294,11 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<HooksListing> {
                 Some(_) => 1,
             };
         }
+        let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
+            diagnostics += 1;
+            continue;
+        };
+        found_array = true;
         for hook in hooks {
             let string = |field: &str| {
                 hook.get(field)
@@ -1302,6 +1307,7 @@ fn parse_hooks_list(response: &Value) -> std::io::Result<HooksListing> {
                     .filter(|s| !s.is_empty())
             };
             let (Some(key), Some(current_hash)) = (string("key"), string("currentHash")) else {
+                diagnostics += 1;
                 continue;
             };
             entries.push(CodexHookEntry {
@@ -1691,6 +1697,34 @@ fn split_trust_key(key: &str) -> Option<(&str, &str)> {
     Some((source, &key[source.len() + 1..]))
 }
 
+/// Does `hooks.json` (already parsed) hold anything at `position`
+/// (`<event_snake>:<group_idx>:<handler_idx>`)? Errs toward yes: event names
+/// are compared ignoring case and underscores (`pre_tool_use` ~ `PreToolUse`),
+/// and a rule at `group_idx` that has no `hooks` array counts as occupying
+/// every handler index, since Codex's view of such a rule is not ours to guess.
+fn position_is_in_hooks_json(root: &Value, position: &str) -> bool {
+    let normalize = |name: &str| name.replace('_', "").to_ascii_lowercase();
+    let mut parts = position.splitn(3, ':');
+    let (Some(event), Some(group), Some(handler)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    let (Ok(group), Ok(handler)) = (group.parse::<usize>(), handler.parse::<usize>()) else {
+        return true;
+    };
+    let Some(events) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    events
+        .iter()
+        .filter(|(name, _)| normalize(name) == normalize(event))
+        .filter_map(|(_, rules)| rules.as_array()?.get(group))
+        .any(|rule| match rule.get("hooks").and_then(Value::as_array) {
+            Some(handlers) => handler < handlers.len(),
+            None => true,
+        })
+}
+
 /// Is `path` this home's own `hooks.json` — verbatim, or through a symlinked
 /// spelling of the same real file? Condition 1 of [`deck_owned_entries`] and
 /// condition (c) of [`sweep_stale_deck_trust_records`] ask the same question.
@@ -1732,11 +1766,18 @@ fn is_this_homes_hooks_json(path: &Path, ours: &Path, ours_real: Option<&Path>) 
 /// the deck's own, so it can only ever authorise the deck's own command — but it
 /// is still an entry in a grant table that grew without bound.
 ///
-/// **What this does not cover.** The listing is taken before the edit, and
-/// [`INSTALL_LOCK`] serialises only this process: a second deck process that
-/// rewrites `hooks.json` and trusts a new position in between could have that
-/// fresh record removed here. That costs the hook its trust until the next spawn
-/// or startup re-records it — fail-closed, never a wider grant.
+/// **And the position is not in `hooks.json` as it is NOW** (Greptile on PR
+/// #1519). The listing is taken before the edit, and [`INSTALL_LOCK`]
+/// serialises only this process, so a second deck process could rewrite
+/// `hooks.json` and trust a new position in between; judged by the listing
+/// alone, that fresh record would look stale. It cannot be swept, because of
+/// ordering: that process writes `hooks.json` ([`install_to`]) before it lists
+/// and trusts, its trust record is in the `config.toml` this edit has already
+/// read, and `hooks.json` is read here after that — so its new position is in
+/// the file this sees. A record whose position exists in the file is kept
+/// whatever the listing said, and a `hooks.json` that cannot be read or parsed
+/// keeps every record. What remains is the ordinary lost update any two
+/// concurrent `config.toml` writers have, which this does not add to.
 fn sweep_stale_deck_trust_records(
     state: &mut toml_edit::Table,
     listed: &[CodexHookEntry],
@@ -1747,6 +1788,12 @@ fn sweep_stale_deck_trust_records(
 
     let ours = home.join("hooks.json");
     let ours_real = ours.canonicalize().ok();
+    let Some(in_file) = std::fs::read(&ours)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    else {
+        return 0;
+    };
     let listed_positions: Vec<&str> = listed
         .iter()
         .filter(|entry| is_this_homes_hooks_json(&entry.source_path, &ours, ours_real.as_deref()))
@@ -1767,7 +1814,8 @@ fn sweep_stale_deck_trust_records(
                 && !listed_positions.contains(&position);
             let deck_hash = deck_hashes.iter().any(|deck| deck == hash);
             let our_file = is_this_homes_hooks_json(Path::new(source), &ours, ours_real.as_deref());
-            (unlisted && deck_hash && our_file).then(|| key.to_string())
+            let gone_from_file = !position_is_in_hooks_json(&in_file, position);
+            (unlisted && deck_hash && our_file && gone_from_file).then(|| key.to_string())
         })
         .collect();
     for key in &stale {
@@ -2471,6 +2519,32 @@ mod tests {
             parse(vec![group(json!("not an array"), Value::Null)]),
             1,
             "a field of a shape we do not understand counts against the listing"
+        );
+        // A group with no `hooks` array still has its warnings counted, and the
+        // missing array is itself a diagnostic when another group carries one
+        // (Qodo and Greptile on PR #1519): otherwise the listing reads as
+        // complete while a whole group is absent from it.
+        assert_eq!(
+            parse(vec![
+                group(json!([]), json!([])),
+                json!({"cwd": "/w2", "warnings": ["w1"]}),
+            ]),
+            2
+        );
+        // An entry dropped for lacking `key` or `currentHash` is a position the
+        // listing does not report, so it counts too.
+        assert_eq!(
+            parse(vec![json!({
+                "cwd": "/w",
+                "warnings": [],
+                "errors": [],
+                "hooks": [
+                    {"key": "/h/hooks.json:stop:0:0", "currentHash": "sha256:a"},
+                    {"key": "/h/hooks.json:stop:1:0"},
+                    {"currentHash": "sha256:c"}
+                ]
+            })]),
+            2
         );
     }
 
