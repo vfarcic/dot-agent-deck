@@ -2101,7 +2101,11 @@ pub fn run_doctor(
     out: &mut impl Write,
 ) -> Result<Verdict, RemoteConnectError> {
     let entry = lookup_remote(name, registry_path)?;
-    let target = entry.ssh_target();
+    // PRD #1487 gave `SshTarget` the deck list's jump host for `remote
+    // upgrade`. The doctor diagnoses the route `connect` takes, which does not
+    // use it yet, so it is cleared here rather than changing what is observed.
+    let mut target = entry.ssh_target();
+    target.jump = None;
 
     // `for_observation`, not `with_wallclock_timeout`: see the module doc. An
     // ordinary executor would make every probe apply the user's `Host` block,
@@ -3229,6 +3233,7 @@ remoteforward 1080 [socks]:0
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         assert!(
             matches!(
@@ -3503,6 +3508,7 @@ remoteforward 1080 [socks]:0
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let observations = Observations {
             inputs: DoctorInputs::default(),
@@ -3522,6 +3528,7 @@ remoteforward 1080 [socks]:0
             user: Some("deck".to_string()),
             port: 2222,
             key: None,
+            jump: None,
         };
         let checks = classify(&observations.inputs);
         let overall = overall_verdict(&checks);

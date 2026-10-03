@@ -586,9 +586,12 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to diagnose.
         name: String,
     },
-    /// Re-run the binary install flow against an existing entry, then bump
-    /// the registry's version field. On a host whose deck Homebrew installed,
-    /// runs `brew upgrade dot-agent-deck` there instead of downloading a copy.
+    /// Install a new build on a remote and restart its daemon onto it. On a
+    /// host whose deck Homebrew installed, runs `brew upgrade dot-agent-deck`
+    /// there instead of downloading a copy. An idle daemon restarts without a
+    /// question; when agents or orchestration roles would stop, it asks first
+    /// on a terminal and, with no terminal to ask on, installs and keeps the
+    /// running daemon. Exits non-zero only when a stage fails.
     Upgrade {
         /// Friendly name of the registry entry to upgrade.
         name: String,
@@ -600,6 +603,10 @@ enum RemoteCmd {
         /// updated.
         #[arg(long = "no-install")]
         no_install: bool,
+        /// Print the outcome as one JSON object on stdout (progress goes to
+        /// stderr).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1993,23 +2000,8 @@ fn main() -> ExitCode {
                 name,
                 version,
                 no_install,
-            } => {
-                let opts = dot_agent_deck::remote::UpgradeOptions {
-                    name,
-                    version,
-                    no_install,
-                    release_base: dot_agent_deck::remote::RELEASE_BASE.to_string(),
-                };
-                let path = dot_agent_deck::remote::default_remotes_path();
-                let executor = dot_agent_deck::remote::SystemSshExecutor::new();
-                match dot_agent_deck::remote::upgrade(&opts, &executor, &path) {
-                    Ok(_) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("{e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
+                json,
+            } => run_remote_upgrade(&name, version, no_install, json),
         },
         Some(Commands::Worktree { cmd }) => match cmd {
             WorktreeCmd::List { json } => run_worktree_list_cli(json),
@@ -2913,6 +2905,88 @@ async fn run_daemon_endpoint_cli() -> ExitCode {
 
     println!("{shown}");
     ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck remote upgrade <name> [--version V] [--no-install] [--json]`
+/// (PRD #1487): install and restart through
+/// [`dot_agent_deck::daemon_upgrade::upgrade_daemon`], the function every
+/// client shares. The restart question is asked only when stdin and stdout are
+/// both terminals; otherwise no one can answer, and live work keeps the
+/// running daemon. With `--json`, stdout carries only the outcome. Exits
+/// non-zero only for a failed stage.
+fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_upgrade::{
+        NoDecider, RestartDecider, SshInstaller, TtyDecider, UpgradePlan, upgrade_daemon,
+        upgrade_ssh_executor,
+    };
+    use dot_agent_deck::remote::{RemoteUpgradeError, RemotesFile};
+    use std::io::{IsTerminal, Write};
+
+    let path = dot_agent_deck::remote::default_remotes_path();
+    // Unknown names and an unreadable registry fail before any ssh, as before.
+    let entry = match RemotesFile::load(&path) {
+        Ok(file) => file.remotes.into_iter().find(|r| r.name == name),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(entry) = entry else {
+        eprintln!(
+            "{}",
+            RemoteUpgradeError::UnknownName {
+                name: name.to_string()
+            }
+        );
+        return ExitCode::FAILURE;
+    };
+
+    // What is said along the way goes to stdout, or to stderr under `--json`
+    // so stdout holds the outcome alone.
+    let report: fn() -> Box<dyn Write> = if json {
+        || Box::new(std::io::stderr())
+    } else {
+        || Box::new(std::io::stdout())
+    };
+    let mut installer = SshInstaller::new(name, path.clone(), report());
+    installer.no_install = no_install;
+    let port =
+        dot_agent_deck::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let tty;
+    let decider: &dyn RestartDecider = if interactive {
+        tty = TtyDecider::new(std::io::stdin().lock(), report());
+        &tty
+    } else {
+        &NoDecider
+    };
+    let plan = UpgradePlan {
+        version,
+        successor: dot_agent_deck::daemon_protocol::RestartSuccessor::Installed,
+    };
+    let mut progress_out = report();
+    let outcome = upgrade_daemon(name, &plan, &installer, &port, decider, &mut |p| {
+        dot_agent_deck::connect::print_upgrade_progress(name, &p, &mut *progress_out)
+    });
+
+    if json {
+        match serde_json::to_string(&outcome) {
+            Ok(line) => println!("{line}"),
+            Err(e) => {
+                eprintln!("remote upgrade: could not encode the outcome: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if outcome.is_failure() {
+        eprintln!("{}", outcome.summary(name));
+    } else {
+        println!("{}", outcome.summary(name));
+    }
+    if outcome.is_failure() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `dot-agent-deck daemon probe [--json]` (PRD #1487, hidden plumbing). One

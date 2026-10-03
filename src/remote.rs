@@ -44,6 +44,13 @@ pub struct SshTarget {
     pub user: Option<String>,
     pub port: u16,
     pub key: Option<PathBuf>,
+    /// PRD #1487 (Risk 4): a `Host` name from `~/.ssh/config` to reach the deck
+    /// through, as `ssh -J <alias>` — the deck list's `jump_host`, so `remote
+    /// upgrade` takes the route the desktop tunnel uses. Emitted by
+    /// [`SystemSshExecutor::build_command`] only when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`]; `connect`'s
+    /// [`crate::connect::build_connect_command`] still ignores it.
+    pub jump: Option<String>,
 }
 
 impl SshTarget {
@@ -57,6 +64,7 @@ impl SshTarget {
             user,
             port,
             key,
+            jump: None,
         }
     }
 
@@ -127,7 +135,7 @@ impl SshTarget {
 
 /// `word` as one POSIX shell word: unchanged when it is made only of
 /// characters no shell treats specially, single-quoted otherwise.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -218,7 +226,7 @@ pub enum SshError {
 /// receives a stripped value, so its escape became a second line of defence
 /// and the doctor quotes the residue rather than the escaped original. See its
 /// doc comment — that trade is recorded there.
-fn scrub_remote_text(s: &str) -> String {
+pub(crate) fn scrub_remote_text(s: &str) -> String {
     strip_control_and_bidi(s, true).trim().to_string()
 }
 
@@ -572,6 +580,22 @@ impl SystemSshExecutor {
         cmd.arg("-p").arg(target.port.to_string());
         if let Some(key) = &target.key {
             cmd.arg("-i").arg(key);
+        }
+        // PRD #1487: the deck list's jump host, validated as the tunnel
+        // validates it — a name from the user's ssh config, nothing an option
+        // or a `ProxyCommand` could reinterpret. A value that fails the check
+        // (a hand-edited registry) is dropped with a warning rather than passed.
+        if let Some(jump) = &target.jump {
+            match crate::remote_tunnel::HostAlias::parse(jump) {
+                Ok(alias) => {
+                    cmd.arg("-J").arg(alias.as_str());
+                }
+                Err(e) => tracing::warn!(
+                    target: "remote",
+                    error = %e,
+                    "ignoring an invalid jump host for this ssh session"
+                ),
+            }
         }
         cmd.arg("--");
         cmd.arg(target.user_host());
@@ -1103,6 +1127,7 @@ impl RemoteEntry {
         if let Some(user) = &self.user {
             target.user = Some(user.clone());
         }
+        target.jump = self.jump_host.clone();
         target
     }
 
@@ -2262,6 +2287,7 @@ mod tests {
             user: Some("user;rm -rf /".to_string()),
             port: 2222,
             key: Some(PathBuf::from("/tmp/key id_rsa")),
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "uname -s -m; echo $(id)");
         let args = args_of(&cmd);
@@ -2289,6 +2315,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2311,6 +2338,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2336,6 +2364,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_wallclock_timeout(7).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2393,6 +2422,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::for_observation(9).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2455,6 +2485,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_keepalive(30, 15, 8).build_command(&target, "echo hi");
         let args = args_of(&cmd);

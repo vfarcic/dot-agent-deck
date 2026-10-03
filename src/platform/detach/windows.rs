@@ -47,12 +47,22 @@ use windows_sys::Win32::System::Threading::{
 /// We do not wait for the child — the spawned daemon stays up after this
 /// returns; callers poll the attach endpoint to know when it is ready.
 pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
+    spawn_daemon_serve_detached_without_env(state_dir, exe, &[])
+}
+
+/// [`spawn_daemon_serve_detached_with_exe`], with each variable in `remove`
+/// left out of the child's otherwise inherited environment (PRD #1487).
+pub fn spawn_daemon_serve_detached_without_env(
+    state_dir: &Path,
+    exe: &Path,
+    remove: &[&str],
+) -> std::io::Result<u32> {
     crate::platform::fsperm::ensure_owner_only_dir(state_dir)?;
     let log_path = state_dir.join("daemon.log");
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
 
     if job_breakaway_needed() {
-        match spawn_with_flags(exe, &log_path, base | CREATE_BREAKAWAY_FROM_JOB) {
+        match spawn_with_flags(exe, &log_path, base | CREATE_BREAKAWAY_FROM_JOB, remove) {
             Ok(pid) => return Ok(pid),
             // `CreateProcess` rejects `CREATE_BREAKAWAY_FROM_JOB` with
             // ERROR_ACCESS_DENIED when the job does not permit breakaway. We
@@ -71,7 +81,7 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
         }
     }
 
-    spawn_with_flags(exe, &log_path, base)
+    spawn_with_flags(exe, &log_path, base, remove)
 }
 
 /// Spawn `exe daemon serve` with `flags`, wiring stdin to `NUL` and
@@ -80,7 +90,12 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
 /// The stdio handles are opened per attempt (rather than once by the caller)
 /// because `Stdio::from(File)` consumes them, so the breakaway retry above needs
 /// a fresh set.
-fn spawn_with_flags(exe: &Path, log_path: &Path, flags: u32) -> std::io::Result<u32> {
+fn spawn_with_flags(
+    exe: &Path,
+    log_path: &Path,
+    flags: u32,
+    remove: &[&str],
+) -> std::io::Result<u32> {
     use std::os::windows::process::CommandExt;
 
     // Plain owner-dir open: the `%LOCALAPPDATA%` parent is per-user ACL'd, so we
@@ -93,14 +108,17 @@ fn spawn_with_flags(exe: &Path, log_path: &Path, flags: u32) -> std::io::Result<
     let stderr = stdout.try_clone()?;
     let stdin = std::fs::File::open("NUL")?;
 
-    let child = std::process::Command::new(exe)
-        .arg("daemon")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
         .arg("serve")
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
-        .creation_flags(flags)
-        .spawn()?;
+        .creation_flags(flags);
+    for key in remove {
+        cmd.env_remove(key);
+    }
+    let child = cmd.spawn()?;
     Ok(child.id())
 }
 
