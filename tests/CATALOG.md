@@ -6449,6 +6449,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the surfacing path itself (covered by `scheduler/live/001`); focus survival (covered by `scheduler/live/002`); the no-hook title case (covered by `scheduler/live/003`); the title after a reconnect (which already masks the bug via startup hydration); the card's status badge / body layout.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/live/005 — Two schedules firing the same repository's orchestration at once open two tabs a user can tell apart, the second numbered (issue #1339).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 tab strip, the grid's first row). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` holding two schedules with one `working_dir` (`shared-repo`), whose `.dot-agent-deck.toml` defines one orchestration `team`; both fired with `RunNow`, the second only once the first run's tab is in the strip, so which run carries the number is fixed. A 220-column PTY, so neither label is ellipsized into looking like the other.
+- **Agent:** none — two `cat` roles per run. The label is decided by the daemon's admission of the run and painted by the attached TUI; no agent participates. Not demo-reel material: no real agent runs, so its entry carries no reel marker.
+- **Asserts:** the strip shows `team · shared-repo` twice and `team · shared-repo · 2` exactly once — i.e. one unnumbered and one numbered tab — and no `· 3`. Verified red with the daemon stamping the derived title instead of the admitted one: both tabs read `team · shared-repo`.
+- **Does not assert:** the title after a detach/reattach, or a reattach with several runs (`orchestration/dispatch/005`); that a client start is refused against a numbered title, or that a run's title is freed when it ends (`orchestration/identity/008`); suffix ordering, the length cap and the canonical-name case (`a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); the desktop Dashboard's group titles, which read the same `display_title`.
+- **Platform coverage:** mac+linux.
+
 
 ### Daemon-side project resolution (PRD #819)
 

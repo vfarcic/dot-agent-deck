@@ -404,7 +404,7 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
         "sh -c 'while [ ! -e {} ]; do sleep 0.05; done'",
         spawned_release.display()
     );
-    std::fs::write(
+    tokio::fs::write(
         spawned_dir.path().join(".dot-agent-deck.toml"),
         format!(
             "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
@@ -412,6 +412,7 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
              [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{role_command}\"\n"
         ),
     )
+    .await
     .expect("write the spawned run's config");
     let spawned = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
