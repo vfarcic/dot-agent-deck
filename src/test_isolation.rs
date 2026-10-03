@@ -135,19 +135,26 @@ ctor::declarative::ctor! {
     }
 }
 
-/// Confirm this test process is detached from any real deck. Idempotent, and
-/// safe to call from any unit test that spawns a pane or posts synthetic hook
-/// events. Writes nothing.
+/// Report what [`detach_before_main`] cleared. Idempotent, and safe to call
+/// from any unit test that spawns a pane or posts synthetic hook events.
+/// Writes nothing.
 ///
 /// [`detach_before_main`] has already cleared the inherited variables — and
-/// redirected `XDG_RUNTIME_DIR` — before the test began, so this prints the
-/// note naming what it cleared, and **panics** if one of them is set again,
-/// because then this process would hand a live-deck route to everything it
-/// spawns. It used to re-scrub such a variable at run time instead; that write
-/// raced any thread already reading the environment, which the SAFETY argument
-/// for it ("nextest runs one test per process") did not exclude — one process
-/// per test is not one thread per process (issue #678). A test that needs an
-/// endpoint sets it on the child.
+/// redirected `XDG_RUNTIME_DIR` — before the test began, so this only prints
+/// the note naming what it cleared. It used to re-scrub a variable set again at
+/// run time; that write raced any thread already reading the environment, which
+/// the SAFETY argument for it ("nextest runs one test per process") did not
+/// exclude — one process per test is not one thread per process (issue #678).
+///
+/// Unlike the integration harness's copy, it does not refuse a variable set
+/// again in-process. Unit tests in this crate set endpoint variables in their
+/// own process on purpose, under their own locks (`platform::paths`'s
+/// precedence tests, `agent_pty`'s stale-socket scrub test, `config`'s
+/// endpoint guard), and under plain `cargo test` those share a process with
+/// every caller of this function — so a refusal here would fail an unrelated
+/// test on a sibling's temporary value. A child spawned through
+/// `agent_pty::spawn` does not inherit such a value either way, because that
+/// path scrubs the named deck variables.
 pub fn detach_from_any_live_deck() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
@@ -163,19 +170,6 @@ pub fn detach_from_any_live_deck() {
             );
         }
     });
-    let reset: Vec<&str> = DECK_ENDPOINT_VARS
-        .into_iter()
-        .filter(|v| std::env::var_os(v).is_some())
-        .collect();
-    assert!(
-        reset.is_empty(),
-        "{} set in this test process after `main` — `detach_before_main` cleared the \
-         inherited copies, so something in this process put them back, and every child \
-         it spawns would inherit a route to a deck. Set an endpoint on the child \
-         instead; this process is no longer scrubbed at run time, because doing so \
-         races any thread already reading the environment (issue #678)",
-        reset.join(", ")
-    );
 }
 
 /// The two endpoint variables [`pin_unreachable_endpoints`] pins. Not the
