@@ -287,6 +287,30 @@ describe("keepSelectionAcrossResize", () => {
     expect(xterm.buffer.active.viewportY, "the release stops the scrolling").toBe(89);
   });
 
+  it("stops scrolling when the pointer leaves the page, and ends when the window loses focus", () => {
+    vi.useFakeTimers();
+    const { xterm } = mount();
+    press(xterm, at(4, 3));
+    xterm.resize(80, 20);
+    move({ clientX: 0.5 * CELL.width, clientY: -30 });
+    vi.advanceTimersByTime(2 * 50);
+    expect(xterm.buffer.active.viewportY).toBe(90);
+    // Released out there, and the page hears nothing more about it.
+    document.documentElement.dispatchEvent(new MouseEvent("mouseleave"));
+    vi.advanceTimersByTime(10 * 50);
+    expect(xterm.buffer.active.viewportY, "no scrolling after the pointer left the page").toBe(90);
+    // A move back on the page with the button still down picks the drag up again.
+    move({ clientX: 0.5 * CELL.width, clientY: -30 });
+    vi.advanceTimersByTime(50);
+    expect(xterm.buffer.active.viewportY).toBe(89);
+    const selected = xterm.selection;
+    window.dispatchEvent(new FocusEvent("blur"));
+    move({ clientX: 0.5 * CELL.width, clientY: -30 });
+    vi.advanceTimersByTime(10 * 50);
+    expect(xterm.buffer.active.viewportY, "losing the window ends the drag").toBe(89);
+    expect(xterm.selection).toEqual(selected);
+  });
+
   it("stops listening once disposed", () => {
     const { xterm, keeper } = mount();
     keeper?.dispose();

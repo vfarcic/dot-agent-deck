@@ -188,10 +188,13 @@ test("terminal_003 a drag that starts with the press focusing the window keeps i
     const input = await openShellPane(deck);
     await deck.traceTerminals();
     const [agent] = await deck.daemonAgents();
-    // The grid the pane fits, once the daemon has applied it. The window gets
-    // the focus first: on a GitHub runner it can open without it, and the grid
-    // then held at 80x24 until the first focus-in (PR #1505's first CI run), so
-    // the control below would see that resize rather than none.
+    // The grid the pane fits, once the daemon has applied it. The window leaves
+    // and regains the focus first. On GitHub runners the grid has held at the
+    // spawn size, 80x24, until the window's first focus-in that the window
+    // itself saw — even with the page already reporting focus (PR #1505's
+    // first two CI runs) — and the control below would see that resize rather
+    // than none.
+    await deck.setWindowFocus(false);
     await deck.setWindowFocus(true);
     await deck.gridSettled();
     const [own] = await deck.grids();

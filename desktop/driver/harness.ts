@@ -56,6 +56,15 @@ const SETTLE_MS = 1_000;
  */
 const DRAG_ATTEMPTS = 3;
 
+/**
+ * Issue #1457 — how long `setWindowFocus` waits for the page to agree with a
+ * focus move before it makes the move again, and how many rounds of moves it
+ * makes (one move per app window each round). A focus change reaches the page
+ * in milliseconds; the bound is load margin.
+ */
+const FOCUS_MS = 10_000;
+const FOCUS_ATTEMPTS = 3;
+
 const paths = {
   app: process.env.DAD_DRIVER_APP ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck-desktop"),
   daemon: process.env.DAD_DRIVER_DAEMON ?? join(REPO_ROOT, "target", "debug", "dot-agent-deck"),
@@ -232,6 +241,8 @@ export class Deck {
   session!: Session;
   private daemon?: ChildProcess;
   private driver?: ChildProcess;
+  /** Issue #1457 — the app window whose focus this page follows, once `setWindowFocus` has found it. */
+  private appWindow?: string;
 
   private constructor(sandbox: string, options: DeckOptions) {
     this.sandbox = sandbox;
@@ -666,25 +677,69 @@ export class Deck {
       if (code !== 0) throw new Error(`xdotool ${args.join(" ")} exited ${code}`);
       return stdout.trim().split("\n").filter(Boolean);
     };
-    const [app] = await xdotool("search", "--onlyvisible", "--name", "Agent Deck");
+    // More than one window can carry the app's title. Measured once, in a run
+    // of the whole file: two, owned by different X clients, with the one listed
+    // first not the window this page's focus follows — most likely the app of
+    // the scenario before, not yet gone (not verified): the next run of that
+    // file needed a second try on each focus-in, the stale window first every
+    // time. Each is tried in turn, the one that worked last time first.
+    const found = await xdotool("search", "--onlyvisible", "--name", "Agent Deck");
+    const apps = found.includes(this.appWindow ?? "")
+      ? [this.appWindow as string, ...found.filter((window) => window !== this.appWindow)]
+      : found;
     const [root] = await xdotool("search", "--maxdepth", "0", "");
-    if (!app || !root) throw new Error(`xdotool found no ${app ? "root" : "app"} window`);
-    if (!focused) {
-      const geometry = Object.fromEntries(
-        (await xdotool("getwindowgeometry", "--shell", app)).map((line) => line.split("=")),
-      ) as Record<string, string>;
+    if (apps.length === 0 || !root) throw new Error(`xdotool found no ${apps.length ? "root" : "app"} window`);
+    const parkPointer = async () => {
+      const rects = await Promise.all(
+        apps.map(async (window) => {
+          const g = Object.fromEntries(
+            (await xdotool("getwindowgeometry", "--shell", window)).map((line) => line.split("=")),
+          ) as Record<string, string>;
+          return { x: Number(g.X), y: Number(g.Y), right: Number(g.X) + Number(g.WIDTH), below: Number(g.Y) + Number(g.HEIGHT) };
+        }),
+      );
       const [width, height] = (await xdotool("getdisplaygeometry"))[0].split(" ").map(Number);
-      const right = Number(geometry.X) + Number(geometry.WIDTH);
-      const below = Number(geometry.Y) + Number(geometry.HEIGHT);
-      if (right >= width && below >= height) throw new Error(`the app's window covers the whole ${width}x${height} display`);
-      await xdotool("mousemove", "--sync", String(right < width ? width - 1 : 0), String(below < height ? height - 1 : 0));
+      const outside = [
+        [width - 1, height - 1],
+        [0, height - 1],
+        [width - 1, 0],
+        [0, 0],
+      ].find(([x, y]) => rects.every((r) => x < r.x || x >= r.right || y < r.y || y >= r.below));
+      if (!outside) throw new Error(`the app's windows cover every corner of the ${width}x${height} display`);
+      await xdotool("mousemove", "--sync", String(outside[0]), String(outside[1]));
+    };
+    const reported = async () => (await this.session.execute<boolean>("return document.hasFocus()")) === focused;
+    if (!focused) await parkPointer();
+    const attempts = focused ? FOCUS_ATTEMPTS * apps.length : FOCUS_ATTEMPTS;
+    for (let attempt = 1; ; attempt += 1) {
+      const target = focused ? apps[(attempt - 1) % apps.length] : root;
+      // A retry leaves through the root window first, so the move is a change
+      // of focus even when X already had it on `target`: X sends no focus
+      // event for a move that changes nothing.
+      if (attempt > 1 && focused) {
+        await parkPointer();
+        await xdotool("windowfocus", "--sync", root);
+      }
+      await xdotool("windowfocus", "--sync", target);
+      try {
+        await waitFor(`the page to report ${focused ? "having" : "losing"} focus`, reported, FOCUS_MS);
+        if (focused) this.appWindow = target;
+        return;
+      } catch (error) {
+        if (attempt < attempts) {
+          console.warn(`setWindowFocus: the page did not report ${focused ? "having" : "losing"} focus after focusing ${target}; trying again`);
+          continue;
+        }
+        const holder = await xdotool("getwindowfocus").catch(() => ["?"]);
+        throw new Error(
+          `${(error as Error).message}, ${attempt} times; X focus is on ${holder.join(",")}, ` +
+            `app window(s) ${apps.join(",")}, root ${root}`,
+        );
+      }
     }
-    const target = focused ? app : root;
-    await xdotool("windowfocus", "--sync", target);
-    await waitFor(`the page to report ${focused ? "having" : "losing"} focus`, async () =>
-      (await this.session.execute<boolean>("return document.hasFocus()")) === focused,
-    );
   }
+
+
 
   /**
    * Tear everything down. On failure, first keep what explains it: a

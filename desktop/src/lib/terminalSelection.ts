@@ -19,7 +19,9 @@ import type { IDisposable, IMarker, Terminal } from "@xterm/xterm";
  *   is held by a buffer marker, which follows its line through the resize, and
  *   until the button comes up every move selects from that cell to the one
  *   under the pointer, as xterm's own drag would have — scrolling, as xterm's
- *   does, while the pointer is above or below the terminal.
+ *   does, while the pointer is above or below the terminal and still on the
+ *   page. It ends on the release, on a move with the button up, or when the
+ *   window loses focus.
  * - **A finished selection is put back.** One the resize clears is selected
  *   again over the same lines, held by markers the same way.
  *
@@ -112,13 +114,21 @@ export function keepSelectionAcrossResize(terminal: Terminal, host: HTMLElement)
     press = undefined;
     window.removeEventListener("mousemove", onMove, true);
     window.removeEventListener("mouseup", onRelease);
+    window.removeEventListener("blur", finish);
+    document.documentElement.removeEventListener("mouseleave", onLeave);
   };
 
-  const finish = () => {
+  function finish() {
     endPress();
     if (terminal.hasSelection()) keep();
     else forget();
-  };
+  }
+
+  // The pointer left the page, where a release may never reach it: stop
+  // scrolling until a move comes back and says the button is still down.
+  function onLeave() {
+    if (press) press.pointer = undefined;
+  }
 
   function onMove(event: MouseEvent) {
     if (!press?.resumed) return;
@@ -150,6 +160,9 @@ export function keepSelectionAcrossResize(terminal: Terminal, host: HTMLElement)
     press = { anchor: anchorAt(cell.line, cell.column), resumed: false };
     window.addEventListener("mousemove", onMove, true);
     window.addEventListener("mouseup", onRelease);
+    // Losing the window ends the gesture: its release will land elsewhere.
+    window.addEventListener("blur", finish);
+    document.documentElement.addEventListener("mouseleave", onLeave);
   };
 
   const resized = terminal.onResize((next) => {
