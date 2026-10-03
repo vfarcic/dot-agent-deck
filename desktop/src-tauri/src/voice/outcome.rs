@@ -1824,6 +1824,15 @@ fn resolve_param(
         deck_identity: None,
         names: Vec::new(),
     };
+    // Whether the transcript names a fact of another agent that the agent
+    // `id` lacks ([`excluded_by_another`]).
+    let heard_against = |id: &str| {
+        let (said, content) = reference_words(transcript.text());
+        agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .is_some_and(|agent| excluded_by_another(agent, &content, &said, agents))
+    };
     match spec.kind {
         // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
         // HERE rather than trusted anywhere: the model marked a boundary in
@@ -1884,11 +1893,17 @@ fn resolve_param(
         // so the transcript is held to the same rule as the reference: naming
         // a daemon these agents are not on reaches none of them.
         ParamKind::AgentRef
-            if names_another_daemon(&word_sequence(transcript.text()), agents, decks) =>
+            if names_another_daemon(&word_sequence(transcript.text()), agents, decks, true) =>
         {
             Err(Unmet::NoMatch)
         }
         ParamKind::AgentRef => match resolve_agent_ref_on(spoken, agents, decks) {
+            // The model may also drop a FACT the user named — "Codex" for
+            // "open the Codex agent in docs-site" — so the agent its answer
+            // reached is held to the transcript's facts too (Qodo on PR
+            // #1529): a word of it that another agent's names account for,
+            // and this one's do not, rules this one out.
+            AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
             AgentRefMatch::One { id, label } => Ok(param(id, label)),
             AgentRefMatch::None => Err(Unmet::NoMatch),
             // Issue #1495 — the model's words tie, and the USER's may not: for
@@ -1904,6 +1919,7 @@ fn resolve_param(
                     .cloned()
                     .collect();
                 match resolve_agent_ref_on(transcript.text(), &tied, decks) {
+                    AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
                     AgentRefMatch::One { id, .. } => {
                         let label = agents
                             .iter()
@@ -3099,7 +3115,7 @@ pub fn resolve_agent_ref_on(
     // exactly where it splits a name ("deploy@build-box", "schedule: issues").
     let mut said = words(&normalize(&spoken_text(spoken)));
     let sequence = word_sequence(spoken);
-    if names_another_daemon(&sequence, agents, decks) {
+    if names_another_daemon(&sequence, agents, decks, false) {
         return AgentRefMatch::None;
     }
     let mut daemon_named = false;
@@ -3108,7 +3124,7 @@ pub fn resolve_agent_ref_on(
         .filter(|deck| deck.holds_agents)
         .flat_map(daemon_names)
     {
-        if name.said_of(&sequence, agents) {
+        if name.said_of(&sequence, agents, false) {
             said.retain(|word| !name.words.contains(word));
             daemon_named = true;
         }
@@ -3198,7 +3214,12 @@ impl DaemonName {
     /// "the agent in billing" next to a daemon also called `billing` is about
     /// the directory, and "the staging reviewer" next to a daemon called
     /// `staging` keeps the word that tells the staging run apart.
-    fn said_of(&self, said: &[String], agents: &[DesktopAgent]) -> bool {
+    ///
+    /// `qualified_only` keeps just the first rule, for a whole TRANSCRIPT:
+    /// there a daemon's name said bare is as likely a command's own word — a
+    /// host called `open` would otherwise refuse "open Mercury" (Qodo on PR
+    /// #1529).
+    fn said_of(&self, said: &[String], agents: &[DesktopAgent], qualified_only: bool) -> bool {
         const LEADS: [&[&str]; 4] = [&["on"], &["from"], &["on", "the"], &["from", "the"]];
         let qualified = |lead: &[&str]| {
             said.windows(lead.len() + self.ordered.len()).any(|window| {
@@ -3208,6 +3229,9 @@ impl DaemonName {
         };
         if !self.ordered.is_empty() && LEADS.iter().any(|lead| qualified(lead)) {
             return true;
+        }
+        if qualified_only {
+            return false;
         }
         let said: BTreeSet<String> = said.iter().cloned().collect();
         !self.words.is_empty()
@@ -3243,12 +3267,17 @@ fn daemon_names(deck: &VoiceDeck) -> Vec<DaemonName> {
 /// ([`VoiceDeck::holds_agents`]), so an agent reference naming another daemon
 /// names none of them: "the Codex agent on build box" is not this machine's
 /// Codex agent.
-fn names_another_daemon(said: &[String], agents: &[DesktopAgent], decks: &[VoiceDeck]) -> bool {
+fn names_another_daemon(
+    said: &[String],
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    qualified_only: bool,
+) -> bool {
     decks
         .iter()
         .filter(|deck| !deck.holds_agents)
         .flat_map(daemon_names)
-        .any(|name| name.said_of(said, agents))
+        .any(|name| name.said_of(said, agents, qualified_only))
 }
 
 /// [`resolve_agent_ref_on`]'s answer for the agents a pass found.
@@ -3303,16 +3332,12 @@ fn best_covered<'a>(
         }
         covered
     };
-    let every_name = |agent: &DesktopAgent| {
-        let mut every = spoken_names(agent);
-        every.extend(agent_facets(agent));
-        every
-    };
     let mut best = (0, 0, false);
     let mut hits: Vec<&DesktopAgent> = Vec::new();
     for agent in agents {
         let shown = spoken_names(agent);
-        let every = every_name(agent);
+        let mut every = shown.clone();
+        every.extend(agent_facets(agent));
         let contains_all = every
             .iter()
             .any(|name| content.is_subset(&words(&normalize(&spoken_text(name)))));
@@ -3329,21 +3354,54 @@ fn best_covered<'a>(
             std::cmp::Ordering::Less => {}
         }
     }
-    // A best match that leaves out a word ANOTHER agent's names account for
-    // is a conflict, not a match: "the Codex agent in docs-site" names the
-    // Codex agent and the agent in docs-site, and when those are two agents,
-    // opening either one acts on something the user excluded. So it finds
-    // nothing, rather than the agent that happens to match more of it.
-    hits.retain(|hit| {
-        let left_out: BTreeSet<String> = content
-            .difference(&covered(&every_name(hit)))
-            .cloned()
-            .collect();
-        !agents
-            .iter()
-            .any(|other| other.id != hit.id && !covered(&every_name(other)).is_disjoint(&left_out))
-    });
+    hits.retain(|hit| !excluded_by_another(hit, content, said, agents));
     hits
+}
+
+/// Whether `agent` leaves out a word of `content` that ANOTHER agent's names
+/// account for — a name of it, shown or known, whose every word is in `said`.
+///
+/// That is a conflict, not a match: "the Codex agent in docs-site" names the
+/// Codex agent and the agent in docs-site, and when those are two agents,
+/// opening either one acts on something the user excluded. So a reference
+/// like that finds nothing ([`best_covered`]), and an agent the model's own
+/// answer reached is held to the transcript the same way ([`resolve_param`]),
+/// since the model may drop the fact that rules it out.
+fn excluded_by_another(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    agents: &[DesktopAgent],
+) -> bool {
+    let covered = |agent: &DesktopAgent| {
+        let mut covered = BTreeSet::new();
+        for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
+            let name_words = words(&normalize(&spoken_text(name)));
+            if !name_words.is_empty() && name_words.is_subset(said) {
+                covered.extend(name_words.intersection(content).cloned());
+            }
+        }
+        covered
+    };
+    let left_out: BTreeSet<String> = content.difference(&covered(agent)).cloned().collect();
+    !left_out.is_empty()
+        && agents
+            .iter()
+            .any(|other| other.id != agent.id && !covered(other).is_disjoint(&left_out))
+}
+
+/// `text`'s words as an agent reference reads them, and the ones of those
+/// that could name something — less [`AGENT_FILLER_WORDS`] and the category
+/// words.
+fn reference_words(text: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let said = words(&normalize(&spoken_text(text)));
+    let content = said
+        .iter()
+        .filter(|word| !AGENT_FILLER_WORDS.contains(&word.as_str()))
+        .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    (said, content)
 }
 
 /// "The newest agent", "the oldest one" — a reference by when an agent
@@ -7780,6 +7838,46 @@ mod tests {
             resolve_agent_ref_on("the reviewer on staging", &runs, &staging),
             AgentRefMatch::Ambiguous(_)
         ));
+
+        // A fact the model dropped is held to the transcript too: "Codex" for
+        // "open the Codex agent in docs-site" opens nothing, since Vega is the
+        // agent in docs-site and Juno is not.
+        let said = "open the Codex agent in docs-site";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+            "{outcome:?}"
+        );
+        // A daemon's name said bare in the TRANSCRIPT is not a daemon there —
+        // it may be the command's own verb: a host called `open` does not stop
+        // "open Mercury".
+        let mut with_an_open_host = decks();
+        with_an_open_host.push(deck("deck-open", "ops@open", false));
+        let said = "open Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &agents,
+            &with_an_open_host,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{outcome:?}"
+        );
 
         // The daemon the agents ARE on is no obstacle.
         let said = "open the Codex agent on the local deck";
