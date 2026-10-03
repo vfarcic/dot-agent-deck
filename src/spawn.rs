@@ -1963,10 +1963,12 @@ enum GuardedOutcome {
 /// only by threading the daemon's `AppState` into the spawn primitive.
 ///
 /// The shared `deadline` (B9) bounds everything before the first byte, above
-/// all waiting behind another writer. A wedged PTY can still block inside the
-/// synchronous `write_all` under the writer mutex — that is pre-existing
-/// behaviour of every write on this path and is tracked as a follow-up, not
-/// fixed here.
+/// all waiting behind another writer — including a write an earlier caller
+/// stopped waiting for that is still inside the PTY. A PTY that stops taking
+/// bytes after that is bounded by [`crate::agent_pty::PTY_WRITE_STALL_BOUND`]
+/// rather than by `deadline`, and reported ambiguous; the write itself runs on
+/// the pane writer's own thread, so it never parks a runtime worker (issue
+/// #525).
 ///
 /// Issue #1243: the bound is enforced inside the write rather than by a timeout
 /// around it. Once the payload is in, the CR waits for it to render on the
