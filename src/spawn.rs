@@ -661,6 +661,7 @@ pub async fn spawn(
                     // declare (issue #308).
                     None,
                     Some(&req.task_name),
+                    &id,
                 );
             }
             run_delivery(
@@ -1062,6 +1063,7 @@ pub async fn spawn(
                         Some(&role.command),
                         role.agent_type.clone(),
                         Some(&role.role_name),
+                        &agent.id,
                     );
                 }
             }
@@ -3018,11 +3020,18 @@ fn surface_spawned_pane(
     // `None` only on the attach path ([`surface_attach_started_agent`]), for a
     // start that named nothing and so has no friendly title to carry.
     task_name: Option<&str>,
+    // Issue #1507: the registry id of the agent this card draws, for the TUI's
+    // creation order only — see `SURFACED_AGENT_ID_METADATA_KEY`.
+    agent_id: &str,
 ) {
     let mut metadata = HashMap::new();
     if let Some(task_name) = task_name {
         metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
     }
+    metadata.insert(
+        crate::event::SURFACED_AGENT_ID_METADATA_KEY.to_string(),
+        agent_id.to_string(),
+    );
     // Issue #684: declare that the DAEMON authored this start to draw a card,
     // rather than a producer announcing a conversation. `session_id` below is the
     // PANE ID and there is no `agent_id`, so without the marker an attached TUI's
@@ -3113,6 +3122,7 @@ pub(crate) fn surface_attach_started_agent(
             command,
             record.agent_type.clone(),
             record.display_name.as_deref(),
+            &record.id,
         ),
         Some(TabMembership::Orchestration {
             name,
@@ -3154,6 +3164,7 @@ pub(crate) fn surface_attach_started_agent(
                 command,
                 record.agent_type.clone(),
                 Some(role_name),
+                &record.id,
             );
         }
         Some(_) => {}
@@ -8253,6 +8264,7 @@ mod tests {
             Some("cat"),
             None,
             Some("morning-digest"),
+            "42",
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
             panic!("expected a BroadcastMsg::Event");
@@ -8270,6 +8282,15 @@ mod tests {
                 .map(String::as_str),
             Some("morning-digest"),
             "the friendly name must ride on the event so the live card titles itself with it"
+        );
+        // Issue #1507: the registry id rides on the metadata for the TUI's
+        // creation order, while `agent_id` stays `None` (asserted above).
+        assert_eq!(
+            e.metadata
+                .get(crate::event::SURFACED_AGENT_ID_METADATA_KEY)
+                .map(String::as_str),
+            Some("42"),
+            "the surfaced agent's registry id must ride on the event for ordering"
         );
         // Issue #684: and it declares itself DAEMON-AUTHORED, so an attached
         // TUI's `AppState` does not read it as a conversation announcing itself
@@ -8567,7 +8588,7 @@ mod tests {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, Some("x"));
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, Some("x"), "1");
     }
 
     /// PRD #225 hardening: the readiness-wait override may shorten the wait but
