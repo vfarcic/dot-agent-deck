@@ -272,6 +272,46 @@ struct Opts {
     probe: ProbeArg,
 }
 
+impl Opts {
+    /// Anchor every path option to `cwd`, the directory the command was run
+    /// from, before any of them reaches a command with a working directory of
+    /// its own (issue #1453).
+    ///
+    /// A relative path is otherwise resolved by whichever process reads it,
+    /// from wherever that process runs: [`create_clone`] runs `git clone` from
+    /// the clone's PARENT, so `--source-clone ../x` passed through still
+    /// relative landed one directory above where it names. Lexical
+    /// (`Path::join`) rather than `canonicalize`, because most of these paths
+    /// do not exist yet, and an absolute path is kept exactly as given.
+    /// The standalone build clone: `--source-clone`, else
+    /// `<repo parent>/dot-agent-deck-xver-src`.
+    fn clone_path(&self, repo_parent: &Path) -> PathBuf {
+        self.source_clone
+            .clone()
+            .unwrap_or_else(|| repo_parent.join("dot-agent-deck-xver-src"))
+    }
+
+    fn anchored_at(mut self, cwd: &Path) -> Self {
+        for path in [
+            &mut self.old_binary,
+            &mut self.source_clone,
+            &mut self.target_dir,
+            &mut self.cargo_cache,
+            &mut self.runs_root,
+            &mut self.releases_dir,
+            &mut self.evidence,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ModeArg {
     SandboxSockets,
@@ -422,7 +462,13 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|a| a == "--") {
         args.remove(1);
     }
-    let opts = Opts::parse_from(args);
+    let opts = match parse_invocation(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("xver: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&opts) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -431,6 +477,19 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the command line and anchor its path options to this process's
+/// working directory — the directory the command was run from (issue #1453).
+/// `main` and the regression test both go through here.
+fn parse_invocation<I, T>(args: I) -> Result<Opts, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
+    Ok(Opts::parse_from(args).anchored_at(&cwd))
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +844,37 @@ fn branch_slug(branch: &str) -> String {
         .collect()
 }
 
+/// `git clone --no-checkout <url> <clone>`, run from the clone's parent.
+///
+/// `clone` must be absolute, and [`Opts::anchored_at`] is what makes
+/// `--source-clone` so: a relative one would be resolved against the parent this
+/// runs from rather than the directory the command was run from, which is issue
+/// #1453. Refused here too, so a future caller cannot reopen it silently.
+fn create_clone(url: &str, clone: &Path) -> Result<(), String> {
+    if !clone.is_absolute() {
+        return Err(format!(
+            "the build clone path {} is relative; it must be anchored to the invoking \
+             directory first (issue #1453)",
+            clone.display()
+        ));
+    }
+    let parent = clone
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", clone.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    must_run(
+        git(parent).args([
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            url,
+            &clone.to_string_lossy(),
+        ]),
+        "git clone (standalone build clone)",
+    )?;
+    Ok(())
+}
+
 /// Point the standalone build clone at `origin/<branch>` and build it.
 ///
 /// A standalone clone rather than a linked worktree of the operator's
@@ -823,20 +913,7 @@ fn new_binary(
     let url = format!("https://github.com/{}.git", opts.repo);
     let fresh = std::fs::symlink_metadata(clone).is_err();
     if fresh {
-        let parent = clone
-            .parent()
-            .ok_or_else(|| format!("{} has no parent", clone.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        must_run(
-            git(parent).args([
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                &url,
-                &clone.to_string_lossy(),
-            ]),
-            "git clone (standalone build clone)",
-        )?;
+        create_clone(&url, clone)?;
         ev.preflight.push(format!(
             "created the standalone build clone {} from {url}",
             clone.display()
@@ -1259,10 +1336,7 @@ fn run_one(
         .parent()
         .ok_or_else(|| "the repository root has no parent".to_string())?
         .to_path_buf();
-    let clone = opts
-        .source_clone
-        .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-src"));
+    let clone = opts.clone_path(&parent);
     let target_dir = opts
         .target_dir
         .clone()
@@ -2562,5 +2636,152 @@ mod domain_tests {
         for d in [absent, empty, legacy] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+}
+
+/// A relative path option lands where it names (issue #1453).
+#[cfg(test)]
+mod path_anchor_tests {
+    use super::*;
+
+    /// Set in the re-exec'd child: the `file://` URL of the bare repository it
+    /// clones from. Its absence makes [`a_relative_source_clone_child`] a no-op.
+    const CHILD: &str = "XVER_TEST_1453_CHILD";
+    const CHILD_TEST: &str = "outer::path_anchor_tests::a_relative_source_clone_child";
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xver-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        std::fs::canonicalize(&d).expect("canonicalize scratch dir")
+    }
+
+    #[test]
+    fn every_relative_path_option_is_anchored_to_the_invoking_directory() {
+        let opts = Opts::parse_from([
+            "xver",
+            "--branch",
+            "b",
+            "--old-binary",
+            "old/dot-agent-deck",
+            "--source-clone",
+            "../src",
+            "--target-dir",
+            "t",
+            "--cargo-cache",
+            "./c",
+            "--runs-root",
+            "../../runs",
+            "--releases-dir",
+            "/abs/releases",
+            "--evidence",
+            "e.md",
+        ])
+        .anchored_at(Path::new("/w/repo"));
+        assert_eq!(
+            opts.old_binary.as_deref(),
+            Some(Path::new("/w/repo/old/dot-agent-deck"))
+        );
+        assert_eq!(
+            opts.source_clone.as_deref(),
+            Some(Path::new("/w/repo/../src"))
+        );
+        assert_eq!(opts.target_dir.as_deref(), Some(Path::new("/w/repo/t")));
+        assert_eq!(opts.cargo_cache.as_deref(), Some(Path::new("/w/repo/./c")));
+        assert_eq!(
+            opts.runs_root.as_deref(),
+            Some(Path::new("/w/repo/../../runs"))
+        );
+        assert_eq!(
+            opts.releases_dir.as_deref(),
+            Some(Path::new("/abs/releases")),
+            "an absolute path is kept exactly as given"
+        );
+        assert_eq!(opts.evidence.as_deref(), Some(Path::new("/w/repo/e.md")));
+
+        let defaults = Opts::parse_from(["xver", "--branch", "b"]).anchored_at(Path::new("/w"));
+        assert_eq!(
+            defaults.source_clone, None,
+            "an omitted path stays omitted, so `run_one` still picks its default"
+        );
+    }
+
+    #[test]
+    fn a_relative_clone_path_is_refused_rather_than_resolved_from_the_parent() {
+        let e = create_clone("file:///nonexistent", Path::new("../x")).unwrap_err();
+        assert!(e.contains("is relative") && e.contains("#1453"), "{e}");
+    }
+
+    /// The bug as the operator met it: the process's own working directory is
+    /// `<root>/a/b`, `--source-clone ../x` is given, and the clone must land at
+    /// `<root>/a/x`, not at `<root>/x` one directory higher. Only a process
+    /// started in that directory reproduces it, so this re-execs the test
+    /// binary there rather than changing the working directory of a process
+    /// other tests share.
+    #[test]
+    fn a_relative_source_clone_lands_where_it_names() {
+        let root = scratch_dir("source-clone-1453");
+        let invoked_from = root.join("a").join("b");
+        std::fs::create_dir_all(&invoked_from).expect("invoking dir");
+        let origin = root.join("origin.git");
+        must_run(
+            git(&root)
+                .args(["init", "--quiet", "--bare"])
+                .arg(&origin)
+                .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+            "git init --bare",
+        )
+        .expect("a bare origin");
+
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let out = Command::new(&exe)
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .current_dir(&invoked_from)
+            .env(CHILD, format!("file://{}", origin.display()))
+            .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child clone failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have run exactly {CHILD_TEST}; zero matches exit 0 too\n{stdout}"
+        );
+        assert!(
+            root.join("a").join("x").join(".git").is_dir(),
+            "`../x` from {} must create {}",
+            invoked_from.display(),
+            root.join("a").join("x").display()
+        );
+        assert!(
+            !root.join("x").exists(),
+            "the clone landed one directory too high, at {} (issue #1453)",
+            root.join("x").display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The child half of [`a_relative_source_clone_lands_where_it_names`]: the
+    /// command's own path for `--source-clone ../x`, from this process's
+    /// working directory — `main`'s [`parse_invocation`], `run_one`'s
+    /// [`Opts::clone_path`], and the [`create_clone`] that `new_binary` calls
+    /// for a clone that does not exist yet. The rest of `new_binary` fetches
+    /// from GitHub and builds, so it is not run here; the live `cargo xver`
+    /// run in PR #1498 covered it.
+    #[test]
+    fn a_relative_source_clone_child() {
+        let Ok(url) = std::env::var(CHILD) else {
+            return;
+        };
+        let opts = parse_invocation(["xver", "--branch", "b", "--source-clone", "../x"])
+            .expect("parse the invocation");
+        let clone = opts.clone_path(Path::new("/never/the/default"));
+        create_clone(&url, &clone).expect("git clone");
     }
 }
