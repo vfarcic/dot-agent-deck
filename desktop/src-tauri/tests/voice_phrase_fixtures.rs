@@ -474,6 +474,17 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
         },
+        // A daemon named as one word, which speech-to-text splits ("mini PC"),
+        // and one the app is not connected to, as every daemon but the one
+        // shown is under a single-daemon selection: switchable, never offered
+        // to the New agent dialog.
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-minipc".to_string(),
+            label: "minipc".to_string(),
+            address: Some("ops@10.0.0.7".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+        },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says
     // `listing = true`: one level of the local deck, with a parent, named the

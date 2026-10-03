@@ -64,6 +64,16 @@ action = "switch_deck"
 outcome = "dispatch"
 resolved_deck = "all-daemons"
 
+# A one-word daemon name as speech-to-text writes it: split, with a comma, and
+# "daemon" heard as "demon" — measured from a real transcript.
+[[fixtures]]
+name = "switch-deck-mini-pc-demon"
+utterance = "Select mini PC, Demon."
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-minipc"
+
 [[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"
