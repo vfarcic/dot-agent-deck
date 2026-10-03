@@ -14406,8 +14406,8 @@ impl AppState {
             // running (`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`): then
             // nothing will ever announce a turn, and output is the only sign of
             // one. The wrapper then reports output going quiet as a classified
-            // `Idle`, so the card reads Working while Codex is drawing and Idle
-            // once it stops, rather than Working forever. Each frame may only
+            // `Idle`, so the card reads Thinking while Codex is drawing and Idle
+            // once it stops, rather than busy forever. Each frame may only
             // move a status that output itself could have set, so it never
             // repaints a hook's Needs Input, Working tool or Error.
             _ if event.agent_type == AgentType::Codex && event.is_wrapper_output_classified() => {
@@ -23523,7 +23523,7 @@ while True:
     /// hooks. With the hooks trusted the card reads Idle before any prompt,
     /// Thinking, Working with the tool, Needs Input, Idle after Stop, and stays
     /// Idle through the redraws that follow; with the prompt hook declared
-    /// unavailable, output reads Working until it goes quiet, never forever.
+    /// unavailable, output reads Thinking until it goes quiet, never forever.
     #[spec("codex/status/002")]
     #[test]
     fn codex_status_002_hooks_decide_a_codex_card_and_output_only_when_they_cannot() {

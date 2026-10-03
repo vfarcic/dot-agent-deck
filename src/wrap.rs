@@ -124,7 +124,7 @@ pub static GENERIC: RuleSet = RuleSet {
 /// deck's Codex hooks are trusted, the card follows those hooks and treats these
 /// events as liveness only (`crate::state::AppState::apply_event`); when the
 /// prompt hook is not running, the wrapper also reports the output going quiet
-/// as Idle ([`QuietOutputIdle`]), so the card reads Working only while Codex is
+/// as Idle ([`QuietOutputIdle`]), so the card reads Thinking only while Codex is
 /// drawing.
 ///
 /// **It deliberately recognises no error and no idle line, and that is the
@@ -2236,8 +2236,8 @@ fn quiet_output_transition(
 
 /// Issue #1493: the degraded status a wrapped Codex gets when the deck could not
 /// get its prompt hook trusted — the case where nothing will ever announce a
-/// turn. Without it the card read Working from the first painted line until
-/// Codex exited. With it, the card reads Working while Codex is drawing and Idle
+/// turn. Without it the card stayed busy from the first painted line until
+/// Codex exited. With it, the card reads Thinking while Codex is drawing and Idle
 /// once its output has been quiet for [`CODEX_QUIET_OUTPUT_IDLE`].
 ///
 /// Ticked from the supervisory loop, the only thread awake when the output
