@@ -1643,10 +1643,13 @@ fn run_one(
         for (src, dst) in staging {
             ev.preflight.push(sandbox::stage_binary(src, &dst)?);
         }
-        if build_lock.take().is_some() {
+        if let Some(lock) = build_lock.take() {
+            lock.still_held()?;
+            drop(lock);
             ev.build.push(
-                "released the build lock once the branch binary was staged into the sandbox; \
-                 another run may check out in the clone and build into the target dir from here"
+                "released the build lock once the branch binary was staged into the sandbox, \
+                 its lock files still the ones it locked; another run may check out in the \
+                 clone and build into the target dir from here"
                     .to_string(),
             );
         }
@@ -1786,13 +1789,14 @@ fn build_lock_note(lock: &buildlock::BuildLock) -> String {
             .map(|p| format!("`{}`", p.display()))
             .collect::<Vec<_>>()
             .join(", "),
-        if lock.waited >= Duration::from_secs(1) {
-            format!(
-                "waited {:.0}s for another run to release them",
-                lock.waited.as_secs_f64()
-            )
-        } else {
+        if lock.waited_for.is_empty() {
             "no other run held them".to_string()
+        } else {
+            format!(
+                "waited {:.1}s for another run to release them: {}",
+                lock.waited.as_secs_f64(),
+                lock.waited_for.join("; then ")
+            )
         }
     )
 }

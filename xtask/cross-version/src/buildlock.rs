@@ -52,18 +52,62 @@ pub struct Need<'a> {
     pub dir: &'a Path,
 }
 
-/// The locks a run holds. Dropping it releases every one of them.
+/// The locks a run holds. Dropping it clears the holder line from each lock
+/// file and releases every one of them.
 #[derive(Debug)]
 pub struct BuildLock {
     held: Vec<(PathBuf, File)>,
-    /// How long acquiring them took, `Duration::ZERO` when nothing waited.
+    /// How long acquiring them took.
     pub waited: Duration,
+    /// The holder line of each run this one found in its way, however briefly;
+    /// empty when no other run held either lock.
+    pub waited_for: Vec<String>,
 }
 
 impl BuildLock {
     /// The lock files held, in acquisition order.
     pub fn files(&self) -> Vec<&Path> {
         self.held.iter().map(|(p, _)| p.as_path()).collect()
+    }
+
+    /// Whether every lock file is still the file this run locked.
+    ///
+    /// A lock lives on an inode, not on a name: a lock file deleted while a
+    /// run holds it lets the next run create a fresh one at the same path and
+    /// lock that, so both use the directory at once. Nothing a run can do with
+    /// `flock` prevents that, so the holder checks before it lets go, and a
+    /// lock that was removed or replaced under it fails the run.
+    pub fn still_held(&self) -> Result<(), String> {
+        for (path, file) in &self.held {
+            if !names_inode(path, file) {
+                return Err(format!(
+                    "the build lock {} was removed or replaced while this run held it, so \
+                     another run could have locked a new file at that path and used the same \
+                     directory at the same time. Do not delete `*{LOCK_SUFFIX}` files while a \
+                     `cargo xver` run is going",
+                    path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BuildLock {
+    fn drop(&mut self) {
+        // Clear the holder line while the lock is still held, so a run that
+        // takes it next never finds this one's line and names it.
+        for (_, file) in &mut self.held {
+            let _ = file.set_len(0);
+        }
+    }
+}
+
+/// Whether `path` names the inode `file` has open.
+fn names_inode(path: &Path, file: &File) -> bool {
+    match (std::fs::symlink_metadata(path), file.metadata()) {
+        (Ok(at_path), Ok(held)) => at_path.dev() == held.dev() && at_path.ino() == held.ino(),
+        _ => false,
     }
 }
 
@@ -153,14 +197,34 @@ fn try_lock_exclusive(file: &File) -> Result<bool, String> {
     Err(format!("flock: {err}"))
 }
 
-/// The holder line the current holder wrote, or a placeholder when it has not
-/// written one yet (it is between taking the lock and writing it).
+/// The holder line the current holder wrote.
+///
+/// The line can be missing or out of date: the holder may be between taking
+/// the lock and writing it, or the line may be a run's that died holding the
+/// lock (a run that exits cleanly clears it). A line whose pid is no longer
+/// running is reported as that, never as the holder.
 fn read_holder(file: &mut File) -> String {
+    const UNRECORDED: &str = "a run that has not recorded itself yet";
     let mut s = String::new();
     let ok = file.seek(SeekFrom::Start(0)).is_ok() && file.read_to_string(&mut s).is_ok();
     let s = s.trim();
     if !ok || s.is_empty() {
-        "a run that has not recorded itself yet".to_string()
+        return UNRECORDED.to_string();
+    }
+    let pid = s
+        .strip_prefix("pid ")
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse::<libc::pid_t>().ok());
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    let exited = pid.is_some_and(|pid| {
+        pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    });
+    if exited {
+        format!(
+            "{UNRECORDED}; the last line recorded there, `{s}`, names a process that has exited"
+        )
     } else {
         s.to_string()
     }
@@ -194,14 +258,36 @@ pub fn acquire(
 ) -> Result<BuildLock, String> {
     let started = Instant::now();
     let deadline = started + wait;
-    let mut held = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for need in needs {
         let path = lock_path(need.dir)?;
+        if let Some(j) = paths.iter().position(|p| *p == path) {
+            // The run would wait on its own lock for the whole of `wait`.
+            return Err(format!(
+                "the {} {} and the {} {} are the same directory; give them different paths",
+                needs[j].what,
+                needs[j].dir.display(),
+                need.what,
+                need.dir.display()
+            ));
+        }
+        paths.push(path);
+    }
+    let mut held = Vec::new();
+    let mut waited_for = Vec::new();
+    for (need, path) in needs.iter().zip(paths) {
         let mut file = open_lock_file(&path)?;
         let mut announced = false;
         loop {
             if try_lock_exclusive(&file)? {
-                break;
+                if names_inode(&path, &file) {
+                    break;
+                }
+                // The file was removed or replaced between the open and the
+                // lock — a holder's lock on a name it no longer has. Lock the
+                // file that is there now instead.
+                file = open_lock_file(&path)?;
+                continue;
             }
             let other = read_holder(&mut file);
             let advice = format!(
@@ -227,6 +313,7 @@ pub fn acquire(
             }
             if !announced {
                 announced = true;
+                waited_for.push(other.clone());
                 on_wait(&format!(
                     "the {} {} is in use by another `cargo xver` run ({other}); waiting up to {}s \
                      for it (--lock-wait-secs). {advice}.",
@@ -243,6 +330,7 @@ pub fn acquire(
     Ok(BuildLock {
         held,
         waited: started.elapsed(),
+        waited_for,
     })
 }
 
@@ -417,6 +505,91 @@ mod tests {
             .expect_err("a symlinked lock file is refused");
         assert!(err.contains("not a symlink"), "{err}");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Greptile on #1533: one directory given as both would wait on its own
+    /// lock for the whole bound before refusing.
+    #[test]
+    fn the_same_directory_as_clone_and_target_is_refused_at_once() {
+        let s = scratch("same");
+        let d = s.join("both");
+        let started = Instant::now();
+        let err = take(&d, &d, "x", Duration::from_secs(30)).expect_err("one directory, two roles");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused, not waited"
+        );
+        assert!(err.contains("same directory"), "{err}");
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Qodo on #1533: a wait shorter than a second is still contention, and
+    /// the run records whom it waited for.
+    #[test]
+    fn a_brief_wait_is_still_recorded_with_the_holder() {
+        let s = scratch("brief");
+        let (clone, target) = (s.join("src"), s.join("target"));
+        let first = take(&clone, &target, "pid 1 branch `quick`", Duration::ZERO).expect("first");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+        let second = take(&clone, &target, "second", Duration::from_secs(30)).expect("second");
+        releaser.join().unwrap();
+        assert_eq!(second.waited_for, vec!["pid 1 branch `quick`".to_string()]);
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Qodo on #1533: a lock is on an inode, so a lock file deleted while held
+    /// lets a second run lock a new file at the same path. The holder catches
+    /// it before it lets go.
+    #[test]
+    fn a_lock_file_removed_while_held_is_caught_by_the_holder() {
+        let s = scratch("removed");
+        let (clone, target) = (s.join("src"), s.join("target"));
+        let first = take(&clone, &target, "first", Duration::ZERO).expect("first");
+        first.still_held().expect("nothing removed yet");
+        std::fs::remove_file(lock_path(&clone).unwrap()).unwrap();
+        let _second = take(
+            &clone,
+            &target.with_file_name("other-target"),
+            "second",
+            Duration::ZERO,
+        )
+        .expect("a new file at the path is a new lock — the hole this check exists for");
+        let err = first
+            .still_held()
+            .expect_err("the holder sees its lock file was replaced");
+        assert!(err.contains("removed or replaced"), "{err}");
+        let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// Qodo on #1533: a run that releases clears its line, and a line left by
+    /// a run that died is never reported as the current holder.
+    #[test]
+    fn a_released_or_dead_holder_is_never_named_as_the_holder() {
+        let s = scratch("stale");
+        let (clone, target) = (s.join("src"), s.join("target"));
+        drop(take(&clone, &target, "pid 1 branch `gone`", Duration::ZERO).expect("first"));
+        let path = lock_path(&clone).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "cleared on release"
+        );
+
+        let mut dead = Command::new("true").spawn().expect("spawn true");
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, format!("pid {dead_pid}, branch `crashed`\n")).unwrap();
+        // Hold it through a second open file description, as a run that has
+        // not yet recorded itself would.
+        let holding = open_lock_file(&path).unwrap();
+        assert!(try_lock_exclusive(&holding).unwrap());
+        let err = take(&clone, &target, "waiter", Duration::ZERO).expect_err("held");
+        assert!(err.contains("has not recorded itself yet"), "{err}");
+        assert!(err.contains("names a process that has exited"), "{err}");
         let _ = std::fs::remove_dir_all(&s);
     }
 
