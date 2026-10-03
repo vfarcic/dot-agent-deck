@@ -60,8 +60,8 @@ use dot_agent_deck_desktop::voice::{
     schema::DECK_HIDDEN_HINT,
     table,
     test_support::{
-        api_preset, api_resolver, in_orchestration, in_titled_orchestration, role_agent_in_state,
-        with_tool,
+        api_preset, api_resolver, facets_fleet, in_orchestration, in_titled_orchestration,
+        role_agent_in_state, with_tool,
     },
 };
 use serde::Deserialize;
@@ -166,6 +166,12 @@ struct PhraseFixture {
     /// fleet.
     #[serde(default)]
     generated_run: bool,
+    /// Plant [`facets_fleet`] instead of the `build` fleet (issue #1495):
+    /// agents whose labels say nothing about what they are doing, told apart
+    /// only by their mode, agent type, directory, orchestration, last prompt
+    /// or start time. The only value is `"facets"`.
+    #[serde(default)]
+    fleet: Option<String>,
     /// The introducing words a dictation fixture expects the model to MARK.
     ///
     /// **Not the text to type**, which is the whole design: the app takes that
@@ -427,6 +433,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     let mut atlas_two = role_agent_in_state("agent-atlas-two", "coder", "working");
     atlas_two.display_name = Some("Atlas".to_string());
     let ambiguous_name_agents = vec![atlas_one, atlas_two];
+    let facet_agents = facets_fleet();
     // The run title a real orchestration gets — `<basename>-orchestrator-N`,
     // inheriting the repository's name — which nobody says word for word.
     let generated_run_agents: Vec<_> = [
@@ -469,6 +476,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: true,
             unavailable: None,
+            // The planted agents are this machine's.
+            holds_agents: true,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-build-box".to_string(),
@@ -476,6 +485,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: None,
+            holds_agents: false,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-stale-box".to_string(),
@@ -483,6 +493,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
+            holds_agents: false,
         },
         // A daemon named as one word, which speech-to-text splits ("mini PC"),
         // and one the app is not connected to, as every daemon but the one
@@ -629,8 +640,22 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             "{}: `tie_may_be_settled` belongs only on a `param_ambiguous` fixture",
             fixture.name
         );
+        if let Some(fleet) = fixture.fleet.as_deref() {
+            assert_eq!(
+                fleet, "facets",
+                "{}: `fleet` names an unknown planted fleet",
+                fixture.name
+            );
+            assert!(
+                !fixture.generated_run,
+                "{}: `fleet` and `generated_run` each plant a fleet; pick one",
+                fixture.name
+            );
+        }
         if let Some(expected) = fixture.resolved_agent.as_deref() {
-            let planted = if fixture.generated_run {
+            let planted = if fixture.fleet.is_some() {
+                &facet_agents
+            } else if fixture.generated_run {
                 &generated_run_agents
             } else {
                 &agents
@@ -737,6 +762,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         let started = Instant::now();
         let fixture_agents = if fixture.name == "open-agent-ambiguous-name" {
             &ambiguous_name_agents
+        } else if fixture.fleet.is_some() {
+            &facet_agents
         } else if fixture.generated_run {
             &generated_run_agents
         } else {
