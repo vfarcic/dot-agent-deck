@@ -87,25 +87,25 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
 /// for as long as anything else holds the pipe's write end: a launcher script
 /// that backgrounds a helper, or a descendant of the version command, exits
 /// the direct child while keeping stdout open, and this runs at TUI start with
-/// [`SETTINGS_LOCK`] held. So stdout is drained on a thread, which stops at the
-/// first newline, at EOF or after 4 KiB, and hands back what it read; the
-/// probe waits for that hand-off until the deadline. The line is accepted only
-/// when the child has also exited on its own by then. Past the deadline,
-/// whether or not a line arrived, the probe answers unknown, kills the child's
-/// whole tree — on Unix its process group, which it was given at spawn, and on
-/// Windows the Job Object it is adopted into right after spawn — reaps it, and
-/// abandons the reader thread, which ends when the pipe closes because a
-/// helper holding it died with the tree. What escapes the tree keeps the pipe,
-/// and with it that one detached thread: on Unix a descendant that moved itself
-/// to another group, on Windows one spawned in the instant between
-/// `CreateProcess` and the job assignment
-/// ([`crate::platform::proc::AgentProcessGroup::adopt`] documents that window).
-/// Either way the probe still returns on time.
+/// [`SETTINGS_LOCK`] held. So stdout is read with the deadline
+/// ([`read_version_line`]), stopping at the first newline, at EOF or after
+/// 4 KiB. The line is accepted only when the child has also exited on its own
+/// by then. Past the deadline, whether or not a line arrived, the probe answers
+/// unknown, kills the child's whole tree — on Unix its process group, which it
+/// was given at spawn, and on Windows the Job Object it is adopted into right
+/// after spawn — and reaps it.
+///
+/// **Nothing the probe started outlives it on its side of the pipe** (issue
+/// #1454). The read happens on the calling thread, so there is no reader to
+/// abandon, and the read end is closed when the probe returns. A descendant
+/// that escaped the tree — on Unix one that moved itself to another group, on
+/// Windows one spawned in the instant between `CreateProcess` and the job
+/// assignment ([`crate::platform::proc::AgentProcessGroup::adopt`] documents
+/// that window) — keeps only its own write end, and its next write fails.
 fn probe_claude_version(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
-    use std::io::Read as _;
     let mut command = std::process::Command::new(program);
     command
         .arg("--version")
@@ -129,25 +129,11 @@ fn probe_claude_version(
     #[cfg(not(windows))]
     let tree = ProbeTree;
     let deadline = std::time::Instant::now() + timeout;
-    let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut output = Vec::new();
-            let mut chunk = [0u8; 512];
-            while output.len() < 4096 && !output.contains(&b'\n') {
-                match stdout.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => output.extend_from_slice(&chunk[..n]),
-                }
-            }
-            output.truncate(4096);
-            let _ = tx.send(output);
-        });
-    } else {
-        drop(tx);
-    }
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let Ok(output) = rx.recv_timeout(remaining) else {
+    let output = match child.stdout.take() {
+        Some(mut stdout) => read_version_line(&mut stdout, deadline),
+        None => Some(Vec::new()),
+    };
+    let Some(output) = output else {
         // Deadline passed with no line. The child is not reaped yet (a zombie
         // at worst), so its pid still names its group.
         kill_probe(&mut child, &tree);
@@ -177,6 +163,119 @@ fn probe_claude_version(
             .is_some_and(claude_version_accepts_stop_failure),
         line,
     )
+}
+
+/// Read the version probe's stdout on the calling thread until a newline, EOF,
+/// a read error or 4 KiB, whichever comes first, and hand back what was read
+/// (at most 4 KiB). `None` when `deadline` passes first.
+///
+/// Every read is preceded by a wait for data that is itself bounded by the
+/// deadline, so the read never blocks: on Unix `poll(2)` on the pipe, on
+/// Windows `PeekNamedPipe` polled every 10ms (an anonymous pipe has no
+/// overlapped reads to cancel).
+fn read_version_line(
+    stdout: &mut std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 512];
+    while output.len() < 4096 && !output.contains(&b'\n') {
+        let available = match wait_for_probe_output(stdout, deadline) {
+            ProbeOutput::Ready(available) => available.clamp(1, chunk.len()),
+            ProbeOutput::Closed => break,
+            ProbeOutput::TimedOut => return None,
+        };
+        match stdout.read(&mut chunk[..available]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => output.extend_from_slice(&chunk[..n]),
+        }
+    }
+    output.truncate(4096);
+    Some(output)
+}
+
+/// What [`wait_for_probe_output`] found on the pipe.
+enum ProbeOutput {
+    /// A read of up to this many bytes will not block: on Windows the count
+    /// waiting in the pipe, on Unix `usize::MAX`, as a read after `poll(2)`
+    /// reports the pipe readable returns what is there without blocking.
+    Ready(usize),
+    /// The pipe is broken or failed: treat as EOF.
+    Closed,
+    TimedOut,
+}
+
+/// Wait until the probe's stdout has something to read — data, EOF or an
+/// error — or `deadline` passes.
+#[cfg(unix)]
+fn wait_for_probe_output(
+    stdout: &std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> ProbeOutput {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ProbeOutput::TimedOut;
+        }
+        // Round up so a sub-millisecond remainder still waits rather than
+        // spinning on a zero timeout.
+        let millis = remaining.as_nanos().div_ceil(1_000_000);
+        let timeout = libc::c_int::try_from(millis).unwrap_or(libc::c_int::MAX);
+        let mut fd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` for the duration of the call, on a
+        // descriptor `stdout` owns and keeps open.
+        let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+        if ready > 0 {
+            // POLLIN, POLLHUP and POLLERR all mean `read` returns at once:
+            // data, EOF or the error.
+            return ProbeOutput::Ready(usize::MAX);
+        }
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return ProbeOutput::Closed;
+        }
+        // Timed out or interrupted: the loop re-checks the deadline.
+    }
+}
+
+/// [`wait_for_probe_output`] on Windows: poll `PeekNamedPipe`, which reports
+/// the bytes waiting without blocking and fails once every write end is gone.
+#[cfg(windows)]
+fn wait_for_probe_output(
+    stdout: &std::process::ChildStdout,
+    deadline: std::time::Instant,
+) -> ProbeOutput {
+    use std::os::windows::io::AsRawHandle as _;
+    loop {
+        let mut available: u32 = 0;
+        // SAFETY: `stdout` owns the handle and keeps it open for the call; no
+        // buffer is passed, only the out-parameter for the available count.
+        let ok = unsafe {
+            windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                stdout.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return ProbeOutput::Closed;
+        }
+        if available > 0 {
+            return ProbeOutput::Ready(available as usize);
+        }
+        if std::time::Instant::now() >= deadline {
+            return ProbeOutput::TimedOut;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Off Windows the probe's tree is its process group, named by the child's pid,
@@ -1641,6 +1740,79 @@ mod tests {
             }
             assert!(gone(helper), "the helper holding stdout outlived the probe");
         }
+    }
+
+    /// Issue #1454: a stand-in `claude` whose helper escapes the probe's
+    /// process group (`setsid`) and keeps stdout open past the deadline. Killing
+    /// the group cannot reach it, so the probe must not leave anything of its
+    /// own holding the pipe's read end: once the probe returns, the escaped
+    /// helper's next write to stdout fails with `EPIPE`. Before the fix a
+    /// detached reader thread owned the read end and sat blocked on it for as
+    /// long as the helper lived, so that write succeeded — the read end being
+    /// closed is the observable that no reader outlived the probe.
+    #[cfg(unix)]
+    #[test]
+    fn the_version_probe_leaves_no_reader_behind_when_a_descendant_escapes_its_group() {
+        if std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status()
+            .map_or(true, |status| !status.success())
+        {
+            eprintln!("SKIP: perl with POSIX is needed to escape the probe's process group");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("escapee.pid");
+        let go_file = dir.path().join("go");
+        let result_file = dir.path().join("result");
+        // The escapee: a new session (so a new process group), SIGPIPE ignored
+        // so a closed read end reads as a failed write rather than a death,
+        // then wait for the test's go-ahead and try to write. It gives up after
+        // 20s so a failing run does not leave it behind for long.
+        let escapee = r#"use POSIX; POSIX::setsid() or die "setsid: $!"; $SIG{PIPE} = "IGNORE"; my ($pid, $go, $result) = @ARGV; for (1 .. 400) { last if -e $go; select(undef, undef, undef, 0.05) } my $wrote = syswrite(STDOUT, "x"); open(my $f, ">", "$result.tmp") or die; print $f (defined $wrote ? "open" : "closed"); close $f; rename("$result.tmp", $result); exit 0"#;
+        let claude = stand_in_claude(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nperl -e '{escapee}' '{pid}' '{go}' '{result}' &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nsleep 0.5\nprintf '2.1.300'\nexit 0\n",
+                pid = pid_file.display(),
+                go = go_file.display(),
+                result = result_file.display(),
+            ),
+        );
+        let bound = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let outcome = probe_claude_version(claude.as_os_str(), bound);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, (false, None), "an unfinished line is unknown");
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(1500),
+            "the probe waited {elapsed:?} against a {bound:?} bound"
+        );
+
+        let escapee: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the stand-in recorded its helper's pid before the deadline")
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::write(&go_file, b"").unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !result_file.exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let result = std::fs::read_to_string(&result_file);
+        // SAFETY: `kill(2)` on the escapee's pid, which this test's stand-in
+        // started and which has either exited (ESRCH, ignored) or is ours.
+        unsafe {
+            libc::kill(escapee, libc::SIGKILL);
+        }
+        let result = result.expect(
+            "the escaped helper survived the probe's group kill and wrote its result \
+             (if it did not, it was killed with the group and this test lost its premise)",
+        );
+        assert_eq!(
+            result, "closed",
+            "the pipe's read end outlived the probe: something the probe started is still reading it"
+        );
     }
 
     /// Issue #714: a stand-in `claude` that prints a full, accepted version
