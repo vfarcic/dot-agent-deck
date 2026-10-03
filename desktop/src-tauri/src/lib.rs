@@ -3334,6 +3334,7 @@ async fn desktop_voice_resolve(
         resolver.as_ref(),
         screen,
         &snapshot.agents,
+        Some(snapshot.connection.deck_id.as_str()),
         &snapshot.observed,
         VoiceDeclaration {
             directories: directories.as_ref(),
@@ -3370,13 +3371,14 @@ async fn resolve_declared_utterance(
     resolver: &dyn voice::IntentResolver,
     screen: voice::Screen,
     agents: &[voice::DesktopAgent],
+    agents_deck: Option<&str>,
     observed: &[crate::dto::ObservedDeckDto],
     declared: VoiceDeclaration<'_>,
     transcript: voice::Transcript,
     labels: crate::settings::LabelSharing,
     show_deck: bool,
 ) -> Result<voice::VoiceResult, String> {
-    let mut decks = voice_decks(observed, declared.deck_step);
+    let mut decks = voice_decks(observed, declared.deck_step, agents_deck);
     // PRD #1195 M3: the decks the Deck selector lists, as the webview sent
     // them — the section the selector is rendering, not `desktop.toml`, which
     // lags it by a queued write — rather than only the ones the app observes,
@@ -3567,7 +3569,7 @@ fn answer_declared_choice(
     observed: &[crate::dto::ObservedDeckDto],
     declared: VoiceDeclaration<'_>,
 ) -> voice::ChoiceAnswer {
-    let mut decks = voice_decks(observed, declared.deck_step);
+    let mut decks = voice_decks(observed, declared.deck_step, None);
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
     if action == voice::SWITCH_DECK_ROW {
         decks = decks
@@ -3657,6 +3659,7 @@ fn selector_voice_decks(
             label: "Local daemon".to_string(),
             address: None,
             local: true,
+            holds_agents: false,
         },
         voice::VoiceDeckSelection {
             token: crate::settings::LOCAL_SELECTION_TOKEN.to_string(),
@@ -3698,6 +3701,7 @@ fn selector_voice_decks(
                 id,
                 local: false,
                 unavailable,
+                holds_agents: false,
             },
             voice::VoiceDeckSelection {
                 token: row.id.as_str().to_string(),
@@ -3753,9 +3757,15 @@ fn selector_voice_decks(
 /// heard from
 /// ([`voice::DECK_NOT_REPORTED`]). With no declaration every deck is taken as
 /// eligible, which is what voice assumed before it was told.
+///
+/// `agents_deck` is the wire id of the deck the agents voice resolves against
+/// were read from — the snapshot's own `connection.deck_id` — and marks that
+/// deck [`voice::VoiceDeck::holds_agents`], so an agent can be named by the
+/// daemon it is on (issue #1495). `None` where no agent is resolved.
 fn voice_decks(
     observed: &[crate::dto::ObservedDeckDto],
     deck_step: Option<&[voice::VoiceDeckChoice]>,
+    agents_deck: Option<&str>,
 ) -> Vec<voice::VoiceDeck> {
     observed
         .iter()
@@ -3782,6 +3792,7 @@ fn voice_decks(
                 address,
                 local,
                 unavailable,
+                holds_agents: agents_deck == Some(deck.deck_id.as_str()),
             }
         })
         .collect()
@@ -5648,7 +5659,7 @@ mod tests {
         .expect("the webview's EndpointSettingsDto parses");
         assert_eq!(selector_rows_beyond_voice(Some(&sent)), None);
 
-        let mut decks = voice_decks(&[], None);
+        let mut decks = voice_decks(&[], None, None);
         let selections = selector_voice_decks(Some(&sent), &mut decks, None);
         let new_box = decks
             .iter()
@@ -5667,7 +5678,7 @@ mod tests {
             "selection": "local",
         }))
         .expect("parses; the schema caps no row count");
-        let mut decks = voice_decks(&[], None);
+        let mut decks = voice_decks(&[], None, None);
         let selections = selector_voice_decks(Some(&oversized), &mut decks, None);
         assert_eq!(
             decks
@@ -5722,6 +5733,7 @@ mod tests {
             &resolver,
             voice::Screen::Deck,
             &[],
+            None,
             &[],
             VoiceDeclaration {
                 directories: None,
@@ -5977,7 +5989,7 @@ mod tests {
             serde_json::from_value(serde_json::json!([{ "deckId": local_key }]))
                 .expect("the webview's shape parses");
 
-        let mut decks = voice_decks(&observed, Some(&step));
+        let mut decks = voice_decks(&observed, Some(&step), None);
         let selections = selector_voice_decks(Some(&endpoints), &mut decks, Some(&step));
         let find = |id: &str| decks.iter().find(|deck| deck.id == id).expect("listed");
         assert_eq!(decks.len(), 3, "{decks:?}");
@@ -6121,7 +6133,7 @@ mod tests {
                 name: None,
             },
         ];
-        let mut decks = voice_decks(&observed, None);
+        let mut decks = voice_decks(&observed, None, None);
         let called: Vec<(&str, Option<&str>)> = decks
             .iter()
             .map(|deck| (deck.label.as_str(), deck.address.as_deref()))
@@ -6175,7 +6187,7 @@ mod tests {
         .expect("the webview's shape parses");
         assert!(validate_voice_deck_step(&step).is_ok());
 
-        let decks = voice_decks(&fleet, Some(&step));
+        let decks = voice_decks(&fleet, Some(&step), None);
         let unavailable = |id: &str| {
             decks
                 .iter()
@@ -6199,7 +6211,7 @@ mod tests {
             Some(voice::DECK_NOT_REPORTED)
         );
         assert!(
-            voice_decks(&fleet, None)
+            voice_decks(&fleet, None, None)
                 .iter()
                 .all(voice::VoiceDeck::eligible),
             "no declaration, no narrowing"

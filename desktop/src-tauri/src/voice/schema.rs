@@ -115,11 +115,18 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     `agents_on_screen` carries each agent's LIVE state as the daemon holds it: \
     `status` is the daemon's own word for what it is doing (`working`, `thinking`, \
     `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
-    `tool` is what it is running right now. A user refers to an agent by state as \
-    readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
-    resolve such a reference against those fields and answer with that agent's \
-    `label`. For a reference the user made by name, answer with the words the user \
-    used and let the app resolve them. `decks` lists every daemon a new agent \
+    `tool` is what it is running right now. It also carries what the deck knows \
+    about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
+    working directory's name), `orchestration` (its run's title), `last_prompt` (the \
+    start of the last prompt it was sent) and `newest_rank` (1 is the agent that \
+    started last); `agents_daemon` is the daemon they are all on. A user refers to \
+    an agent by state or by task as readily as by name — \"the one that is \
+    stuck\", \"the one fixing the scroll\" — so resolve such a reference against \
+    those fields and answer with that agent's `label`. For a reference the user made \
+    by name, mode, agent type, directory, orchestration, daemon or start order — \
+    \"the dispatcher\", \"the Codex agent\", \"the one in billing\", \"the newest \
+    agent\" — answer with the words the user used and let the app resolve them. \
+    `decks` lists every daemon a new agent \
     can be started on, named the way the screen names it; a `deck_ref` param is a \
     reference to one of those daemons — \"local\" means this machine's, and a user \
     may still call a daemon a deck — and is \

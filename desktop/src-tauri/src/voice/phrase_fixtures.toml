@@ -78,6 +78,112 @@ action = "open_agent"
 outcome = "param_ambiguous"
 candidates = ["agent-atlas-one", "agent-atlas-two"]
 
+# Issue #1495 — agents named the way the user thinks about them, against the
+# `facets` fleet (`test_support::facets_fleet`): labels that say nothing about
+# what each agent is doing, so only its mode, type, directory, orchestration,
+# last prompt or start time can tell it apart. The first is the reported
+# sentence, word for word: a dispatcher whose own name is "Mercury".
+[[fixtures]]
+name = "open-agent-select-dispatcher"
+utterance = "Select Dispatcher agent."
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-go-to-dispatcher"
+utterance = "go to the dispatcher"
+screen = "deck"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-switch-to-codex"
+utterance = "switch to the Codex agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-by-directory"
+utterance = "open the agent in dot agent deck"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-mercury"
+
+[[fixtures]]
+name = "open-agent-by-orchestration"
+utterance = "show the reviewer in the PRD 1487 orchestration"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-review-1487"
+
+[[fixtures]]
+name = "open-agent-by-daemon"
+utterance = "open the Codex agent on the local deck"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-by-last-prompt"
+utterance = "show me the one fixing the scroll"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-juno"
+
+[[fixtures]]
+name = "open-agent-newest"
+utterance = "open the newest agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-vega"
+
+# Two Claude Code agents: a tie, offered as the numbered choice.
+[[fixtures]]
+name = "open-agent-ambiguous-claude"
+utterance = "open the Claude agent"
+screen = "overview"
+fleet = "facets"
+action = "open_agent"
+outcome = "param_ambiguous"
+candidates = ["agent-mercury", "agent-vega"]
+
+# The controls: "select" with a daemon still switches the daemon, and a name
+# the screen shows still opens that agent by its label.
+[[fixtures]]
+name = "switch-deck-select-build-box-daemon"
+utterance = "select build box daemon"
+screen = "overview"
+fleet = "facets"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "open-agent-tester-by-label"
+utterance = "open tester"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
 [[fixtures]]
 name = "open-agent-unavailable"
 utterance = "zoom the tester"

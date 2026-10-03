@@ -231,7 +231,10 @@ describe("VoicePanel", () => {
     // no such field — because a name is arbitrary text and can itself be a
     // path; and the words go with a command that REACHES the endpoint, since
     // the locally decided ones named above send nothing.
-    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments");
+    // Issue #1495: the start of each agent's last prompt and its directory's
+    // NAME now go, so the negation is narrowed to what still does not.
+    expect(disclosure).toHaveTextContent("the start of the last prompt it was sent (at most 80 characters)");
+    expect(disclosure).toHaveTextContent("This app adds no field of its own for a full filesystem path, a daemon or agent id, more of a prompt than that start, or a tool's arguments");
     expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
     expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
     expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");
