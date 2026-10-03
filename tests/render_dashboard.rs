@@ -294,6 +294,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             live_target: None,
             last_activity_ms,
             blocked: None,
+            hook_generation: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());

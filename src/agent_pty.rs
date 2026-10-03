@@ -18294,6 +18294,7 @@ mod spawn_tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

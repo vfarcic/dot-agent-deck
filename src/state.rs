@@ -811,6 +811,35 @@ pub struct SessionSnapshot {
     /// so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_wait: Option<SubagentWait>,
+    /// Issue #532: the PANE's hook generation as the daemon holds it
+    /// ([`AppState::pane_hook_session_id`]), so a reconnecting TUI starts from
+    /// the daemon's answer instead of from whichever frame happens to reach it
+    /// first. Since #532 an ordinary frame cannot move an established
+    /// generation, so a TUI whose first frame after reconnecting came from a
+    /// wrapped agent's wrapper would otherwise hold the wrapper's id until the
+    /// agent's next `SessionStart`, and its guarded sends would be refused
+    /// against the daemon's. Adopted by [`AppState::seed_hydrated_session`].
+    ///
+    /// A property of the pane rather than of this session, carried here because
+    /// this is the per-pane record a reconnect already reads; filled by
+    /// [`AppState::live_session_for`], never by [`SessionState::live_snapshot`].
+    /// Additive optional, the `blocked` precedent: an older daemon omits it and
+    /// the TUI builds the generation from events as before, and an older TUI
+    /// ignores the key, so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_generation: Option<HookGeneration>,
+}
+
+/// Issue #532: a pane's hook generation on the wire — see
+/// [`SessionSnapshot::hook_generation`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookGeneration {
+    /// The hook session id the daemon's send guard compares a guarded write's
+    /// `expected_session_id` against.
+    pub session_id: String,
+    /// When the generation's newest frame was stamped, in milliseconds since
+    /// the Unix epoch (the `last_activity_ms` unit).
+    pub established_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -944,6 +973,8 @@ impl SessionState {
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
             subagent_wait: self.subagent_wait.clone(),
+            // A pane property: `AppState::live_session_for` fills it.
+            hook_generation: None,
         }
     }
 
@@ -1543,12 +1574,42 @@ pub struct AppState {
     /// generation is refused with no bytes. Cleared on `SessionEnd`.
     ///
     /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
-    /// `(session_id, established_at)` pair, NOT just the id. The generation only
-    /// advances on a genuinely newer session (an incoming id different from the
-    /// current one whose event timestamp is `>=` the established one); an
-    /// out-of-order / older-generation event is IGNORED so a delayed prior-event
-    /// can neither restore a stale id nor clear a newer one, and a delayed
+    /// `(session_id, established_at)` pair, NOT just the id. A frame naming the
+    /// current generation only refreshes its timestamp, and a delayed
     /// prior-generation `SessionEnd` cannot wipe the current generation.
+    ///
+    /// Issue #532: once a pane HAS a generation, only a genuine `SessionStart`
+    /// naming a different session moves it (issue #424 D2: whatever its
+    /// timestamp). An ordinary frame naming another session — a delayed
+    /// straggler, or a second producer on the same pane such as the
+    /// `dot-agent-deck wrap` host beside a wrapped agent's native hooks —
+    /// changes nothing. That is the rule [`latch_generation`] applies, so the
+    /// daemon's send guard and its own delivery latch agree on what the pane's
+    /// conversation is.
+    ///
+    /// **Rule 12: issue #532 needs no `PROTOCOL_VERSION` bump and no
+    /// `CONTRACT_BREAKS` entry.** The wire is unchanged and each side computes
+    /// this value from the same event stream; what moved is when an ordinary
+    /// frame may move it, and every old/new pairing is today's behaviour or
+    /// fails closed. A newer TUI against an older daemon is refused exactly as
+    /// intermittently as today. An older TUI against a newer daemon can bind
+    /// the wrapper's id after the agent announced its own conversation, and
+    /// that send is now always refused rather than sometimes accepted; once it
+    /// has written, that TUI's own target check already abandoned such a
+    /// delivery at the next alternation. The desktop binds the session a
+    /// genuine `SessionStart` named, which a newer daemon now honours instead
+    /// of refusing intermittently. A newer daemon accepts a write the older one
+    /// refused only when an ordinary frame under another session id arrived
+    /// with no `SessionStart` for it — a second producer, or a producer that
+    /// rolls its session id without announcing the new one. Claude Code, Codex,
+    /// Devin and OpenCode each map a native session-start hook to
+    /// `SessionStart`, and Pi reports under one pane-derived id for its whole
+    /// life. The reconnect half, [`SessionSnapshot::hook_generation`], is an
+    /// additive optional: an older TUI ignores it, and a newer TUI against an
+    /// older daemon builds the generation from events, where a wrapper frame
+    /// that arrives first holds the pane until the agent's next `SessionStart`
+    /// and that daemon refuses the TUI's sends whenever the agent spoke last —
+    /// intermittent refusal, as today, never a write into another conversation.
     ///
     /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
     /// conversation, or because an ordinary frame carrying a pane id arrived. A
@@ -1586,6 +1647,18 @@ pub struct AppState {
     /// Monotonic per pane, `u64`, in memory only; it grows by one per real
     /// conversation rollover, which no daemon lifetime can exhaust.
     pane_generation_closures: HashMap<String, u64>,
+    /// Issue #532 (Qodo on #1515): the panes whose CURRENT
+    /// [`Self::pane_hook_session`] entry was set by a genuine `SessionStart`
+    /// this state applied itself, as opposed to one an ordinary frame
+    /// established or [`Self::adopt_hydrated_generation`] seeded.
+    ///
+    /// Read only by that seeding. A reconnecting TUI subscribes to events before
+    /// it hydrates, so an announcement can reach it after the daemon built its
+    /// `ListAgents` snapshot, and must then not be overwritten by it. See
+    /// [`Self::adopt_hydrated_generation`] for the opposite ordering and why
+    /// keeping the local announcement still converges. Kept in step with the
+    /// map at each site that writes it.
+    pane_generation_announced: HashSet<String>,
     /// Issue #915 (finding 4): how many of each AGENT's own hook generations
     /// have ended, keyed by the registry agent id the `SessionEnd` carried.
     ///
@@ -10085,6 +10158,9 @@ impl AppState {
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
+        let announced_before = pane_id
+            .as_ref()
+            .is_some_and(|pane| self.pane_generation_announced.contains(pane));
         // Issue #424 H4: the closure COUNT is the same fact seen over time, so it
         // is restored for the same reason the entry is. A report that bumped it
         // would read to an in-flight TUI delivery as "a conversation ended while
@@ -10101,6 +10177,11 @@ impl AppState {
                 None => {
                     self.pane_hook_session.remove(&pane);
                 }
+            }
+            if announced_before {
+                self.pane_generation_announced.insert(pane.clone());
+            } else {
+                self.pane_generation_announced.remove(&pane);
             }
             match closures_before {
                 Some(count) => {
@@ -10351,7 +10432,19 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| s.live_snapshot())
+            .map(|s| {
+                let mut snapshot = s.live_snapshot();
+                // Issue #532: the pane's generation, so a reconnecting TUI
+                // adopts the daemon's answer. See
+                // [`SessionSnapshot::hook_generation`].
+                snapshot.hook_generation = pane_id
+                    .and_then(|pane| self.pane_hook_session.get(pane))
+                    .map(|(session_id, established_at)| HookGeneration {
+                        session_id: session_id.clone(),
+                        established_ms: established_at.timestamp_millis(),
+                    });
+                snapshot
+            })
     }
 
     /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
@@ -10860,6 +10953,7 @@ impl AppState {
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         let Some(snap) = live else { return };
+        self.adopt_hydrated_generation(&pane_id, snap.hook_generation.as_ref());
         let observed = snap
             .last_activity_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis);
@@ -10916,6 +11010,58 @@ impl AppState {
     /// those on the same pane, and those from the same agent. `None` when this
     /// state holds no such session. [`Self::seed_hydrated_session`] is the only
     /// caller.
+    /// Issue #532: take the daemon's hook generation for `pane_id` on a
+    /// reconnect — see [`SessionSnapshot::hook_generation`].
+    ///
+    /// The daemon's answer REPLACES a generation this state built from ordinary
+    /// frames that reached it before hydration ran (the event subscriber starts
+    /// first), because the daemon saw the whole history and this state saw only
+    /// its tail. It does NOT replace one a genuine `SessionStart` set here
+    /// ([`Self::pane_generation_announced`]), because neither side of that pair
+    /// can be ordered against the other from what this state holds: the
+    /// snapshot carries no position in the event stream, and a genuine start's
+    /// timestamp is not evidence of order (#424 D2). Of the two orderings,
+    /// keeping the local announcement is the one that converges by itself.
+    /// When it landed between `ListAgents` and this call it is the newer, and
+    /// replacing it would leave this state on a superseded id with nothing
+    /// left in flight to correct it. When it is the OLDER one — this state's
+    /// stream lags the daemon, which has already moved to a later announcement
+    /// — that later announcement is still in flight on the same ordered stream
+    /// and moves the pane when it is applied. What stays open is a stream that
+    /// drops that later announcement: this state then holds the older id until
+    /// the next one, and its guarded sends are refused rather than delivered,
+    /// as for any announcement a lagged or reconnected subscriber misses. The
+    /// same generation keeps the later of the two timestamps either way, so a
+    /// fresher frame already applied here is not rolled back.
+    ///
+    /// Moves the generation without counting a closure: hydration runs before
+    /// any delivery exists for this state to protect. Absent on an older
+    /// daemon's snapshot, which leaves the event-built generation alone.
+    fn adopt_hydrated_generation(&mut self, pane_id: &str, generation: Option<&HookGeneration>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let Some(established_at) =
+            DateTime::<Utc>::from_timestamp_millis(generation.established_ms)
+        else {
+            return;
+        };
+        let established_at = match self.pane_hook_session.get(pane_id) {
+            Some((current, current_ts)) if *current == generation.session_id => {
+                established_at.max(*current_ts)
+            }
+            Some(_) if self.pane_generation_announced.contains(pane_id) => return,
+            _ => {
+                self.pane_generation_announced.remove(pane_id);
+                established_at
+            }
+        };
+        self.pane_hook_session.insert(
+            pane_id.to_string(),
+            (generation.session_id.clone(), established_at),
+        );
+    }
+
     fn newest_activity_for(&self, pane_id: &str, agent_id: Option<&str>) -> Option<DateTime<Utc>> {
         self.sessions
             .values()
@@ -14213,6 +14359,7 @@ impl AppState {
                     })
             {
                 self.pane_hook_session.remove(pane_id);
+                self.pane_generation_announced.remove(pane_id);
                 // Issue #424 H4: the conversation this pane was in is over. The
                 // session and its journal are removed below, so this counter is
                 // the only thing left to tell a TUI pass that sampled the
@@ -14347,13 +14494,13 @@ impl AppState {
         // continuity, but the generation tracked here rolls forward, so the send
         // guard refuses an old queued prompt against the new conversation.
         //
-        // Greptile finding #4 (monotonic): the generation only ADVANCES; it never
-        // regresses. Advance to the incoming id when it is a genuinely newer
-        // generation — a different id whose event timestamp is at least the
-        // established one (or a fresher timestamp for the same id). A delayed
-        // event from a PRIOR generation (older timestamp, different id) is
-        // IGNORED, so it can neither restore a stale generation nor overwrite the
-        // current one.
+        // Greptile finding #4 (monotonic): the generation never regresses. A
+        // frame naming the current generation refreshes its timestamp; a delayed
+        // event from a PRIOR generation is IGNORED, so it can neither restore a
+        // stale generation nor overwrite the current one. Issue #532 narrowed the
+        // ordinary-frame half further: a non-start frame naming a DIFFERENT
+        // session never moves a pane that already has a generation, however new
+        // it is (see the `Some` arm below).
         //
         // Issue #424 D2 (both reviewers): the monotonic rule above has ONE
         // exception, and it is the same policy `latch_generation` applies. A
@@ -14364,14 +14511,15 @@ impl AppState {
         // future pins this pane's generation permanently, every real
         // announcement afterwards is discarded as a straggler, and the TUI keeps
         // reporting — and authorizing sends against — a conversation that no
-        // longer exists. Ordinary frames keep the monotonic rule, so a delayed
-        // `Thinking` still cannot restore a superseded generation.
+        // longer exists. Ordinary frames cannot move an established generation
+        // at all (issue #532), so a delayed `Thinking` still cannot restore a
+        // superseded generation.
         //
         // A LAUNCHER-ORIGIN start is excluded from the carve-out on purpose: it
         // is explicitly not a conversation announcing itself (PRD #225 M3), and a
         // wrapped pane legitimately has two producers under one registry agent,
         // so letting the wrapper's fork-time start win unconditionally would make
-        // the #532 alternation worse rather than better.
+        // the pane alternate between them (issue #532).
         //
         // Issue #424 F3 (auditor HIGH): that exclusion has to cut BOTH ways. A
         // launcher-origin start naming a DIFFERENT generation used to fall
@@ -14392,9 +14540,10 @@ impl AppState {
         // writes, so a generation established by something that announced no
         // conversation became the target the prompt claimed, and the real agent's
         // announcement then read as that target being lost. See `provisional_start`
-        // below. That also strictly improves
-        // #532: the wrapper's fork-time start can no longer take the generation
-        // off the wrapped agent's native session.
+        // below. That closed the boot-provenance half of #532: the wrapper's
+        // fork-time start can no longer take the generation off the wrapped
+        // agent's native session. Issue #532 itself closed the ordinary-frame
+        // half.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
             // Issue #243: widened to EITHER wrapper origin. The reasoning above is
@@ -14446,13 +14595,36 @@ impl AppState {
                         // Same generation: keep the id, bump the established
                         // timestamp so subsequent older events stay rejected.
                         incoming_ts > *current_ts
-                    } else if provisional_start {
-                        // Boot provenance never replaces a live conversation.
-                        false
                     } else {
-                        // Different generation: an announcement always wins; any
-                        // other frame must not be older.
-                        announces_generation || incoming_ts >= *current_ts
+                        // Different generation: only an ANNOUNCEMENT moves a pane
+                        // that already has one, and it moves it whatever its
+                        // producer clock says (#424 D2). Boot provenance never
+                        // replaces a live conversation (#424 F3), and neither
+                        // does an ordinary frame (issue #532).
+                        //
+                        // An ordinary frame naming another session is either a
+                        // straggler from a superseded generation or a SECOND
+                        // PRODUCER on the same pane, and neither is a
+                        // conversation beginning. The second producer is the
+                        // normal shape of a wrapped agent: `dot-agent-deck wrap`
+                        // reports under `{pane}-session` while the agent's native
+                        // hooks report under their own id, so letting the newer
+                        // frame win made the pane's generation alternate with
+                        // whichever producer spoke last, and the daemon's send
+                        // guard (an exact match against this value) refused
+                        // deliveries into the very conversation the agent had
+                        // announced. This is the rule `latch_generation` already
+                        // applies on the daemon's own delivery path, so the two
+                        // now agree.
+                        //
+                        // What it gives up: a producer whose session id rolls
+                        // over WITHOUT a `SessionStart` keeps the pane on its
+                        // first generation. Claude Code, Codex, Devin and
+                        // OpenCode each map a native session-start hook to
+                        // `SessionStart`, Pi reports under one pane-derived id
+                        // for its whole life, and such a producer was already
+                        // invisible to `latch_generation`.
+                        announces_generation
                     }
                 }
             };
@@ -14465,12 +14637,14 @@ impl AppState {
                 // Two exclusions, both the discriminator [`latch_generation`] and
                 // `crate::ui`'s witness already apply, for their reasons:
                 //
-                // * only an ANNOUNCEMENT counts. This map advances on any frame
-                //   carrying a pane id, so a pane whose ordinary events drift
-                //   through session ids (`prompt/pane-input/026`, and the #532
-                //   wrapped-agent alternation) would otherwise report a rolling
-                //   series of ended conversations and abandon deliveries nothing
-                //   endangered.
+                // * only an ANNOUNCEMENT counts. An ordinary frame can still
+                //   ESTABLISH a generation on a pane that has none, and that is
+                //   not a closure either (next point). Since issue #532 it can
+                //   no longer replace one, so this guard is now belt and braces
+                //   for the `advance` rule above rather than the only thing
+                //   keeping a pane whose ordinary events drift through session
+                //   ids (`prompt/pane-input/026`) from reporting a rolling series
+                //   of ended conversations.
                 // * establishing a generation where the pane had NONE is not a
                 //   closure. That is the launcher case #424 exists for: the first
                 //   genuine announcement after our write is the conversation we
@@ -14494,8 +14668,19 @@ impl AppState {
                 {
                     self.note_generation_closed(pane_id);
                 }
+                let replaces = self
+                    .pane_hook_session
+                    .get(pane_id)
+                    .is_none_or(|(current, _)| *current != incoming_session_id);
                 self.pane_hook_session
                     .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+                // Issue #532: a refresh of the same generation keeps whatever
+                // established it; a new entry records whether it was announced.
+                if announces_generation {
+                    self.pane_generation_announced.insert(pane_id.clone());
+                } else if replaces {
+                    self.pane_generation_announced.remove(pane_id);
+                }
             }
         }
 
@@ -23751,6 +23936,7 @@ while True:
                 detail: Some("You\u{2019}ve hit your usage limit.".to_string()),
                 resets_at_ms: Some(9_000),
             }),
+            hook_generation: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -23814,6 +24000,7 @@ while True:
                 detail: None,
                 resets_at_ms,
             }),
+            hook_generation: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();
