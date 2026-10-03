@@ -480,6 +480,17 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// file". So no
 /// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
 ///
+/// **PRD #1487 contributes no bump for [`AttachRequest::RestartDaemon`].** It
+/// is the second rung of the graded path (`CLAUDE.md` rule 18): a new variant
+/// whose one sender, [`crate::daemon_client::DaemonClient::restart_daemon`],
+/// withholds it unless the `Hello` reply of that same call names
+/// [`CAP_RESTART_DAEMON`] — so an older daemon is never sent it, and an older
+/// client never sends it. The reply's [`AttachResponse::restart`] is additive
+/// and optional. No existing field or verb changed meaning, so no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual is the usual
+/// one — a raw sender that skips the check gets an older daemon's
+/// `malformed request` refusal and nothing is stopped — and it fails closed.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -693,6 +704,18 @@ pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
 /// dispatch arm is not `#[cfg]`-gated.
 pub const CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT: &str = "subscribe-events-with-snapshot";
 
+/// Capability string for [`AttachRequest::RestartDaemon`] (PRD #1487).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`.
+/// Its one sender, [`crate::daemon_client::DaemonClient::restart_daemon`],
+/// withholds the frame unless the `Hello` reply of THAT call names this
+/// string — never a cached set, because the whole point of the verb is that the
+/// daemon behind the endpoint gets replaced.
+///
+/// Advertised on every platform: the handler arm is not `#[cfg]`-gated, and
+/// the successor spawn it hands off to exists on both detach backends.
+pub const CAP_RESTART_DAEMON: &str = "restart-daemon";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -879,6 +902,8 @@ fn invalid_client_id_message() -> String {
 /// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
 /// not `#[cfg]`-gated, and neither is issue #1555's
 /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`].
+/// PRD #1487's [`CAP_RESTART_DAEMON`] is on both lists: its dispatch arm is
+/// not `#[cfg]`-gated either.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -897,6 +922,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_RESTART_DAEMON,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -911,6 +937,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_RESTART_DAEMON,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2313,6 +2340,165 @@ pub enum AttachRequest {
     SeedLastCommand {
         command: String,
     },
+    /// PRD #1487: restart this daemon — onto the build now installed at its own
+    /// path ([`RestartSuccessor::Installed`]), or for a client that starts its
+    /// own build afterwards ([`RestartSuccessor::ClientSpawns`]). The reply
+    /// rides back on [`AttachResponse::restart`].
+    ///
+    /// The daemon applies one policy whoever asks: when nothing is live it
+    /// restarts straight away; when agents or orchestration roles are live it
+    /// answers [`RestartDaemonReply::NeedsConfirmation`] naming every one of
+    /// them, and restarts only when a later request carries that same set in
+    /// `confirm`. Before any of that, in `Installed` mode, it verifies the
+    /// installed binary answers `--version` — so nobody is asked to confirm a
+    /// restart that cannot happen, and a failed check leaves the old daemon
+    /// running untouched. See `crate::daemon_restart` for the pieces and
+    /// `docs/develop/daemon-teardown-paths.md` for where this sits among the
+    /// other teardown paths.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RESTART_DAEMON`]**, by its
+    /// one sender, so it contributes no [`PROTOCOL_VERSION`] bump.
+    ///
+    /// It adds **no authority** to this wire, for the reason
+    /// [`Self::StopDaemon`] gives: a peer that can send it can already stop the
+    /// deck with `KIND_SHUTDOWN`. No binary path crosses the wire — the daemon
+    /// resolves its successor from what it recorded at startup.
+    RestartDaemon {
+        /// The set the user confirmed with "Restart now". `None` on the first
+        /// ask. Compared order-insensitively — see
+        /// [`RestartStopSet::same_targets`].
+        #[serde(default)]
+        confirm: Option<RestartStopSet>,
+        /// The version the client just installed (what landed — for Homebrew
+        /// that may differ from the client's own). In `Installed` mode the
+        /// daemon refuses with [`RestartRefusalReason::VersionMismatch`] if the
+        /// binary it resolves reports something else.
+        #[serde(default)]
+        expected_version: Option<String>,
+        /// Who starts the successor. Defaults to [`RestartSuccessor::Installed`].
+        #[serde(default)]
+        successor: RestartSuccessor,
+    },
+}
+
+/// PRD #1487: who starts the daemon that replaces one answering
+/// [`AttachRequest::RestartDaemon`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartSuccessor {
+    /// The daemon resolves the binary now installed at its own path, verifies
+    /// it, and spawns it once it has released its sockets.
+    #[default]
+    Installed,
+    /// The local Replace: the daemon applies the same policy, drains and exits,
+    /// and the CLIENT spawns its own build. No binary path crosses the wire.
+    ClientSpawns,
+}
+
+/// PRD #1487: what a restart would stop — the agents the daemon manages and the
+/// orchestration roles registered against live panes.
+///
+/// Compared order-insensitively by [`Self::same_targets`]: agent ids as a set,
+/// roles as a set of `(pane_id, role, orchestration)`. `label`, `cwd`,
+/// `pane_id` on an agent and `is_orchestrator` on a role are display only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartStopSet {
+    #[serde(default)]
+    pub agents: Vec<RestartAgent>,
+    #[serde(default)]
+    pub roles: Vec<crate::state::OrchestrationRoleRecord>,
+}
+
+/// One agent in a [`RestartStopSet`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartAgent {
+    /// The daemon's registry id — the compared identity.
+    pub id: String,
+    /// `display_name`, else the id, as [`RunningAgentsSummary::from_records`]
+    /// labels it.
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+impl RestartStopSet {
+    /// Nothing would be stopped — the restart needs no confirmation.
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty() && self.roles.is_empty()
+    }
+
+    /// Whether `other` names exactly the same agents and roles, in any order.
+    pub fn same_targets(&self, other: &Self) -> bool {
+        use std::collections::BTreeSet;
+        let agents = |s: &Self| {
+            s.agents
+                .iter()
+                .map(|a| a.id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let roles = |s: &Self| {
+            s.roles
+                .iter()
+                .map(|r| (r.pane_id.clone(), r.role.clone(), r.orchestration.clone()))
+                .collect::<BTreeSet<_>>()
+        };
+        agents(self) == agents(other) && roles(self) == roles(other)
+    }
+}
+
+/// PRD #1487: the answer to [`AttachRequest::RestartDaemon`], carried on
+/// [`AttachResponse::restart`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum RestartDaemonReply {
+    /// `ok = true`. Written BEFORE any teardown; a failed write aborts the
+    /// restart. `to_version` is what the verified installed binary reported
+    /// (`Installed`), or the client's `expected_version` (`ClientSpawns`).
+    Accepted {
+        from_version: String,
+        to_version: Option<String>,
+        successor: RestartSuccessor,
+        stopping: RestartStopSet,
+    },
+    /// `ok = false`. Something is live and `confirm` was absent
+    /// (`stale = false`) or no longer matches (`stale = true`). Nothing was
+    /// stopped; `at_stake` is the full current set.
+    NeedsConfirmation {
+        at_stake: RestartStopSet,
+        stale: bool,
+    },
+    /// `ok = false`. Nothing was stopped; the old daemon keeps running.
+    Refused {
+        reason: RestartRefusalReason,
+        message: String,
+    },
+}
+
+/// Why the daemon refused an [`AttachRequest::RestartDaemon`].
+///
+/// `#[serde(other)]` on [`Self::Unknown`] keeps a newer daemon's next reason
+/// from failing an older client's whole-response decode, as
+/// [`StopRefusalReason::Unknown`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartRefusalReason {
+    /// Another restart holds the lock, one was already accepted, or the daemon
+    /// is already shutting down.
+    InProgress,
+    /// The installed binary could not be worked out from what the daemon
+    /// recorded at startup.
+    TargetUnresolvable,
+    /// The resolved path is absent, or not a regular executable file.
+    TargetMissing,
+    /// `<target> --version` failed, timed out, or printed no parsable version.
+    TargetDidNotAnswer,
+    /// The target answered with a version other than `expected_version`.
+    VersionMismatch,
+    /// A reason this build does not know, reported by a newer daemon.
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_rows() -> u16 {
@@ -2804,6 +2990,13 @@ pub struct AttachResponse {
     /// [`Self::directories`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_agent_options: Option<crate::new_agent_options::NewAgentOptions>,
+    /// PRD #1487: the answer to [`AttachRequest::RestartDaemon`]. `None` on
+    /// every other response. Set on refusals too, beside `ok = false` and a
+    /// one-line `error`, so a client that knows nothing of this field still
+    /// shows something true. Additive + optional, and the request it answers is
+    /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartDaemonReply>,
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -3123,6 +3316,43 @@ pub async fn serve_attach_with_counter(
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
+    // PRD #1487: a server started this way records no install, so a
+    // `restart-daemon` it is sent can drain (`ClientSpawns`) but never resolves
+    // a successor to spawn (`Installed` is refused as `target-unresolvable`).
+    // `run_daemon_with` passes the daemon's own control through
+    // [`serve_attach_with_restart`].
+    serve_attach_with_restart(
+        listener,
+        registry,
+        event_tx,
+        client_count,
+        state,
+        shutdown,
+        scheduler,
+        reuse_registry,
+        worktree_registry,
+        Arc::new(crate::daemon_restart::RestartControl::default()),
+    )
+    .await
+}
+
+/// [`serve_attach_with_counter`] plus the daemon's PRD #1487
+/// [`crate::daemon_restart::RestartControl`], shared by every connection so
+/// restart requests serialise across clients and the accepted successor reaches
+/// `run_daemon_with`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_attach_with_restart(
+    listener: IpcListener,
+    registry: Arc<AgentPtyRegistry>,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+    state: SharedState,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+    reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    restart: Arc<crate::daemon_restart::RestartControl>,
+) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
     // Issue #454: this is one of the two seams that first hold BOTH the
@@ -3163,6 +3393,7 @@ pub async fn serve_attach_with_counter(
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
                 let worktree_registry = worktree_registry.clone();
+                let restart = restart.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -3201,6 +3432,7 @@ pub async fn serve_attach_with_counter(
                         scheduler,
                         reuse_registry,
                         worktree_registry,
+                        restart,
                     )
                     .await
                     {
@@ -3903,6 +4135,171 @@ async fn record_rearmed_context(
 /// the record moved under it before giving up on the report.
 const REARM_RECORD_ATTEMPTS: usize = 4;
 
+/// One refusal to an [`AttachRequest::RestartDaemon`]: `ok = false`, the
+/// message in `error` for a client that knows nothing of the field, and the
+/// structured reply beside it.
+fn restart_refusal(reason: RestartRefusalReason, message: String) -> AttachResponse {
+    let mut resp = AttachResponse::err(format!("restart-daemon refused: {message}"));
+    resp.restart = Some(RestartDaemonReply::Refused { reason, message });
+    resp
+}
+
+/// PRD #1487: the [`AttachRequest::RestartDaemon`] arm. Steps, in order:
+///
+/// 1. Take the restart lock; a held lock, an accepted restart, or a daemon
+///    already shutting down is `InProgress`. Held until step 6.
+/// 2. `Installed` mode: resolve and verify the target. A failure is `Refused`
+///    and nothing has been touched — before the live-set check, so nobody is
+///    asked to confirm a restart that cannot happen.
+/// 3. Snapshot what is at stake, from the same sources `StopDaemon` reads.
+/// 4. Apply [`crate::daemon_restart::restart_decision`]; ask if it says so.
+/// 5. Write `Accepted` — a failed write aborts the restart (`?`).
+/// 6. Latch acceptance and record the successor; release the lock.
+/// 7. Disclose (#1109): the teardown inventory, then one line naming the target.
+/// 8. Drain, then signal shutdown. `run_daemon_with` spawns the successor once
+///    the sockets are released.
+#[allow(clippy::too_many_arguments)]
+async fn handle_restart_daemon(
+    stream: &mut IpcStream,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    shutdown: Option<&Arc<tokio::sync::Notify>>,
+    restart: &Arc<crate::daemon_restart::RestartControl>,
+    confirm: Option<RestartStopSet>,
+    expected_version: Option<String>,
+    mode: RestartSuccessor,
+) -> io::Result<()> {
+    use crate::daemon_restart::{
+        RESTART_VERIFY_TIMEOUT, resolve_restart_target, restart_decision, stop_set,
+        verify_restart_target,
+    };
+
+    // 1.
+    let guard = match restart.try_begin() {
+        Some(guard) if !registry.is_shutting_down() => guard,
+        _ => {
+            warn!("RestartDaemon refused: another restart or shutdown is already under way");
+            let resp = restart_refusal(
+                RestartRefusalReason::InProgress,
+                "another restart or shutdown of this daemon is already under way".into(),
+            );
+            return write_resp(stream, &resp).await;
+        }
+    };
+
+    // 2.
+    let (target, to_version) = match mode {
+        RestartSuccessor::Installed => {
+            let target = match resolve_restart_target(&restart.install().startup_exe) {
+                Ok(target) => target,
+                Err(reason) => {
+                    let message = format!(
+                        "could not work out the installed build from the path this daemon \
+                         started from ({})",
+                        restart.install().startup_exe.display()
+                    );
+                    warn!(?reason, "RestartDaemon refused: {message}");
+                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                }
+            };
+            let check_target = target.clone();
+            let check_expected = expected_version.clone();
+            let verified = tokio::task::spawn_blocking(move || {
+                verify_restart_target(
+                    &check_target,
+                    check_expected.as_deref(),
+                    RESTART_VERIFY_TIMEOUT,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err((
+                    RestartRefusalReason::TargetDidNotAnswer,
+                    format!("checking the installed build failed ({e})"),
+                ))
+            });
+            match verified {
+                Ok(version) => (Some(target), Some(version)),
+                Err((reason, message)) => {
+                    warn!(?reason, target = %target.display(), "RestartDaemon refused: {message}");
+                    return write_resp(stream, &restart_refusal(reason, message)).await;
+                }
+            }
+        }
+        RestartSuccessor::ClientSpawns => (None, expected_version.clone()),
+    };
+
+    // 3.
+    let roles = state.read().await.live_orchestration_roles(registry);
+    let at_stake = stop_set(&roles, &registry.agent_records());
+
+    // 4.
+    if let Some(reply) = restart_decision(&at_stake, confirm.as_ref()) {
+        let stale = matches!(
+            reply,
+            RestartDaemonReply::NeedsConfirmation { stale: true, .. }
+        );
+        warn!(
+            agent_count = at_stake.agents.len(),
+            role_count = at_stake.roles.len(),
+            stale,
+            "RestartDaemon needs confirmation; daemon stays up"
+        );
+        let summary = format!(
+            "restart-daemon needs confirmation: it would stop {} agent(s) and {} orchestration \
+             role(s){}",
+            at_stake.agents.len(),
+            at_stake.roles.len(),
+            if stale {
+                "; what is at stake changed since it was confirmed"
+            } else {
+                ""
+            }
+        );
+        let mut resp = AttachResponse::err(summary);
+        resp.restart = Some(reply);
+        return write_resp(stream, &resp).await;
+    }
+
+    // 5.
+    let mut resp = AttachResponse::ok();
+    resp.restart = Some(RestartDaemonReply::Accepted {
+        from_version: env!("DAD_VERSION").to_string(),
+        to_version: to_version.clone(),
+        successor: mode,
+        stopping: at_stake,
+    });
+    write_resp(stream, &resp).await?;
+
+    // 6.
+    restart.mark_accepted(target.clone());
+    drop(guard);
+
+    // 7.
+    crate::daemon_stop::log_teardown_inventory(state, registry, "restart-daemon").await;
+    warn!(
+        target = %target.as_deref().map(|t| t.display().to_string()).unwrap_or_default(),
+        to_version = to_version.as_deref().unwrap_or(""),
+        successor = ?mode,
+        "RestartDaemon accepted — restarting onto the installed build; every agent and \
+         orchestration role named above was confirmed by the client"
+    );
+
+    // 8.
+    let registry_for_shutdown = registry.clone();
+    tokio::task::spawn_blocking(move || {
+        registry_for_shutdown.shutdown_all_graceful(Duration::from_secs(3));
+    })
+    .await
+    .ok();
+    if let Some(s) = shutdown {
+        s.notify_one();
+    } else {
+        warn!("RestartDaemon handled but no daemon-shutdown notify wired (likely a test harness)");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -3913,6 +4310,7 @@ async fn handle_connection(
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    restart: Arc<crate::daemon_restart::RestartControl>,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -4228,6 +4626,27 @@ async fn handle_connection(
                     "StopDaemon handled but no daemon-shutdown notify wired (likely a test harness)"
                 );
             }
+            return Ok(());
+        }
+        // PRD #1487: restart onto the installed build (or for a client that
+        // spawns its own), under the D6 policy. Step order is load-bearing and
+        // documented in `docs/develop/daemon-teardown-paths.md`.
+        AttachRequest::RestartDaemon {
+            confirm,
+            expected_version,
+            successor,
+        } => {
+            handle_restart_daemon(
+                &mut stream,
+                &registry,
+                &state,
+                shutdown.as_ref(),
+                &restart,
+                confirm,
+                expected_version,
+                successor,
+            )
+            .await?;
             return Ok(());
         }
         AttachRequest::StartAgent {

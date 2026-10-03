@@ -416,6 +416,14 @@ pub struct Daemon {
     /// endpoint. Ignored when [`Self::attach_socket_path`] is `None` — a daemon
     /// that serves no attach protocol has nothing to alias.
     pub legacy_attach_socket_path: Option<PathBuf>,
+    /// PRD #1487: this daemon's restart state — what it recorded about its own
+    /// binary, the lock that serialises `restart-daemon` requests, and the
+    /// accepted successor [`run_daemon_with`] spawns once the sockets are
+    /// released. Every constructor records no install
+    /// ([`crate::daemon_restart::InstallRecord::unresolved`]), so an in-process
+    /// or test daemon never spawns its own harness; `daemon serve` sets the real
+    /// one through [`Self::with_restart_control`].
+    pub restart_control: Arc<crate::daemon_restart::RestartControl>,
 }
 
 impl Daemon {
@@ -440,6 +448,7 @@ impl Daemon {
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
             legacy_socket_path: None,
             legacy_attach_socket_path: None,
+            restart_control: Arc::default(),
         }
     }
 
@@ -467,6 +476,7 @@ impl Daemon {
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
             legacy_socket_path: None,
             legacy_attach_socket_path: None,
+            restart_control: Arc::default(),
         }
     }
 
@@ -500,6 +510,17 @@ impl Daemon {
     pub fn with_legacy_aliases(mut self, hook: Option<PathBuf>, attach: Option<PathBuf>) -> Self {
         self.legacy_socket_path = hook;
         self.legacy_attach_socket_path = attach;
+        self
+    }
+
+    /// PRD #1487: use this restart control — `daemon serve` passes one built
+    /// from [`crate::daemon_restart::InstallRecord::capture`]; a test passes one
+    /// whose record points at a script of its own.
+    pub fn with_restart_control(
+        mut self,
+        control: Arc<crate::daemon_restart::RestartControl>,
+    ) -> Self {
+        self.restart_control = control;
         self
     }
 }
@@ -778,6 +799,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
+    let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
     // this event names?" against the registry rather than against a set it
     // would have to maintain by hand — see `crate::state::AgentOwnership`.
@@ -955,8 +977,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
+        let attach_restart = restart_control.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_restart(
                 listener,
                 registry,
                 attach_event_tx,
@@ -966,6 +989,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_scheduler,
                 attach_reuse,
                 attach_worktrees,
+                attach_restart,
             )
             .await
             {
@@ -1018,8 +1042,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
+        let attach_restart = restart_control.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_restart(
                 listener,
                 registry,
                 attach_event_tx,
@@ -1029,6 +1054,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_scheduler,
                 attach_reuse,
                 attach_worktrees,
+                attach_restart,
             )
             .await
             {
@@ -1132,6 +1158,27 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // the deterministic half.
     crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
+
+    // PRD #1487: an accepted `restart-daemon` in `Installed` mode left its
+    // verified target here. Spawn it only now — the hook loop has returned,
+    // the attach servers are aborted and the aliases unlinked — because the
+    // successor's bind refuses while this daemon's socket is alive. It inherits
+    // this process's environment, so it binds the same endpoint. If the spawn
+    // fails no daemon is left running: the agents were stopped by consent, and
+    // the next client lazy-spawns from its own binary.
+    if let Some(target) = restart_control.take_successor() {
+        match crate::daemon_attach::spawn_daemon_serve_detached_with_exe(
+            &crate::config::state_dir(),
+            &target,
+        ) {
+            Ok(pid) => info!(pid, target = %target.display(), "successor daemon spawned"),
+            Err(e) => error!(
+                target = %target.display(),
+                error = %e,
+                "could not spawn the successor daemon; none is running until a client starts one"
+            ),
+        }
+    }
 
     result
 }

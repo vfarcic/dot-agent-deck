@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::untrusted_text::strip_control_and_bidi;
+use crate::version::parse_version_output;
 
 /// GitHub releases base URL used to download `dot-agent-deck` binaries onto
 /// remote hosts. Kept as a re-export under this crate-local name because three
@@ -1403,12 +1404,6 @@ fn detect_platform(uname_stdout: &str) -> Option<&'static str> {
         ("Darwin", "arm64") => Some("darwin-arm64"),
         _ => None,
     }
-}
-
-/// Pull the version number out of `dot-agent-deck --version` output.
-/// Expected shape: `dot-agent-deck X.Y.Z` (possibly with trailing whitespace).
-fn parse_version_output(stdout: &str) -> Option<String> {
-    stdout.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
 /// Install (or version-check, with `no_install`) the remote binary and assert
