@@ -24,27 +24,27 @@ Rule 12's procedure is written in keystrokes because a person was always going t
 
 ## In CI
 
-The advisory `cross-version` job in `.github/workflows/ci.yml` runs the harness on a GitHub runner for every pull request that changes what the binary is built from — anything under `src/`, `build.rs`, `Cargo.toml`, `Cargo.lock` or `xtask/cross-version/` — and for a `workflow_dispatch` of the workflow (issue #1507). A runner suits it better than a contributor's machine on both of its constraints: it has the disk the [preflight](#what-a-run-does) asks for to itself, and it is the disposable VM the trust boundary above says unreviewed code belongs in.
+The advisory `cross-version` job in `.github/workflows/ci.yml` runs the harness on a GitHub runner for every pull request that changes what the binary is built from — anything under `src/`, the build's own inputs (`build.rs`, `build_version_resolve.rs`, `Cargo.toml`, `Cargo.lock`, `.cargo/`, `scripts/link-gate.sh`, `scripts/build-gate.sh`, a toolchain file) or `xtask/cross-version/` — and for a `workflow_dispatch` of the workflow (issue #1507). `docs/` reaches the binary too, as embedded help text, which no TUI↔daemon contract reads, so a docs-only pull request does not run it. A runner suits it better than a contributor's machine on both of its constraints: it has the disk the [preflight](#what-a-run-does) asks for to itself, and it is the disposable VM the trust boundary above says unreviewed code belongs in.
 
 What the job runs:
 
 ```sh
-cargo xver --repo <this repository> --branch pull/<n>/head --previous <tag> \
+cargo xver --repo <this repository> --branch <head SHA> --previous <tag> \
   --direction both --probe generic --allow-build-changes --min-free-gib 15 \
   --runs-root /xr
 ```
 
-- `--branch pull/<n>/head` fetches the pull request's head from this repository, which covers a fork's pull request too; a dispatch passes the dispatched branch instead.
+- `--branch <head SHA>`: the pull request's head commit, or the dispatched commit. A SHA rather than `pull/<n>/head` or a branch name, because a ref can move between the job's protocol check and the harness's own fetch, and then the harness would build a commit nothing checked. GitHub serves a fetch by SHA for any commit its refs reach, which covers a fork's pull request through `refs/pull/<n>/head`.
 - `--previous` is the nearest stable tag the pull request's head can reach (`git describe --tags --abbrev=0 --exclude '*-*'`), so a branch cut before the newest release is paired with the release it was cut after ([Which release is "previous"](#which-release-is-previous)).
 - `--direction both` runs forward, the pairing rule 12 names, and reverse, the only one that runs the branch's daemon code.
-- `--probe generic`, because `pull/<n>/head` carries no `dispatch-issue-<n>` component for `auto` to select a probe from.
+- `--probe generic`, because a SHA carries no `dispatch-issue-<n>` component for `auto` to select a probe from.
 - `--allow-build-changes`, because the review the flag asks for protects a host with something on it, which the runner is not.
 - `--min-free-gib 15`, because the default floor of 100 is sized for a dev box shared with other builds; a run writes one debug build of the binary, its crates and one release asset.
-- `--runs-root /xr`, a short directory on the runner's disk, because each sandbox's sockets live under `<runs root>/<branch slug>-<epoch>/` and a Unix socket address is capped at 108 bytes. Under the default root beside the checkout, the dispatch of `agent/dispatch-issue-1507-tui-agent-order` produced a 120-byte `hook.sock` path and both directions aborted before their first tell (run [`37141701230`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141701230)). With `/xr` a branch name has roughly 60 bytes to spare; a longer one still aborts, with a message naming the path.
+- `--runs-root /xr`, a short directory on the runner's disk, because each sandbox's sockets live under `<runs root>/<branch slug>-<epoch>/` and a Unix socket address is capped at 108 bytes. Under the default root beside the checkout, the dispatch of `agent/dispatch-issue-1507-tui-agent-order` produced a 120-byte `hook.sock` path and both directions aborted before their first tell (run [`37141701230`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141701230)). Under `/xr` the 40-character SHA the job passes fits with room to spare.
 
-Two things happen before the harness starts: the job installs `bubblewrap` and sets `kernel.apparmor_restrict_unprivileged_userns=0`, since Ubuntu 24.04 confines the unprivileged user namespaces both of the harness's namespaces are; and it compares `PROTOCOL_VERSION` at the previous release with the pull request's head. When the constant moved, the job does not run the harness: the two builds refuse each other by design (the `PROTOCOL_VERSION` paragraph at the top of this page), and the job says so in a notice instead of reporting the refusal as a failing tell.
+Two things happen before the harness starts: the job installs `bubblewrap` and sets `kernel.apparmor_restrict_unprivileged_userns=0`, since Ubuntu 24.04 confines the unprivileged user namespaces both of the harness's namespaces are; and it compares `PROTOCOL_VERSION` at the previous release with the pull request's head. When the constant moved, the job does not run the harness: the two builds refuse each other by design (the `PROTOCOL_VERSION` paragraph at the top of this page), and the job says so in a notice, and in a `<SHA>-protocol-refusal.md` evidence file, instead of reporting the refusal as a failing tell.
 
-Both evidence files are uploaded as the run's `xver-evidence-attempt-<n>` artifact. A passing job with that artifact is rule 12's cross-version run for the pull request's head; link the run in the pull request body.
+The evidence files (both directions' when the harness ran, the refusal file when it did not) are uploaded as the run's `xver-evidence-attempt-<n>` artifact. A passing job with that artifact is rule 12's cross-version run for the pull request's head; link the run in the pull request body.
 
 The first run, on PR #1524 (run [`37141330180`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141330180)), passed both directions against `v0.45.0`: the job took 4.5 minutes, of which `cargo xver` was 3m39s, the cold build of the binary 89s, and the runner reported 84 GiB free.
 

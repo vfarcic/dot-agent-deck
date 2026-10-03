@@ -235,7 +235,12 @@ jobs:
       # by `cross-version` alone, for every PR author — the step above returns
       # early for anyone but Renovate, so it cannot answer this. The TUI and the
       # daemon are one binary (CLAUDE.md rule 18), so any change under `src/` can
-      # move the contract between them; a docs-only PR cannot.
+      # move the contract between them, and so can the build's own inputs:
+      # `build.rs` and the module it includes, the manifests, `.cargo/` (the
+      # linker), the scripts the linker runs and a toolchain file. `docs/` also
+      # reaches the binary — `build.rs` embeds the published pages — but as help
+      # text, which no TUI↔daemon contract reads, so a docs-only PR does not run
+      # the check.
       - id: binary
         env:
           GH_TOKEN: ${{ github.token }}
@@ -265,7 +270,9 @@ jobs:
           binary=false
           while IFS= read -r f; do
             case "$f" in
-              src/* | build.rs | Cargo.toml | Cargo.lock | xtask/cross-version/*)
+              src/* | build.rs | build_version_resolve.rs | Cargo.toml | Cargo.lock | \
+                .cargo/* | scripts/link-gate.sh | scripts/build-gate.sh | \
+                rust-toolchain | rust-toolchain.toml | xtask/cross-version/*)
                 echo "'$f' feeds the binary or the harness -> cross-version runs"
                 binary=true
                 break
@@ -919,32 +926,28 @@ jobs:
           # runner's ext4 disk, not a tmpfs, which the preflight requires.
           sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 /xr
           df -h / "$GITHUB_WORKSPACE/.."
-      # The branch under test, and the release to pair it with. A PR is fetched
-      # by `pull/<n>/head` from this repository, which also covers a fork's PR;
-      # a dispatch tests the ref it was dispatched on.
+      # The commit under test, and the release to pair it with. The harness is
+      # handed the head's SHA rather than a ref: `pull/<n>/head` and a branch
+      # both move, and a push landing between this step and the harness's own
+      # fetch would build a commit the protocol check below never looked at.
+      # GitHub serves a fetch by SHA for any commit its refs reach, a fork PR's
+      # head included (through `refs/pull/<n>/head`).
       #
       # The previous release is the nearest stable tag reachable from that head,
       # not the Latest release: a branch cut before the newest release would
       # otherwise face a daemon carrying changes it has never seen (the harness
       # doc's "Which release is previous").
       #
-      # And a branch that moves `PROTOCOL_VERSION` is not run at all. The two
+      # And a commit that moves `PROTOCOL_VERSION` is not run at all. The two
       # builds refuse each other by design across a bump — that refusal IS the
       # outcome rule 12 asks to record, and the harness would report it as a
-      # failing `aborted` tell.
+      # failing `aborted` tell. The step writes that outcome as an evidence file
+      # of its own, so the artifact exists either way.
       - id: plan
         env:
-          EVENT: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = pull_request ]; then
-            branch="pull/$PR_NUMBER/head"
-          else
-            branch="$REF_NAME"
-          fi
           previous=$(git describe --tags --abbrev=0 --exclude '*-*' "$HEAD_SHA")
           protocol() {
             git show "$1:src/daemon_protocol.rs" \
@@ -952,18 +955,22 @@ jobs:
           }
           old=$(protocol "$previous")
           new=$(protocol "$HEAD_SHA")
-          echo "branch=$branch previous=$previous protocol $old -> $new"
+          echo "commit=$HEAD_SHA previous=$previous protocol $old -> $new"
           if [ -z "$old" ] || [ -z "$new" ]; then
             echo "::error::could not read PROTOCOL_VERSION at $previous or $HEAD_SHA"
             exit 1
           fi
           if [ "$old" != "$new" ]; then
-            echo "::notice::PROTOCOL_VERSION moves from $old ($previous) to $new on this branch, so the two builds refuse each other by design; no cross-version run. Record that refusal as the rule 12 outcome."
+            message="PROTOCOL_VERSION moves from $old ($previous) to $new at $HEAD_SHA, so the two builds refuse each other by design; no cross-version run. Record that refusal as the rule 12 outcome."
+            echo "::notice::$message"
+            mkdir -p .dot-agent-deck/xver-evidence
+            printf '# Cross-version check: not run\n\n%s\n' "$message" \
+              > ".dot-agent-deck/xver-evidence/$HEAD_SHA-protocol-refusal.md"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "commit=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "previous=$previous" >> "$GITHUB_OUTPUT"
       # `--min-free-gib 15`: the default floor of 100 GiB is sized for a dev box
       # shared with other builds (CLAUDE.md rule 14). What a run writes is one
@@ -971,7 +978,7 @@ jobs:
       # on a runner that builds nothing else.
       #
       # `--probe generic`: a reverse run otherwise derives its stimulus from a
-      # `dispatch-issue-<n>` branch name, which `pull/<n>/head` is not.
+      # `dispatch-issue-<n>` branch name, which a commit SHA is not.
       #
       # `--allow-build-changes`: a branch that touches build-time code is built
       # into a target dir of its own in the build namespace; on a laptop the flag
@@ -980,15 +987,15 @@ jobs:
       - if: steps.plan.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.plan.outputs.branch }}
+          COMMIT: ${{ steps.plan.outputs.commit }}
           PREVIOUS: ${{ steps.plan.outputs.previous }}
           REPO: ${{ github.repository }}
         run: |
-          cargo xver --repo "$REPO" --branch "$BRANCH" --previous "$PREVIOUS" \
+          cargo xver --repo "$REPO" --branch "$COMMIT" --previous "$PREVIOUS" \
             --direction both --probe generic --allow-build-changes --min-free-gib 15 \
             --runs-root /xr
       - name: Preserve the evidence
-        if: always() && steps.plan.outputs.run == 'true'
+        if: always() && steps.plan.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: xver-evidence-attempt-${{ github.run_attempt }}
