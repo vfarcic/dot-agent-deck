@@ -996,8 +996,11 @@ function upgradeFleet(): DeckSnapshot[] {
     fleetDeck(
       FIXTURE_DAEMON_ID,
       { status: "connected", deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: "Daemon responding", deckKind: "local", upgradeOffer: { kind: "current" } },
-      agents,
-      "/home/dev/code/dot-agent-deck-gui",
+      // The docs agents, not the shared `connected` ones: the `daemon-upgrade`
+      // docs screenshot shows this deck behind its dialog, and the shared
+      // agents carry demo-run paths.
+      docsAgents,
+      DOCS_CWD,
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,

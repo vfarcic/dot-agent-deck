@@ -28,6 +28,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
+| Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
 
@@ -38,7 +39,7 @@ These are TUI-only:
 - The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
 - Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
-- Installing the deck on a remote machine and starting a daemon there (`dot-agent-deck remote add`, `dot-agent-deck connect`). The desktop app connects to a remote daemon that is already running; see [Daemons](daemons.md).
+- Installing the deck on a remote machine and starting a daemon there (`dot-agent-deck remote add`, `dot-agent-deck connect`). The desktop app connects to a remote daemon that is already running, and can [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version once it does; see [Daemons](daemons.md).
 
 The desktop app has two things the TUI does not: one Dashboard over several daemons at once, and voice control.
 

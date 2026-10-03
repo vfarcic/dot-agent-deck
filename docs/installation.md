@@ -277,8 +277,8 @@ When it connects, the app checks whether it and the daemon can work together:
 | Situation | What the Dashboard shows | What to do |
 |---|---|---|
 | The two are compatible | Connects normally | Nothing |
-| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one. **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
-| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | Update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one; for a remote daemon older than the app, press **Upgrade** ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)). **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
+| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | For a remote daemon older than the app, press **Upgrade**. Otherwise update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
 
 **Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 
