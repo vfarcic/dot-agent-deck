@@ -252,6 +252,7 @@ mod tests {
             live_target: None,
             last_activity_ms: None,
             blocked: None,
+            hook_generation: None,
         }
     }
 

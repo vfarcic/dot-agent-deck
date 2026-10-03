@@ -810,6 +810,35 @@ pub struct SessionSnapshot {
     /// so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_wait: Option<SubagentWait>,
+    /// Issue #532: the PANE's hook generation as the daemon holds it
+    /// ([`AppState::pane_hook_session_id`]), so a reconnecting TUI starts from
+    /// the daemon's answer instead of from whichever frame happens to reach it
+    /// first. Since #532 an ordinary frame cannot move an established
+    /// generation, so a TUI whose first frame after reconnecting came from a
+    /// wrapped agent's wrapper would otherwise hold the wrapper's id until the
+    /// agent's next `SessionStart`, and its guarded sends would be refused
+    /// against the daemon's. Adopted by [`AppState::seed_hydrated_session`].
+    ///
+    /// A property of the pane rather than of this session, carried here because
+    /// this is the per-pane record a reconnect already reads; filled by
+    /// [`AppState::live_session_for`], never by [`SessionState::live_snapshot`].
+    /// Additive optional, the `blocked` precedent: an older daemon omits it and
+    /// the TUI builds the generation from events as before, and an older TUI
+    /// ignores the key, so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_generation: Option<HookGeneration>,
+}
+
+/// Issue #532: a pane's hook generation on the wire — see
+/// [`SessionSnapshot::hook_generation`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookGeneration {
+    /// The hook session id the daemon's send guard compares a guarded write's
+    /// `expected_session_id` against.
+    pub session_id: String,
+    /// When the generation's newest frame was stamped, in milliseconds since
+    /// the Unix epoch (the `last_activity_ms` unit).
+    pub established_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -943,6 +972,8 @@ impl SessionState {
             last_activity_ms: Some(self.last_activity.timestamp_millis()),
             blocked: self.blocked.clone(),
             subagent_wait: self.subagent_wait.clone(),
+            // A pane property: `AppState::live_session_for` fills it.
+            hook_generation: None,
         }
     }
 
@@ -1556,7 +1587,12 @@ pub struct AppState {
     /// rolls its session id without announcing the new one. Claude Code, Codex,
     /// Devin and OpenCode each map a native session-start hook to
     /// `SessionStart`, and Pi reports under one pane-derived id for its whole
-    /// life.
+    /// life. The reconnect half, [`SessionSnapshot::hook_generation`], is an
+    /// additive optional: an older TUI ignores it, and a newer TUI against an
+    /// older daemon builds the generation from events, where a wrapper frame
+    /// that arrives first holds the pane until the agent's next `SessionStart`
+    /// and that daemon refuses the TUI's sends whenever the agent spoke last —
+    /// intermittent refusal, as today, never a write into another conversation.
     ///
     /// Issue #684: an entry only ever exists because a producer ANNOUNCED a
     /// conversation, or because an ordinary frame carrying a pane id arrived. A
@@ -10214,7 +10250,19 @@ impl AppState {
                     .cmp(&b.last_activity)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             })
-            .map(|s| s.live_snapshot())
+            .map(|s| {
+                let mut snapshot = s.live_snapshot();
+                // Issue #532: the pane's generation, so a reconnecting TUI
+                // adopts the daemon's answer. See
+                // [`SessionSnapshot::hook_generation`].
+                snapshot.hook_generation = pane_id
+                    .and_then(|pane| self.pane_hook_session.get(pane))
+                    .map(|(session_id, established_at)| HookGeneration {
+                        session_id: session_id.clone(),
+                        established_ms: established_at.timestamp_millis(),
+                    });
+                snapshot
+            })
     }
 
     /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
@@ -10723,6 +10771,7 @@ impl AppState {
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         let Some(snap) = live else { return };
+        self.adopt_hydrated_generation(&pane_id, snap.hook_generation.as_ref());
         let observed = snap
             .last_activity_ms
             .and_then(DateTime::<Utc>::from_timestamp_millis);
@@ -10779,6 +10828,44 @@ impl AppState {
     /// those on the same pane, and those from the same agent. `None` when this
     /// state holds no such session. [`Self::seed_hydrated_session`] is the only
     /// caller.
+    /// Issue #532: take the daemon's hook generation for `pane_id` on a
+    /// reconnect — see [`SessionSnapshot::hook_generation`].
+    ///
+    /// The daemon's answer REPLACES whatever this state built from frames that
+    /// reached it before hydration ran (the event subscriber starts first), with
+    /// one exception: the same generation keeps the later of the two
+    /// timestamps, so a fresher frame already applied here is not rolled back.
+    /// What that gives up is a genuine `SessionStart` that landed between the
+    /// daemon building the snapshot and this call: this state then holds the
+    /// superseded id until the next announcement, and its guarded sends are
+    /// refused by the daemon rather than delivered — the safe direction. The
+    /// window is the time between `ListAgents` and seeding, and wrapper frames
+    /// are far likelier to land in it than an announcement is.
+    ///
+    /// Moves the generation without counting a closure: hydration runs before
+    /// any delivery exists for this state to protect. Absent on an older
+    /// daemon's snapshot, which leaves the event-built generation alone.
+    fn adopt_hydrated_generation(&mut self, pane_id: &str, generation: Option<&HookGeneration>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let Some(established_at) =
+            DateTime::<Utc>::from_timestamp_millis(generation.established_ms)
+        else {
+            return;
+        };
+        let established_at = match self.pane_hook_session.get(pane_id) {
+            Some((current, current_ts)) if *current == generation.session_id => {
+                established_at.max(*current_ts)
+            }
+            _ => established_at,
+        };
+        self.pane_hook_session.insert(
+            pane_id.to_string(),
+            (generation.session_id.clone(), established_at),
+        );
+    }
+
     fn newest_activity_for(&self, pane_id: &str, agent_id: Option<&str>) -> Option<DateTime<Utc>> {
         self.sessions
             .values()
@@ -23134,6 +23221,7 @@ while True:
                 detail: Some("You\u{2019}ve hit your usage limit.".to_string()),
                 resets_at_ms: Some(9_000),
             }),
+            hook_generation: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -23197,6 +23285,7 @@ while True:
                 detail: None,
                 resets_at_ms,
             }),
+            hook_generation: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

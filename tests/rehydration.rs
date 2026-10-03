@@ -2924,6 +2924,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         live_target: None,
         last_activity_ms: None,
         blocked: None,
+        hook_generation: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3071,6 +3072,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         live_target: None,
                         last_activity_ms: None,
                         blocked: None,
+                        hook_generation: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3490,4 +3492,90 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     );
 
     drop(controller);
+}
+
+/// Scenario: A wrapped Codex pane is running under the daemon: the wrapper's frames report under `<pane>-session`, Codex announced its own conversation, and the wrapper has spoken since. A TUI reconnects, and the first frame its event stream delivers is the wrapper's. Seeding the card from the daemon's `ListAgents` reply must leave the reconnected TUI on the conversation Codex announced, the one the daemon's send guard holds — not on the wrapper's id, which no later ordinary frame can correct. The control is an older daemon's reply, which carries no generation and so leaves the event-built one.
+#[spec("session/live/017")]
+#[test]
+fn live_017_reconnect_adopts_the_daemons_pane_generation() {
+    let pane = "pane-wrapped-reconnect";
+    let agent_id = "agent-wrapped-reconnect";
+    let wrapper_session = format!("{pane}-session");
+    let base = Utc::now() - chrono::Duration::seconds(60);
+    let frame = |session: &str, event_type: EventType, secs: i64| AgentEvent {
+        session_id: session.to_string(),
+        agent_type: AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: base + chrono::Duration::seconds(secs),
+        user_prompt: None,
+        metadata: Default::default(),
+        pane_id: Some(pane.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+
+    // The daemon has seen the whole history.
+    let mut daemon = AppState::default();
+    daemon.register_pane(pane.to_string());
+    daemon.apply_event(frame(&wrapper_session, EventType::Thinking, 1));
+    daemon.apply_event(frame("codex-native", EventType::SessionStart, 2));
+    daemon.apply_event(frame("codex-native", EventType::ToolStart, 3));
+    daemon.apply_event(frame(&wrapper_session, EventType::Thinking, 4));
+    assert_eq!(
+        daemon.pane_hook_session_id(pane).as_deref(),
+        Some("codex-native"),
+        "precondition: the daemon holds the conversation Codex announced"
+    );
+    // What goes on the wire in the `ListAgents` reply.
+    let wire = serde_json::to_value(
+        daemon
+            .live_session_for(agent_id, Some(pane))
+            .expect("the daemon has a live session for the pane"),
+    )
+    .expect("snapshot serializes");
+
+    let reconnect = |wire: serde_json::Value| {
+        let snapshot: SessionSnapshot = serde_json::from_value(wire).expect("snapshot parses");
+        let mut tui = AppState::default();
+        tui.register_pane(pane.to_string());
+        // The event subscriber starts before hydration, so a frame can land
+        // first — here the wrapper's.
+        tui.apply_event(frame(&wrapper_session, EventType::Thinking, 5));
+        tui.seed_hydrated_session(
+            pane.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(agent_id.to_string()),
+            Some(&snapshot),
+        );
+        // Codex keeps working after the reconnect.
+        tui.apply_event(frame("codex-native", EventType::ToolStart, 6));
+        tui.pane_hook_session_id(pane)
+    };
+
+    assert_eq!(
+        reconnect(wire.clone()).as_deref(),
+        Some("codex-native"),
+        "a reconnected TUI must hold the generation the daemon's send guard holds (issue #532)"
+    );
+
+    // Control: an older daemon's reply carries no generation, so the TUI keeps
+    // what it built from events — the wrapper's id, which Codex's ordinary
+    // frames cannot replace. This is the residual the field closes.
+    let mut older = wire;
+    older
+        .as_object_mut()
+        .expect("snapshot is an object")
+        .remove("hook_generation")
+        .expect("a current daemon sends the generation");
+    assert_eq!(
+        reconnect(older).as_deref(),
+        Some(wrapper_session.as_str()),
+        "without the daemon's generation the TUI keeps the one it built from events"
+    );
 }
