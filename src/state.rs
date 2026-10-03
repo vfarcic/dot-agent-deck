@@ -3241,13 +3241,18 @@ fn record_delegation_commission(
 /// release sites are exactly the callers of this function. The audit of
 /// `dispatch_one_owned`'s five exits, and why the two that release nothing are
 /// already correct, is recorded at the top of that function.
+///
+/// `arm_id` is the dispatch's own commission
+/// ([`crate::agent_pty::CommissionDispatchInFlight::arm_id`]), so the release
+/// takes that commission rather than an older delivered one (issue #1447).
 fn release_undelivered_commission(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
+    arm_id: Option<u64>,
     role: &str,
     reason: &'static str,
 ) {
-    if registry.release_delegation_commission(worker_pane_id) {
+    if registry.release_delegation_commission(worker_pane_id, arm_id) {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -7728,7 +7733,10 @@ async fn bind_dispatched_commission(
 ///    needs none: `begin_pane_close` drains the pane's silence watches under the
 ///    same lock hold that drops the close waiter this arm woke on.
 /// 4. **The tail** — reuses the record rather than arming a second one, and the
-///    existing `!delivered` and unresolved-identity arms cancel it by `seq`.
+///    existing `!delivered` and unresolved-identity arms withdraw it by `seq`.
+///    On the `clear = false` path the tail arms the record itself, and keeps
+///    the watch it replaces running until the write is settled (issue #1446):
+///    a delivery supersedes it, and a withdrawal puts it back.
 ///
 /// The **respawn-error** exit is absent from this list on purpose: the record is
 /// armed inside the success arm, so a failed respawn never creates one.
@@ -7763,7 +7771,9 @@ async fn bind_dispatched_commission(
 /// releases the commission, numbered as the noted delivery's are:
 ///
 /// 1. **The pi-native `clear = true` return** — keeps it: the seed is a
-///    delivery, so a `work-done` is owed.
+///    delivery, so a `work-done` is owed. It binds the replacement's agent id
+///    onto it first, as the tail does (issue #1448), so the agent-exit sweep
+///    can match it.
 /// 2. **The dead-replacement return** — retires.
 /// 3. **The readiness-buffer close return** — retires, belt-and-braces:
 ///    `begin_pane_close` drained the pane's records already.
@@ -8218,6 +8228,21 @@ async fn dispatch_one_owned(
                         "delegate: pi worker respawned for clear=true; \
                          stashing seed for native get-seed pull (no injection)"
                     );
+                    // Issue #1448: the seed is this delegation's delivery, so the
+                    // replacement is the worker its idle-worker record waits on —
+                    // bind it, as the tail does before its write. Returning
+                    // without the bind left the record unbound, so the
+                    // replacement's own exit matched nothing and the
+                    // orchestrator heard about it only when the idle timer ran
+                    // out. (The commission was bound to the replacement above,
+                    // the moment the respawn succeeded.) Bound HERE and not
+                    // there because the injection path must stay unbound across
+                    // its `SessionStart` wait: a replacement that dies inside it
+                    // is reported by the dead-replacement return, and a bound
+                    // record could report it a second time from the exit sweep.
+                    if let Some(seq) = delegation_seq {
+                        registry.bind_delegation_worker_agent_id(&pane_id, seq, &new_agent_id);
+                    }
                     registry.set_pending_seed(&pane_id, &one_liner);
                     // Issue #617 (finding 6): bind the fallback to the agent the
                     // respawn just produced. This task sleeps for the grace
@@ -8527,6 +8552,7 @@ async fn dispatch_one_owned(
                     release_undelivered_commission(
                         &registry,
                         &pane_id,
+                        commission_arm_id,
                         &target_role,
                         "the clear=true replacement worker never became live",
                     );
@@ -9021,6 +9047,7 @@ async fn dispatch_one_owned(
                 release_undelivered_commission(
                     &registry,
                     &pane_id,
+                    commission_arm_id,
                     &target_role,
                     "respawn failed for clear=true",
                 );
@@ -9101,8 +9128,10 @@ async fn dispatch_one_owned(
     // task's already-live cancellation channel retire it on its own.
     let mut silence = match (silence_watch, reserved_silence.take()) {
         (Some(watch), Some(armed)) => Some((watch, armed, event_tx.subscribe())),
+        // Issue #1446: until this generation's pointer is written, the watch it
+        // replaces keeps running — the write below can still be refused.
         (Some(watch), None) => registry
-            .arm_silence_watch(
+            .arm_silence_watch_until_delivered(
                 &pane_id,
                 &orchestrator_pane_id,
                 expected_worker_agent_id.as_deref(),
@@ -9519,6 +9548,7 @@ async fn dispatch_one_owned(
         release_undelivered_commission(
             &registry,
             &pane_id,
+            commission_arm_id,
             &target_role,
             "the identity gate refused the task pointer",
         );
@@ -9662,9 +9692,11 @@ async fn dispatch_one_owned(
     };
     // Nothing was delivered, so there is nothing to be silent about: disarm the
     // record we registered before the write rather than leaving it to be swept
-    // by the next delegate or close.
+    // by the next delegate or close. Issue #1446: WITHDRAW it, so the record it
+    // displaced — an earlier delegation that was delivered and is still owed —
+    // gets its watch back rather than going with it.
     if !delivered {
-        registry.cancel_silence_watch_if(&pane_id, armed.seq);
+        registry.withdraw_silence_watch_if(&pane_id, armed.seq);
         return;
     }
     let Some(worker_agent_id) = expected_worker_agent_id else {
@@ -9675,9 +9707,12 @@ async fn dispatch_one_owned(
         // variant in the match above. Belt and braces — an unbound watch could
         // not tell this worker's events from a successor's (review finding S1),
         // so it must not be armed.
-        registry.cancel_silence_watch_if(&pane_id, armed.seq);
+        registry.withdraw_silence_watch_if(&pane_id, armed.seq);
         return;
     };
+    // Issue #1446: delivered, so this generation now supersedes the watch it
+    // displaced when it was armed.
+    registry.confirm_silence_watch_delivered(&pane_id, armed.seq);
     // PRD #249 M3: the write said "bytes reached a PTY", which is not "an agent
     // consumed them". Watch for the symptom of the difference.
     arm_delegate_silence_watch(
@@ -19472,6 +19507,177 @@ mod tests {
             Some(newer.seq),
             "issue #1423: an older delegation's undelivered exit must not retire a newer \
              delegation's idle-worker record"
+        );
+
+        // Issue #1446: an EARLIER delegation to this worker was delivered and its
+        // silent-worker watch is still running when this one is dispatched and
+        // refused. The refusal withdraws only its own watch: the earlier one's
+        // task keeps running, and it can still take its own record to report a
+        // worker that stayed quiet.
+        let earlier = registry
+            .arm_silence_watch(worker_pane, "orch-pane", Some("earlier-worker-agent"))
+            .expect("arm the earlier, delivered delegation's silent-worker watch");
+        let mut earlier_cancel = earlier.cancel;
+        dispatch(arm().seq).await;
+        assert!(
+            matches!(
+                earlier_cancel.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "issue #1446: a refused re-delegation cancelled the silent-worker watch of an \
+             earlier delegation that WAS delivered and is still unanswered"
+        );
+        assert!(
+            registry.cancel_silence_watch_if(worker_pane, earlier.seq),
+            "issue #1446: the earlier delegation's watch must still own the pane's record, so \
+             it can consume it and report the worker if it stays silent"
+        );
+    }
+
+    /// Issue #1446, the other half: a re-delegation that IS delivered still
+    /// supersedes the earlier delegation's silent-worker watch — its write
+    /// answers the earlier "did anything happen?" — and the earlier
+    /// delegation's late `work-done` is still credited to it rather than
+    /// disarming the newer watch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_one_owned_supersedes_the_earlier_silence_watch_once_delivered() {
+        const ORCH_PANE: &str = "supersede-on-delivery-orch";
+        const WORKER_PANE: &str = "supersede-on-delivery-worker";
+
+        let _schedule = RETRY_SCHEDULE_ENV_LOCK.lock().await;
+        let _env = RetryScheduleEnv::set("0");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )]),
+                    agent_type: Some(agent_type),
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn stand-in")
+        };
+        let worker = spawn(WORKER_PANE, crate::event::AgentType::Codex);
+        let orch = spawn(ORCH_PANE, crate::event::AgentType::ClaudeCode);
+        let (event_tx, _event_rx) = broadcast::channel(64);
+
+        let earlier = registry
+            .arm_silence_watch(WORKER_PANE, ORCH_PANE, Some(&worker))
+            .expect("arm the earlier delegation's silent-worker watch");
+        let mut earlier_cancel = earlier.cancel;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dispatch_one_owned(
+                registry.clone(),
+                event_tx.clone(),
+                None,
+                ORCH_PANE.to_string(),
+                "coder".to_string(),
+                WORKER_PANE.to_string(),
+                "do the task".to_string(),
+                None,
+                Some(SilenceWatch {
+                    window: std::time::Duration::from_secs(60),
+                    target: SilenceReportTarget {
+                        pane_id: ORCH_PANE.to_string(),
+                        agent_id: Some(orch.clone()),
+                        orchestration: None,
+                    },
+                    redeliveries: None,
+                    retry_done: None,
+                }),
+                PointerQueueClock::new(registry.clone(), WORKER_PANE.to_string(), None),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the dispatch finishes");
+
+        assert!(
+            matches!(
+                earlier_cancel.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a delivered re-delegation must supersede the earlier delegation's watch"
+        );
+        assert!(
+            matches!(
+                registry.retire_silence_watch(WORKER_PANE),
+                crate::agent_pty::SilenceWatchRetirement::KeptNewer { remaining: 0, .. }
+            ),
+            "the earlier delegation's late work-done is credited to it, and the newer watch \
+             stays armed"
+        );
+        drop(event_tx);
+        registry.shutdown_all();
+    }
+
+    /// Issue #1447: a dispatch whose pointer never reached the worker releases
+    /// ITS OWN commission. Here an older delegation to the same worker was
+    /// delivered and is still owed, and the newer one is refused; the commission
+    /// left owed must be the older one, carrying the older one's arm time, so it
+    /// expires a commission TTL after IT was armed — not after the refused one
+    /// was.
+    #[tokio::test]
+    async fn dispatch_one_owned_releases_its_own_commission_when_refused() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let worker_pane = "worker-pane-releases-its-own-commission";
+        let t0 = std::time::Instant::now();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+
+        // The older delegation: armed at t0 and delivered, so its dispatch has
+        // already let go of its in-flight guard.
+        let crate::agent_pty::CommissionArm::Armed { in_flight, .. } =
+            registry.arm_delegation_commission_at(worker_pane, "orch-pane", None, false, t0)
+        else {
+            panic!("arm the older delegation's commission");
+        };
+        drop(in_flight);
+        // The newer one, six days later, whose pointer is refused below.
+        let crate::agent_pty::CommissionArm::Armed { in_flight, .. } = registry
+            .arm_delegation_commission_at(worker_pane, "orch-pane", None, true, t0 + 6 * day)
+        else {
+            panic!("arm the newer delegation's commission");
+        };
+
+        // The worker pane has no live agent, so the identity gate refuses.
+        dispatch_one_owned(
+            registry.clone(),
+            event_tx.clone(),
+            None,
+            "orch-pane".to_string(),
+            "worker-role".to_string(),
+            worker_pane.to_string(),
+            "probe task".to_string(),
+            None,
+            None,
+            PointerQueueClock::new(registry.clone(), worker_pane.to_string(), None),
+            None,
+            Some(in_flight),
+            None,
+        )
+        .await;
+
+        assert!(
+            registry.owes_delegation_commission(worker_pane),
+            "the older, delivered delegation is still owed a work-done"
+        );
+        assert_eq!(
+            registry.retire_delegation_commission_at(
+                worker_pane,
+                t0 + crate::agent_pty::DELEGATION_COMMISSION_TTL + day,
+            ),
+            crate::agent_pty::WorkDoneProvenance::Unsolicited,
+            "issue #1447: the refused dispatch released the OLDER delegation's arm time, so the \
+             commission left owed carries the refused one's and outlives its own TTL"
         );
     }
 

@@ -1210,7 +1210,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead.
+/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead. Run twice: once for a worker delegated to in place, and once for a pi-native `clear = true` role, whose delegate respawns the worker and hands the task over as the replacement's seed before that replacement exits on its own (issue #1448).
 #[spec("scheduler/idle-worker/016")]
 #[test]
 fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
@@ -1222,111 +1222,148 @@ fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
     // EOF-triggered sweep, never from either timer running out.
     let _env = EnvGuard::set(Some("60000"));
     runtime().block_on(async {
-        let harness = IdleHarness::with_workers(
-            &[("vanishing-worker", WORKER_EXITS_ON_ITS_OWN_COMMAND)],
-            None,
+        natural_worker_exit_reports_promptly("vanishing-worker", None).await;
+        // Issue #1448: a pi-native `clear = true` delegate delivers its pointer
+        // as the respawned pi's seed and returns before the inline injection.
+        // The idle-worker record must still learn the REPLACEMENT's agent id on
+        // that path, or the replacement's own exit matches nothing and the
+        // orchestrator hears about it only when the 60 s idle timer runs out.
+        natural_worker_exit_reports_promptly(
+            "vanishing-pi-worker",
+            Some(&format!(
+                "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
+                 [[orchestrations.roles]]\nname = \"vanishing-pi-worker\"\n\
+                 command = \"{WORKER_EXITS_ON_ITS_OWN_COMMAND}\"\nagent = \"pi\"\nclear = true\n"
+            )),
         )
         .await;
+    });
+}
 
-        let worker_pane_id = worker_pane("vanishing-worker");
-        let worker_agent_id = harness.worker_agent_ids["vanishing-worker"].clone();
+/// `scheduler/idle-worker/016`'s body for one worker `role`. With a
+/// `project_config` that makes the role `clear = true`, the delegate replaces
+/// the worker first, and it is the REPLACEMENT whose natural exit is awaited.
+async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option<&str>) {
+    let harness =
+        IdleHarness::with_workers(&[(role, WORKER_EXITS_ON_ITS_OWN_COMMAND)], project_config).await;
 
-        // Wait for the worker's own readiness marker before delegating — the
-        // same precondition every other harness test in this file relies on
-        // (a delegate landing before termios is raw could be swallowed).
-        let ready = harness
-            .wait_for_snapshot_of(
-                &worker_agent_id,
-                |snapshot| snapshot.contains("WORKER-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            ready.contains("WORKER-READY"),
-            "the vanishing-worker stub never became ready; snapshot = {ready:?}"
-        );
+    let worker_pane_id = worker_pane(role);
+    let worker_agent_id = harness.worker_agent_ids[role].clone();
 
-        harness.delegate(&["vanishing-worker"]).await;
+    // Wait for the worker's own readiness marker before delegating — the
+    // same precondition every other harness test in this file relies on
+    // (a delegate landing before termios is raw could be swallowed).
+    let ready = harness
+        .wait_for_snapshot_of(
+            &worker_agent_id,
+            |snapshot| snapshot.contains("WORKER-READY"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        ready.contains("WORKER-READY"),
+        "the {role} stub never became ready; snapshot = {ready:?}"
+    );
 
-        // The worker's own script exits on its own shortly after — no
-        // StopAgent, no explicit close of any kind. Wait until the registry
-        // genuinely has no live owner for its pane, mirroring
-        // `end_orchestrator_process`'s freed-pane wait.
-        let freed = tokio::time::timeout(Duration::from_secs(5), async {
-            while harness
-                .registry
-                .pane_current_agent_id(&worker_pane_id)
-                .is_some()
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    harness.delegate(&[role]).await;
+
+    if project_config.is_some() {
+        // The `clear = true` delegate respawns the worker: wait for the
+        // replacement to own the pane, so the exit awaited below is ITS exit
+        // and not the original's.
+        let replaced = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match harness.registry.pane_current_agent_id(&worker_pane_id) {
+                    Some(current) if current != worker_agent_id => return,
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
             }
         })
         .await;
         assert!(
-            freed.is_ok(),
-            "the vanishing-worker stub never exited on its own, so the scenario under test \
-             could not occur"
+            replaced.is_ok(),
+            "precondition: the clear = true delegate never respawned the {role} worker"
         );
-        assert!(
-            !harness.registry.is_pane_closing(&worker_pane_id),
-            "the worker pane is in a CLOSE transition, so a deliberate close's own record sweep \
-             — not the EOF-triggered sweep — would be what retired the records, and this test \
-             would stop covering the natural-exit path"
-        );
+    }
 
-        // The notice must land promptly — well before either timeout watch's
-        // (60s / 30s) window could have fired it instead.
-        //
-        // Issue #708: the wait includes the terminator byte, so it cannot end one
-        // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
-        // read a terminator that simply had not landed yet.
-        let snapshot = harness
-            .wait_for_snapshot(
-                |snapshot| worker_exited_terminator(snapshot).is_some(),
-                Duration::from_secs(5),
-            )
-            .await;
-        assert!(
-            snapshot.contains(WORKER_EXITED_NEEDLE),
-            "no EOF-triggered 'worker exited without work-done' notice appeared in the \
-             orchestrator's pane within 5s of the worker's natural exit; snapshot = {snapshot:?}"
-        );
-        // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
-        // orchestrator's input box reaches nobody in an unattended dispatched
-        // unit — there is no human to press Enter — so the orchestrator would
-        // wait forever for a `work-done` the dead process can never send. The
-        // report must be a turn of its own (CR) and say what to do about it.
-        let terminator = worker_exited_terminator(&snapshot);
-        let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
-            .into_iter()
-            .filter(|option| !snapshot.contains(option))
-            .collect();
-        assert!(
-            terminator == Some(b'\r') && missing_options.is_empty(),
-            "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
-             an LF-terminated line in the orchestrator's scrollback) and must name the \
-             remediation options (notify the user, re-delegate, reassign); terminator = \
-             {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
-        );
-        assert!(
-            snapshot.contains(&worker_pane_id),
-            "the notice must name the exited worker's pane so the orchestrator knows which \
-             worker to check; snapshot = {snapshot:?}"
-        );
-        assert_eq!(
-            idle_count(&snapshot),
-            0,
-            "the OLDER timeout-based idle prompt fired instead of (or alongside) the new \
-             EOF-triggered notice, meaning the sweep did not retire the OutstandingDelegation \
-             record before its own timer ran out; snapshot = {snapshot:?}"
-        );
-        assert!(
-            !snapshot.contains(SILENCE_NEEDLE),
-            "the OLDER timeout-based silence notice fired instead of (or alongside) the new \
-             EOF-triggered notice, meaning the sweep did not retire the SilenceWatchRecord \
-             before its own timer ran out; snapshot = {snapshot:?}"
-        );
-    });
+    // The worker's own script exits on its own shortly after — no
+    // StopAgent, no explicit close of any kind. Wait until the registry
+    // genuinely has no live owner for its pane, mirroring
+    // `end_orchestrator_process`'s freed-pane wait.
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        while harness
+            .registry
+            .pane_current_agent_id(&worker_pane_id)
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        freed.is_ok(),
+        "the {role} stub never exited on its own, so the scenario under test could not occur"
+    );
+    assert!(
+        !harness.registry.is_pane_closing(&worker_pane_id),
+        "the worker pane is in a CLOSE transition, so a deliberate close's own record sweep \
+         — not the EOF-triggered sweep — would be what retired the records, and this test \
+         would stop covering the natural-exit path"
+    );
+
+    // The notice must land promptly — well before either timeout watch's
+    // (60s / 30s) window could have fired it instead.
+    //
+    // Issue #708: the wait includes the terminator byte, so it cannot end one
+    // byte early (the submit CR trails the payload by `SUBMIT_DELAY`) and
+    // read a terminator that simply had not landed yet.
+    let snapshot = harness
+        .wait_for_snapshot(
+            |snapshot| worker_exited_terminator(snapshot).is_some(),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        snapshot.contains(WORKER_EXITED_NEEDLE),
+        "no EOF-triggered 'worker exited without work-done' notice appeared in the \
+         orchestrator's pane within 5s of the {role} worker's natural exit; \
+         snapshot = {snapshot:?}"
+    );
+    // Issue #708: SUBMITTED, not written. A notice left unsubmitted in the
+    // orchestrator's input box reaches nobody in an unattended dispatched
+    // unit — there is no human to press Enter — so the orchestrator would
+    // wait forever for a `work-done` the dead process can never send. The
+    // report must be a turn of its own (CR) and say what to do about it.
+    let terminator = worker_exited_terminator(&snapshot);
+    let missing_options: Vec<&str> = ["notify the user", "re-delegate", "reassign"]
+        .into_iter()
+        .filter(|option| !snapshot.contains(option))
+        .collect();
+    assert!(
+        terminator == Some(b'\r') && missing_options.is_empty(),
+        "the worker-exited notice must be SUBMITTED as a turn (terminated by CR, not left as \
+         an LF-terminated line in the orchestrator's scrollback) and must name the \
+         remediation options (notify the user, re-delegate, reassign); terminator = \
+         {terminator:?}, missing options = {missing_options:?}, snapshot = {snapshot:?}"
+    );
+    assert!(
+        snapshot.contains(&worker_pane_id),
+        "the notice must name the exited worker's pane so the orchestrator knows which \
+         worker to check; snapshot = {snapshot:?}"
+    );
+    assert_eq!(
+        idle_count(&snapshot),
+        0,
+        "the OLDER timeout-based idle prompt fired instead of (or alongside) the new \
+         EOF-triggered notice, meaning the sweep did not retire the OutstandingDelegation \
+         record before its own timer ran out; snapshot = {snapshot:?}"
+    );
+    assert!(
+        !snapshot.contains(SILENCE_NEEDLE),
+        "the OLDER timeout-based silence notice fired instead of (or alongside) the new \
+         EOF-triggered notice, meaning the sweep did not retire the SilenceWatchRecord \
+         before its own timer ran out; snapshot = {snapshot:?}"
+    );
 }
 
 /// Scenario: Delegate to a silent control worker and to a worker that ignores SIGTERM, then StopAgent the TERM-resistant one so its three-second grace window brackets the detector deadline. The test asserts the overlap actually happened, then requires a prompt for the control and none for the worker whose close was in flight.
