@@ -5453,8 +5453,13 @@ fn env_write_refuses_while_runtime_threads_exist_and_not_after_the_runtime_drops
         .worker_threads(2)
         .build()
         .expect("build multi-thread runtime");
-    // Make sure the workers have started before looking for them.
-    runtime.block_on(async { tokio::task::yield_now().await });
+    // A new thread carries its creator's name until it renames itself, so a
+    // worker that has not run yet is listed under this test's name. Wait
+    // (bounded) for the workers to take theirs before looking for them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while env_write::tokio_runtime_threads().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         !env_write::tokio_runtime_threads().is_empty(),
         "a live multi-thread runtime must show up in /proc/self/task; threads: {:?}",

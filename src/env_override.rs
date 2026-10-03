@@ -13,7 +13,7 @@
 //! **Production reads the environment exactly as before.** Nothing outside the
 //! tests calls [`override_for_tests`], so [`ACTIVE`] stays `false` for the life
 //! of a release process and [`var`] is `std::env::var(name).ok()` behind one
-//! relaxed atomic load. The environment variable stays the user-facing knob.
+//! atomic load. The environment variable stays the user-facing knob.
 //! The setter is `pub` only because integration tests link the library as an
 //! ordinary dependency and cannot see `#[cfg(test)]` items; it is
 //! `#[doc(hidden)]` for the same reason the L1 seams in `ui.rs` are.

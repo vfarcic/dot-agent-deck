@@ -13,9 +13,10 @@
 //!
 //! This makes the rule a runtime refusal rather than a comment: every
 //! env-writing guard in those files calls [`assert_no_tokio_runtime`] first.
-//! What it cannot see is a runtime built with a custom thread name, or one on a
-//! host without `/proc` (only the in-runtime half applies there); no test in
-//! this tree names its runtime threads.
+//! What it cannot see: a runtime built with a custom thread name (no test in
+//! this tree names its runtime threads); a worker started an instant before the
+//! check, which still carries its creator's name until it renames itself; and,
+//! on a host without `/proc`, anything but the in-runtime half.
 
 /// Panic, naming `site`, if the calling thread is inside a Tokio runtime or (on
 /// Linux) if any Tokio runtime thread is still alive in this process after
