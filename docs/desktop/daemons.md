@@ -16,7 +16,7 @@ The selector only chooses. Daemons are added and removed in **Settings → Daemo
 
 ## Watch a daemon on another machine
 
-The app reaches a remote daemon through an ssh tunnel, using the `ssh` program on this computer and your ssh config. It does not install anything on the host and does not start a daemon there, so do these first.
+The app reaches a remote daemon through an ssh tunnel, using the `ssh` program on this computer and your ssh config. It does not install the deck on a new host and does not start a daemon there, so do these first. (Once a daemon runs there, the app can [upgrade it](#upgrade-a-remote-daemon).)
 
 1. **Make ssh to the host work without a prompt.** The app runs ssh non-interactively (`BatchMode=yes`, `StrictHostKeyChecking=yes`), so a password prompt or an unknown host key fails the connection. Check from a terminal: `ssh -o BatchMode=yes <user>@<host> true` must exit 0 without asking anything.
 2. **Install the deck on the host and start a daemon there.** See [What a remote daemon must already have](#what-a-remote-daemon-must-already-have).
@@ -49,8 +49,8 @@ A field whose value the app refuses (a character ssh would misread, a key path t
 | Result | What to do |
 | --- | --- |
 | `<daemon> answered and is compatible with this app.` | Nothing: the daemon is ready. |
-| `This daemon is older than this app. The app has not connected, because it could misread …` (or `This app is older than the daemon. …`) | Update the older of the two so both run the same version. Until then the Dashboard offers **Connect anyway**, which uses the daemon as it is until you quit the app. |
-| `This daemon is older than this app, and the two cannot work together.` (or `This app is older than the daemon, …`) | Update the older of the two so both run the same version. Nothing overrides this. |
+| `This daemon is older than this app. The app has not connected, because it could misread …` (or `This app is older than the daemon. …`) | Update the older of the two so both run the same version. For a remote daemon older than the app, the Dashboard offers **Upgrade** ([below](#upgrade-a-remote-daemon)). Until then the Dashboard offers **Connect anyway**, which uses the daemon as it is until you quit the app. |
+| `This daemon is older than this app, and the two cannot work together.` (or `This app is older than the daemon, …`) | Update the older of the two so both run the same version; for a remote daemon older than the app, press **Upgrade** on the Dashboard ([below](#upgrade-a-remote-daemon)). Nothing overrides this. |
 | `This daemon and this app are different versions. …` | Each has changes the other lacks, which usually means two development builds. Run the same version of both. |
 | `The daemon turned this app away.` | Test again in a moment. If it keeps happening, restart the daemon on its host. |
 | `The ssh connection to <daemon> works, but nothing is listening on its daemon socket over there.` | Start a daemon on the host (below), then test again. |
@@ -76,6 +76,48 @@ A test also lists what your ssh config adds to the tunnel (for example port forw
    To have it come back after a logout, a crash or a reboot, run it under `systemd --user` or a macOS LaunchAgent as [Remote Environment Requirements](../remote-requirements.md#recommended-for-persistent-and-safe-use) describes.
 
 While the desktop app is connected to a daemon, that connection counts as a client, so the daemon does not idle out under it.
+
+## Upgrade a remote daemon
+
+When a remote daemon runs an older release than the app, the app offers **Upgrade** for it. It installs the app's version on that machine and restarts the daemon onto it, without leaving the app. It is the same upgrade as `dot-agent-deck remote upgrade <name>` in a terminal ([Remote Environments → Upgrade a remote](../remote-environments.md#upgrade-a-remote)): the same question when agents are running, and the same results.
+
+**Where it appears:**
+
+- On the Dashboard, on the daemon's section header, when the daemon is connected. Hovering it shows both versions.
+- In the **Incompatible daemon** note, when the app has refused the daemon because it is older, beside the note's other buttons.
+
+It does not appear when the daemon runs the same release as the app, when the daemon is newer than the app (update the app instead; upgrading the app is not done from here), or when the app could not learn the daemon's version. Upgrade is for remote daemons. For the daemon on this machine, update the deck the usual way and [recycle the daemon](../troubleshooting.md#recycling-the-daemon).
+
+**What happens when you press it:**
+
+1. A dialog says what it will do, for example `This installs 0.45.0 on build-box (its daemon runs 0.44.0 now) and restarts the daemon onto it.` Press **Upgrade**, or **Cancel** to do nothing.
+2. The dialog shows its progress: **Installing the new version**, **Restarting the daemon**, **Checking the new daemon answers**.
+3. If agents or orchestration roles are running on that daemon, it stops before restarting and lists every one the restart would stop, by name, with its pane and directory where the daemon knows them.
+   - **Restart now** stops exactly those and restarts the daemon onto the new version.
+   - **Keep current daemon**, the default, stops nothing: the new version stays installed, the old daemon keeps running your agents, and it runs the new version the next time it restarts. Closing the dialog or pressing `Escape` at this point is the same as **Keep current daemon**.
+   - If what is running changes while you decide, nothing is stopped and the dialog shows the new list and asks again.
+
+   With nothing running, there is nothing to ask, and the daemon restarts straight away.
+4. The dialog ends with what happened, in one of these forms:
+
+| Title | What it means | What to do |
+| --- | --- | --- |
+| **Daemon upgraded** | The daemon now runs the app's version. The dialog lists anything the restart stopped. The panes you had open on that daemon's agents close. | Nothing. Start new agents with **New agent**. |
+| **Daemon kept running** | The new version is installed, and the daemon keeps running the old one with the listed agents, because you chose to keep it, or because what was running kept changing while you were asked. | Press **Upgrade** again when those agents have finished. |
+| **Installed — the daemon could not restart itself** | The new version is installed, but the running daemon is from a release that cannot be asked to restart, so it keeps running the old version. | Do what the dialog says: from a terminal, `dot-agent-deck connect <name>` and accept its restart prompt, or `dot-agent-deck daemon restart` on that machine. Once the daemon runs this release or a later one, it can restart itself. |
+| **Installed — no daemon was running** | Nothing was running there, so nothing was restarted. | Start a daemon on that machine ([below](#what-a-remote-daemon-must-already-have)); it runs the new version. |
+| **Another restart is already running** | Someone else, from a terminal or another app, is restarting the same daemon. | Press **Reconnect** in a moment. |
+| **Upgrade failed** | A step failed, and the dialog says which one and why. When the install failed, nothing changed. When the restart failed, the new version is installed and the old daemon keeps running. | Fix what the reason names, then press **Upgrade** again. `dot-agent-deck remote doctor <name>` diagnoses the ssh setup and the install of a host. If it failed while checking the restarted daemon, see [Restarted, but the new daemon did not answer](#restarted-but-the-new-daemon-did-not-answer). |
+
+![The Upgrade dialog over the Dashboard for the remote daemon dev@build-box, titled Restart and stop these?: Installing the new version is ticked, Restarting the daemon is in progress, and the dialog lists the three agents the restart would stop, each with its directory, above a Keep current daemon button and a red Restart now button](/img/daemon-upgrade-desktop.png)
+
+**Check it worked:** the daemon's section shows its agents again (or **No agents are running yet**) and no longer offers **Upgrade**.
+
+The app installs over ssh from this computer, the way `remote upgrade` does, so the host needs what `remote add` needs: `curl` to download the release, or a Homebrew install of the deck, which it then upgrades with `brew` ([Remote Environment Requirements](../remote-requirements.md)). If the daemon is no longer in the deck list (`remotes.toml`), for example because it was removed with the CLI, the app says so and suggests `dot-agent-deck remote add`, or `dot-agent-deck remote upgrade` from a terminal. Pressing **Upgrade** again while an upgrade of the same daemon is running is refused.
+
+### Restarted, but the new daemon did not answer
+
+`It failed while checking the restarted daemon: restarted, but the new daemon did not answer within 20s` means the old daemon stopped and its replacement did not come up in time. If a systemd user service runs the daemon on that machine, this is expected: run `systemctl --user restart dot-agent-deck.service` there ([Keep the daemon running](../remote-requirements.md#keep-the-daemon-running)). Otherwise, start a daemon on the host as [above](#what-a-remote-daemon-must-already-have), or run `dot-agent-deck connect <name>`, which starts one. Then press **Reconnect**.
 
 ## Rename a remote daemon
 
