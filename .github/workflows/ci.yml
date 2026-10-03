@@ -910,7 +910,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          df -h "$GITHUB_WORKSPACE/.."
+          # A short, disk-backed runs root. Each sandbox's sockets live under
+          # `<runs root>/<branch slug>-<epoch>/`, and a Unix socket address is
+          # capped at 108 bytes: under the default root beside the checkout
+          # (`/home/runner/work/<repo>/dot-agent-deck-xver-runs`), a branch
+          # named like `agent/dispatch-issue-1507-tui-agent-order` overran it
+          # by 16 bytes and the run aborted before its first tell. `/` is the
+          # runner's ext4 disk, not a tmpfs, which the preflight requires.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0700 /xr
+          df -h / "$GITHUB_WORKSPACE/.."
       # The branch under test, and the release to pair it with. A PR is fetched
       # by `pull/<n>/head` from this repository, which also covers a fork's PR;
       # a dispatch tests the ref it was dispatched on.
@@ -977,7 +985,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           cargo xver --repo "$REPO" --branch "$BRANCH" --previous "$PREVIOUS" \
-            --direction both --probe generic --allow-build-changes --min-free-gib 15
+            --direction both --probe generic --allow-build-changes --min-free-gib 15 \
+            --runs-root /xr
       - name: Preserve the evidence
         if: always() && steps.plan.outputs.run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
