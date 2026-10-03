@@ -4237,7 +4237,11 @@ impl SilenceHarness {
         }
     }
 
-    async fn delegate_and_wait_for_pointer(&self) {
+    /// Returns the worker pane's delegation resolution epoch as it stood the
+    /// moment `handle_delegate` returned — before the dispatch it spawned has
+    /// run, so before the delivered pointer is confirmed and moves it. See
+    /// [`Self::wait_until_pointer_confirmed`].
+    async fn delegate_and_wait_for_pointer(&self) -> Option<u64> {
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -4252,6 +4256,7 @@ impl SilenceHarness {
                 &self.event_tx,
             )
             .await;
+        let armed = self.registry.delegation_resolution_epoch(WORKER_PANE);
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
@@ -4264,6 +4269,30 @@ impl SilenceHarness {
             "silence-watch precondition failed: worker never received pointer; snapshot = {:?}",
             String::from_utf8_lossy(&delivered)
         );
+        armed
+    }
+
+    /// Drive the runtime, without moving a paused clock, until the pointer
+    /// write has returned and been confirmed delivered — which is what arms
+    /// the silent-worker watch — and the watch's task has been polled once,
+    /// so its window is counted from the clock as it stands now.
+    ///
+    /// The pointer being VISIBLE is not that moment: its CR follows the
+    /// payload, and the PTY writes it on the pane writer's own thread (issue
+    /// #525), so the confirmation lands a runtime turn after the bytes do. A
+    /// test that pauses the clock as soon as the pointer shows and then
+    /// advances it can otherwise arm the watch after the advance.
+    async fn wait_until_pointer_confirmed(&self, armed: Option<u64>) {
+        assert!(
+            poll_until_after_time_advance(Duration::from_secs(5), || {
+                self.registry.delegation_resolution_epoch(WORKER_PANE) != armed
+            })
+            .await,
+            "the delivered pointer was never confirmed, so the silent-worker watch never armed"
+        );
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn start_draft_delegate(&self, supersede: bool) {
@@ -5521,12 +5550,10 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
 
             window.repoint(Some("18446744073709551616"));
             let harness = SilenceHarness::new(64).await;
-            harness.delegate_and_wait_for_pointer().await;
+            let armed = harness.delegate_and_wait_for_pointer().await;
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..3 {
-                tokio::task::yield_now().await;
-            }
+            harness.wait_until_pointer_confirmed(armed).await;
             std::thread::sleep(Duration::from_millis(50));
             let early = harness.orchestrator_snapshot();
             assert!(

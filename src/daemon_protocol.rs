@@ -6034,7 +6034,6 @@ async fn handle_attach_stream(
     loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
-                use std::io::Write;
                 // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
                 // just in the UI. If the focused session became non-live (a
                 // wrapped Codex pane that declared `history-only`, or a
@@ -6089,7 +6088,7 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
-                let mut w = writer.lock().await;
+                let w = writer.lock().await;
                 // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
                 // immediately before writing. A close/respawn (registry removal),
                 // a liveness transition, or a rebind can land WHILE this frame
@@ -6160,10 +6159,12 @@ async fn handle_attach_stream(
                     payload = %escape_bytes_for_log(&bytes),
                     "STREAM_IN forwarded to PTY writer"
                 );
-                if w.write_all(&bytes).is_err() {
+                // Issue #525: awaited, not written inline — the PTY is written
+                // by the pane writer's own thread, so a pane whose agent has
+                // stopped reading holds this task, never a runtime worker.
+                if w.write_user(&bytes).await.is_err() {
                     break;
                 }
-                let _ = w.flush();
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
                 // stamp the pane's deliver-on-idle debounce clock so a
                 // concurrent scheduled reuse fire queues its prompt instead of
@@ -6171,7 +6172,7 @@ async fn handle_attach_stream(
                 // key the reuse path delivers to).
                 //
                 // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
-                // released, and the `write_all` above stamps it too (the pane
+                // released, and the `write_user` above stamps it too (the pane
                 // writer observes every non-daemon byte — see
                 // `crate::agent_pty::PaneWriter`). This used to drop the writer
                 // first and stamp afterwards, and a guarded automatic sender

@@ -1610,6 +1610,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start, or one whose earlier request's response was lost — neither binds from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`), and both are still abandoned at the deadline (#1520); event-stream resynchronization after a reconnect, which this does not add; the wire field in isolation (`prompt/pane-input/009`); the spawned binary (`prompt/pane-input/044`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/046 — A send into a pane that stopped reading comes back as possibly delivered instead of hanging, and does not hold up other panes (issue #525).
+- **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; no LLM).
+- **Agent:** none — a `sh` that puts its terminal in raw mode (echo left on, so the send's first bytes show it has reached the PTY) and then `sleep`s without reading, and a plain `cat` started on the same daemon.
+- **Asserts:** an identified `WriteAndSubmit` of a 200 KB line into the stuck pane returns `ambiguous` within 30 s rather than never; a send to the `cat` pane made while that one is pending returns `applied` within 8 s and its text reaches the pane; and the dashboard shows `Error` once the stuck send is reported. Before #525 the stuck send never came back, because its `write(2)` blocked the daemon's runtime worker until the pane read.
+- **Does not assert:** which card carries the `Error` (the grid is searched as a whole); the exact stall bound; a real agent that stops reading (no agent can be made to on demand); the unit-level accounting of a stalled write (`a_stalled_guarded_write_is_ambiguous_and_later_writes_add_nothing_behind_it` and the other issue #525 tests in `src/agent_pty.rs`).
+- **Platform coverage:** linux (the stuck-pane shape needs a kernel that blocks the master's writer on a full raw-mode input queue, which the macOS runner's did not).
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -3551,6 +3558,7 @@ without depending on the config struct API.
 - **Why it exists:** nothing on the natural-exit path takes a role pane out of the daemon's routing maps (a close does, as does a failed orchestration spawn's rollback), so a role whose worker crashed or quit still resolved and `delegate` exited 0 with nothing printed while the pointer write failed later inside the detached dispatch. Confirmed red on `main` at `c7ef92f9` (`exit=Some(0)` for the second `steady` delegate), and red again with only the daemon's exited-occupant check disabled. The `fresh` arm is the issue's own guard against the cheap fix: with the check applied to every exited pane regardless of `clear`, it fails at that arm with exit 1 (verified).
 - **Does not assert:** a worker whose registry entry is gone entirely rather than exited (a closed pane is unregistered, and a `clear = true` re-create is `orchestration/delegate/022`); `pane restart`, which the CLI names as the remedy; the busy refusal (#580), which this test deliberately keeps out of the way.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell roles).
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1539"]` (CLAUDE.md rule 6). Its control step, the first delegate to a live `clear = false` worker of this fixture, intermittently misses its 30 s wait for the pointer. It was met as FLAKY on CI's `e2e-deterministic` (#1535) and reproduced on the pre-#525 tree under contention; #1539 has the evidence, the command that runs it (`--run-ignored only`), and what lifts the quarantine.
 
 #### orchestration/work-done
 
@@ -3668,6 +3676,7 @@ without depending on the config struct API.
 - **Why it exists:** the L2 counterpart of `orchestration/work-done/014`, through the real daemon's `StartAgent`, hook socket and token gate (Qodo, #1525). Verified red with only the crediting-time retire disabled: the orchestrator was told `Worker quitter has completed their task. Read .dot-agent-deck/work-done-quitter.md …`.
 - **Does not assert:** the rendered TUI grid (the daemon's own PTY snapshot of the orchestrator pane is what it reads); a successor that is itself delegated to before it reports, which the ledger's unit tests own (`commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own`).
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell roles).
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1539"]` (CLAUDE.md rule 6). Its control step, the first delegate to a live `clear = false` worker of this fixture, intermittently misses its 30 s wait for the pointer. It was met as FLAKY on CI's `e2e-deterministic` (#1535) and reproduced on the pre-#525 tree under contention; #1539 has the evidence, the command that runs it (`--run-ignored only`), and what lifts the quarantine.
 
 #### orchestration/provenance
 
@@ -6486,6 +6495,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Verified load-bearing:** red on the pre-fix code (the pane's live agent read before the state lock, and a rejected event still reaching the episode logic) with no notice for `overwritten-worker` or `cancelled-worker` and one for `control-worker`. The two halves of the fix are each sufficient on their own for these interleavings — green with only the admission gate (a rejected event touches no episode), green with only the live agent read under the state lock — and red with both removed.
 - **Does not assert:** a SUCCESSOR's own admitted report arriving while the pane's owner is being read — the window between a spawn reserving the new generation and publishing it, which no test seam can hold open; the under-lock read covers it for a successor published by the time the event is applied, and one still unpublished then opens no episode until its next report. Also not asserted: the registry-level scoping of a cancel to the episode's own agent (`agent_pty::spawn_tests::waiting_notice_episode_is_one_per_generation_and_cancellable`); a `clear = true` delegate performing the replacement itself, which this test does by hand to control the ordering; and the rendering in an attached TUI.
 - **Platform coverage:** mac+linux.
+- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1526"]` (CLAUDE.md rule 6). It lost the `overwritten-worker` waiting notice on STARVED `e2e-deterministic` runs of PR #1535 (load 80–97 on 4 vCPUs, `cpu some 100%`), the same signature as `scheduler/idle-worker/021`, and passed every local run, including pinned beside CPU burners; #1526 has the runs, the command that runs it (`--run-ignored only`), and what lifts the quarantine.
 
 ##### scheduler/idle-worker/024 — A blocked worker with an outstanding delegation notifies the orchestrator once without retiring the ledger (issue #714).
 - **Layer:** L2, lane 1, PTY-attached; the notice and ledger require the running daemon path.

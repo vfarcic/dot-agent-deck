@@ -2271,6 +2271,10 @@ fn worker_hook_event(
 /// Scenario: Delegate to three workers whose agents are each replaced in their pane by a successor that is already waiting for input when it is delegated to again. For two of them a hook event from the REPLACED agent reaches the daemon's real ingestion first, reads the pane's owner, and is held on the state lock until the replacement has happened — one reporting `WaitingForInput`, the other, after an untagged report repainted the successor's card, reporting `thinking`. The orchestrator pane must receive exactly one waiting-for-input notice about each successor, the third worker being the control with no stale event at all.
 #[spec("scheduler/idle-worker/023")]
 #[test]
+// Quarantined (CLAUDE.md rule 6): the same starved-runner loss of a waiting
+// notice as `idle-worker/021`, met on PR #1535's `e2e-deterministic` runs and
+// green locally. #1526 has both, how to run them, and what lifts them.
+#[ignore = "quarantined: vfarcic, #1526"]
 fn idle_worker_023_a_replaced_agents_stale_report_cannot_erase_its_successors_wait() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(Some("600000"));
