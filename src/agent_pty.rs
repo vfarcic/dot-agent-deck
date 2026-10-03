@@ -21148,24 +21148,40 @@ mod spawn_tests {
             })
             .expect("spawn stand-in");
 
-        // No draft and a free writer, so everything up to the first byte takes
-        // well under a millisecond — and the deadline then falls inside the
-        // write's own `SUBMIT_DELAY`, after the payload and before the CR.
-        let started = Instant::now();
-        let deadline = started + SUBMIT_DELAY / 2;
-        let sent = tokio::time::timeout(
-            Duration::from_secs(5),
-            registry.write_and_submit_guarded_first_write_within(
-                PANE,
-                TEXT,
-                &agent,
-                || async { true },
-                started,
-                deadline,
-            ),
-        )
-        .await
-        .expect("bounded");
+        // No draft and a free writer, so everything up to the first byte
+        // normally takes well under a millisecond — and the deadline then falls
+        // inside the write's own `SUBMIT_DELAY`, after the payload and before
+        // the CR. On a starved machine the prelude alone can outlast the
+        // deadline, which ends the call with `DeadlineElapsed` and NOTHING
+        // written (measured at load ~50: 1.3 s for this test, failing it).
+        // That is the other, correct branch of the same contract, so it is
+        // retried with a fresh deadline rather than read as this test's
+        // failure; the echo count below proves no earlier attempt wrote a
+        // byte, and a deadline that cancelled a write under way would fail
+        // every attempt.
+        let mut attempts = 0;
+        let (sent, deadline) = loop {
+            attempts += 1;
+            let started = Instant::now();
+            let deadline = started + SUBMIT_DELAY / 2;
+            let sent = tokio::time::timeout(
+                Duration::from_secs(5),
+                registry.write_and_submit_guarded_first_write_within(
+                    PANE,
+                    TEXT,
+                    &agent,
+                    || async { true },
+                    started,
+                    deadline,
+                ),
+            )
+            .await
+            .expect("bounded");
+            match sent {
+                Err(AgentPtyError::DeadlineElapsed) if attempts < 20 => continue,
+                sent => break (sent, deadline),
+            }
+        };
         assert!(
             Instant::now() >= deadline,
             "precondition: the write must outlive its deadline"
