@@ -27,7 +27,7 @@ use crate::issue_dispatch_run::KeptWorktree;
 // `KbAction` = a remappable keybinding action (MoveDown, Help, …).
 use crate::keybindings::{Action as KbAction, KeybindingConfig};
 use crate::palette;
-use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
+use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome, SubmitReply};
 use crate::project_config::{OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, ConfirmedSubmission,
@@ -1891,6 +1891,56 @@ struct PromptDelivery {
     /// that laundered a `/clear` into an authorization, and `prompt/pane-input/026`
     /// for the drifting-session-id pane it would abandon.
     observed_generation: Option<String>,
+    /// Issue #621: the generation the DAEMON named when it refused this
+    /// delivery `stale` for naming none — the pane's current conversation as
+    /// the authoritative state saw it, which this TUI's own view may never
+    /// learn. The event subscriber does not replay what it missed across a
+    /// reconnect, so a dropped `SessionStart` leaves
+    /// `AppState::pane_hook_session_id` at `None` for an agent that is sitting
+    /// idle, waiting for exactly the prompt it would take to make it emit
+    /// anything else.
+    ///
+    /// Recorded only while the delivery is unbound AND has written nothing
+    /// (`attempts == 0`), and consumed by [`bind_delivery_generation`] under
+    /// that same precondition, so it is the snapshot bind with one more source
+    /// rather than a new kind of binding: it names the conversation the bytes
+    /// are about to enter and claims nothing retroactively. A delivery that has
+    /// already written cannot use one — from a point-in-time answer it cannot
+    /// tell the conversation it wrote into from a successor whose predecessor
+    /// ended while it was not looking (the #424 H4 sequence), which is what the
+    /// closure count exists to see and what a dropped event stream also drops.
+    ///
+    /// [`delivery_target_changed`] reads it as the pane's current generation
+    /// while the snapshot has none, which is the one place the snapshot's
+    /// silence would otherwise read as the bound conversation having gone.
+    ///
+    /// How it sits beside issue #532's rule that, once a pane has a generation,
+    /// only a genuine `SessionStart` moves it. It is never written into
+    /// `AppState`, so it cannot move the TUI's generation at all: it is
+    /// per-delivery, and consulted only where the snapshot has NO generation.
+    /// The moment the snapshot holds one — a `SessionStart`, a first frame on
+    /// a pane that had none, or the daemon's `SessionSnapshot::hook_generation`
+    /// adopted at hydration — the snapshot wins in both places. On the daemon
+    /// side the value it carries IS the `pane_hook_session` entry that rule
+    /// governs, read by the guard that refused, so it is exactly what a named
+    /// retry is compared against. Hydration runs when the TUI starts or attaches
+    /// a pane, not when the event subscriber reconnects, which is why a running
+    /// TUI still needs this.
+    refusal_generation: Option<String>,
+    /// Issue #621 (review): some request of this delivery failed after it may
+    /// have reached the daemon's write, so it may have written although
+    /// `attempts` is still 0 — a write the daemon applied whose response was
+    /// lost. A failure the controller knows came before the request (a failed
+    /// capability probe or connection) does not set it. A refusal's generation must
+    /// not be adopted then: binding it would treat the delivery as unwritten
+    /// and name a conversation the earlier bytes may never have entered, which
+    /// is the #424 H4 hazard the snapshot bind answers with the closure count
+    /// and a refusal cannot. The daemon's delivery ledger normally replays such
+    /// a write's `Applied` for the same wire id, so this is the fallback for when
+    /// it does not (an evicted record, a changed wire identity), not the common
+    /// path. Sticky: one uncertain request keeps the delivery on the old
+    /// behaviour for its lifetime.
+    write_unacknowledged: bool,
     /// Issue #424 H4 (auditor HIGH): the pane's generation-CLOSURE count at the
     /// instant of the FIRST write. `None` until then — nothing is written, so
     /// nothing can have been revoked.
@@ -3926,7 +3976,7 @@ fn process_pending_seed_prompts(
         // seed falls through to the deadline below, which ends it without a
         // second write. See [`InFlightPromptSend`].
         if let Some(sending) = in_flight.get_mut(&sp.pane_id) {
-            let polled = sending.pending.poll();
+            let polled = sending.pending.poll_reply();
             if polled.is_none() && sp.created_at.elapsed() <= AUTOMATIC_PROMPT_DEADLINE {
                 return true;
             }
@@ -4098,6 +4148,8 @@ fn process_pending_seed_prompts(
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
                     expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
                     observed_generation: None,
+                    refusal_generation: None,
+                    write_unacknowledged: false,
                     closures_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
@@ -4203,7 +4255,7 @@ fn process_pending_seed_prompts(
                 expected_session_id.as_deref(),
                 Some(&wire_delivery_id),
             );
-            return match pending.poll() {
+            return match pending.poll_reply() {
                 Some(outcome) => apply_seed_send_outcome(
                     outcome,
                     &issued,
@@ -4239,7 +4291,7 @@ fn process_pending_seed_prompts(
 /// retained.
 #[allow(clippy::too_many_arguments)]
 fn apply_seed_send_outcome(
-    outcome: Result<SendResult, PaneError>,
+    reply: SubmitReply,
     issued: &IssuedPromptSend,
     pane_id: &str,
     snapshot: &AppState,
@@ -4257,6 +4309,11 @@ fn apply_seed_send_outcome(
         issued.capability,
         issued.already_written,
     );
+    let SubmitReply {
+        result: outcome,
+        current_session_id,
+        may_have_written,
+    } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this
         // means. Whether the agent's TUI was in submit-CR-aware mode
@@ -4341,6 +4398,13 @@ fn apply_seed_send_outcome(
         // feedback. Bounded by the deadline checked at the top of the
         // delivery closure (finding #13) — never a forever loop.
         Ok(other) => {
+            // Issue #621: a `stale` may name the conversation the retry has to
+            // name — the one this TUI's event stream may never deliver.
+            if other == SendResult::Stale
+                && let Some(delivery) = deliveries.get_mut(pane_id)
+            {
+                note_refusal_generation(delivery, current_session_id);
+            }
             schedule_send_retry(backoff, pane_id, now);
             *feedback = Some(format!(
                 "Seed prompt not delivered ({}); will retry",
@@ -4350,6 +4414,13 @@ fn apply_seed_send_outcome(
         }
         // Transport failure: retain for retry, back off, surface feedback.
         Err(e) => {
+            // Issue #621 (review): not proof that nothing was written — see
+            // [`PromptDelivery::write_unacknowledged`] — unless the controller
+            // knows the failure came before the request could reach the
+            // daemon (a failed capability probe or connection), which is.
+            if may_have_written && let Some(delivery) = deliveries.get_mut(pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(backoff, pane_id, now);
             *feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
             true
@@ -4419,6 +4490,8 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             expected_agent_id,
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
@@ -4595,17 +4668,13 @@ enum SubmissionEvidence {
 /// is the same one-handoff shape [`crate::state::latch_generation`] applies on
 /// the daemon side.
 ///
-/// **Known residual (issue #532).** A pane hosting a wrapped agent has TWO
-/// producers under one registry agent id — `dot-agent-deck wrap` emits under
-/// `{pane}-session`, the wrapped agent's native hooks under their own id — and
-/// `AppState::pane_hook_session` tracks whichever event is newest, so the pane's
-/// "current generation" alternates between them. This check then reads that
-/// alternation as a lost target and abandons. The daemon's own send guard
-/// already refuses the same shape (it requires an EXACT match against the
-/// current generation), so this makes an existing intermittent refusal
-/// deterministic one frame earlier rather than introducing a new failure; the
-/// fix belongs at `pane_hook_session`, which should not treat a non-announcing
-/// frame from a second producer as a generation.
+/// A pane hosting a wrapped agent has TWO producers under one registry agent
+/// id — `dot-agent-deck wrap` emits under `{pane}-session`, the wrapped agent's
+/// native hooks under their own id. Until issue #532 `AppState::pane_hook_session`
+/// followed whichever of them spoke last, so this check read the alternation as
+/// a lost target and abandoned. It now moves an established generation only on
+/// a genuine `SessionStart`, so the wrapper's ordinary frames leave the target
+/// this delivery bound alone (`prompt/pane-input/043`).
 fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &PromptDelivery) -> bool {
     // Issue #424 S4 (reviewer HIGH): "nothing has been written" is
     // `attempts == 0` AND no baseline, not `attempts == 0` alone. A daemon can
@@ -4645,8 +4714,15 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
     let Some(reference) = reference else {
         return false;
     };
+    // Issue #621: a snapshot with NO generation is not evidence that the bound
+    // one went away when the daemon itself named it and this view never
+    // received it — see [`PromptDelivery::refusal_generation`]. Only the
+    // absence is overridden: a generation the snapshot does observe still
+    // decides, and an end it observes was already caught by the closure count
+    // above.
     snapshot
         .pane_hook_session_id(pane_id)
+        .or_else(|| delivery.refusal_generation.clone())
         .is_none_or(|current| current != reference)
 }
 
@@ -4675,10 +4751,10 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 ///   appears after the write is not that conversation — we never addressed it —
 ///   so adopting it retroactively claims a target this delivery never had, and
 ///   any later generation on that pane then reads as a lost target. That is not
-///   hypothetical: the snapshot's `pane_hook_session` advances on ANY event
-///   carrying a pane id, including one from a producer that never announced a
-///   session, so a pane whose events carry drifting session ids would abandon
-///   deliveries it never endangered (`prompt/pane-input/026`).
+///   hypothetical: the snapshot's `pane_hook_session` is ESTABLISHED by any
+///   event carrying a pane id, including one from a producer that never
+///   announced a session, so binding retroactively would claim a target this
+///   delivery never addressed (`prompt/pane-input/026`).
 ///
 /// A prompt written into a pane that had NO generation — the 10 s-fallback
 /// launcher case — therefore stays UNBOUND for as long as it is merely being
@@ -4691,9 +4767,18 @@ fn delivery_target_changed(snapshot: &AppState, pane_id: &str, delivery: &Prompt
 /// and is refreshed on EVERY frame — that half is what lets a late-identifying
 /// producer still arm its retries.
 fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
+    // Issue #621: the snapshot first, and the generation a `stale` refusal named
+    // only where the snapshot has none — the case where this view dropped the
+    // `SessionStart` and will not see it again. Same once-only, before-the-first-
+    // write precondition either way; see [`PromptDelivery::refusal_generation`].
     if delivery.expected_session_id.is_none()
         && delivery.attempts == 0
-        && let Some(current) = snapshot.pane_hook_session_id(pane_id)
+        && let Some(current) = snapshot.pane_hook_session_id(pane_id).or_else(|| {
+            delivery
+                .refusal_generation
+                .clone()
+                .filter(|_| !delivery.write_unacknowledged)
+        })
     {
         adopt_generation(delivery, current);
     }
@@ -4762,10 +4847,9 @@ fn bind_delivery_generation(delivery: &mut PromptDelivery, snapshot: &AppState, 
 /// The `prompt/pane-input/026` counter-example that argued against binding late
 /// does not reach this: it concerned a pane whose ORDINARY frames carry drifting
 /// session ids, and the daemon-side latch now treats only a `SessionStart` as an
-/// announcement. The residual that does remain is #532's wrapped-agent
-/// alternation, which `AppState::pane_hook_session` still tracks across two
-/// producers; that shows up as an abandoned delivery — the safe direction — and
-/// is already documented on [`delivery_target_changed`].
+/// announcement — and since issue #532 so does `AppState::pane_hook_session`
+/// once a pane has a generation, which is what ended the wrapped-agent
+/// alternation documented on [`delivery_target_changed`].
 fn bind_generation_before_retry(delivery: &mut PromptDelivery, snapshot: &AppState, pane_id: &str) {
     if delivery.attempts == 0 || delivery.expected_session_id.is_some() {
         return;
@@ -4788,6 +4872,24 @@ fn adopt_generation(delivery: &mut PromptDelivery, generation: String) {
     if delivery.wire_issued {
         delivery.epoch = delivery.epoch.saturating_add(1);
         delivery.wire_issued = false;
+    }
+}
+
+/// Issue #621: keep the generation a `stale` refusal named, for
+/// [`bind_delivery_generation`] to bind on the next pass. Only for a delivery
+/// that is still unbound and has written nothing — the precondition the bind
+/// itself enforces, checked here too so the field never holds a value that
+/// could not be used — and none of whose requests ended in a transport error,
+/// which may have written regardless ([`PromptDelivery::write_unacknowledged`]). A newer refusal replaces an older one: until the
+/// delivery binds, the latest generation the daemon reported is the one the
+/// next attempt has to name.
+fn note_refusal_generation(delivery: &mut PromptDelivery, generation: Option<String>) {
+    if delivery.expected_session_id.is_none()
+        && delivery.attempts == 0
+        && !delivery.write_unacknowledged
+        && let Some(generation) = generation
+    {
+        delivery.refusal_generation = Some(generation);
     }
 }
 
@@ -4936,12 +5038,11 @@ fn evidence_channel_is_unidentified(
 ///
 /// The discriminator is [`crate::state::latch_generation`]'s, for its reasons: a
 /// `SessionStart` is self-describing and authoritative, and anything else is
-/// inference. `AppState::pane_hook_session` deliberately advances on ANY frame
-/// carrying a pane id — good for the send guard, useless as evidence that a
-/// conversation began — so reading it raw would make a pane whose ordinary
-/// events drift through session ids look like a rolling series of
-/// conversations. That pane is `prompt/pane-input/026`, and it is also the #532
-/// wrapped-agent alternation.
+/// inference. `AppState::pane_hook_session` deliberately lets ANY frame carrying
+/// a pane id ESTABLISH a generation on a pane that has none — good for the send
+/// guard, useless as evidence that a conversation began — so reading it raw
+/// would make an inferred generation look like an announced one. That pane is
+/// `prompt/pane-input/026`.
 ///
 /// Matched by TIMESTAMP rather than by session id, because the two are not the
 /// same string by the time they reach here: `AppState::apply_event`'s reuse
@@ -5177,7 +5278,7 @@ fn deliver_orchestrator_prompt(
     // deadline below, which ends it without a second write. See
     // [`InFlightPromptSend`].
     if let Some(sending) = ui.in_flight_prompt_sends.get_mut(start_pane_id.as_str()) {
-        let polled = sending.pending.poll();
+        let polled = sending.pending.poll_reply();
         if polled.is_none() && !deadline_passed {
             return;
         }
@@ -5466,7 +5567,7 @@ fn deliver_orchestrator_prompt(
         expected_session_id.as_deref(),
         wire_delivery_id.as_deref(),
     );
-    match pending.poll() {
+    match pending.poll_reply() {
         Some(outcome) => apply_orchestrator_send_outcome(
             ui,
             outcome,
@@ -5494,7 +5595,7 @@ fn deliver_orchestrator_prompt(
 #[allow(clippy::too_many_arguments)]
 fn apply_orchestrator_send_outcome(
     ui: &mut UiState,
-    outcome: Result<SendResult, PaneError>,
+    reply: SubmitReply,
     issued: &IssuedPromptSend,
     snapshot: &AppState,
     now: std::time::Instant,
@@ -5512,6 +5613,11 @@ fn apply_orchestrator_send_outcome(
         issued.watermark,
         issued.capability,
     );
+    let SubmitReply {
+        result: outcome,
+        current_session_id,
+        may_have_written,
+    } = reply;
     match outcome {
         // Issue #424: the PTY accepted the bytes — that is ALL this means. The
         // prompt, the role's non-`Working` status, the delivery identity and the
@@ -5590,6 +5696,12 @@ fn apply_orchestrator_send_outcome(
             );
         }
         Ok(other) => {
+            // Issue #621: the seed path's twin — see `apply_seed_send_outcome`.
+            if other == SendResult::Stale
+                && let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id)
+            {
+                note_refusal_generation(delivery, current_session_id);
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             let msg = if other == SendResult::HistoryOnly {
                 "History-only session cannot accept live input".to_string()
@@ -5602,6 +5714,10 @@ fn apply_orchestrator_send_outcome(
             ui.status_message = Some((msg, now));
         }
         Err(e) => {
+            // Issue #621 (review): the seed path's twin.
+            if may_have_written && let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id) {
+                delivery.write_unacknowledged = true;
+            }
             schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
             ui.status_message = Some((
                 format!("Orchestrator prompt not delivered ({e}); will retry"),
@@ -37940,6 +38056,723 @@ mod tests {
         }
     }
 
+    /// Issue #621: a TUI prompt-delivery consumer wired to the PRODUCTION daemon
+    /// handler over a real attach socket, rather than to a double that imitates
+    /// it. The daemon owns its own `AppState` — the authoritative one, which
+    /// knows the pane's hook generation — and the test hands the delivery loop a
+    /// SEPARATE client snapshot, so the two can disagree exactly the way they do
+    /// when the TUI's event subscriber dropped a `SessionStart` across a
+    /// reconnect.
+    ///
+    /// The target is `/bin/cat`, so a payload that reaches the PTY is visible in
+    /// the registry's buffer: that buffer, not the controller's own bookkeeping,
+    /// is what "delivered" means in the assertions.
+    #[cfg(unix)]
+    struct DaemonBackedPaneController {
+        registry: Arc<crate::agent_pty::AgentPtyRegistry>,
+        state: crate::state::SharedState,
+        agent_id: String,
+        client: crate::daemon_client::DaemonClient,
+        runtime: tokio::runtime::Runtime,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl DaemonBackedPaneController {
+        fn new(pane_id: &str) -> Self {
+            crate::test_isolation::detach_from_any_live_deck();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("build the daemon test runtime");
+            let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane_id.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn the daemon-side byte-observation target");
+            let state: crate::state::SharedState =
+                Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            runtime.block_on(async {
+                state.write().await.register_pane(pane_id.to_string());
+            });
+            let (dir, path, listener) = {
+                // The listener registers with the reactor as it is built.
+                let _runtime = runtime.enter();
+                let dir = crate::test_temp::tempdir().expect("scratch dir for the socket");
+                let path = dir.path().join("attach.sock");
+                let listener = crate::daemon_protocol::bind_attach_listener(&path)
+                    .expect("bind the attach socket");
+                (dir, path, listener)
+            };
+            let (served_registry, served_state) = (registry.clone(), state.clone());
+            runtime.spawn(async move {
+                let (events, _) = tokio::sync::broadcast::channel(16);
+                let _ = crate::daemon_protocol::serve_attach_with_counter(
+                    listener,
+                    served_registry,
+                    events,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    served_state,
+                    None,
+                    Arc::new(crate::scheduler::Scheduler::with_stderr_notifier()),
+                    crate::spawn::new_reuse_registry(),
+                    crate::issue_dispatch_run::new_worktree_registry(),
+                )
+                .await;
+            });
+            Self {
+                registry,
+                state,
+                agent_id,
+                client: crate::daemon_client::DaemonClient::new(path),
+                runtime,
+                _dir: dir,
+            }
+        }
+
+        /// Announce `session_id` on the DAEMON's state only — the client
+        /// snapshot the delivery loop reads never sees it.
+        fn announce_on_daemon(&self, pane_id: &str, session_id: &str) {
+            let event = AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(self.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(crate::event::LiveTarget {
+                    kind: crate::event::TargetKind::Pty,
+                    writable: crate::event::Writable::Live,
+                }),
+            };
+            self.runtime.block_on(async {
+                self.state.write().await.apply_event(event);
+            });
+        }
+
+        fn delivered(&self, payload: &str) -> bool {
+            let buffer = self
+                .registry
+                .snapshot(&self.agent_id)
+                .expect("daemon-side byte-observation snapshot");
+            buffer
+                .windows(payload.len())
+                .any(|window| window == payload.as_bytes())
+        }
+    }
+
+    #[cfg(unix)]
+    impl PaneController for DaemonBackedPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some(self.agent_id.clone())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        /// The production controller's submit, verbatim: the render loop is
+        /// handed the same polled handle, carrying the same reply.
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            crate::embedded_pane::begin_guarded_submit(
+                self.runtime.handle(),
+                self.client.clone(),
+                pane_id,
+                text,
+                expected_agent_id,
+                expected_session_id,
+                delivery_id,
+            )
+        }
+        fn name(&self) -> &str {
+            "daemon-backed"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #621: run render passes of the seed path until `delivered` holds or
+    /// `frames` passes have run, collapsing every retry backoff so each pass is
+    /// a real attempt. An in-flight write is waited for (bounded) rather than
+    /// counted as a pass, because the daemon holds a submit's CR until it
+    /// renders.
+    #[cfg(unix)]
+    fn drive_seed_frames(
+        ui: &mut UiState,
+        pane: &Arc<dyn PaneController>,
+        snapshot: &AppState,
+        pane_id: &str,
+        frames: usize,
+        delivered: impl Fn() -> bool,
+    ) {
+        for _ in 0..frames {
+            if delivered() {
+                return;
+            }
+            process_pending_seed_prompts(ui, pane, snapshot);
+            let waited = std::time::Instant::now();
+            while ui.in_flight_prompt_sends.contains_key(pane_id)
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                process_pending_seed_prompts(ui, pane, snapshot);
+            }
+            if let Some(backoff) = ui.send_retry_backoff.get_mut(pane_id) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
+        }
+    }
+
+    /// Scenario: Start an agent whose daemon has recorded its conversation while the TUI's own view never received that `SessionStart` (the event stream dropped it across a reconnect), then let the seed and orchestrator prompts go out. Every unnamed write is refused `stale`, and the prompt must still reach the agent's pane, naming the conversation the daemon reported; a control where the TUI does see the start after one `stale` delivers too, without counting that refusal as an attempt.
+    #[cfg(unix)]
+    #[spec("prompt/pane-input/045")]
+    #[test]
+    fn pane_input_045_dropped_session_start_still_delivers_the_prompt() {
+        const GENERATION: &str = "daemon-only-generation-621";
+
+        // The reported case: the daemon knows the generation, the TUI never will.
+        const SEED_PANE: &str = "dropped-start-seed-pane";
+        const SEED_PROMPT: &str = "SEED-REACHED-THE-AGENT-621";
+        let seed_daemon = Arc::new(DaemonBackedPaneController::new(SEED_PANE));
+        seed_daemon.announce_on_daemon(SEED_PANE, GENERATION);
+        let seed_pane: Arc<dyn PaneController> = seed_daemon.clone();
+        let mut seed_ui = default_ui();
+        // Nothing announced a conversation in the TUI's view, so the 10-second
+        // fallback is the door — exactly what a dropped `SessionStart` leaves.
+        seed_ui
+            .pending_seed_prompts
+            .push(aged_seed_prompt(SEED_PANE, SEED_PROMPT));
+        let seed_snapshot = ready_prompt_snapshot(SEED_PANE, &seed_daemon.agent_id);
+        assert_eq!(
+            seed_snapshot.pane_hook_session_id(SEED_PANE),
+            None,
+            "precondition: the TUI's view never received the SessionStart"
+        );
+        drive_seed_frames(
+            &mut seed_ui,
+            &seed_pane,
+            &seed_snapshot,
+            SEED_PANE,
+            5,
+            || seed_daemon.delivered(SEED_PROMPT),
+        );
+        let seed_bound = seed_ui
+            .prompt_delivery
+            .get(SEED_PANE)
+            .and_then(|d| d.expected_session_id.clone());
+        let seed_delivered = seed_daemon.delivered(SEED_PROMPT);
+        // The pass AFTER the write: the TUI's view still has no generation, and
+        // that silence must not read as the bound conversation having ended —
+        // the seed stays held for its confirmation instead of being abandoned
+        // as "the agent's conversation changed" with its bytes already typed.
+        process_pending_seed_prompts(&mut seed_ui, &seed_pane, &seed_snapshot);
+        let seed_still_held = seed_ui
+            .pending_seed_prompts
+            .iter()
+            .any(|sp| sp.pane_id == SEED_PANE);
+        let seed_status = seed_ui
+            .status_message
+            .as_ref()
+            .map(|(message, _)| message.clone());
+        seed_daemon.registry.shutdown_all();
+        assert!(
+            seed_delivered && seed_bound.as_deref() == Some(GENERATION),
+            "a seed whose SessionStart the TUI never saw must still reach the agent, bound to the \
+             generation the daemon's refusal named; delivered={seed_delivered}, bound={seed_bound:?}"
+        );
+        assert!(
+            seed_still_held
+                && !seed_status
+                    .as_deref()
+                    .is_some_and(|m| m.contains("abandoned")),
+            "a delivered seed must stay held for confirmation on the next pass, not be abandoned \
+             because the TUI's own view never saw the generation; held={seed_still_held}, \
+             status={seed_status:?}"
+        );
+
+        // The orchestrator twin.
+        const ROLE_PANE: &str = "dropped-start-orchestrator-pane";
+        const ROLE_PROMPT: &str = "ROLE-PROMPT-REACHED-THE-AGENT-621";
+        let role_daemon = Arc::new(DaemonBackedPaneController::new(ROLE_PANE));
+        role_daemon.announce_on_daemon(ROLE_PANE, GENERATION);
+        let role_pane: Arc<dyn PaneController> = role_daemon.clone();
+        let tab_id: TabId = 62100;
+        let started = std::time::Instant::now();
+        let mut role_ui = default_ui();
+        role_ui.orchestration_prompt_anchor_at.insert(
+            tab_id,
+            started
+                .checked_sub(
+                    SPAWN_TIME_READINESS_TIMEOUT
+                        + SPAWN_TIME_READINESS_BUFFER
+                        + std::time::Duration::from_millis(100),
+                )
+                .expect("aged anchor timestamp"),
+        );
+        let role_snapshot = ready_prompt_snapshot(ROLE_PANE, &role_daemon.agent_id);
+        let role_panes = [ROLE_PANE.to_string()];
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut role_prompt = Some(ROLE_PROMPT.to_string());
+        for _ in 0..5 {
+            if role_daemon.delivered(ROLE_PROMPT) {
+                break;
+            }
+            deliver_orchestrator_prompt(
+                &mut role_ui,
+                role_pane.as_ref(),
+                &role_snapshot,
+                std::time::Instant::now(),
+                tab_id,
+                &role_panes,
+                0,
+                &mut role_statuses,
+                &mut role_prompt,
+            );
+            let waited = std::time::Instant::now();
+            while role_ui.in_flight_prompt_sends.contains_key(ROLE_PANE)
+                && waited.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                deliver_orchestrator_prompt(
+                    &mut role_ui,
+                    role_pane.as_ref(),
+                    &role_snapshot,
+                    std::time::Instant::now(),
+                    tab_id,
+                    &role_panes,
+                    0,
+                    &mut role_statuses,
+                    &mut role_prompt,
+                );
+            }
+            if let Some(backoff) = role_ui.send_retry_backoff.get_mut(ROLE_PANE) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
+        }
+        let role_bound = role_ui
+            .prompt_delivery
+            .get(ROLE_PANE)
+            .and_then(|d| d.expected_session_id.clone());
+        let role_delivered = role_daemon.delivered(ROLE_PROMPT);
+        // The pass after the write, as for the seed above.
+        deliver_orchestrator_prompt(
+            &mut role_ui,
+            role_pane.as_ref(),
+            &role_snapshot,
+            std::time::Instant::now(),
+            tab_id,
+            &role_panes,
+            0,
+            &mut role_statuses,
+            &mut role_prompt,
+        );
+        let role_abandoned = role_ui.orchestration_remit_abandoned.contains(&tab_id);
+        role_daemon.registry.shutdown_all();
+        assert!(
+            role_delivered && role_bound.as_deref() == Some(GENERATION),
+            "an orchestrator prompt whose SessionStart the TUI never saw must still reach the \
+             agent, bound to the generation the daemon's refusal named; \
+             delivered={role_delivered}, bound={role_bound:?}"
+        );
+        assert!(
+            role_prompt.is_some() && !role_abandoned,
+            "a delivered role prompt must stay held for confirmation on the next pass, not be \
+             abandoned because the TUI's own view never saw the generation; \
+             prompt_held={}, abandoned={role_abandoned}",
+            role_prompt.is_some()
+        );
+
+        // Control: the ordinary race. The TUI's view is one event behind for one
+        // pass — one safe `stale` — and then observes the start itself.
+        const RACE_PANE: &str = "ordinary-race-seed-pane";
+        const RACE_PROMPT: &str = "RACE-SEED-REACHED-THE-AGENT-621";
+        let race_daemon = Arc::new(DaemonBackedPaneController::new(RACE_PANE));
+        race_daemon.announce_on_daemon(RACE_PANE, GENERATION);
+        let race_pane: Arc<dyn PaneController> = race_daemon.clone();
+        let mut race_ui = default_ui();
+        race_ui
+            .pending_seed_prompts
+            .push(aged_seed_prompt(RACE_PANE, RACE_PROMPT));
+        let mut race_snapshot = ready_prompt_snapshot(RACE_PANE, &race_daemon.agent_id);
+        drive_seed_frames(
+            &mut race_ui,
+            &race_pane,
+            &race_snapshot,
+            RACE_PANE,
+            1,
+            || race_daemon.delivered(RACE_PROMPT),
+        );
+        let after_refusal = race_ui
+            .prompt_delivery
+            .get(RACE_PANE)
+            .map(|d| d.attempts)
+            .expect("a refused seed keeps its delivery");
+        apply_generation_event(
+            &mut race_snapshot,
+            RACE_PANE,
+            &race_daemon.agent_id,
+            GENERATION,
+            EventType::SessionStart,
+        );
+        drive_seed_frames(
+            &mut race_ui,
+            &race_pane,
+            &race_snapshot,
+            RACE_PANE,
+            3,
+            || race_daemon.delivered(RACE_PROMPT),
+        );
+        let race_delivered = race_daemon.delivered(RACE_PROMPT);
+        race_daemon.registry.shutdown_all();
+        assert_eq!(
+            after_refusal, 0,
+            "control: a `stale` refusal writes nothing, so it must not count as an attempt"
+        );
+        assert!(
+            race_delivered,
+            "control: once the TUI observes the start itself, the seed binds it and is delivered"
+        );
+    }
+
+    /// Issue #621: the generation a `stale` refusal names is the snapshot bind
+    /// with one more source, so it inherits the bind's precondition exactly. A
+    /// delivery that has already WRITTEN must not adopt it — a point-in-time
+    /// answer cannot tell the conversation those bytes entered from a successor
+    /// whose predecessor ended while the event stream was down — and a delivery
+    /// already BOUND must never be redirected by it into another conversation.
+    #[test]
+    fn refusal_generation_binds_only_an_unwritten_unbound_delivery() {
+        const PANE_ID: &str = "refusal-generation-policy-pane";
+        let snapshot = AppState::default();
+        let fresh = || PromptDelivery {
+            expected_agent_id: Some("agent".to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
+            closures_at_write: Some(0),
+            delivery_id: "refusal-policy".to_string(),
+            epoch: 0,
+            wire_issued: true,
+            attempts: 0,
+            watermark: None,
+            can_report_prompts: false,
+        };
+
+        let mut unwritten = fresh();
+        note_refusal_generation(&mut unwritten, Some("reported".to_string()));
+        bind_delivery_generation(&mut unwritten, &snapshot, PANE_ID);
+        assert_eq!(
+            unwritten.expected_session_id.as_deref(),
+            Some("reported"),
+            "an unwritten, unbound delivery binds the generation the refusal named"
+        );
+        assert_eq!(
+            unwritten.epoch, 1,
+            "binding changes the wire identity, so it must rotate the epoch like any other bind"
+        );
+        assert!(
+            !delivery_target_changed(&snapshot, PANE_ID, &unwritten),
+            "the TUI's empty view of the pane is not evidence the reported generation ended"
+        );
+
+        let mut written = fresh();
+        written.attempts = 1;
+        note_refusal_generation(&mut written, Some("reported".to_string()));
+        bind_delivery_generation(&mut written, &snapshot, PANE_ID);
+        bind_generation_before_retry(&mut written, &snapshot, PANE_ID);
+        assert_eq!(
+            (written.refusal_generation, written.expected_session_id),
+            (None, None),
+            "a delivery that already wrote must not adopt a generation from a refusal"
+        );
+
+        // Greptile P1 on #1521: a request whose response was LOST may have
+        // written although `attempts` is 0, so a later refusal must not make
+        // the delivery look unwritten — whether the uncertainty came before the
+        // refusal or after it was recorded.
+        let mut lost_response = fresh();
+        lost_response.write_unacknowledged = true;
+        note_refusal_generation(&mut lost_response, Some("reported".to_string()));
+        bind_delivery_generation(&mut lost_response, &snapshot, PANE_ID);
+        assert_eq!(
+            (
+                lost_response.refusal_generation,
+                lost_response.expected_session_id
+            ),
+            (None, None),
+            "a delivery with an unacknowledged write must not adopt a refusal's generation"
+        );
+        let mut lost_after_refusal = fresh();
+        note_refusal_generation(&mut lost_after_refusal, Some("reported".to_string()));
+        lost_after_refusal.write_unacknowledged = true;
+        bind_delivery_generation(&mut lost_after_refusal, &snapshot, PANE_ID);
+        assert_eq!(
+            lost_after_refusal.expected_session_id, None,
+            "nor bind one recorded before the uncertain request"
+        );
+
+        let mut bound = fresh();
+        bound.expected_session_id = Some("original".to_string());
+        note_refusal_generation(&mut bound, Some("successor".to_string()));
+        bind_delivery_generation(&mut bound, &snapshot, PANE_ID);
+        assert_eq!(
+            (
+                bound.refusal_generation,
+                bound.expected_session_id.as_deref()
+            ),
+            (None, Some("original")),
+            "a bound delivery must never be redirected by a refusal's generation"
+        );
+    }
+
+    /// Issue #621 (Qodo on #1521): a controller that answers each submit from a
+    /// script of whole replies, and records the session each one named.
+    struct ScriptedReplyPaneController {
+        replies: std::sync::Mutex<std::collections::VecDeque<SubmitReply>>,
+        named: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedReplyPaneController {
+        fn new(replies: Vec<SubmitReply>) -> Self {
+            Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                named: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PaneController for ScriptedReplyPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn pane_agent_id(&self, _pane_id: &str) -> Option<String> {
+            Some("scripted-agent".to_string())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn begin_write_and_submit_to_pane_with_identity(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            _delivery_id: Option<&str>,
+        ) -> crate::pane::PendingSubmit {
+            self.named
+                .lock()
+                .unwrap()
+                .push(expected_session_id.map(str::to_string));
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SubmitReply {
+                    result: Ok(SendResult::Stale),
+                    current_session_id: None,
+                    may_have_written: false,
+                });
+            crate::pane::PendingSubmit::ready_reply(reply)
+        }
+        fn name(&self) -> &str {
+            "scripted-reply"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Issue #621 (Qodo on #1521): a failure that provably wrote nothing — a
+    /// failed capability probe or connection — must not cost a delivery its
+    /// recovery from a later `stale` that names the conversation, on either
+    /// TUI path; a failure after the request may have reached the daemon must.
+    #[test]
+    fn an_unsent_failure_keeps_refusal_recovery_and_a_maybe_written_one_does_not() {
+        const GENERATION: &str = "refused-against-621";
+        let failure = |may_have_written| SubmitReply {
+            result: Err(PaneError::CommandFailed(
+                "write_and_submit: injected".into(),
+            )),
+            current_session_id: None,
+            may_have_written,
+        };
+        let stale = || SubmitReply {
+            result: Ok(SendResult::Stale),
+            current_session_id: Some(GENERATION.to_string()),
+            may_have_written: false,
+        };
+        let applied = || SubmitReply {
+            result: Ok(SendResult::Applied),
+            current_session_id: None,
+            may_have_written: false,
+        };
+
+        let seed_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-seed-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let mut ui = default_ui();
+            ui.pending_seed_prompts
+                .push(aged_seed_prompt(PANE_ID, "scripted seed"));
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            for _ in 0..3 {
+                process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let role_named = |first_may_have_written: bool| {
+            const PANE_ID: &str = "scripted-role-pane";
+            let controller = Arc::new(ScriptedReplyPaneController::new(vec![
+                failure(first_may_have_written),
+                stale(),
+                applied(),
+            ]));
+            let pane: Arc<dyn PaneController> = controller.clone();
+            let tab_id: TabId = 62101;
+            let mut ui = default_ui();
+            ui.orchestration_prompt_anchor_at.insert(
+                tab_id,
+                std::time::Instant::now()
+                    .checked_sub(
+                        SPAWN_TIME_READINESS_TIMEOUT
+                            + SPAWN_TIME_READINESS_BUFFER
+                            + std::time::Duration::from_millis(100),
+                    )
+                    .expect("aged anchor timestamp"),
+            );
+            let snapshot = ready_prompt_snapshot(PANE_ID, "scripted-agent");
+            let role_panes = [PANE_ID.to_string()];
+            let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+            let mut role_prompt = Some("scripted role prompt".to_string());
+            for _ in 0..3 {
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    pane.as_ref(),
+                    &snapshot,
+                    std::time::Instant::now(),
+                    tab_id,
+                    &role_panes,
+                    0,
+                    &mut role_statuses,
+                    &mut role_prompt,
+                );
+                if let Some(backoff) = ui.send_retry_backoff.get_mut(PANE_ID) {
+                    backoff.next_attempt_at = std::time::Instant::now();
+                }
+            }
+            controller.named.lock().unwrap().clone()
+        };
+
+        let recovered = vec![None, None, Some(GENERATION.to_string())];
+        let held_back = vec![None, None, None];
+        assert_eq!(
+            (seed_named(false), role_named(false)),
+            (recovered.clone(), recovered),
+            "after a failure that wrote nothing, the attempt after the `stale` names the \
+             conversation it reported, on both paths"
+        );
+        assert_eq!(
+            (seed_named(true), role_named(true)),
+            (held_back.clone(), held_back),
+            "after a failure that may have written, a refusal's generation is never adopted"
+        );
+    }
+
     /// Scenario: Let a TUI seed reach its reporting pane, type an unsent user draft before the replacement payload is due, and independently type another draft after the replacement but before the submit-only probe. In both timelines the next automatic attempt must send no bytes, so it neither appends its payload nor submits the user's draft.
     #[cfg(unix)]
     #[spec("prompt/pane-input/032")]
@@ -40187,6 +41020,8 @@ mod tests {
             expected_agent_id: Some("epoch-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
@@ -40293,6 +41128,8 @@ mod tests {
             expected_agent_id: Some("legacy-hook-agent".into()),
             expected_session_id: None,
             observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged: false,
             closures_at_write: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,

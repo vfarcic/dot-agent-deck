@@ -2,13 +2,13 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, typ
 import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
-import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
 import { useVoiceOn } from "../hooks/useVoiceOn";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto, type VoiceNumberedSectionKind } from "../lib/voiceNumbers";
-import { gridFit, offPageSentence, pageMarker, pageSlice, type PageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
+import { gridFit, offPageSentence, pageMarker, pageSlice, usedColumns, type PageSlice, type VoiceOffPageItem, type VoicePager } from "../lib/voicePages";
 import { VoiceNumber } from "./VoiceNumber";
 import {
   ambiguousOrchestrationReason,
@@ -1377,6 +1377,14 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   const modesPaged = voiceOn && modeSlice.pages > 1;
   const modeOffset = modesPaged ? modeSlice.start : 0;
   const shownModes = modesPaged ? modes.slice(modeSlice.start, modeSlice.end) : modes;
+  /* Issue #1494 — a page is drawn in only the columns its rows or chips
+     need, so a few long names share the whole width instead of being cut
+     short beside empty columns. The ambiguous orchestrations' disabled chips
+     are cells of the Mode grid too, on the page they are drawn on. */
+  const directoryColumns = directoryFit ? usedColumns(directoryFit, shownRows.length, "column") : undefined;
+  const ambiguousShown = (orchestrationEnd >= modeOffset && orchestrationEnd < modeOffset + shownModes.length)
+    || (orchestrationEnd >= modes.length && (!modesPaged || modeSlice.end === modes.length));
+  const modeColumns = modeFit ? usedColumns(modeFit, shownModes.length + (ambiguousShown ? ambiguousChips.length : 0), "row") : undefined;
   /**
    * Which list "next page" turns: the Mode row once a directory is chosen
    * and it pages, else the directory rows when they page, else the Mode row
@@ -1937,9 +1945,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
             ref={directoryListRef}
             className={`new-agent-list is-directories${voiceOn ? " is-paged" : ""}`}
             /* While voice is on the rows are a grid that fills the browser's
-               space, a page at a time (change 4): as many columns as fit,
-               filled top to bottom. */
-            style={voiceOn && directoryFit ? { gridTemplateColumns: `repeat(${directoryFit.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${directoryFit.rows}, minmax(${DIRECTORY_CELL.rowHeight}px, 1fr))` } : undefined}
+               space, a page at a time (change 4): filled top to bottom, in as
+               many columns as fit and no more than the page's rows need
+               (issue #1494). */
+            style={voiceOn && directoryFit ? { gridTemplateColumns: `repeat(${directoryColumns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${directoryFit.rows}, minmax(${DIRECTORY_CELL.rowHeight}px, 1fr))` } : undefined}
             role="listbox"
             aria-label="Directories"
             aria-disabled={busy || undefined}
@@ -1970,7 +1979,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                   : (
                     <>
                       {row.entry.isProject ? <FolderGit2 size={13} aria-hidden="true" /> : <Folder size={13} aria-hidden="true" />}
-                      <span className="new-agent-row-name">{displayText(row.entry.displayName, DISPLAY_LIMITS.name)}</span>
+                      <span className="new-agent-row-name" title={displayTitle(row.entry.displayName)}>{displayText(row.entry.displayName, DISPLAY_LIMITS.name)}</span>
                       {row.entry.isProject && <span className="new-agent-row-tag" data-testid="new-agent-project-mark">project</span>}
                       {row.entry.isSymlink && <span className="new-agent-row-tag" data-testid="new-agent-link-mark" title="A symbolic link: opening it lists the directory it leads to">link</span>}
                     </>
@@ -2013,7 +2022,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
         <div
           ref={chipsRef}
           className={`new-agent-chips${voiceOn ? " is-paged" : ""}`}
-          style={voiceOn && modeFit ? { gridTemplateColumns: `repeat(${modeFit.columns}, minmax(0, 1fr))` } : undefined}
+          style={voiceOn && modeFit ? { gridTemplateColumns: `repeat(${modeColumns}, minmax(0, 1fr))` } : undefined}
           role="group"
           aria-labelledby={`${titleId}-mode`}
           data-testid="new-agent-modes"
@@ -2028,6 +2037,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                 aria-pressed={candidate.id === mode}
                 data-mode={candidate.id}
                 data-testid={`new-agent-mode-${candidate.id}`}
+                title={voiceOn ? candidate.label : undefined}
                 disabled={formDisabled}
                 onClick={() => selectMode(candidate.id)}
               >

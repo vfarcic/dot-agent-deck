@@ -2433,6 +2433,12 @@ pub struct FirstWriteSend {
     /// Time spent asleep waiting for the draft to clear. Zero when nothing was
     /// pending. Excludes time spent queued behind another writer.
     pub deferred: Duration,
+    /// Issue #1455: the send was [`GuardedSend::Ambiguous`], and every byte it
+    /// put into the input box was erased back out again (issue #876's drain),
+    /// so nothing of it is left there and it kept no payload record. Always
+    /// `false` for any other outcome, and for an ambiguous write that left
+    /// bytes behind. The one ambiguous case a caller may write again.
+    pub erased: bool,
 }
 
 impl GuardedSendDetail {
@@ -4694,6 +4700,37 @@ struct SilenceWatchRecord {
     /// watch's own conditional take). Mirrors
     /// [`OutstandingDelegation::_watch_cancel`].
     _cancel: oneshot::Sender<()>,
+    /// Issue #1446: the record this one replaced, kept — its watch task still
+    /// running — while this generation's task pointer has not been written.
+    /// Only [`AgentPtyRegistry::arm_silence_watch_until_delivered`] sets it.
+    ///
+    /// Replacing the record cancels the older watch, which is right once the
+    /// newer pointer is written: the newer write answers the older "did
+    /// anything happen?" question. Before the write it is not, because the
+    /// write can still be refused, and a refusal used to take the whole record
+    /// with it — so an earlier delegation that WAS delivered, and whose worker
+    /// had not yet said a word, lost its silent-worker watch to a delegation
+    /// that never arrived. Now the newer delivery drops this
+    /// ([`AgentPtyRegistry::confirm_silence_watch_delivered`]) and a refusal
+    /// puts it back ([`AgentPtyRegistry::withdraw_silence_watch_if`]).
+    displaced: Option<Box<SilenceWatchRecord>>,
+}
+
+impl SilenceWatchRecord {
+    /// Drop the displaced record (and anything it displaced in turn) when
+    /// `matches` says so, returning whether one went. Used by the drains, so a
+    /// displaced watch is cancelled by the same pane close or agent exit that
+    /// cancels a record in the map.
+    fn drop_displaced_if(&mut self, matches: &impl Fn(&SilenceWatchRecord) -> bool) -> bool {
+        let Some(displaced) = self.displaced.as_mut() else {
+            return false;
+        };
+        if matches(displaced) {
+            self.displaced = None;
+            return true;
+        }
+        displaced.drop_displaced_if(matches)
+    }
 }
 
 /// Issue #448: the commission ledger's per-worker-pane entry — how many
@@ -4710,12 +4747,18 @@ struct SilenceWatchRecord {
 /// Issue #590: each commission also carries the instant it was armed, so it can
 /// expire on its own age ([`DELEGATION_COMMISSION_TTL`]). The count is still what
 /// every caller reads; the timestamps only decide when a commission stops being
-/// owed. Whenever one commission leaves the entry — a completion credited, an
-/// undelivered delegate released, an expiry — it is the OLDEST timestamp that
+/// owed. Whenever a commission leaves the entry without its delegation being
+/// known — a completion credited, an expiry — it is the OLDEST timestamp that
 /// goes, because which delegation a completion answered is unknowable, and
 /// dropping the oldest leaves the survivors carrying the newest arm times the
 /// entry has seen: any mismatch then errs toward a commission living longer,
 /// never shorter.
+///
+/// Issue #1447: an undelivered delegate's release is the exception, because
+/// there the delegation IS known — the dispatch releasing it holds its arm id.
+/// It removes that commission's own entry ([`Self::remove_arm`]), so a
+/// delivered sibling keeps its own arm time rather than inheriting the
+/// undelivered one's.
 struct DelegationCommission {
     /// Arm instant of each outstanding commission, oldest first — one per
     /// commission, so every one expires on its own age.
@@ -4726,7 +4769,7 @@ struct DelegationCommission {
     /// instants past a cap into a bare count, which let a folded commission
     /// outlive its own deadline (Greptile, #1285); the cap now saturates the
     /// count instead — see [`Self::push`].
-    armed_at: VecDeque<Instant>,
+    armed_at: VecDeque<ArmedCommission>,
     /// Pane of the orchestrator that issued them, so closing the ORCHESTRATOR
     /// clears the ledger as well as the two watches — a commission is owed to a
     /// specific orchestrator, and a pane id freed by a close can be inherited by
@@ -4751,7 +4794,9 @@ struct DelegationCommission {
     /// that exits naturally takes no path that sweeps its commission, so the
     /// entry can outlive it by up to [`DELEGATION_COMMISSION_TTL`] (issue #507);
     /// this is what stops a later agent in the same pane, which was never
-    /// delegated to, from being reported as the commissioned worker.
+    /// delegated to, from being reported as the commissioned worker. Crediting a
+    /// `work-done` reads the per-commission binding instead
+    /// ([`ArmedCommission::worker_agent_id`]).
     worker_agent_id: Option<String>,
     /// Issue #447 review (#1347, Qodo): the arm id
     /// ([`CommissionDispatchInFlight::arm_id`]) of the newest commission. A
@@ -4759,6 +4804,21 @@ struct DelegationCommission {
     /// dispatch lock after a newer delegate was armed — spawned dispatch tasks
     /// are not ordered — cannot overwrite the newer commission's worker.
     newest_arm_id: Option<u64>,
+}
+
+/// One outstanding commission in a [`DelegationCommission`]: the arm id its
+/// dispatch carries ([`CommissionDispatchInFlight::arm_id`]) and the instant it
+/// was armed.
+struct ArmedCommission {
+    /// Issue #1447: what lets an undelivered delegate release its OWN entry.
+    arm_id: u64,
+    at: Instant,
+    /// Issue #507: the registry agent id of the worker THIS commission's task
+    /// pointer went to, once known — the same binding as
+    /// [`DelegationCommission::worker_agent_id`], kept per commission so a
+    /// completion can tell the agent's own commissions from a predecessor's
+    /// still on the same pane (Greptile, #1525). `None` until bound.
+    worker_agent_id: Option<String>,
 }
 
 /// Issue #590: how long a commission stays owed without a `work-done` crediting
@@ -4807,17 +4867,68 @@ impl DelegationCommission {
     /// still the arm time of a real delegation, so none expires before its own
     /// deadline — what saturates is the count, exactly as the `u32` this deque
     /// replaced did at `u32::MAX`.
-    fn push(&mut self, now: Instant) {
+    fn push(&mut self, arm_id: u64, now: Instant) {
         if self.armed_at.len() >= MAX_OUTSTANDING_COMMISSIONS {
             self.armed_at.pop_back();
         }
-        self.armed_at.push_back(now);
+        self.armed_at.push_back(ArmedCommission {
+            arm_id,
+            at: now,
+            worker_agent_id: None,
+        });
     }
 
-    /// Remove one commission, the oldest — see the type's doc comment for why
-    /// it is always the oldest.
+    /// Remove one commission whose delegation is unknown, the oldest — see the
+    /// type's doc comment for why it is the oldest.
     fn pop_oldest(&mut self) {
         self.armed_at.pop_front();
+    }
+
+    /// Issue #507: spend one commission on a `work-done` from `reporting_agent`
+    /// — the oldest one bound to that agent when there is one (Greptile,
+    /// #1525), otherwise the oldest.
+    fn credit(&mut self, reporting_agent: Option<&str>) {
+        let own = reporting_agent.and_then(|agent| {
+            self.armed_at
+                .iter()
+                .position(|c| c.worker_agent_id.as_deref() == Some(agent))
+        });
+        match own {
+            Some(index) => {
+                self.armed_at.remove(index);
+            }
+            None => self.pop_oldest(),
+        }
+        self.follow_newest_outstanding();
+    }
+
+    /// Issue #507 (Qodo, #1525): once the newest commission has been removed,
+    /// point [`Self::newest_arm_id`] and [`Self::worker_agent_id`] at the newest
+    /// one still outstanding. Otherwise they keep naming a commission that is
+    /// gone: a later bind for the surviving one is refused as "not the newest",
+    /// and [`AgentPtyRegistry::commission_owed_to_agent`] keeps answering for
+    /// the agent whose commission was spent, suppressing the waiting notice of
+    /// the agent that still owes one. A no-op while the newest is still here.
+    fn follow_newest_outstanding(&mut self) {
+        let Some(newest) = self.armed_at.back() else {
+            return;
+        };
+        if self.newest_arm_id == Some(newest.arm_id) {
+            return;
+        }
+        self.newest_arm_id = Some(newest.arm_id);
+        self.worker_agent_id = newest.worker_agent_id.clone();
+    }
+
+    /// Issue #1447: remove the commission armed as `arm_id`, returning whether
+    /// it was still here. The deque stays ordered by arm time, since removing
+    /// an element keeps the order of the rest.
+    fn remove_arm(&mut self, arm_id: u64) -> bool {
+        let Some(index) = self.armed_at.iter().position(|c| c.arm_id == arm_id) else {
+            return false;
+        };
+        self.armed_at.remove(index);
+        true
     }
 
     /// Drop every commission at least [`DELEGATION_COMMISSION_TTL`] old, and
@@ -4825,7 +4936,7 @@ impl DelegationCommission {
     fn expire(&mut self, now: Instant) -> u32 {
         let mut expired: u32 = 0;
         while let Some(armed) = self.armed_at.front() {
-            if now.saturating_duration_since(*armed) < DELEGATION_COMMISSION_TTL {
+            if now.saturating_duration_since(armed.at) < DELEGATION_COMMISSION_TTL {
                 break;
             }
             self.armed_at.pop_front();
@@ -4837,7 +4948,7 @@ impl DelegationCommission {
     /// Age of the oldest commission still owed.
     fn oldest_age(&self, now: Instant) -> Duration {
         self.armed_at.front().map_or(Duration::ZERO, |armed| {
-            now.saturating_duration_since(*armed)
+            now.saturating_duration_since(armed.at)
         })
     }
 }
@@ -6252,6 +6363,36 @@ impl AgentPtyRegistry {
         orchestrator_pane_id: &str,
         worker_agent_id: Option<&str>,
     ) -> Option<ArmedSilenceWatch> {
+        self.arm_silence_watch_keeping(worker_pane_id, orchestrator_pane_id, worker_agent_id, false)
+    }
+
+    /// Issue #1446: [`Self::arm_silence_watch`] for a generation whose task
+    /// pointer is about to be written and may still be refused. The record it
+    /// replaces keeps its watch running, held inside the new record
+    /// ([`SilenceWatchRecord::displaced`]), until the caller settles the
+    /// write: [`Self::confirm_silence_watch_delivered`] when it delivered,
+    /// [`Self::withdraw_silence_watch_if`] when it did not. The caller must do
+    /// one or the other on every path.
+    ///
+    /// Not for the `clear = true` respawn's early arm (issue #687): there the
+    /// replaced record belongs to the agent the respawn just removed, so it has
+    /// to be cancelled at once, which is what [`Self::arm_silence_watch`] does.
+    pub fn arm_silence_watch_until_delivered(
+        &self,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        worker_agent_id: Option<&str>,
+    ) -> Option<ArmedSilenceWatch> {
+        self.arm_silence_watch_keeping(worker_pane_id, orchestrator_pane_id, worker_agent_id, true)
+    }
+
+    fn arm_silence_watch_keeping(
+        &self,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        worker_agent_id: Option<&str>,
+        keep_displaced: bool,
+    ) -> Option<ArmedSilenceWatch> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
@@ -6259,9 +6400,9 @@ impl AgentPtyRegistry {
             return None;
         }
         let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
-        let superseded = tracker
-            .silence_watches
-            .get(worker_pane_id)
+        let previous = tracker.silence_watches.remove(worker_pane_id);
+        let superseded = previous
+            .as_ref()
             .map_or(0, |prev| prev.superseded.saturating_add(1));
         let (cancel_tx, cancel_rx) = oneshot::channel();
         tracker.silence_watches.insert(
@@ -6272,12 +6413,67 @@ impl AgentPtyRegistry {
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
                 worker_agent_id: worker_agent_id.map(str::to_string),
                 _cancel: cancel_tx,
+                // Without `keep_displaced` the previous record is dropped here,
+                // which resolves its task's cancellation channel: the
+                // supersession.
+                displaced: previous.filter(|_| keep_displaced).map(Box::new),
             },
         );
         Some(ArmedSilenceWatch {
             seq,
             cancel: cancel_rx,
         })
+    }
+
+    /// Issue #1446: generation `seq`'s task pointer was delivered, so the watch
+    /// it displaced is superseded now — dropping it cancels that watch's task,
+    /// exactly as an immediate [`Self::arm_silence_watch`] would have. A no-op
+    /// when the record is gone or is a newer generation's.
+    ///
+    /// It also resolves the pane's pending notices
+    /// ([`Self::delegation_resolution_epoch_is`]), because the displaced watch
+    /// may already have fired while this pointer was being written — its window
+    /// can run out during a wait on the worker's draft — and taken its own
+    /// record. Its notice then waits on the orchestrator's writer with an epoch
+    /// captured before this delivery; moving the epoch is what makes that
+    /// notice stand down, as it would have had the supersession cancelled the
+    /// watch at arm time (Qodo, PR #1502).
+    pub fn confirm_silence_watch_delivered(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock().unwrap();
+        if let Some(record) = tracker.silence_watches.get_mut(worker_pane_id)
+            && record.seq == seq
+        {
+            record.displaced = None;
+            self.note_delegation_resolved(&mut tracker, worker_pane_id);
+        }
+    }
+
+    /// Issue #1446: generation `seq`'s task pointer was NOT delivered, so
+    /// withdraw its watch **only if** it is still generation `seq` — and put
+    /// back the record it displaced, whose watch never stopped running. That
+    /// restored record is an earlier delegation that was delivered and is still
+    /// owed, so it keeps its own `superseded` count; any `work-done` credited
+    /// while it was displaced was applied to it as well
+    /// ([`Self::retire_silence_watch`]). Returns whether a record was withdrawn.
+    pub fn withdraw_silence_watch_if(&self, worker_pane_id: &str, seq: u64) -> bool {
+        let mut tracker = self.delegations.lock().unwrap();
+        if !tracker
+            .silence_watches
+            .get(worker_pane_id)
+            .is_some_and(|w| w.seq == seq)
+        {
+            return false;
+        }
+        let withdrawn = tracker
+            .silence_watches
+            .remove(worker_pane_id)
+            .expect("watch present under the same lock");
+        if let Some(displaced) = withdrawn.displaced {
+            tracker
+                .silence_watches
+                .insert(worker_pane_id.to_string(), *displaced);
+        }
+        true
     }
 
     /// Issue #448: record that the orchestrator has commissioned work from
@@ -6344,7 +6540,7 @@ impl AgentPtyRegistry {
 
     /// [`Self::arm_delegation_commission`] against an explicit clock, so the
     /// expiry is testable without waiting a week.
-    fn arm_delegation_commission_at(
+    pub(crate) fn arm_delegation_commission_at(
         self: &Arc<Self>,
         worker_pane_id: &str,
         orchestrator_pane_id: &str,
@@ -6375,13 +6571,13 @@ impl AgentPtyRegistry {
                 oldest_age: superseded_oldest_age,
             };
         }
-        entry.push(now);
+        let id = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        entry.push(id, now);
         // Last delegate wins: a pane id that has changed hands (orchestrator
         // closed, successor spawned onto the same id) must not leave the ledger
         // pointing its close sweep at the dead pane.
         entry.orchestrator_pane_id = orchestrator_pane_id.to_string();
         entry.orchestrator_agent_id = orchestrator_agent_id.map(str::to_string);
-        let id = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
         // Nobody holds this commission's task pointer yet: the caller binds the
         // worker once it knows who that is, under this arm's id (Qodo, #1347).
         entry.worker_agent_id = None;
@@ -6519,13 +6715,17 @@ impl AgentPtyRegistry {
         worker_agent_id: &str,
     ) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        let Some(entry) = tracker
-            .commissions
-            .get_mut(worker_pane_id)
-            .filter(|entry| entry.newest_arm_id == Some(arm_id))
-        else {
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
+        // Issue #507: the commission's own binding is applied whether or not it
+        // is still the newest — only the entry-wide field is last-delegate-wins.
+        if let Some(armed) = entry.armed_at.iter_mut().find(|c| c.arm_id == arm_id) {
+            armed.worker_agent_id = Some(worker_agent_id.to_string());
+        }
+        if entry.newest_arm_id != Some(arm_id) {
+            return false;
+        }
         entry.worker_agent_id = Some(worker_agent_id.to_string());
         true
     }
@@ -6700,19 +6900,37 @@ impl AgentPtyRegistry {
     /// has ever been delegated to. Issue #590: expired commissions are dropped
     /// before the credit, so a completion arriving after
     /// [`DELEGATION_COMMISSION_TTL`] is not laundered into a solicited one.
+    /// Issue #507: so are commissions made to an agent that no longer holds the
+    /// pane — see [`Self::retire_commissions_of_a_previous_occupant`].
     pub fn retire_delegation_commission(&self, worker_pane_id: &str) -> WorkDoneProvenance {
         self.retire_delegation_commission_at(worker_pane_id, Instant::now())
     }
 
     /// [`Self::retire_delegation_commission`] against an explicit clock.
-    fn retire_delegation_commission_at(
+    pub(crate) fn retire_delegation_commission_at(
         &self,
         worker_pane_id: &str,
         now: Instant,
     ) -> WorkDoneProvenance {
+        // Issue #507: read before the tracker lock, which this method never
+        // holds together with the registry's own.
+        let reporting_agent = self.pane_current_agent_id(worker_pane_id);
         let mut tracker = self.delegations.lock().unwrap();
         self.note_delegation_resolved(&mut tracker, worker_pane_id);
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
+        let retired = Self::retire_commissions_of_a_previous_occupant(
+            &mut tracker,
+            worker_pane_id,
+            reporting_agent.as_deref(),
+        );
+        if retired > 0 {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                retired,
+                "work-done: retired delegation commissions made to an agent that no longer holds \
+                 this pane, so they are not credited to its successor"
+            );
+        }
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return WorkDoneProvenance::Unsolicited;
         };
@@ -6728,15 +6946,68 @@ impl AgentPtyRegistry {
                 WorkDoneProvenance::Solicited { remaining: 0 }
             };
         }
-        entry.pop_oldest();
+        // Issue #507 (Greptile, #1525): the reporting agent's own commission
+        // goes first, when one is bound to it, so a successor's completion
+        // never spends a commission it does not owe while its own stays owed.
+        entry.credit(reporting_agent.as_deref());
         WorkDoneProvenance::Solicited {
             remaining: entry.outstanding(),
         }
     }
 
+    /// Issue #507: retire the commissions on `worker_pane_id` that were made to
+    /// an agent other than `reporting_agent`, the pane's current occupant, and
+    /// return how many went. Caller holds the tracker lock.
+    ///
+    /// A worker that exits on its own takes no path that sweeps its commissions
+    /// ([`Self::sweep_delegations_on_exit`] deliberately leaves them), and the
+    /// pane id is then free for another agent. Without this, that agent's first
+    /// `work-done` spent the predecessor's commission: reported to the
+    /// orchestrator as the delegated work coming back, and filed over the
+    /// role's `work-done-<role>.md`.
+    ///
+    /// Decided per commission, from the agent its own task pointer went to
+    /// ([`ArmedCommission::worker_agent_id`]). Kept: a commission bound to the
+    /// reporting agent; one not bound yet; and one whose dispatch is still in
+    /// flight, matched by its own arm id rather than by a count (Qodo, #1525) —
+    /// its pointer has not been written, and will go to whoever holds the pane.
+    /// Nothing is retired when there is no live occupant to compare with.
+    fn retire_commissions_of_a_previous_occupant(
+        tracker: &mut DelegationTracker,
+        worker_pane_id: &str,
+        reporting_agent: Option<&str>,
+    ) -> u32 {
+        let Some(reporting_agent) = reporting_agent else {
+            return 0;
+        };
+        let in_flight: HashSet<u64> = tracker
+            .commission_dispatches_in_flight
+            .get(worker_pane_id)
+            .map(|guards| guards.keys().copied().collect())
+            .unwrap_or_default();
+        let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
+            return 0;
+        };
+        let before = entry.armed_at.len();
+        entry.armed_at.retain(|armed| {
+            in_flight.contains(&armed.arm_id)
+                || armed
+                    .worker_agent_id
+                    .as_deref()
+                    .is_none_or(|bound| bound == reporting_agent)
+        });
+        let retired = u32::try_from(before - entry.armed_at.len()).unwrap_or(u32::MAX);
+        entry.follow_newest_outstanding();
+        if entry.outstanding() == 0 {
+            tracker.commissions.remove(worker_pane_id);
+        }
+        retired
+    }
+
     /// Issue #448 review (finding 1): release ONE commission armed for
     /// `worker_pane_id` because the delegate that armed it never reached the
-    /// worker. Returns whether an entry was found to release.
+    /// worker. Returns whether an entry was found to release. `arm_id` is that
+    /// delegate's own arm id ([`CommissionDispatchInFlight::arm_id`]).
     ///
     /// The ledger's counterpart to [`Self::cancel_silence_watch_if`], and it
     /// exists for the same reason: the commission is armed in the synchronous
@@ -6752,16 +7023,25 @@ impl AgentPtyRegistry {
     /// whole entry would discard a sibling delegation's genuine commission and
     /// mislabel ITS completion as unsolicited. The entry is removed as it
     /// reaches zero so the map keeps tracking live debt rather than every pane
-    /// ever delegated to. Issue #590: it is the OLDEST arm instant that goes, not
-    /// the undelivered delegate's own — see [`DelegationCommission`] for why
-    /// that is the direction that can only lengthen a survivor's life.
-    pub fn release_delegation_commission(&self, worker_pane_id: &str) -> bool {
+    /// ever delegated to.
+    ///
+    /// Issue #1447: it is the undelivered delegate's OWN commission that goes,
+    /// found by `arm_id`. Releasing the oldest instead — which is what a
+    /// completion has to do, not knowing which delegation it answered — left a
+    /// delivered older sibling carrying the undelivered one's arm time, so it
+    /// stayed owed past its own [`DELEGATION_COMMISSION_TTL`]. When `arm_id` is
+    /// `None` or no longer in the entry (something that does not know
+    /// delegations apart, such as [`Self::retire_commissions_of_replaced_agent`],
+    /// took it already), the oldest goes, so the count stays right either way.
+    pub fn release_delegation_commission(&self, worker_pane_id: &str, arm_id: Option<u64>) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
         self.note_delegation_resolved(&mut tracker, worker_pane_id);
         let Some(entry) = tracker.commissions.get_mut(worker_pane_id) else {
             return false;
         };
-        entry.pop_oldest();
+        if !arm_id.is_some_and(|arm_id| entry.remove_arm(arm_id)) {
+            entry.pop_oldest();
+        }
         if entry.outstanding() == 0 {
             tracker.commissions.remove(worker_pane_id);
         }
@@ -6915,6 +7195,16 @@ impl AgentPtyRegistry {
         };
         if record.superseded > 0 {
             record.superseded -= 1;
+            // Issue #1446: a displaced record counts the same older generations
+            // plus itself, so the credit applies to it too — to the generations
+            // it superseded first, then to itself, which resolves its watch.
+            if let Some(displaced) = record.displaced.as_mut() {
+                if displaced.superseded > 0 {
+                    displaced.superseded -= 1;
+                } else {
+                    record.displaced = None;
+                }
+            }
             return SilenceWatchRetirement::KeptNewer {
                 seq: record.seq,
                 remaining: record.superseded,
@@ -6936,18 +7226,23 @@ impl AgentPtyRegistry {
     /// pane close already resolved this delegation while the window ran, and the
     /// notice must be suppressed. Mirrors
     /// [`Self::take_outstanding_delegation_if`]: one mutex, exactly one winner.
+    ///
+    /// Issue #1446: a record displaced by a newer generation whose pointer is
+    /// still being written ([`SilenceWatchRecord::displaced`]) is still a live
+    /// watch, so its own task can take it here too. Cancelling the newer
+    /// record takes the displaced one with it: that is a delivery's ack, or a
+    /// caller that never displaced anything, and an undelivered pointer goes
+    /// through [`Self::withdraw_silence_watch_if`] instead.
     pub fn cancel_silence_watch_if(&self, worker_pane_id: &str, seq: u64) -> bool {
         let mut tracker = self.delegations.lock().unwrap();
-        if tracker
-            .silence_watches
-            .get(worker_pane_id)
-            .is_some_and(|w| w.seq == seq)
-        {
+        let Some(record) = tracker.silence_watches.get_mut(worker_pane_id) else {
+            return false;
+        };
+        if record.seq == seq {
             tracker.silence_watches.remove(worker_pane_id);
-            true
-        } else {
-            false
+            return true;
         }
+        record.drop_displaced_if(&|displaced| displaced.seq == seq)
     }
 
     /// PRD #126: atomically take the outstanding delegation for
@@ -7439,9 +7734,21 @@ impl AgentPtyRegistry {
             })
             .map(|(worker_pane, _)| worker_pane.clone())
             .collect();
-        keys.iter()
+        let removed = keys
+            .iter()
             .filter(|key| tracker.silence_watches.remove(*key).is_some())
-            .count()
+            .count();
+        // Issue #1446: a displaced watch aimed at this pane's orchestrator goes
+        // too, though the record holding it was armed by another orchestrator.
+        let displaced = tracker
+            .silence_watches
+            .values_mut()
+            .map(|watch| {
+                watch.drop_displaced_if(&|displaced| displaced.orchestrator_pane_id == pane_id)
+            })
+            .filter(|dropped| *dropped)
+            .count();
+        removed + displaced
     }
 
     /// Issue #448: the [`Self::drain_delegations_touching`] counterpart for the
@@ -7537,9 +7844,25 @@ impl AgentPtyRegistry {
             })
             .map(|(worker_pane, _)| worker_pane.clone())
             .collect();
-        keys.iter()
+        let removed = keys
+            .iter()
             .filter(|key| tracker.silence_watches.remove(*key).is_some())
-            .count()
+            .count();
+        // Issue #1446: the same test, applied to watches still displaced by a
+        // newer generation whose pointer has not been written.
+        let displaced = tracker
+            .silence_watches
+            .iter_mut()
+            .map(|(worker_pane, watch)| {
+                let on_this_pane = worker_pane.as_str() == pane_id;
+                watch.drop_displaced_if(&|displaced| {
+                    (on_this_pane && displaced.worker_agent_id.as_deref() == Some(exited_agent_id))
+                        || displaced.orchestrator_pane_id == pane_id
+                })
+            })
+            .filter(|dropped| *dropped)
+            .count();
+        removed + displaced
     }
 
     /// Worker-exit sweep: called from `pump_reader`'s EOF branch the moment a
@@ -7568,17 +7891,14 @@ impl AgentPtyRegistry {
     /// genuine, still-owed commission, not an undelivered one, so there is
     /// nothing here for the ledger's no-delivery invariant to release. The
     /// same non-drain also applies to the ORCHESTRATOR side of a natural
-    /// exit, and that half is a known, accepted asymmetry rather than an
-    /// oversight: [`Self::drain_commissions_touching`] is only ever invoked
-    /// from the *deliberate*-close path (`begin_pane_close`/
-    /// `finish_pane_close`), so a naturally-exiting orchestrator's commission
-    /// entries — keyed by worker pane id — outlive the exit. If that worker
-    /// pane id is later reused, an unrelated agent's genuinely-uncommissioned
-    /// `work-done` is credited `Solicited` and overwrites the role's
-    /// `work-done-<role>.md`. Accepted for now because the reverse (draining
-    /// on natural exit here) is a larger, separately-scoped change; a
-    /// deliberate close already closes the gap for the case that goes through
-    /// it.
+    /// exit: [`Self::drain_commissions_touching`] is only ever invoked from
+    /// the *deliberate*-close path (`begin_pane_close`/`finish_pane_close`),
+    /// so a naturally-exiting agent's commission entries — keyed by worker
+    /// pane id — outlive the exit. Issue #507: what stops a later occupant of
+    /// that worker pane id from spending one is the crediting side, not this
+    /// sweep — [`Self::retire_delegation_commission`] retires the commissions
+    /// bound to an agent other than the pane's current one before it credits
+    /// anything.
     ///
     /// Idempotent by construction: [`Self::drain_delegations_touching_for_exit`]/
     /// [`Self::drain_silence_watches_touching_for_exit`] no-op on a pane with
@@ -9164,6 +9484,22 @@ impl AgentPtyRegistry {
             .map(|(id, _)| id.clone())
     }
 
+    /// Issue #524: whether `pane_id_env`'s occupant has EXITED — the pane has a
+    /// registry entry that has not been handed over to a successor, and none of
+    /// them is live. A worker that crashed or quit on its own leaves exactly
+    /// this behind, because nothing on the natural-exit path removes the
+    /// entry. `false`
+    /// for a live pane and for a pane with no entry at all.
+    pub fn pane_occupant_has_exited(&self, pane_id_env: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let mut occupants = inner
+            .agents
+            .values()
+            .filter(|a| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
+            .peekable();
+        occupants.peek().is_some() && occupants.all(|a| a.exited.load(Ordering::SeqCst))
+    }
+
     /// PRD #20 R20-003 (finding #4): whether a deck client is CURRENTLY attached
     /// to (driving) `pane_id` — i.e. its agent's PTY stream has ≥1 live
     /// subscriber.
@@ -9681,10 +10017,14 @@ impl AgentPtyRegistry {
     ///   ordinary prompt write submits these bytes fused to the NEXT real prompt
     ///   (pinned by
     ///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
-    /// * **Fixed daemon-authored text, and only pre-scrubbed interpolation.**
-    ///   Because these bytes can be submitted later, glued to somebody else's
-    ///   turn, nothing a repository or an agent controls should ride them, and
-    ///   there is no submitted-turn framing to fence such a value inside. A
+    /// * **Fixed daemon-authored text, with nothing a repository or an agent
+    ///   controls interpolated.** Because these bytes can be submitted later,
+    ///   glued to somebody else's turn, no such value should ride them, and
+    ///   there is no submitted-turn framing to fence one inside. A character
+    ///   scrub does not make a value safe here: a pane id passes
+    ///   [`is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub yet an orchestration
+    ///   role pane's id embeds the config-supplied orchestration name (issue
+    ///   #1380), so it is excluded too. A
     ///   caller that wants an untrusted value in its text belongs on
     ///   [`Self::write_and_submit_guarded`] instead, where the text is a turn
     ///   of its own rather than a prefix glued to the next one.
@@ -9780,6 +10120,7 @@ impl AgentPtyRegistry {
             Ok(FirstWriteSend {
                 detail: GuardedSendDetail::Outcome(outcome),
                 deferred,
+                erased: false,
             })
         };
         let mut deferred = Duration::ZERO;
@@ -9980,6 +10321,7 @@ impl AgentPtyRegistry {
                 return Ok(FirstWriteSend {
                     detail: GuardedSendDetail::RefusedUserInput,
                     deferred,
+                    erased: false,
                 });
             }
         }
@@ -10136,6 +10478,7 @@ impl AgentPtyRegistry {
             PayloadDelivery::Ambiguous { stranded } => {
                 let leaves_bytes_behind = stranded > 0;
                 let is_submit = matches!(mode, SubmitMode::Submit);
+                let erased = !leaves_bytes_behind && is_submit && !payload.is_empty();
                 if leaves_bytes_behind || payload.is_empty() {
                     w.note_automatic_write(pane_id, mode, &payload);
                 }
@@ -10163,7 +10506,7 @@ impl AgentPtyRegistry {
                                  prompt above whatever you had typed: clear or submit it before \
                                  typing on",
                     });
-                } else if is_submit && !payload.is_empty() {
+                } else if erased {
                     // `is_submit` matters: a NOTICE reaching this arm was never
                     // offered to the drain (its bytes are meant to stay), so
                     // saying they were erased would be a lie in the log.
@@ -10175,7 +10518,11 @@ impl AgentPtyRegistry {
                          out of the input box, so no payload record is kept"
                     );
                 }
-                finish(GuardedSend::Ambiguous, deferred)
+                Ok(FirstWriteSend {
+                    detail: GuardedSendDetail::Outcome(GuardedSend::Ambiguous),
+                    deferred,
+                    erased,
+                })
             }
             PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
         }
@@ -12300,18 +12647,7 @@ impl AgentPtyRegistry {
                 match inner.agents.get(agent) {
                     // Published, and this really is its pane.
                     Some(a) if a.pane_id_env.as_deref() == Some(pane) => {
-                        // Round 3 (auditor finding 4): `pane_handed_over` is the
-                        // MONOTONE half of the retirement rule and has to be
-                        // read first. `pane_claimed_by_other` looks at who holds
-                        // the pane NOW, which un-answers itself the moment the
-                        // successor exits too — so a retired generation got its
-                        // pane back once both records were dead. The flag is set
-                        // as the pane changes hands and is never cleared, so the
-                        // handover is permanent no matter what becomes of the
-                        // successor. See [`RunningAgent::pane_handed_over`].
-                        let disowned =
-                            a.pane_handed_over || Self::pane_claimed_by_other(&inner, pane, agent);
-                        if !a.exited.load(Ordering::SeqCst) || !disowned {
+                        if Self::generation_speaks_for_pane(&inner, agent, a, pane) {
                             Ownership::Owned
                         } else {
                             Ownership::Unclaimed
@@ -12326,17 +12662,26 @@ impl AgentPtyRegistry {
             // A producer that named no generation: a pre-F9 hook script, or any
             // wrapper that lost `DOT_AGENT_DECK_AGENT_ID` on the way (PRD #110 /
             // issue #398 keep this shape working deliberately). There is nothing
-            // to bind to, so the pane is the whole answer — any generation
-            // claiming it, live or retired, admits. Unchanged from round 1.
+            // to bind to, so the pane is the whole answer — any generation that
+            // the keyed arm above would let speak for it admits: an in-flight
+            // spawn, a live generation, or a retired one still inside its grace.
+            //
+            // Issue #698: the SAME retirement rule as the keyed arm, not "any
+            // record still naming the pane". A retired generation whose pane was
+            // handed over may not speak for it under its own id, and dropping
+            // the id must not be the way around that — with its successor reaped
+            // too, the pane has nobody left to answer for it. The lone retiree
+            // with no successor still admits, which is what lets a late
+            // token-less final `Idle`/`SessionEnd` land after the PTY EOF.
             (Some(pane), None) => {
                 let claimed = inner
                     .pending_spawns
                     .values()
                     .any(|reserved| reserved.as_deref() == Some(pane))
-                    || inner
-                        .agents
-                        .values()
-                        .any(|a| a.pane_id_env.as_deref() == Some(pane));
+                    || inner.agents.iter().any(|(id, a)| {
+                        a.pane_id_env.as_deref() == Some(pane)
+                            && Self::generation_speaks_for_pane(&inner, id, a, pane)
+                    });
                 if claimed {
                     Ownership::Owned
                 } else {
@@ -12529,6 +12874,31 @@ impl AgentPtyRegistry {
             .expect("registry lock poisoned in a test seam")
             .pending_spawns
             .insert(agent_id.to_string(), Some(pane_id.to_string()));
+    }
+
+    /// The retirement rule, shared by both pane-naming arms of
+    /// [`Self::generation_ownership`]: may the published generation `id`,
+    /// whose record `a` names `pane`, still speak for that pane?
+    ///
+    /// A live generation always may. A retired one may until its pane changes
+    /// hands — the grace that lets a final `Idle`/`SessionEnd` written just
+    /// before exit land after the PTY EOF was observed.
+    ///
+    /// Round 3 (auditor finding 4): `pane_handed_over` is the MONOTONE half of
+    /// the rule and has to be read first. `pane_claimed_by_other` looks at who
+    /// holds the pane NOW, which un-answers itself the moment the successor
+    /// exits too — so a retired generation got its pane back once both records
+    /// were dead. The flag is set as the pane changes hands and is never
+    /// cleared, so the handover is permanent no matter what becomes of the
+    /// successor. See [`RunningAgent::pane_handed_over`].
+    fn generation_speaks_for_pane(
+        inner: &RegistryInner,
+        id: &str,
+        a: &RunningAgent,
+        pane: &str,
+    ) -> bool {
+        !a.exited.load(Ordering::SeqCst)
+            || !(a.pane_handed_over || Self::pane_claimed_by_other(inner, pane, id))
     }
 
     /// Issue #454 (round-2 audit): does any generation OTHER than `excluded`
@@ -15764,6 +16134,129 @@ mod spawn_tests {
              as the sibling test above pins for a lone retiree — nothing has \
              claimed the pane after it"
         );
+        assert!(
+            owns(&registry, Some("handback-pane-454"), None),
+            "and so does an untagged producer naming the pane: the successor's \
+             grace period is still open, so its late token-less final report \
+             must land (PRD #110 / issue #398)"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698, the control: the token-less (`(Some(P), None)`) arm keeps
+    /// the retirement grace a lone retired generation gets from the keyed arm.
+    ///
+    /// A pre-F9 hook script, or any wrapper that lost
+    /// `DOT_AGENT_DECK_AGENT_ID`, writes its final `Idle`/`SessionEnd` and exits
+    /// — and the PTY EOF can be observed before those bytes are read. With no
+    /// successor on the pane, that report must still be owned, or it is dropped
+    /// and the pane's session state leaks. This is the case directly adjacent to
+    /// the one #698 closes, and losing it is what broke the first round of the
+    /// #318 work, so it is pinned on its own.
+    #[tokio::test]
+    async fn a_lone_retired_generation_still_owns_its_pane_for_an_untagged_producer() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "lone-retiree-pane-698".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry
+                .agent_record_any(&id)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some("lone-retiree-pane-698"),
+            "precondition: the retired record must still be in the registry"
+        );
+
+        assert!(
+            owns(&registry, Some("lone-retiree-pane-698"), None),
+            "a retired generation with no successor still answers for its pane \
+             when the producer named no generation — that is what lets a late \
+             token-less final Idle/SessionEnd land after the PTY EOF"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Issue #698: the token-less arm applies the SAME retirement rule as the
+    /// keyed arm, so a pane whose retired generation was handed over and whose
+    /// successor was then reaped answers for nobody.
+    ///
+    /// `A` exits on `P` and lingers unreaped; `B` takes `P` (setting `A`'s
+    /// `pane_handed_over`); `B` is closed, and `close_agent` removes only `B`.
+    /// `A` still stands as `{exited, pane_handed_over}`. The keyed arm has said
+    /// `A` may not speak for `P` since the handover, and the pane-only arm used
+    /// to answer `Owned` anyway because it matched any record still naming `P`.
+    /// Both generations are gone, so nothing may speak for the pane.
+    #[tokio::test]
+    async fn a_handed_over_then_reaped_pane_owns_nothing_for_an_untagged_producer() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let pane = "handed-over-reaped-pane-698";
+        let opts = |command| SpawnOptions {
+            command: Some(command),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..SpawnOptions::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once the first child is gone");
+        registry.close_agent(&new).expect("close the successor");
+
+        assert!(
+            registry.agent_record_any(&new).is_none(),
+            "precondition: the successor's record must be reaped"
+        );
+        assert_eq!(
+            registry
+                .agent_record_any(&old)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some(pane),
+            "precondition: the handed-over predecessor must still be in the \
+             registry, or this test proves nothing about the pane-only arm"
+        );
+        assert_eq!(
+            registry.generation_ownership(Some(pane), Some(&old)),
+            Ownership::Unclaimed,
+            "precondition: the keyed arm already disowns the handed-over \
+             predecessor"
+        );
+
+        assert_eq!(
+            registry.generation_ownership(Some(pane), None),
+            Ownership::Unclaimed,
+            "an untagged producer naming a pane whose only remaining record was \
+             handed over must not be owned — the keyed arm refuses that \
+             generation, and the pane-only arm has to apply the same retirement \
+             rule rather than matching any record that still names the pane"
+        );
         registry.shutdown_all();
     }
 
@@ -17366,7 +17859,8 @@ mod spawn_tests {
         let expected =
             crate::platform::paths::executable_path().expect("the test binary has a usable path");
         let prior = std::env::var(key).ok();
-        // SAFETY: serialized by ENV_TEST_LOCK and restored before asserting.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. Restored
+        // before asserting.
         unsafe {
             std::env::set_var(key, "/an/enclosing/deck/dot-agent-deck");
         }
@@ -17419,6 +17913,16 @@ mod spawn_tests {
     /// Test mutex covering temporary process-env mutation. `std::env::set_var`
     /// is process-global, so any test that pokes at the environment must run
     /// serialized to avoid leaking the value into a sibling test's spawn.
+    ///
+    /// **What it does not cover** (issue #1516). `set_var` / `remove_var` also
+    /// race any *thread* reading the environment at that moment, and this lock
+    /// excludes sibling tests, not threads. The tests that write under it build
+    /// no runtime and start no thread: [`spawn`] forks the child and starts no
+    /// reader, and the child's own environment is fixed at exec. So under
+    /// nextest the threads that exist at each write are the test's own and
+    /// libtest's runner thread, which waits for it. Under plain `cargo test`
+    /// every other test of this binary shares the process, and one that takes no
+    /// lock and reads the environment races these writes (issue #245).
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -17430,9 +17934,9 @@ mod spawn_tests {
         // `dot-agent-deck` would itself try to act as a stream client).
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: tests in this module are serialized by ENV_TEST_LOCK and
-        // we restore the prior value before releasing the lock, so the
-        // process-global env mutation is invisible to other tests.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released, so other tests
+        // that take the lock never see this one.
         let prior = std::env::var(DOT_AGENT_DECK_VIA_DAEMON).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_VIA_DAEMON, "1");
@@ -17472,8 +17976,8 @@ mod spawn_tests {
         // pane (so hooks would route events to the wrong tab).
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
@@ -17516,8 +18020,8 @@ mod spawn_tests {
         // `SessionStart` and drew a card for it on the real dashboard.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
@@ -17556,8 +18060,8 @@ mod spawn_tests {
         // fixing the leak above would break every legitimate producer.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
@@ -17598,8 +18102,8 @@ mod spawn_tests {
         // happens to carry a stale one.
         let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
-        // before the lock is released.
+        // SAFETY: see `ENV_TEST_LOCK` for the threads that exist here. The
+        // prior value is restored before the lock is released.
         let prior = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();
         unsafe {
             std::env::set_var(DOT_AGENT_DECK_PANE_ID, "stale-pane");
@@ -17801,6 +18305,7 @@ mod spawn_tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -20776,38 +21281,62 @@ mod spawn_tests {
     /// recorded exactly like any other, however late that makes it. A deadline
     /// that cancelled it mid-write would leave our bytes in the box unsubmitted
     /// and with no #424 record that they are there.
+    ///
+    /// The setup is retried when it did not hold: on a starved box the
+    /// deadline can pass before the first byte, and the call then correctly
+    /// refuses with nothing written — which is not the case under test. A
+    /// write cancelled mid-way fails every attempt, the last one included, so
+    /// the retries tolerate starvation without hiding that regression.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
         const PANE: &str = "issue-544-mid-write";
         const TEXT: &str = "MIDWRITE-SENTINEL";
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let agent = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
-                ..SpawnOptions::default()
-            })
-            .expect("spawn stand-in");
+        const ATTEMPTS: usize = 5;
+        let mut attempt = 0;
+        let (registry, agent, deadline, sent) = loop {
+            attempt += 1;
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in");
 
-        // No draft and a free writer, so everything up to the first byte takes
-        // well under a millisecond — and the deadline then falls inside the
-        // write's own `SUBMIT_DELAY`, after the payload and before the CR.
-        let started = Instant::now();
-        let deadline = started + SUBMIT_DELAY / 2;
-        let sent = tokio::time::timeout(
-            Duration::from_secs(5),
-            registry.write_and_submit_guarded_first_write_within(
-                PANE,
-                TEXT,
-                &agent,
-                || async { true },
-                started,
-                deadline,
-            ),
-        )
-        .await
-        .expect("bounded");
+            // No draft and a free writer, so everything up to the first byte
+            // normally takes well under a millisecond — and the deadline then
+            // falls inside the write's own `SUBMIT_DELAY`, after the payload
+            // and before the CR.
+            let started = Instant::now();
+            let deadline = started + SUBMIT_DELAY / 2;
+            let sent = tokio::time::timeout(
+                Duration::from_secs(5),
+                registry.write_and_submit_guarded_first_write_within(
+                    PANE,
+                    TEXT,
+                    &agent,
+                    || async { true },
+                    started,
+                    deadline,
+                ),
+            )
+            .await
+            .expect("bounded");
+            match sent {
+                // Starved before the first byte (issue #1494's `cargo
+                // test-fast` at load ~40 on 16 cores): the precondition did
+                // not hold, so set it up again.
+                Err(AgentPtyError::DeadlineElapsed) if attempt < ATTEMPTS => {
+                    eprintln!(
+                        "attempt {attempt}: the deadline passed before the first byte; retrying"
+                    );
+                    registry.shutdown_all();
+                }
+                sent => break (registry, agent, deadline, sent),
+            }
+        };
         assert!(
             Instant::now() >= deadline,
             "precondition: the write must outlive its deadline"
@@ -21609,6 +22138,142 @@ mod spawn_tests {
         ));
     }
 
+    /// Issue #1446: a generation armed with `arm_silence_watch_until_delivered`
+    /// keeps the watch it replaced running until its own pointer is settled.
+    /// Delivery supersedes that watch, a refusal puts it back with its own
+    /// accounting, completions credited meanwhile apply to it too, it can still
+    /// consume itself to report, and a close of its orchestrator cancels it.
+    #[test]
+    fn silence_watch_until_delivered_keeps_the_displaced_watch_until_settled() {
+        let closed = |rx: &mut oneshot::Receiver<()>| {
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed))
+        };
+        let reg = Arc::new(AgentPtyRegistry::new());
+
+        // A refusal restores the earlier watch, task still running.
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let mut older_cancel = older.cancel;
+        let refused = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("refused");
+        assert!(
+            !closed(&mut older_cancel),
+            "the arm alone must not cancel it"
+        );
+        assert!(reg.withdraw_silence_watch_if("worker", refused.seq));
+        assert!(!closed(&mut older_cancel), "a refusal must not cancel it");
+        match reg.retire_silence_watch("worker") {
+            SilenceWatchRetirement::Cancelled { seq } => assert_eq!(
+                seq, older.seq,
+                "the restored watch is the earlier delegation's, with no phantom superseded count"
+            ),
+            other => panic!("expected the earlier watch back, got {other:?}"),
+        }
+        assert!(closed(&mut older_cancel));
+
+        // A delivery supersedes it.
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let mut older_cancel = older.cancel;
+        let delivered = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("delivered");
+        reg.confirm_silence_watch_delivered("worker", delivered.seq);
+        assert!(
+            closed(&mut older_cancel),
+            "a delivery supersedes the earlier watch"
+        );
+        assert!(!reg.withdraw_silence_watch_if("worker", older.seq));
+        assert!(reg.cancel_silence_watch_if("worker", delivered.seq));
+
+        // A completion credited while the earlier watch is displaced is
+        // credited to it as well, so a refusal cannot resurrect a watch whose
+        // delegation has already reported.
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let mut older_cancel = older.cancel;
+        let refused = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("refused");
+        assert!(matches!(
+            reg.retire_silence_watch("worker"),
+            SilenceWatchRetirement::KeptNewer { remaining: 0, .. }
+        ));
+        assert!(
+            closed(&mut older_cancel),
+            "the credited delegation's watch is resolved"
+        );
+        assert!(reg.withdraw_silence_watch_if("worker", refused.seq));
+        assert!(matches!(
+            reg.retire_silence_watch("worker"),
+            SilenceWatchRetirement::Nothing
+        ));
+
+        // The displaced watch can still consume its own record to report.
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let pending = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("pending");
+        assert!(reg.cancel_silence_watch_if("worker", older.seq));
+        assert!(
+            !reg.cancel_silence_watch_if("worker", older.seq),
+            "one-shot"
+        );
+        assert!(reg.withdraw_silence_watch_if("worker", pending.seq));
+        assert!(matches!(
+            reg.retire_silence_watch("worker"),
+            SilenceWatchRetirement::Nothing
+        ));
+
+        // If the displaced watch fired and took its own record, a delivery of
+        // the newer pointer still supersedes the notice it composed: the epoch
+        // that notice captured no longer holds (Qodo, PR #1502). The
+        // commission arm is what gives the pane an epoch.
+        assert!(arm_commission(&reg, "worker", "orch"));
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let delivered = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("delivered");
+        let epoch = reg.delegation_resolution_epoch("worker");
+        assert!(
+            epoch.is_some(),
+            "precondition: the pane has a resolution epoch"
+        );
+        assert!(reg.cancel_silence_watch_if("worker", older.seq));
+        assert!(reg.delegation_resolution_epoch_is("worker", epoch));
+        reg.confirm_silence_watch_delivered("worker", delivered.seq);
+        assert!(
+            !reg.delegation_resolution_epoch_is("worker", epoch),
+            "a notice the displaced watch built before the newer delivery must stand down"
+        );
+        assert!(reg.cancel_silence_watch_if("worker", delivered.seq));
+
+        // Closing the displaced watch's orchestrator cancels it, though the
+        // record holding it was armed by another orchestrator.
+        let older = reg
+            .arm_silence_watch("worker", "orch-a", None)
+            .expect("older");
+        let mut older_cancel = older.cancel;
+        let pending = reg
+            .arm_silence_watch_until_delivered("worker", "orch-b", None)
+            .expect("pending");
+        reg.begin_pane_close("orch-a");
+        assert!(closed(&mut older_cancel));
+        assert!(reg.withdraw_silence_watch_if("worker", pending.seq));
+        assert!(matches!(
+            reg.retire_silence_watch("worker"),
+            SilenceWatchRetirement::Nothing
+        ));
+    }
+
     /// The identity-bound worker-side match `sweep_delegations_on_exit`
     /// (via `drain_delegations_touching_for_exit`) requires before it will
     /// retire a delegation for the exiting pane's worker side: a record
@@ -22161,13 +22826,13 @@ mod spawn_tests {
     fn commission_ledger_releases_an_undelivered_delegations_commission() {
         let reg = Arc::new(AgentPtyRegistry::new());
         assert!(
-            !reg.release_delegation_commission("worker"),
+            !reg.release_delegation_commission("worker", None),
             "there is nothing to release for a worker nobody delegated to"
         );
 
         // One delegate, undelivered: the ledger must not keep the debt.
         assert!(arm_commission(&reg, "worker", "orch"));
-        assert!(reg.release_delegation_commission("worker"));
+        assert!(reg.release_delegation_commission("worker", None));
         assert_eq!(
             reg.retire_delegation_commission("worker"),
             WorkDoneProvenance::Unsolicited,
@@ -22178,7 +22843,7 @@ mod spawn_tests {
         // Two delegates, only the second undelivered: the first is still owed.
         assert!(arm_commission(&reg, "worker", "orch"));
         assert!(arm_commission(&reg, "worker", "orch"));
-        assert!(reg.release_delegation_commission("worker"));
+        assert!(reg.release_delegation_commission("worker", None));
         assert_eq!(
             reg.retire_delegation_commission("worker"),
             WorkDoneProvenance::Solicited { remaining: 0 },
@@ -22269,7 +22934,7 @@ mod spawn_tests {
                 reg.retire_delegation_commission("worker");
             }),
             ("an undelivered delegate's release", &|| {
-                reg.release_delegation_commission("worker");
+                reg.release_delegation_commission("worker", None);
             }),
             ("a restart cancelling the watches", &|| {
                 reg.cancel_watches_of_replaced_agent("worker");
@@ -22730,7 +23395,7 @@ mod spawn_tests {
         );
         // The parked write was refused: it releases its own commission, and the
         // queued supersede still owes one.
-        assert!(reg.release_delegation_commission("worker"));
+        assert!(reg.release_delegation_commission("worker", None));
         assert!(reg.owes_delegation_commission("worker"));
         drop(b);
     }
@@ -22842,6 +23507,175 @@ mod spawn_tests {
         assert!(
             !reg.cancel_watches_of_replaced_agent("worker"),
             "nothing left"
+        );
+    }
+
+    /// Issue #507: a `work-done` from an agent that is not the one the pane's
+    /// commissions were made to retires those commissions instead of spending
+    /// one — except a commission whose dispatch is still queued, whose pointer
+    /// will go to whoever holds the pane.
+    #[test]
+    fn commission_ledger_retires_what_only_a_previous_occupant_owed() {
+        fn arm(reg: &Arc<AgentPtyRegistry>) -> CommissionDispatchInFlight {
+            match reg.arm_delegation_commission("worker", "orch", None, true) {
+                CommissionArm::Armed { in_flight, .. } => in_flight,
+                other => panic!("the commission must arm: {other:?}"),
+            }
+        }
+        let retire = |reg: &Arc<AgentPtyRegistry>, reporting: Option<&str>| {
+            let mut tracker = reg.delegations.lock().unwrap();
+            AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
+                &mut tracker,
+                "worker",
+                reporting,
+            )
+        };
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        // Two delegations made to `old-agent`, both dispatched.
+        for _ in 0..2 {
+            let dispatched = arm(&reg);
+            reg.bind_commission_worker_agent_id("worker", dispatched.arm_id(), "old-agent");
+            drop(dispatched);
+        }
+        assert_eq!(
+            retire(&reg, Some("old-agent")),
+            0,
+            "its own agent keeps them"
+        );
+        assert_eq!(retire(&reg, None), 0, "no live occupant to compare with");
+
+        // A third, bound to `old-agent` at delegate time and still queued
+        // behind the pane's dispatch lock when `new-agent` reports.
+        let queued = arm(&reg);
+        reg.bind_commission_worker_agent_id("worker", queued.arm_id(), "old-agent");
+        assert_eq!(
+            retire(&reg, Some("new-agent")),
+            2,
+            "the two dispatched to the previous occupant go"
+        );
+        assert!(
+            reg.owes_delegation_commission("worker"),
+            "the queued one is kept: its pointer has not been written yet"
+        );
+        drop(queued);
+        assert_eq!(retire(&reg, Some("new-agent")), 1);
+        assert!(!reg.owes_delegation_commission("worker"));
+    }
+
+    /// Issue #507 review (Qodo, #1525): a queued dispatch's commission is kept
+    /// by its own arm id, not by counting — here the OLDER commission is the
+    /// queued one, and a count-based keep would have retired it and kept the
+    /// newer one the previous occupant was given.
+    #[test]
+    fn commission_ledger_keeps_the_queued_commission_by_arm_id() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let arm = |reg: &Arc<AgentPtyRegistry>| match reg
+            .arm_delegation_commission("worker", "orch", None, true)
+        {
+            CommissionArm::Armed { in_flight, .. } => in_flight,
+            other => panic!("the commission must arm: {other:?}"),
+        };
+        let queued = arm(&reg);
+        let delivered = arm(&reg);
+        reg.bind_commission_worker_agent_id("worker", delivered.arm_id(), "old-agent");
+        drop(delivered);
+        // Read under the lock and asserted after it: a failed assertion with the
+        // tracker held would poison it for `queued`'s drop and abort the run.
+        let (retired, kept) = {
+            let mut tracker = reg.delegations.lock().unwrap();
+            let retired = AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
+                &mut tracker,
+                "worker",
+                Some("new-agent"),
+            );
+            let kept: Vec<u64> = tracker
+                .commissions
+                .get("worker")
+                .map(|entry| entry.armed_at.iter().map(|c| c.arm_id).collect())
+                .unwrap_or_default();
+            (retired, kept)
+        };
+        assert_eq!(retired, 1);
+        assert_eq!(
+            kept,
+            vec![queued.arm_id()],
+            "the queued commission is the one kept"
+        );
+        drop(queued);
+    }
+
+    /// Issue #507 review (Greptile, #1525): a successor that was itself given a
+    /// task (`--supersede` over the commission its predecessor still owed)
+    /// keeps its own commission and loses only the predecessor's — the binding
+    /// is per commission, not just the newest one's.
+    #[test]
+    fn commission_ledger_retires_a_predecessor_s_commission_beside_the_successor_s_own() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        for agent in ["old-agent", "new-agent"] {
+            let CommissionArm::Armed { in_flight, .. } =
+                reg.arm_delegation_commission("worker", "orch", None, true)
+            else {
+                panic!("the commission must arm");
+            };
+            reg.bind_commission_worker_agent_id("worker", in_flight.arm_id(), agent);
+            drop(in_flight);
+        }
+        let mut tracker = reg.delegations.lock().unwrap();
+        assert_eq!(
+            AgentPtyRegistry::retire_commissions_of_a_previous_occupant(
+                &mut tracker,
+                "worker",
+                Some("new-agent"),
+            ),
+            1,
+            "only the predecessor's commission goes"
+        );
+        let kept: Vec<Option<String>> = tracker.commissions["worker"]
+            .armed_at
+            .iter()
+            .map(|c| c.worker_agent_id.clone())
+            .collect();
+        assert_eq!(kept, vec![Some("new-agent".to_string())]);
+    }
+
+    /// Issue #507 review (Qodo, #1525): crediting the reporting agent's own
+    /// commission when it is the NEWEST leaves an older, still-queued one owed;
+    /// once that one is bound to its worker, the ledger must say that worker
+    /// owes it — a ledger still naming the spent commission's worker suppresses
+    /// the waiting notice of the one that does.
+    #[test]
+    fn commission_ledger_follows_the_newest_outstanding_after_crediting_it() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let arm = |reg: &Arc<AgentPtyRegistry>| match reg
+            .arm_delegation_commission("worker", "orch", None, true)
+        {
+            CommissionArm::Armed { in_flight, .. } => in_flight,
+            other => panic!("the commission must arm: {other:?}"),
+        };
+        let queued = arm(&reg);
+        let newer = arm(&reg);
+        reg.bind_commission_worker_agent_id("worker", newer.arm_id(), "first-agent");
+        drop(newer);
+        reg.delegations
+            .lock()
+            .unwrap()
+            .commissions
+            .get_mut("worker")
+            .expect("two commissions owed")
+            .credit(Some("first-agent"));
+        // The queued dispatch now writes its pointer and binds its worker.
+        reg.bind_commission_worker_agent_id("worker", queued.arm_id(), "second-agent");
+        drop(queued);
+        assert!(
+            reg.commission_owed_to_agent("worker", "second-agent")
+                .is_some(),
+            "the surviving commission is owed by the agent it was bound to"
+        );
+        assert!(
+            reg.commission_owed_to_agent("worker", "first-agent")
+                .is_none(),
+            "the spent commission's agent owes nothing"
         );
     }
 

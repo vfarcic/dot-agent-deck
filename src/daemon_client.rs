@@ -798,6 +798,51 @@ pub async fn read_response<R: AsyncRead + Unpin>(
     }
 }
 
+/// Issue #621: a guarded `write-and-submit`'s answer as
+/// [`DaemonClient::write_and_submit_with_identity_reply`] reports it — the
+/// honest [`SendResult`], and on a `stale` refusal of a request that named no
+/// session, the hook-session generation the daemon refused it against
+/// ([`crate::daemon_protocol::AttachResponse::current_session_id`]).
+///
+/// That generation is how a caller whose own event stream never delivered the
+/// pane's `SessionStart` learns which conversation to name. It is advisory:
+/// the retry naming it goes back through the same guard. An older daemon never
+/// sends one, so `None` there means exactly what it always did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedSendReply {
+    pub result: SendResult,
+    pub current_session_id: Option<String>,
+}
+
+/// Issue #621 (review): a guarded `write-and-submit` that produced no outcome,
+/// and whether it could nonetheless have written. `may_have_written` is false
+/// only when the failure provably left the daemon untouched — the capability
+/// probe, the connection, building the request — or when the daemon itself
+/// answered with a refusal; it is true from the moment the request frame
+/// started going out until a decodable answer came back, which is the
+/// lost-response case a delivery has to stay cautious about.
+#[derive(Debug)]
+pub struct GuardedSendFailure {
+    pub error: ClientError,
+    pub may_have_written: bool,
+}
+
+impl GuardedSendFailure {
+    fn unsent(error: ClientError) -> Self {
+        Self {
+            error,
+            may_have_written: false,
+        }
+    }
+
+    fn maybe_written(error: ClientError) -> Self {
+        Self {
+            error,
+            may_have_written: true,
+        }
+    }
+}
+
 /// PRD #20 R20-011: translate a `WriteAndSubmit` [`AttachResponse`] into the
 /// honest [`SendResult`] a caller acts on, enforcing that `ok` AGREES with the
 /// delivered-vs-non-delivered outcome. Three cases:
@@ -1685,6 +1730,30 @@ impl DaemonClient {
         expected_session_id: Option<&str>,
         delivery_id: Option<&str>,
     ) -> Result<SendResult, ClientError> {
+        self.write_and_submit_with_identity_reply(
+            pane_id,
+            text,
+            expected_agent_id,
+            expected_session_id,
+            delivery_id,
+        )
+        .await
+        .map(|reply| reply.result)
+        .map_err(|failure| failure.error)
+    }
+
+    /// Issue #621: [`Self::write_and_submit_with_identity`], keeping the
+    /// generation a `stale` refusal names — see [`GuardedSendReply`]. The two
+    /// send exactly the same request; only what is kept from the answer
+    /// differs.
+    pub async fn write_and_submit_with_identity_reply(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> Result<GuardedSendReply, GuardedSendFailure> {
         // PRD #20 R20-006 (finding #6): an identity-bearing send DEPENDS on the
         // daemon's guarded-send guarantees (exact agent+session match, atomic
         // delivery-id dedup). If the daemon doesn't advertise that capability —
@@ -1697,12 +1766,20 @@ impl DaemonClient {
         // and stays legacy-compatible.
         let identity_bearing =
             expected_agent_id.is_some() || expected_session_id.is_some() || delivery_id.is_some();
-        if identity_bearing && !self.daemon_advertises_guarded_send().await? {
-            return Err(ClientError::Server(
+        // Issue #621 (review): everything up to the request frame leaves the
+        // daemon untouched, so a failure there is `unsent` — a caller may treat
+        // it as proof that nothing was written.
+        if identity_bearing
+            && !self
+                .daemon_advertises_guarded_send()
+                .await
+                .map_err(GuardedSendFailure::unsent)?
+        {
+            return Err(GuardedSendFailure::unsent(ClientError::Server(
                 "daemon does not advertise guarded-send support; refusing to submit an \
                  identity-bearing prompt unguarded (would risk double-submit / mis-deliver)"
                     .into(),
-            ));
+            )));
         }
         let mut request = serde_json::json!({
             "op": "write-and-submit",
@@ -1719,21 +1796,58 @@ impl DaemonClient {
             request["delivery_id"] = serde_json::Value::String(v.to_string());
         }
         let resp = self.issue_json_command(&request).await?;
-        interpret_send_response(resp)
+        let current_session_id = resp.current_session_id.clone();
+        // A decoded answer is the daemon's own account. `ok = false` with no
+        // delivered outcome is one of its refusals, each of which writes
+        // nothing (a malformed guard, a conflicting or oversized delivery id, a
+        // clean transport failure); only the contradiction — a delivered
+        // outcome beside `ok = false` — leaves the write in doubt.
+        let claims_delivered = matches!(
+            resp.send_result,
+            Some(SendResult::Applied | SendResult::Queued)
+        );
+        let result = interpret_send_response(resp).map_err(|error| GuardedSendFailure {
+            error,
+            may_have_written: claims_delivered,
+        })?;
+        // Kept only beside the outcome it explains, and only when this request
+        // named no session: a generation offered alongside anything else —
+        // including a `stale` for a request that DID name one, which is a lost
+        // target — is not an address this client should ever write to.
+        let current_session_id = current_session_id
+            .filter(|_| result == SendResult::Stale && expected_session_id.is_none());
+        Ok(GuardedSendReply {
+            result,
+            current_session_id,
+        })
     }
 
     /// One-shot request/response for a hand-built JSON request. Used by
     /// [`Self::write_and_submit_with_identity`] to carry additive fields the
     /// [`AttachRequest`] enum doesn't declare, without widening the enum.
+    ///
+    /// Issue #621 (review): a failure says which side of the request frame it
+    /// happened on. Connecting and building the request leave the daemon
+    /// untouched (`unsent`); from the first byte of the frame on, the daemon
+    /// may have received a whole request and acted on it, and only an answer
+    /// it sent says otherwise.
     async fn issue_json_command(
         &self,
         request: &serde_json::Value,
-    ) -> Result<AttachResponse, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
-        let payload = serde_json::to_vec(request)
-            .map_err(|e| ClientError::Malformed(format!("request JSON: {e}")))?;
-        write_frame(&mut wr, KIND_REQ, &payload).await?;
-        read_response(&mut rd).await
+    ) -> Result<AttachResponse, GuardedSendFailure> {
+        let (mut rd, mut wr) = self
+            .connect()
+            .await
+            .map_err(|e| GuardedSendFailure::unsent(e.into()))?;
+        let payload = serde_json::to_vec(request).map_err(|e| {
+            GuardedSendFailure::unsent(ClientError::Malformed(format!("request JSON: {e}")))
+        })?;
+        write_frame(&mut wr, KIND_REQ, &payload)
+            .await
+            .map_err(|e| GuardedSendFailure::maybe_written(e.into()))?;
+        read_response(&mut rd)
+            .await
+            .map_err(GuardedSendFailure::maybe_written)
     }
 
     /// PRD #20 R20-006 (finding #6): probe whether the daemon advertises the
@@ -5158,6 +5272,114 @@ start = true
             !matches!(result, Ok(SendResult::Applied | SendResult::Queued)),
             "ok=false must win over a contradictory delivered result; got {result:?}"
         );
+    }
+
+    /// Issue #621 (Qodo on #1521): a failed guarded send says whether it could
+    /// have written. Failures before the request frame — no daemon at all, a
+    /// daemon that does not advertise guarded send — and a daemon's own
+    /// refusal are `may_have_written = false`, so a delivery may still bind the
+    /// generation a later `stale` names; a request the daemon read and never
+    /// answered is `true`, because it may have been applied.
+    #[cfg(unix)]
+    #[test]
+    fn guarded_send_failure_says_whether_the_request_could_have_written() {
+        #[derive(Clone, Copy)]
+        enum Script {
+            NoGuardedSend,
+            ReadAndHangUp,
+            Refuse,
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build guarded-send failure runtime");
+        runtime.block_on(async {
+            let send = |path: PathBuf| async move {
+                DaemonClient::new(path)
+                    .write_and_submit_with_identity_reply(
+                        "pane-621",
+                        "prompt",
+                        Some("agent-621"),
+                        None,
+                        Some("delivery-621"),
+                    )
+                    .await
+            };
+            let scripted = |script: Script| {
+                let (dir, path, listener) = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("guarded-failure.sock");
+                    let listener = bind_attach_listener(&path).expect("bind synthetic daemon");
+                    (dir, path, listener)
+                };
+                let server = tokio::spawn(async move {
+                    loop {
+                        let Ok(mut stream) = listener.accept().await else {
+                            return;
+                        };
+                        let Ok(Some((_, payload))) = read_frame(&mut stream).await else {
+                            continue;
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&payload).expect("decode request");
+                        if request["op"] == "hello" {
+                            let hello = AttachResponse::hello(PROTOCOL_VERSION);
+                            let hello = match script {
+                                Script::NoGuardedSend => hello,
+                                _ => hello.with_guarded_send(),
+                            };
+                            let _ = crate::daemon_protocol::write_resp(&mut stream, &hello).await;
+                            continue;
+                        }
+                        match script {
+                            Script::ReadAndHangUp => drop(stream),
+                            _ => {
+                                let refusal = AttachResponse::err(
+                                    "delivery id reused with a conflicting payload/target",
+                                );
+                                let _ =
+                                    crate::daemon_protocol::write_resp(&mut stream, &refusal).await;
+                            }
+                        }
+                    }
+                });
+                (dir, path, server)
+            };
+
+            let missing = tempfile::tempdir().unwrap();
+            let no_daemon = send(missing.path().join("absent.sock")).await;
+
+            let mut observed = Vec::new();
+            for (name, script) in [
+                ("no guarded-send capability", Script::NoGuardedSend),
+                ("request read, never answered", Script::ReadAndHangUp),
+                ("daemon refusal", Script::Refuse),
+            ] {
+                let (_dir, path, server) = scripted(script);
+                let outcome = send(path).await;
+                server.abort();
+                observed.push((
+                    name,
+                    outcome.map(|r| r.result).map_err(|f| f.may_have_written),
+                ));
+            }
+
+            assert!(
+                matches!(no_daemon, Err(ref f) if !f.may_have_written),
+                "no daemon at all wrote nothing: {no_daemon:?}"
+            );
+            assert_eq!(
+                observed,
+                vec![
+                    ("no guarded-send capability", Err(false)),
+                    ("request read, never answered", Err(true)),
+                    ("daemon refusal", Err(false)),
+                ],
+                "only a request the daemon may have acted on without answering is in doubt"
+            );
+        });
     }
 
     /// Scenario: Point a new identity-bearing send client at a synthetic older

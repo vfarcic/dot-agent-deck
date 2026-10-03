@@ -1032,9 +1032,15 @@ impl EnvRestore {
             .iter()
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
+        common::env_write::assert_no_tokio_runtime("EnvRestore::set");
         for (key, value) in vars {
-            // SAFETY: called before the test starts its runtime, so this thread
-            // is the only one of the test reading the environment.
+            // SAFETY: a stated residual, not a proof (issue #1516). Called
+            // before the test builds its runtime, which the assertion above
+            // checks, so no deck code is running. The threads that can exist:
+            // this test's own, libtest's runner thread waiting for it, and the
+            // harness's `load-context` heartbeat once a harness temp dir exists,
+            // which sleeps and reads `/proc`, never the environment. Under plain
+            // `cargo test` the other tests of this file race it (issue #245).
             unsafe { std::env::set_var(key, value) };
         }
         Self(saved)
@@ -1043,8 +1049,16 @@ impl EnvRestore {
 
 impl Drop for EnvRestore {
     fn drop(&mut self) {
+        if !std::thread::panicking() {
+            common::env_write::assert_no_tokio_runtime("EnvRestore::drop");
+        }
         for (key, value) in &self.0 {
-            // SAFETY: dropped after the test's runtime has shut down.
+            // SAFETY: as for `EnvRestore::set`. Dropped after the runtime, whose
+            // drop joins its threads. What can still be running besides the
+            // threads named there is the detached PTY reader of an agent whose
+            // PTY has not reached EOF yet (`agent_pty::pump_reader`), which
+            // reads its PTY and updates the registry, and reads no environment
+            // variable.
             match value {
                 Some(value) => unsafe { std::env::set_var(key, value) },
                 None => unsafe { std::env::remove_var(key) },

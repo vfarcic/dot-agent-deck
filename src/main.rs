@@ -949,15 +949,19 @@ fn delegate_verdict(
         };
     }
     let unresolved = resp.unresolved_roles.join(", ");
-    // The four causes, stated as the four causes rather than as the one that
+    // The five causes, stated as the five causes rather than as the one that
     // happens to be most common. Issue #554 added the fourth: the daemon routes
     // by the role name a pane was started with, so a role renamed in the toml
     // after the orchestration started is present in the file and still reaches
     // nobody — the first cause alone sent the user to a file that looked right.
+    // Issue #524 added the fifth: a worker that exited on its own is still in
+    // the role maps, and only a `clear = true` role is respawned by a delegate.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
                   itself — an orchestrator cannot delegate to itself — when \
-                  its worker pane has been closed, or when the role was renamed \
+                  its worker pane has been closed, when its worker has exited \
+                  and the role is not `clear = true` — `dot-agent-deck pane \
+                  restart <role>` starts it again — or when the role was renamed \
                   or added in .dot-agent-deck.toml after this orchestration \
                   started — running panes keep the role names they were started \
                   with until the orchestration is restarted.)";
@@ -2481,6 +2485,10 @@ fn spawn_event_subscriber(
                     loop {
                         match sub.next_event().await {
                             Ok(Some(BroadcastMsg::Event(event))) => {
+                                #[cfg(feature = "e2e")]
+                                if e2e_subscriber_drops(&event) {
+                                    continue;
+                                }
                                 state.write().await.apply_event(event);
                             }
                             // PRD #120: a daemon-spawned orchestration (issue
@@ -2538,6 +2546,29 @@ fn spawn_event_subscriber(
             delay = std::cmp::min(delay * 2, max_delay);
         }
     });
+}
+
+/// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
+/// way it does when they arrive while it is reconnecting — it resubscribes
+/// without replaying what it missed, so the daemon knows the conversation and
+/// the TUI never learns it. A reconnect cannot be timed against an agent's boot
+/// from a PTY test, so the test names a session-id prefix in
+/// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
+/// asserts the prompt is still delivered.
+///
+/// EVERY event of that conversation is dropped, not only its `SessionStart`:
+/// any later frame carrying the session id — the daemon's own `ShellIdle` for a
+/// pane that went quiet, measured arriving right behind the start — would
+/// establish the generation in the TUI's view on its own, so a gap that misses
+/// the start alone recovers by itself. The failure needs the gap to cover the
+/// boot, and this models exactly that.
+///
+/// Compiled only into the `e2e` build, like `effective_current_exe`'s seam in
+/// `platform/paths.rs`, so a shipped binary has no switch that discards events.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
+        .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
@@ -3975,21 +4006,23 @@ mod tests {
             msg.contains("ghost"),
             "the message must name the role that missed: {msg}"
         );
-        // The four causes, not the one that happens to be most common: the
+        // The five causes, not the one that happens to be most common: the
         // old message told the user to go check role names in the toml even
         // when the role was sitting there correctly and was simply the
         // orchestrator itself, or had had its worker pane closed — or, issue
         // #554, had been renamed in the toml after the orchestration started,
         // which leaves the file looking right while the daemon still routes by
-        // the old name.
+        // the old name — or, issue #524, had a worker that exited on its own.
         assert!(
             msg.contains(".dot-agent-deck.toml")
                 && msg.contains("orchestrator cannot delegate to itself")
                 && msg.contains("worker pane has been closed")
+                && msg.contains("worker has exited")
+                && msg.contains("pane restart <role>")
                 && msg.contains(
                     "renamed or added in .dot-agent-deck.toml after this orchestration started"
                 ),
-            "the message must state all four causes, not assert one: {msg}"
+            "the message must state all five causes, not assert one: {msg}"
         );
     }
 

@@ -58,6 +58,19 @@ export function gridFit(width: number, height: number, cell: { rowHeight: number
   return { columns: fit(width, cell.minColumnWidth), rows: fit(height, cell.rowHeight) };
 }
 
+/**
+ * Issue #1494 — how many of `fit`'s columns `count` cells use: only as many as
+ * they need, so a few cells share the whole width instead of each squeezed
+ * into one of many narrow columns. Cells filled top to bottom (`"column"`)
+ * need a column per `fit.rows` of them; cells filled left to right (`"row"`)
+ * a column each. Never more than fit, never fewer than one. A page's capacity
+ * stays `fit.columns × fit.rows`: this narrows only how a page is drawn.
+ */
+export function usedColumns(fit: GridFit, count: number, flow: "column" | "row"): number {
+  const needed = flow === "column" ? Math.ceil(count / fit.rows) : count;
+  return Math.max(1, Math.min(fit.columns, needed));
+}
+
 /** The visible marker beside a paged list. */
 export function pageMarker(slice: Pick<PageSlice, "page" | "pages">): string {
   return `Page ${slice.page} of ${slice.pages}`;

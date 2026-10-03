@@ -259,6 +259,28 @@ pub async fn kept_worktree_preview(
     pane_ids: &[String],
     probe_timeout: Duration,
 ) -> Option<KeptWorktree> {
+    kept_worktree_preview_with(
+        records,
+        worktrees,
+        pane_ids,
+        probe_timeout,
+        worktree_is_dirty,
+    )
+    .await
+}
+
+/// [`kept_worktree_preview`] with the dirtiness probe passed in, so a test can
+/// hand it a probe that never answers. A real `git status` cannot make the
+/// deadline win deterministically: `tokio::time::timeout` polls the probe
+/// before its timer, so a probe that has already finished when the timer fires
+/// beats even a 1ns deadline (issue #1449).
+async fn kept_worktree_preview_with(
+    records: &[AgentRecord],
+    worktrees: &WorktreeRegistry,
+    pane_ids: &[String],
+    probe_timeout: Duration,
+    probe: impl AsyncFn(&Path) -> Result<bool, String>,
+) -> Option<KeptWorktree> {
     let mut seen: Vec<PathBuf> = Vec::new();
     for pane_id in pane_ids {
         let Some(record) = records
@@ -282,34 +304,33 @@ pub async fn kept_worktree_preview(
         if policy != Some(RemovalPolicy::KeepIfDirty) {
             continue;
         }
-        let confirmed_dirty =
-            match tokio::time::timeout(probe_timeout, worktree_is_dirty(&worktree)).await {
-                Ok(Ok(true)) => true,
-                // Clean: this tree is about to be REMOVED, and saying so would be
-                // the noise that makes the warning worth ignoring. Say nothing.
-                Ok(Ok(false)) => continue,
-                // A failed probe is what `remove_worktree` itself treats as a
-                // reason to keep, so report the path — under wording that does not
-                // claim more than was measured.
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        worktree = %worktree.display(),
-                        error = %e,
-                        "close preview: could not check worktree status"
-                    );
-                    false
-                }
-                // A blown deadline is not an answer either way: the removal path
-                // runs the same probe with no deadline and may still find it clean.
-                // Report conditionally rather than dropping the path.
-                Err(_) => {
-                    tracing::debug!(
-                        worktree = %worktree.display(),
-                        "close preview: worktree status probe timed out"
-                    );
-                    false
-                }
-            };
+        let confirmed_dirty = match tokio::time::timeout(probe_timeout, probe(&worktree)).await {
+            Ok(Ok(true)) => true,
+            // Clean: this tree is about to be REMOVED, and saying so would be
+            // the noise that makes the warning worth ignoring. Say nothing.
+            Ok(Ok(false)) => continue,
+            // A failed probe is what `remove_worktree` itself treats as a
+            // reason to keep, so report the path — under wording that does not
+            // claim more than was measured.
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    error = %e,
+                    "close preview: could not check worktree status"
+                );
+                false
+            }
+            // A blown deadline is not an answer either way: the removal path
+            // runs the same probe with no deadline and may still find it clean.
+            // Report conditionally rather than dropping the path.
+            Err(_) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    "close preview: worktree status probe timed out"
+                );
+                false
+            }
+        };
         return Some(KeptWorktree {
             path: worktree.to_string_lossy().into_owned(),
             confirmed_dirty,
@@ -2457,6 +2478,10 @@ mod tests {
     /// The probe's deadline degrades the WORDING, never the report: the tree is
     /// kept whether or not the status walk finished, and the path is the half
     /// the user actually needs.
+    ///
+    /// The probe is a stand-in that never answers, so the deadline is the only
+    /// way out. A real `git status` under a 1ns deadline raced the timer and
+    /// occasionally won (issue #1449).
     #[tokio::test]
     async fn kept_worktree_preview_still_reports_the_path_when_the_probe_times_out() {
         let tmp = crate::test_temp::tempdir().unwrap();
@@ -2469,11 +2494,12 @@ mod tests {
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
         let records = vec![pane_in("pane-1", &wt)];
 
-        let kept = kept_worktree_preview(
+        let kept = kept_worktree_preview_with(
             &records,
             &reg,
             &["pane-1".to_string()],
-            Duration::from_nanos(1),
+            Duration::from_millis(1),
+            async |_: &Path| std::future::pending().await,
         )
         .await
         .expect("an unanswered probe must still report the path");

@@ -92,6 +92,12 @@ impl WorkDoneHarness {
     /// `.dot-agent-deck.toml` into that directory when the test needs to move the
     /// detector seams; `None` leaves production defaults in force.
     async fn new(project_config: Option<&str>) -> Self {
+        Self::with_worker(project_config, "cat").await
+    }
+
+    /// [`Self::new`] with the `coder` worker running `worker_command` instead
+    /// of `cat` — for a test that needs the worker's process to end on cue.
+    async fn with_worker(project_config: Option<&str>, worker_command: &str) -> Self {
         common::init_test_env();
         let cwd = common::race_safe_tempdir();
         if let Some(contents) = project_config {
@@ -128,7 +134,7 @@ impl WorkDoneHarness {
             .expect("spawn the orchestrator observer stub");
         registry
             .spawn_agent(SpawnOptions {
-                command: Some("cat"),
+                command: Some(worker_command),
                 cwd: Some(&cwd_str),
                 env: vec![
                     (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
@@ -1394,6 +1400,175 @@ fn work_done_011_abandoned_close_does_not_make_the_deck_deny_a_real_delegation()
             );
         });
     }
+}
+
+/// Issue #507: the trigger file the `coder` worker waits on before it exits on
+/// its own — no `StopAgent`, no close, nothing the daemon asked for.
+const WORKER_EXIT_TRIGGER: &str = "worker-exit-now";
+
+/// The pointer `handle_delegate` writes into the worker's pane, matched with
+/// whitespace squeezed out because a long pointer wraps at the pane's width.
+const WORKER_TASK_POINTER: &str = "worker-task-coder.md";
+
+/// Poll `condition` every 20 ms until it holds or `timeout` elapses, without
+/// blocking the runtime the dispatch tasks run on.
+async fn poll_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The report the first worker files for the delegation it really was given —
+/// written to `work-done-coder.md` by the deck itself, so it is the file a
+/// laundered completion would overwrite.
+const COMMISSIONED_SENTINEL: &str = "commissioned-report-body-5e2c";
+
+/// How many times `needle` occurs in `pane`'s scrollback, with whitespace
+/// squeezed out of both so a pointer wrapped at the pane's width still counts.
+fn squeezed_count(registry: &AgentPtyRegistry, agent_id: &str, needle: &str) -> usize {
+    let squeezed: String =
+        String::from_utf8_lossy(&registry.snapshot(agent_id).unwrap_or_default())
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+    squeezed.matches(needle).count()
+}
+
+/// Scenario: Delegate to `coder` and let it report, so the deck files that report at `.dot-agent-deck/work-done-coder.md`; delegate again and wait until the task pointer is in its pane, then let the worker's process EXIT ON ITS OWN — no `StopAgent`, no pane close — and start a different agent in the same pane id. That successor was never delegated to, so when it reports `work-done` the orchestrator must be told the deck has no outstanding delegation on record, must not get a second "has completed their task" pointer, and the first report must still be the one in `work-done-coder.md`.
+#[spec("orchestration/work-done/014")]
+#[test]
+fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_commission() {
+    runtime().block_on(async {
+        // Both delegation watches off and `roles = []`, so `clear` resolves to
+        // nothing and the delegate reaches the live worker without a respawn —
+        // `002`'s shape, which pins the ordinary pointer for a real completion.
+        // The worker sits in a loop until the test tells it to exit.
+        let harness = WorkDoneHarness::with_worker(
+            Some(
+                "worker_response_timeout_minutes = 0\n\n[[orchestrations]]\nname = \"unused\"\nroles = []\n",
+            ),
+            &format!("while [ ! -f ./{WORKER_EXIT_TRIGGER} ]; do sleep 0.05; done; exit 0"),
+        )
+        .await;
+        let first_worker = harness
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .expect("the first worker is live");
+
+        // ---- CONTROL: a delegation that really is answered -----------------
+        // The deck files the report and points the orchestrator at it, so the
+        // ordinary path works here and the summary file is the deck's own.
+        harness.delegate().await;
+        harness
+            .work_done(&format!("Finished the delegated task. {COMMISSIONED_SENTINEL}"))
+            .await;
+        let snapshot = harness
+            .wait_for_orchestrator(
+                |snapshot| snapshot.contains(POINTER_NEEDLE),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            snapshot.contains(POINTER_NEEDLE)
+                && std::fs::read_to_string(harness.summary_path())
+                    .is_ok_and(|report| report.contains(COMMISSIONED_SENTINEL)),
+            "control — a commissioned completion must be filed and pointed at; \
+             snapshot = {snapshot:?}"
+        );
+
+        // ---- A SECOND DELEGATION, OWED BY THE FIRST WORKER -----------------
+        harness.delegate().await;
+        let delivered = poll_until(Duration::from_secs(20), || {
+            squeezed_count(&harness.registry, &first_worker, WORKER_TASK_POINTER) >= 2
+        })
+        .await;
+        assert!(
+            delivered,
+            "control — the second task pointer never reached the first worker's pane; \
+             snapshot = {:?}",
+            String::from_utf8_lossy(&harness.registry.snapshot(&first_worker).unwrap_or_default())
+        );
+        assert!(
+            harness
+                .registry
+                .commission_owed_to_agent(WORKER_PANE, &first_worker)
+                .is_some(),
+            "control — the second delegate must leave a commission owed by the first worker"
+        );
+
+        // ---- THE NATURAL EXIT ----------------------------------------------
+        // The worker's own process ends. Nothing calls `StopAgent`,
+        // `begin_pane_close` or `finish_pane_close`.
+        std::fs::write(harness.cwd.path().join(WORKER_EXIT_TRIGGER), b"go\n")
+            .expect("release the worker's exit");
+        let exited = poll_until(Duration::from_secs(10), || {
+            harness.registry.pane_current_agent_id(WORKER_PANE).is_none()
+        })
+        .await;
+        assert!(
+            exited,
+            "the first worker never exited on its own, so the pane id was never free"
+        );
+
+        // A DIFFERENT agent takes the same pane id — the spawn the daemon's
+        // `StartAgent` makes — and is never delegated to.
+        let cwd_str = harness.cwd.path().to_string_lossy().to_string();
+        let successor = harness
+            .registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd_str),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    ("SHELL".to_string(), "/bin/sh".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("a successor takes the exited worker's pane id");
+        assert_ne!(
+            successor, first_worker,
+            "the successor must be a different agent"
+        );
+
+        harness
+            .work_done(&format!("Did what a person asked me. {FRESH_SENTINEL}"))
+            .await;
+        let snapshot = harness
+            .wait_for_orchestrator(
+                |snapshot| {
+                    snapshot.contains(FRESH_SENTINEL)
+                        || snapshot.matches(POINTER_NEEDLE).count() >= 2
+                        || snapshot.contains(DIVERTED_NEEDLE)
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        assert_eq!(
+            snapshot.matches(POINTER_NEEDLE).count(),
+            1,
+            "issue #507: an agent that was never delegated to inherited the exited worker's \
+             commission, so its completion was reported to the orchestrator as the delegated \
+             work coming back; snapshot = {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains(UNSOLICITED_NEEDLE) && snapshot.contains(FRESH_SENTINEL),
+            "the successor's completion must reach the orchestrator, labelled as one the deck has \
+             no delegation on record for; snapshot = {snapshot:?}"
+        );
+        let filed = std::fs::read_to_string(harness.summary_path()).expect("the summary file");
+        assert!(
+            filed.contains(COMMISSIONED_SENTINEL) && !filed.contains(FRESH_SENTINEL),
+            "issue #507: the successor's uncommissioned completion overwrote the last report the \
+             orchestrator DID commission; work-done-coder.md = {filed:?}"
+        );
+    });
 }
 
 /// Issue #331: the words the daemon uses when it saved a commissioned report

@@ -159,7 +159,14 @@ async fn codex_worker_001_inner() {
         .await;
 
     let sentinel = cwd.path().join(SENTINEL_NAME);
-    let sentinel_ok = common::wait_for_path_async(&sentinel, Duration::from_secs(240)).await;
+    // Poll the CONTENT, not existence: a shell redirect creates the file before
+    // the write lands, so an existence wait can read it empty (issue #244).
+    let sentinel_result = common::wait_for_file_trimmed_eq_async(
+        &sentinel,
+        SENTINEL_CONTENT,
+        Duration::from_secs(240),
+    )
+    .await;
     let worker_pane = || {
         daemon
             .registry
@@ -167,16 +174,13 @@ async fn codex_worker_001_inner() {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
     };
-    let pane = worker_pane();
-    assert!(
-        sentinel_ok,
-        "wrapped Codex never created {SENTINEL_NAME:?}. pointer_reached_pane={}\n=== Codex worker pane ===\n{pane}\n=== end ===",
-        pane.contains("worker-task-coder.md")
-    );
-    if let Err(observed) =
-        common::wait_for_file_trimmed_eq(&sentinel, SENTINEL_CONTENT, Duration::from_secs(10))
-    {
-        panic!("Codex worker created the sentinel with unexpected contents; observed: {observed}");
+    if let Err(observed) = sentinel_result {
+        let pane = worker_pane();
+        panic!(
+            "wrapped Codex never wrote {SENTINEL_CONTENT:?} into {SENTINEL_NAME:?} within 240s; \
+             observed: {observed}. pointer_reached_pane={}\n=== Codex worker pane ===\n{pane}\n=== end ===",
+            pane.contains("worker-task-coder.md")
+        );
     }
 
     let work_done = cwd

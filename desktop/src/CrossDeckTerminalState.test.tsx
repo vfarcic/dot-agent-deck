@@ -43,8 +43,10 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
     readonly buffer = { active: { baseY: 0 }, onBufferChange: (): { dispose: () => void } => ({ dispose: () => {} }) };
     onScroll(): { dispose: () => void } { return { dispose: () => {} }; }
     onWriteParsed(): { dispose: () => void } { return { dispose: () => {} }; }
-    onResize(): { dispose: () => void } { return { dispose: () => {} }; }
     attachCustomKeyEventHandler(): void {}
+    // Issue #1457 — the selection keeper's subscriptions.
+    onResize(): { dispose: () => void } { return { dispose: () => {} }; }
+    onSelectionChange(): { dispose: () => void } { return { dispose: () => {} }; }
     dispose(): void {}
   }
   class FakeFitAddon {

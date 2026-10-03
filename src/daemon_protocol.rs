@@ -2410,6 +2410,29 @@ pub struct AttachResponse {
     /// `None` on every non-`WriteAndSubmit` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_result: Option<crate::event::SendResult>,
+    /// Issue #621: on a `stale` refusal of a paned `write-and-submit` that named
+    /// NO session, the hook-session generation the pane carried when the guard
+    /// refused it — the conversation the caller would have to name for the
+    /// write to be accepted. Read by the guard itself, under the target writer
+    /// and the same `AppState` guard as the refusal, so it is the value the
+    /// refusal was decided on rather than a later re-read.
+    ///
+    /// Why it exists: before it, a refused caller's ONLY route to the
+    /// generation was its own event stream, and the TUI's subscriber does not
+    /// replay what it missed across a reconnect. A `SessionStart` dropped there
+    /// left every retry unnamed and every one refused, until the prompt was
+    /// abandoned at `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`.
+    ///
+    /// `None` on every other response — including a `stale` refusal of a
+    /// request that DID name a session, which is a lost target and not an
+    /// invitation to rebind (a delivery bound to one conversation must never be
+    /// redirected into its successor). Advisory, not an authorization: the
+    /// retry that names it is re-validated by the same guard. Additive +
+    /// optional (`#[serde(default, skip_serializing_if)]`): an older daemon
+    /// omits it, an older client ignores it, and the request/response shape is
+    /// otherwise unchanged, so it needs no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<String>,
     /// PRD #20 R20-003/004/006 (finding #6): guarded-send capability advertised
     /// on the `Hello` reply. `Some(true)` means this daemon enforces the
     /// identity/idempotency guards on `write-and-submit` (exact agent + session
@@ -2729,6 +2752,15 @@ impl AttachResponse {
             ok: delivered,
             send_result: Some(result),
             ..Default::default()
+        }
+    }
+    /// Issue #621: [`Self::with_send_result`] for a guarded send's full outcome,
+    /// carrying the generation a `stale` refusal was decided on — see
+    /// [`Self::current_session_id`].
+    fn with_write_and_submit_outcome(outcome: WriteAndSubmitOutcome) -> Self {
+        Self {
+            current_session_id: outcome.current_session_id,
+            ..Self::with_send_result(outcome.result)
         }
     }
     /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
@@ -3063,6 +3095,7 @@ pub async fn run_attach_server_with_counter(
 /// deliberate carve-out that CANNOT distinguish such an agent from a
 /// conversation that has just ended, which is a known hole spelled out at the
 /// arm that implements it.
+#[cfg(test)]
 async fn compute_write_and_submit_outcome(
     registry: &AgentPtyRegistry,
     state: &SharedState,
@@ -3070,6 +3103,41 @@ async fn compute_write_and_submit_outcome(
     text: &str,
     extras: &WriteAndSubmitExtras,
 ) -> Result<crate::event::SendResult, String> {
+    compute_write_and_submit_reply(registry, state, pane_id, text, extras)
+        .await
+        .map(|outcome| outcome.result)
+}
+
+/// Issue #621: what a `write-and-submit` decided — the honest
+/// [`crate::event::SendResult`], plus, on a `stale` refusal of a paned request
+/// that named no session, the generation the guard refused it against. See
+/// [`AttachResponse::current_session_id`] for why the second half exists and
+/// what it does not license.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteAndSubmitOutcome {
+    result: crate::event::SendResult,
+    current_session_id: Option<String>,
+}
+
+impl From<crate::event::SendResult> for WriteAndSubmitOutcome {
+    fn from(result: crate::event::SendResult) -> Self {
+        Self {
+            result,
+            current_session_id: None,
+        }
+    }
+}
+
+/// [`compute_write_and_submit_outcome`] with the refused generation kept — what
+/// the attach handler answers from. The decision is identical; issue #621 only
+/// stops discarding the one value the refusal was made on.
+async fn compute_write_and_submit_reply(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    pane_id: &str,
+    text: &str,
+    extras: &WriteAndSubmitExtras,
+) -> Result<WriteAndSubmitOutcome, String> {
     use crate::agent_pty::GuardedSend;
     use crate::event::{SendResult, Writable};
     // PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
@@ -3107,8 +3175,8 @@ async fn compute_write_and_submit_outcome(
         }
     };
     match writable {
-        Writable::HistoryOnly => Ok(SendResult::HistoryOnly),
-        Writable::None => Ok(SendResult::NoLiveTarget),
+        Writable::HistoryOnly => Ok(SendResult::HistoryOnly.into()),
+        Writable::None => Ok(SendResult::NoLiveTarget.into()),
         Writable::Live => {
             // The re-validation closure runs UNDER the held target writer (inside
             // `write_and_submit_guarded`), immediately before the write, against
@@ -3137,8 +3205,15 @@ async fn compute_write_and_submit_outcome(
             // nothing and answers with the same `SendResult::NoLiveTarget` the
             // resolution block above already gives an identity-less request.
             let Some(agent_id) = extras.expected_agent_id.clone() else {
-                return Ok(SendResult::NoLiveTarget);
+                return Ok(SendResult::NoLiveTarget.into());
             };
+            // Issue #621: the generation the unnamed-request arm below refuses
+            // against, written by the closure under the writer and read back
+            // only if the send comes back `Stale`. Set by that arm alone, so
+            // every other cause of a `Stale` — the agent exiting, the pane
+            // changing hands, a named generation that no longer matches —
+            // leaves it `None`.
+            let refused_generation = Arc::new(std::sync::Mutex::new(None::<String>));
             let guarded = if is_paneless {
                 // A paneless target is re-validated by agent identity (mirroring
                 // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
@@ -3157,6 +3232,7 @@ async fn compute_write_and_submit_outcome(
                 // Issue #915 (finding 4): the ended-generation witness is keyed by
                 // AGENT, so the closure needs the identity it is already bound to.
                 let agent_for_check = agent_id.clone();
+                let refused_generation = Arc::clone(&refused_generation);
                 registry
                     .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
@@ -3275,23 +3351,31 @@ async fn compute_write_and_submit_outcome(
                         // Binding once rather than every frame is also what keeps
                         // this from looping.
                         //
-                        // It is NOT a general guarantee. `Stale` does not carry
-                        // the daemon's current generation, so a refused caller's
-                        // ONLY route to it is its own event stream — and
-                        // `spawn_event_subscriber` (`main.rs`) resubscribes after
-                        // a lagged or errored stream WITHOUT replaying what it
-                        // missed. A `SessionStart` dropped in that window is
-                        // never applied to the client `AppState`, so its
-                        // `pane_hook_session_id` for the pane stays `None`
-                        // indefinitely: every retry goes out unnamed, every one
-                        // is refused here, and at
+                        // Issue #621: and it now recovers when the caller's event
+                        // stream DROPPED the generation too. `spawn_event_subscriber`
+                        // (`main.rs`) resubscribes after a lagged or errored
+                        // stream WITHOUT replaying what it missed, so a
+                        // `SessionStart` dropped in that window was never applied
+                        // to the client `AppState`: every retry went out unnamed,
+                        // every one was refused here, and at
                         // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
-                        // (60 s) the delivery is ABANDONED with the prompt never
-                        // delivered. Bounded and logged rather than silent or
-                        // mis-delivered — but lost. Closing it means
-                        // resynchronizing state after a reconnect, or returning
-                        // the daemon's current generation on `Stale`; both are
-                        // design changes outside this branch.
+                        // (60 s) the prompt was abandoned undelivered. This arm
+                        // therefore records the generation it refuses against,
+                        // and the reply carries it
+                        // (`AttachResponse::current_session_id`), so the caller
+                        // can name it without waiting on an event it will never
+                        // receive. The TUI adopts it only for a delivery that has
+                        // written nothing yet — the same precondition as the
+                        // snapshot bind — so it names the conversation the bytes
+                        // are about to enter and claims nothing retroactively.
+                        // A delivery that already wrote into a pane with no
+                        // generation and then missed the start still cannot
+                        // bind from a refusal, and is still abandoned at the
+                        // deadline: from a point-in-time answer it cannot tell
+                        // the conversation it wrote into from a successor whose
+                        // predecessor ended unseen. Resynchronizing client state
+                        // after a reconnect would close that too, and is the
+                        // more general remedy the issue names.
                         //
                         // Issue #608 audit, finding 5(b): this arm refuses on the
                         // SESSION evidence alone, with no `has_live_attach`
@@ -3304,8 +3388,8 @@ async fn compute_write_and_submit_outcome(
                         // more — and `Stale` is retryable, so an unattached
                         // caller whose snapshot HAS the generation names it on
                         // the next attempt (one whose snapshot never observes it
-                        // retries unnamed until the deadline — see finding 6
-                        // above). Measured before adopting: across the whole
+                        // can name the generation this refusal reports, issue
+                        // #621 — see finding 6 above). Measured before adopting: across the whole
                         // fast tier the ONLY paned send that reaches this arm
                         // against a current generation is an ATTACHED one, which
                         // both rules refuse identically.
@@ -3384,7 +3468,14 @@ async fn compute_write_and_submit_outcome(
                                 None => return false,
                             },
                             None => {
-                                if guard.pane_hook_session_id(&pane_for_check).is_some() {
+                                // Issue #621: refused, and the refusal now says
+                                // which conversation it was refused against —
+                                // see `AttachResponse::current_session_id`.
+                                if let Some(current) = guard.pane_hook_session_id(&pane_for_check) {
+                                    *refused_generation
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        Some(current);
                                     return false;
                                 }
                                 if guard.agent_generation_ended(&agent_for_check) {
@@ -3397,11 +3488,17 @@ async fn compute_write_and_submit_outcome(
                     .await
             };
             match guarded {
-                Ok(GuardedSend::Applied) => Ok(SendResult::Applied),
-                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession),
-                Ok(GuardedSend::Stale) => Ok(SendResult::Stale),
-                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget),
-                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous),
+                Ok(GuardedSend::Applied) => Ok(SendResult::Applied.into()),
+                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession.into()),
+                Ok(GuardedSend::Stale) => Ok(WriteAndSubmitOutcome {
+                    result: SendResult::Stale,
+                    current_session_id: refused_generation
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take(),
+                }),
+                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget.into()),
+                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous.into()),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -4851,13 +4948,17 @@ async fn handle_connection(
             match extras.delivery_id.as_deref() {
                 // No idempotency key (legacy / non-guarded caller): compute once,
                 // no dedup ledger involvement.
-                None => match compute_write_and_submit_outcome(
+                None => match compute_write_and_submit_reply(
                     &registry, &state, &pane_id, &text, &extras,
                 )
                 .await
                 {
                     Ok(outcome) => {
-                        write_resp(&mut stream, &AttachResponse::with_send_result(outcome)).await?
+                        write_resp(
+                            &mut stream,
+                            &AttachResponse::with_write_and_submit_outcome(outcome),
+                        )
+                        .await?
                     }
                     Err(e) => write_resp(&mut stream, &AttachResponse::err(e)).await?,
                 },
@@ -4902,7 +5003,7 @@ async fn handle_connection(
                             .await?
                         }
                         crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
-                            match compute_write_and_submit_outcome(
+                            match compute_write_and_submit_reply(
                                 &registry, &state, &pane_id, &text, &extras,
                             )
                             .await
@@ -4911,10 +5012,13 @@ async fn handle_connection(
                                     // Cache a DELIVERED (`applied`/`queued`) or
                                     // AMBIGUOUS outcome; a non-delivery stays
                                     // retryable (see `record_delivery_outcome`).
-                                    registry.record_delivery_outcome(&permit, outcome);
+                                    // A `stale` is never cached, so the
+                                    // generation it carries (issue #621) is
+                                    // never replayed stale either.
+                                    registry.record_delivery_outcome(&permit, outcome.result);
                                     write_resp(
                                         &mut stream,
-                                        &AttachResponse::with_send_result(outcome),
+                                        &AttachResponse::with_write_and_submit_outcome(outcome),
                                     )
                                     .await?
                                 }
@@ -8058,6 +8162,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -8095,6 +8200,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
                 blocked: None,
+                hook_generation: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

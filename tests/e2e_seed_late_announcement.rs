@@ -16,6 +16,10 @@
 //! on screen: the deck writes the bytes BEFORE the delivery goes wrong, so a PTY
 //! buffers them and the text survives the failure. What does not survive is the
 //! ordering, which the stand-in reports directly.
+//!
+//! `prompt/pane-input/044` (issue #621) shares the fixture and the form driver:
+//! a seed whose agent DID announce itself, to the daemon, while the deck's own
+//! event stream missed it.
 
 mod common;
 
@@ -227,4 +231,74 @@ fn new_pane_019_a_silent_agent_receives_one_seed_after_the_readiness_fallback() 
         .filter(|line| line.contains(SEED_MARKER))
         .count();
     assert_eq!(copies, 1, "the seed must arrive exactly once.\nLog:\n{log}");
+}
+
+/// Scenario: Spawn the built-in dispatcher with a stand-in that announces its conversation at once, while the deck's own event stream misses that conversation's events (the reconnect window issue #621 describes, reproduced with the `e2e` build's drop seam). The daemon knows the conversation and the deck does not, so the deck's unnamed seed is refused; the seed must still reach the agent well before the 60-second delivery deadline.
+#[spec("prompt/pane-input/044")]
+#[test]
+fn pane_input_044_a_seed_whose_session_start_the_deck_missed_is_still_delivered() {
+    // The prefix the stand-in's genuine conversation id carries, and the one
+    // the TUI's subscriber is told to drop. Every event of that conversation is
+    // lost to the TUI — the start AND the daemon's `ShellIdle` that follows it,
+    // either of which would teach the TUI the generation — while the daemon
+    // applies them as normal.
+    const DROPPED_PREFIX: &str = "dropped-start-";
+    const LOG: &str = "dropped-start.log";
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS", DROPPED_PREFIX)
+        .launch_with_fixture("dispatcher-seed");
+    deck.wait_for_string("No active agents");
+
+    // A stand-in that announces exactly one conversation — no wrapper-fork
+    // boot start beside it, which the deck WOULD see and bind, turning this
+    // into a bound delivery against a different generation (a case the fix
+    // deliberately does not redirect). It then records every line it reads.
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let quoted_bin = format!("'{}'", bin.replace('\'', r"'\''"));
+    let script = deck.workdir().join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"{DROPPED_PREFIX}%s\"}}' \
+             \"$DOT_AGENT_DECK_PANE_ID\" | {quoted_bin} hook --agent claude-code >/dev/null 2>&1 \
+             || {{ printf 'hook-rejected\\n' >> {LOG}; exit 97; }}\n\
+             printf 'announced\\n' >> {LOG}\n\
+             while IFS= read -r line; do\n\
+             \x20 printf 'received|%s\\n' \"$line\" >> {LOG}\n\
+             done\n"
+        ),
+    )
+    .expect("write announcing stand-in");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod announcing stand-in");
+
+    let submitted = Instant::now();
+    spawn_seeded_dispatcher(&deck, "./claude");
+    let log_path = deck.workdir().join(LOG);
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        common::wait_for_file_substr_count(&log_path, "announced", 1, Duration::from_secs(20)),
+        "precondition: the stand-in must have announced its conversation to the daemon.\n\
+         Log:\n{}\ngrid:\n{}",
+        log(),
+        deck.snapshot_grid()
+    );
+
+    // With nothing announced in the deck's view, the 10-second fallback is the
+    // door, and its first write goes out naming no conversation. Bounded well
+    // inside the 60-second deadline so an abandoned seed fails here rather than
+    // reading as slow.
+    const DELIVERY_WAIT: Duration = Duration::from_secs(40);
+    let delivered = common::wait_for_file_substr_count(&log_path, SEED_MARKER, 1, DELIVERY_WAIT);
+    assert!(
+        delivered,
+        "the seed never reached the agent within {}s of submitting the form, although the \
+         daemon knew its conversation — the deck's unnamed writes were refused and nothing \
+         told it which conversation to name.\nLog:\n{}\ngrid:\n{}",
+        submitted.elapsed().as_secs(),
+        log(),
+        deck.snapshot_grid()
+    );
 }

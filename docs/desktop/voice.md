@@ -92,7 +92,7 @@ While voice is on, a list that does not fit in the window is shown a page at a t
 
 ![The New agent dialog with voice on: the daemons, the directories and the modes are each numbered from 1, the directories fill the dialog in five columns, and "Page 1 of 3" shows beside the Directory heading](/img/voice-pages-desktop.png)
 
-- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
+- **Each page fills the space the list has.** Directories and modes are laid out in as many columns as fit, and a short list uses only the columns it needs, so a few long directory names are shown whole. A name that is cut short shows in full when you hover over it. The Daemons screen shows four tiles per page, the four the `1`–`4` keys select.
 - **"Page 2 of 3"** shows beside a list that has pages: next to the **Directory** heading or under **Mode** in the New agent dialog, and above the tiles on the Daemons screen.
 - **Say "next page" or "previous page"** to turn it ("go to the next page" and "go back a page" work too). On the last page, the first page, or a screen with no pages, nothing moves and the app says why. In the New agent dialog, the directories turn until you choose one, and then the modes do.
 - **Numbers start at 1 on every page** and refer to the page showing. Turning the page changes the numbers, so a number you began to say before the page turned chooses nothing and the app asks you to say it again.

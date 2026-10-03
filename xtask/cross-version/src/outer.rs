@@ -70,7 +70,8 @@ use crate::probe::Probe;
 use crate::report::{Evidence, RunVerdict};
 use crate::sandbox::{Direction, EndpointMatrix, EndpointMode, EnvSpec, Sandbox};
 use crate::{
-    buildgate, buildns, ctl, inner, isolation, previous, probe, probes, proc, report, sandbox, stub,
+    buildgate, buildlock, buildns, ctl, inner, isolation, previous, probe, probes, proc, report,
+    sandbox, stub,
 };
 
 /// The hidden flag the outer half passes to the copy of this binary it starts
@@ -247,6 +248,15 @@ struct Opts {
     #[arg(long, default_value_t = 1200)]
     run_timeout_secs: u64,
 
+    /// How long to wait for another `cargo xver` run to release the build
+    /// clone and target dir this run needs (issue #1530). A run holds both
+    /// from before its first `git` command in the clone until its branch
+    /// binary is staged into its sandbox, so the wait is for one fetch and
+    /// build, not for a whole run. `0` refuses at once. Either way the message
+    /// names the run holding them.
+    #[arg(long, default_value_t = 1200)]
+    lock_wait_secs: u64,
+
     /// Which pairing to run.
     ///
     /// `forward` (the default, and rule 12's pairing): the previous release's
@@ -270,6 +280,46 @@ struct Opts {
     /// than silently ignored.
     #[arg(long, value_enum, default_value_t = ProbeArg::Auto)]
     probe: ProbeArg,
+}
+
+impl Opts {
+    /// Anchor every path option to `cwd`, the directory the command was run
+    /// from, before any of them reaches a command with a working directory of
+    /// its own (issue #1453).
+    ///
+    /// A relative path is otherwise resolved by whichever process reads it,
+    /// from wherever that process runs: [`create_clone`] runs `git clone` from
+    /// the clone's PARENT, so `--source-clone ../x` passed through still
+    /// relative landed one directory above where it names. Lexical
+    /// (`Path::join`) rather than `canonicalize`, because most of these paths
+    /// do not exist yet, and an absolute path is kept exactly as given.
+    /// The standalone build clone: `--source-clone`, else
+    /// `<repo parent>/dot-agent-deck-xver-src`.
+    fn clone_path(&self, repo_parent: &Path) -> PathBuf {
+        self.source_clone
+            .clone()
+            .unwrap_or_else(|| repo_parent.join("dot-agent-deck-xver-src"))
+    }
+
+    fn anchored_at(mut self, cwd: &Path) -> Self {
+        for path in [
+            &mut self.old_binary,
+            &mut self.source_clone,
+            &mut self.target_dir,
+            &mut self.cargo_cache,
+            &mut self.runs_root,
+            &mut self.releases_dir,
+            &mut self.evidence,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.is_relative() {
+                *path = cwd.join(&*path);
+            }
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -422,7 +472,13 @@ pub fn main() -> ExitCode {
     if args.get(1).is_some_and(|a| a == "--") {
         args.remove(1);
     }
-    let opts = Opts::parse_from(args);
+    let opts = match parse_invocation(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("xver: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run(&opts) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -431,6 +487,19 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Parse the command line and anchor its path options to this process's
+/// working directory — the directory the command was run from (issue #1453).
+/// `main` and the regression test both go through here.
+fn parse_invocation<I, T>(args: I) -> Result<Opts, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot read the current directory: {e}"))?;
+    Ok(Opts::parse_from(args).anchored_at(&cwd))
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +854,37 @@ fn branch_slug(branch: &str) -> String {
         .collect()
 }
 
+/// `git clone --no-checkout <url> <clone>`, run from the clone's parent.
+///
+/// `clone` must be absolute, and [`Opts::anchored_at`] is what makes
+/// `--source-clone` so: a relative one would be resolved against the parent this
+/// runs from rather than the directory the command was run from, which is issue
+/// #1453. Refused here too, so a future caller cannot reopen it silently.
+fn create_clone(url: &str, clone: &Path) -> Result<(), String> {
+    if !clone.is_absolute() {
+        return Err(format!(
+            "the build clone path {} is relative; it must be anchored to the invoking \
+             directory first (issue #1453)",
+            clone.display()
+        ));
+    }
+    let parent = clone
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", clone.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    must_run(
+        git(parent).args([
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            url,
+            &clone.to_string_lossy(),
+        ]),
+        "git clone (standalone build clone)",
+    )?;
+    Ok(())
+}
+
 /// Point the standalone build clone at `origin/<branch>` and build it.
 ///
 /// A standalone clone rather than a linked worktree of the operator's
@@ -823,20 +923,7 @@ fn new_binary(
     let url = format!("https://github.com/{}.git", opts.repo);
     let fresh = std::fs::symlink_metadata(clone).is_err();
     if fresh {
-        let parent = clone
-            .parent()
-            .ok_or_else(|| format!("{} has no parent", clone.display()))?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        must_run(
-            git(parent).args([
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                &url,
-                &clone.to_string_lossy(),
-            ]),
-            "git clone (standalone build clone)",
-        )?;
+        create_clone(&url, clone)?;
         ev.preflight.push(format!(
             "created the standalone build clone {} from {url}",
             clone.display()
@@ -1103,6 +1190,20 @@ fn new_binary(
             run.report.pid_ns
         ));
         ev.build.push(buildns::LINK_POOL_NOTE.to_string());
+        let head_now = must_run(
+            git(&clone).args(["rev-parse", "HEAD"]),
+            "git rev-parse HEAD",
+        )?;
+        let status_now = must_run(
+            git(&clone).args(["status", "--porcelain", "--untracked-files=no"]),
+            "git status",
+        )?;
+        if let Some(moved) = clone_moved(&sha, &head_now, &status_now) {
+            return Err(moved);
+        }
+        ev.build.push(format!(
+            "the build clone was still at {sha}, with no tracked modification, after the build"
+        ));
     }
     let bin = target.join("debug").join("dot-agent-deck");
     if !bin.exists() {
@@ -1129,6 +1230,56 @@ fn new_binary(
 /// environment injected a `DAD_BUILD_ID` — so the note reports it as that
 /// rather than as a measurement, and says so plainly when there is none.
 fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
+    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
+                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
+                      independent measurement.";
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => format!(
+            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
+             from is NOT knowable from this run. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::NoCommit { build_id } => format!(
+            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
+             it was built from is NOT knowable. Do not read this run as a test of the branch \
+             HEAD `{head_sha}`."
+        ),
+        BuiltFrom::Other { build_id, short } => format!(
+            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
+             `{head_sha}`. This run tested another build, and its tells say nothing about that \
+             HEAD. {provenance}"
+        ),
+        BuiltFrom::DirtyHead { build_id } => format!(
+            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
+             built from that commit PLUS uncommitted changes in the build clone, which is not \
+             the commit under test. {provenance}"
+        ),
+        BuiltFrom::Head { build_id, short } => format!(
+            "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
+             the binary's own stamp it is a build of the commit under test. {provenance}"
+        ),
+    }
+}
+
+/// Which commit the branch binary says it was built from, against the HEAD
+/// the run fetched and checked out.
+#[derive(Debug, PartialEq, Eq)]
+enum BuiltFrom {
+    /// No `daemon hello` was recorded: the scenario stopped before it ran.
+    NoHello,
+    /// The build id carries no `-g<sha>` component.
+    NoCommit { build_id: String },
+    /// The build id names the HEAD, clean.
+    Head { build_id: String, short: String },
+    /// The build id names the HEAD, with `-dirty`.
+    DirtyHead { build_id: String },
+    /// The build id names another commit.
+    Other { build_id: String, short: String },
+}
+
+/// Read the commit out of the branch binary's own build id,
+/// `<version>-g<short-sha>[-dirty]` (`build.rs`), from its `daemon hello`.
+fn built_from(head_sha: &str, new_hello: &str) -> BuiltFrom {
     let build_id = serde_json::from_str::<serde_json::Value>(new_hello.trim())
         .ok()
         .and_then(|v| {
@@ -1137,11 +1288,7 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
                 .map(str::to_string)
         });
     let Some(build_id) = build_id else {
-        return format!(
-            "The branch binary's `daemon hello` was not recorded, so which commit it was built \
-             from is NOT knowable from this run. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoHello;
     };
     let (stem, dirty) = match build_id.strip_suffix("-dirty") {
         Some(stem) => (stem, true),
@@ -1150,38 +1297,89 @@ fn skip_build_note(head_sha: &str, new_hello: &str) -> String {
     let short = stem
         .rsplit_once("-g")
         .map(|(_, sha)| sha)
-        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+        .filter(|sha| sha.len() >= 4 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_string);
     let Some(short) = short else {
-        return format!(
-            "Its build id `{build_id}` names no commit (no `-g<sha>` component), so which commit \
-             it was built from is NOT knowable. Do not read this run as a test of the branch \
-             HEAD `{head_sha}`."
-        );
+        return BuiltFrom::NoCommit { build_id };
     };
-    let provenance = "The build id is the binary's own stamp — what the branch's `build.rs` read \
-                      from `git` when it last ran, or an injected `DAD_BUILD_ID` — not an \
-                      independent measurement.";
     if !head_sha
         .to_ascii_lowercase()
         .starts_with(&short.to_ascii_lowercase())
     {
-        return format!(
-            "**STALE:** its build id `{build_id}` names commit `{short}`, NOT the branch HEAD \
-             `{head_sha}`. This run tested another build, and its tells say nothing about that \
-             HEAD. {provenance}"
-        );
+        return BuiltFrom::Other { build_id, short };
     }
     if dirty {
-        return format!(
-            "Its build id `{build_id}` names the branch HEAD `{head_sha}` with `-dirty`: it was \
-             built from that commit PLUS uncommitted changes in the build clone, which is not \
-             the commit under test. {provenance}"
-        );
+        return BuiltFrom::DirtyHead { build_id };
     }
-    format!(
-        "Its build id `{build_id}` names commit `{short}`, the branch HEAD `{head_sha}`, so by \
-         the binary's own stamp it is a build of the commit under test. {provenance}"
-    )
+    BuiltFrom::Head { build_id, short }
+}
+
+/// For a run that built the branch itself (issue #1530): the evidence row
+/// naming the commit the binary was actually built from, and — when that is
+/// not provably the HEAD the run fetched — why the run cannot pass.
+///
+/// A missing `daemon hello` is recorded but not a mismatch of its own: the
+/// scenario stopped before it ran, and that already keeps the run from passing.
+fn built_commit_check(head_sha: &str, new_hello: &str) -> (String, Option<String>) {
+    match built_from(head_sha, new_hello) {
+        BuiltFrom::NoHello => (
+            "not recorded — the branch binary's `daemon hello` never ran in this run".to_string(),
+            None,
+        ),
+        BuiltFrom::Head { build_id, short } => (
+            format!(
+                "`{short}`, the branch HEAD it fetched, by the binary's own build id `{build_id}`"
+            ),
+            None,
+        ),
+        BuiltFrom::Other { build_id, short } => (
+            format!(
+                "**`{short}` — NOT the branch HEAD `{head_sha}` it fetched** (build id `{build_id}`)"
+            ),
+            Some(format!(
+                "its build id `{build_id}` names commit `{short}`, not the branch HEAD \
+                 `{head_sha}` the run fetched and checked out — something else checked out in \
+                 the build clone during the build, so the tells measured another commit"
+            )),
+        ),
+        BuiltFrom::DirtyHead { build_id } => (
+            format!("**the branch HEAD plus uncommitted changes** (build id `{build_id}`)"),
+            Some(format!(
+                "its build id `{build_id}` says it was built from the branch HEAD `{head_sha}` \
+                 plus uncommitted changes in the build clone, which is not the commit under test"
+            )),
+        ),
+        BuiltFrom::NoCommit { build_id } => (
+            format!("**not knowable** — the build id `{build_id}` names no commit"),
+            Some(format!(
+                "its build id `{build_id}` names no commit, so the run cannot confirm it built \
+                 the branch HEAD `{head_sha}` it fetched"
+            )),
+        ),
+    }
+}
+
+/// The build clone's HEAD and status after the build, against the commit the
+/// run checked out before it (issue #1530). Anything that checked out in the
+/// clone while Cargo read it — a run that ignored the build lock, such as one
+/// from a harness that predates it — shows here.
+fn clone_moved(fetched: &str, head_now: &str, status_now: &str) -> Option<String> {
+    if head_now.trim() != fetched {
+        return Some(format!(
+            "the build clone's HEAD moved during the build: it is now {}, but the run fetched, \
+             checked out and built {fetched}. Another process checked out in the clone while \
+             Cargo was reading it, so the binary may be a build of either commit or a mix of \
+             both. Give each concurrent run its own --source-clone and --target-dir",
+            head_now.trim()
+        ));
+    }
+    if !status_now.trim().is_empty() {
+        return Some(format!(
+            "the build clone has tracked modifications after the build of {fetched} — something \
+             other than this harness edited it while Cargo was reading it:\n{status_now}"
+        ));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,10 +1457,7 @@ fn run_one(
         .parent()
         .ok_or_else(|| "the repository root has no parent".to_string())?
         .to_path_buf();
-    let clone = opts
-        .source_clone
-        .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-src"));
+    let clone = opts.clone_path(&parent);
     let target_dir = opts
         .target_dir
         .clone()
@@ -1378,6 +1573,37 @@ fn run_one(
 
     println!("xver ({}): inputs", direction.name());
     let old_src = old_binary(opts, &previous.tag, &releases, &mut ev)?;
+    // One run at a time on this clone and target dir (issue #1530), held
+    // until the branch binary is staged into the sandbox below.
+    let holder = format!(
+        "pid {}, branch `{}` ({}), since {}, --source-clone {}, --target-dir {}",
+        std::process::id(),
+        opts.branch,
+        direction.name(),
+        utc_now(),
+        clone.display(),
+        target_dir.display()
+    );
+    let lock = buildlock::acquire(
+        &[
+            buildlock::Need {
+                what: "build clone",
+                flag: "--source-clone",
+                dir: &clone,
+            },
+            buildlock::Need {
+                what: "target dir",
+                flag: "--target-dir",
+                dir: &target_dir,
+            },
+        ],
+        &holder,
+        Duration::from_secs(opts.lock_wait_secs),
+        buildlock::POLL,
+        |m| println!("xver ({}): {m}", direction.name()),
+    )?;
+    ev.build.push(build_lock_note(&lock));
+    let mut build_lock = Some(lock);
     let (new_src, head_sha) =
         new_binary(opts, &clone, &target_dir, &cargo_cache, &runs_root, &mut ev)?;
     ev.head_sha = head_sha;
@@ -1416,6 +1642,16 @@ fn run_one(
         }
         for (src, dst) in staging {
             ev.preflight.push(sandbox::stage_binary(src, &dst)?);
+        }
+        if let Some(lock) = build_lock.take() {
+            lock.still_held()?;
+            drop(lock);
+            ev.build.push(
+                "released the build lock once the branch binary was staged into the sandbox, \
+                 its lock files still the ones it locked; another run may check out in the \
+                 clone and build into the target dir from here"
+                    .to_string(),
+            );
         }
         ev.old_binary = sb.old_bin();
         ev.new_binary = sb.new_bin(direction);
@@ -1498,6 +1734,11 @@ fn run_one(
         let note = skip_build_note(&ev.head_sha, &ev.new_hello);
         println!("xver ({}): --skip-build: {note}", direction.name());
         ev.skip_build = Some(note);
+    } else {
+        let (row, mismatch) = built_commit_check(&ev.head_sha, &ev.new_hello);
+        println!("xver ({}): commit built — {row}", direction.name());
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
     }
 
     println!("xver ({}): postconditions", direction.name());
@@ -1536,6 +1777,28 @@ fn run_one(
     );
     println!("xver ({}): {}", direction.name(), verdict.label());
     Ok(passed)
+}
+
+/// What the evidence says about the build lock a run took.
+fn build_lock_note(lock: &buildlock::BuildLock) -> String {
+    format!(
+        "held an exclusive lock on the build clone and the target dir ({}) from before the first \
+         `git` command in the clone until the branch binary was staged; {}",
+        lock.files()
+            .iter()
+            .map(|p| format!("`{}`", p.display()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if lock.waited_for.is_empty() {
+            "no other run held them".to_string()
+        } else {
+            format!(
+                "waited {:.1}s for another run to release them: {}",
+                lock.waited.as_secs_f64(),
+                lock.waited_for.join("; then ")
+            )
+        }
+    )
 }
 
 /// Record an error the outer half hit before or around the namespace. With no
@@ -2175,6 +2438,29 @@ mod verdict_tests {
         assert!(!run_passed(&v, true, false), "a postcondition did not hold");
     }
 
+    /// Issue #1530: four passing tells measured on a binary that is not a
+    /// build of the fetched HEAD are not a pass for that HEAD.
+    #[test]
+    fn a_binary_built_from_another_commit_voids_even_four_passing_tells() {
+        let head = "e2bbb2050f00ba5eba11c0ffee00000000000000";
+        let hello = r#"{"ok":true,"server_version":10,"build_version":"0.41.0-g3715d563"}"#;
+        let mut ev = with_tells(&[Verdict::Pass; 4]);
+        let (row, mismatch) = built_commit_check(head, hello);
+        ev.built_commit = row;
+        ev.build_mismatch = mismatch;
+        let v = ev.verdict();
+        assert!(
+            matches!(v, RunVerdict::Incomplete(ref why) if why.contains("3715d563") && why.contains(head)),
+            "{v:?}"
+        );
+        assert!(!run_passed(&v, true, true));
+        let md = ev.render();
+        assert!(
+            md.contains("| commit built | **`3715d563` — NOT the branch HEAD"),
+            "{md}"
+        );
+    }
+
     #[test]
     fn an_isolation_failure_dominates_even_a_failing_tell_and_is_incomplete() {
         let mut ev = with_tells(&[Verdict::Pass, Verdict::Fail]);
@@ -2467,6 +2753,50 @@ mod skip_build_tests {
         assert!(note.contains("build of the commit under test"), "{note}");
     }
 
+    /// Issue #1530: a run that built the branch records the commit its binary
+    /// was built from, and only the fetched HEAD itself, clean, is no mismatch.
+    #[test]
+    fn a_built_run_records_the_commit_built_and_flags_anything_but_the_fetched_head() {
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205"));
+        assert!(
+            row.contains("`e2bbb205`, the branch HEAD it fetched"),
+            "{row}"
+        );
+        assert_eq!(mismatch, None);
+
+        let (row, mismatch) = built_commit_check(HEAD, &hello("0.41.0-g3715d563"));
+        assert!(row.contains("NOT the branch HEAD"), "{row}");
+        let why = mismatch.expect("another commit is a mismatch");
+        assert!(why.contains("3715d563") && why.contains(HEAD), "{why}");
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-ge2bbb205-dirty"));
+        assert!(mismatch.expect("dirty").contains("uncommitted changes"));
+
+        let (_, mismatch) = built_commit_check(HEAD, &hello("0.41.0-unknown"));
+        assert!(mismatch.expect("no commit").contains("cannot confirm"));
+
+        let (row, mismatch) = built_commit_check(HEAD, "");
+        assert!(row.contains("never ran"), "{row}");
+        assert_eq!(mismatch, None, "a run with no hello already cannot pass");
+    }
+
+    /// Issue #1530: the clone is re-read after the build, and a HEAD that moved
+    /// while Cargo read it — the reported interleaving — refuses the run.
+    #[test]
+    fn a_clone_that_moved_during_the_build_is_caught() {
+        assert_eq!(clone_moved(HEAD, &format!("{HEAD}\n"), ""), None);
+        let moved = clone_moved(HEAD, "3715d563aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "")
+            .expect("another HEAD is caught");
+        assert!(moved.contains("moved during the build"), "{moved}");
+        assert!(
+            moved.contains("3715d563") && moved.contains(HEAD),
+            "{moved}"
+        );
+        assert!(moved.contains("--source-clone"), "{moved}");
+        let edited = clone_moved(HEAD, HEAD, " M src/main.rs\n").expect("an edit is caught");
+        assert!(edited.contains("tracked modifications"), "{edited}");
+    }
+
     #[test]
     fn a_missing_hello_says_the_commit_is_not_knowable() {
         for raw in ["", "not json", r#"{"ok":true}"#] {
@@ -2562,5 +2892,152 @@ mod domain_tests {
         for d in [absent, empty, legacy] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+}
+
+/// A relative path option lands where it names (issue #1453).
+#[cfg(test)]
+mod path_anchor_tests {
+    use super::*;
+
+    /// Set in the re-exec'd child: the `file://` URL of the bare repository it
+    /// clones from. Its absence makes [`a_relative_source_clone_child`] a no-op.
+    const CHILD: &str = "XVER_TEST_1453_CHILD";
+    const CHILD_TEST: &str = "outer::path_anchor_tests::a_relative_source_clone_child";
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xver-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        std::fs::canonicalize(&d).expect("canonicalize scratch dir")
+    }
+
+    #[test]
+    fn every_relative_path_option_is_anchored_to_the_invoking_directory() {
+        let opts = Opts::parse_from([
+            "xver",
+            "--branch",
+            "b",
+            "--old-binary",
+            "old/dot-agent-deck",
+            "--source-clone",
+            "../src",
+            "--target-dir",
+            "t",
+            "--cargo-cache",
+            "./c",
+            "--runs-root",
+            "../../runs",
+            "--releases-dir",
+            "/abs/releases",
+            "--evidence",
+            "e.md",
+        ])
+        .anchored_at(Path::new("/w/repo"));
+        assert_eq!(
+            opts.old_binary.as_deref(),
+            Some(Path::new("/w/repo/old/dot-agent-deck"))
+        );
+        assert_eq!(
+            opts.source_clone.as_deref(),
+            Some(Path::new("/w/repo/../src"))
+        );
+        assert_eq!(opts.target_dir.as_deref(), Some(Path::new("/w/repo/t")));
+        assert_eq!(opts.cargo_cache.as_deref(), Some(Path::new("/w/repo/./c")));
+        assert_eq!(
+            opts.runs_root.as_deref(),
+            Some(Path::new("/w/repo/../../runs"))
+        );
+        assert_eq!(
+            opts.releases_dir.as_deref(),
+            Some(Path::new("/abs/releases")),
+            "an absolute path is kept exactly as given"
+        );
+        assert_eq!(opts.evidence.as_deref(), Some(Path::new("/w/repo/e.md")));
+
+        let defaults = Opts::parse_from(["xver", "--branch", "b"]).anchored_at(Path::new("/w"));
+        assert_eq!(
+            defaults.source_clone, None,
+            "an omitted path stays omitted, so `run_one` still picks its default"
+        );
+    }
+
+    #[test]
+    fn a_relative_clone_path_is_refused_rather_than_resolved_from_the_parent() {
+        let e = create_clone("file:///nonexistent", Path::new("../x")).unwrap_err();
+        assert!(e.contains("is relative") && e.contains("#1453"), "{e}");
+    }
+
+    /// The bug as the operator met it: the process's own working directory is
+    /// `<root>/a/b`, `--source-clone ../x` is given, and the clone must land at
+    /// `<root>/a/x`, not at `<root>/x` one directory higher. Only a process
+    /// started in that directory reproduces it, so this re-execs the test
+    /// binary there rather than changing the working directory of a process
+    /// other tests share.
+    #[test]
+    fn a_relative_source_clone_lands_where_it_names() {
+        let root = scratch_dir("source-clone-1453");
+        let invoked_from = root.join("a").join("b");
+        std::fs::create_dir_all(&invoked_from).expect("invoking dir");
+        let origin = root.join("origin.git");
+        must_run(
+            git(&root)
+                .args(["init", "--quiet", "--bare"])
+                .arg(&origin)
+                .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+                .env("GIT_CONFIG_NOSYSTEM", "1"),
+            "git init --bare",
+        )
+        .expect("a bare origin");
+
+        let exe = std::env::current_exe().expect("current_exe: this is a test binary");
+        let out = Command::new(&exe)
+            .args([CHILD_TEST, "--exact", "--nocapture", "--test-threads=1"])
+            .current_dir(&invoked_from)
+            .env(CHILD, format!("file://{}", origin.display()))
+            .env("GIT_CONFIG_GLOBAL", root.join("no-config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("re-exec this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the child clone failed\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have run exactly {CHILD_TEST}; zero matches exit 0 too\n{stdout}"
+        );
+        assert!(
+            root.join("a").join("x").join(".git").is_dir(),
+            "`../x` from {} must create {}",
+            invoked_from.display(),
+            root.join("a").join("x").display()
+        );
+        assert!(
+            !root.join("x").exists(),
+            "the clone landed one directory too high, at {} (issue #1453)",
+            root.join("x").display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The child half of [`a_relative_source_clone_lands_where_it_names`]: the
+    /// command's own path for `--source-clone ../x`, from this process's
+    /// working directory — `main`'s [`parse_invocation`], `run_one`'s
+    /// [`Opts::clone_path`], and the [`create_clone`] that `new_binary` calls
+    /// for a clone that does not exist yet. The rest of `new_binary` fetches
+    /// from GitHub and builds, so it is not run here; the live `cargo xver`
+    /// run in PR #1498 covered it.
+    #[test]
+    fn a_relative_source_clone_child() {
+        let Ok(url) = std::env::var(CHILD) else {
+            return;
+        };
+        let opts = parse_invocation(["xver", "--branch", "b", "--source-clone", "../x"])
+            .expect("parse the invocation");
+        let clone = opts.clone_path(Path::new("/never/the/default"));
+        create_clone(&url, &clone).expect("git clone");
     }
 }

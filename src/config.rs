@@ -2161,7 +2161,11 @@ command = "vim"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.toml");
         let prev = std::env::var("DOT_AGENT_DECK_SESSION").ok();
-        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        // SAFETY: a stated residual, not a proof (issue #1516). This test starts
+        // no runtime and no thread, so under nextest the threads that exist are
+        // its own and libtest's runner thread, which waits for it. Under plain
+        // `cargo test` it takes no lock and races any sibling test reading the
+        // environment (issue #245).
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_SESSION", path.to_str().unwrap());
         }
@@ -2294,7 +2298,11 @@ command = "vim"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("star.json");
         let prev = std::env::var("DOT_AGENT_DECK_STAR_PROMPT").ok();
-        // SAFETY: test is single-threaded; no other code reads this var concurrently.
+        // SAFETY: a stated residual, not a proof (issue #1516). This test starts
+        // no runtime and no thread, so under nextest the threads that exist are
+        // its own and libtest's runner thread, which waits for it. Under plain
+        // `cargo test` it takes no lock and races any sibling test reading the
+        // environment (issue #245).
         unsafe {
             std::env::set_var("DOT_AGENT_DECK_STAR_PROMPT", path.to_str().unwrap());
         }
@@ -2440,7 +2448,11 @@ timeout_secs = 600
         let prev_attach = std::env::var("DOT_AGENT_DECK_ATTACH_SOCKET").ok();
         let prev_sock = std::env::var("DOT_AGENT_DECK_SOCKET").ok();
         let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: state-dir lock held, restored on the way out.
+        // SAFETY: a stated residual, not a proof (issue #1516). The state-dir
+        // lock excludes the sibling tests that take it, not threads. This test
+        // starts no runtime and no thread, so under nextest the threads that
+        // exist are its own and libtest's runner thread, which waits for it.
+        // Restored on the way out.
         unsafe {
             std::env::remove_var("DOT_AGENT_DECK_ATTACH_SOCKET");
             std::env::remove_var("DOT_AGENT_DECK_SOCKET");

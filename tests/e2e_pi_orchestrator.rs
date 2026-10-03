@@ -380,7 +380,14 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     //    per-step timeout (Design Decision #7): pi boot + model + delegate, then
     //    the worker reads its task file and does the work.
     let sentinel = cwd.path().join(SENTINEL_NAME);
-    let sentinel_ok = common::wait_for_path_async(&sentinel, Duration::from_secs(240)).await;
+    // Poll the CONTENT, not existence: a shell redirect creates the file before
+    // the write lands, so an existence wait can read it empty (issue #244).
+    let sentinel_result = common::wait_for_file_containing_async(
+        &sentinel,
+        SENTINEL_CONTENT,
+        Duration::from_secs(240),
+    )
+    .await;
 
     let orch_pane =
         String::from_utf8_lossy(&daemon.registry.snapshot(&orch_agent_id).unwrap_or_default())
@@ -400,20 +407,15 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let api_errored = ["quota", "exceeded", "billing", "unauthorized", "rate limit"]
         .iter()
         .any(|k| orch_lower.contains(k) || worker_lower.contains(k));
-    assert!(
-        sentinel_ok,
-        "the delegated worker never created the sentinel {SENTINEL_NAME:?} within 240s. \
-         api_error_in_a_pane={api_errored} (if true, an account/quota is the blocker, not the \
-         delegate path).\n=== pi orchestrator pane ===\n{orch_pane}\n\
-         === worker pane ===\n{worker_pane}\n=== end ==="
-    );
-
-    let contents = std::fs::read_to_string(&sentinel).expect("read sentinel file");
-    assert!(
-        contents.contains(SENTINEL_CONTENT),
-        "sentinel {SENTINEL_NAME:?} exists but does not contain {SENTINEL_CONTENT:?}; \
-         got:\n{contents}"
-    );
+    if let Err(observed) = sentinel_result {
+        panic!(
+            "the delegated worker never wrote {SENTINEL_CONTENT:?} into the sentinel \
+             {SENTINEL_NAME:?} within 240s; observed: {observed}. \
+             api_error_in_a_pane={api_errored} (if true, an account/quota is the blocker, not \
+             the delegate path).\n=== pi orchestrator pane ===\n{orch_pane}\n\
+             === worker pane ===\n{worker_pane}\n=== end ==="
+        );
+    }
 
     // 2. work-done returned to the orchestrator: the daemon wrote the per-role
     //    summary file (handle_work_done), proving the worker ran
