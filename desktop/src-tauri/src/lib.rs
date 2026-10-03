@@ -5939,6 +5939,22 @@ mod tests {
             result.outcome
         );
 
+        // A daemon with "all" as one word of its name stays reachable by that
+        // name (Qodo on PR #1504): "all hands" names `all-hands` alone.
+        let result = resolve_with_section(
+            &named("all-hands"),
+            "switch daemon to all hands",
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "all hands"),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(
+            switched_to(&result).map(|(token, ..)| token),
+            Some("rownamed".to_string()),
+            "{:?}",
+            result.outcome
+        );
+
         // All daemons is a selection, not a daemon a new agent can start on:
         // named for the New agent dialog, it is refused with that reason.
         let mut decks = voice_decks(&[], None);
