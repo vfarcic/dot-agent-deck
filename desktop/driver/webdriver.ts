@@ -209,6 +209,50 @@ export class Session {
     ]);
   }
 
+  /**
+   * Issue #1457 — the first half of a drag: move to a viewport point and press
+   * the left button there, and KEEP it held, so a scenario can make something
+   * happen mid-gesture before `releaseAt` finishes it. Separate Perform
+   * Actions requests share the session's input state, which is what keeps the
+   * button down between the two. This is the one action here that skips
+   * `perform`'s Release Actions, and only when it succeeds.
+   */
+  async pressAt(point: { x: number; y: number }): Promise<void> {
+    const actions = [
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 0, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pointerDown", button: 0 },
+        ],
+      },
+    ];
+    try {
+      await this.request("POST", "/actions", { actions });
+    } catch (error) {
+      await this.request("DELETE", "/actions").catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Issue #1457 — the second half of `pressAt`'s drag: move to `point` the way `drag` does, rest, and release. */
+  async releaseAt(point: { x: number; y: number }): Promise<void> {
+    await this.perform([
+      {
+        type: "pointer",
+        id: "mouse",
+        parameters: { pointerType: "mouse" },
+        actions: [
+          { type: "pointerMove", duration: 100, origin: "viewport", x: Math.round(point.x), y: Math.round(point.y) },
+          { type: "pause", duration: 150 },
+          { type: "pointerUp", button: 0 },
+        ],
+      },
+    ]);
+  }
+
   private async perform(actions: unknown[]): Promise<void> {
     try {
       await this.request("POST", "/actions", { actions });

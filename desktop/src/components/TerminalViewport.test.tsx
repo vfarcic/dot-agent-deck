@@ -53,6 +53,9 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
       return { dispose: () => { this.handlers.delete(handler); } };
     }
     attachCustomKeyEventHandler(): void {}
+    // Issue #1457 — the selection keeper's subscriptions; `terminalSelection.test.ts` covers it.
+    onResize(): { dispose: () => void } { return { dispose: () => undefined }; }
+    onSelectionChange(): { dispose: () => void } { return { dispose: () => undefined }; }
     input(data: string): void { this.typeKey(data); }
     /** A keystroke: what xterm hands the component's `onData` callback. */
     typeKey(data: string): void { for (const handler of [...this.handlers]) handler(data); }

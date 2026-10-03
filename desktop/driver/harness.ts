@@ -11,7 +11,7 @@
 
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +62,7 @@ const paths = {
   tauriDriver: process.env.DAD_DRIVER_TAURI_DRIVER ?? "tauri-driver",
   nativeDriver: process.env.DAD_DRIVER_NATIVE_DRIVER ?? "WebKitWebDriver",
   xclip: process.env.DAD_DRIVER_XCLIP ?? "xclip",
+  xdotool: process.env.DAD_DRIVER_XDOTOOL ?? "xdotool",
   results: process.env.DAD_DRIVER_RESULTS ?? join(REPO_ROOT, "desktop", "driver-results"),
 };
 
@@ -151,6 +152,58 @@ async function stopChild(child: ChildProcess | undefined): Promise<void> {
     child.kill("SIGKILL");
     await exited(child);
   }
+}
+
+/** The attach protocol's frame kinds this harness speaks (`src/daemon_protocol.rs`). */
+const KIND_REQ = 0x01;
+const KIND_RESP = 0x02;
+
+/** One attach-protocol frame: a kind byte, a big-endian u32 length, the payload. */
+function frame(kind: number, payload: unknown): Buffer {
+  const body = Buffer.from(JSON.stringify(payload));
+  const header = Buffer.alloc(5);
+  header[0] = kind;
+  header.writeUInt32BE(body.length, 1);
+  return Buffer.concat([header, body]);
+}
+
+/**
+ * Send one request on a fresh connection to the daemon's attach socket and
+ * resolve with the socket once the daemon's response frame says ok. Anything
+ * after the response — an attach stream's replay and live output — is read and
+ * dropped, so the daemon never blocks writing to this client.
+ */
+function request(socketPath: string, payload: unknown): Promise<Socket> {
+  return new Promise((settle, fail) => {
+    const socket = connect(socketPath);
+    let buffered = Buffer.alloc(0);
+    let answered = false;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      fail(new Error(`no response to ${JSON.stringify(payload)} within ${WAIT_MS}ms`));
+    }, WAIT_MS);
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      if (!answered) fail(error);
+    });
+    socket.once("connect", () => socket.write(frame(KIND_REQ, payload)));
+    socket.on("data", (chunk: Buffer) => {
+      if (answered) return;
+      buffered = Buffer.concat([buffered, chunk]);
+      if (buffered.length < 5) return;
+      const length = buffered.readUInt32BE(1);
+      if (buffered.length < 5 + length) return;
+      answered = true;
+      clearTimeout(timer);
+      const response = JSON.parse(buffered.subarray(5, 5 + length).toString()) as { ok?: boolean; error?: string };
+      if (buffered[0] !== KIND_RESP || !response.ok) {
+        socket.destroy();
+        fail(new Error(`the daemon refused ${JSON.stringify(payload)}: ${JSON.stringify(response)}`));
+        return;
+      }
+      settle(socket);
+    });
+  });
 }
 
 /** What a scenario's deck is configured with. */
@@ -408,10 +461,11 @@ export class Deck {
    * The first click matters. WebDriver types into the page without the window
    * holding focus, so a press is also the window's focus-in, and on a focus-in
    * the app claims this terminal's size on its daemon (PRD #1105). When that
-   * changes the grid's row count, xterm drops any selection in progress, so a
-   * drag started by that same press selects nothing (#1457 asks whether a
-   * person can hit this). The click lets that settle, and the row is measured
-   * again after it, because a new grid moves the rows.
+   * changes the grid's row count the rows move under the pointer: the terminal
+   * carries the drag on from the cell it was pressed on (#1457, which
+   * `terminal_003` covers), but this drag would still end where the row was
+   * measured before the resize. The click lets that settle, and the row is
+   * measured again after it.
    *
    * The click is not always the press that focuses the window. In five
    * failed runs on GitHub runners the grid held still for the whole settle
@@ -511,7 +565,7 @@ export class Deck {
   }
 
   /** Until every mounted terminal's grid and box have held still for `SETTLE_MS`. */
-  private async gridSettled(): Promise<void> {
+  async gridSettled(): Promise<void> {
     let last = "";
     let since = Date.now();
     await waitFor("the terminal's grid to settle", async () => {
@@ -547,10 +601,83 @@ export class Deck {
   }
 
   /** The daemon's own view of its agents, from the CLI rather than the window. */
-  async daemonAgents(): Promise<{ cwd?: string; label?: string }[]> {
+  async daemonAgents(): Promise<{ agent_id: string; cwd?: string; label?: string }[]> {
     const { code, stdout } = await run(paths.daemon, ["daemon", "status", "--json"], this.env);
     if (code !== 0) throw new Error(`daemon status exited ${code}`);
-    return (JSON.parse(stdout) as { agents: { cwd?: string; label?: string }[] }).agents;
+    return (JSON.parse(stdout) as { agents: { agent_id: string; cwd?: string; label?: string }[] }).agents;
+  }
+
+  /** Issue #1457 — what every mounted terminal's xterm holds as its selection, for a failure message. */
+  async selections(): Promise<string[]> {
+    return (await this.terminalScreens()).map(({ selection }) => selection);
+  }
+
+  /** Issue #1457 — every mounted terminal's grid as `[cols, rows]`. */
+  async grids(): Promise<[number, number][]> {
+    return (await this.terminalScreens()).map(({ cols, rows }) => [cols, rows]);
+  }
+
+  /**
+   * Issue #1457 — a second client on the same agent, standing in for a TUI the
+   * person was using before they came to the window: it attaches to `agentId`
+   * as a viewer of `rows` x `cols` and claims focus, so under PRD #1105's
+   * last-focused-wins rule the daemon sizes the agent to it, and the window's
+   * grid with it. It speaks the attach protocol directly, as the TUI does,
+   * through the sandbox's own socket. `close()` detaches it.
+   */
+  async standInClient(agentId: string, rows: number, cols: number): Promise<{ close: () => void }> {
+    const socketPath = this.env.DOT_AGENT_DECK_ATTACH_SOCKET as string;
+    const clientId = "c-driver-stand-in-tui";
+    const stream = await request(socketPath, {
+      op: "attach-stream",
+      id: agentId,
+      rows,
+      cols,
+      geometry_updates: true,
+      client_id: clientId,
+    });
+    stream.on("data", () => undefined);
+    stream.on("error", () => undefined);
+    (await request(socketPath, { op: "focus-gained", client_id: clientId })).destroy();
+    return { close: () => stream.destroy() };
+  }
+
+  /**
+   * Issue #1457 — move the display's input focus, as a window manager does: to
+   * the app's window, or away from it to the root window, which is the
+   * window-manager-free way to put "another window in front". xvfb runs no
+   * window manager, so a press never moves focus by itself, and this is how a
+   * scenario makes a press also be the window's focus-in.
+   *
+   * Focus on the root window follows the pointer into whatever window is under
+   * it, so the display's real pointer is parked outside the app's window first
+   * — measured: without that, the app kept its focus. WebDriver's pointer
+   * actions are the webview's own, and never move that pointer.
+   */
+  async setWindowFocus(focused: boolean): Promise<void> {
+    const xdotool = async (...args: string[]) => {
+      const { code, stdout } = await run(paths.xdotool, args, this.env);
+      if (code !== 0) throw new Error(`xdotool ${args.join(" ")} exited ${code}`);
+      return stdout.trim().split("\n").filter(Boolean);
+    };
+    const [app] = await xdotool("search", "--onlyvisible", "--name", "Agent Deck");
+    const [root] = await xdotool("search", "--maxdepth", "0", "");
+    if (!app || !root) throw new Error(`xdotool found no ${app ? "root" : "app"} window`);
+    if (!focused) {
+      const geometry = Object.fromEntries(
+        (await xdotool("getwindowgeometry", "--shell", app)).map((line) => line.split("=")),
+      ) as Record<string, string>;
+      const [width, height] = (await xdotool("getdisplaygeometry"))[0].split(" ").map(Number);
+      const right = Number(geometry.X) + Number(geometry.WIDTH);
+      const below = Number(geometry.Y) + Number(geometry.HEIGHT);
+      if (right >= width && below >= height) throw new Error(`the app's window covers the whole ${width}x${height} display`);
+      await xdotool("mousemove", "--sync", String(right < width ? width - 1 : 0), String(below < height ? height - 1 : 0));
+    }
+    const target = focused ? app : root;
+    await xdotool("windowfocus", "--sync", target);
+    await waitFor(`the page to report ${focused ? "having" : "losing"} focus`, async () =>
+      (await this.session.execute<boolean>("return document.hasFocus()")) === focused,
+    );
   }
 
   /**

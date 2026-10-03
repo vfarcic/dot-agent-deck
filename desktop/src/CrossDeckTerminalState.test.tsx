@@ -40,6 +40,9 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
     onData(): { dispose: () => void } { return { dispose: () => {} }; }
     attachCustomKeyEventHandler(): void {}
+    // Issue #1457 — the selection keeper's subscriptions.
+    onResize(): { dispose: () => void } { return { dispose: () => {} }; }
+    onSelectionChange(): { dispose: () => void } { return { dispose: () => {} }; }
     dispose(): void {}
   }
   class FakeFitAddon {
