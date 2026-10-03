@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, typ
 import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
-import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { useMeasuredBox, usePager } from "../hooks/useVoicePages";
@@ -1979,7 +1979,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
                   : (
                     <>
                       {row.entry.isProject ? <FolderGit2 size={13} aria-hidden="true" /> : <Folder size={13} aria-hidden="true" />}
-                      <span className="new-agent-row-name" title={displayText(row.entry.displayName, DISPLAY_LIMITS.name)}>{displayText(row.entry.displayName, DISPLAY_LIMITS.name)}</span>
+                      <span className="new-agent-row-name" title={displayTitle(row.entry.displayName)}>{displayText(row.entry.displayName, DISPLAY_LIMITS.name)}</span>
                       {row.entry.isProject && <span className="new-agent-row-tag" data-testid="new-agent-project-mark">project</span>}
                       {row.entry.isSymlink && <span className="new-agent-row-tag" data-testid="new-agent-link-mark" title="A symbolic link: opening it lists the directory it leads to">link</span>}
                     </>
