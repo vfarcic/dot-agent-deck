@@ -4500,11 +4500,11 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the hydration path that carries the value (`session/live/004`); the ordering consequences of seeding it (`status/supersede/016`, `/017`); the desktop's fold, which runs the same seeding function (the desktop crate's `a_fetched_last_activity_survives_the_fold`); a PTY-attached reconnect.
 - **Platform coverage:** mac+linux+windows.
 
-##### session/live/017 — A reconnected TUI adopts the daemon's pane generation, so a wrapped pane's wrapper frame arriving first cannot strand its guarded sends (issue #532).
-- **Layer:** L1 (two `AppState`s — the daemon's and a reconnecting TUI's — joined through `AppState::live_session_for`, a JSON round trip of the `SessionSnapshot` as the `ListAgents` reply carries it, and `AppState::seed_hydrated_session`; no daemon process, no PTY).
+##### session/live/017 — A reconnected TUI adopts the daemon's pane generation, so a wrapped pane's wrapper frame arriving first cannot strand its guarded sends, and an announcement it received after `ListAgents` is kept (issue #532).
+- **Layer:** fast synthetic integration (a full in-process daemon with a `cat` pane spawned through the TUI's real `StartAgent` attach request, events applied to the daemon's state, the real `ListAgents` reply via `EmbeddedPaneController::hydrate_from_daemon`, and the production `AppState::seed_hydrated_session` seam; no PTY-attached TUI, no LLM).
 - **Agent:** none (synthetic wrapped Codex: wrapper frames under `<pane>-session`, native frames under Codex's own session).
-- **Asserts:** the daemon holds the conversation Codex announced; a TUI whose event stream delivers a wrapper frame before hydration, then seeds from the daemon's snapshot, then sees a Codex `ToolStart`, holds that same conversation (before the fix it held the wrapper's id). Control: the same reply with `hook_generation` removed — an older daemon — leaves the TUI on the id it built from events.
-- **Does not assert:** the real hydration path (`EmbeddedPaneController::hydrate_from_daemon`, pinned by `session/live/004`) or a PTY-attached reconnect; an announcement landing between `ListAgents` and seeding, which the TUI then misses until the next one (documented on `AppState::adopt_hydrated_generation`, fails closed).
+- **Asserts:** the daemon holds the conversation Codex announced; a fresh TUI state that applied a wrapper frame before seeding, then sees a Codex `ToolStart`, holds that same conversation (before the fix: the wrapper's id); a fresh TUI state that applied a genuine `SessionStart` for a new session before seeding keeps it rather than rolling back to the reply (Qodo on #1515). Control: the same reply with `hook_generation` removed — an older daemon — leaves the TUI on the id it built from events.
+- **Does not assert:** a PTY-attached reconnect or the real event subscriber's timing (the pre-seed frames are applied directly to stand for what it delivered); the daemon's hook-socket admission of the frames.
 - **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)

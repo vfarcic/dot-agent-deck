@@ -1630,6 +1630,18 @@ pub struct AppState {
     /// Monotonic per pane, `u64`, in memory only; it grows by one per real
     /// conversation rollover, which no daemon lifetime can exhaust.
     pane_generation_closures: HashMap<String, u64>,
+    /// Issue #532 (Qodo on #1515): the panes whose CURRENT
+    /// [`Self::pane_hook_session`] entry was set by a genuine `SessionStart`
+    /// this state applied itself, as opposed to one an ordinary frame
+    /// established or [`Self::adopt_hydrated_generation`] seeded.
+    ///
+    /// Read only by that seeding. A reconnecting TUI subscribes to events before
+    /// it hydrates, so an announcement can reach it after the daemon built its
+    /// `ListAgents` snapshot; every announcement this state applies also reached
+    /// the daemon, in the same broadcast order, so this state's own latest one is
+    /// at least as current as the snapshot's and must not be overwritten by it.
+    /// Kept in step with the map at each site that writes it.
+    pane_generation_announced: HashSet<String>,
     /// Issue #915 (finding 4): how many of each AGENT's own hook generations
     /// have ended, keyed by the registry agent id the `SessionEnd` carried.
     ///
@@ -9984,6 +9996,9 @@ impl AppState {
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
+        let announced_before = pane_id
+            .as_ref()
+            .is_some_and(|pane| self.pane_generation_announced.contains(pane));
         // Issue #424 H4: the closure COUNT is the same fact seen over time, so it
         // is restored for the same reason the entry is. A report that bumped it
         // would read to an in-flight TUI delivery as "a conversation ended while
@@ -10000,6 +10015,11 @@ impl AppState {
                 None => {
                     self.pane_hook_session.remove(&pane);
                 }
+            }
+            if announced_before {
+                self.pane_generation_announced.insert(pane.clone());
+            } else {
+                self.pane_generation_announced.remove(&pane);
             }
             match closures_before {
                 Some(count) => {
@@ -10831,16 +10851,15 @@ impl AppState {
     /// Issue #532: take the daemon's hook generation for `pane_id` on a
     /// reconnect — see [`SessionSnapshot::hook_generation`].
     ///
-    /// The daemon's answer REPLACES whatever this state built from frames that
-    /// reached it before hydration ran (the event subscriber starts first), with
-    /// one exception: the same generation keeps the later of the two
-    /// timestamps, so a fresher frame already applied here is not rolled back.
-    /// What that gives up is a genuine `SessionStart` that landed between the
-    /// daemon building the snapshot and this call: this state then holds the
-    /// superseded id until the next announcement, and its guarded sends are
-    /// refused by the daemon rather than delivered — the safe direction. The
-    /// window is the time between `ListAgents` and seeding, and wrapper frames
-    /// are far likelier to land in it than an announcement is.
+    /// The daemon's answer REPLACES a generation this state built from ordinary
+    /// frames that reached it before hydration ran (the event subscriber starts
+    /// first), because the daemon saw the whole history and this state saw only
+    /// its tail. It does NOT replace one a genuine `SessionStart` set here
+    /// ([`Self::pane_generation_announced`]): that announcement also reached the
+    /// daemon, in the same order, so it is at least as current as the snapshot,
+    /// and newer than it when it landed between `ListAgents` and this call. The
+    /// same generation keeps the later of the two timestamps either way, so a
+    /// fresher frame already applied here is not rolled back.
     ///
     /// Moves the generation without counting a closure: hydration runs before
     /// any delivery exists for this state to protect. Absent on an older
@@ -10858,7 +10877,11 @@ impl AppState {
             Some((current, current_ts)) if *current == generation.session_id => {
                 established_at.max(*current_ts)
             }
-            _ => established_at,
+            Some(_) if self.pane_generation_announced.contains(pane_id) => return,
+            _ => {
+                self.pane_generation_announced.remove(pane_id);
+                established_at
+            }
         };
         self.pane_hook_session.insert(
             pane_id.to_string(),
@@ -13939,6 +13962,7 @@ impl AppState {
                     })
             {
                 self.pane_hook_session.remove(pane_id);
+                self.pane_generation_announced.remove(pane_id);
                 // Issue #424 H4: the conversation this pane was in is over. The
                 // session and its journal are removed below, so this counter is
                 // the only thing left to tell a TUI pass that sampled the
@@ -14247,8 +14271,19 @@ impl AppState {
                 {
                     self.note_generation_closed(pane_id);
                 }
+                let replaces = self
+                    .pane_hook_session
+                    .get(pane_id)
+                    .is_none_or(|(current, _)| *current != incoming_session_id);
                 self.pane_hook_session
                     .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+                // Issue #532: a refresh of the same generation keeps whatever
+                // established it; a new entry records whether it was announced.
+                if announces_generation {
+                    self.pane_generation_announced.insert(pane_id.clone());
+                } else if replaces {
+                    self.pane_generation_announced.remove(pane_id);
+                }
             }
         }
 

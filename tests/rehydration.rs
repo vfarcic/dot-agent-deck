@@ -107,6 +107,7 @@ struct AgentEventDaemon {
     attach_path: PathBuf,
     registry: Arc<AgentPtyRegistry>,
     event_tx: tokio::sync::broadcast::Sender<BroadcastMsg>,
+    state: SharedState,
     handle: JoinHandle<()>,
 }
 
@@ -127,7 +128,7 @@ async fn start_agent_event_daemon() -> AgentEventDaemon {
     let hook_path = dir.path().join("hook.sock");
     let attach_path = dir.path().join("attach.sock");
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
-    let daemon = Daemon::with_attach(state, attach_path.clone())
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
         .with_idle_shutdown(None)
         .with_lock_dir_override(Some(dir.path().join("locks")));
     let registry = daemon.pty_registry.clone();
@@ -159,6 +160,7 @@ async fn start_agent_event_daemon() -> AgentEventDaemon {
         attach_path,
         registry,
         event_tx,
+        state,
         handle,
     }
 }
@@ -3494,13 +3496,34 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     drop(controller);
 }
 
-/// Scenario: A wrapped Codex pane is running under the daemon: the wrapper's frames report under `<pane>-session`, Codex announced its own conversation, and the wrapper has spoken since. A TUI reconnects, and the first frame its event stream delivers is the wrapper's. Seeding the card from the daemon's `ListAgents` reply must leave the reconnected TUI on the conversation Codex announced, the one the daemon's send guard holds — not on the wrapper's id, which no later ordinary frame can correct. The control is an older daemon's reply, which carries no generation and so leaves the event-built one.
+/// Scenario: A wrapped Codex pane runs under a real daemon, where Codex announced its conversation and the wrapper (reporting under `<pane>-session`) has spoken since; a fresh TUI hydrates through `ListAgents` after its event stream already delivered a wrapper frame. The reconnected TUI must hold the conversation the daemon's send guard holds, and must keep a genuine `SessionStart` it received after the daemon built its reply rather than roll back to the reply. Control: an older daemon's reply carries no generation, so the TUI keeps the id it built from events.
 #[spec("session/live/017")]
 #[test]
 fn live_017_reconnect_adopts_the_daemons_pane_generation() {
-    let pane = "pane-wrapped-reconnect";
-    let agent_id = "agent-wrapped-reconnect";
-    let wrapper_session = format!("{pane}-session");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build wrapped-pane reconnect runtime");
+    rt.block_on(live_017_reconnect_adopts_the_daemons_pane_generation_inner());
+}
+
+async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
+    const PANE: &str = "pane-wrapped-reconnect";
+    let wrapper_session = format!("{PANE}-session");
+    let daemon = start_agent_event_daemon().await;
+    let cwd = test_temp::tempdir().expect("allocate wrapped-reconnect pane cwd");
+    let client = DaemonClient::new(daemon.attach_path.clone());
+    let agent_id = client
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+            agent_type: Some(AgentType::Codex),
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("spawn the pane through the TUI's StartAgent attach path");
     let base = Utc::now() - chrono::Duration::seconds(60);
     let frame = |session: &str, event_type: EventType, secs: i64| AgentEvent {
         session_id: session.to_string(),
@@ -3512,70 +3535,102 @@ fn live_017_reconnect_adopts_the_daemons_pane_generation() {
         timestamp: base + chrono::Duration::seconds(secs),
         user_prompt: None,
         metadata: Default::default(),
-        pane_id: Some(pane.to_string()),
-        agent_id: Some(agent_id.to_string()),
+        pane_id: Some(PANE.to_string()),
+        agent_id: Some(agent_id.clone()),
         agent_version: None,
         schema_version: None,
         live_target: None,
     };
 
-    // The daemon has seen the whole history.
-    let mut daemon = AppState::default();
-    daemon.register_pane(pane.to_string());
-    daemon.apply_event(frame(&wrapper_session, EventType::Thinking, 1));
-    daemon.apply_event(frame("codex-native", EventType::SessionStart, 2));
-    daemon.apply_event(frame("codex-native", EventType::ToolStart, 3));
-    daemon.apply_event(frame(&wrapper_session, EventType::Thinking, 4));
-    assert_eq!(
-        daemon.pane_hook_session_id(pane).as_deref(),
-        Some("codex-native"),
-        "precondition: the daemon holds the conversation Codex announced"
-    );
-    // What goes on the wire in the `ListAgents` reply.
-    let wire = serde_json::to_value(
-        daemon
-            .live_session_for(agent_id, Some(pane))
-            .expect("the daemon has a live session for the pane"),
-    )
-    .expect("snapshot serializes");
-
-    let reconnect = |wire: serde_json::Value| {
-        let snapshot: SessionSnapshot = serde_json::from_value(wire).expect("snapshot parses");
-        let mut tui = AppState::default();
-        tui.register_pane(pane.to_string());
-        // The event subscriber starts before hydration, so a frame can land
-        // first — here the wrapper's.
-        tui.apply_event(frame(&wrapper_session, EventType::Thinking, 5));
-        tui.seed_hydrated_session(
-            pane.to_string(),
-            None,
-            Some(AgentType::Codex),
-            Some(agent_id.to_string()),
-            Some(&snapshot),
+    // The daemon sees the whole history: the wrapper, Codex's announcement,
+    // Codex working, and the wrapper again.
+    {
+        let mut state = daemon.state.write().await;
+        state.apply_event(frame(&wrapper_session, EventType::Thinking, 1));
+        state.apply_event(frame("codex-native", EventType::SessionStart, 2));
+        state.apply_event(frame("codex-native", EventType::ToolStart, 3));
+        state.apply_event(frame(&wrapper_session, EventType::Thinking, 4));
+        assert_eq!(
+            state.pane_hook_session_id(PANE).as_deref(),
+            Some("codex-native"),
+            "precondition: the daemon holds the conversation Codex announced"
         );
-        // Codex keeps working after the reconnect.
-        tui.apply_event(frame("codex-native", EventType::ToolStart, 6));
-        tui.pane_hook_session_id(pane)
+    }
+
+    // A fresh TUI hydrates over the real attach socket (`ListAgents`).
+    let controller = Arc::new(EmbeddedPaneController::new(
+        daemon.attach_path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let controller = controller.clone();
+        tokio::task::spawn_blocking(move || controller.hydrate_from_daemon())
+            .await
+            .expect("fresh TUI hydration task did not panic")
+    };
+    let pane = hydrated
+        .iter()
+        .find(|pane| pane.agent_id == agent_id)
+        .unwrap_or_else(|| panic!("the wrapped pane was not hydrated; hydrated={hydrated:?}"))
+        .clone();
+    assert!(
+        pane.live.is_some(),
+        "the daemon's reply must carry the pane's live snapshot"
+    );
+
+    // `before_seed` is what the TUI's event stream delivered between
+    // subscribing and seeding; `after_seed` is Codex working afterwards.
+    let reconnect = |live: Option<SessionSnapshot>, before_seed: Vec<AgentEvent>| {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE.to_string());
+        for event in before_seed {
+            tui.apply_event(event);
+        }
+        tui.seed_hydrated_session(
+            PANE.to_string(),
+            pane.cwd.clone(),
+            pane.agent_type.clone(),
+            Some(agent_id.clone()),
+            live.as_ref(),
+        );
+        tui.apply_event(frame("codex-native", EventType::ToolStart, 10));
+        tui.pane_hook_session_id(PANE)
     };
 
     assert_eq!(
-        reconnect(wire.clone()).as_deref(),
+        reconnect(
+            pane.live.clone(),
+            vec![frame(&wrapper_session, EventType::Thinking, 5)]
+        )
+        .as_deref(),
         Some("codex-native"),
-        "a reconnected TUI must hold the generation the daemon's send guard holds (issue #532)"
+        "a wrapper frame that reached the TUI first must not outlast the daemon's generation (issue #532)"
     );
-
-    // Control: an older daemon's reply carries no generation, so the TUI keeps
-    // what it built from events — the wrapper's id, which Codex's ordinary
-    // frames cannot replace. This is the residual the field closes.
-    let mut older = wire;
-    older
-        .as_object_mut()
-        .expect("snapshot is an object")
-        .remove("hook_generation")
-        .expect("a current daemon sends the generation");
     assert_eq!(
-        reconnect(older).as_deref(),
+        reconnect(
+            pane.live.clone(),
+            vec![frame("codex-cleared", EventType::SessionStart, 6)]
+        )
+        .as_deref(),
+        Some("codex-cleared"),
+        "a genuine SessionStart the TUI received after the daemon built its reply must survive seeding"
+    );
+    let older_daemon = pane.live.clone().map(|mut live| {
+        assert!(
+            live.hook_generation.take().is_some(),
+            "a current daemon's reply carries the generation"
+        );
+        live
+    });
+    assert_eq!(
+        reconnect(
+            older_daemon,
+            vec![frame(&wrapper_session, EventType::Thinking, 5)]
+        )
+        .as_deref(),
         Some(wrapper_session.as_str()),
         "without the daemon's generation the TUI keeps the one it built from events"
     );
+
+    drop(controller);
 }
