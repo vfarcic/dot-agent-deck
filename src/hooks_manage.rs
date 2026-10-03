@@ -265,14 +265,17 @@ fn wait_for_probe_output(
                 std::ptr::null_mut(),
             )
         };
+        // The deadline is checked before the result is used: bytes that
+        // arrived during the last sleep came after it, and are as late as the
+        // line a child prints after the deadline (Greptile on PR #1512).
+        if std::time::Instant::now() >= deadline {
+            return ProbeOutput::TimedOut;
+        }
         if ok == 0 {
             return ProbeOutput::Closed;
         }
         if available > 0 {
             return ProbeOutput::Ready(available as usize);
-        }
-        if std::time::Instant::now() >= deadline {
-            return ProbeOutput::TimedOut;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1767,9 +1770,10 @@ mod tests {
         let result_file = dir.path().join("result");
         // The escapee: a new session (so a new process group), SIGPIPE ignored
         // so a closed read end reads as a failed write rather than a death,
-        // then wait for the test's go-ahead and try to write. It gives up after
-        // 20s so a failing run does not leave it behind for long.
-        let escapee = r#"use POSIX; POSIX::setsid() or die "setsid: $!"; $SIG{PIPE} = "IGNORE"; my ($pid, $go, $result) = @ARGV; for (1 .. 400) { last if -e $go; select(undef, undef, undef, 0.05) } my $wrote = syswrite(STDOUT, "x"); open(my $f, ">", "$result.tmp") or die; print $f (defined $wrote ? "open" : "closed"); close $f; rename("$result.tmp", $result); exit 0"#;
+        // then wait for the test's go-ahead, try to write, record whether the
+        // write went through, and exit. Without a go-ahead it gives up after
+        // 20s, so a failing run does not leave it behind for long.
+        let escapee = r#"use POSIX; POSIX::setsid() or die "setsid: $!"; $SIG{PIPE} = "IGNORE"; my (undef, $go, $result) = @ARGV; for (1 .. 400) { last if -e $go; select(undef, undef, undef, 0.05) } my $wrote = syswrite(STDOUT, "x"); open(my $f, ">", "$result.tmp") or die; print $f (defined $wrote ? "open" : "closed"); close $f; rename("$result.tmp", $result); exit 0"#;
         let claude = stand_in_claude(
             dir.path(),
             &format!(
@@ -1789,23 +1793,19 @@ mod tests {
             "the probe waited {elapsed:?} against a {bound:?} bound"
         );
 
-        let escapee: i32 = std::fs::read_to_string(&pid_file)
-            .expect("the stand-in recorded its helper's pid before the deadline")
-            .trim()
-            .parse()
-            .unwrap();
+        // The escapee is never signalled: it exits on its own once it has
+        // written its result, or after its 20s cap, so there is no pid to
+        // outlive it and be reused (Greptile on PR #1512).
+        assert!(
+            pid_file.exists(),
+            "the stand-in started its helper before the deadline"
+        );
         std::fs::write(&go_file, b"").unwrap();
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !result_file.exists() && std::time::Instant::now() < until {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let result = std::fs::read_to_string(&result_file);
-        // SAFETY: `kill(2)` on the escapee's pid, which this test's stand-in
-        // started and which has either exited (ESRCH, ignored) or is ours.
-        unsafe {
-            libc::kill(escapee, libc::SIGKILL);
-        }
-        let result = result.expect(
+        let result = std::fs::read_to_string(&result_file).expect(
             "the escaped helper survived the probe's group kill and wrote its result \
              (if it did not, it was killed with the group and this test lost its premise)",
         );
