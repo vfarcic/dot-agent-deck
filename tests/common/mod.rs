@@ -10930,7 +10930,19 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
 /// carried the wrong text.
 #[allow(dead_code)]
 fn describe_file(path: &Path) -> String {
-    match std::fs::read_to_string(path) {
+    describe_read(path, std::fs::read_to_string(path))
+}
+
+/// Async sibling of [`describe_file`], so an async waiter's timeout path does
+/// not do a blocking read on a runtime worker.
+#[allow(dead_code)]
+async fn describe_file_async(path: &Path) -> String {
+    describe_read(path, tokio::fs::read_to_string(path).await)
+}
+
+#[allow(dead_code)]
+fn describe_read(path: &Path, read: std::io::Result<String>) -> String {
+    match read {
         Ok(contents) => format!("{} contains {contents:?}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             format!("{} does not exist", path.display())
@@ -11008,6 +11020,56 @@ pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Resul
     wait_for_file_matching(path, timeout, |contents| {
         contents.matches('\n').count() >= want
     })
+}
+
+/// Async sibling of [`wait_for_file_matching`], for an async e2e `_inner`
+/// body: the sync poll sleeps on the calling thread, which inside a tokio
+/// test parks a runtime worker for the whole wait (up to minutes for a
+/// real-agent sentinel), starving the daemon tasks the test is waiting on.
+/// Same contract — `Ok(())` once `path` is readable AND `matches` accepts its
+/// contents, `Err(`[`describe_file_async`]`)` on timeout — and the same reason to
+/// prefer it over [`wait_for_path_async`] + an immediate read: a shell
+/// redirect creates the file before the write lands (issue #244).
+#[allow(dead_code)]
+async fn wait_for_file_matching_async(
+    path: &Path,
+    timeout: Duration,
+    matches: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = tokio::fs::read_to_string(path).await
+            && matches(&contents)
+        {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(describe_file_async(path).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Async sibling of [`wait_for_file_trimmed_eq`]: bounded poll until `path`'s
+/// TRIMMED contents equal `expected` exactly.
+#[allow(dead_code)]
+pub async fn wait_for_file_trimmed_eq_async(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching_async(path, timeout, |contents| contents.trim() == expected).await
+}
+
+/// Async sibling of [`wait_for_file_containing`]: bounded poll until `path`'s
+/// contents contain `needle`.
+#[allow(dead_code)]
+pub async fn wait_for_file_containing_async(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching_async(path, timeout, |contents| contents.contains(needle)).await
 }
 
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
