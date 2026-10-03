@@ -21000,6 +21000,61 @@ mod spawn_tests {
         );
     }
 
+    /// Issue #525 (Greptile, PR #1535): an attach client's keystrokes into a
+    /// pane that is not taking input — the `STREAM_IN` path, which waits on
+    /// [`PaneWriter::write_user`] without a bound — park only that stream, never
+    /// the runtime worker running it. On a one-worker runtime a heartbeat keeps
+    /// beating while the write waits, and the write completes, in full and
+    /// recorded, once the pane takes input again. The handler being cancelled
+    /// mid-write instead is `a_guarded_first_write_reads_the_draft_after_a_stalled_keystroke_lands`.
+    #[test]
+    fn a_stalled_attach_write_leaves_the_runtime_worker_free() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("one-worker runtime");
+        let (registry, agent, gate, log, _notices, _displaced) =
+            rt.block_on(gated_pane("issue-525-attach-pane", false));
+        let writer = registry.agent_writer(&agent).unwrap();
+        let beats = Arc::new(AtomicU64::new(0));
+        let beats_task = beats.clone();
+        rt.spawn(async move {
+            loop {
+                beats_task.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let typing_writer = writer.clone();
+        rt.spawn(async move {
+            let w = typing_writer.lock().await;
+            let _ = tx.send(w.write_user(b"typed while stuck").await.is_ok());
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        let before = beats.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(1));
+        let during = beats.load(Ordering::SeqCst) - before;
+        assert!(
+            rx.try_recv().is_err(),
+            "precondition: the keystrokes are still waiting on the pane"
+        );
+        assert!(
+            during > 10,
+            "the runtime's only worker stopped while an attach write waited ({during} heartbeats)"
+        );
+
+        gate.release();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "the keystrokes go in once the pane takes input"
+        );
+        assert_eq!(log.lock().unwrap().as_slice(), b"typed while stuck");
+        rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
     /// Issue #525: a job still queued behind a write the PTY has not taken is
     /// withdrawn when its caller's bound runs out, or when its caller is
     /// dropped, and then never written — which is what lets a caller that
