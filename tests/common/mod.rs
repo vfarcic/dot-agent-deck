@@ -10114,6 +10114,15 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
     count
 }
 
+/// Open a `SubscribeEvents` stream on an arbitrary daemon attach socket, for a
+/// test whose daemon is neither a `DaemonProc` nor the one its `TuiDeck`
+/// spawned. Open it before the event you wait for: nothing is replayed.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn subscribe_events_on(socket: &Path) -> EventSub {
+    EventSub::open(socket).expect("open SubscribeEvents stream")
+}
+
 /// Send one `AttachRequest` over a daemon attach socket and read back the
 /// single `AttachResponse`. Blocking; shared by `DaemonProc` and the
 /// `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).

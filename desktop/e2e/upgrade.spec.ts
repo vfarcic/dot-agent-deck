@@ -1,4 +1,5 @@
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
+import { test } from "./support/load-budget";
 
 /**
  * PRD #1487 M5 — the desktop's Upgrade action, as a user drives it.
@@ -31,6 +32,7 @@ function card(page: Page, name: string): Locator {
 }
 
 test.describe("Upgrade a daemon from the dashboard", () => {
+  /** Scenario: show the older remote's Upgrade action and the refused remote's remedy, with no offer on the current local daemon. */
   test("is offered on an older daemon's card and nowhere else", async ({ page }) => {
     await openUpgradeFleet(page);
 
@@ -42,6 +44,7 @@ test.describe("Upgrade a daemon from the dashboard", () => {
     await expect(card(page, RUNNER).getByTestId("overview-incompatible")).toContainText("Upgrade installs this app's version on that machine");
   });
 
+  /** Scenario: start Upgrade on a busy remote, inspect the named restart question, and choose Restart now; the card becomes current and empty. */
   test("asks before stopping running agents, and Restart now upgrades", async ({ page }) => {
     await openUpgradeFleet(page);
     await card(page, BUILD_BOX).getByTestId("daemon-upgrade").click();
@@ -59,7 +62,7 @@ test.describe("Upgrade a daemon from the dashboard", () => {
     await expect(page.getByTestId("upgrade-stage-installing")).toHaveAttribute("data-state", "done");
     await expect(question).toContainText(`Restarting the daemon on ${BUILD_BOX} stops`);
     const atStake = page.getByTestId("upgrade-at-stake").getByRole("listitem");
-    expect(await atStake.count()).toBeGreaterThan(0);
+    await expect(atStake.first()).toBeVisible();
 
     await page.getByTestId("upgrade-restart-now").click();
     await expect(question).toHaveCount(0);
@@ -77,6 +80,7 @@ test.describe("Upgrade a daemon from the dashboard", () => {
     await expect(card(page, BUILD_BOX).getByTestId("overview-first-run")).toBeVisible();
   });
 
+  /** Scenario: choose Keep at the busy remote's question and read the installed-but-kept outcome; its agents and Upgrade offer remain visible. */
   test("Keep current daemon stops nothing and says so", async ({ page }) => {
     await openUpgradeFleet(page);
     await card(page, BUILD_BOX).getByTestId("daemon-upgrade").click();
@@ -96,6 +100,7 @@ test.describe("Upgrade a daemon from the dashboard", () => {
     await expect(card(page, BUILD_BOX).getByTestId("overview-first-run")).toHaveCount(0);
   });
 
+  /** Scenario: upgrade the refused idle remote from its remedy; it reconnects without a restart question and reports that nothing was stopped. */
   test("Upgrade in a refused daemon's note restarts an idle daemon without asking", async ({ page }) => {
     await openUpgradeFleet(page);
     await card(page, RUNNER).getByTestId("overview-upgrade").click();
@@ -114,6 +119,7 @@ test.describe("Upgrade a daemon from the dashboard", () => {
 });
 
 test.describe("Upgrade from the Daemons screen's banner", () => {
+  /** Scenario: use Upgrade in the incompatible-daemon banner and read its success; the remedy disappears once the deck is current. */
   test("offers Upgrade beside the other remedies and runs it", async ({ page }) => {
     await page.goto("/?fixture=1&state=upgrade-error&experimental=1");
     await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();

@@ -24434,6 +24434,35 @@ mod spawn_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
+        // Make the deadline cross AFTER accepted payload bytes rather than
+        // betting that echo-watch setup finishes within SUBMIT_DELAY / 2.
+        // Echo-watch setup uses the blocking pool, so the old 50ms allowance
+        // can expire before any bytes under load. Only this test's writer is delayed.
+        struct DeadlineCrossingWriter {
+            inner: Box<dyn std::io::Write + Send>,
+            deadline: Arc<Mutex<Option<Instant>>>,
+            crossed: bool,
+        }
+        impl std::io::Write for DeadlineCrossingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let deadline = self.deadline.lock().unwrap().expect("deadline armed");
+                if !self.crossed {
+                    assert!(
+                        Instant::now() < deadline,
+                        "setup must finish before the deadline"
+                    );
+                }
+                let written = self.inner.write(bytes)?;
+                if written > 0 && !self.crossed {
+                    self.crossed = true;
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
         const PANE: &str = "issue-544-mid-write";
         const TEXT: &str = "MIDWRITE-SENTINEL";
         const ATTEMPTS: usize = 5;
@@ -24448,13 +24477,30 @@ mod spawn_tests {
                     ..SpawnOptions::default()
                 })
                 .expect("spawn stand-in");
-
-            // No draft and a free writer, so everything up to the first byte
-            // normally takes well under a millisecond — and the deadline then
-            // falls inside the write's own `SUBMIT_DELAY`, after the payload
-            // and before the CR.
+            let deadline_slot = Arc::new(Mutex::new(None));
+            // Wrap the agent's own PTY writer: the first swap hands it back,
+            // the second installs it inside the deadline-crossing wrapper (and
+            // returns the placeholder sink, which is safe to drop).
+            let original = registry
+                .replace_agent_writer_for_test(&agent, Box::new(std::io::sink()))
+                .await;
+            let _placeholder = registry
+                .replace_agent_writer_for_test(
+                    &agent,
+                    Box::new(DeadlineCrossingWriter {
+                        inner: original,
+                        deadline: Arc::clone(&deadline_slot),
+                        crossed: false,
+                    }),
+                )
+                .await;
+            // Two seconds bound preparation; the writer itself makes the
+            // payload cross that deadline. This remains a completion test even
+            // if the machine is fast, without a 50ms scheduling assumption
+            // before the write.
             let started = Instant::now();
-            let deadline = started + SUBMIT_DELAY / 2;
+            let deadline = started + Duration::from_secs(2);
+            *deadline_slot.lock().unwrap() = Some(deadline);
             let sent = tokio::time::timeout(
                 Duration::from_secs(5),
                 registry.write_and_submit_guarded_first_write_within(
@@ -24469,9 +24515,8 @@ mod spawn_tests {
             .await
             .expect("bounded");
             match sent {
-                // Starved before the first byte (issue #1494's `cargo
-                // test-fast` at load ~40 on 16 cores): the precondition did
-                // not hold, so set it up again.
+                // Starved for the whole preparation window before the first
+                // byte: the precondition did not hold, so set it up again.
                 Err(AgentPtyError::DeadlineElapsed) if attempt < ATTEMPTS => {
                     eprintln!(
                         "attempt {attempt}: the deadline passed before the first byte; retrying"
