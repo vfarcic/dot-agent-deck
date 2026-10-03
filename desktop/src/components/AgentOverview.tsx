@@ -657,6 +657,8 @@ const DASHBOARD_SCROLL_MIN = 120;
 export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
 /** Already at the top, for "scroll up". */
 export const DASHBOARD_AT_TOP = "The dashboard is already at the top.";
+/** A menu or dialog is in front of the dashboard, such as the open Daemon selector. */
+export const DASHBOARD_COVERED = "Something is open over the dashboard, so it was not scrolled. Close it first.";
 /** Nothing to scroll: every daemon and agent fits in the window. */
 export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 

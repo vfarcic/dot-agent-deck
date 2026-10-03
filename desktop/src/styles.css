@@ -1241,6 +1241,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
 .workspace-page { color: var(--ink); font-weight: 700; }
+/* Issue #1492: a row scrolled into view by voice (`revealAgent`) stops clear
+   of the sticky top bar and the voice row, not underneath either. */
+.overview-row { scroll-margin-top: 84px; scroll-margin-bottom: calc(var(--voice-reserved) + 12px); }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather
    than alarming: an unreachable deck in a fleet is a fact about that deck, and

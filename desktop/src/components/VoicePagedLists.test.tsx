@@ -494,6 +494,25 @@ describe("the agent dashboard scrolls while voice is on", () => {
     expect(page.at()).toBe(0);
   });
 
+  /** Scenario: with the Daemon selector's menu open over a tall dashboard, “scroll down” and “next page” leave the dashboard where it is and say something is open over it. */
+  it("does not scroll the dashboard behind the open Daemon selector", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    deck.fleet = tallFleet().fleet;
+    deck.snapshot = deck.fleet[0];
+    const page = scrollableWindow(3000);
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    fireEvent.click(screen.getByTestId("deck-selector-toggle"));
+    expect(screen.getByTestId("deck-selector-menu")).toBeInTheDocument();
+    await speak(voice, "scroll down");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);
+    await speak(voice, "next page");
+    expect(page.scrollBy).not.toHaveBeenCalled();
+    expect(page.at()).toBe(0);
+  });
+
   /** Scenario: control — with the New agent dialog open over a tall dashboard, “next page” turns the directory browser's page and leaves the dashboard behind it where it was. */
   it("turns the directory page, not the dashboard, while the New agent dialog is open", async () => {
     const voice = microphone();
