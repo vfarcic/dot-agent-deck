@@ -203,7 +203,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
 - **Agent:** none (twelve synthetic agents seeded through the TUI's startup hydration path, `AppState::seed_hydrated_session`, with daemon agent ids `1`..`12`).
 - **Asserts:** a desktop-created dispatcher (`desktop-9ff5ffc73955d0fe-0`) and eleven dispatched units (`sched-dispatch-…-N`), none with a numeric pane id, are drawn top to bottom in the order the daemon created them — dispatcher first — and a second render draws the same order. Before the fix every non-numeric pane id sorted as `u64::MAX`, so all twelve tied and took `HashMap` order; with twelve agents that matches creation order with odds of 1 in 12!.
-- **Does not assert:** the desktop app's own order (it renders the daemon's `ListAgents` order, which is sorted by the same numeric agent id); live-surfaced agents that reach the TUI by `SessionStart` rather than hydration (they carry the same daemon agent id on the event); filtering (`dashboard/filter/*`).
+- **Does not assert:** the desktop app's own order (it renders the daemon's `ListAgents` order, which is sorted by the same numeric agent id); agents surfaced live to an already-attached TUI rather than hydrated (`dashboard/order/004`); filtering (`dashboard/filter/*`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### dashboard/order/002 — TUI-created panes and daemon-spawned agents interleave in creation order (issue #1507).
@@ -218,6 +218,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (three synthetic role sessions).
 - **Asserts:** with an orchestrator that carries the newest daemon agent id of its three roles (a `clear = true` respawn), creation order alone puts it last, and the tab's role-order sort still puts it first, followed by the other roles in config order.
 - **Does not assert:** the rendered orchestration tab (`tabs/orchestration/*`); the respawn itself.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/004 — An agent the daemon surfaces live to an attached TUI takes its creation position before its first hook (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: the daemon's real `spawn::surface_attach_started_agent` broadcast applied through `AppState::apply_event`, then `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (a hydrated dispatcher, two live-surfaced units that have sent no hook, and a later TUI-created pane).
+- **Asserts:** the cards read dispatcher, unit, unit, TUI pane — the live-surfaced units are placed by the registry id their card-surfacing `SessionStart` names (`SURFACED_AGENT_ID_METADATA_KEY`), while the event's own `agent_id` stays `None`. Control: the same surface without that key, as a daemon predating it sends, falls back after every card that has an id.
+- **Does not assert:** the supersession of the surfaced card by the agent's real `SessionStart` (covered by the `status/supersede/*` and `prompt/pane-input/033` tests); a live-surfaced orchestration tab, whose role order `dashboard/order/003` covers.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/card-stats

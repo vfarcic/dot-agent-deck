@@ -441,6 +441,17 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// `AgentEvent.metadata` key carrying the daemon registry id of the agent a
+/// card-surfacing `SessionStart` draws (issue #1507), so an already-attached
+/// TUI can place the live card in creation order before the agent's first real
+/// hook — and at all for a pane that never sends one (a shell, `cat`).
+///
+/// ORDER ONLY, never identity: the event's own `agent_id` stays `None` so the
+/// agent's real `SessionStart` still supersedes the placeholder (see
+/// `surface_spawned_pane`). Additive on the wire: an older daemon sends no key
+/// and the card falls back to the pane-id order, and an older TUI ignores it.
+pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
+
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
 /// automatic prompt delivery failed on this pane (issue #424).
 ///

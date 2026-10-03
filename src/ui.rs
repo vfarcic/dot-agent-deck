@@ -2965,22 +2965,29 @@ fn sort_by_role_order(sessions: &mut [(&String, &SessionState)], role_pane_ids: 
 
 /// The dashboard's creation-order sort key for one session (issue #1507).
 ///
-/// First the daemon's agent id, compared as a number: the daemon mints it from
+/// First the daemon's agent id, compared as a number. The daemon mints it from
 /// a monotonic counter for every spawn, whatever started it (the TUI, the
 /// desktop app, `dispatch`, a schedule, an orchestration), and sorts its own
-/// `ListAgents` reply by it — the order the desktop app renders. So both
-/// clients list the same agents in the same order. The pane id cannot serve:
-/// only a TUI-created pane's is numeric, and every daemon-minted one
-/// (`desktop-<nonce>-<n>`, `sched-…-<n>`) used to tie and fall back to
-/// `HashMap` order.
+/// `ListAgents` reply by it, which is the order the desktop app renders its
+/// tiles in. The pane id cannot serve: only a TUI-created pane's is numeric,
+/// and every daemon-minted one (`desktop-<nonce>-<n>`, `sched-…-<n>`) used to
+/// tie and fall back to `HashMap` order.
 ///
-/// Sessions with no numeric agent id (a hook from outside any pane, a legacy
-/// hook script) come after every agent that has one, ordered as before: by
-/// numeric pane id, paned before paneless, then start time. The pane id and
-/// session id as strings close the key, so equal keys cannot occur and the
-/// order never depends on the map's iteration order.
+/// The id comes from the session's own `agent_id` when it has one (a hydrated
+/// card, or any card whose agent has sent a hook), else from the id the
+/// daemon's card-surfacing `SessionStart` named for its pane
+/// ([`AppState::pane_surfaced_agent_seq`]) — a live-surfaced card before its
+/// agent's first hook, or a pane that never sends one.
+///
+/// Sessions with neither (a hook from outside any pane, a legacy hook script,
+/// a card surfaced by a daemon too old to name the id) come after every agent
+/// that has one, ordered as before: by numeric pane id, paned before paneless,
+/// then start time. The pane id and session id as strings close the key, so
+/// equal keys cannot occur and the order never depends on the map's iteration
+/// order.
 #[allow(clippy::type_complexity)]
 fn creation_order_key<'a>(
+    state: &AppState,
     session_id: &'a str,
     session: &'a SessionState,
 ) -> (
@@ -2993,16 +3000,25 @@ fn creation_order_key<'a>(
 ) {
     // `(is_none, value)`: a present number sorts by value, ahead of every
     // absent one (a bare `Option` would put `None` first).
-    fn numeric_last_if_absent(id: Option<&str>) -> (bool, u64) {
-        match id.and_then(|id| id.parse::<u64>().ok()) {
+    fn last_if_absent(n: Option<u64>) -> (bool, u64) {
+        match n {
             Some(n) => (false, n),
             None => (true, 0),
         }
     }
+    fn numeric(id: Option<&str>) -> Option<u64> {
+        id.and_then(|id| id.parse::<u64>().ok())
+    }
+    let agent_seq = numeric(session.agent_id.as_deref()).or_else(|| {
+        session
+            .pane_id
+            .as_deref()
+            .and_then(|pane| state.pane_surfaced_agent_seq(pane))
+    });
     (
-        numeric_last_if_absent(session.agent_id.as_deref()),
+        last_if_absent(agent_seq),
         session.pane_id.is_none(),
-        numeric_last_if_absent(session.pane_id.as_deref()),
+        last_if_absent(numeric(session.pane_id.as_deref())),
         session.started_at,
         session.pane_id.as_deref().unwrap_or(""),
         session_id,
@@ -3012,7 +3028,7 @@ fn creation_order_key<'a>(
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
     sessions.sort_by(|(a_id, a), (b_id, b)| {
-        creation_order_key(a_id, a).cmp(&creation_order_key(b_id, b))
+        creation_order_key(state, a_id, a).cmp(&creation_order_key(state, b_id, b))
     });
 
     if ui.filter_text.is_empty() {
@@ -42414,6 +42430,130 @@ mod tests {
         assert_eq!(
             order_drawn_names(&rows, &["ninth", "tenth"]),
             ["ninth", "tenth"]
+        );
+    }
+
+    /// Surface one dashboard agent to an attached TUI exactly as the daemon
+    /// does after an attach-socket start (`spawn::surface_attach_started_agent`,
+    /// the real producer), and apply what it broadcasts to `state`.
+    fn order_surface_live_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+        strip_surfaced_id: bool,
+    ) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let record = crate::agent_pty::AgentRecord {
+            id: agent_id.to_string(),
+            pane_id_env: Some(pane_id.to_string()),
+            display_name: Some(name.to_string()),
+            cwd: Some("/home/dev/dot-agent-deck".to_string()),
+            tab_membership: None,
+            agent_type: Some(AgentType::ClaudeCode),
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            crashed: None,
+            orchestrator_context_path: None,
+        };
+        crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));
+        let crate::event::BroadcastMsg::Event(mut event) =
+            rx.try_recv().expect("the daemon surfaces the card")
+        else {
+            panic!("expected the card-surfacing SessionStart");
+        };
+        assert!(event.is_card_surface_session_start());
+        assert_eq!(event.agent_id, None, "the surface names no agent identity");
+        if strip_surfaced_id {
+            // What an older daemon sends: no surfaced id at all.
+            event
+                .metadata
+                .remove(crate::event::SURFACED_AGENT_ID_METADATA_KEY);
+        }
+        state.register_pane(pane_id.to_string());
+        state.apply_event(event);
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the surfaced agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// Scenario: A TUI is attached to a daemon running a desktop-created
+    /// dispatcher, then `dispatch` starts two units the daemon surfaces to the
+    /// TUI live (neither has sent a hook yet), then the user creates a pane in
+    /// the TUI. The cards must read dispatcher, unit, unit, TUI pane — creation
+    /// order — not put the units last for lacking an agent id of their own.
+    #[spec("dashboard/order/004")]
+    #[test]
+    fn order_004_live_surfaced_agents_take_their_creation_position() {
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            false,
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1492-b-13",
+            "3",
+            "unit-1492",
+            false,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let names = ["dispatcher", "unit-1491", "unit-1492", "tui-pane"];
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        tui-pane
+        ");
+
+        // Control: the same live card surfaced by a daemon too old to name the
+        // id has nothing to order by, so it falls back after every card that
+        // has one — the documented limit, not a regression.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            true,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        assert_eq!(
+            order_drawn_names(&rows, &["dispatcher", "unit-1491", "tui-pane"]),
+            ["dispatcher", "tui-pane", "unit-1491"]
         );
     }
 
