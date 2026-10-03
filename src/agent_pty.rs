@@ -2458,6 +2458,8 @@ struct PaneWriterTarget {
     writer: Arc<AsyncMutex<PaneWriter>>,
     agent_id: String,
     exited: Arc<AtomicBool>,
+    /// Issue #525: see [`RunningAgent::pty_progress`].
+    pty_progress: Arc<PtyInFlight>,
 }
 
 /// PRD #20 R20-004 (finding #3): one ledger record per seen `delivery_id`.
@@ -2946,6 +2948,10 @@ pub struct RunningAgent {
     /// than a field behind its async lock, because the removal paths are
     /// synchronous and must not wait on a writer another task holds.
     pub pane_retired: Arc<AtomicBool>,
+    /// Issue #525: [`Self::writer`]'s PTY thread's progress, held outside the
+    /// writer's lock so a delivery waiting for that lock can tell a pane whose
+    /// PTY has stopped taking bytes from one that is only busy.
+    pub(crate) pty_progress: Arc<PtyInFlight>,
     pub bus: Arc<AgentBus>,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
@@ -4283,6 +4289,12 @@ impl PaneWriter {
         Ok(())
     }
 
+    /// Issue #525: the PTY thread's progress, readable without this writer's
+    /// lock — see [`RunningAgent::pty_progress`].
+    pub(crate) fn pty_progress(&self) -> Arc<PtyInFlight> {
+        self.pty.in_flight.clone()
+    }
+
     /// Issue #525: resolve once no write handed to this pane's PTY thread is
     /// still waiting for, or inside, the PTY. A guarded delivery waits here,
     /// within its own bound, before its payload, so a write an earlier caller
@@ -4390,12 +4402,45 @@ struct PtyJob {
 
 /// Issue #525: jobs handed to the thread and not yet finished or withdrawn.
 #[derive(Default)]
-struct PtyInFlight {
+pub(crate) struct PtyInFlight {
     count: std::sync::atomic::AtomicUsize,
     idle: Notify,
+    /// When the thread started the job it is in now, as milliseconds since
+    /// [`pty_clock_epoch`] plus one; `0` while it is between jobs. What tells a
+    /// PTY that has stopped taking bytes apart from a writer that is merely
+    /// busy — see [`Self::stuck_for`].
+    busy_since: AtomicU64,
+}
+
+/// Issue #525: the origin of [`PtyInFlight::busy_since`]'s clock — the wall
+/// clock, for the reason [`within_real_time`] gives.
+fn pty_clock_epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
 }
 
 impl PtyInFlight {
+    fn job_started(&self) {
+        let now = pty_clock_epoch().elapsed().as_millis() as u64 + 1;
+        self.busy_since.store(now, Ordering::SeqCst);
+    }
+
+    fn job_finished(&self) {
+        self.busy_since.store(0, Ordering::SeqCst);
+    }
+
+    /// How long the thread has been inside the job it is in now, or `None`
+    /// between jobs. A job the PTY takes in microseconds never reads as stuck,
+    /// however many writers are queued for the pane.
+    pub(crate) fn stuck_for(&self) -> Option<Duration> {
+        match self.busy_since.load(Ordering::SeqCst) {
+            0 => None,
+            since => Some(Duration::from_millis(
+                (pty_clock_epoch().elapsed().as_millis() as u64 + 1).saturating_sub(since),
+            )),
+        }
+    }
+
     fn leave(&self) {
         if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.idle.notify_waiters();
@@ -4469,9 +4514,18 @@ struct PtyWriterThread {
 }
 
 impl PtyWriterThread {
-    fn spawn(mut inner: Box<dyn std::io::Write + Send>, recorder: InputRecorder) -> Self {
+    fn spawn(inner: Box<dyn std::io::Write + Send>, recorder: InputRecorder) -> Self {
+        Self::spawn_reporting_to(inner, recorder, Arc::default())
+    }
+
+    /// [`Self::spawn`], counting its jobs in `in_flight` — kept across a writer
+    /// swap so a handle taken from the old thread reports on the new one.
+    fn spawn_reporting_to(
+        mut inner: Box<dyn std::io::Write + Send>,
+        recorder: InputRecorder,
+        in_flight: Arc<PtyInFlight>,
+    ) -> Self {
         let (jobs, queue) = std::sync::mpsc::channel::<PtyJob>();
-        let in_flight = Arc::new(PtyInFlight::default());
         let thread_in_flight = in_flight.clone();
         std::thread::Builder::new()
             .name("pty-writer".to_string())
@@ -4490,6 +4544,7 @@ impl PtyWriterThread {
                         // Withdrawn by a caller that stopped waiting.
                         continue;
                     }
+                    thread_in_flight.job_started();
                     let done = match job.op {
                         PtyOp::Write(buf, source) => match inner.write(&buf) {
                             Ok(n) => {
@@ -4515,11 +4570,13 @@ impl PtyWriterThread {
                         },
                         #[cfg(test)]
                         PtyOp::Surrender(back) => {
+                            thread_in_flight.job_finished();
                             thread_in_flight.leave();
                             let _ = back.send((inner, recorder));
                             return;
                         }
                     };
+                    thread_in_flight.job_finished();
                     // Answered BEFORE it counts as finished, so a caller whose
                     // bound runs out in between finds the answer rather than
                     // reporting a finished write as stalled.
@@ -9917,19 +9974,21 @@ impl AgentPtyRegistry {
         });
 
         let pane_retired = Arc::new(AtomicBool::new(false));
+        let pane_writer = PaneWriter::new(
+            writer,
+            pane_id_env.clone(),
+            self.pane_input.clone(),
+            pane_retired.clone(),
+        );
         let agent = RunningAgent {
             child,
             process_group,
             master,
+            pty_progress: pane_writer.pty_progress(),
             // Issue #424 H1: every byte anyone other than the daemon writes to
             // this PTY is a user keystroke, and the clock recording it has to
             // move under the same lock the write takes — see [`PaneWriter`].
-            writer: Arc::new(AsyncMutex::new(PaneWriter::new(
-                writer,
-                pane_id_env.clone(),
-                self.pane_input.clone(),
-                pane_retired.clone(),
-            ))),
+            writer: Arc::new(AsyncMutex::new(pane_writer)),
             pane_retired,
             bus,
             pane_id_env,
@@ -10226,6 +10285,7 @@ impl AgentPtyRegistry {
                 writer: a.writer.clone(),
                 agent_id: id.clone(),
                 exited: a.exited.clone(),
+                pty_progress: a.pty_progress.clone(),
             })
     }
 
@@ -10248,6 +10308,7 @@ impl AgentPtyRegistry {
                 writer: a.writer.clone(),
                 agent_id: agent_id.to_string(),
                 exited: a.exited.clone(),
+                pty_progress: a.pty_progress.clone(),
             })
     }
 
@@ -10945,15 +11006,29 @@ impl AgentPtyRegistry {
             // barrier the TOCTOU test holds open by locking the writer externally.
             //
             // Issue #525 (Qodo, PR #1535): a caller with no deadline still
-            // waits at most the stall bound, measured on the wall clock. The
-            // writer can be held by an attach client's keystrokes waiting on a
-            // PTY that stopped reading, and an unbounded wait here would make
-            // this delivery as stuck as that pane.
+            // stops waiting once the pane's PTY has been inside one write for
+            // the whole stall bound, measured on the wall clock. The writer can
+            // be held by an attach client's keystrokes waiting on a PTY that
+            // stopped reading, and an unbounded wait here would make this
+            // delivery as stuck as that pane.
             let w = match within(deferred) {
                 Some(_) => before_write_deadline(within(deferred), target.writer.lock()).await?,
-                None => match within_real_time(stall, target.writer.lock()).await {
-                    Some(w) => w,
-                    None => return not_reading(&target.agent_id),
+                None => loop {
+                    if let Some(w) = within_real_time(stall, target.writer.lock()).await {
+                        break w;
+                    }
+                    // Only a PTY that has been inside one write for the whole
+                    // bound is "not reading". A writer held by other
+                    // deliveries that keep going in — several notices queued
+                    // for one orchestrator on a starved machine — is only
+                    // busy, and this delivery keeps its place in the queue.
+                    if target
+                        .pty_progress
+                        .stuck_for()
+                        .is_some_and(|stuck| stuck >= stall)
+                    {
+                        return not_reading(&target.agent_id);
+                    }
                 },
             };
             // Issue #525: a write an earlier holder of this writer stopped
@@ -11783,6 +11858,8 @@ impl AgentPtyRegistry {
             // Issue #714: dropped — a respawned agent starts unblocked, and its
             // next quota failure reports afresh.
             quota_block: _,
+            // The replacement gets a writer, and a PTY thread, of its own.
+            pty_progress: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -13983,7 +14060,8 @@ impl AgentPtyRegistry {
             )
             .expect("the displaced writer's thread is running");
         let (displaced, recorder) = rx.await.expect("the displaced writer comes back");
-        guard.pty = PtyWriterThread::spawn(inner, recorder);
+        let in_flight = guard.pty.in_flight.clone();
+        guard.pty = PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight);
         displaced
     }
 
@@ -14033,6 +14111,8 @@ impl AgentPtyRegistry {
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
+        let pane_writer =
+            PaneWriter::new(writer, None, self.pane_input.clone(), pane_retired.clone());
         inner.agents.insert(
             id.clone(),
             RunningAgent {
@@ -14046,12 +14126,8 @@ impl AgentPtyRegistry {
                 // their documented `Child::kill` fallback here.
                 process_group: crate::platform::proc::AgentProcessGroup::adopt(None),
                 master: pair.master,
-                writer: Arc::new(AsyncMutex::new(PaneWriter::new(
-                    writer,
-                    None,
-                    self.pane_input.clone(),
-                    pane_retired.clone(),
-                ))),
+                pty_progress: pane_writer.pty_progress(),
+                writer: Arc::new(AsyncMutex::new(pane_writer)),
                 pane_retired,
                 bus: Arc::new(AgentBus::new()),
                 pane_id_env: pane_id_env.map(str::to_string),
@@ -21098,6 +21174,92 @@ mod spawn_tests {
         );
         assert_eq!(log.lock().unwrap().as_slice(), b"typed while stuck");
         rt.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Issue #525: a guarded write with no deadline waits for a pane's writer
+    /// for as long as that writer is only BUSY — here held past the stall bound
+    /// with nothing stuck in the PTY, the shape of several notices queued for
+    /// one orchestrator on a starved machine — and is delivered when its turn
+    /// comes. Bounding the lock wait itself refused such a write (CI on PR
+    /// #1535, `scheduler/idle-worker/023`, on a starved runner).
+    #[tokio::test]
+    async fn a_guarded_write_queued_behind_a_busy_writer_still_goes_in() {
+        const PANE: &str = "issue-525-busy-pane";
+        const STALL: Duration = Duration::from_millis(300);
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, false).await;
+        registry.set_pty_write_stall_bound_for_test(STALL);
+        gate.release();
+        let writer = registry.agent_writer(&agent).unwrap();
+        let held = writer.lock().await;
+
+        let delivery = {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                registry
+                    .write_notice_guarded(PANE, "queued notice", &agent, || async { true })
+                    .await
+            })
+        };
+        tokio::time::sleep(STALL * 4).await;
+        assert!(
+            !delivery.is_finished(),
+            "the delivery keeps its place behind a busy writer"
+        );
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), delivery)
+                .await
+                .expect("the delivery finishes once the writer is free")
+                .unwrap()
+                .expect("delivered, not refused"),
+            GuardedSend::Applied
+        );
+        assert_eq!(log.lock().unwrap().as_slice(), b"queued notice\n");
+    }
+
+    /// Issue #525 (Qodo, PR #1535): the other side of the test above. When the
+    /// writer is held by an attach client's keystrokes stuck inside a PTY that
+    /// has stopped taking bytes, a guarded write with no deadline stops waiting
+    /// once the PTY has been inside that write for the stall bound, and is
+    /// refused with nothing of it written.
+    #[tokio::test]
+    async fn a_guarded_write_behind_a_stuck_attach_write_is_refused_with_nothing_written() {
+        const PANE: &str = "issue-525-stuck-attach-pane";
+        const STALL: Duration = Duration::from_millis(300);
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, false).await;
+        registry.set_pty_write_stall_bound_for_test(STALL);
+        let writer = registry.agent_writer(&agent).unwrap();
+        let typing = {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let w = writer.lock().await;
+                w.write_user(b"stuck keys").await
+            })
+        };
+        until_a_pty_job_is_in_flight(&writer).await;
+
+        let started = Instant::now();
+        let refused = registry
+            .write_notice_guarded(PANE, "refused notice", &agent, || async { true })
+            .await;
+        assert!(
+            matches!(refused, Err(AgentPtyError::Writer(_))),
+            "refused as a pane that is not reading: {refused:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused within a few stall bounds, not after {:?}",
+            started.elapsed()
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(10), typing)
+            .await
+            .expect("the keystrokes go in once the PTY takes input")
+            .unwrap()
+            .expect("written");
+        assert_eq!(log.lock().unwrap().as_slice(), b"stuck keys");
     }
 
     /// Issue #525: a job still queued behind a write the PTY has not taken is
