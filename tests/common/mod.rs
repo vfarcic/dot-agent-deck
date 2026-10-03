@@ -7457,26 +7457,34 @@ const DECK_ENDPOINT_VARS: [&str; 5] = [
 ///
 /// **Both halves run before `main`**, in [`detach_before_main`], so a test that
 /// never calls this function — or [`init_test_env`], or [`TuiDeck::builder`] —
-/// is covered too. This function remains as the place the note is printed and
-/// re-scrubs the identity variables for a test that set them itself; it leaves
-/// `XDG_RUNTIME_DIR` alone, so a test that chose its own runtime dir keeps it.
-/// It does not cover a child started with `env_clear`, which inherits neither
-/// half — the deck launches below set their endpoints explicitly for that.
+/// is covered too. It does not cover a child started with `env_clear`, which
+/// inherits neither half — the deck launches below set their endpoints
+/// explicitly for that.
+///
+/// **This function writes nothing** (issue #678). It used to re-scrub the
+/// identity variables at run time, for a test that had set them itself, under a
+/// SAFETY argument — "one process per test, so only this test's threads exist"
+/// — that did not establish what it claimed: one process per test is not one
+/// thread per process, and [`init_test_env`] is reached from inside
+/// multi-threaded Tokio runtimes whose workers already exist
+/// ([`spawn_inprocess_daemon`], and `delegate_prompt_injection.rs`'s
+/// `#[tokio::test(flavor = "multi_thread")]` bodies). What is left is the part
+/// that needs no write: print the note naming what [`detach_before_main`]
+/// cleared, and **refuse** — panic — if a variable is set again by the time a
+/// test calls this, because then this process would hand a live-deck route to
+/// everything it spawns. The remedy that message names is the one every test
+/// here already uses: set an endpoint on the child (`Command::env`), never on
+/// this process.
 ///
 /// Tests that need an endpoint set it explicitly per-child (`Command::env`), so
-/// removing the ambient value changes nothing for them.
+/// the ambient value being absent changes nothing for them.
 fn detach_from_any_live_deck() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let mut leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
-        for var in DECK_ENDPOINT_VARS {
-            if std::env::var_os(var).is_some() && !leaked.contains(&var) {
-                leaked.push(var);
-            }
-        }
+        let leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
         if !leaked.is_empty() {
-            // Loud on purpose: the run is now safe, but the contributor should
-            // know their shell was pointed at a live deck.
+            // Loud on purpose: the run is safe, but the contributor should know
+            // their shell was pointed at a live deck.
             eprintln!(
                 "note: detaching this test process from a live deck — cleared {}. \
                  Tests set endpoints per-child; the inherited values would have \
@@ -7484,21 +7492,21 @@ fn detach_from_any_live_deck() {
                 leaked.join(", ")
             );
         }
-        for var in DECK_ENDPOINT_VARS {
-            // SAFETY: a stated residual, not a proof — issue #678. The
-            // `OnceLock` makes this happen exactly once per test process and
-            // excludes nothing else, and "before the harness spawns any thread"
-            // is not established: `init_test_env()` is reached from inside
-            // multi-threaded Tokio runtimes whose workers already exist
-            // (`spawn_inprocess_daemon`, and `delegate_prompt_injection.rs`'s
-            // `#[tokio::test(flavor = "multi_thread")]` body). What is true is
-            // that these are idempotent setup-time writes of values no library
-            // thread in this process reads, before anything is spawned — and
-            // since issue #1473 they are normally no-ops, because
-            // [`detach_before_main`] already removed them.
-            unsafe { std::env::remove_var(var) };
-        }
     });
+    let reset: Vec<&str> = DECK_ENDPOINT_VARS
+        .into_iter()
+        .filter(|var| std::env::var_os(var).is_some())
+        .collect();
+    assert!(
+        reset.is_empty(),
+        "{} set in this test process after `main` — `detach_before_main` cleared the \
+         inherited copies, so something in this process put them back, and every child \
+         it spawns would inherit a route to a deck. Set an endpoint on the child \
+         (`Command::env`) instead; the harness no longer scrubs this process at run \
+         time, because doing so races any thread already reading the environment \
+         (issue #678)",
+        reset.join(", ")
+    );
 }
 
 /// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a path beneath
@@ -7528,10 +7536,12 @@ ctor::declarative::ctor! {
             .into_iter()
             .filter(|v| std::env::var_os(v).is_some())
             .collect();
-        // SAFETY: a constructor runs before `main`, while this process has one
-        // thread, so nothing can observe the environment mid-write — the
-        // guarantee the `remove_var` in `detach_from_any_live_deck` can only
-        // state as a residual.
+        // SAFETY: a constructor runs before `main`, so before libtest or any
+        // code in this binary has started a thread, and nothing can observe
+        // the environment mid-write (see `child_lifetime_bound`'s constructor
+        // for what was measured). This is the only place the harness writes these
+        // variables: `detach_from_any_live_deck` checks them and writes
+        // nothing (issue #678).
         unsafe {
             for var in DECK_ENDPOINT_VARS {
                 std::env::remove_var(var);
@@ -7545,9 +7555,12 @@ ctor::declarative::ctor! {
 
 /// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the
 /// test binaries that deliberately do NOT link this harness to
-/// `#[path]`-include on their own. `init_test_env` below calls the same
-/// [`child_lifetime_bound::arm`], so there is one implementation and one SAFETY
-/// argument rather than one per spawn-owning crate.
+/// `#[path]`-include on their own. Declaring it here brings in its pre-main
+/// constructor (issue #678), which pins the cap for every test binary that
+/// links this harness; `init_test_env` below calls the same
+/// [`child_lifetime_bound::arm`] to check it ran, so there is one
+/// implementation and one SAFETY argument rather than one per spawn-owning
+/// crate.
 ///
 /// `pub` so `tests/agent_lifetime_bound.rs` can unit-test
 /// [`child_lifetime_bound::clamped`] in ONE crate. The alternative — a

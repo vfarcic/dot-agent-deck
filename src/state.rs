@@ -13,7 +13,8 @@ use crate::event::{
     RestartRoleSignal, SpawnRoleSignal, WorkDoneSignal, Writable,
 };
 use crate::project_config::{
-    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, ProjectConfig,
+    load_project_config,
 };
 /// Issue #714: the quota-block reason types live in [`crate::quota_block`], and
 /// are re-exported here beside the [`SessionStatus::Blocked`] they explain.
@@ -1992,6 +1993,10 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 /// the file per delegation (as `lookup_orchestration_role` already does) means
 /// an edited timeout takes effect on the next delegate without a respawn.
 ///
+/// Reads the file on the calling thread. A request handler resolves the same
+/// value through [`worker_response_timeout_in`], from configs read with no state
+/// guard held (issue #1387).
+///
 /// PRD #126 M1 audit (finding 4) — bounds, for BOTH sources:
 ///
 /// * **`0` means "detector disabled"**, explicitly and for either source. The
@@ -2006,6 +2011,16 @@ pub const MAX_WORKER_RESPONSE_TIMEOUT_MS: u64 = MAX_WORKER_RESPONSE_TIMEOUT_MINU
 ///   file/default, an out-of-range file value falls back to
 ///   [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`]. Nothing is clamped silently.
 pub fn worker_response_timeout(
+    orchestration_cwd: Option<&str>,
+    worker_cwd: Option<&str>,
+) -> Option<std::time::Duration> {
+    let configs = ProjectConfigs::load_blocking(orchestration_cwd.into_iter().chain(worker_cwd));
+    worker_response_timeout_in(&configs, orchestration_cwd, worker_cwd)
+}
+
+/// [`worker_response_timeout`], resolved from configs the caller already read.
+fn worker_response_timeout_in(
+    configs: &ProjectConfigs,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
@@ -2034,9 +2049,8 @@ pub fn worker_response_timeout(
         .into_iter()
         .chain(worker_cwd)
         .find_map(|cwd| {
-            load_project_config(std::path::Path::new(cwd))
-                .ok()
-                .flatten()
+            configs
+                .get(cwd)
                 .map(|cfg| cfg.worker_response_timeout_minutes)
         })
         .unwrap_or(DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES);
@@ -3362,7 +3376,7 @@ fn release_reserved_silence_watch(
     }
 }
 
-/// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
+/// PRD #126: take the resolved timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
 /// three ways it legitimately does nothing stay legible:
@@ -3377,10 +3391,11 @@ fn release_reserved_silence_watch(
 /// * **the pane is mid-close** — [`AgentPtyRegistry::arm_outstanding_delegation`]
 ///   refuses, closing the arm-after-cancel race.
 ///
-/// PRD #140 integration: `orchestration` is the daemon's routing identity, whose
-/// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
-/// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
-/// than read back out of the identity.
+/// `timeout` is [`worker_response_timeout`]'s answer for this delegate, `None`
+/// for a disabled detector. The caller resolves it from project configs it read
+/// with no state guard held (issue #1387), and from the orchestration's cwd,
+/// which PRD #140's routing identity does not carry (see
+/// [`AppState::orchestration_cwd_of`]).
 ///
 /// Returns the armed record's generation (`Some(seq)`) when a
 /// watch was armed, `None` on any of the three no-op paths above. The caller
@@ -3393,10 +3408,9 @@ fn arm_idle_worker_watch_for_delegation(
     role: &str,
     orchestrator_pane_id: &str,
     orchestration: Option<&OrchestrationIdentity>,
-    orchestration_cwd: Option<&str>,
-    worker_cwd: Option<&str>,
+    timeout: Option<std::time::Duration>,
 ) -> Option<u64> {
-    let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
+    let Some(timeout) = timeout else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -4495,6 +4509,7 @@ pub const DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS: &str =
 /// the derived default — off. That is deliberate: the two questions are
 /// independently switchable in both directions.
 fn delegate_no_event_window(
+    configs: &ProjectConfigs,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) -> Option<std::time::Duration> {
@@ -4514,7 +4529,7 @@ fn delegate_no_event_window(
         }
         return Some(window);
     }
-    worker_response_timeout(orchestration_cwd, worker_cwd)
+    worker_response_timeout_in(configs, orchestration_cwd, worker_cwd)
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
 
@@ -5984,17 +5999,144 @@ pub fn compose_worker_task_file(
     format!("{}\n\n{}", body.trim_end(), work_done_footer(role))
 }
 
+/// Issue #1387: the `.dot-agent-deck.toml` of each directory a request resolves
+/// role config from, as one request read them.
+///
+/// Every daemon verb that resolves a role — `delegate`, `restart-role`,
+/// `spawn-role` — used to read the file synchronously while holding the
+/// [`AppState`] read guard. A read that hung (a network mount, a FIFO at the
+/// config path) then parked a runtime thread and, behind that guard, every
+/// writer: hook ingestion stopped until the read returned. The verbs now read
+/// through [`read_guard_with_project_configs`], which reads on the blocking pool
+/// with no guard held, and resolve from this.
+///
+/// Read once per request and never kept past it: an edit to the file takes
+/// effect on the next delegate (#704/#705).
+#[derive(Debug, Default)]
+pub(crate) struct ProjectConfigs {
+    /// `None` for a directory with no config or one that does not parse — both
+    /// resolve as "no role config", as they always have.
+    by_dir: HashMap<String, Option<ProjectConfig>>,
+}
+
+impl ProjectConfigs {
+    /// Read `dirs` on the calling thread. Only for a caller that is not on a
+    /// request path: tests, and [`worker_response_timeout`].
+    pub(crate) fn load_blocking<S: Into<String>>(dirs: impl IntoIterator<Item = S>) -> Self {
+        let by_dir = dirs
+            .into_iter()
+            .map(Into::into)
+            .map(|dir| {
+                let config = load_project_config(std::path::Path::new(&dir))
+                    .ok()
+                    .flatten();
+                (dir, config)
+            })
+            .collect();
+        Self { by_dir }
+    }
+
+    /// Read `dirs` on the blocking pool. This frees the runtime thread, not a
+    /// state guard the caller holds — a request handler reads through
+    /// [`read_guard_with_project_configs`], which holds none.
+    pub(crate) async fn load(dirs: Vec<String>) -> Self {
+        let mut configs = Self::default();
+        configs.read_more(dirs).await;
+        configs
+    }
+
+    /// Read whichever of `dirs` this set has not read yet, on the blocking pool.
+    async fn read_more(&mut self, dirs: Vec<String>) {
+        let unread = self.unread(dirs);
+        if unread.is_empty() {
+            return;
+        }
+        match tokio::task::spawn_blocking(move || Self::load_blocking(unread)).await {
+            Ok(read) => self.by_dir.extend(read.by_dir),
+            Err(e) => warn!(
+                error = %e,
+                "reading the project config failed; the directories it named resolve as \
+                 having none for this request"
+            ),
+        }
+    }
+
+    /// Which of `dirs` this set has not read, each named once.
+    fn unread(&self, dirs: Vec<String>) -> Vec<String> {
+        let mut unread: Vec<String> = dirs
+            .into_iter()
+            .filter(|dir| !self.by_dir.contains_key(dir))
+            .collect();
+        unread.sort();
+        unread.dedup();
+        unread
+    }
+
+    /// The config `dir` holds, or `None` when it holds none. A directory this
+    /// set never read answers `None` too, and says so in the log — see
+    /// [`read_guard_with_project_configs`] for the one way that can happen.
+    pub(crate) fn get(&self, dir: &str) -> Option<&ProjectConfig> {
+        match self.by_dir.get(dir) {
+            Some(config) => config.as_ref(),
+            None => {
+                warn!(
+                    dir = %escape_id_for_log(dir),
+                    "the project config of this directory was not read for this request; \
+                     resolving it as having none"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// How many times [`read_guard_with_project_configs`] drops its guard to read a
+/// directory the state names. One round is the ordinary case; a further one is
+/// needed only when the state changed while the first was reading.
+const PROJECT_CONFIG_READ_ROUNDS: usize = 3;
+
+/// Issue #1387: a read guard on `state`, with the project config of every
+/// directory `dirs_of` names under that same guard — read while no guard was
+/// held.
+///
+/// `dirs_of` runs under a short guard, which is dropped while those files are
+/// read on the blocking pool; then the guard is taken again and `dirs_of` asked
+/// once more, because the state may have moved in between (a pane registered
+/// with another cwd). A directory it names that was not read is read the same
+/// way, with the guard dropped again. After [`PROJECT_CONFIG_READ_ROUNDS`] such
+/// rounds the guard is returned anyway, and a directory still unread resolves
+/// as having no config ([`ProjectConfigs::get`] logs it) — the state would have
+/// had to change during every round.
+async fn read_guard_with_project_configs<'a>(
+    state: &'a SharedState,
+    dirs_of: impl Fn(&AppState) -> Vec<String>,
+) -> (tokio::sync::RwLockReadGuard<'a, AppState>, ProjectConfigs) {
+    let mut configs = ProjectConfigs::default();
+    let mut rounds = 0;
+    loop {
+        let guard = state.read().await;
+        let unread = configs.unread(dirs_of(&guard));
+        if unread.is_empty() || rounds == PROJECT_CONFIG_READ_ROUNDS {
+            return (guard, configs);
+        }
+        drop(guard);
+        rounds += 1;
+        configs.read_more(unread).await;
+    }
+}
+
 /// Issue #447: whether a delegate to `role` will replace the worker's agent
 /// (`clear = true`) — the same decision `dispatch_one_owned` makes, from the
 /// same inputs. `false` when the role config cannot be resolved, as there.
 fn delegate_respawns_worker(
+    configs: &ProjectConfigs,
     cwd: Option<&str>,
     orchestration: Option<&OrchestrationIdentity>,
     role: &str,
 ) -> bool {
     match (cwd, orchestration) {
         (Some(cwd), Some(identity)) => {
-            lookup_orchestration_role_indexed(cwd, identity.name(), role)
+            lookup_orchestration_role_indexed(configs, cwd, identity.name(), role)
                 .is_some_and(|(_, role_config)| role_config.clear)
         }
         _ => false,
@@ -6002,8 +6144,8 @@ fn delegate_respawns_worker(
 }
 
 /// Look up the role config for `role_name` inside the orchestration
-/// named `orchestration_name`, by parsing the project config file at
-/// `cwd`, together with the role's INDEX within that orchestration.
+/// named `orchestration_name`, in the project config of `cwd` as `configs`
+/// read it, together with the role's INDEX within that orchestration.
 /// Returns `None` when any layer is missing (no project config,
 /// no matching orchestration, no matching role) — the caller treats
 /// "no config" as "no template, no clear" and falls through to the
@@ -6015,11 +6157,12 @@ fn delegate_respawns_worker(
 /// re-create a worker pane from nothing — the card would otherwise land outside
 /// the orchestration's tab, or in the wrong column of it.
 fn lookup_orchestration_role_indexed(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig)> {
-    lookup_orchestration_role_seated(cwd, orchestration_name, role_name)
+    lookup_orchestration_role_seated(configs, cwd, orchestration_name, role_name)
         .map(|(index, role, _)| (index, role))
 }
 
@@ -6030,13 +6173,12 @@ fn lookup_orchestration_role_indexed(
 /// read of the file, so the role and its seat cannot come from two versions of
 /// it.
 fn lookup_orchestration_role_seated(
+    configs: &ProjectConfigs,
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
 ) -> Option<(usize, OrchestrationRoleConfig, bool)> {
-    let cfg = load_project_config(std::path::Path::new(cwd))
-        .ok()
-        .flatten()?;
+    let cfg = configs.get(cwd)?;
     let Some(orch) = cfg
         .orchestrations
         .iter()
@@ -7887,9 +8029,13 @@ async fn dispatch_one_owned(
     // Issue #606: the role's INDEX comes back too, so that a `clear = true`
     // respawn which has to re-create the pane from nothing can rebuild the
     // pane's `TabMembership` and keep the card on its orchestration's tab.
+    //
+    // Issue #1387: read on the blocking pool, so a config whose read hangs parks
+    // this dispatch (it holds no state guard) and not a runtime thread.
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
-            lookup_orchestration_role_indexed(c, identity.name(), &target_role)
+            let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
+            lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
     };
@@ -11427,6 +11573,18 @@ impl AppState {
     /// this has decided the targets, so a test of this function is a test of
     /// where a delegate actually lands (M5.0).
     pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        self.route_delegate(sender_pane_id, to, true)
+    }
+
+    /// [`Self::delegate_targets`], logging the roles it drops only when
+    /// `log_dropped` is set — so a caller that needs the routing before the delegate is
+    /// handled (issue #1387's config read) does not log those warnings twice.
+    fn route_delegate(
+        &self,
+        sender_pane_id: &str,
+        to: &[String],
+        log_dropped: bool,
+    ) -> Vec<(String, String)> {
         let orchestration = self.pane_orchestration_map.get(sender_pane_id);
         let mut targets: Vec<(String, String)> = Vec::new();
         let mut seen_roles: HashSet<&str> = HashSet::new();
@@ -11443,10 +11601,12 @@ impl AppState {
                 // own note treats `signal.to` as already safe because the daemon
                 // logs the whole array with `?`-Debug; that holds for the array
                 // and not for an element interpolated with `%` here.
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: duplicate target role in one signal; ignored"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: duplicate target role in one signal; ignored"
+                    );
+                }
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -11460,10 +11620,12 @@ impl AppState {
                 .map(|(pane_id, _)| pane_id.clone())
                 .collect();
             if role_panes.is_empty() {
-                warn!(
-                    role = %escape_id_for_log(target_role),
-                    "delegate: no worker pane found for role"
-                );
+                if log_dropped {
+                    warn!(
+                        role = %escape_id_for_log(target_role),
+                        "delegate: no worker pane found for role"
+                    );
+                }
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -11554,23 +11716,59 @@ impl AppState {
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
     ) -> crate::event::DelegateResponse {
-        self.handle_attested_delegate(signal, registry, event_tx, state, None)
-            .await
+        // Issue #1387: read off the runtime's thread, but with `&self` — which
+        // may be a guard on the daemon's state — still held, so this is for a
+        // caller holding no shared guard (a bare `AppState` in a fixture). The
+        // daemon goes through the free [`handle_attested_delegate`], which
+        // reads with no guard held at all.
+        let configs = ProjectConfigs::load(self.delegate_config_dirs(&signal, registry)).await;
+        self.handle_attested_delegate_with_configs(
+            signal, registry, event_tx, state, None, &configs,
+        )
+        .await
     }
 
-    /// [`Self::handle_delegate_with_state`] for a delegate whose sender the hook
-    /// provenance gate attested: `sender_agent_id` is the registry agent id its
-    /// capability token was minted for. The daemon's hook loop calls this; see
-    /// [`record_delegation_commission`] for what the identity decides (issue #580
-    /// review, Qodo, #1285). `None` behaves exactly as
-    /// [`Self::handle_delegate_with_state`].
-    pub async fn handle_attested_delegate(
+    /// Issue #1387: every directory a delegate from `signal` resolves a project
+    /// config from — the orchestration's, and the cwd of each pane it routes
+    /// to — and none at all for a sender it is about to refuse, so neither a
+    /// refused caller nor a pane the delegate does not reach can make it wait
+    /// on a slow file.
+    fn delegate_config_dirs(
+        &self,
+        signal: &DelegateSignal,
+        registry: &AgentPtyRegistry,
+    ) -> Vec<String> {
+        if !self.is_orchestrator_caller(&signal.pane_id) {
+            return Vec::new();
+        }
+        let mut dirs: Vec<String> = self
+            .orchestration_cwd_of(&signal.pane_id, registry)
+            .into_iter()
+            .collect();
+        dirs.extend(
+            self.route_delegate(&signal.pane_id, &signal.to, false)
+                .into_iter()
+                .filter_map(|(_, pane_id)| self.pane_cwd_map.get(&pane_id).cloned()),
+        );
+        dirs
+    }
+
+    /// The body of [`Self::handle_delegate_with_state`] and of the free
+    /// [`handle_attested_delegate`], resolving every project config it needs
+    /// from `configs` — it reads no file itself (issue #1387).
+    ///
+    /// `sender_agent_id` is the registry agent id the sender's capability token
+    /// was minted for, when the hook provenance gate attested it; see
+    /// [`record_delegation_commission`] for what the identity decides (issue
+    /// #580 review, Qodo, #1285).
+    async fn handle_attested_delegate_with_configs(
         &self,
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
         state: Option<&SharedState>,
         sender_agent_id: Option<&str>,
+        configs: &ProjectConfigs,
     ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if let Some(error) = self.refuse_unless_orchestrator_caller(&signal.pane_id, "delegate") {
@@ -11772,7 +11970,12 @@ impl AppState {
             // pointer is actually written to, and to the fresh agent on a
             // `clear = true` respawn.
             if let Some(in_flight) = commission_in_flight.as_ref()
-                && !delegate_respawns_worker(cwd.as_deref(), orchestration.as_ref(), &target_role)
+                && !delegate_respawns_worker(
+                    configs,
+                    cwd.as_deref(),
+                    orchestration.as_ref(),
+                    &target_role,
+                )
             {
                 if let Some(worker_agent_id) = registry.pane_current_agent_id(&pane_id) {
                     registry.bind_commission_worker_agent_id(
@@ -11813,8 +12016,7 @@ impl AppState {
                 &target_role,
                 &orchestrator_pane_id,
                 orchestration.as_ref(),
-                orchestration_cwd.as_deref(),
-                cwd.as_deref(),
+                worker_response_timeout_in(configs, orchestration_cwd.as_deref(), cwd.as_deref()),
             );
             // Issue #544 (PR #1398 review): the guard that ends the "queued"
             // mark the arm just set, built before anything else can fail and
@@ -11834,8 +12036,8 @@ impl AppState {
             // while the delegate is still live, not on the dispatch task's first
             // poll, which can land after the pane changed hands.
             let silence_watch =
-                delegate_no_event_window(orchestration_cwd.as_deref(), cwd.as_deref()).map(
-                    |window| SilenceWatch {
+                delegate_no_event_window(configs, orchestration_cwd.as_deref(), cwd.as_deref())
+                    .map(|window| SilenceWatch {
                         window,
                         target: SilenceReportTarget {
                             pane_id: orchestrator_pane_id.clone(),
@@ -11844,8 +12046,7 @@ impl AppState {
                         },
                         redeliveries: None,
                         retry_done: None,
-                    },
-                );
+                    });
 
             // Issue #962: read NOW, under the guard this delegate is being handled
             // with — see `dispatch_one_owned`'s `recorded_title`.
@@ -12022,6 +12223,14 @@ impl AppState {
         }
     }
 
+    /// Whether [`Self::refuse_unless_orchestrator_caller`] would let `pane_id`
+    /// through, without its warnings. Issue #1387: a verb asks this before
+    /// reading the project config, so a caller about to be refused waits on no
+    /// file read.
+    fn is_orchestrator_caller(&self, pane_id: &str) -> bool {
+        self.pane_role_map.contains_key(pane_id) && self.orchestrator_pane_ids.contains(pane_id)
+    }
+
     fn refuse_unless_orchestrator_caller(&self, pane_id: &str, verb: &str) -> Option<String> {
         if !self.pane_role_map.contains_key(pane_id) {
             // Issue #1082: the `pane_role_map` lookup just MISSED, so this id
@@ -12051,6 +12260,37 @@ impl AppState {
         }
         None
     }
+}
+
+/// The daemon's `delegate` verb: [`AppState::handle_delegate_with_state`] for a
+/// delegate whose sender the hook provenance gate attested, `sender_agent_id`
+/// being the registry agent id its capability token was minted for. `None`
+/// behaves exactly as an unattested delegate.
+///
+/// Issue #1387: a FREE function taking the [`SharedState`] handle rather than an
+/// `AppState` method called through the caller's read guard, so the project
+/// configs the delegate resolves roles and timeouts from are read with no guard
+/// held — see [`read_guard_with_project_configs`]. The routing that follows
+/// runs under one guard, as before.
+pub async fn handle_attested_delegate(
+    signal: DelegateSignal,
+    state: &SharedState,
+    registry: &Arc<AgentPtyRegistry>,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    sender_agent_id: Option<&str>,
+) -> crate::event::DelegateResponse {
+    let (guard, configs) =
+        read_guard_with_project_configs(state, |s| s.delegate_config_dirs(&signal, registry)).await;
+    guard
+        .handle_attested_delegate_with_configs(
+            signal,
+            registry,
+            event_tx,
+            Some(state),
+            sender_agent_id,
+            &configs,
+        )
+        .await
 }
 
 /// Shared by [`handle_restart_role_with_state`]'s early (pre-lock) crash
@@ -12160,7 +12400,28 @@ pub async fn handle_restart_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a request one of the checks below refuses before it gets to
+        // the role's config.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            let targets =
+                s.route_delegate(&signal.pane_id, std::slice::from_ref(&signal.role), false);
+            let [(_, pane_id)] = targets.as_slice() else {
+                return Vec::new();
+            };
+            if restart_refusal_for_crashed_pane(registry, pane_id, &signal.role, signal.force)
+                .is_some()
+            {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "restart a role")
         {
@@ -12219,7 +12480,7 @@ pub async fn handle_restart_role_with_state(
         let cwd = guard.orchestration_cwd_of(&signal.pane_id, registry);
         let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_indexed(c, identity.name(), &signal.role)
+                lookup_orchestration_role_indexed(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
@@ -12436,7 +12697,17 @@ pub async fn handle_spawn_role_with_state(
     }
 
     let resolved = {
-        let guard = state.read().await;
+        // Issue #1387: the role's config is read with no guard held, and not at
+        // all for a caller the first check below refuses.
+        let (guard, configs) = read_guard_with_project_configs(state, |s| {
+            if !s.is_orchestrator_caller(&signal.pane_id) {
+                return Vec::new();
+            }
+            s.orchestration_cwd_of(&signal.pane_id, registry)
+                .into_iter()
+                .collect()
+        })
+        .await;
         if let Some(error) =
             guard.refuse_unless_orchestrator_caller(&signal.pane_id, "spawn a role")
         {
@@ -12451,7 +12722,7 @@ pub async fn handle_spawn_role_with_state(
 
         let role_config_seated = match (cwd.as_deref(), identity.as_ref()) {
             (Some(c), Some(identity)) => {
-                lookup_orchestration_role_seated(c, identity.name(), &signal.role)
+                lookup_orchestration_role_seated(&configs, c, identity.name(), &signal.role)
             }
             _ => None,
         };
@@ -16363,27 +16634,18 @@ mod tests {
         )
         .expect("write project config");
         let cwd = dir.path().to_str().expect("utf8 cwd");
+        let configs = ProjectConfigs::load_blocking([cwd]);
         let identity = OrchestrationIdentity::Instance {
             id: "tab-1".to_string(),
             name: "orch".to_string(),
         };
-        assert!(delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "fresh"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "kept"
-        ));
-        assert!(!delegate_respawns_worker(
-            Some(cwd),
-            Some(&identity),
-            "unknown-role"
-        ));
-        assert!(!delegate_respawns_worker(None, Some(&identity), "fresh"));
-        assert!(!delegate_respawns_worker(Some(cwd), None, "fresh"));
+        let respawns =
+            |cwd, identity, role| delegate_respawns_worker(&configs, cwd, identity, role);
+        assert!(respawns(Some(cwd), Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), Some(&identity), "kept"));
+        assert!(!respawns(Some(cwd), Some(&identity), "unknown-role"));
+        assert!(!respawns(None, Some(&identity), "fresh"));
+        assert!(!respawns(Some(cwd), None, "fresh"));
     }
 
     /// Issue #447: the waiting-for-input notice is one line, fences both
@@ -17700,6 +17962,49 @@ mod tests {
         );
     }
 
+    /// Issue #1387 (Greptile, Qodo, #1514): a delegate reads the configs of the
+    /// orchestration and of the workers it routes to — not of another worker in
+    /// the same orchestration, whose slow file would otherwise hold up a
+    /// handoff it plays no part in — and none at all for a sender it refuses.
+    #[test]
+    fn delegate_config_dirs_names_only_the_routed_workers() {
+        let mut state = AppState::default();
+        let identity = instance("orch-1387");
+        state.register_orchestration_role(
+            "orch",
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some("/o"),
+        );
+        state.register_orchestration_role("coder", "coder", false, identity.clone(), Some("/c"));
+        state.register_orchestration_role("tester", "tester", false, identity, Some("/t"));
+        let registry = AgentPtyRegistry::new();
+        let signal = |from: &str| DelegateSignal {
+            pane_id: from.to_string(),
+            task: "probe".to_string(),
+            to: vec!["coder".to_string()],
+            supersede: false,
+            timestamp: Utc::now(),
+            token: None,
+        };
+
+        let mut dirs = state.delegate_config_dirs(&signal("orch"), &registry);
+        dirs.sort();
+        assert_eq!(dirs, vec!["/c".to_string(), "/o".to_string()]);
+        assert!(
+            state
+                .delegate_config_dirs(&signal("tester"), &registry)
+                .is_empty(),
+            "a worker's delegate is refused, so it must read nothing first"
+        );
+        assert!(
+            state
+                .delegate_config_dirs(&signal("stranger"), &registry)
+                .is_empty()
+        );
+    }
+
     /// Issue #580 review (Qodo, #1285): the busy check reads the ATTESTED sender,
     /// not the orchestrator pane's current occupant. Here the pane has no live
     /// agent at all, so a re-resolving check would see no identity and refuse;
@@ -17707,7 +18012,7 @@ mod tests {
     /// attested predecessor identity is what keeps its own refusal.
     #[tokio::test]
     async fn handle_attested_delegate_decides_on_the_attested_sender() {
-        let state = two_same_name_cwd_tabs(true);
+        let state: SharedState = Arc::new(RwLock::new(two_same_name_cwd_tabs(true)));
         let registry = Arc::new(AgentPtyRegistry::new());
         match registry.arm_delegation_commission("A_coder", "A_orch", Some("orch-agent-1"), false) {
             crate::agent_pty::CommissionArm::Armed { .. } => {}
@@ -17723,18 +18028,18 @@ mod tests {
             token: None,
         };
 
-        let predecessor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-1"))
-            .await;
+        let predecessor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-1"))
+                .await;
         assert_eq!(
             predecessor.busy.len(),
             1,
             "the delegating orchestrator is refused: {predecessor:?}"
         );
 
-        let successor = state
-            .handle_attested_delegate(signal(), &registry, &event_tx, None, Some("orch-agent-2"))
-            .await;
+        let successor =
+            handle_attested_delegate(signal(), &state, &registry, &event_tx, Some("orch-agent-2"))
+                .await;
         assert_eq!(
             successor.delivered,
             vec!["coder".to_string()],
@@ -17790,7 +18095,9 @@ mod tests {
         let seat = |toml: &str, role: &str| -> Option<(usize, bool)> {
             let cwd = tempfile::tempdir().expect("tempdir");
             std::fs::write(cwd.path().join(".dot-agent-deck.toml"), toml).expect("write toml");
-            lookup_orchestration_role_seated(cwd.path().to_str().expect("utf8"), "team", role)
+            let cwd = cwd.path().to_str().expect("utf8");
+            let configs = ProjectConfigs::load_blocking([cwd]);
+            lookup_orchestration_role_seated(&configs, cwd, "team", role)
                 .map(|(index, _, is_orchestrator)| (index, is_orchestrator))
         };
         let unflagged = "[[orchestrations]]\nname = \"team\"\n\n\
@@ -18958,7 +19265,11 @@ mod tests {
 
         let disabled = config_dir("0");
         assert_eq!(
-            delegate_no_event_window(disabled.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(disabled.path().to_str()),
+                disabled.path().to_str(),
+                None
+            ),
             None,
             "a disabled idle detector must not produce a silent-worker watch either"
         );
@@ -18966,7 +19277,11 @@ mod tests {
         // Two minutes of "owes an answer" is 30 s of "has said nothing at all".
         let long = config_dir("2");
         assert_eq!(
-            delegate_no_event_window(long.path().to_str(), None),
+            delegate_no_event_window(
+                &ProjectConfigs::load_blocking(long.path().to_str()),
+                long.path().to_str(),
+                None
+            ),
             Some(MAX_DELEGATE_NO_EVENT_WINDOW),
         );
     }
@@ -19011,7 +19326,7 @@ mod tests {
             // SAFETY: lock held for the duration; restored below.
             unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS, raw) };
             assert_eq!(
-                delegate_no_event_window(cwd, None),
+                delegate_no_event_window(&ProjectConfigs::load_blocking(cwd), cwd, None),
                 expected,
                 "{DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS}={raw:?} must resolve to {expected:?}"
             );

@@ -28,6 +28,11 @@
 //! this a one-line fix rather than the per-`SpawnOptions` whack-a-mole it looks
 //! like.
 //!
+//! **The value is written before `main`** (issue #678), by the constructor
+//! [`arm_before_main`], because that is the only point at which writing the
+//! environment is sound without a proof about every thread in the process.
+//! [`arm`] writes nothing; it checks the constructor ran.
+//!
 //! # Why this is its own file rather than a function in `common/mod.rs`
 //!
 //! It started as one, and a function in `common/mod.rs` can only be called by a
@@ -35,7 +40,7 @@
 //! `AgentPtyRegistry` do not, and not by oversight — `tests/rehydration.rs`,
 //! `tests/daemon_protocol.rs` and `tests/shell_activity.rs` avoid `mod common;`
 //! deliberately, because `tests/common/mod.rs` is ~420 KB of PTY/vt100 harness
-//! and pulling it into a fast-tier crate to reach one `set_var` is a real
+//! and pulling it into a fast-tier crate to reach one variable is a real
 //! compile cost for no coverage. (`tests/rehydration.rs` and
 //! `tests/daemon_protocol.rs` already `#[path]`-include `src/test_temp.rs` for
 //! exactly the same reason.) So the arming lives here, in a file small enough
@@ -46,15 +51,16 @@
 //! mod child_lifetime_bound;
 //! ```
 //!
-//! and `common::init_test_env()` calls the same [`arm`] — one implementation and
-//! one SAFETY argument rather than one copy per spawn-owning crate.
+//! and `tests/common/mod.rs` declares it as a module too — so every test binary that
+//! links either one gets the same constructor, one implementation and one SAFETY
+//! argument rather than one copy per spawn-owning crate.
 //!
 //! **Self-contained, for the same reason `src/test_temp.rs` is** (issue #474):
 //! this file is compiled into every crate that `#[path]`-includes it, where
 //! `crate::` names that *test binary's* own root and nothing this repository
-//! defines is in scope. It uses `std` plus one public constant from the library
-//! by its extern-crate path; no `crate::` or file-scope `super::` path may
-//! appear here.
+//! defines is in scope. It uses `std`, the `ctor` dev-dependency, and one
+//! public constant from the library, each by its extern-crate path; no
+//! `crate::` or file-scope `super::` path may appear here.
 //!
 //! Enforced by linkage-check rule 10: a file under `tests/` that constructs an
 //! `AgentPtyRegistry` or calls `run_daemon_with` must arm the bound, so the next
@@ -149,66 +155,78 @@ pub fn clamped(ambient: Option<&str>) -> Option<String> {
     }
 }
 
-/// Pin the cap in this process's environment, once.
-///
-/// A shorter ambient cap is kept; anything else — absent, zero, unparseable, or
-/// above the 300 s ceiling — is replaced. See [`clamped`] for why the ceiling is
-/// enforced rather than merely defaulted, and for what it deliberately does not
-/// reach: a child whose environment `TuiDeck` rebuilds from scratch never sees
-/// this process's value at all, so a test's own `with_env` cap is passed through
-/// unclamped (issue #679).
-///
-/// Idempotent: the `OnceLock` makes repeat calls free.
-///
-/// Deliberately NOT done through `.cargo/config.toml`'s `[env]`: that has no
-/// per-subcommand scoping, so it would apply to `cargo run` as well and hand a
-/// developer a deck whose daemon self-terminates at 300 s. Nor through
-/// `.config/nextest.toml`'s `[env]`, which does not exist — nextest has no such
-/// key at top level or per profile and *silently ignores* one (re-measured on
-/// cargo-nextest 0.9.143: both `[env]` and `[profile.default] env = {…}` are
-/// accepted without error and reach no test process).
-///
-/// # Safety
-///
-/// `std::env::set_var` is `unsafe` in edition 2024 because it races any thread
-/// concurrently *reading* the environment, in Rust or in C, and that is a
-/// data race rather than merely a lost update. State the residual plainly:
-///
-/// - The `OnceLock` bounds this to **one** write per process. It serialises
-///   calls to this function and **excludes nothing else** — it is load-bearing
-///   for idempotence and decorative for thread safety.
-/// - One process per test (every gate here runs under `cargo nextest run`) does
-///   **not** imply one thread per process. Several callers reach this from
-///   inside a multi-threaded Tokio runtime whose workers already exist —
-///   `tests/delegate_prompt_injection.rs`'s `#[tokio::test(flavor =
-///   "multi_thread")]` body, and `common::spawn_inprocess_daemon`. A worker
-///   calling `getenv` concurrently with this write is unsound, and nothing here
-///   prevents it.
-/// - What is actually true is weaker and worth having anyway: this is a single,
-///   idempotent, setup-time write performed before the calling test spawns
-///   anything, of a value no library thread in this process reads. That is the
-///   same profile `common::detach_from_any_live_deck`'s `remove_var` has run on
-///   since it was written — an **inherited** argument, not a proof.
-///
-/// Kept rather than replaced because the alternatives were measured and cost
-/// more than they buy: a registry/`SpawnOptions` child-environment overlay
-/// applied at `agent_pty::spawn` reaches only children of that call, and 4 armed
-/// test files spawn the deck binary through a raw `std::process::Command` that
-/// would silently lose the cap. Tracked for a real fix by **issue #678**, which
-/// covers this call and `detach_from_any_live_deck`'s `remove_var` together
-/// because they share the defect and the second is where the argument came
-/// from. Call it during a test's setup, before it spawns anything.
-pub fn arm() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
+/// What [`arm_before_main`] left behind for [`arm`] to check: `Some` once the
+/// constructor has run in this process.
+static ARMED_BEFORE_MAIN: OnceLock<()> = OnceLock::new();
+
+ctor::declarative::ctor! {
+    /// Pin the cap in this process's environment before `main` (issue #678).
+    ///
+    /// A shorter ambient cap is kept; anything else — absent, zero,
+    /// unparseable, or above the 300 s ceiling — is replaced. See [`clamped`]
+    /// for why the ceiling is enforced rather than merely defaulted, and for
+    /// what it deliberately does not reach: a child whose environment `TuiDeck`
+    /// rebuilds from scratch never sees this process's value at all, so a
+    /// test's own `with_env` cap is passed through unclamped (issue #679).
+    ///
+    /// **Why a constructor.** `std::env::set_var` is `unsafe` in edition 2024
+    /// because it races any thread concurrently *reading* the environment, in
+    /// Rust or in C. This used to run inside [`arm`], from test setup, and the
+    /// argument for it ("nextest gives each test its own process") did not
+    /// establish what it claimed: one process per test is not one thread per
+    /// process, and several callers reached it from inside a multi-threaded
+    /// Tokio runtime whose workers already existed. A constructor runs before
+    /// `main` — before libtest starts the thread a test runs on, and before any
+    /// code in the test binary can start one — so there is no other thread to
+    /// race. That is the same guarantee `common::detach_before_main` relies on
+    /// for the deck endpoint variables (issue #1473).
+    ///
+    /// Every test binary that links `tests/common/mod.rs` or `#[path]`-includes
+    /// this file runs it, whether or not a test calls [`arm`] — so arming no
+    /// longer depends on call ordering inside the test at all.
+    ///
+    /// Deliberately NOT done through `.cargo/config.toml`'s `[env]`: that has
+    /// no per-subcommand scoping, so it would apply to `cargo run` as well and
+    /// hand a developer a deck whose daemon self-terminates at 300 s. Nor
+    /// through `.config/nextest.toml`'s `[env]`, which does not exist — nextest
+    /// has no such key at top level or per profile and *silently ignores* one
+    /// (re-measured on cargo-nextest 0.9.143: both `[env]` and
+    /// `[profile.default] env = {…}` are accepted without error and reach no
+    /// test process).
+    ///
+    /// Prints nothing: stderr is not promised to be usable before `main`.
+    #[ctor(unsafe)]
+    fn arm_before_main() {
         let var = dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
-        let ambient = std::env::var(var).ok();
-        let Some(value) = clamped(ambient.as_deref()) else {
-            return;
-        };
-        // SAFETY: see the `# Safety` section above. Not a proof — a stated
-        // residual: at most once per process, during test setup, of a value no
-        // thread in this process reads, under a one-process-per-test runner.
-        unsafe { std::env::set_var(var, value) };
-    });
+        if let Some(value) = clamped(std::env::var(var).ok().as_deref()) {
+            // SAFETY: a constructor runs before `main`, so before libtest or
+            // any code in this binary has started a thread, and nothing can
+            // read the environment while it is being written. (Measured on
+            // Linux: a test binary links only libc, libm and libgcc_s, none of
+            // which starts a thread from a constructor of its own.)
+            unsafe { std::env::set_var(var, value) };
+        }
+        let _ = ARMED_BEFORE_MAIN.set(());
+    }
+}
+
+/// Check that the cap was pinned before `main`. Writes nothing.
+///
+/// The pinning itself is [`arm_before_main`], a constructor that has already
+/// run by the time any test body does — so this call is no longer what arms
+/// the bound, and its position in a test does not matter. It stays for two
+/// reasons. It is the marker linkage-check rule 10 looks for in a file that
+/// spawns agents, and a call to it cannot compile unless the file actually
+/// includes this module, which is what brings the constructor in. And it fails
+/// loudly if the constructor did not run on some platform, rather than letting
+/// every wrapped child spawn unbounded in silence.
+pub fn arm() {
+    assert!(
+        ARMED_BEFORE_MAIN.get().is_some(),
+        "the wrapped-child lifetime bound was not armed before `main`: \
+         `child_lifetime_bound::arm_before_main` never ran in this process, so \
+         {} is not pinned and a wrapped stand-in that outlives its wrapper is never \
+         reaped (issues #668, #678)",
+        dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS
+    );
 }
