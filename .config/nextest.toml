@@ -542,6 +542,13 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'test(orchestration_012_real_agent_reflows_across_a_zoom_round_trip)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
+# Two real-agent turns plus readiness and bounded upgrade/reconnect waits can
+# exceed the default 180s kill window. Let the scenario report its own failed
+# phase and grid; this changes neither its assertion waits nor retry policy.
+[[profile.default.overrides]]
+filter = 'test(remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so

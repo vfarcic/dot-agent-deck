@@ -4765,6 +4765,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH or independently compiled releases.
 - **Platform coverage:** linux+mac.
 
+##### remote/upgrade/008 — Interactive Haiku keeps working after Keep, then a named restart stops it. [reel]
+- **Layer:** L2 (PTY-attached TUI and upgrade CLI; lane 2, real interactive Claude Haiku).
+- **Agent:** Claude Code (Haiku, interactive; imported credentials, onboarding and cwd trust seeded).
+- **Asserts:** unique file contents absent from the prompt render in the agent's live pane before upgrade; the restart question names that agent and pane; Keep preserves its identity and PID and it reads a new sentinel afterward; Restart now stops the sole disclosed agent, replaces the daemon build at the same endpoint, and connect renders the new empty dashboard.
+- **Does not assert:** real SSH authentication, release-download compatibility, desktop behavior, or survival of a role map (covered synthetically by /006).
+- **Platform coverage:** mac+linux (Unix); credentials required locally, never run in CI.
+
 #### remote/connect
 
 ##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.

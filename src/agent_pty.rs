@@ -21273,6 +21273,35 @@ mod spawn_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
+        // Make the deadline cross AFTER accepted payload bytes rather than
+        // betting that echo-watch setup finishes within SUBMIT_DELAY / 2.
+        // Echo-watch setup uses the blocking pool, so the old 50ms allowance
+        // can expire before any bytes under load. Only this test's writer is delayed.
+        struct DeadlineCrossingWriter {
+            inner: Box<dyn std::io::Write + Send>,
+            deadline: Arc<Mutex<Option<Instant>>>,
+            crossed: bool,
+        }
+        impl std::io::Write for DeadlineCrossingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let deadline = self.deadline.lock().unwrap().expect("deadline armed");
+                if !self.crossed {
+                    assert!(
+                        Instant::now() < deadline,
+                        "setup must finish before the deadline"
+                    );
+                }
+                let written = self.inner.write(bytes)?;
+                if written > 0 && !self.crossed {
+                    self.crossed = true;
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
         const PANE: &str = "issue-544-mid-write";
         const TEXT: &str = "MIDWRITE-SENTINEL";
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -21284,11 +21313,25 @@ mod spawn_tests {
             })
             .expect("spawn stand-in");
 
-        // No draft and a free writer, so everything up to the first byte takes
-        // well under a millisecond — and the deadline then falls inside the
-        // write's own `SUBMIT_DELAY`, after the payload and before the CR.
+        let deadline_slot = Arc::new(Mutex::new(None));
+        {
+            let handle = registry
+                .subscribe(&agent)
+                .expect("attach the owned byte target");
+            let mut writer = handle.writer.lock().await;
+            let inner = std::mem::replace(&mut writer.inner, Box::new(std::io::sink()));
+            writer.inner = Box::new(DeadlineCrossingWriter {
+                inner,
+                deadline: Arc::clone(&deadline_slot),
+                crossed: false,
+            });
+        }
+        // Two seconds bound preparation; the writer itself makes the payload
+        // cross that deadline. This remains a completion test even if the
+        // machine is fast, without a 50ms scheduling assumption before write.
         let started = Instant::now();
-        let deadline = started + SUBMIT_DELAY / 2;
+        let deadline = started + Duration::from_secs(2);
+        *deadline_slot.lock().unwrap() = Some(deadline);
         let sent = tokio::time::timeout(
             Duration::from_secs(5),
             registry.write_and_submit_guarded_first_write_within(
