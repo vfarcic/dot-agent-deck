@@ -34,10 +34,11 @@ use spec::spec;
 /// Scenario: Launch `dot-agent-deck daemon serve` (idle shutdown DISABLED) from
 /// a short-lived intermediate `sh` parent that backgrounds it and records its
 /// pid, with `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED=1`. Wait for the daemon to bind
-/// its attach socket (watchdog armed), then SIGKILL the intermediate parent so
-/// the daemon is orphaned to init. Assert the daemon process terminates within
-/// a few seconds — proving the watchdog gracefully shuts an orphaned, otherwise
-/// never-exiting test daemon down instead of leaking it to PID 1.
+/// its attach socket with a bounded load-scaled startup wait (watchdog armed),
+/// then SIGKILL the intermediate parent so the daemon is orphaned to init.
+/// Assert the daemon process terminates within a few seconds — proving the
+/// watchdog gracefully shuts an orphaned, otherwise never-exiting test daemon
+/// down instead of leaking it to PID 1.
 #[spec("lifecycle/orphan-exit/001")]
 #[test]
 fn orphan_exit_001_orphaned_daemon_self_exits() {
@@ -90,9 +91,12 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
     let daemon_pid = read_pid().expect("daemon pid recorded");
 
     // Wait for the daemon to bind its attach socket — by then the watchdog has
-    // captured its original parent pid and is polling.
+    // captured its original parent pid and is polling. Startup is a fixture
+    // precondition, not the watchdog's shutdown budget; allow for I/O starvation.
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
     assert!(
@@ -125,9 +129,9 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
 }
 
 /// Scenario: Start `dot-agent-deck daemon serve` with idle shutdown DISABLED and
-/// file logging pointed at a tempdir, wait for it to bind its attach socket,
-/// then send it a plain SIGTERM — the same signal `daemon stop` / `daemon
-/// restart` use. Assert the daemon exits within a few seconds AND that it left a
+/// file logging pointed at a tempdir, allow a bounded load-scaled wait for its
+/// attach socket, then send it a plain SIGTERM — the same signal `daemon stop` /
+/// `daemon restart` use. Assert the daemon exits within a few seconds AND that it left a
 /// log line naming the signal, so a daemon that vanishes mid-session is never
 /// again silent about why.
 #[spec("lifecycle/sigterm/001")]
@@ -166,7 +170,9 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
     // Bound the wait on readiness: once the attach socket exists the signal
     // handler is installed (both are set up before the hook loop runs).
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
 
@@ -208,10 +214,10 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
     }
 }
 
-/// Scenario: Start a daemon, then send it TWO SIGTERMs in a row. The first
-/// begins graceful shutdown; the second must force an immediate exit with status
-/// 143 rather than being swallowed. Installing a handler replaces the default
-/// disposition process-wide, so without this escape hatch a wedged shutdown
+/// Scenario: Start a daemon with a bounded load-scaled readiness wait, then send
+/// it TWO SIGTERMs in a row. The first begins graceful shutdown; the second must
+/// leave the process gone rather than being swallowed. Installing a handler
+/// replaces the default disposition process-wide, so without this escape hatch a wedged shutdown
 /// could no longer be ended with `pkill` — which sends SIGTERM by default.
 #[spec("lifecycle/sigterm/002")]
 #[test]
@@ -245,7 +251,9 @@ fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
 
     let daemon_pid = daemon.id() as i32;
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
 
@@ -291,9 +299,10 @@ fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
     }
 }
 
-/// Scenario: Start a real `daemon serve` with file logging, ask it over its
-/// attach socket to start one agent carrying an orchestration `TabMembership`
-/// (so the daemon registers a real orchestration role for that pane), then send
+/// Scenario: Start a real `daemon serve` with file logging and a bounded
+/// load-scaled readiness wait, ask it over its attach socket to start one agent
+/// carrying an orchestration `TabMembership` (so the daemon registers a real
+/// orchestration role for that pane), then send
 /// a plain SIGTERM. Assert the daemon's log names the pane, the role, the
 /// orchestration and the fact that the registration is gone for good — a stray
 /// signal must leave a record of what it destroyed, not just that it happened.
@@ -341,7 +350,9 @@ async fn sigterm_003_signal_shutdown_names_the_agents_and_roles_it_destroys() {
 
     let daemon_pid = daemon.id() as i32;
     assert!(
-        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+            attach_socket.exists()
+        }),
         "daemon never bound its attach socket"
     );
 

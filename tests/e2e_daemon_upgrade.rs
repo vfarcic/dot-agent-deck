@@ -1,0 +1,564 @@
+#![cfg(all(feature = "e2e", unix))]
+
+//! Credential-free, headless L2 coverage of the confirmed daemon restart.
+//! The installed target is owned by each fixture and atomically replaced;
+//! neither the developer's install nor Cargo's executable is overwritten.
+//! The successor wrapper records its PID and executes a retained test build.
+//! These are process-handover tests, not two-release compatibility or UI tests.
+
+mod common;
+
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
+use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery, RestartDaemonRequest};
+use dot_agent_deck::daemon_protocol::{
+    AttachRequest, AttachResponse, CAP_RESTART_DAEMON, RestartDaemonReply, RestartRefusalReason,
+    RestartStopSet, RestartSuccessor,
+};
+use spec::spec;
+use tempfile::TempDir;
+
+const WAIT: Duration = Duration::from_secs(15);
+
+fn shell_path(path: &Path) -> String {
+    format!(
+        "'{}'",
+        path.to_str()
+            .expect("UTF-8 fixture path")
+            .replace('\'', "'\\''")
+    )
+}
+
+fn retain_binary(target: &Path) {
+    let built = env!("CARGO_BIN_EXE_dot-agent-deck");
+    if fs::hard_link(built, target).is_err() {
+        fs::copy(built, target).expect("retain the test binary");
+    }
+}
+
+struct InstalledDaemon {
+    child: Child,
+    attach: PathBuf,
+    target: PathBuf,
+    retained: PathBuf,
+    successor_pid: PathBuf,
+    agent_pids: Vec<i32>,
+    runtime: tokio::runtime::Runtime,
+    _dir: TempDir,
+}
+
+impl InstalledDaemon {
+    fn spawn() -> Self {
+        common::init_test_env();
+        let dir = common::harness_tempdir().expect("restart fixture tempdir");
+        let home = dir.path().join("home");
+        let bin_dir = home.join(".local/bin");
+        fs::create_dir_all(&bin_dir).expect("create isolated install directory");
+        let target = bin_dir.join("dot-agent-deck");
+        let retained = dir.path().join("retained-build");
+        retain_binary(&target);
+        retain_binary(&retained);
+        let attach = dir.path().join("attach.sock");
+        let log = fs::File::create(dir.path().join("daemon.log")).expect("daemon log");
+        let child = Command::new(&target)
+            .args(["daemon", "serve"])
+            .current_dir(&home)
+            .env_clear()
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            )
+            .env("TERM", "xterm-256color")
+            .env("DOT_AGENT_DECK_SOCKET", dir.path().join("hook.sock"))
+            .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach)
+            .env("DOT_AGENT_DECK_STATE_DIR", dir.path().join("state"))
+            .env(
+                "DOT_AGENT_DECK_SCHEDULES",
+                dir.path().join("schedules.toml"),
+            )
+            .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+            .env("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED", "1")
+            .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "300")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .process_group(0)
+            .spawn()
+            .expect("start real daemon from the owned install path");
+        let fixture = Self {
+            child,
+            attach,
+            target,
+            retained,
+            successor_pid: dir.path().join("successor.pid"),
+            agent_pids: Vec::new(),
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("restart client runtime"),
+            _dir: dir,
+        };
+        assert!(
+            common::wait_until(WAIT, || fixture.hello().is_some()),
+            "the original daemon must answer Hello before the installed file is replaced"
+        );
+        fixture.install_successor(None);
+        fixture
+    }
+
+    fn hello(&self) -> Option<AttachResponse> {
+        self.runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    DaemonClient::new(self.attach.clone()).probe_running(),
+                )
+                .await
+            })
+            .ok()?
+            .ok()?
+    }
+
+    fn request(&self, request: &AttachRequest) -> AttachResponse {
+        common::attach_request_on(&self.attach, request).expect("attach request")
+    }
+
+    fn agents(&self) -> Vec<AgentRecord> {
+        let response = self.request(&AttachRequest::ListAgents);
+        assert!(response.ok, "ListAgents failed: {:?}", response.error);
+        response.agent_records.expect("ListAgents agent inventory")
+    }
+
+    fn replace_target(&self, contents: &str, mode: u32) {
+        let staged = self.target.with_extension("staged");
+        fs::write(&staged, contents).expect("write staged install target");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(mode)).expect("target mode");
+        fs::rename(staged, &self.target)
+            .expect("atomically replace owned target, not linked inode");
+    }
+
+    fn install_successor(&self, verification_gate: Option<(&Path, &Path)>) {
+        let gate = verification_gate
+            .map(|(entered, release)| {
+                format!(
+                    "printf entered > {}\nwhile [ ! -e {} ]; do sleep 0.02; done\n",
+                    shell_path(entered),
+                    shell_path(release)
+                )
+            })
+            .unwrap_or_default();
+        self.replace_target(&format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n{gate}exec {} --version\nfi\nprintf '%s\\n' \"$$\" > {}\nexec {} \"$@\"\n",
+            shell_path(&self.retained), shell_path(&self.successor_pid), shell_path(&self.retained)), 0o700);
+    }
+
+    fn start_agent(&mut self, label: &str, role_index: Option<usize>) -> AgentRecord {
+        let index = self.agent_pids.len();
+        let pane = format!("restart-fixture-pane-{index}");
+        let pid_file = self._dir.path().join(format!("agent-{index}.pid"));
+        let script = self._dir.path().join(format!("agent-{index}.sh"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec cat\n",
+                shell_path(&pid_file)
+            ),
+        )
+        .expect("write narrow stand-in agent");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("stand-in mode");
+        let cwd = self._dir.path().to_str().unwrap().to_owned();
+        let response = self.request(&AttachRequest::StartAgent {
+            command: Some(format!("/bin/sh {}", shell_path(&script))),
+            cwd: Some(cwd.clone()),
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane.clone())],
+            display_name: Some(label.into()),
+            tab_membership: role_index.map(|role_index| TabMembership::Orchestration {
+                name: "restart-team".into(),
+                role_index,
+                role_name: label.into(),
+                is_start_role: role_index == 0,
+                orchestration_cwd: Some(cwd),
+                display_title: None,
+                orchestration_id: Some("restart-instance".into()),
+            }),
+            agent_type: None,
+            seed: None,
+            authoring_kind: None,
+        });
+        assert!(response.ok, "stand-in spawn failed: {:?}", response.error);
+        assert!(
+            common::wait_until(WAIT, || read_pid(&pid_file).is_some()),
+            "stand-in never started"
+        );
+        self.agent_pids.push(read_pid(&pid_file).unwrap());
+        self.agents()
+            .into_iter()
+            .find(|agent| agent.pane_id_env.as_deref() == Some(&pane))
+            .expect("spawned stand-in must appear in ListAgents")
+    }
+
+    fn seed_live_set(&mut self) -> Vec<AgentRecord> {
+        vec![
+            self.start_agent("ordinary-live", None),
+            self.start_agent("lead", Some(0)),
+            self.start_agent("coder", Some(1)),
+        ]
+    }
+
+    fn restart(&self, confirm: Option<RestartStopSet>) -> RestartDaemonReply {
+        let result = self
+            .runtime
+            .block_on(
+                DaemonClient::new(self.attach.clone()).restart_daemon(restart_request(confirm)),
+            )
+            .expect("restart request must yield a structured reply");
+        match result {
+            GatedQuery::Answered(reply) => reply,
+            GatedQuery::Unsupported => panic!("new daemon must advertise {CAP_RESTART_DAEMON}"),
+        }
+    }
+
+    fn assert_untouched(&mut self, expected: &[AgentRecord]) {
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "refused restart exited original daemon"
+        );
+        assert!(
+            self.hello().is_some(),
+            "original daemon stopped answering Hello"
+        );
+        assert!(!self.successor_pid.exists(), "refusal launched a successor");
+        let actual: BTreeSet<_> = self.agents().into_iter().map(|agent| agent.id).collect();
+        let wanted: BTreeSet<_> = expected.iter().map(|agent| agent.id.clone()).collect();
+        assert_eq!(actual, wanted, "refusal changed live agent identities");
+        for pid in &self.agent_pids {
+            assert!(
+                common::process_running(*pid),
+                "refusal stopped stand-in PID {pid}"
+            );
+        }
+        let roles = self
+            .request(&AttachRequest::ListAgents)
+            .orchestration_roles
+            .unwrap_or_default();
+        assert_eq!(roles.len(), 2, "refusal lost the orchestration role map");
+    }
+
+    fn assert_replaced(&mut self) {
+        let old_pid = self.child.id() as i32;
+        // Poll the owned Child so an exited process is also reaped on macOS,
+        // where a kill(pid, 0) probe cannot distinguish an unreaped zombie.
+        let exited = {
+            let child = RefCell::new(&mut self.child);
+            common::wait_until(WAIT, || {
+                child
+                    .borrow_mut()
+                    .try_wait()
+                    .expect("poll original daemon")
+                    .is_some()
+            })
+        };
+        assert!(exited, "Accepted must exit the old daemon PID {old_pid}");
+        let status = self.child.wait().expect("reap original daemon");
+        assert!(
+            status.success(),
+            "old daemon did not exit cleanly: {status}"
+        );
+        assert!(
+            common::wait_until(WAIT, || read_pid(&self.successor_pid).is_some()),
+            "installed target never started a successor"
+        );
+        let successor_pid = read_pid(&self.successor_pid).unwrap();
+        assert_ne!(successor_pid, old_pid, "restart must change the daemon PID");
+        assert!(
+            common::wait_until(WAIT, || self.hello().is_some()),
+            "successor must answer Hello at the same endpoint"
+        );
+        assert!(
+            common::process_running(successor_pid),
+            "successor exited after binding"
+        );
+        assert!(
+            self.agents().is_empty(),
+            "confirmed agents survived in successor inventory"
+        );
+        assert!(
+            self.request(&AttachRequest::ListAgents)
+                .orchestration_roles
+                .unwrap_or_default()
+                .is_empty(),
+            "confirmed role map survived replacement"
+        );
+        for pid in &self.agent_pids {
+            assert!(
+                common::wait_until(WAIT, || !common::process_running(*pid)),
+                "Accepted left confirmed stand-in PID {pid} alive"
+            );
+        }
+    }
+}
+
+fn read_pid(path: &Path) -> Option<i32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+impl Drop for InstalledDaemon {
+    fn drop(&mut self) {
+        // The successor detaches into a new group; the original group's cleanup
+        // does not own it. Only fixture-recorded PIDs are signalled here.
+        for pid in [Some(self.child.id() as i32), read_pid(&self.successor_pid)]
+            .into_iter()
+            .flatten()
+        {
+            if common::process_running(pid) {
+                // SAFETY: these are the daemon PIDs recorded by this fixture.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        for pid in &self.agent_pids {
+            if common::process_running(*pid) {
+                // SAFETY: this fixture's stand-in script recorded its own PID.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.wait();
+        if std::thread::panicking() {
+            eprintln!(
+                "restart fixture daemon log:\n{}",
+                fs::read_to_string(self._dir.path().join("daemon.log")).unwrap_or_default()
+            );
+        }
+    }
+}
+
+fn restart_request(confirm: Option<RestartStopSet>) -> RestartDaemonRequest {
+    RestartDaemonRequest {
+        confirm,
+        expected_version: None,
+        successor: RestartSuccessor::Installed,
+    }
+}
+
+fn needs_confirmation(reply: RestartDaemonReply, expected_stale: bool) -> RestartStopSet {
+    match reply {
+        RestartDaemonReply::NeedsConfirmation { at_stake, stale } => {
+            assert_eq!(stale, expected_stale, "wrong confirmation freshness");
+            at_stake
+        }
+        other => panic!("expected NeedsConfirmation, got {other:?}"),
+    }
+}
+
+fn assert_full_set(set: &RestartStopSet, expected: &[AgentRecord]) {
+    assert_eq!(
+        set.agents.len(),
+        expected.len(),
+        "disclosure must name every live agent exactly once"
+    );
+    for record in expected {
+        let disclosed = set
+            .agents
+            .iter()
+            .find(|agent| agent.id == record.id)
+            .expect("missing live agent");
+        assert_eq!(Some(&disclosed.label), record.display_name.as_ref());
+        assert_eq!(disclosed.pane_id, record.pane_id_env);
+        assert_eq!(disclosed.cwd, record.cwd);
+    }
+    assert_eq!(set.roles.len(), 2, "disclosure must name both roles");
+    for (role, is_orchestrator) in [("lead", true), ("coder", false)] {
+        let disclosed = set
+            .roles
+            .iter()
+            .find(|entry| entry.role == role)
+            .expect("missing live role");
+        assert_eq!(disclosed.orchestration, "restart-team");
+        assert_eq!(disclosed.is_orchestrator, is_orchestrator);
+        assert!(
+            expected
+                .iter()
+                .any(|agent| agent.pane_id_env.as_deref() == Some(&disclosed.pane_id)),
+            "role disclosure must identify the live pane"
+        );
+    }
+}
+
+fn accepted(reply: RestartDaemonReply) -> RestartStopSet {
+    match reply {
+        RestartDaemonReply::Accepted {
+            from_version,
+            to_version,
+            successor,
+            stopping,
+        } => {
+            assert!(
+                !from_version.is_empty(),
+                "Accepted must identify original version"
+            );
+            assert!(
+                to_version.is_some(),
+                "Installed acceptance must report verified target version"
+            );
+            assert_eq!(successor, RestartSuccessor::Installed);
+            stopping
+        }
+        other => panic!("expected Accepted, got {other:?}"),
+    }
+}
+
+/// Scenario: Start an idle daemon from an owned install path, replace that path with a verified successor wrapper, and request restart without confirmation. Accepted must be followed by the old process exiting and a different PID answering Hello on the same endpoint.
+#[spec("lifecycle/wire-restart/001")]
+#[test]
+fn wire_restart_001_idle_daemon_hands_over_to_the_installed_target() {
+    let mut daemon = InstalledDaemon::spawn();
+    let hello = daemon.hello().unwrap();
+    assert!(
+        hello
+            .capabilities
+            .unwrap_or_default()
+            .iter()
+            .any(|cap| cap == CAP_RESTART_DAEMON)
+    );
+    let stopping = accepted(daemon.restart(None));
+    assert!(stopping.agents.is_empty() && stopping.roles.is_empty());
+    daemon.assert_replaced();
+}
+
+/// Scenario: Start one ordinary stand-in and two orchestration roles, then ask the daemon to restart without confirmation twice. Both replies must disclose every agent and role with stale false, while the original process, agents and role map remain alive.
+#[spec("lifecycle/wire-restart/002")]
+#[test]
+fn wire_restart_002_live_agents_and_roles_require_confirmation_without_stopping() {
+    let mut daemon = InstalledDaemon::spawn();
+    let agents = daemon.seed_live_set();
+    for _ in [0, 1] {
+        let set = needs_confirmation(daemon.restart(None), false);
+        assert_full_set(&set, &agents);
+        daemon.assert_untouched(&agents);
+    }
+}
+
+/// Scenario: Ask for a restart with live stand-ins and roles, then return the disclosed confirmation set in reverse order. The daemon must accept, stop the named processes and roles, and serve the same endpoint from a successor PID.
+#[spec("lifecycle/wire-restart/003")]
+#[test]
+fn wire_restart_003_matching_confirmation_stops_named_agents_and_replaces_daemon() {
+    let mut daemon = InstalledDaemon::spawn();
+    let agents = daemon.seed_live_set();
+    let mut confirm = needs_confirmation(daemon.restart(None), false);
+    assert_full_set(&confirm, &agents);
+    confirm.agents.reverse();
+    confirm.roles.reverse();
+    let stopping = accepted(daemon.restart(Some(confirm)));
+    assert_full_set(&stopping, &agents);
+    daemon.assert_replaced();
+}
+
+/// Scenario: Obtain a confirmation set, then start another stand-in with the same display name as an existing one before returning the old set. The daemon must report stale true with the new full set, preserve every process and role, and keep its original PID.
+#[spec("lifecycle/wire-restart/004")]
+#[test]
+fn wire_restart_004_stale_confirmation_discloses_new_full_set_without_stopping() {
+    let mut daemon = InstalledDaemon::spawn();
+    let mut agents = daemon.seed_live_set();
+    let confirm = needs_confirmation(daemon.restart(None), false);
+    assert_full_set(&confirm, &agents);
+    agents.push(daemon.start_agent("ordinary-live", None));
+    let fresh = needs_confirmation(daemon.restart(Some(confirm)), true);
+    assert_full_set(&fresh, &agents);
+    daemon.assert_untouched(&agents);
+}
+
+/// Scenario: With stand-in agents and roles alive, replace the daemon's install target with a non-executable file and then an executable whose version probe fails. Each request must refuse with the appropriate target reason and leave the original daemon, agents and roles untouched.
+#[spec("lifecycle/wire-restart/005")]
+#[test]
+fn wire_restart_005_unverified_install_target_preserves_daemon_and_live_agents() {
+    let mut daemon = InstalledDaemon::spawn();
+    let agents = daemon.seed_live_set();
+    for (script, mode, expected) in [
+        (
+            "#!/bin/sh\nexit 0\n",
+            0o600,
+            RestartRefusalReason::TargetMissing,
+        ),
+        (
+            "#!/bin/sh\nexit 23\n",
+            0o700,
+            RestartRefusalReason::TargetDidNotAnswer,
+        ),
+    ] {
+        daemon.replace_target(script, mode);
+        match daemon.restart(None) {
+            RestartDaemonReply::Refused { reason, message } => {
+                assert_eq!(reason, expected);
+                assert!(!message.is_empty(), "target refusal must explain why");
+            }
+            other => panic!("unverified target must refuse before asking consent: {other:?}"),
+        }
+        daemon.assert_untouched(&agents);
+    }
+}
+
+/// Scenario: Hold the first restart inside a test-controlled version probe, then send a second request while verification is in progress. Exactly the first request must be accepted and the second must return InProgress before the probe is released, followed by a working successor.
+#[spec("lifecycle/wire-restart/006")]
+#[test]
+fn wire_restart_006_concurrent_requests_accept_exactly_one_restart() {
+    let mut daemon = InstalledDaemon::spawn();
+    let entered = daemon._dir.path().join("verification-entered");
+    let release = daemon._dir.path().join("verification-release");
+    daemon.install_successor(Some((&entered, &release)));
+    let attach = daemon.attach.clone();
+    let first = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(DaemonClient::new(attach).restart_daemon(restart_request(None)))
+    });
+    assert!(
+        common::wait_until(WAIT, || entered.exists()),
+        "first request never began target verification"
+    );
+    let client = DaemonClient::new(daemon.attach.clone());
+    let second = daemon.runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.restart_daemon(restart_request(None)),
+        )
+        .await
+    });
+    // Always unblock the first verifier before asserting the second result.
+    fs::write(&release, "release").expect("release first version probe");
+    match second
+        .expect("concurrent restart must refuse immediately")
+        .expect("second reply")
+    {
+        GatedQuery::Answered(RestartDaemonReply::Refused { reason, .. }) => {
+            assert_eq!(reason, RestartRefusalReason::InProgress);
+        }
+        other => panic!("second request must refuse InProgress, got {other:?}"),
+    }
+    match first
+        .join()
+        .expect("first requester panicked")
+        .expect("first reply")
+    {
+        GatedQuery::Answered(reply) => assert!(accepted(reply).is_empty()),
+        other => panic!("first request was not answered: {other:?}"),
+    }
+    daemon.assert_replaced();
+}
