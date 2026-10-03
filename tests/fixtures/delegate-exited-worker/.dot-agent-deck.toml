@@ -1,4 +1,5 @@
-# Fixture for `orchestration/delegate/049` (issue #524).
+# Fixture for `orchestration/delegate/049` (issue #524) and
+# `orchestration/work-done/015` (issue #507).
 #
 # Two workers that end ON THEIR OWN — no `StopAgent`, no pane close — when the
 # test creates their trigger file. Each first reports `work-done` from inside
@@ -11,6 +12,10 @@
 # worker to reach, and must say so. `fresh` is `clear = true`: a delegate to it
 # after the exit respawns the role, so it must still be delivered — the half
 # that rules out simply refusing every dead pane.
+#
+# `quitter` (`clear = false`) is the #507 worker: given a task, it exits on its
+# trigger WITHOUT reporting, so the commission stays owed while its pane id is
+# free for the successor the test starts there.
 #
 # `$DAD_TEST_BIN` is the branch's own binary, passed in by the test so an
 # installed release on `PATH` cannot stand in for it.
@@ -31,3 +36,8 @@ clear = false
 name = "fresh"
 command = "while [ ! -f ./fresh-exit ]; do sleep 0.1; done; rm -f ./fresh-exit; \"$DAD_TEST_BIN\" work-done --task fresh-reported; exit 0"
 clear = true
+
+[[orchestrations.roles]]
+name = "quitter"
+command = "while [ ! -f ./quitter-exit ]; do sleep 0.1; done; exit 0"
+clear = false
