@@ -16165,6 +16165,9 @@ impl AppState {
         // so delivery order does not follow producer stamps. Now it advances
         // with the newest frame OBSERVED for the session and never regresses
         // (`status/supersede/004`).
+        // Issue #1493 (Qodo on PR #1523): the newest frame seen BEFORE this
+        // one, for the wrapper-start arm below.
+        let newest_before = session.last_activity;
         if event.timestamp > session.last_activity {
             session.last_activity = event.timestamp;
         }
@@ -16477,6 +16480,18 @@ impl AppState {
                 });
                 session.active_tool = None;
                 true
+            }
+            // Issue #1493: the wrapper's interface start for a Codex pane is
+            // sent from a thread of its own, so it can arrive after frames it
+            // predates — a classified Thinking, or the first native hook. Stamped
+            // older than anything the card has already seen, it is a boot
+            // observation the card has moved past, and asserts nothing.
+            EventType::SessionStart
+                if event.agent_type == AgentType::Codex
+                    && event.is_wrapper_interface_session_start()
+                    && event.timestamp < newest_before =>
+            {
+                false
             }
             EventType::SessionStart => {
                 // Issue #1493: the wrapper's start says its child's output went
@@ -26050,6 +26065,30 @@ while True:
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 19));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Idle);
         state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 21));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+
+        // A wrapper interface start that arrives after frames it predates — an
+        // untrusted Thinking, or a native prompt — does not reset the card
+        // (Qodo on PR #1523).
+        let late_start = |secs| {
+            let mut start = codex_wrapper_frame(EventType::SessionStart, true, secs);
+            start.metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+            );
+            start
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 5));
+        state.apply_event(late_start(4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 5));
+        state.apply_event(late_start(4));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
 
         // A detached command's Working (the shell monitor's) still ends with
