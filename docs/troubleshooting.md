@@ -310,7 +310,8 @@ When the upgrade changed the attach protocol, the new TUI cannot attach to the o
 
 - **You kept it, or nobody could answer.** Agents or orchestration roles were running, and you chose **Keep current daemon**, or the command ran without a terminal. Upgrade again when they have finished, and choose **Restart now** if you are ready to stop them.
 - **`… is too old to restart itself`.** The daemon was started by a release that cannot be asked to restart. Run `dot-agent-deck connect <remote>`: the TUI on the host restarts the older daemon, asking first when agents are running.
-- **`… did not answer within 20s`.** The old daemon stopped and the new one did not come up in time. If a systemd user service runs the daemon on the host, run `systemctl --user restart dot-agent-deck.service` there; otherwise `dot-agent-deck connect <remote>` starts one.
+- **`… did not answer within 20s`.** The old daemon stopped and the new one did not come up in time. Run `dot-agent-deck connect <remote>`, which starts one. If a systemd user service runs the daemon on the host, systemd normally starts the new one itself; check that the unit keeps `Restart=on-failure` and run `systemctl --user restart dot-agent-deck.service` there.
+- **`… is too old to restart it from here`.** You installed an older release with `--version`, one from before the deck could restart a daemon during an upgrade. The daemon keeps running. Run `dot-agent-deck connect <remote>`: the TUI on the host restarts the daemon onto the older release, asking first when agents are running.
 
 [Remote Environments → When the upgrade cannot restart the daemon](remote-environments.md#when-the-upgrade-cannot-restart-the-daemon) lists every result with its fix, and [Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon) shows how the desktop app words them.
 

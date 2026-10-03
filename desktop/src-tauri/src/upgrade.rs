@@ -266,6 +266,7 @@ pub(crate) enum NotRestartedDto {
     },
     AnotherRestartInProgress,
     NoDaemonRunning,
+    InstalledBuildTooOld,
 }
 
 /// [`UpgradeOutcome`], camelCase — what `desktop_upgrade_daemon` resolves with.
@@ -337,6 +338,9 @@ impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
                         NotRestartedDto::AnotherRestartInProgress
                     }
                     NotRestartedReason::NoDaemonRunning => NotRestartedDto::NoDaemonRunning,
+                    NotRestartedReason::InstalledBuildTooOld => {
+                        NotRestartedDto::InstalledBuildTooOld
+                    }
                 },
             },
             UpgradeOutcome::InstalledDaemonTooOld {
@@ -676,6 +680,16 @@ mod tests {
         .unwrap();
         assert_eq!(idle["reason"]["kind"], "no-daemon-running");
         assert!(idle.get("fromVersion").is_none());
+
+        let older_build = serde_json::to_value(UpgradeOutcomeDto::from(
+            &UpgradeOutcome::InstalledNotRestarted {
+                from_version: None,
+                installed_version: "0.40.0".into(),
+                reason: NotRestartedReason::InstalledBuildTooOld,
+            },
+        ))
+        .unwrap();
+        assert_eq!(older_build["reason"]["kind"], "installed-build-too-old");
 
         let too_old = serde_json::to_value(UpgradeOutcomeDto::from(
             &UpgradeOutcome::InstalledDaemonTooOld {

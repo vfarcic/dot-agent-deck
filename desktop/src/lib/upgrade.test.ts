@@ -71,6 +71,7 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     ["failed installing", { outcome: "failed", stage: "installing", reason: "ssh: connection timed out" }],
     ["failed restarting", { outcome: "failed", stage: "restarting", reason: "the installed build did not answer", installedVersion: "0.45.0" }],
     ["failed verifying", { outcome: "failed", stage: "verifying", reason: "the new daemon did not answer within 20s", installedVersion: "0.45.0" }],
+    ["installed build too old", { outcome: "installed-not-restarted", installedVersion: "0.40.0", reason: { kind: "installed-build-too-old" } }],
   ];
 
   it.each(outcomes)("%s renders a title and at least one sentence, with no internals", (_name, outcome) => {
@@ -81,6 +82,13 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
       expect(view.body.every((sentence) => sentence.trim().length > 0)).toBe(true);
       expect(view.body.join(" ")).not.toMatch(/capability|protocol|RestartDaemon|NeedsConfirmation|ClientSpawns|stop set/i);
     }
+  });
+
+  it("says an older installed build left the daemon running, and how to switch", () => {
+    const view = outcomeView(outcomes[11][1], "build-box", "upgrade");
+    expect(view.tone).toBe("neutral");
+    expect(view.body[0]).toBe("0.40.0 is installed on build-box. That version is too old to restart the daemon from this app, so the daemon keeps running.");
+    expect(view.body[1]).toContain("run `dot-agent-deck connect build-box` in a terminal");
   });
 
   it("says what was stopped, and only when something was", () => {

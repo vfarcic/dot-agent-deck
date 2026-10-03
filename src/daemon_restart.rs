@@ -52,6 +52,8 @@ const VERSION_OUTPUT_CAP: u64 = 8 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRecord {
     pub startup_exe: PathBuf,
+    /// Who restarts this process when it exits — see [`Supervisor`].
+    pub supervisor: Supervisor,
 }
 
 impl InstallRecord {
@@ -61,6 +63,7 @@ impl InstallRecord {
     pub fn capture() -> Self {
         Self {
             startup_exe: std::env::current_exe().unwrap_or_default(),
+            supervisor: detect_supervisor(&SupervisionFacts::capture()),
         }
     }
 
@@ -70,7 +73,138 @@ impl InstallRecord {
     pub fn unresolved() -> Self {
         Self {
             startup_exe: PathBuf::new(),
+            supervisor: Supervisor::None,
         }
+    }
+}
+
+/// Who restarts this daemon when it exits, decided once at `daemon serve`
+/// start.
+///
+/// It matters to an accepted [`RestartSuccessor::Installed`] restart. With no
+/// supervisor the daemon starts its successor itself, detached, once its
+/// sockets are released. Under a service manager that does not work: systemd
+/// treats the exit of a service's main process as the end of the service and
+/// kills everything left in its cgroup — the detached successor included — and
+/// the documented unit's `Restart=on-failure` does not restart after a clean
+/// exit. So a supervised daemon starts no successor and instead exits with
+/// [`SUPERVISED_RESTART_EXIT`], which `Restart=on-failure` (and launchd's
+/// `KeepAlive`) answers by running the unit's own command again: the build now
+/// installed at that path.
+///
+/// [`RestartSuccessor::Installed`]: crate::daemon_protocol::RestartSuccessor::Installed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Supervisor {
+    /// Nothing restarts this process; the daemon starts its own successor.
+    None,
+    /// The main process of a systemd service.
+    Systemd,
+    /// A launchd job.
+    Launchd,
+}
+
+/// The exit status of a supervised daemon that accepted a restart: non-zero so
+/// systemd's `Restart=on-failure` restarts the unit, and `EX_TEMPFAIL` because
+/// the exit asks to be run again.
+pub const SUPERVISED_RESTART_EXIT: u8 = 75;
+
+/// What [`detect_supervisor`] decides from, gathered by
+/// [`SupervisionFacts::capture`] and spelled out so the decision is testable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupervisionFacts {
+    /// This process's pid.
+    pub pid: u32,
+    /// Its parent's pid at startup.
+    pub ppid: u32,
+    /// The parent's command name (`/proc/<ppid>/comm`), where readable.
+    pub parent_comm: Option<String>,
+    /// `INVOCATION_ID`, which systemd sets for every process it starts.
+    pub invocation_id: Option<String>,
+    /// `SYSTEMD_EXEC_PID` (systemd 248+): the pid systemd started.
+    pub systemd_exec_pid: Option<String>,
+    /// `XPC_SERVICE_NAME`, which launchd sets to a job's label.
+    pub xpc_service_name: Option<String>,
+}
+
+impl SupervisionFacts {
+    /// This process's facts, read now. `daemon serve` reads them before
+    /// anything else could reparent it.
+    pub fn capture() -> Self {
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        // SAFETY: getppid has no preconditions and cannot fail.
+        #[cfg(unix)]
+        let ppid = unsafe { libc::getppid() } as u32;
+        #[cfg(not(unix))]
+        let ppid = 0;
+        #[cfg(target_os = "linux")]
+        let parent_comm = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+            .ok()
+            .map(|c| c.trim().to_string());
+        #[cfg(not(target_os = "linux"))]
+        let parent_comm = None;
+        Self {
+            pid: std::process::id(),
+            ppid,
+            parent_comm,
+            invocation_id: env("INVOCATION_ID"),
+            systemd_exec_pid: env("SYSTEMD_EXEC_PID"),
+            xpc_service_name: env("XPC_SERVICE_NAME"),
+        }
+    }
+}
+
+/// Decide whether a service manager started THIS process, pure.
+///
+/// The environment variables alone are not enough: every child of a service —
+/// a shell in a terminal started by a user service, a deck started from an
+/// agent's pane under a supervised daemon — inherits them. Treating such a
+/// daemon as supervised would make it exit for a restart nobody performs, so
+/// each rule also requires evidence that this process is the one the manager
+/// started:
+///
+/// - **systemd**: `INVOCATION_ID` is set, and `SYSTEMD_EXEC_PID` names this
+///   pid. Where systemd predates `SYSTEMD_EXEC_PID` (before 248), the parent
+///   must be the service manager itself (`systemd`).
+/// - **launchd**: `XPC_SERVICE_NAME` names a job (a shell under Terminal has
+///   `0`), and the parent is launchd (pid 1).
+pub fn detect_supervisor(facts: &SupervisionFacts) -> Supervisor {
+    if facts.invocation_id.is_some() {
+        let started_us = match facts.systemd_exec_pid.as_deref() {
+            Some(pid) => pid.trim().parse::<u32>().ok() == Some(facts.pid),
+            None => facts.parent_comm.as_deref() == Some("systemd"),
+        };
+        if started_us {
+            return Supervisor::Systemd;
+        }
+    }
+    if let Some(name) = facts.xpc_service_name.as_deref()
+        && name != "0"
+        && facts.ppid == 1
+    {
+        return Supervisor::Launchd;
+    }
+    Supervisor::None
+}
+
+/// What `run_daemon_with` does with an accepted restart once its sockets are
+/// released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorPlan {
+    /// No restart was accepted, or the client starts its own build.
+    Nothing,
+    /// Start this binary, detached.
+    Spawn(PathBuf),
+    /// Start nothing and exit with [`SUPERVISED_RESTART_EXIT`], so the service
+    /// manager starts the installed build.
+    LeaveToSupervisor(Supervisor),
+}
+
+/// [`SuccessorPlan`] from the accepted target and the supervisor, pure.
+pub fn successor_plan(target: Option<PathBuf>, supervisor: Supervisor) -> SuccessorPlan {
+    match (target, supervisor) {
+        (None, _) => SuccessorPlan::Nothing,
+        (Some(target), Supervisor::None) => SuccessorPlan::Spawn(target),
+        (Some(_), supervisor) => SuccessorPlan::LeaveToSupervisor(supervisor),
     }
 }
 
@@ -305,6 +439,7 @@ pub struct RestartControl {
     lock: tokio::sync::Mutex<()>,
     accepted: AtomicBool,
     successor: StdMutex<Option<PathBuf>>,
+    handed_off: AtomicBool,
     install: InstallRecord,
 }
 
@@ -314,6 +449,7 @@ impl RestartControl {
             lock: tokio::sync::Mutex::new(()),
             accepted: AtomicBool::new(false),
             successor: StdMutex::new(None),
+            handed_off: AtomicBool::new(false),
             install,
         }
     }
@@ -357,6 +493,25 @@ impl RestartControl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+    }
+
+    /// What to do with the accepted successor, once — [`Self::take_successor`]
+    /// decided against the recorded [`Supervisor`]. A
+    /// [`SuccessorPlan::LeaveToSupervisor`] answer also latches
+    /// [`Self::handed_to_supervisor`], which `daemon serve` reads for its exit
+    /// status.
+    pub fn take_successor_plan(&self) -> SuccessorPlan {
+        let plan = successor_plan(self.take_successor(), self.install.supervisor);
+        if matches!(plan, SuccessorPlan::LeaveToSupervisor(_)) {
+            self.handed_off.store(true, Ordering::SeqCst);
+        }
+        plan
+    }
+
+    /// Whether an accepted restart was left to the service manager, so the
+    /// daemon must exit with [`SUPERVISED_RESTART_EXIT`].
+    pub fn handed_to_supervisor(&self) -> bool {
+        self.handed_off.load(Ordering::SeqCst)
     }
 }
 
@@ -841,5 +996,169 @@ mod tests {
             Some(PathBuf::from("/x/dot-agent-deck"))
         );
         assert_eq!(control.take_successor(), None, "consumed once");
+    }
+
+    // ---- supervision ----
+
+    /// A systemd service's main process: `INVOCATION_ID` set and
+    /// `SYSTEMD_EXEC_PID` naming this pid.
+    fn systemd_main() -> SupervisionFacts {
+        SupervisionFacts {
+            pid: 4242,
+            ppid: 1700,
+            parent_comm: Some("systemd".into()),
+            invocation_id: Some("0f3c9a".into()),
+            systemd_exec_pid: Some("4242".into()),
+            xpc_service_name: None,
+        }
+    }
+
+    #[test]
+    fn a_systemd_main_process_is_supervised() {
+        assert_eq!(detect_supervisor(&systemd_main()), Supervisor::Systemd);
+        // The system manager is pid 1 and the parent check is not consulted
+        // while SYSTEMD_EXEC_PID answers.
+        let system = SupervisionFacts {
+            ppid: 1,
+            parent_comm: None,
+            ..systemd_main()
+        };
+        assert_eq!(detect_supervisor(&system), Supervisor::Systemd);
+        // Before systemd 248 there is no SYSTEMD_EXEC_PID: the parent being the
+        // manager is the evidence.
+        let old = SupervisionFacts {
+            systemd_exec_pid: None,
+            ..systemd_main()
+        };
+        assert_eq!(detect_supervisor(&old), Supervisor::Systemd);
+    }
+
+    /// The case that must not be mistaken for a service: a daemon started by a
+    /// TUI whose shell inherited a service's environment. Treating it as
+    /// supervised would make it exit for a restart nobody performs.
+    #[test]
+    fn a_child_that_inherited_a_services_environment_is_not_supervised() {
+        let inherited = SupervisionFacts {
+            pid: 5000,
+            ppid: 4999,
+            parent_comm: Some("dot-agent-deck".into()),
+            ..systemd_main()
+        };
+        assert_eq!(detect_supervisor(&inherited), Supervisor::None);
+        // Older systemd: no exec pid, and the parent is not the manager.
+        let inherited_old = SupervisionFacts {
+            systemd_exec_pid: None,
+            ..inherited.clone()
+        };
+        assert_eq!(detect_supervisor(&inherited_old), Supervisor::None);
+        // An unparseable exec pid proves nothing.
+        let garbled = SupervisionFacts {
+            systemd_exec_pid: Some("not-a-pid".into()),
+            ..systemd_main()
+        };
+        assert_eq!(detect_supervisor(&garbled), Supervisor::None);
+        // SYSTEMD_EXEC_PID without INVOCATION_ID is not systemd's doing.
+        let no_invocation = SupervisionFacts {
+            invocation_id: None,
+            ..systemd_main()
+        };
+        assert_eq!(detect_supervisor(&no_invocation), Supervisor::None);
+        // Nothing set at all: a plain lazily spawned daemon.
+        assert_eq!(
+            detect_supervisor(&SupervisionFacts {
+                pid: 10,
+                ppid: 9,
+                ..SupervisionFacts::default()
+            }),
+            Supervisor::None
+        );
+    }
+
+    #[test]
+    fn a_launchd_job_is_supervised_and_a_terminal_shell_is_not() {
+        let job = SupervisionFacts {
+            pid: 700,
+            ppid: 1,
+            xpc_service_name: Some("ai.devopstoolkit.dot-agent-deck".into()),
+            ..SupervisionFacts::default()
+        };
+        assert_eq!(detect_supervisor(&job), Supervisor::Launchd);
+        // Terminal.app's shells carry XPC_SERVICE_NAME=0.
+        let terminal = SupervisionFacts {
+            xpc_service_name: Some("0".into()),
+            ..job.clone()
+        };
+        assert_eq!(detect_supervisor(&terminal), Supervisor::None);
+        // A job's label inherited by a process launchd did not start.
+        let child = SupervisionFacts { ppid: 650, ..job };
+        assert_eq!(detect_supervisor(&child), Supervisor::None);
+    }
+
+    #[test]
+    fn a_supervised_daemon_leaves_the_successor_to_its_manager() {
+        let target = PathBuf::from("/home/u/.local/bin/dot-agent-deck");
+        assert_eq!(
+            successor_plan(Some(target.clone()), Supervisor::None),
+            SuccessorPlan::Spawn(target.clone()),
+            "unsupervised: unchanged, the daemon starts its successor"
+        );
+        for supervisor in [Supervisor::Systemd, Supervisor::Launchd] {
+            assert_eq!(
+                successor_plan(Some(target.clone()), supervisor),
+                SuccessorPlan::LeaveToSupervisor(supervisor)
+            );
+            // ClientSpawns (or no restart at all) records no target: nothing
+            // to start and nothing to leave to anyone.
+            assert_eq!(successor_plan(None, supervisor), SuccessorPlan::Nothing);
+        }
+        assert_eq!(
+            successor_plan(None, Supervisor::None),
+            SuccessorPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn restart_control_latches_a_hand_off_only_for_an_accepted_supervised_restart() {
+        let supervised = |supervisor| {
+            RestartControl::new(InstallRecord {
+                startup_exe: PathBuf::from("/x/dot-agent-deck"),
+                supervisor,
+            })
+        };
+
+        let control = supervised(Supervisor::Systemd);
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(!control.handed_to_supervisor(), "no restart was accepted");
+
+        let control = supervised(Supervisor::Systemd);
+        control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck")));
+        assert_eq!(
+            control.take_successor_plan(),
+            SuccessorPlan::LeaveToSupervisor(Supervisor::Systemd)
+        );
+        assert!(control.handed_to_supervisor());
+
+        let control = supervised(Supervisor::None);
+        control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck")));
+        assert_eq!(
+            control.take_successor_plan(),
+            SuccessorPlan::Spawn(PathBuf::from("/x/dot-agent-deck"))
+        );
+        assert!(!control.handed_to_supervisor());
+
+        // ClientSpawns under a supervisor: the client starts its own build, so
+        // the daemon exits cleanly as before.
+        let control = supervised(Supervisor::Systemd);
+        control.mark_accepted(None);
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(!control.handed_to_supervisor());
+    }
+
+    #[test]
+    fn the_supervised_exit_status_is_a_failure_to_systemd() {
+        // `Restart=on-failure` restarts on any non-zero status outside
+        // `SuccessExitStatus`, which by default is 0 and the clean signals.
+        assert_ne!(SUPERVISED_RESTART_EXIT, 0);
+        assert_eq!(InstallRecord::unresolved().supervisor, Supervisor::None);
     }
 }

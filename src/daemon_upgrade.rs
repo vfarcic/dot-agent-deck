@@ -93,6 +93,10 @@ pub enum NotRestartedReason {
     AnotherRestartInProgress,
     /// No daemon was running; the next one to start runs the new build.
     NoDaemonRunning,
+    /// The installed build predates the commands that reach the running
+    /// daemon (an older release named with `--version`, or an older Homebrew
+    /// tap release), so it could not ask the daemon anything.
+    InstalledBuildTooOld,
 }
 
 /// The stage an upgrade is in, for progress and for [`UpgradeOutcome::Failed`].
@@ -158,6 +162,10 @@ impl UpgradeOutcome {
                     ),
                     NotRestartedReason::NoDaemonRunning => format!(
                         "Installed {installed_version} on '{deck}'. No daemon was running, so nothing was restarted; the next one to start runs the new build."
+                    ),
+                    NotRestartedReason::InstalledBuildTooOld => format!(
+                        "Installed {installed_version} on '{deck}'. The daemon was not restarted, because {installed_version} is too old to restart it from here; the daemon that was running keeps running. {}",
+                        installed_too_old_remedy(deck, installed_version)
                     ),
                 }
             }
@@ -286,11 +294,42 @@ pub trait Installer {
     fn install(&self, version: &str) -> Result<InstalledBuild, String>;
 }
 
+/// Why [`DaemonPort::probe`] learned nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeError {
+    /// The installed build cannot reach the running daemon: it predates the
+    /// command that asks. Not a failure of the upgrade — the build is in
+    /// place — so it becomes [`NotRestartedReason::InstalledBuildTooOld`].
+    InstalledBuildTooOld(String),
+    /// Anything else, in plain language.
+    Other(String),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstalledBuildTooOld(reason) | Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for ProbeError {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
+}
+
+impl From<&str> for ProbeError {
+    fn from(reason: &str) -> Self {
+        Self::Other(reason.to_string())
+    }
+}
+
 /// Reaches the running daemon.
 pub trait DaemonPort {
     /// The running daemon's `Hello`, or `Ok(None)` when none is running. Never
     /// starts one.
-    fn probe(&self) -> Result<Option<AttachResponse>, String>;
+    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError>;
     /// Send the restart request. Must go through
     /// [`DaemonClient::restart_daemon`], which withholds it from a daemon that
     /// does not advertise it — `Unsupported` then means the daemon is too old.
@@ -494,7 +533,14 @@ fn run_upgrade(
                 reason: NotRestartedReason::NoDaemonRunning,
             };
         }
-        Err(reason) => return restarting_failed(reason),
+        Err(ProbeError::InstalledBuildTooOld(_)) => {
+            return UpgradeOutcome::InstalledNotRestarted {
+                from_version: None,
+                installed_version: installed.version,
+                reason: NotRestartedReason::InstalledBuildTooOld,
+            };
+        }
+        Err(ProbeError::Other(reason)) => return restarting_failed(reason),
     };
     let from_version = hello.daemon_version.clone();
     let from_build = hello.build_version.clone();
@@ -601,6 +647,13 @@ fn run_upgrade(
 fn too_old_remedy(deck: &str) -> String {
     format!(
         "Its agents keep running on the old build. To switch, connect with `dot-agent-deck connect {deck}` and accept its restart prompt, or run `dot-agent-deck daemon restart` on that machine."
+    )
+}
+
+/// The remedy when the installed build is too old to restart the daemon.
+fn installed_too_old_remedy(deck: &str, installed_version: &str) -> String {
+    format!(
+        "To switch to {installed_version}, run `dot-agent-deck connect {deck}`: the TUI on that machine restarts the daemon onto it, asking first when agents are running."
     )
 }
 
@@ -842,15 +895,17 @@ impl Installer for NoInstall {
 
 /// A remote daemon, reached through the remote's freshly installed binary.
 impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
-    fn probe(&self) -> Result<Option<AttachResponse>, String> {
+    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError> {
         match SshDaemonPort::probe(self) {
             Ok(probe) if probe.running => Ok(probe.hello),
             Ok(_) => Ok(None),
-            Err(RemoteDaemonError::Unsupported { .. }) => Err(format!(
-                "the installed build at {} is too old to report on the running daemon",
-                self.binary()
-            )),
-            Err(e) => Err(e.to_string()),
+            Err(RemoteDaemonError::Unsupported { .. }) => {
+                Err(ProbeError::InstalledBuildTooOld(format!(
+                    "the installed build at {} is too old to report on the running daemon",
+                    self.binary()
+                )))
+            }
+            Err(e) => Err(ProbeError::Other(e.to_string())),
         }
     }
 
@@ -918,7 +973,10 @@ impl WireDaemonPort {
     /// client's build.
     fn release_then_spawn(&self) -> Result<(), String> {
         let deadline = Instant::now() + LOCAL_RELEASE_TIMEOUT;
-        while DaemonPort::probe(self)?.is_some() {
+        while DaemonPort::probe(self)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "the old daemon was still running {}s after it agreed to stop",
@@ -932,7 +990,7 @@ impl WireDaemonPort {
 }
 
 impl DaemonPort for WireDaemonPort {
-    fn probe(&self) -> Result<Option<AttachResponse>, String> {
+    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError> {
         self.handle
             .block_on(async {
                 tokio::time::timeout(LOCAL_PROBE_TIMEOUT, self.client.probe_running()).await
@@ -943,7 +1001,7 @@ impl DaemonPort for WireDaemonPort {
                     LOCAL_PROBE_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| e.to_string())
+            .map_err(|e| ProbeError::Other(e.to_string()))
     }
 
     fn restart(
@@ -990,7 +1048,7 @@ impl WireDaemonPort {
                     reason: NotRestartedReason::NoDaemonRunning,
                 };
             }
-            Err(reason) => return failed(UpgradeStage::Restarting, reason),
+            Err(reason) => return failed(UpgradeStage::Restarting, reason.to_string()),
         };
         let from_version = hello.daemon_version.clone();
         // The unforced stop refuses while anything is live — the same refusal
@@ -1102,7 +1160,7 @@ mod tests {
         h
     }
 
-    type Probe = Result<Option<AttachResponse>, String>;
+    type Probe = Result<Option<AttachResponse>, ProbeError>;
     type Restart = Result<GatedQuery<RestartDaemonReply>, String>;
 
     /// Scripted probes and restart replies; the last probe repeats.
@@ -1557,6 +1615,135 @@ mod tests {
             &remote_plan(),
         );
         assert_eq!(outcome, fallback);
+    }
+
+    /// `remote upgrade --version <older release>`: the freshly installed build
+    /// predates `daemon probe`, so it cannot reach the daemon. That is not a
+    /// failure — the build is installed and the daemon keeps running — and the
+    /// summary says how to switch.
+    #[test]
+    fn an_installed_build_too_old_to_probe_leaves_the_daemon_running() {
+        let port = FakePort::new(
+            vec![Err(ProbeError::InstalledBuildTooOld(
+                "the installed build at ~/.local/bin/dot-agent-deck is too old".into(),
+            ))],
+            vec![],
+        );
+        let (outcome, stages) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::InstalledNotRestarted {
+                from_version: None,
+                installed_version: "0.40.0".into(),
+                reason: NotRestartedReason::InstalledBuildTooOld,
+            }
+        );
+        assert!(!outcome.is_failure(), "the CLI exits 0");
+        assert!(port.requests.borrow().is_empty(), "nothing was sent");
+        assert_eq!(stages, [UpgradeStage::Installing, UpgradeStage::Restarting]);
+        let summary = outcome.summary("box");
+        assert!(summary.contains("Installed 0.40.0 on 'box'"), "{summary}");
+        assert!(summary.contains("keeps running"), "{summary}");
+        assert!(summary.contains("dot-agent-deck connect box"), "{summary}");
+        assert!(!summary.contains("failed"), "{summary}");
+    }
+
+    /// The same case through the real ssh port: the remote binary exits with
+    /// clap's usage status for the `daemon probe` it does not know.
+    #[test]
+    fn the_ssh_port_reports_an_old_installed_build_as_too_old_not_failed() {
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct OldBinary {
+            commands: std::rc::Rc<RefCell<Vec<String>>>,
+        }
+        impl SshExecutor for OldBinary {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                self.commands.borrow_mut().push(command.to_string());
+                Ok(SshOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "error: unrecognized subcommand 'probe'".into(),
+                })
+            }
+        }
+
+        let commands = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let port = SshDaemonPort::new(
+            OldBinary {
+                commands: commands.clone(),
+            },
+            SshTarget::parse("u@h", 22, None),
+            "~/.local/bin/dot-agent-deck",
+        );
+        let probed = DaemonPort::probe(&port);
+        assert!(
+            matches!(probed, Err(ProbeError::InstalledBuildTooOld(_))),
+            "{probed:?}"
+        );
+
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::InstalledNotRestarted {
+                    reason: NotRestartedReason::InstalledBuildTooOld,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!outcome.is_failure());
+        // Only probes ran: no restart was asked of a binary that cannot ask.
+        let commands = commands.borrow();
+        assert!(!commands.is_empty());
+        assert!(
+            commands.iter().all(|c| c.ends_with("daemon probe --json")),
+            "{commands:?}"
+        );
+
+        // Any other failed probe is still a failure of the restarting stage.
+        struct Broken;
+        impl SshExecutor for Broken {
+            fn run(&self, _target: &SshTarget, _command: &str) -> Result<SshOutput, SshError> {
+                Ok(SshOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "boom".into(),
+                })
+            }
+        }
+        let port = SshDaemonPort::new(
+            Broken,
+            SshTarget::parse("u@h", 22, None),
+            "~/.local/bin/dot-agent-deck",
+        );
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::Failed {
+                    stage: UpgradeStage::Restarting,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
     }
 
     #[test]

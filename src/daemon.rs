@@ -1166,15 +1166,31 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // this process's environment, so it binds the same endpoint. If the spawn
     // fails no daemon is left running: the agents were stopped by consent, and
     // the next client lazy-spawns from its own binary.
-    if let Some(target) = restart_control.take_successor() {
-        match crate::daemon_attach::spawn_restart_successor(&crate::config::state_dir(), &target) {
-            Ok(pid) => info!(pid, target = %target.display(), "successor daemon spawned"),
-            Err(e) => error!(
-                target = %target.display(),
-                error = %e,
-                "could not spawn the successor daemon; none is running until a client starts one"
-            ),
+    //
+    // Under a service manager the successor is not ours to start: systemd
+    // would kill it with this unit's cgroup. `daemon serve` reads
+    // `handed_to_supervisor` and exits non-zero instead, so the manager runs
+    // the unit's own command — the installed build — again.
+    match restart_control.take_successor_plan() {
+        crate::daemon_restart::SuccessorPlan::Nothing => {}
+        crate::daemon_restart::SuccessorPlan::Spawn(target) => {
+            match crate::daemon_attach::spawn_restart_successor(
+                &crate::config::state_dir(),
+                &target,
+            ) {
+                Ok(pid) => info!(pid, target = %target.display(), "successor daemon spawned"),
+                Err(e) => error!(
+                    target = %target.display(),
+                    error = %e,
+                    "could not spawn the successor daemon; none is running until a client starts one"
+                ),
+            }
         }
+        crate::daemon_restart::SuccessorPlan::LeaveToSupervisor(supervisor) => info!(
+            ?supervisor,
+            exit_status = crate::daemon_restart::SUPERVISED_RESTART_EXIT,
+            "restart accepted under a service manager; exiting for it to start the installed build"
+        ),
     }
 
     result
