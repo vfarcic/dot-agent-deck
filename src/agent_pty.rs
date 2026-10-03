@@ -6374,13 +6374,23 @@ impl AgentPtyRegistry {
     /// Issue #1446: generation `seq`'s task pointer was delivered, so the watch
     /// it displaced is superseded now — dropping it cancels that watch's task,
     /// exactly as an immediate [`Self::arm_silence_watch`] would have. A no-op
-    /// when the record is gone, is a newer generation's, or displaced nothing.
+    /// when the record is gone or is a newer generation's.
+    ///
+    /// It also resolves the pane's pending notices
+    /// ([`Self::delegation_resolution_epoch_is`]), because the displaced watch
+    /// may already have fired while this pointer was being written — its window
+    /// can run out during a wait on the worker's draft — and taken its own
+    /// record. Its notice then waits on the orchestrator's writer with an epoch
+    /// captured before this delivery; moving the epoch is what makes that
+    /// notice stand down, as it would have had the supersession cancelled the
+    /// watch at arm time (Qodo, PR #1502).
     pub fn confirm_silence_watch_delivered(&self, worker_pane_id: &str, seq: u64) {
         let mut tracker = self.delegations.lock().unwrap();
         if let Some(record) = tracker.silence_watches.get_mut(worker_pane_id)
             && record.seq == seq
         {
             record.displaced = None;
+            self.note_delegation_resolved(&mut tracker, worker_pane_id);
         }
     }
 
@@ -21886,6 +21896,31 @@ mod spawn_tests {
             reg.retire_silence_watch("worker"),
             SilenceWatchRetirement::Nothing
         ));
+
+        // If the displaced watch fired and took its own record, a delivery of
+        // the newer pointer still supersedes the notice it composed: the epoch
+        // that notice captured no longer holds (Qodo, PR #1502). The
+        // commission arm is what gives the pane an epoch.
+        assert!(arm_commission(&reg, "worker", "orch"));
+        let older = reg
+            .arm_silence_watch("worker", "orch", None)
+            .expect("older");
+        let delivered = reg
+            .arm_silence_watch_until_delivered("worker", "orch", None)
+            .expect("delivered");
+        let epoch = reg.delegation_resolution_epoch("worker");
+        assert!(
+            epoch.is_some(),
+            "precondition: the pane has a resolution epoch"
+        );
+        assert!(reg.cancel_silence_watch_if("worker", older.seq));
+        assert!(reg.delegation_resolution_epoch_is("worker", epoch));
+        reg.confirm_silence_watch_delivered("worker", delivered.seq);
+        assert!(
+            !reg.delegation_resolution_epoch_is("worker", epoch),
+            "a notice the displaced watch built before the newer delivery must stand down"
+        );
+        assert!(reg.cancel_silence_watch_if("worker", delivered.seq));
 
         // Closing the displaced watch's orchestrator cancels it, though the
         // record holding it was armed by another orchestrator.

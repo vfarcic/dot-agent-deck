@@ -19491,6 +19491,7 @@ mod tests {
     /// answers the earlier "did anything happen?" — and the earlier
     /// delegation's late `work-done` is still credited to it rather than
     /// disarming the newer watch.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_one_owned_supersedes_the_earlier_silence_watch_once_delivered() {
         const ORCH_PANE: &str = "supersede-on-delivery-orch";
