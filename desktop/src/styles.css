@@ -648,6 +648,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .reader-jump:hover { background: var(--shell-teal-surface); }
 .terminal-host .xterm { height: 100%; }
 .terminal-host .xterm-viewport { scrollbar-color: var(--shell-thumb) var(--terminal); scrollbar-width: thin; }
+/* Issue #1492: xterm shows its scrollbar only while the terminal is hovered or
+   scrolled, so output above or below the rows on screen was invisible at rest.
+   `has-scrollback` is set by `TerminalViewport` while there is any, and keeps
+   the bar shown and usable then; a terminal whose output fits has none. */
+.terminal-host.has-scrollback .xterm .xterm-scrollable-element > .scrollbar.vertical { opacity: 1; pointer-events: auto; }
 .text-panel { width: 100%; height: 100%; padding: 10px; overflow: auto; color: var(--shell-ink); background: var(--terminal); font-size: 9px; }
 .panel-caption { margin-bottom: 8px; display: flex; align-items: center; gap: 5px; color: var(--shell-faint); text-transform: uppercase; letter-spacing: .09em; }
 .diff-panel > code { padding: 4px 0; display: block; border-bottom: 1px solid var(--shell-line); color: var(--shell-teal-text); }
@@ -1240,10 +1245,30 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    fleet view; the gap is what separates two decks' cards from each other now
    that there can be several, and with one deck it changes nothing. */
 .overview-body { padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+/* Issue #1492: the dashboard's daemons scroll in their own region, between the
+   top bar and the voice row, rather than the whole window scrolling. Its
+   scrollbar is then the dashboard's own and is drawn at rest: macOS and most
+   Linux desktops otherwise show a scrollbar only while it is being scrolled,
+   so a dashboard with more below looked complete. Styling it is what keeps
+   WebKit and WebView2 from treating it as an overlay that fades; it is still
+   drawn only when the daemons overflow. A region rather than the window, so
+   the full-window layers over the dashboard (an agent pane, a dialog, the
+   voice row) keep the whole window's width. Not beside
+   `scrollbar-color`/`scrollbar-width`, which make Chromium ignore these rules. */
+.overview-screen .deck-main { height: calc(100vh - var(--bottom-rail-height)); min-height: 0; display: flex; flex-direction: column; }
+/* `position: relative` makes the region the containing block of what is
+   absolutely positioned inside it — the visually hidden table headers — so it
+   clips them; otherwise they sit at their static place below the window and
+   make the window scroll as well. */
+.overview-screen .overview-body { position: relative; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.overview-body::-webkit-scrollbar { width: 12px; }
+.overview-body::-webkit-scrollbar-track { background: var(--canvas); }
+.overview-body::-webkit-scrollbar-thumb { min-height: 40px; border: 3px solid var(--canvas); border-radius: 6px; background: var(--line-strong); }
+.overview-body::-webkit-scrollbar-thumb:hover { background: var(--faint); }
 .workspace-page { color: var(--ink); font-weight: 700; }
-/* Issue #1492: a row scrolled into view by voice (`revealAgent`) stops clear
-   of the sticky top bar and the voice row, not underneath either. */
-.overview-row { scroll-margin-top: 84px; scroll-margin-bottom: calc(var(--voice-reserved) + 12px); }
+/* Issue #1492: a row scrolled into view by voice (`revealAgent`) stops a
+   little inside the dashboard's scroll region rather than flush with its edge. */
+.overview-row { scroll-margin: 12px 0; }
 .daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
 /* A deck that is not answering, sitting beside decks that are. Dimmed rather
    than alarming: an unreachable deck in a fleet is a fact about that deck, and

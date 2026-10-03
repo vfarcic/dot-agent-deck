@@ -43,21 +43,29 @@ const SCROLLS: Record<string, { action: string; invoke: string; report: string }
 };
 
 /**
- * jsdom lays nothing out and does not scroll, so the window is given a
- * document `height` tall and an 800px viewport, and `scrollBy` / `scrollTo`
- * move `scrollY` within it the way a browser would.
+ * jsdom lays nothing out and does not scroll, so the dashboard's scroll region
+ * (`.overview-body`) is given content `height` tall in a 640px box, and
+ * `scrollBy` / `scrollTo` — which jsdom does not define on elements — move its
+ * `scrollTop` within that the way a browser would. Removed again by
+ * {@link restoreScrolling}.
  */
-function scrollableWindow(height: number) {
-  const viewport = 800;
+function scrollableDashboard(height: number) {
+  const box = 640;
   let y = 0;
-  const room = () => Math.max(0, height - viewport);
-  const clamp = (top: number) => { y = Math.min(room(), Math.max(0, top)); };
-  vi.spyOn(window, "innerHeight", "get").mockReturnValue(viewport);
-  vi.spyOn(window, "scrollY", "get").mockImplementation(() => y);
-  vi.spyOn(document.documentElement, "scrollHeight", "get").mockReturnValue(height);
-  const scrollBy = vi.spyOn(window, "scrollBy").mockImplementation(((options: ScrollToOptions) => clamp(y + (options.top ?? 0))) as typeof window.scrollBy);
-  const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(((options: ScrollToOptions) => clamp(options.top ?? 0)) as typeof window.scrollTo);
+  const isRegion = (element: Element) => element.classList.contains("overview-body");
+  const clamp = (top: number) => { y = Math.min(Math.max(0, height - box), Math.max(0, top)); };
+  vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (this: Element) { return isRegion(this) ? height : 0; });
+  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return isRegion(this) ? box : 0; });
+  vi.spyOn(Element.prototype, "scrollTop", "get").mockImplementation(function (this: Element) { return isRegion(this) ? y : 0; });
+  const scrollBy = vi.fn(function (this: Element, options: ScrollToOptions) { if (isRegion(this)) clamp(y + (options.top ?? 0)); });
+  const scrollTo = vi.fn(function (this: Element, options: ScrollToOptions) { if (isRegion(this)) clamp(options.top ?? 0); });
+  Object.assign(Element.prototype, { scrollBy, scrollTo });
   return { at: () => y, scrollBy, scrollTo };
+}
+
+function restoreScrolling() {
+  delete (Element.prototype as Partial<Element>).scrollBy;
+  delete (Element.prototype as Partial<Element>).scrollTo;
 }
 
 /** Voice-pages daemons, a daemon running a second orchestration (`orc-release`), and a daemon with no agents. */
@@ -394,7 +402,7 @@ describe("visible pages for voice-selected lists", () => {
 
 describe("the agent dashboard scrolls while voice is on", () => {
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); restoreScrolling(); });
 
   /** Scenario: with All daemons and voice on, a fleet taller than the window — the voice-pages daemons, a daemon running a second orchestration and a daemon with no agents — shows every daemon section, every orchestration card and every agent row, exactly as with voice off. */
   it("shows every daemon section and orchestration card of a tall fleet while voice is on", async () => {
@@ -440,7 +448,7 @@ describe("the agent dashboard scrolls while voice is on", () => {
     const deck = runtime(voice, true);
     deck.fleet = tallFleet().fleet;
     deck.snapshot = deck.fleet[0];
-    const page = scrollableWindow(3000);
+    const page = scrollableDashboard(3000);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
 
@@ -450,17 +458,17 @@ describe("the agent dashboard scrolls while voice is on", () => {
 
     await speak(voice, "scroll down");
     const screenful = page.at();
-    expect(screenful).toBeGreaterThan(400);
-    expect(screenful).toBeLessThanOrEqual(800);
+    expect(screenful).toBeGreaterThan(300);
+    expect(screenful).toBeLessThanOrEqual(640);
     await speak(voice, "scroll down");
     expect(page.at()).toBe(2 * screenful);
     await speak(voice, "scroll up");
     expect(page.at()).toBe(screenful);
 
     await speak(voice, "scroll to the bottom");
-    expect(page.at()).toBe(2200);
+    expect(page.at()).toBe(2360);
     await speak(voice, "scroll down");
-    expect(page.at()).toBe(2200);
+    expect(page.at()).toBe(2360);
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/already at the bottom/i);
 
     await speak(voice, "scroll to the top");
@@ -470,7 +478,7 @@ describe("the agent dashboard scrolls while voice is on", () => {
   /** Scenario: on a dashboard that fits the window, “scroll down” moves nothing and says the whole dashboard is already on screen. */
   it("says there is nothing to scroll on a dashboard that fits", async () => {
     const voice = microphone();
-    const page = scrollableWindow(600);
+    const page = scrollableDashboard(600);
     render(<DeckShell runtime={runtime(voice)} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
     await speak(voice, "scroll down");
@@ -484,11 +492,11 @@ describe("the agent dashboard scrolls while voice is on", () => {
     const deck = runtime(voice, true);
     deck.fleet = tallFleet().fleet;
     deck.snapshot = deck.fleet[0];
-    const page = scrollableWindow(3000);
+    const page = scrollableDashboard(3000);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
     await speak(voice, "next page");
-    expect(page.at()).toBeGreaterThan(400);
+    expect(page.at()).toBeGreaterThan(300);
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
     await speak(voice, "previous page");
     expect(page.at()).toBe(0);
@@ -500,7 +508,7 @@ describe("the agent dashboard scrolls while voice is on", () => {
     const deck = runtime(voice, true);
     deck.fleet = tallFleet().fleet;
     deck.snapshot = deck.fleet[0];
-    const page = scrollableWindow(3000);
+    const page = scrollableDashboard(3000);
     render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
     fireEvent.click(screen.getByTestId("deck-selector-toggle"));
@@ -516,7 +524,7 @@ describe("the agent dashboard scrolls while voice is on", () => {
   /** Scenario: control — with the New agent dialog open over a tall dashboard, “next page” turns the directory browser's page and leaves the dashboard behind it where it was. */
   it("turns the directory page, not the dashboard, while the New agent dialog is open", async () => {
     const voice = microphone();
-    const page = scrollableWindow(3000);
+    const page = scrollableDashboard(3000);
     render(<DeckShell runtime={runtime(voice, true)} initialView={{ kind: "overview" }} />);
     await openBrowser();
     await turnOnVoice();

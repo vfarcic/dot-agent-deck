@@ -77,7 +77,7 @@ A spoken number, with or without its list, is worked out on your computer and is
 
 ## Scrolling the dashboard
 
-The dashboard looks the same with voice on as with voice off: nothing is left out, and when it is taller than the window, it scrolls. Voice only adds the numbers. You can scroll with the mouse, the trackpad or the keyboard as usual, or by voice:
+The dashboard looks the same with voice on as with voice off: nothing is left out, and when it is taller than the window, it scrolls, with a scrollbar on the right edge that shows how much more there is and where you are. Voice only adds the numbers. You can scroll with the mouse, the trackpad or the keyboard as usual, or by voice:
 
 - **"scroll down"** or **"scroll up"** moves the dashboard about one window. "Scroll down a bit", "go down", "page down", "go up" and "page up" work too, and so do "next page" and "previous page".
 - **"scroll to the top"** or **"scroll to the bottom"** goes to the first or the last daemon.

@@ -54,6 +54,11 @@ const { terminals, FakeTerminal, FakeFitAddon } = vi.hoisted(() => {
     }
     attachCustomKeyEventHandler(): void {}
     input(data: string): void { this.typeKey(data); }
+    /* The scrollback listeners `TerminalViewport` registers (issue #1492); nothing here scrolls. */
+    readonly buffer = { active: { baseY: 0 }, onBufferChange: (): { dispose: () => void } => ({ dispose: () => {} }) };
+    onScroll(): { dispose: () => void } { return { dispose: () => {} }; }
+    onWriteParsed(): { dispose: () => void } { return { dispose: () => {} }; }
+    onResize(): { dispose: () => void } { return { dispose: () => {} }; }
     /** A keystroke: what xterm hands the component's `onData` callback. */
     typeKey(data: string): void { for (const handler of [...this.handlers]) handler(data); }
     dispose(): void { this.disposed = true; }

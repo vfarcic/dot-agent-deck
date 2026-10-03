@@ -148,7 +148,7 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(page.getByTestId("new-agent-current-path")).toHaveText(selectedPath!);
   });
 
-  /** Scenario: in a short window with Voice on, the crowded dashboard draws every daemon section and agent row with no page marker, and a spoken “scroll down” scrolls the window down by most of its height. */
+  /** Scenario: in a short window with Voice on, the crowded dashboard draws every daemon section and agent row with no page marker, and a spoken “scroll down” scrolls the dashboard down by most of its height. */
   test("crowded dashboard scrolls with voice on and draws every row", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 480 });
     await open(page, "voice-pages", "scroll down");
@@ -159,11 +159,13 @@ test.describe("visible pages for voice-selected lists", () => {
     await expect(page.locator(".overview-row")).toHaveCount(rows);
     await expect(page.getByTestId("daemon-group")).toHaveCount(sections);
     expect(rows).toBe(25);
-    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(200);
-    expect(await page.evaluate(() => window.scrollY)).toBeLessThanOrEqual(480);
+    const region = page.locator(".overview-body");
+    await expect.poll(() => region.evaluate((element) => element.scrollTop)).toBeGreaterThan(150);
+    expect(await region.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(await region.evaluate((element) => element.clientHeight));
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
   });
 
-  /** Scenario: in a short window with Voice on, saying “twenty five” for the crowded dashboard's last row, scrolled out of view, opens its agent and leaves that row fully in view between the top bar and the voice row. */
+  /** Scenario: in a short window with Voice on, saying “twenty five” for the crowded dashboard's last row, scrolled out of view, opens its agent and leaves that row fully in view in the dashboard, between the top bar and the voice row. */
   test("a row opened by its number is scrolled clear of the top bar and the voice row", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 480 });
     await open(page, "voice-pages", "twenty five");
@@ -175,7 +177,7 @@ test.describe("visible pages for voice-selected lists", () => {
       const box = element.getBoundingClientRect();
       const top = document.querySelector(".topbar")!.getBoundingClientRect().bottom;
       const voice = document.querySelector("[data-testid='voice-row']")!.getBoundingClientRect().top;
-      return { rowTop: box.top, rowBottom: box.bottom, top, voice, scrolled: window.scrollY };
+      return { rowTop: box.top, rowBottom: box.bottom, top, voice, scrolled: document.querySelector(".overview-body")!.scrollTop };
     });
     expect(geometry.scrolled).toBeGreaterThan(0);
     expect(geometry.rowTop).toBeGreaterThanOrEqual(geometry.top);

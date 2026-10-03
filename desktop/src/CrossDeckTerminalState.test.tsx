@@ -39,6 +39,11 @@ const { writes, terminalInstances, FakeTerminal, FakeFitAddon } = vi.hoisted(() 
     focus(): void {}
     resize(cols: number, rows: number): void { this.cols = cols; this.rows = rows; }
     onData(): { dispose: () => void } { return { dispose: () => {} }; }
+    /* The scrollback listeners `TerminalViewport` registers (issue #1492); nothing here scrolls. */
+    readonly buffer = { active: { baseY: 0 }, onBufferChange: (): { dispose: () => void } => ({ dispose: () => {} }) };
+    onScroll(): { dispose: () => void } { return { dispose: () => {} }; }
+    onWriteParsed(): { dispose: () => void } { return { dispose: () => {} }; }
+    onResize(): { dispose: () => void } { return { dispose: () => {} }; }
     attachCustomKeyEventHandler(): void {}
     dispose(): void {}
   }

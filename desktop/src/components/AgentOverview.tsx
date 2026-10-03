@@ -663,29 +663,25 @@ export const DASHBOARD_COVERED = "Something is open over the dashboard, so it wa
 export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 
 /**
- * Issue #1492 — scroll the dashboard by voice. The dashboard is the page:
- * the window scrolls it, under a sticky top bar and above the voice row. A
- * screen is the window's height less those two and a little overlap, so the
- * row that was at the bottom edge is still in sight at the top after "scroll
- * down". Answers `undefined` when it scrolled, or why it did not.
+ * Issue #1492 — scroll the dashboard by voice. The daemons scroll in their own
+ * region, `.overview-body`, between the top bar and the voice row. A screen is
+ * that region's height less a little overlap, so the row that was at the
+ * bottom edge is still in sight at the top after "scroll down". Answers
+ * `undefined` when it scrolled, or why it did not.
  */
-function scrollDashboard(main: HTMLElement | null, move: DashboardScroll): string | undefined {
-  const page = document.scrollingElement ?? document.documentElement;
-  const room = page.scrollHeight - window.innerHeight;
-  if (room <= 1) return DASHBOARD_FITS;
+function scrollDashboard(region: HTMLElement | null, move: DashboardScroll): string | undefined {
+  const room = region ? region.scrollHeight - region.clientHeight : 0;
+  if (!region || room <= 1) return DASHBOARD_FITS;
   const behavior: ScrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-  const at = window.scrollY;
+  const at = region.scrollTop;
   if ((move === "down" || move === "bottom") && at >= room - 1) return DASHBOARD_AT_BOTTOM;
   if ((move === "up" || move === "top") && at <= 1) return DASHBOARD_AT_TOP;
   if (move === "top" || move === "bottom") {
-    window.scrollTo({ top: move === "top" ? 0 : room, behavior });
+    region.scrollTo({ top: move === "top" ? 0 : room, behavior });
     return undefined;
   }
-  const header = main?.querySelector(".topbar");
-  const below = header ? Math.max(0, header.getBoundingClientRect().bottom) : 0;
-  const reserved = main ? Number.parseFloat(getComputedStyle(main).paddingBottom) || 0 : 0;
-  const screen = Math.max(DASHBOARD_SCROLL_MIN, window.innerHeight - below - reserved - DASHBOARD_SCROLL_OVERLAP);
-  window.scrollBy({ top: move === "down" ? screen : -screen, behavior });
+  const screen = Math.max(DASHBOARD_SCROLL_MIN, region.clientHeight - DASHBOARD_SCROLL_OVERLAP);
+  region.scrollBy({ top: move === "down" ? screen : -screen, behavior });
   return undefined;
 }
 
@@ -957,14 +953,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     },
   };
   /*
-    Issue #1492 — the dashboard scrolls (the window does), and a row acted on
+    Issue #1492 — the dashboard scrolls in its own region, and a row acted on
     by number or by name is scrolled into view first, so it is on screen
     behind the pane that opens over it, and on screen when that pane closes.
   */
-  const mainRef = useRef<HTMLElement>(null);
+  const bodyRef = useRef<HTMLElement>(null);
   const revealAgent = useCallback((deckId: string, agentId: string) => {
     const testId = `overview-agent-${agentDomKey({ daemonId: deckId, id: agentId })}`;
-    const row = Array.from(mainRef.current?.querySelectorAll(".overview-row") ?? []).find((candidate) => candidate.getAttribute("data-testid") === testId);
+    const row = Array.from(bodyRef.current?.querySelectorAll(".overview-row") ?? []).find((candidate) => candidate.getAttribute("data-testid") === testId);
     row?.scrollIntoView?.({ block: "nearest" });
   }, []);
   /*
@@ -1027,7 +1023,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* Issue #1492 — the dashboard's own scroll, served always: Rust offers
          the scroll rows only while the New agent dialog is closed, and a
          scroll that lands under a pane moves only the screen behind it. */
-      scrollDashboard: (move: DashboardScroll) => scrollDashboard(mainRef.current, move),
+      scrollDashboard: (move: DashboardScroll) => scrollDashboard(bodyRef.current, move),
       revealAgent,
     };
     voiceChannel.current = newAgent
@@ -1246,7 +1242,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const overviewScreen = (
     <div className="control-deck overview-screen">
       {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
-      <main className="deck-main" ref={mainRef}>
+      <main className="deck-main">
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
@@ -1286,7 +1282,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           </div>
         )}
 
-        <section className="overview-body" aria-label="Agent dashboard">
+        <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef}>
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
