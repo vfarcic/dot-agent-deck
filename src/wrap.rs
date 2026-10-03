@@ -2264,11 +2264,27 @@ impl QuietOutputIdle {
     }
 
     /// The wrapper announced its child's output settled, which the card reads as
-    /// Idle: record the quiet without sending anything more.
-    fn note_settled(&mut self, detector: &Mutex<Detector>, watch: &InterfaceWatch) {
+    /// Idle: record the quiet. When that moves the detector off Working, also
+    /// send the Idle as a classified frame (Qodo on PR #1523): the start was
+    /// stamped before this lock was taken, so a Thinking the tee classified in
+    /// between is newer than it and the deck drops the start as stale. Stamped
+    /// here, under the lock, this Idle is newer than that Thinking and leaves
+    /// through the same ordered sender after it.
+    fn note_settled(
+        &mut self,
+        detector: &Mutex<Detector>,
+        watch: &InterfaceWatch,
+        emitter: &Emitter,
+    ) {
         let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-        det.observe_detected(Some(DetectedEvent::Idle));
+        let changed = det.observe_detected(Some(DetectedEvent::Idle));
         self.quiet_reported_at_output_ms = Some(watch.last_output_ms.load(Ordering::SeqCst));
+        let event = changed
+            .map(|idle| emitter.build_event(idle.event_type(), output_classified_metadata()));
+        drop(det);
+        if let Some(event) = event {
+            emitter.send_classified(&event);
+        }
     }
 
     fn tick(&mut self, detector: &Mutex<Detector>, watch: &InterfaceWatch, emitter: &Emitter) {
@@ -2737,7 +2753,7 @@ fn run_wrap_pty(
             if fact == InterfaceFact::OutputSettled
                 && let Some(quiet) = quiet_output_idle.as_mut()
             {
-                quiet.note_settled(&detector, &interface);
+                quiet.note_settled(&detector, &interface, emitter);
             }
         }
         if let Some(quiet) = quiet_output_idle.as_mut() {
