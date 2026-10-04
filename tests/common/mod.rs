@@ -11491,9 +11491,14 @@ impl BroadcastEventLog {
 /// pause between two writes is part of what is being written — an agent's
 /// served interrupt carries one between its steps — and Decision 21 keeps
 /// every sleep in `common`.
+///
+/// Dropping it closes the connection and joins the drain thread, so a test
+/// that attaches leaves neither a thread nor a daemon-side connection behind.
 #[cfg(unix)]
 pub struct AttachInput {
     stream: std::os::unix::net::UnixStream,
+    stop: Arc<AtomicBool>,
+    drain: Option<JoinHandle<()>>,
 }
 
 #[cfg(unix)]
@@ -11523,12 +11528,36 @@ impl AttachInput {
             .write_all(&payload)
             .expect("write AttachStream payload");
         stream.flush().expect("flush AttachStream");
-        let mut drain = stream.try_clone().expect("clone the attach stream");
-        std::thread::spawn(move || {
+        let mut reader = stream.try_clone().expect("clone the attach stream");
+        // `shutdown` in `Drop` is what ends this read; the timeout only bounds
+        // the join should a platform not wake a blocked read on shutdown.
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let drain = std::thread::spawn(move || {
             let mut sink = [0u8; 8192];
-            while matches!(drain.read(&mut sink), Ok(n) if n > 0) {}
+            while !stop_reader.load(Ordering::Relaxed) {
+                match reader.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
         });
-        Self { stream }
+        Self {
+            stream,
+            stop,
+            drain: Some(drain),
+        }
     }
 
     /// One `KIND_STREAM_IN` frame carrying `bytes`.
@@ -11552,6 +11581,19 @@ impl AttachInput {
         for (bytes, pause) in steps {
             self.write(bytes);
             std::thread::sleep(pause);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AttachInput {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Shutting the socket down, not just dropping this half, is what
+        // closes it: the drain thread holds a clone of the same socket.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
         }
     }
 }
