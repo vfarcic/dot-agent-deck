@@ -3,7 +3,7 @@
 **Status**: Draft — **blocked on Jev access.** No TypeSafe account is available yet, so no milestone can start. M1 is a go/no-go measurement, and nothing after it is built unless M1 passes.
 **Priority**: Low
 **Created**: 2026-09-24
-**Related**: [PRD #1273](1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](421-issue-triage-labels-and-dispatch-claims.md) (the other classification mechanism; the interlock below still holds)
+**Related**: [PRD #1273](done/1273-jev-voice-command-backend.md) (Jev as a voice command model — same model, independent decision), [PRD #421](421-issue-triage-labels-and-dispatch-claims.md) (the other classification mechanism; the interlock below still holds)
 
 ## Problem Statement
 

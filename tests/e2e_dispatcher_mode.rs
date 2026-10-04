@@ -544,13 +544,21 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // re-enter the launcher (itself named `claude`). Both agents this test brings
     // up run on it: the dispatcher, and the unit it dispatches, which inherits the
     // same `default_command`.
+    //
+    // `--allowedTools Bash` (issue #1520's lane-2 run): without it the agent's
+    // `dot-agent-deck dispatch …` call stops on Claude Code's "This command
+    // requires approval" dialog, which nothing in an unattended run answers, so
+    // all three nudges time out on a pane that has already received its seed.
+    // Measured failing 3 of 4 runs on the PR #1553 branch; both failures whose
+    // grid was captured ended on that dialog. CLAUDE.md rule 4 asks for exactly
+    // this flag.
     let real_claude = real_claude_path();
     let launcher = common::write_late_announcing_real_agent(
         staging.path(),
         LAUNCHER_LOG,
         LAUNCHER_DELAY_SECS,
         &format!(
-            "'{}' --model {HAIKU_MODEL}",
+            "'{}' --model {HAIKU_MODEL} --allowedTools Bash",
             real_claude.to_string_lossy().replace('\'', r"'\''")
         ),
     );

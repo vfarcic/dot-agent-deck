@@ -104,7 +104,7 @@ Each unit also appears on your deck like any other work: a card for a single age
 
 If the unit's agent does not report submitting its task within about a minute, the deck puts a notice on **the unit's own card** saying the task may never have arrived. The notice is not sent to the dispatcher. Not every lost task leaves a notice:
 
-- A **Pi** unit does not report submitted prompts, so there is nothing to check and no notice.
+- A **Pi** unit is not checked, so it never gets a notice.
 - A **Codex** unit whose prompt hook the deck knows will not run gets no notice either. That happens when you switched the hook off in Codex's `/hooks` list, or when `codex` is reachable only inside a launcher (such as `devbox run codex-big`) and not on the deck's own `PATH`; see [Codex events not showing](troubleshooting.md#codex-events-not-showing).
 - If the unit's pane went away, or its agent was replaced, before the task was typed in, the deck records that in its log and not on the card.
 

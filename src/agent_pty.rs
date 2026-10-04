@@ -5424,6 +5424,13 @@ struct DelegationTracker {
     /// on by every later arm, completion, release and restart retirement;
     /// removed on pane close, so it is bounded by the panes alive.
     resolution_epochs: HashMap<String, u64>,
+    /// Issue #1526: per worker pane, a value that changes every time one of its
+    /// task pointers is confirmed delivered — see
+    /// [`AgentPtyRegistry::pointer_delivery_epoch`]. Kept apart from
+    /// `resolution_epochs` because a delivery resolves only the silent-worker
+    /// watch it displaced, never the delegation it delivers. Removed on pane
+    /// close, so it is bounded by the panes alive.
+    pointer_delivery_epochs: HashMap<String, u64>,
 }
 
 /// Issue #447: one worker pane's pending "this delegated worker is waiting for
@@ -7256,22 +7263,50 @@ impl AgentPtyRegistry {
     /// exactly as an immediate [`Self::arm_silence_watch`] would have. A no-op
     /// when the record is gone or is a newer generation's.
     ///
-    /// It also resolves the pane's pending notices
-    /// ([`Self::delegation_resolution_epoch_is`]), because the displaced watch
-    /// may already have fired while this pointer was being written — its window
-    /// can run out during a wait on the worker's draft — and taken its own
-    /// record. Its notice then waits on the orchestrator's writer with an epoch
-    /// captured before this delivery; moving the epoch is what makes that
-    /// notice stand down, as it would have had the supersession cancelled the
-    /// watch at arm time (Qodo, PR #1502).
+    /// It also moves the pane's [`Self::pointer_delivery_epoch`] on, because the
+    /// displaced watch may already have fired while this pointer was being
+    /// written — its window can run out during a wait on the worker's draft —
+    /// and taken its own record. Its notice then waits on the orchestrator's
+    /// writer with an epoch captured before this delivery; moving the epoch is
+    /// what makes that notice stand down, as it would have had the supersession
+    /// cancelled the watch at arm time (Qodo, PR #1502).
+    ///
+    /// Issue #1526: that epoch is NOT [`Self::delegation_resolution_epoch`]. A
+    /// delivery answers the displaced went-quiet question and nothing else: an
+    /// idle-worker, waiting-for-input or worker-exited notice about the
+    /// delegation being delivered is not resolved by its own pointer arriving,
+    /// and moving the shared epoch refused a waiting notice that fired just
+    /// before the pointer landed — for good, since that notice is one-shot.
     pub fn confirm_silence_watch_delivered(&self, worker_pane_id: &str, seq: u64) {
         let mut tracker = self.delegations.lock().unwrap();
-        if let Some(record) = tracker.silence_watches.get_mut(worker_pane_id)
-            && record.seq == seq
-        {
-            record.displaced = None;
-            self.note_delegation_resolved(&mut tracker, worker_pane_id);
-        }
+        let Some(record) = tracker
+            .silence_watches
+            .get_mut(worker_pane_id)
+            .filter(|record| record.seq == seq)
+        else {
+            return;
+        };
+        record.displaced = None;
+        let epoch = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        tracker
+            .pointer_delivery_epochs
+            .insert(worker_pane_id.to_string(), epoch);
+    }
+
+    /// Issue #1526: a value for `worker_pane_id` that moves on every time one of
+    /// its task pointers is confirmed delivered
+    /// ([`Self::confirm_silence_watch_delivered`]); `None` for a pane none has
+    /// been delivered to since it opened. The silent-worker report captures it
+    /// when its watch fires and refuses its write once it has moved: a newer
+    /// pointer that reached the worker meanwhile answers the older "did anything
+    /// happen?" question (Qodo, PR #1502). No other notice reads it.
+    pub fn pointer_delivery_epoch(&self, worker_pane_id: &str) -> Option<u64> {
+        self.delegations
+            .lock()
+            .unwrap()
+            .pointer_delivery_epochs
+            .get(worker_pane_id)
+            .copied()
     }
 
     /// Issue #1446: generation `seq`'s task pointer was NOT delivered, so
@@ -7329,7 +7364,11 @@ impl AgentPtyRegistry {
     /// worker cannot both pass it. Expired commissions
     /// ([`DELEGATION_COMMISSION_TTL`]) are dropped first, which is what keeps a
     /// commission nobody will ever answer from refusing that worker for ever
-    /// (issue #590). The ledger is the signal rather than the worker's status:
+    /// (issue #590), and so are commissions bound to an agent other than the
+    /// pane's current occupant — a worker that exited on its own, whose pane a
+    /// successor now holds (issue #1531; see
+    /// [`Self::retire_commissions_of_a_previous_occupant`]). The ledger is the
+    /// signal rather than the worker's status:
     /// status is hook-reported, and a hook event is not proof of anything.
     ///
     /// With `supersede`, arming does not REPLACE a previous entry — it
@@ -7374,6 +7413,49 @@ impl AgentPtyRegistry {
         supersede: bool,
         now: Instant,
     ) -> CommissionArm {
+        // Issue #1531: read before the tracker lock, which is never held
+        // together with the registry's own (the same order as crediting).
+        let occupant = self.pane_current_agent_id(worker_pane_id);
+        let arm = self.arm_delegation_commission_for_occupant(
+            worker_pane_id,
+            orchestrator_pane_id,
+            orchestrator_agent_id,
+            supersede,
+            now,
+            occupant.as_deref(),
+        );
+        // Qodo (#1551): the pane can change hands between that read and the
+        // lock, and a refusal decided for the agent that just left would turn
+        // away its successor. A refusal records nothing, so it is decided once
+        // more, against the agent holding the pane now, when that has changed.
+        if matches!(arm, CommissionArm::Busy { .. }) {
+            let current = self.pane_current_agent_id(worker_pane_id);
+            if current != occupant {
+                return self.arm_delegation_commission_for_occupant(
+                    worker_pane_id,
+                    orchestrator_pane_id,
+                    orchestrator_agent_id,
+                    supersede,
+                    now,
+                    current.as_deref(),
+                );
+            }
+        }
+        arm
+    }
+
+    /// [`Self::arm_delegation_commission_at`] for a known pane occupant,
+    /// `occupant` — the pane's current live agent, read by the caller without
+    /// the tracker lock held.
+    fn arm_delegation_commission_for_occupant(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        orchestrator_agent_id: Option<&str>,
+        supersede: bool,
+        now: Instant,
+        occupant: Option<&str>,
+    ) -> CommissionArm {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
@@ -7381,6 +7463,22 @@ impl AgentPtyRegistry {
             return CommissionArm::Closing;
         }
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
+        // Issue #1531: a commission made to an agent that no longer holds the
+        // pane can never be answered, so it does not make the pane's current
+        // occupant busy — the same retirement #507 applies when crediting.
+        // Without it a live successor in the pane of a worker that exited on
+        // its own was refused as busy until `--supersede` or its own first
+        // `work-done`.
+        let retired =
+            Self::retire_commissions_of_a_previous_occupant(&mut tracker, worker_pane_id, occupant);
+        if retired > 0 {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                retired,
+                "delegate: retired delegation commissions made to an agent that no longer holds \
+                 this pane, so they do not make its current occupant busy"
+            );
+        }
         let entry = tracker
             .commissions
             .entry(worker_pane_id.to_string())
@@ -7790,7 +7888,8 @@ impl AgentPtyRegistry {
     /// pane id is then free for another agent. Without this, that agent's first
     /// `work-done` spent the predecessor's commission: reported to the
     /// orchestrator as the delegated work coming back, and filed over the
-    /// role's `work-done-<role>.md`.
+    /// role's `work-done-<role>.md`. Issue #1531: arming a delegate runs it too,
+    /// against the same occupant, so the busy refusal does not count them either.
     ///
     /// Decided per commission, from the agent its own task pointer went to
     /// ([`ArmedCommission::worker_agent_id`]). Kept: a commission bound to the
@@ -8337,6 +8436,7 @@ impl AgentPtyRegistry {
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
         tracker.resolution_epochs.remove(pane_id);
+        tracker.pointer_delivery_epochs.remove(pane_id);
         let dropped_commissions = Self::drain_commissions_touching(&mut tracker, pane_id);
         if dropped_commissions > 0 {
             tracing::debug!(
@@ -8380,6 +8480,7 @@ impl AgentPtyRegistry {
         tracker.waiting_notices.remove(pane_id);
         tracker.waiting_notice_sent_at.remove(pane_id);
         tracker.resolution_epochs.remove(pane_id);
+        tracker.pointer_delivery_epochs.remove(pane_id);
         Self::drain_commissions_touching(&mut tracker, pane_id);
         let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
         if !closed {
@@ -24189,9 +24290,12 @@ mod spawn_tests {
         ));
 
         // If the displaced watch fired and took its own record, a delivery of
-        // the newer pointer still supersedes the notice it composed: the epoch
-        // that notice captured no longer holds (Qodo, PR #1502). The
-        // commission arm is what gives the pane an epoch.
+        // the newer pointer still supersedes the notice it composed: the
+        // delivery epoch that notice captured no longer holds (Qodo, PR
+        // #1502). Issue #1526: the delivery leaves the resolution epoch alone,
+        // because every other notice reads that one, and none of them is about
+        // a delegation its own pointer resolves. The commission arm is what
+        // gives the pane a resolution epoch.
         assert!(arm_commission(&reg, "worker", "orch"));
         let older = reg
             .arm_silence_watch("worker", "orch", None)
@@ -24199,18 +24303,29 @@ mod spawn_tests {
         let delivered = reg
             .arm_silence_watch_until_delivered("worker", "orch", None)
             .expect("delivered");
-        let epoch = reg.delegation_resolution_epoch("worker");
+        let resolution = reg.delegation_resolution_epoch("worker");
         assert!(
-            epoch.is_some(),
+            resolution.is_some(),
             "precondition: the pane has a resolution epoch"
         );
+        let delivery = reg.pointer_delivery_epoch("worker");
         assert!(reg.cancel_silence_watch_if("worker", older.seq));
-        assert!(reg.delegation_resolution_epoch_is("worker", epoch));
+        assert_eq!(reg.pointer_delivery_epoch("worker"), delivery);
         reg.confirm_silence_watch_delivered("worker", delivered.seq);
-        assert!(
-            !reg.delegation_resolution_epoch_is("worker", epoch),
+        assert_ne!(
+            reg.pointer_delivery_epoch("worker"),
+            delivery,
             "a notice the displaced watch built before the newer delivery must stand down"
         );
+        assert!(
+            reg.delegation_resolution_epoch_is("worker", resolution),
+            "a delivery resolved the delegation it delivered, so a waiting-for-input notice \
+             about it that fired just before the pointer landed would be refused (#1526)"
+        );
+        // A confirm for a generation that is no longer the pane's moves nothing.
+        let delivery = reg.pointer_delivery_epoch("worker");
+        reg.confirm_silence_watch_delivered("worker", older.seq);
+        assert_eq!(reg.pointer_delivery_epoch("worker"), delivery);
         assert!(reg.cancel_silence_watch_if("worker", delivered.seq));
 
         // Closing the displaced watch's orchestrator cancels it, though the

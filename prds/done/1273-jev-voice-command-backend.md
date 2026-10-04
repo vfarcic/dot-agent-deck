@@ -1,13 +1,15 @@
 # PRD #1273: Jev as an optional command model for desktop voice control
 
-**Status**: Draft — **blocked on TypeSafe early access.** No Jev key is available yet, so no milestone can start. The design below was settled in discussion on 2026-09-24; M1 is a go/no-go measurement, and nothing after it is built unless M1 passes.
+**Status**: No Longer Needed — closed without starting M1; see the 2026-10-03 Work Log entry.
+**Last Updated**: 2026-10-03
+**Closed**: 2026-10-03
 **Priority**: Low
 **Created**: 2026-09-24
-**Depends on**: [PRD #802](done/802-desktop-voice-control.md) (desktop voice control, shipped) and a TypeSafe early-access key.
+**Depends on**: [PRD #802](802-desktop-voice-control.md) (desktop voice control, shipped) and a TypeSafe early-access key.
 
 ## Problem Statement
 
-Desktop voice control ([PRD #802](done/802-desktop-voice-control.md)) turns an utterance into an action in two stages: **Speech** transcribes audio to text, and **Commands** resolves that text against the command table (`desktop/src-tauri/src/voice/commands.toml`) and live state. Commands has two backends today, selected by `[voice.intent] backend`: `openai_compatible` (the default, `gpt-5-mini` with reasoning suppressed) and `anthropic` (`claude-haiku-4-5`, strict tool-use). Both are chat models forced into a closed-set answer. #802 measured the Anthropic shape at a **~0.9 s median** per utterance, which is most of what a user waits for after they stop speaking.
+Desktop voice control ([PRD #802](802-desktop-voice-control.md)) turns an utterance into an action in two stages: **Speech** transcribes audio to text, and **Commands** resolves that text against the command table (`desktop/src-tauri/src/voice/commands.toml`) and live state. Commands has two backends today, selected by `[voice.intent] backend`: `openai_compatible` (the default, `gpt-5-mini` with reasoning suppressed) and `anthropic` (`claude-haiku-4-5`, strict tool-use). Both are chat models forced into a closed-set answer. #802 measured the Anthropic shape at a **~0.9 s median** per utterance, which is most of what a user waits for after they stop speaking.
 
 [Jev](https://docs.typesafe.ai/), released by TypeSafe AI on 2026-09-15, is a different kind of model: a "System One" decision model that returns no text at all, only typed answers to choice, yes/no and score questions, with probabilities. TypeSafe claims 70–500 ms latency, and pricing is $0.042 per million input tokens with free output. That shape matches #802's own design principle unusually well — **the model returns a situation; the app renders the sentence** — because Jev *cannot* return anything but a situation.
 
@@ -145,3 +147,14 @@ Selecting Jev sends transcripts and live agent names to TypeSafe, whose data-ret
 ### 2026-09-24 — Created
 
 Designed in discussion before any key was available. Decisions: reuse the existing Commands fields; top result only; every param kind becomes a choice question, with dictation's prefix chosen among the transcript's own leading word sequences; M1 is a go/no-go measurement with parity to the current backends' pass rate as the bar; the older-build settings fold is verified by testing against a build from `main`; a Jev-specific description column is acceptable if the fixtures require it; data handling is the user's choice and responsibility, disclosed like the other providers.
+
+### 2026-10-03 — Closed, not pursued
+
+Closed by the maintainer before any key arrived. Jev still sits behind TypeSafe's early-access waitlist, but access is not the reason: on review, Jev can only ever be an **addition** to the current Commands model, not a replacement, and running two Commands backends is more than the feature is worth.
+
+- **It cannot return words.** Voice has gone from the two param kinds this PRD was designed against to nine (`ParamKind`, `desktop/src-tauri/src/voice/table.rs`). The six references (agent, deck, directory, mode, agent type, orchestration) map onto choice questions, but three params carry text taken from the utterance. `SpokenPrefix` survives as a choice among the transcript's leading cuts, and `CommandText` would need a start-and-end pair of choices, but `FilterText` is a transformation rather than a span ("show only those starting with letter D" sets `d`), which a choice over the transcript cannot express.
+- **Chains are not expressible** as one choice ([PRD #1184](../1184-voice-command-chains.md) already notes they would be unavailable under such a backend).
+- **So the only workable design is a hybrid** — Jev for the action and the references, the chat model for every text-bearing command — which means two backends on the path, two keys, two failure modes and the phrase fixtures run against both, to save about half a second on mostly navigational commands. Since this PRD was written, much of the latency-sensitive traffic (typing mode, send phrases, numbers, choice-list answers) is decided on the machine and never reaches the Commands model.
+- **The one benefit worth keeping — confidence for rejecting artefacts — does not need Jev.** Phantom phrases from silence are being addressed at the speech stage under #1450.
+
+**Revisit only if** Jev (or a similar decision model) can return spans or text from the input, or the voice table stops needing free-text params — that is, if it could *replace* the Commands model rather than sit beside it.
