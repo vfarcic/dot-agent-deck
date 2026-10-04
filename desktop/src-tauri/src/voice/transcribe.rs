@@ -172,8 +172,10 @@ fn no_voice(measure: VoiceMeasure) -> String {
 ///
 /// Two questions, cheapest first: did enough of it rise out of the room to be
 /// a word ([`MIN_SPEECH`]), and is what rose a human voice ([`human_voice`]).
-/// One function so [`handle_audio`] and [`HttpTranscriber::run`]'s backstop
-/// cannot ask different ones.
+///
+/// CPU-bound — the voice check runs a model over every 16 ms of the segment,
+/// up to [`super::capture::MAX_UTTERANCE`] of it — so [`handle_audio`] runs it
+/// on a blocking worker rather than on the async runtime (Qodo on PR #1550).
 fn ineligible(audio: &Pcm16) -> Option<(String, String)> {
     let measure = audio.measure_speech();
     if measure.voiced < MIN_SPEECH {
@@ -402,8 +404,16 @@ impl HttpTranscriber {
         // and a caller that went straight to it would otherwise post the audio.
         // Reported as a BACKEND failure rather than as a not-configured one: the
         // setup is fine, which is a different thing to do next.
-        if let Some((detail, _)) = ineligible(audio) {
-            return Err(TranscriptionError::Backend(detail));
+        //
+        // **The cheap half only.** [`handle_audio`]'s second question, whether
+        // the audio holds a voice ([`ineligible`]), runs a model over the
+        // whole segment; asking it again here would score every utterance the
+        // app sends twice (Qodo on PR #1550). [`handle_audio`] is the one
+        // entry point this app transcribes through, so the voice check is
+        // there and only there.
+        let measure = audio.measure_speech();
+        if measure.voiced < MIN_SPEECH {
+            return Err(TranscriptionError::Backend(not_enough_speech(measure).0));
         }
 
         // Read at call time, Rust-side, and dropped with this scope — and on
@@ -991,7 +1001,29 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     // out of the room is a voice at all — for the same reason it sits here:
     // a backend's own no-speech verdict is missing from some backends and
     // wrong on others, so the audio is judged before any of them is called.
-    if let Some((detail, sentence)) = ineligible(audio) {
+    //
+    // On a blocking worker, because the voice check is CPU work over the whole
+    // segment ([`ineligible`]). The copy is at most
+    // [`super::capture::MAX_UTTERANCE`] of 16-bit audio, under a megabyte. A
+    // worker that panics refuses the segment as a failure, never as silence:
+    // "could not check" is not "nothing was said".
+    let checked = audio.clone();
+    let verdict = match tokio::task::spawn_blocking(move || ineligible(&checked)).await {
+        Ok(verdict) => verdict,
+        Err(_) => {
+            let detail = "the audio check did not finish".to_string();
+            return VoiceTranscription {
+                outcome: TranscriptionOutcome::Failed {
+                    sentence: format!("Could not turn that into text ({detail})."),
+                    detail,
+                },
+                transcribe_ms: None,
+                backend,
+                audio_ms,
+            };
+        }
+    };
+    if let Some((detail, sentence)) = verdict {
         return VoiceTranscription {
             outcome: TranscriptionOutcome::Silent { detail, sentence },
             transcribe_ms: None,
@@ -2348,6 +2380,42 @@ mod tests {
                 );
                 assert!(result.transcribe_ms.is_some(), "{said} ({level})");
             }
+        }
+    }
+
+    /// Scenario: somebody knocks on the desk or puts a mug down, and a moment
+    /// later says a short command quietly, all in one segment. The loud sound
+    /// must not drown the command: it still reaches the backend and is heard
+    /// (Greptile on PR #1550 — the level is normalised before the voice check,
+    /// and a normalisation taken from the loudest moment of the whole segment
+    /// would turn the command down by the knock's level).
+    #[tokio::test]
+    async fn voice_transcribe_a_quiet_command_after_a_loud_knock_is_still_heard() {
+        let mut n = noise(23);
+        let knock: Vec<f64> = (0..4_800)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                9_000.0 * (-t / 0.08).exp() * (std::f64::consts::TAU * 90.0 * t).sin()
+                    + if i < 40 { n() * 9_000.0 } else { 0.0 }
+            })
+            .collect();
+        for (seed, (said, fixture)) in COMMANDS.iter().enumerate().take(14) {
+            // Quiet, at a peak of 1 200 over a room at 80, and under a knock
+            // at 9 000 — clear of the audio gate, so only the voice check can
+            // refuse it.
+            let command = spoken(fixture, 1_200.0, 80.0, 40 + seed as u32);
+            let mut samples: Vec<f64> = command.samples().iter().map(|&s| f64::from(s)).collect();
+            // Room before the command (`spoken` leads with 600 ms) holds the
+            // knock at 100 ms, so 500 ms separate it from the first word.
+            add(&mut samples, &knock[..1_600.min(knock.len())], 0.1);
+            let audio = pcm(samples);
+            let result = handle_audio(&StubTranscriber::hearing(*said), &audio).await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some(*said),
+                "{said} after a knock: {:?}",
+                result.outcome
+            );
         }
     }
 

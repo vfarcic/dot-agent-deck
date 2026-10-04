@@ -84,15 +84,35 @@ pub const VOICE_SCORE: f32 = 0.5;
 /// see and delete. The quietest, fastest command measured held fifteen.
 pub const MIN_VOICE: Duration = Duration::from_millis(80);
 
-/// The RMS the loudest 20 ms of a segment is scaled to before it is scored.
+/// The RMS the loudest 20 ms of each sound in a segment is scaled to before
+/// it is scored.
 ///
 /// The model scores a quiet voice low — unscaled, speech at a peak of 400
-/// over a room at 64 scored no frame over 0.54 — so the segment is brought to
+/// over a room at 64 scored no frame over 0.54 — so each sound is brought to
 /// one level first. Scaling moves the voice and the room together, so the
 /// signal-to-noise ratio the model judges is the one the microphone delivered.
 /// 3 000 was the best of the targets measured (1 000 to 6 000): the widest gap
 /// between the highest-scoring non-speech and the lowest-scoring speech.
+///
+/// **Per sound, not per segment** ([`SOUND_GAP`]): a knock on the desk half a
+/// second before a quiet "send it" set the level for the whole segment when it
+/// was taken from the segment's loudest moment, turned the command down by the
+/// knock's level, and the command was refused (Greptile on PR #1550,
+/// `voice_transcribe_a_quiet_command_after_a_loud_knock_is_still_heard`).
 const VOICE_LEVEL: f64 = 3_000.0;
+
+/// How much quiet separates two sounds, each brought to [`VOICE_LEVEL`] on its
+/// own: 300 ms of audio under the speech bar. Longer than the pause between
+/// the words of a command, so a command is one sound.
+const SOUND_GAP: usize = 15;
+
+/// How far each side of a sound its level applies, in 20 ms frames — 200 ms,
+/// so the model's view of the sound's onset and decay is at the sound's level
+/// rather than at the segment's.
+const SOUND_MARGIN: usize = 10;
+
+/// The 20 ms frame the level rule works in, in samples.
+const LEVEL_FRAME: usize = TARGET_SAMPLE_RATE as usize / 50;
 
 /// The most a segment is ever amplified, so a buffer of near-digital silence
 /// is not raised into something the model has to guess about. A segment that
@@ -116,25 +136,71 @@ impl VoiceMeasure {
     }
 }
 
-/// Score `audio` for human voice.
-pub fn measure(audio: &Pcm16) -> VoiceMeasure {
-    let samples = audio.samples();
-    let loudest = samples
-        .chunks_exact(TARGET_SAMPLE_RATE as usize / 50)
+/// The gain each 20 ms frame of `audio` is scored at.
+///
+/// Each run of speech-level frames ([`Pcm16::speech_frames`]), with gaps
+/// shorter than [`SOUND_GAP`] closed, is one sound; its frames and
+/// [`SOUND_MARGIN`] either side are scaled so its loudest frame reaches
+/// [`VOICE_LEVEL`]. Where two sounds' margins overlap the smaller gain wins.
+/// Frames belonging to no sound — the room — keep the gain the segment's
+/// loudest frame gives, which is how the whole segment was scaled before.
+fn frame_gains(audio: &Pcm16) -> Vec<f64> {
+    let rms: Vec<f64> = audio
+        .samples()
+        .chunks_exact(LEVEL_FRAME)
         .map(|frame| {
             let energy: f64 = frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
             (energy / frame.len() as f64).sqrt()
         })
-        .fold(0.0, f64::max);
-    let gain = (VOICE_LEVEL / loudest.max(1.0)).min(MAX_GAIN);
+        .collect();
+    let gain_for = |peak: f64| (VOICE_LEVEL / peak.max(1.0)).min(MAX_GAIN);
+    let segment_gain = gain_for(rms.iter().copied().fold(0.0, f64::max));
+
+    let speech = audio.speech_frames();
+    let mut sounds: Vec<(usize, usize)> = Vec::new();
+    for index in (0..speech.len()).filter(|&index| speech[index]) {
+        match sounds.last_mut() {
+            Some((_, end)) if index - *end <= SOUND_GAP => *end = index,
+            _ => sounds.push((index, index)),
+        }
+    }
+
+    let mut gains: Vec<Option<f64>> = vec![None; rms.len()];
+    for (start, end) in sounds {
+        let gain = gain_for(rms[start..=end].iter().copied().fold(0.0, f64::max));
+        let from = start.saturating_sub(SOUND_MARGIN);
+        let to = (end + SOUND_MARGIN).min(rms.len().saturating_sub(1));
+        for slot in &mut gains[from..=to] {
+            *slot = Some(slot.map_or(gain, |other| other.min(gain)));
+        }
+    }
+    gains
+        .into_iter()
+        .map(|gain| gain.unwrap_or(segment_gain))
+        .collect()
+}
+
+/// Score `audio` for human voice.
+pub fn measure(audio: &Pcm16) -> VoiceMeasure {
+    let samples = audio.samples();
+    let gains = frame_gains(audio);
+    // The last partial 20 ms frame has no verdict; it takes its neighbour's.
+    let gain_at = |sample: usize| {
+        gains
+            .get(sample / LEVEL_FRAME)
+            .or(gains.last())
+            .copied()
+            .unwrap_or(1.0)
+    };
 
     let mut detector = earshot::Detector::default();
     let mut frame = [0i16; VOICE_FRAME];
     let mut voiced = 0usize;
     let mut peak_score = 0.0f32;
-    for chunk in samples.chunks_exact(VOICE_FRAME) {
-        for (slot, &sample) in frame.iter_mut().zip(chunk) {
-            *slot = (f64::from(sample) * gain)
+    for (index, chunk) in samples.chunks_exact(VOICE_FRAME).enumerate() {
+        let start = index * VOICE_FRAME;
+        for (offset, (slot, &sample)) in frame.iter_mut().zip(chunk).enumerate() {
+            *slot = (f64::from(sample) * gain_at(start + offset))
                 .round()
                 .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
         }

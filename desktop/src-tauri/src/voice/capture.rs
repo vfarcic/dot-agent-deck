@@ -223,6 +223,19 @@ impl Pcm16 {
         detector.measure()
     }
 
+    /// [`SpeechDetector`]'s verdict on every whole 20 ms frame, in order —
+    /// the same rule [`Pcm16::measure_speech`] counts, frame by frame.
+    ///
+    /// [`super::human_voice`] reads it to find the separate sounds in a
+    /// segment, so each can be brought to one level on its own (issue #1450).
+    pub fn speech_frames(&self) -> Vec<bool> {
+        let mut detector = SpeechDetector::default();
+        self.samples
+            .chunks_exact(VAD_FRAME)
+            .map(|frame| detector.push_frame(mean_square(frame)))
+            .collect()
+    }
+
     /// Whether the buffer holds enough speech to be worth transcribing at all.
     ///
     /// The eligibility test in front of every transcription call
