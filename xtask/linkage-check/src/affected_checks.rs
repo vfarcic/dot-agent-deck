@@ -36,11 +36,22 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-/// CLAUDE.md rule 2's two commands and rule 5's per-task tier, verbatim.
-pub(crate) const FULL_GATES: &[&str] = &[
-    "cargo fmt --check",
-    "cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings",
-    "cargo test-fast",
+/// CLAUDE.md rule 2's two commands and rule 5's per-task tier, verbatim, as
+/// argument vectors so `--run` needs no shell.
+pub(crate) const FULL_GATES: &[&[&str]] = &[
+    &["cargo", "fmt", "--check"],
+    &[
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--features",
+        "e2e,e2e-live",
+        "--",
+        "-D",
+        "warnings",
+    ],
+    &["cargo", "test-fast"],
 ];
 
 /// Every xtask package's tests, and no root package or desktop crate.
@@ -49,8 +60,16 @@ pub(crate) const FULL_GATES: &[&str] = &[
 /// is included without anyone editing this line;
 /// `the_workspace_has_no_member_this_helper_does_not_account_for` fails if a
 /// member that is not an xtask appears.
-pub(crate) const XTASK_TESTS: &str =
-    "cargo nextest run --workspace --exclude dot-agent-deck --exclude dot-agent-deck-desktop";
+pub(crate) const XTASK_TESTS: &[&str] = &[
+    "cargo",
+    "nextest",
+    "run",
+    "--workspace",
+    "--exclude",
+    "dot-agent-deck",
+    "--exclude",
+    "dot-agent-deck-desktop",
+];
 
 /// The root package's name, as `-p` takes it.
 const ROOT_PACKAGE: &str = "dot-agent-deck";
@@ -215,13 +234,17 @@ pub(crate) fn classify(path: &str) -> Verdict {
     Verdict::Full("in no text mapping, so the full gates apply (fail safe)")
 }
 
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
 /// The commands a set of changed paths needs, in the order to run them.
 ///
 /// Empty when nothing changed. The full gates when any path is not text.
 /// Otherwise [`XTASK_TESTS`] plus, when a class names any, ONE root-package
 /// command carrying every named test and lib module with the union of their
 /// features, so two classes never build the root package twice.
-pub(crate) fn commands(paths: &[String]) -> Vec<String> {
+pub(crate) fn plan(paths: &[String]) -> Vec<Vec<String>> {
     if paths.is_empty() {
         return Vec::new();
     }
@@ -230,7 +253,7 @@ pub(crate) fn commands(paths: &[String]) -> Vec<String> {
     let mut features = BTreeSet::new();
     for path in paths {
         match classify(path) {
-            Verdict::Full(_) => return FULL_GATES.iter().map(|c| c.to_string()).collect(),
+            Verdict::Full(_) => return FULL_GATES.iter().map(|c| argv(c)).collect(),
             Verdict::Text(class) => {
                 for test in class.root_tests {
                     tests.insert(test.name);
@@ -240,21 +263,21 @@ pub(crate) fn commands(paths: &[String]) -> Vec<String> {
             }
         }
     }
-    let mut out = vec![XTASK_TESTS.to_string()];
+    let mut out = vec![argv(XTASK_TESTS)];
     if tests.is_empty() && modules.is_empty() {
         return out;
     }
-    let mut root = format!("cargo nextest run -p {ROOT_PACKAGE}");
+    let mut root = argv(&["cargo", "nextest", "run", "-p", ROOT_PACKAGE]);
     if !features.is_empty() {
-        root.push_str(" --features ");
-        root.push_str(&features.into_iter().collect::<Vec<_>>().join(","));
+        root.push("--features".to_string());
+        root.push(features.into_iter().collect::<Vec<_>>().join(","));
     }
     if !modules.is_empty() {
-        root.push_str(" --lib");
+        root.push("--lib".to_string());
     }
     for test in &tests {
-        root.push_str(" --test ");
-        root.push_str(test);
+        root.push("--test".to_string());
+        root.push(test.to_string());
     }
     if !modules.is_empty() {
         // `--lib` runs every unit test in the crate unless filtered; keep the
@@ -263,15 +286,57 @@ pub(crate) fn commands(paths: &[String]) -> Vec<String> {
         if !tests.is_empty() {
             filter.insert(0, "kind(test)".to_string());
         }
-        root.push_str(&format!(" -E '{}'", filter.join(" | ")));
+        root.push("-E".to_string());
+        root.push(filter.join(" | "));
     }
     out.push(root);
     out
 }
 
+/// One argument vector as a shell line: an argument with anything outside a
+/// conservative safe set is single-quoted.
+fn shell_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            let safe = !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_-./,=:+@".contains(c));
+            if safe {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`plan`] as shell lines, the form the report prints.
+pub(crate) fn commands(paths: &[String]) -> Vec<String> {
+    plan(paths).iter().map(|c| shell_line(c)).collect()
+}
+
+/// Text that goes inside a `#` comment of the report, with every control
+/// character escaped. A file name may contain a newline, and printed raw it
+/// would end the comment and put the rest of the name on a line of its own —
+/// a command, to anyone who runs the report as a script.
+fn comment_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// The report: every changed path with its verdict as a `#` comment, then the
-/// commands, one per line — so the output is itself a runnable shell script.
+/// commands, one per line — so the output is itself a shell script.
 pub(crate) fn render(origin: &str, paths: &[String]) -> String {
+    let origin = comment_text(origin);
     let mut out = String::new();
     if paths.is_empty() {
         out.push_str(&format!(
@@ -283,9 +348,10 @@ pub(crate) fn render(origin: &str, paths: &[String]) -> String {
         "# affected-checks: {} changed path(s) {origin}\n",
         paths.len()
     ));
-    let width = paths.iter().map(|p| p.len()).max().unwrap_or(0);
+    let shown: Vec<String> = paths.iter().map(|p| comment_text(p)).collect();
+    let width = shown.iter().map(|p| p.chars().count()).max().unwrap_or(0);
     let mut full = false;
-    for path in paths {
+    for (path, shown) in paths.iter().zip(&shown) {
         let why = match classify(path) {
             Verdict::Full(why) => {
                 full = true;
@@ -293,7 +359,7 @@ pub(crate) fn render(origin: &str, paths: &[String]) -> String {
             }
             Verdict::Text(class) => format!("{}: {}", class.name, class.read_by),
         };
-        out.push_str(&format!("#   {path:<width$}  {why}\n"));
+        out.push_str(&format!("#   {shown:<width$}  {why}\n"));
     }
     if full {
         out.push_str(
@@ -323,20 +389,47 @@ pub(crate) fn parse_nul_list(bytes: &[u8]) -> Vec<String> {
 }
 
 /// A path as given on the command line, in the form [`classify`] reads.
+///
+/// Only a leading `./` is dropped. A backslash is left alone: on Unix it is a
+/// legal file-name character, so turning it into `/` could move an unmapped
+/// file into a mapped directory, and a Windows-style path left as typed maps to
+/// nothing and so gets the full gates — the safe side.
 fn normalize_arg(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let mut path = path.as_str();
+    let mut path = path;
     while let Some(rest) = path.strip_prefix("./") {
         path = rest;
     }
     path.to_string()
 }
 
+/// Git's repository-location variables. Each outranks `-C`, and a pre-commit
+/// hook, `rebase --exec` or `bisect run` can set them, so left in place they
+/// could make the diff describe another repository and narrow this one's gates.
+/// The same list `repo_state`'s fixtures clear (issue #834).
+pub(crate) const GIT_LOCATION_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
+
+/// `git -C <root> <args>`, with [`GIT_LOCATION_VARS`] removed so `root` is the
+/// repository it reads.
+fn git_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    for var in GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
+    let out = git_command(root, args)
         .output()
         .map_err(|e| format!("invoke git {}: {e}", args.join(" ")))?;
     if !out.status.success() {
@@ -371,11 +464,43 @@ fn changed_paths(root: &Path, base: &str) -> Result<(String, Vec<String>), Strin
     Ok((merge_base, paths.into_iter().collect()))
 }
 
-const USAGE: &str = "usage: cargo xtask affected-checks [--base <ref>] [PATH...]";
+const USAGE: &str = "usage: cargo xtask affected-checks [--run] [--base <ref>] [PATH...]";
+
+/// Runs each command in order from `root`, stopping at the first that fails.
+/// No shell is involved: every command is an argument vector.
+fn execute(root: &Path, plan: &[Vec<String>]) -> ExitCode {
+    for command in plan {
+        eprintln!("affected-checks: running {}", shell_line(command));
+        match Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(root)
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!(
+                    "affected-checks: `{}` failed ({status})",
+                    shell_line(command)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!(
+                    "affected-checks: cannot start `{}`: {e}",
+                    shell_line(command)
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    eprintln!("affected-checks: all {} command(s) passed", plan.len());
+    ExitCode::SUCCESS
+}
 
 pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
     let mut base = "origin/main".to_string();
     let mut explicit: Vec<String> = Vec::new();
+    let mut execute_plan = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -389,9 +514,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
                 println!("<ref> (default origin/main) and the working tree, untracked files");
                 println!("included; `--base HEAD` narrows it to what is not yet committed.");
                 println!("Rust or a build input selects the full gates, and so does any path");
-                println!("no text mapping covers. The output is a runnable shell script.");
+                println!("no text mapping covers. `--run` runs the checks after printing them,");
+                println!("stopping at the first failure; without it nothing is run.");
                 return ExitCode::SUCCESS;
             }
+            "--run" => execute_plan = true,
             "--base" => match iter.next() {
                 Some(value) => base = value.clone(),
                 None => {
@@ -410,31 +537,37 @@ pub(crate) fn run(root: &Path, args: &[String]) -> ExitCode {
         }
     }
 
-    if !explicit.is_empty() {
+    let (origin, paths) = if explicit.is_empty() {
+        match changed_paths(root, &base) {
+            Ok((merge_base, paths)) => {
+                let short = merge_base.get(..12).unwrap_or(&merge_base).to_string();
+                (format!("against {base} (merge-base {short})"), paths)
+            }
+            Err(e) => {
+                // Fail safe: a change that cannot be computed gets the full
+                // gates, and the exit status says something went wrong.
+                eprintln!("xtask affected-checks: {e}");
+                println!(
+                    "# affected-checks: could not compute the change, so the full gates apply"
+                );
+                for command in FULL_GATES {
+                    println!("{}", shell_line(&argv(command)));
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
         explicit.sort();
         explicit.dedup();
-        print!("{}", render("as given", &explicit));
-        return ExitCode::SUCCESS;
+        ("as given".to_string(), explicit)
+    };
+    print!("{}", render(&origin, &paths));
+    if execute_plan {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        return execute(root, &plan(&paths));
     }
-    match changed_paths(root, &base) {
-        Ok((merge_base, paths)) => {
-            let short = merge_base.get(..12).unwrap_or(&merge_base);
-            print!(
-                "{}",
-                render(&format!("against {base} (merge-base {short})"), &paths)
-            );
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            // Fail safe: a change that cannot be computed gets the full gates.
-            eprintln!("xtask affected-checks: {e}");
-            println!("# affected-checks: could not compute the change, so the full gates apply");
-            for command in FULL_GATES {
-                println!("{command}");
-            }
-            ExitCode::FAILURE
-        }
-    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -452,7 +585,11 @@ mod tests {
     }
 
     fn full() -> Vec<String> {
-        FULL_GATES.iter().map(|c| c.to_string()).collect()
+        FULL_GATES.iter().map(|c| shell_line(&argv(c))).collect()
+    }
+
+    fn xtask() -> String {
+        shell_line(&argv(XTASK_TESTS))
     }
 
     // --- the classification the issue asks for ---------------------------
@@ -504,7 +641,7 @@ mod tests {
             assert_eq!(
                 commands(&paths(&[path])),
                 vec![
-                    XTASK_TESTS.to_string(),
+                    xtask(),
                     "cargo nextest run -p dot-agent-deck --features e2e --lib \
                      --test e2e_cli_docs --test embedded_docs_boundary \
                      -E 'kind(test) | test(/^embedded_docs::/)'"
@@ -523,7 +660,7 @@ mod tests {
             ".claude/skills/pr-create/SKILL.md",
             ".claude/skills/verify-pr/scan.sh",
         ] {
-            assert_eq!(commands(&paths(&[path])), vec![XTASK_TESTS.to_string()]);
+            assert_eq!(commands(&paths(&[path])), vec![xtask()]);
         }
     }
 
@@ -531,16 +668,13 @@ mod tests {
     fn a_workflow_change_runs_the_xtask_tests() {
         assert_eq!(
             commands(&paths(&[".github/workflows/ci.yml"])),
-            vec![XTASK_TESTS.to_string()]
+            vec![xtask()]
         );
-        assert_eq!(
-            commands(&paths(&["renovate.json"])),
-            vec![XTASK_TESTS.to_string()]
-        );
+        assert_eq!(commands(&paths(&["renovate.json"])), vec![xtask()]);
         assert_eq!(
             commands(&paths(&["devbox.json"])),
             vec![
-                XTASK_TESTS.to_string(),
+                xtask(),
                 "cargo nextest run -p dot-agent-deck --test dogfood_config".to_string(),
             ]
         );
@@ -554,7 +688,7 @@ mod tests {
                 "CLAUDE.md",
                 "changelog.d/1.misc.md"
             ])),
-            vec![XTASK_TESTS.to_string()]
+            vec![xtask()]
         );
     }
 
@@ -585,7 +719,7 @@ mod tests {
         assert_eq!(
             commands(&paths(&["devbox.json", "docs/x.md"])),
             vec![
-                XTASK_TESTS.to_string(),
+                xtask(),
                 "cargo nextest run -p dot-agent-deck --features e2e --lib \
                  --test dogfood_config --test e2e_cli_docs --test embedded_docs_boundary \
                  -E 'kind(test) | test(/^embedded_docs::/)'"
@@ -617,7 +751,69 @@ mod tests {
         );
         assert!(parse_nul_list(b"").is_empty());
         assert_eq!(normalize_arg("./docs/x.md"), "docs/x.md");
-        assert_eq!(normalize_arg("docs\\x.md"), "docs/x.md");
+        // A backslash is a file-name character on Unix, so it is kept, and the
+        // unmapped root-level file it names gets the full gates.
+        assert_eq!(normalize_arg("docs\\x.md"), "docs\\x.md");
+        assert!(matches!(
+            classify(&normalize_arg("docs\\x.md")),
+            Verdict::Full(_)
+        ));
+    }
+
+    #[test]
+    fn the_full_gates_print_as_the_commands_claude_md_names() {
+        assert_eq!(
+            full(),
+            vec![
+                "cargo fmt --check",
+                "cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings",
+                "cargo test-fast",
+            ]
+        );
+        assert_eq!(
+            xtask(),
+            "cargo nextest run --workspace --exclude dot-agent-deck --exclude dot-agent-deck-desktop"
+        );
+    }
+
+    #[test]
+    fn a_file_name_cannot_put_a_command_line_into_the_report() {
+        // A changed path, and a `--base` value, each carrying a newline and a
+        // command: printed raw, `touch pwned` would be a line of the script.
+        let changed = paths(&["docs/x.md\ntouch pwned\n#", "CLAUDE.md"]);
+        let report = render("against x\rtouch pwned2\n", &changed);
+        let lines: Vec<&str> = report
+            .split(['\n', '\r'])
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(lines, commands(&changed), "{report}");
+        assert!(report.contains("docs/x.md\\ntouch pwned\\n#"), "{report}");
+    }
+
+    #[test]
+    fn shell_lines_quote_what_a_shell_would_split_or_expand() {
+        assert_eq!(
+            shell_line(&argv(&["a", "-E", "kind(test) | x", "it's", ""])),
+            "a -E 'kind(test) | x' 'it'\\''s' ''"
+        );
+    }
+
+    #[test]
+    fn git_runs_without_the_ambient_repository_location_variables() {
+        let command = git_command(Path::new("/repo"), &["diff"]);
+        let removed: Vec<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for var in GIT_LOCATION_VARS {
+            assert!(removed.iter().any(|r| r == var), "{var} is not removed");
+        }
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-C", "/repo", "diff"]);
     }
 
     // --- the guard: the mapping cannot silently go stale -----------------
@@ -1091,7 +1287,9 @@ mod tests {
         }
         for (_, package) in PARTLY_RUN_CRATES {
             assert!(
-                XTASK_TESTS.contains(&format!("--exclude {package}")),
+                XTASK_TESTS
+                    .windows(2)
+                    .any(|pair| pair == ["--exclude", *package]),
                 "XTASK_TESTS must exclude {package}"
             );
         }
