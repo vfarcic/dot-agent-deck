@@ -804,7 +804,8 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     // Issue #1540: the deck's last New-agent-form command, loaded from this
     // daemon's state directory so it survives a restart. A missing or bad file
-    // loads as "none" and never stops the daemon; see `crate::last_command`.
+    // — and, on Unix, a symlink or a file another user owns — loads as "none"
+    // and never stops the daemon; see `crate::last_command`.
     // Read synchronously, like `schedules.toml` below: one small, bounded,
     // `O_NONBLOCK` read before the daemon serves anything.
     {

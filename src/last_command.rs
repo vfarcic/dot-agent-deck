@@ -28,6 +28,18 @@
 //! that the in-memory copy is authoritative and every change is written
 //! through.
 //!
+//! **What the loader refuses.** The file is a value the form offers back and
+//! the user then starts, so on Unix the loader opens it `O_NOFOLLOW` and
+//! judges the open handle: a symlink, a file that is not regular, or one not
+//! owned by the daemon's effective uid loads as "no last command" with a
+//! fixed log line that carries none of its contents. So another local user
+//! who can write the state directory can delete or replace the file, but a
+//! file they put there, or a link they point it through, is not offered. The
+//! check is made on the file at load only; the state directory's own
+//! permissions are not checked. On Windows the loader applies only the
+//! regular-file and size checks and follows a symlink; no ownership check is
+//! made there.
+//!
 //! **The state directory is the deck's persistence identity**, not its
 //! endpoint — the precedent `schedules.toml` (found by the config directory)
 //! and `daemon.log` / `spawn.lock` (in the same state directory) already set.
@@ -37,8 +49,8 @@
 //! `DOT_AGENT_DECK_STATE_DIR`s.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,18 +99,28 @@ pub fn is_recordable(command: &str) -> bool {
 /// One per daemon, installed on its `AppState` at startup
 /// ([`crate::state::AppState::set_last_command_store`]). Every method that
 /// writes is **blocking** file I/O, so the dispatch calls them from a blocking
-/// thread. The value and the file are changed under one lock, so the file
-/// always ends up holding the last value set, even when two starts race.
+/// thread. Writers are serialised by one lock held across the write, so the
+/// file always ends up holding the last value set, even when two starts race.
+/// Readers never take that lock: [`Self::get`] reads a separate snapshot that
+/// is only ever held for a clone or an assignment, so a form asking for the
+/// value never waits on a disk write.
 #[derive(Debug)]
 pub struct LastCommandStore {
     path: PathBuf,
-    value: Mutex<Option<String>>,
+    /// What [`Self::get`] returns. Locked only briefly, never across I/O.
+    value: RwLock<Option<String>>,
+    /// Held by a writer for the whole of a record or seed, file write
+    /// included. `true` while `value` holds something the last write failed
+    /// to persist, so the next record or seed of that same value writes it
+    /// again rather than reporting it unchanged.
+    writer: Mutex<bool>,
 }
 
 /// What [`LastCommandStore::record`] / [`LastCommandStore::seed`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
-    /// The value was set (in memory, and written to disk).
+    /// The value was set in memory and written to disk — including a retry
+    /// that persisted a value an earlier failed write left only in memory.
     Set,
     /// Nothing changed: the command is not recordable, or — for a seed — the
     /// daemon already has a value.
@@ -117,12 +139,21 @@ impl LastCommandStore {
     /// Never fails: a missing file is "no last command", and an unreadable,
     /// oversized, non-regular or malformed one is logged and treated the same
     /// way — the value is a convenience, and a bad file must not stop the
-    /// daemon starting. A loaded value that [`is_recordable`] rejects is
-    /// dropped as well, so nothing reaches a form that a start could not have
-    /// recorded.
+    /// daemon starting. So, on Unix, is a symlink or a file another user owns
+    /// (the module doc has what that check does and does not cover). A loaded
+    /// value that [`is_recordable`] rejects is dropped as well, so nothing
+    /// reaches a form that a start could not have recorded.
     pub fn load(path: PathBuf) -> Self {
-        let value = match crate::bounded_read::read_config_file(&path, MAX_FILE_BYTES) {
+        let value = match read_store_file(&path, current_uid()) {
             Ok(None) => None,
+            Err(StoreFileError::Refused(reason)) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason,
+                    "ignoring a last-command file this daemon does not trust"
+                );
+                None
+            }
             Ok(Some(text)) => match toml::from_str::<Persisted>(&text) {
                 Ok(persisted) => persisted.last_command.filter(|c| is_recordable(c)),
                 Err(error) => {
@@ -137,7 +168,7 @@ impl LastCommandStore {
                     None
                 }
             },
-            Err(error) => {
+            Err(StoreFileError::Io(error)) => {
                 tracing::warn!(
                     path = %path.display(),
                     %error,
@@ -148,7 +179,8 @@ impl LastCommandStore {
         };
         Self {
             path,
-            value: Mutex::new(value),
+            value: RwLock::new(value),
+            writer: Mutex::new(false),
         }
     }
 
@@ -157,9 +189,10 @@ impl LastCommandStore {
         &self.path
     }
 
-    /// The deck's last command, if it has one. Never blocks on I/O.
+    /// The deck's last command, if it has one. Never waits on I/O: it takes
+    /// only the snapshot lock, which no writer holds across a file write.
     pub fn get(&self) -> Option<String> {
-        self.lock().clone()
+        self.read_value().clone()
     }
 
     /// Record `command` as the deck's last command, replacing any value.
@@ -168,43 +201,168 @@ impl LastCommandStore {
     /// A command [`is_recordable`] rejects changes nothing. When the write to
     /// disk fails the in-memory value is still updated — the clients of this
     /// daemon still share it until it restarts — and the error is returned for
-    /// the caller to log.
+    /// the caller to log; the next record of the same command then writes it
+    /// again instead of reporting it unchanged.
     pub fn record(&self, command: &str) -> Result<StoreOutcome, String> {
         if !is_recordable(command) {
             return Ok(StoreOutcome::Unchanged);
         }
-        let mut value = self.lock();
-        if value.as_deref() == Some(command) {
+        let mut unsaved = self.lock_writer();
+        if !*unsaved && self.read_value().as_deref() == Some(command) {
             return Ok(StoreOutcome::Unchanged);
         }
-        *value = Some(command.to_string());
-        write_atomic(&self.path, command)?;
-        Ok(StoreOutcome::Set)
+        self.write_through(&mut unsaved, command)
     }
 
     /// Set `command` only when the daemon has no last command yet — how a
     /// client hands over a value it kept before the daemon owned one, without
     /// overwriting a newer one another client already recorded. **Blocking.**
+    ///
+    /// A failed write behaves as it does for [`Self::record`]: the value is
+    /// kept in memory, and a later seed of the same command writes it again.
     pub fn seed(&self, command: &str) -> Result<StoreOutcome, String> {
         if !is_recordable(command) {
             return Ok(StoreOutcome::Unchanged);
         }
-        let mut value = self.lock();
-        if value.is_some() {
+        let mut unsaved = self.lock_writer();
+        let retry = *unsaved && self.read_value().as_deref() == Some(command);
+        if !retry && self.read_value().is_some() {
             return Ok(StoreOutcome::Unchanged);
         }
-        *value = Some(command.to_string());
-        write_atomic(&self.path, command)?;
-        Ok(StoreOutcome::Set)
+        self.write_through(&mut unsaved, command)
     }
 
-    /// Poison-tolerant: an `Option<String>` has nothing a panic could leave
-    /// half-written.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    /// Publish `command` to readers, then write it to disk, with the writer
+    /// lock (`unsaved`) held by the caller throughout. The snapshot is updated
+    /// first so the clients share the value even if the write fails.
+    fn write_through(&self, unsaved: &mut bool, command: &str) -> Result<StoreOutcome, String> {
+        *self.write_value() = Some(command.to_string());
+        let written = write_atomic(&self.path, command);
+        *unsaved = written.is_err();
+        written.map(|()| StoreOutcome::Set)
+    }
+
+    // All three locks are poison-tolerant: an `Option<String>` or a `bool`
+    // has nothing a panic could leave half-written.
+
+    fn read_value(&self) -> std::sync::RwLockReadGuard<'_, Option<String>> {
         self.value
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_value(&self) -> std::sync::RwLockWriteGuard<'_, Option<String>> {
+        self.value
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Why [`read_store_file`] produced no value.
+#[derive(Debug)]
+enum StoreFileError {
+    /// The file could not be read, or is not a regular file within
+    /// [`MAX_FILE_BYTES`].
+    Io(std::io::Error),
+    /// The file is one the daemon declines to trust (Unix only): a symlink,
+    /// or owned by another user. A fixed description, never file contents.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Refused(&'static str),
+}
+
+impl From<std::io::Error> for StoreFileError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// The daemon's effective uid, which the store file must be owned by.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Read [`LAST_COMMAND_FILE`] at `path`: `Ok(None)` when it does not exist.
+///
+/// On Unix the file is opened `O_NOFOLLOW | O_NONBLOCK` and judged from the
+/// open handle, so what is checked is what is read: a symlink at `path` is
+/// refused rather than followed, and the opened file must be regular, owned by
+/// `owner_uid`, and at most [`MAX_FILE_BYTES`] long. `owner_uid` is a parameter
+/// so a test can stand in for "another user" without being root. Elsewhere this
+/// is [`crate::bounded_read::read_config_file`], which follows symlinks and
+/// checks no owner.
+#[cfg(unix)]
+fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+    use std::io::{Error, ErrorKind, Read as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        // `O_NOFOLLOW` fails a symlink with `ELOOP` (Linux, macOS) or `EMLINK`
+        // (FreeBSD). Confirm it from the path rather than trust the errno: the
+        // open has already failed, so nothing is read either way.
+        Err(error) => {
+            return Err(
+                if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    StoreFileError::Refused("it is a symbolic link")
+                } else {
+                    StoreFileError::Io(error)
+                },
+            );
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StoreFileError::Io(Error::new(
+            ErrorKind::InvalidInput,
+            "it is not a regular file",
+        )));
+    }
+    if metadata.uid() != owner_uid {
+        return Err(StoreFileError::Refused(
+            "it is owned by another user than the daemon's",
+        ));
+    }
+    let too_large = || {
+        StoreFileError::Io(Error::new(
+            ErrorKind::InvalidData,
+            format!("it is larger than the {MAX_FILE_BYTES}-byte limit"),
+        ))
+    };
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| StoreFileError::Io(Error::new(ErrorKind::InvalidData, error.utf8_error())))
+}
+
+#[cfg(not(unix))]
+fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+    Ok(crate::bounded_read::read_config_file(path, MAX_FILE_BYTES)?)
 }
 
 /// The 1-based line a parse of [`LAST_COMMAND_FILE`] failed on, or `0` when the
@@ -496,5 +654,131 @@ mod tests {
         let as_dir = dir.path().join("a-directory");
         std::fs::create_dir(&as_dir).unwrap();
         assert_eq!(LastCommandStore::load(as_dir).get(), None);
+    }
+
+    /// Scenario (issue #1540): a record whose disk write fails still updates
+    /// the value the forms are offered, and recording the same command again
+    /// once the write can succeed persists it rather than reporting it
+    /// unchanged. The same holds for a seed.
+    #[test]
+    fn a_failed_write_is_retried_by_the_next_equal_record_or_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LAST_COMMAND_FILE);
+        // A non-empty directory where the file belongs: the rename into place
+        // fails on every platform.
+        let block = || {
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("occupant"), b"x").unwrap();
+        };
+        let unblock = || std::fs::remove_dir_all(&path).unwrap();
+
+        let store = LastCommandStore::load(path.clone());
+        block();
+        assert!(store.record("claude").is_err(), "the write must fail");
+        assert_eq!(store.get().as_deref(), Some("claude"));
+        assert!(
+            store.record("claude").is_err(),
+            "an equal record retries the write instead of reporting Unchanged"
+        );
+        unblock();
+        assert_eq!(store.record("claude").unwrap(), StoreOutcome::Set);
+        assert_eq!(
+            LastCommandStore::load(path.clone()).get().as_deref(),
+            Some("claude")
+        );
+        assert_eq!(store.record("claude").unwrap(), StoreOutcome::Unchanged);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LAST_COMMAND_FILE);
+        let store = LastCommandStore::load(path.clone());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupant"), b"x").unwrap();
+        assert!(store.seed("from-session-toml").is_err());
+        assert_eq!(store.get().as_deref(), Some("from-session-toml"));
+        assert_eq!(
+            store.seed("another").unwrap(),
+            StoreOutcome::Unchanged,
+            "the daemon has a value, so a different seed is still refused"
+        );
+        std::fs::remove_dir_all(&path).unwrap();
+        assert_eq!(store.seed("from-session-toml").unwrap(), StoreOutcome::Set);
+        assert_eq!(
+            LastCommandStore::load(path).get().as_deref(),
+            Some("from-session-toml")
+        );
+        assert_eq!(
+            store.seed("from-session-toml").unwrap(),
+            StoreOutcome::Unchanged
+        );
+    }
+
+    /// Scenario (issue #1540): while a writer holds the store across its disk
+    /// write, a form asking for the last command still gets an answer at once.
+    #[test]
+    fn get_does_not_wait_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store_in(&dir));
+        store.record("claude").unwrap();
+        let writer = store.lock_writer();
+        let reader = std::sync::Arc::clone(&store);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(reader.get()).unwrap());
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("get blocked on the writer lock");
+        drop(writer);
+        assert_eq!(got.as_deref(), Some("claude"));
+    }
+
+    /// Scenario (issue #1540): a last-command file reached through a symlink
+    /// is not offered — not even when the link points at a well-formed file —
+    /// and the log says why without quoting the command.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_loads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("planted.toml");
+        std::fs::write(&target, "last_command = \"planted --secret\"\n").unwrap();
+        let path = dir.path().join(LAST_COMMAND_FILE);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(matches!(
+            read_store_file(&path, current_uid()),
+            Err(StoreFileError::Refused(_))
+        ));
+        assert_eq!(LastCommandStore::load(path.clone()).get(), None);
+
+        // The next record replaces the link with a file of the daemon's own,
+        // and leaves the link's target alone.
+        let store = LastCommandStore::load(path.clone());
+        store.record("claude").unwrap();
+        assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(
+            LastCommandStore::load(path).get().as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "last_command = \"planted --secret\"\n"
+        );
+    }
+
+    /// Scenario (issue #1540): a last-command file owned by another user than
+    /// the daemon's is refused, while the same file owned by the daemon's user
+    /// loads. "Another user" is stood in for by asking for a different owner
+    /// uid, since changing a file's owner needs root.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_owned_by_another_user_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LAST_COMMAND_FILE);
+        std::fs::write(&path, "last_command = \"claude\"\n").unwrap();
+        assert_eq!(
+            read_store_file(&path, current_uid()).unwrap().as_deref(),
+            Some("last_command = \"claude\"\n")
+        );
+        assert!(matches!(
+            read_store_file(&path, current_uid().wrapping_add(1)),
+            Err(StoreFileError::Refused(_))
+        ));
     }
 }

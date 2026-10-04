@@ -5518,13 +5518,12 @@ async fn handle_connection(
             {
                 Ok(mut options) => {
                     // Issue #1540: the deck's last command, from the daemon's
-                    // in-memory copy — no I/O, so it is read here rather than
-                    // inside the blocking query.
-                    options.last_command = state
-                        .read()
-                        .await
-                        .last_command_store()
-                        .and_then(|store| store.get());
+                    // in-memory snapshot — `get` takes no lock a writer holds
+                    // across disk I/O, so it is read here rather than inside
+                    // the blocking query. The store is bound first so the
+                    // `AppState` guard is released before it is read.
+                    let store = state.read().await.last_command_store();
+                    options.last_command = store.and_then(|store| store.get());
                     let mut resp = AttachResponse::ok();
                     resp.new_agent_options = Some(options);
                     resp
@@ -5544,7 +5543,10 @@ async fn handle_connection(
         // Issue #1540: set the deck's last command only if it has none. `ok`
         // whether or not it was taken — the caller has nothing to do either way.
         AttachRequest::SeedLastCommand { command } => {
-            if let Some(store) = state.read().await.last_command_store() {
+            // Bound in its own statement so the `AppState` read guard is
+            // dropped before the blocking seed is awaited.
+            let store = state.read().await.last_command_store();
+            if let Some(store) = store {
                 let outcome = tokio::task::spawn_blocking(move || store.seed(&command)).await;
                 match outcome {
                     Ok(Ok(_)) => {}
@@ -5565,6 +5567,8 @@ async fn handle_connection(
 /// test harness — records nothing. Never fails the caller: the start it follows
 /// has already been accepted.
 async fn record_last_command(state: &SharedState, command: String) {
+    // `let … else` drops the `AppState` read guard at the end of this
+    // statement, before the blocking record is awaited.
     let Some(store) = state.read().await.last_command_store() else {
         return;
     };
