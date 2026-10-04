@@ -6607,40 +6607,55 @@ struct RegistryInner {
     exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
 }
 
-/// Issue #1396 item 3 (Qodo, PR #1557): undoes a prepared start's pane binding
-/// ([`RegistryInner::prepared_pane_dirs`]) unless the start published an agent.
+/// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
 ///
-/// The binding is recorded under the lock that reserves the pane, before the
-/// fork, so every failure after that point — the spawn itself, the shutdown
-/// latch, the duplicate check — would otherwise leave the pane bound to a
-/// directory no agent ever ran in, and a later plain start there in another
-/// directory would be refused as a stale preparation. `Drop` restores whatever
-/// binding the pane had before (a re-prepared start replaces one), or removes
-/// it. It takes the registry lock, so it must be declared BEFORE any guard of
-/// that lock in the same scope: locals drop in reverse order, so the lock guard
-/// is released first. The success path calls [`Self::commit`] instead.
-#[cfg(unix)]
-struct PreparedBindingUndo<'a> {
+/// `Drop` releases it by taking the registry lock, which is correct for every
+/// path that is NOT already holding it. The post-spawn path *is* — `spawn_agent`
+/// holds `inner` from the post-spawn acquisition through `agents.insert` — so it
+/// calls [`Self::publish_locked`] or [`Self::abandon_locked`] instead, which
+/// consume the guard and disarm `Drop` (a second lock acquisition on a
+/// `std::sync::Mutex` would deadlock).
+///
+/// Issue #1396 item 3 (Qodo, PR #1557): it also carries the undo of a prepared
+/// start's pane binding ([`RegistryInner::prepared_pane_dirs`]), which is
+/// recorded under the same lock as the reservation, before the fork. A start
+/// that never publishes its agent restores the binding the pane had before (a
+/// re-prepared start replaces one) or removes it, and does so in the SAME lock
+/// hold that gives the pane up: undone any later, another start could reserve
+/// the pane, bind it and publish in between, and the undo would then overwrite
+/// that start's binding.
+struct SpawnReservation<'a> {
     registry: &'a AgentPtyRegistry,
-    /// The pane, and the binding it had before this start; `None` when this
-    /// start recorded no binding, or once committed.
-    prior: Option<(String, Option<crate::prep_token::InodeIdentity>)>,
+    id: Option<String>,
+    /// The pane, and its binding before this start; `None` when this start
+    /// recorded no binding.
+    #[cfg(unix)]
+    prior_binding: Option<(String, Option<crate::prep_token::InodeIdentity>)>,
 }
 
-#[cfg(unix)]
-impl PreparedBindingUndo<'_> {
-    /// Keep the binding: the start published its agent.
-    fn commit(mut self) {
-        self.prior = None;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for PreparedBindingUndo<'_> {
-    fn drop(&mut self) {
-        if let Some((pane, prior)) = self.prior.take()
-            && let Ok(mut inner) = self.registry.inner.lock()
+impl<'a> SpawnReservation<'a> {
+    /// The agent is published: give up the reservation and keep the binding,
+    /// while the caller holds the registry lock.
+    fn publish_locked(mut self, inner: &mut RegistryInner) {
+        #[cfg(unix)]
         {
+            self.prior_binding = None;
+        }
+        self.give_up(inner);
+    }
+
+    /// The start was refused after the fork: give up the reservation and undo
+    /// the binding, while the caller holds the registry lock.
+    fn abandon_locked(mut self, inner: &mut RegistryInner) {
+        self.give_up(inner);
+    }
+
+    fn give_up(&mut self, inner: &mut RegistryInner) {
+        if let Some(id) = self.id.take() {
+            inner.pending_spawns.remove(&id);
+        }
+        #[cfg(unix)]
+        if let Some((pane, prior)) = self.prior_binding.take() {
             match prior {
                 Some(identity) => {
                     inner.prepared_pane_dirs.insert(pane, identity);
@@ -6653,35 +6668,18 @@ impl Drop for PreparedBindingUndo<'_> {
     }
 }
 
-/// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
-///
-/// `Drop` releases it by taking the registry lock, which is correct for every
-/// path that is NOT already holding it. The success path *is* — `spawn_agent`
-/// holds `inner` from the post-spawn acquisition through `agents.insert` — so it
-/// calls [`Self::release_locked`] instead, which consumes the guard and disarms
-/// `Drop` (a second lock acquisition on a `std::sync::Mutex` would deadlock).
-struct SpawnReservation<'a> {
-    registry: &'a AgentPtyRegistry,
-    id: Option<String>,
-}
-
-impl<'a> SpawnReservation<'a> {
-    /// Release the reservation while the caller already holds the registry lock.
-    fn release_locked(mut self, inner: &mut RegistryInner) {
-        if let Some(id) = self.id.take() {
-            inner.pending_spawns.remove(&id);
-        }
-    }
-}
-
 impl Drop for SpawnReservation<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
+        #[cfg(unix)]
+        let armed = self.id.is_some() || self.prior_binding.is_some();
+        #[cfg(not(unix))]
+        let armed = self.id.is_some();
+        if armed {
             // A poisoned lock means some other thread panicked mid-mutation;
             // there is nothing useful to do here and panicking in `Drop` would
             // abort. The stale entry is bounded by one per panicking spawn.
             if let Ok(mut inner) = self.registry.inner.lock() {
-                inner.pending_spawns.remove(&id);
+                self.give_up(&mut inner);
             }
         }
     }
@@ -10043,7 +10041,7 @@ impl AgentPtyRegistry {
         // it is the one that is atomic with the `agents.insert`, and this one is
         // not a substitute for it.
         #[cfg(unix)]
-        let mut prepared_binding = None;
+        let mut prior_binding = None;
         let preallocated_id = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref candidate) = pane_id_env
@@ -10080,27 +10078,22 @@ impl AgentPtyRegistry {
             // Issue #1396 item 3: bind the pane to the directory its prepared
             // start verified, under the same lock and before the fork, for the
             // reason the token requirement above is recorded here.
-            // Undone if this start never publishes its agent
-            // ([`PreparedBindingUndo`]).
+            // Undone, with the reservation, if this start never publishes its
+            // agent ([`SpawnReservation`]).
             #[cfg(unix)]
             if let (Some(pane), Some(dir)) = (pane_id_env.as_ref(), dir) {
                 let prior = inner
                     .prepared_pane_dirs
                     .insert(pane.clone(), dir.identity());
-                prepared_binding = Some((pane.clone(), prior));
+                prior_binding = Some((pane.clone(), prior));
             }
             id
-        };
-        // Declared before the post-spawn `inner` guard below, so that guard is
-        // released before this one's `Drop` takes the lock.
-        #[cfg(unix)]
-        let prepared_binding = PreparedBindingUndo {
-            registry: self,
-            prior: prepared_binding,
         };
         let reservation = SpawnReservation {
             registry: self,
             id: Some(preallocated_id.clone()),
+            #[cfg(unix)]
+            prior_binding,
         };
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -10180,11 +10173,11 @@ impl AgentPtyRegistry {
         let spawned_at = chrono::Utc::now();
         let mut inner = self.inner.lock().unwrap();
         // Issue #454: hand ownership over from the reservation to `agents`
-        // WITHOUT releasing the lock in between — every early return below has
-        // already given up on this spawn, and the success path inserts under
-        // this very acquisition. Released here rather than via `Drop` because
-        // `Drop` would try to take a lock this scope already holds.
-        reservation.release_locked(&mut inner);
+        // WITHOUT releasing the lock in between — each early return below gives
+        // the reservation up (and undoes a prepared binding) under this
+        // acquisition, and the success path publishes and inserts under it.
+        // Never via `Drop` here, because `Drop` would try to take a lock this
+        // scope already holds.
 
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
         // shutdown latch *inside* the inner lock, so the check + insert
@@ -10199,6 +10192,7 @@ impl AgentPtyRegistry {
         // the insert. On Err the `guard` Drop kills the child we just
         // spawned, so the rejection doesn't leak a PTY.
         if self.shutting_down.load(Ordering::SeqCst) {
+            reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
         }
 
@@ -10237,12 +10231,12 @@ impl AgentPtyRegistry {
                     && !a.exited.load(Ordering::SeqCst)
             })
         {
+            reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
         }
         // Every refusal is behind us and the insert below cannot fail, so the
         // pane keeps the binding this start recorded.
-        #[cfg(unix)]
-        prepared_binding.commit();
+        reservation.publish_locked(&mut inner);
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
         // box that no longer exists. Left behind it could only refuse this
