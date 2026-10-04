@@ -418,6 +418,24 @@ export function isUnsupportedFlagFailure(outcome: ExecOutcome): boolean {
 	return outcome.code === 2 && /^error: unexpected argument '--/.test((outcome.stderr ?? "").trimStart());
 }
 
+/**
+ * A queue that runs each task only after every earlier one has finished, in
+ * the order they were enqueued, whatever each one's outcome. The extension
+ * sends every card report through one, so a report — including an older-CLI
+ * retry — can never reach the deck after a report Pi emitted later (a slow
+ * `agent_start` retry landing after `agent_settled` would leave a settled card
+ * on Thinking). Pi awaits each handler before emitting its next event today;
+ * the queue keeps the order from depending on that.
+ */
+export function createSerialQueue(): <T>(task: () => Promise<T>) => Promise<T> {
+	let tail: Promise<unknown> = Promise.resolve();
+	return <T>(task: () => Promise<T>): Promise<T> => {
+		const run = tail.then(task, task);
+		tail = run.catch(() => undefined);
+		return run;
+	};
+}
+
 /** Minimal shape of a `dot-agent-deck` CLI exec result (subset of Pi's ExecResult). */
 export interface ExecOutcome {
 	code: number;

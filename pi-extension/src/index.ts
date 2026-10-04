@@ -28,6 +28,7 @@ import {
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
+	createSerialQueue,
 	execFailureMessage,
 	isAgentState,
 	isUnsupportedFlagFailure,
@@ -148,7 +149,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// socket error) still gets the bare retry for that one report but leaves
 	// the session's detail reporting on.
 	let legacyCli = false;
-	const report = async (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
+	// Every report, with its retry, runs to completion before the next one
+	// starts, so the deck receives them in the order Pi emitted them.
+	const inOrder = createSerialQueue();
+	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> =>
+		inOrder(() => reportNow(eventName, event, ctx));
+	const reportNow = async (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
 		const decided = piEventReport(eventName, event, ctx.cwd);
 		if (!decided) {
 			return;

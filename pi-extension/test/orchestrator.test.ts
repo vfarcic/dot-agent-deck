@@ -24,6 +24,7 @@ import {
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
+	createSerialQueue,
 	DECK_BIN,
 	DECK_EXE_ENV,
 	execFailureMessage,
@@ -480,5 +481,34 @@ describe("issue #622: falling back for a CLI older than the extension", () => {
 				stderr: "Failed to send agent-event for /work/error: unexpected argument '--x'",
 			}),
 		);
+	});
+});
+
+describe("issue #622: reports reach the deck in the order Pi emitted them", () => {
+	const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	test("a slow earlier report finishes before a fast later one starts", async () => {
+		const inOrder = createSerialQueue();
+		const log: string[] = [];
+		const first = inOrder(async () => {
+			log.push("agent_start:begin");
+			await delay(30); // e.g. a failed detailed report plus its bare retry
+			log.push("agent_start:end");
+		});
+		const second = inOrder(async () => {
+			log.push("agent_settled:begin");
+			log.push("agent_settled:end");
+		});
+		await Promise.all([first, second]);
+		assert.deepEqual(log, ["agent_start:begin", "agent_start:end", "agent_settled:begin", "agent_settled:end"]);
+	});
+
+	test("a failed report does not stop the ones after it", async () => {
+		const inOrder = createSerialQueue();
+		const failed = inOrder(async () => {
+			throw new Error("daemon down");
+		});
+		await assert.rejects(failed, /daemon down/);
+		assert.equal(await inOrder(async () => "next"), "next");
 	});
 });
