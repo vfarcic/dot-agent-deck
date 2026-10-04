@@ -1,6 +1,6 @@
 # PRD #1541: Voice control of the open agent's prompt — interrupt, clear, scratch that
 
-**Status**: Draft
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-10-03
 **Issue**: [#1541](https://github.com/vfarcic/dot-agent-deck/issues/1541)
@@ -61,9 +61,40 @@ Each is delivered as the keys that do that job **for the agent in the pane**. Ag
 - **Visible outcome, staleness rules unchanged.** Each command reports what it did, and follows the existing voice rules: nothing runs if the pane on screen changed, a confirmation is open, or the agent was replaced while the app was working out what was said.
 - **Where phrases are decided.** Today, send phrases and "type on/off" are matched on this machine and never reach the Commands service. M1 decides whether the new phrases join that local set, and `docs/desktop/voice.md`'s "What is sent where" is updated to match.
 
+## M1 decisions (recorded 2026-10-04, with the user)
+
+These answer the M1 milestone and the open questions below. Where they differ from earlier sections of this document, these win.
+
+1. **Experimental flag (CLAUDE.md rule 9): no.** The commands ship visible, like the rest of voice control.
+2. **Typing mode decides what a word means, and all three commands live only in typing mode.** With typing mode on, the user is talking *to the agent about its prompt*, so prompt words are commands there. With it off, the user is running *the app*, and the agent screen keeps its app commands. A phrase belongs to exactly one mode. Commands that end an agent or close something (`stop_agent`, and whatever #1402 adds) are **not** reachable in typing mode until the user says "typing off", which is already true today because typing mode types everything it does not recognise.
+3. **Matching is local and whole-utterance.** The phrases join the on-machine lists in `desktop/src-tauri/src/voice/dictation.rs` and are matched by `dictation_intercept` the way "send" and "typing off" are: the whole utterance, less an edge politeness word, must equal a listed phrase. "Scratch the last prompt" said alone is a command; "we should work on the scratch feature" is typed; a command word inside a sentence never fires; and "type …" (the dictation opener) always types what follows. Nothing new is sent to the Commands service. `docs/desktop/voice.md`'s "What is sent where" and the in-app disclosure are updated to say so.
+4. **Phrases (typing mode only).**
+   - **Interrupt:** "interrupt", "interrupt it", "interrupt that", "stop", "stop it", "stop that". A bare "stop" in typing mode therefore interrupts; "stop typing" and "stop listening" keep their meanings (distinct whole phrases).
+   - **Clear the prompt:** "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything", "delete everything".
+   - **Scratch that:** "scratch that", "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that".
+   - **Outside typing mode**, the interrupt-only, clear and scratch phrases ("interrupt", "clear the prompt", "scratch that", …) run nothing and the row says to say "typing on" first. A bare "stop" outside typing mode is left to #1402, which was updated on 2026-10-04 to make it end the open agent behind the stop confirmation; until #1402 lands it keeps today's answer.
+5. **Interrupt asks for no confirmation.** In every supported agent it ends the turn and keeps the agent, its session and any draft typed mid-turn, so a mishearing is recoverable.
+6. **Repeat guard.** A repeated interrupt reaching an idle agent is harmful (it opens Rewind in Claude Code, the transcript browser in Codex, the Session Tree in Pi on an empty prompt, and clears the draft in Claude Code). So interrupt is sent only while the agent's status says it is working, and a second interrupt to the same pane within a few seconds of the first is refused rather than sent.
+7. **Where the keys live (rule 18): the deck.** The per-agent keys are defined in `src/agent_registry.rs` and served by the daemon as an additive optional field on `AgentRecord` (no `PROTOCOL_VERSION` bump, the `cli_name` precedent of #856), so a deck answers for the agent versions on its own host. The desktop sends the bytes over the existing terminal-input path. A deck too old to send the field gets the command refused with a reason.
+8. **Undo for clear: yes, when known.** The existing Undo button re-types the cleared text only when every character of the prompt came from voice since the last send, clear or interrupt in that pane; any keyboard input in the pane disables it, and the row then says the clear cannot be undone.
+9. **Devin: unsupported for all three commands**, named in `docs/desktop/voice.md` (rule 20). It is logged out on the box where the keys were measured, so none of its keys could be verified; revisit when someone measures it logged in.
+
+### Verified per-agent key table
+
+Measured 2026-10-03 in a private tmux server, cheap models, versions from `--version`.
+
+| | Claude Code 2.1.289 | Codex 0.160.0 | OpenCode 1.18.34 | Pi 0.87.1 | Devin 3000.11.3 |
+| --- | --- | --- | --- | --- | --- |
+| Interrupt | `ESC` once | `ESC` once | `ESC`, ~0.3 s pause, `ESC` (the first only arms "esc again") | `ESC` once | unsupported (not measured) |
+| Clear | `Ctrl+U` (0x15), one per wrapped screen row; a single write of 64 or more is ignored, so send in writes of at most 32 | `Ctrl+U`, one per line | `Ctrl+U`, one per line | `Ctrl+U`, one per line | unsupported (not measured) |
+| Delete one character | `DEL` (0x7f) | `DEL` | `DEL` | `DEL` | unsupported (not measured) |
+| Paste collapse of an unbracketed write | more than 800 characters becomes `[Pasted text #N]` | more than 1000 becomes `[Pasted Content …]` | never | never | unknown |
+
+Extra `Ctrl+U` presses on an empty prompt are harmless in all four measured agents, so clear may over-count. `Ctrl+C` is never used: on an empty prompt it quits Codex and OpenCode outright. "Scratch that" removes the last voice write with `DEL` × its character count, and refuses a write longer than 800 characters, where Claude Code and Codex may have collapsed it.
+
 ## Milestones
 
-- [ ] **M1 — Decisions recorded.** The rule 9 experimental-flag answer; the phrases for each command and what a bare "stop" means in a pane; the verified per-agent key table (Claude Code, OpenCode, Codex, Pi, Devin) with the agent versions checked and the unsupported cells named; where the key definitions live (desktop vs deck, rule 18); which commands work during typing mode; whether "clear the prompt" offers Undo by re-typing the cleared text when the app knows all of it; local vs Commands-service matching.
+- [x] **M1 — Decisions recorded.** (See "M1 decisions" above.) The rule 9 experimental-flag answer; the phrases for each command and what a bare "stop" means in a pane; the verified per-agent key table (Claude Code, OpenCode, Codex, Pi, Devin) with the agent versions checked and the unsupported cells named; where the key definitions live (desktop vs deck, rule 18); which commands work during typing mode; whether "clear the prompt" offers Undo by re-typing the cleared text when the app knows all of it; local vs Commands-service matching.
 - [ ] **M2 — Interrupt.** The voice row, the per-agent keys, the outcome reports and refusals; works on every agent M1 marked as supported.
 - [ ] **M3 — Clear the prompt.** Same shape as M2.
 - [ ] **M4 — Scratch that.** Tracking what the app last typed per pane, the "still the end of the prompt" check, and the refusals when it cannot be sure.

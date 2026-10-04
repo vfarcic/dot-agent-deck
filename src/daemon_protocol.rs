@@ -3809,6 +3809,10 @@ async fn handle_connection(
             // resolve from the registry's spawn-time type while the record
             // travels with the live one beside it.
             crate::agent_pty::attach_cli_names(&mut records);
+            // PRD #1541: the keys that interrupt and edit each agent's prompt,
+            // from the same registry and the same reported identity, after the
+            // live join for the same reason.
+            crate::agent_pty::attach_prompt_keys(&mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -8011,6 +8015,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8033,6 +8038,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8205,6 +8211,7 @@ mod tests {
             }),
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8565,6 +8572,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: Some("claude".into()),
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8597,6 +8605,41 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.cli_name.as_deref(), Some("claude-next"));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-6"));
+    }
+
+    /// PRD #1541: `AgentRecord.prompt_keys` is additive and optional in both
+    /// directions — the basis of the no-`PROTOCOL_VERSION`-bump decision, proven
+    /// the way `cli_name` above is. Absent means NO KEY on the wire, and an
+    /// older peer's record without it decodes to `None`, which a client reads as
+    /// "this deck sent no keys" and refuses on.
+    #[test]
+    fn prompt_keys_are_additive_and_optional_in_both_directions() {
+        let keys = crate::agent_registry::spec(&AgentType::OpenCode)
+            .prompt_keys
+            .clone()
+            .expect("OpenCode carries prompt keys");
+        let mut rec: AgentRecord =
+            serde_json::from_str(r#"{"id": "3", "pane_id_env": "pane-3"}"#).expect("decodes");
+        rec.prompt_keys = Some(keys.clone());
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.prompt_keys, Some(keys));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert_eq!(value["prompt_keys"]["interrupt"][0]["pause_after_ms"], 300);
+
+        rec.prompt_keys = None;
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("prompt_keys").is_none(),
+            "no keys must mean no key at all; got {json}"
+        );
+
+        let legacy = r#"{"id": "5", "pane_id_env": "pane-5", "cli_name": "claude"}"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(old.prompt_keys.is_none());
+        assert_eq!(old.cli_name.as_deref(), Some("claude"));
     }
 
     /// Issue #887: `AttachResponse.schedule_revision` is additive and optional

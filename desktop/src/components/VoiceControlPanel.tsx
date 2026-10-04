@@ -88,6 +88,7 @@ import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNe
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
+import type { VoicePaneAgent } from "../lib/promptKeys";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
 /**
@@ -742,8 +743,15 @@ function choiceRefusal(lost: Lost): string {
  * daemon can replace an agent under the same deck and agent id, and the mode
  * ends then too, even when no snapshot ever showed the pane without an agent.
  */
-/** `terminalHidden`: the pane is showing another tab (Diff, Checks, …), so its prompt is not on screen (PR #1451). */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean };
+/**
+ * `terminalHidden`: the pane is showing another tab (Diff, Checks, …), so its prompt is not on screen (PR #1451).
+ *
+ * PRD #1541 — the {@link VoicePaneAgent} half: the agent's type and its name
+ * for refusals, whether it is mid-turn (interrupt is sent only while
+ * `turn === "working"`), and the deck's prompt keys for it (absent ⇒ the deck
+ * is too old or the agent is unsupported, and the command is refused).
+ */
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean } & VoicePaneAgent;
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184

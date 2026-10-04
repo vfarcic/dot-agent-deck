@@ -489,7 +489,61 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, **as the daemon served them** (`AgentRecord::prompt_keys`) —
+    /// copied through, bounded by [`map_prompt_keys`], and never resolved from
+    /// this crate's own registry, for the reason `cli_name` gives (issue #856).
+    ///
+    /// Absent when the daemon has no measured keys for the agent (Devin, an
+    /// unrecognised type), when it predates the field, or when what it sent
+    /// fails [`map_prompt_keys`]'s bounds. The voice surface refuses the
+    /// command with a reason in every one of those cases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_keys: Option<DesktopPromptKeys>,
     pub tab: DesktopTab,
+}
+
+/// PRD #1541: the webview's view of `agent_registry::PromptKeys` — the keys
+/// voice control presses to interrupt a turn, clear the prompt and delete what
+/// it typed. Field meanings are the daemon's; see `PromptKeys` there.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPromptKeys {
+    /// Write each step's bytes in order, pausing `pause_after_ms` after each.
+    pub interrupt: Vec<DesktopKeyStep>,
+    pub clear: DesktopClearKey,
+    pub delete_char: DesktopDeleteCharKey,
+}
+
+/// PRD #1541: one write of an interrupt sequence.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopKeyStep {
+    pub bytes: String,
+    pub pause_after_ms: u32,
+}
+
+/// PRD #1541: the key that clears the prompt and how many presses it needs.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopClearKey {
+    pub bytes: String,
+    /// `per_wrapped_row` or `per_line` — the daemon's wire value. A rule this
+    /// build does not know never reaches the webview: [`map_prompt_keys`]
+    /// drops the whole set instead.
+    pub presses: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+}
+
+/// PRD #1541: the key that deletes one character, and the longest write the
+/// agent keeps as typed text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDeleteCharKey {
+    pub bytes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_literal_write_chars: Option<u32>,
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -1406,6 +1460,82 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
     }
 }
 
+/// PRD #1541: the most steps an interrupt may take. The longest measured is
+/// two (OpenCode's `ESC`, pause, `ESC`).
+const PROMPT_KEY_MAX_STEPS: usize = 4;
+/// PRD #1541: the longest single key, in bytes. Every measured key is one byte;
+/// this leaves room for an escape sequence without admitting text.
+const PROMPT_KEY_MAX_BYTES: usize = 16;
+/// PRD #1541: the longest pause between interrupt steps. The measured one is
+/// 300 ms; anything near this bound would leave a voice command hanging.
+const PROMPT_KEY_MAX_PAUSE_MS: u32 = 2_000;
+
+/// PRD #1541: one key the daemon served, accepted only when it is a KEY: it
+/// starts with a control byte (a C0 control or `DEL` — which admits an escape
+/// sequence and rejects a line of text), is short, never contains `Ctrl+C`
+/// (`0x03`), and never contains a CR or LF, which would submit the prompt.
+fn prompt_key_bytes(bytes: &str) -> Option<String> {
+    let starts_with_control = bytes
+        .bytes()
+        .next()
+        .is_some_and(|first| first < 0x20 || first == 0x7f);
+    let ok = starts_with_control
+        && bytes.len() <= PROMPT_KEY_MAX_BYTES
+        && !bytes.contains(['\u{3}', '\r', '\n']);
+    ok.then(|| bytes.to_string())
+}
+
+/// PRD #1541: the daemon's prompt keys as the webview receives them — or
+/// `None` when any part is out of bounds, so the voice surface refuses the
+/// command rather than pressing half a key set.
+///
+/// The bounds are this client's own promises, kept at the seam where the
+/// daemon's data enters: it never presses `Ctrl+C` (it quits Codex and
+/// OpenCode on an empty prompt), never waits long between steps, never writes
+/// a "key" that is really a line of text, and never counts presses by a rule
+/// it does not know. A daemon owns the PTY these keys are written to, so the
+/// bounds protect the desktop's behaviour rather than the agent from its deck.
+pub(crate) fn map_prompt_keys(
+    keys: &dot_agent_deck::agent_registry::PromptKeys,
+) -> Option<DesktopPromptKeys> {
+    use dot_agent_deck::agent_registry::ClearPresses;
+
+    if keys.interrupt.is_empty() || keys.interrupt.len() > PROMPT_KEY_MAX_STEPS {
+        return None;
+    }
+    let interrupt = keys
+        .interrupt
+        .iter()
+        .map(|step| {
+            (step.pause_after_ms <= PROMPT_KEY_MAX_PAUSE_MS).then_some(())?;
+            Some(DesktopKeyStep {
+                bytes: prompt_key_bytes(&step.bytes)?,
+                pause_after_ms: step.pause_after_ms,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let presses = match keys.clear.presses {
+        ClearPresses::PerWrappedRow => "per_wrapped_row",
+        ClearPresses::PerLine => "per_line",
+        ClearPresses::Unknown => return None,
+    };
+    if keys.clear.max_presses_per_write == Some(0) {
+        return None;
+    }
+    Some(DesktopPromptKeys {
+        interrupt,
+        clear: DesktopClearKey {
+            bytes: prompt_key_bytes(&keys.clear.bytes)?,
+            presses,
+            max_presses_per_write: keys.clear.max_presses_per_write,
+        },
+        delete_char: DesktopDeleteCharKey {
+            bytes: prompt_key_bytes(&keys.delete_char.bytes)?,
+            max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+        },
+    })
+}
+
 fn session_status_name(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Thinking => "thinking",
@@ -1515,6 +1645,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // `agent_registry` — a fallback would reinstate the divergence the field
     // closes, and make the change cosmetic.
     let cli_name = record.cli_name;
+    // PRD #1541: the daemon's keys, bounded — never this crate's own registry.
+    let prompt_keys = record.prompt_keys.as_ref().and_then(map_prompt_keys);
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -1534,6 +1666,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        prompt_keys,
         tab,
     }
 }
@@ -3095,6 +3228,7 @@ mod tests {
             // Issue #856: as the DAEMON reported it. The fixture agent is
             // Codex, and `codex` is what a codex daemon resolves.
             cli_name: Some("codex".into()),
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         }
@@ -3150,6 +3284,175 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["agentType"], "codex");
         assert!(value.get("cliName").is_none());
+    }
+
+    fn registry_keys(agent_type: AgentType) -> dot_agent_deck::agent_registry::PromptKeys {
+        dot_agent_deck::agent_registry::spec(&agent_type)
+            .prompt_keys
+            .clone()
+            .expect("a measured agent carries prompt keys")
+    }
+
+    /// PRD #1541: the daemon's prompt keys reach the webview in its camelCase
+    /// vocabulary, with the bytes unchanged and an absent limit absent.
+    #[test]
+    fn prompt_keys_are_copied_from_the_daemon_in_the_webview_shape() {
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::ClaudeCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"],
+            serde_json::json!({
+                "interrupt": [{"bytes": "\u{1b}", "pauseAfterMs": 0}],
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "maxPressesPerWrite": 32},
+                "deleteChar": {"bytes": "\u{7f}", "maxLiteralWriteChars": 800},
+            })
+        );
+
+        let mut record = fixture_record();
+        record.prompt_keys = Some(registry_keys(AgentType::OpenCode));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(
+            value["promptKeys"]["interrupt"],
+            serde_json::json!([
+                {"bytes": "\u{1b}", "pauseAfterMs": 300},
+                {"bytes": "\u{1b}", "pauseAfterMs": 0},
+            ])
+        );
+        assert_eq!(value["promptKeys"]["clear"]["presses"], "per_line");
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("maxPressesPerWrite")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["deleteChar"]
+                .get("maxLiteralWriteChars")
+                .is_none()
+        );
+    }
+
+    /// PRD #1541: a record the daemon served no keys for has none in the
+    /// webview — even for an agent type this crate's own registry has keys
+    /// for. A local fallback would answer for a deck whose agent versions this
+    /// build never measured (the #856 principle).
+    #[test]
+    fn absent_prompt_keys_are_never_filled_from_the_local_registry() {
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::ClaudeCode);
+        record.live = None;
+        record.prompt_keys = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "claude_code");
+        assert!(value.get("promptKeys").is_none());
+    }
+
+    /// PRD #1541: a key set that breaks one of the desktop's own promises is
+    /// dropped whole, so the voice surface refuses rather than pressing part of
+    /// it.
+    #[test]
+    fn out_of_bounds_prompt_keys_are_dropped_whole() {
+        use dot_agent_deck::agent_registry::{ClearPresses, KeyStep};
+        use std::borrow::Cow;
+
+        type Breaker = Box<dyn Fn(&mut dot_agent_deck::agent_registry::PromptKeys)>;
+        let cases: Vec<(&str, Breaker)> = vec![
+            (
+                "Ctrl+C in clear",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15\x03")),
+            ),
+            (
+                "Ctrl+C in an interrupt step",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x03"),
+                        pause_after_ms: 0,
+                    }]);
+                }),
+            ),
+            (
+                "empty delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("")),
+            ),
+            (
+                "text, not a key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("rm -rf ~ && echo")),
+            ),
+            (
+                "a key that submits",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7f\r")),
+            ),
+            (
+                "a key longer than the bound",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[1;2;3;4;5;6;7;8")),
+            ),
+            (
+                "no interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(Vec::new())),
+            ),
+            (
+                "too many steps",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![
+                        KeyStep {
+                            bytes: Cow::Borrowed("\x1b"),
+                            pause_after_ms: 0
+                        };
+                        5
+                    ]);
+                }),
+            ),
+            (
+                "a long pause",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![KeyStep {
+                        bytes: Cow::Borrowed("\x1b"),
+                        pause_after_ms: 60_000,
+                    }]);
+                }),
+            ),
+            (
+                "an unknown clear rule",
+                Box::new(|k| k.clear.presses = ClearPresses::Unknown),
+            ),
+            (
+                "zero presses per write",
+                Box::new(|k| k.clear.max_presses_per_write = Some(0)),
+            ),
+        ];
+        for (name, break_it) in cases {
+            let mut keys = registry_keys(AgentType::ClaudeCode);
+            break_it(&mut keys);
+            assert_eq!(map_prompt_keys(&keys), None, "{name} must drop the key set");
+        }
+        // And the untouched set passes, so the cases above fail for their own
+        // reason.
+        assert!(map_prompt_keys(&registry_keys(AgentType::ClaudeCode)).is_some());
+    }
+
+    /// PRD #1541: the browser fixture's prompt keys
+    /// (`desktop/src/data/prompt-keys.json`) are what a deck built from this
+    /// tree serves — every measured agent, keyed by its wire type, in the
+    /// webview's shape — so `?fixture=1` previews the real keys rather than a
+    /// copy that drifted.
+    #[test]
+    fn the_browser_fixture_prompt_keys_match_the_registry() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/data/prompt-keys.json"))
+                .expect("the fixture is JSON");
+        let mut expected = serde_json::Map::new();
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                expected.insert(
+                    agent_type_name(&agent.agent_type).to_string(),
+                    serde_json::to_value(
+                        map_prompt_keys(keys).expect("registry keys are in bounds"),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert_eq!(fixture, serde_json::Value::Object(expected));
     }
 
     #[test]

@@ -1126,6 +1126,38 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * PRD #1541. What the voice surface needs to press keys at an agent reaches
+   * the agent model: its type, whether it is mid-turn, and the DECK's prompt
+   * keys — copied through, and absent where the daemon sent none even for a
+   * type this app knows keys for (the #856 principle: no local table).
+   */
+  it("carries the agent type, turn and the deck's prompt keys, and absent keys as absent", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const keys = {
+      interrupt: [{ bytes: "\u001b", pauseAfterMs: 300 }, { bytes: "\u001b", pauseAfterMs: 0 }],
+      clear: { bytes: "\u0015", presses: "per_line" as const },
+      deleteChar: { bytes: "\u007f" },
+    };
+    const reported = structuredClone(snapshot);
+    reported.agents[0].agentType = "open_code";
+    reported.agents[0].status = "thinking";
+    reported.agents[0].promptKeys = keys;
+    const agent = mapDesktopSnapshot(reported).agents[0];
+    expect(agent?.agentType).toBe("open_code");
+    expect(agent?.turn).toBe("working");
+    expect(agent?.promptKeys).toEqual(keys);
+
+    const keyless = structuredClone(snapshot);
+    keyless.agents[0].agentType = "claude_code";
+    keyless.agents[0].status = "running";
+    delete keyless.agents[0].promptKeys;
+    const bare = mapDesktopSnapshot(keyless).agents[0];
+    expect(bare?.promptKeys).toBeUndefined();
+    // `running` is the crate's word for "no hook state": not evidence of a turn.
+    expect(bare?.turn).toBeUndefined();
+  });
+
+  /**
    * Issue #887. `scheduleRevision` is carried through so `projectsRevision` in
    * `App.tsx` can key the project re-list on it; nothing renders it. An
    * unreporting daemon leaves it absent rather than defaulting it to a number,

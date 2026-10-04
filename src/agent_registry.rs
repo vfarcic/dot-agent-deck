@@ -22,7 +22,10 @@
 //! later milestone — the registry is meant to be the single source of truth per
 //! the PRD success criteria.
 
+use std::borrow::Cow;
+
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 
 use crate::event::AgentType;
 
@@ -159,6 +162,158 @@ impl PrePromptReadiness {
     }
 }
 
+/// PRD #1541: the keys that edit or interrupt this agent's prompt — what voice
+/// control presses to interrupt a turn, clear the prompt, or remove what it last
+/// typed.
+///
+/// **Measured, per agent and per version, and only for the versions named.**
+/// Each value below was driven against the real agent in a private tmux server
+/// on 2026-10-03 (`prds/1541-voice-agent-prompt-control.md`, "Verified per-agent
+/// key table"): Claude Code 2.1.289, Codex 0.160.0, OpenCode 1.18.34 and Pi
+/// 0.87.1. An agent upgrade can move a key, so a reader citing one of these
+/// should cite the version beside it, and a change here is a re-measurement, not
+/// an edit.
+///
+/// **Devin carries none.** It was logged out on the box the table was measured
+/// on, so none of its keys could be verified; its entry is `None` until someone
+/// measures it logged in. The neutral [`NONE`] placeholder carries none either —
+/// the deck does not know what is in that pane.
+///
+/// **`Ctrl+C` (`0x03`) is never one of these keys, deliberately.** On an empty
+/// prompt it quits Codex and OpenCode outright, and a second one quits Pi, so a
+/// misheard or repeated command could end the agent. The interrupt is `ESC`
+/// instead, which ends the turn and keeps the agent, its session and any draft
+/// typed mid-turn in every measured agent. A unit test pins that no sequence
+/// here contains `0x03`.
+///
+/// **Served by the daemon, not compiled into a client** (PRD #1541 M1 decision
+/// 7, rule 18): a deck answers for the agent versions on its own host, the way
+/// [`crate::agent_pty::AgentRecord::cli_name`] answers which binary it forked
+/// (issue #856). It reaches clients as
+/// [`crate::agent_pty::AgentRecord::prompt_keys`], an additive optional field.
+///
+/// The strings are the exact bytes to write to the agent's PTY, unbracketed —
+/// the same path the user's own keystrokes take. They are all ASCII control
+/// characters today, and `str` rather than bytes so a JSON client can hand them
+/// to its terminal-write call unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptKeys {
+    /// Interrupt the agent's current turn: the steps to write in order, each
+    /// followed by its pause. One `ESC` for Claude Code, Codex and Pi; `ESC`,
+    /// ~300 ms, `ESC` for OpenCode, whose first `ESC` only arms "esc again to
+    /// interrupt".
+    ///
+    /// **Only while the agent is working.** On an IDLE agent a repeated `ESC`
+    /// opens Rewind in Claude Code (and clears a draft), the transcript browser
+    /// in Codex and the Session Tree in Pi, so the sender's guard — send only
+    /// while the status says working, and never twice in quick succession — is
+    /// part of this key's contract, not an option.
+    pub interrupt: Cow<'static, [KeyStep]>,
+    /// Clear the whole prompt.
+    pub clear: ClearKey,
+    /// Delete the one character before the cursor.
+    pub delete_char: DeleteCharKey,
+}
+
+/// One write in a [`PromptKeys`] sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyStep {
+    /// The bytes to write.
+    pub bytes: Cow<'static, str>,
+    /// How long to wait after this write before the next step, in
+    /// milliseconds. `0` on the last step.
+    #[serde(default)]
+    pub pause_after_ms: u32,
+}
+
+/// How [`PromptKeys::clear`] empties the prompt: one key, pressed as many times
+/// as the prompt needs.
+///
+/// **Over-counting is harmless** in every measured agent — an extra press on an
+/// empty prompt does nothing — so a sender that cannot see the prompt should
+/// round up rather than risk leaving text behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClearKey {
+    /// The key to press. `Ctrl+U` (`0x15`, NAK) in every measured agent.
+    pub bytes: Cow<'static, str>,
+    /// What one press removes, so the sender can count the presses a prompt
+    /// needs.
+    pub presses: ClearPresses,
+    /// The most presses to put in one write; `None` where no limit was
+    /// observed. Claude Code ignores a single write of 64 or more NAKs
+    /// ENTIRELY (10 to 63 worked), so its writes are capped well below that, at
+    /// 32. Codex, OpenCode and Pi took 300 in one write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_presses_per_write: Option<u32>,
+}
+
+/// What one [`ClearKey`] press removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearPresses {
+    /// One press per WRAPPED screen row (Claude Code): a prompt of `n`
+    /// characters in a pane `cols` wide needs `ceil(n / cols)` presses, plus
+    /// one per newline in a multi-line draft.
+    PerWrappedRow,
+    /// One press per logical line (Codex, OpenCode, Pi): a single-line prompt
+    /// needs one press however long it is, and a multi-line draft two per line.
+    PerLine,
+    /// Forward-compat catch-all: a rule a NEWER daemon names that this build
+    /// does not know. A client cannot count presses for it and must treat the
+    /// key as unsupported. Never produced by this build.
+    #[serde(other)]
+    Unknown,
+}
+
+/// How [`PromptKeys::delete_char`] removes text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteCharKey {
+    /// The key that deletes one character. `DEL` (`0x7f`) in every measured
+    /// agent; bursts of 150 in one write were exact.
+    pub bytes: Cow<'static, str>,
+    /// The longest single unbracketed write, in characters, that this agent is
+    /// measured to keep as typed text — so that pressing [`Self::bytes`] once
+    /// per character removes it exactly. Above it the agent collapses the write
+    /// into a paste placeholder that ONE delete removes whole: Claude Code
+    /// above 800 characters (`[Pasted text #N]`), Codex above 1000 (`[Pasted
+    /// Content …]`). `None` where no collapse was observed (OpenCode and Pi
+    /// kept 2290 characters as text).
+    ///
+    /// This is the AGENT's measured figure, not voice's policy. Voice refuses
+    /// to remove a write longer than 800 characters for every agent (PRD #1541
+    /// M1), so a sender applies `min(800, this)` — the per-agent value exists so
+    /// that policy is a client decision that can be revisited against the
+    /// deck's own measurement rather than baked into the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_literal_write_chars: Option<u32>,
+}
+
+/// `ESC`: the interrupt key in every measured agent.
+const ESC: &str = "\x1b";
+/// `Ctrl+U` (NAK): deletes to the start of the line in every measured agent.
+const CTRL_U: &str = "\x15";
+/// `DEL`: deletes one character in every measured agent.
+const DEL: &str = "\x7f";
+
+/// The single `ESC` that interrupts Claude Code, Codex and Pi.
+static SINGLE_ESC: [KeyStep; 1] = [KeyStep {
+    bytes: Cow::Borrowed(ESC),
+    pause_after_ms: 0,
+}];
+
+/// OpenCode's interrupt: the first `ESC` only arms "esc again to interrupt",
+/// the second, ~300 ms later, interrupts.
+static OPENCODE_DOUBLE_ESC: [KeyStep; 2] = [
+    KeyStep {
+        bytes: Cow::Borrowed(ESC),
+        pause_after_ms: 300,
+    },
+    KeyStep {
+        bytes: Cow::Borrowed(ESC),
+        pause_after_ms: 0,
+    },
+];
+
 /// PRD #20 finding #15: an integration-hook handler (install / uninstall) —
 /// `Ok(())` on success, `Err(message)` on a reported failure.
 pub type HookFn = fn() -> Result<(), String>;
@@ -221,6 +376,11 @@ pub struct AgentSpec {
     /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
     pub startup_auto_install: Option<fn()>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, as measured against the versions [`PromptKeys`] names. `None`
+    /// where they are unmeasured (Devin) or there is no agent to press them at
+    /// (the neutral placeholder). See [`PromptKeys`].
+    pub prompt_keys: Option<PromptKeys>,
 }
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
@@ -393,6 +553,21 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(claude_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::hooks_manage::auto_install),
+    // PRD #1541, measured on Claude Code 2.1.289: one ESC interrupts; one
+    // Ctrl+U per WRAPPED row, and a single write of 64+ is ignored, so 32 per
+    // write; an unbracketed write over 800 characters collapses to a paste.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerWrappedRow,
+            max_presses_per_write: Some(32),
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: Some(800),
+        },
+    }),
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -414,6 +589,20 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(opencode_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::opencode_manage::auto_install),
+    // PRD #1541, measured on OpenCode 1.18.34: ESC, ~300 ms, ESC interrupts;
+    // one Ctrl+U per line; no paste collapse of an unbracketed write.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&OPENCODE_DOUBLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: None,
+        },
+    }),
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -432,6 +621,20 @@ pub static PI: AgentSpec = AgentSpec {
     materialize: Some(pi_materialize),
     // Pi materializes its extension at SPAWN time, not startup.
     startup_auto_install: None,
+    // PRD #1541, measured on Pi 0.87.1: one ESC interrupts; one Ctrl+U per
+    // line; no paste collapse of an unbracketed write.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: None,
+        },
+    }),
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -465,6 +668,20 @@ pub static CODEX: AgentSpec = AgentSpec {
     // basename isn't `codex` (`devbox run codex-big`), which the spawn-command
     // seam can't detect and which therefore got NO integration before.
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
+    // PRD #1541, measured on Codex 0.160.0: one ESC interrupts; one Ctrl+U per
+    // line; an unbracketed write over 1000 characters collapses to a paste.
+    prompt_keys: Some(PromptKeys {
+        interrupt: Cow::Borrowed(&SINGLE_ESC),
+        clear: ClearKey {
+            bytes: Cow::Borrowed(CTRL_U),
+            presses: ClearPresses::PerLine,
+            max_presses_per_write: None,
+        },
+        delete_char: DeleteCharKey {
+            bytes: Cow::Borrowed(DEL),
+            max_literal_write_chars: Some(1000),
+        },
+    }),
 };
 
 /// Devin CLI — native-hooks strategy. The second agent to reuse
@@ -509,6 +726,9 @@ pub static DEVIN: AgentSpec = AgentSpec {
     hook_uninstall: Some(devin_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
+    // PRD #1541: unsupported, not measured — Devin was logged out on the box
+    // the key table was measured on, so none of its keys could be verified.
+    prompt_keys: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -530,6 +750,8 @@ pub static NONE: AgentSpec = AgentSpec {
     hook_uninstall: None,
     materialize: None,
     startup_auto_install: None,
+    // Not an agent: there is nothing to press keys at.
+    prompt_keys: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -861,6 +1083,149 @@ mod tests {
                 "a shipped agent's badge should not reuse the neutral placeholder colour"
             );
         }
+    }
+
+    fn keys(agent_type: AgentType) -> &'static PromptKeys {
+        spec(&agent_type)
+            .prompt_keys
+            .as_ref()
+            .unwrap_or_else(|| panic!("{agent_type:?} should carry prompt keys"))
+    }
+
+    fn step(bytes: &'static str, pause_after_ms: u32) -> KeyStep {
+        KeyStep {
+            bytes: Cow::Borrowed(bytes),
+            pause_after_ms,
+        }
+    }
+
+    /// PRD #1541: each measured agent's keys, pinned by value against the
+    /// verified table in the PRD. A change here is a re-measurement — update
+    /// the versions in [`PromptKeys`]'s doc comment with it.
+    #[test]
+    fn prompt_keys_match_the_verified_table() {
+        let claude = keys(AgentType::ClaudeCode);
+        assert_eq!(claude.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(claude.clear.bytes, "\x15");
+        assert_eq!(claude.clear.presses, ClearPresses::PerWrappedRow);
+        assert_eq!(claude.clear.max_presses_per_write, Some(32));
+        assert_eq!(claude.delete_char.bytes, "\x7f");
+        assert_eq!(claude.delete_char.max_literal_write_chars, Some(800));
+
+        let codex = keys(AgentType::Codex);
+        assert_eq!(codex.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(codex.clear.bytes, "\x15");
+        assert_eq!(codex.clear.presses, ClearPresses::PerLine);
+        assert_eq!(codex.clear.max_presses_per_write, None);
+        assert_eq!(codex.delete_char.bytes, "\x7f");
+        assert_eq!(codex.delete_char.max_literal_write_chars, Some(1000));
+
+        let opencode = keys(AgentType::OpenCode);
+        assert_eq!(
+            opencode.interrupt.as_ref(),
+            &[step("\x1b", 300), step("\x1b", 0)],
+            "OpenCode's first ESC only arms the interrupt"
+        );
+        assert_eq!(opencode.clear.bytes, "\x15");
+        assert_eq!(opencode.clear.presses, ClearPresses::PerLine);
+        assert_eq!(opencode.clear.max_presses_per_write, None);
+        assert_eq!(opencode.delete_char.bytes, "\x7f");
+        assert_eq!(opencode.delete_char.max_literal_write_chars, None);
+
+        let pi = keys(AgentType::Pi);
+        assert_eq!(pi.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(pi.clear.bytes, "\x15");
+        assert_eq!(pi.clear.presses, ClearPresses::PerLine);
+        assert_eq!(pi.clear.max_presses_per_write, None);
+        assert_eq!(pi.delete_char.bytes, "\x7f");
+        assert_eq!(pi.delete_char.max_literal_write_chars, None);
+    }
+
+    /// PRD #1541: Devin is unsupported until measured logged in, and the
+    /// neutral placeholder has no agent to press keys at — so neither carries
+    /// keys, and a client refuses rather than guessing.
+    #[test]
+    fn devin_and_the_placeholder_have_no_prompt_keys() {
+        assert!(spec(&AgentType::Devin).prompt_keys.is_none());
+        assert!(spec(&AgentType::None).prompt_keys.is_none());
+    }
+
+    /// PRD #1541: no key sequence contains `Ctrl+C` (`0x03`), which quits Codex
+    /// and OpenCode on an empty prompt. Checked over every entry, so a future
+    /// agent's keys are held to it too.
+    #[test]
+    fn no_prompt_key_contains_ctrl_c() {
+        let entries = ALL.iter().copied().chain(std::iter::once(&NONE));
+        for agent in entries {
+            let Some(keys) = agent.prompt_keys.as_ref() else {
+                continue;
+            };
+            let sequences = keys
+                .interrupt
+                .iter()
+                .map(|step| step.bytes.as_ref())
+                .chain([keys.clear.bytes.as_ref(), keys.delete_char.bytes.as_ref()]);
+            for bytes in sequences {
+                assert!(
+                    !bytes.is_empty(),
+                    "{}: an empty key presses nothing",
+                    agent.label
+                );
+                assert!(
+                    !bytes.as_bytes().contains(&0x03),
+                    "{}: a prompt key must never contain Ctrl+C",
+                    agent.label
+                );
+            }
+            assert!(
+                !keys.interrupt.is_empty(),
+                "{}: an interrupt needs at least one step",
+                agent.label
+            );
+            assert_eq!(
+                keys.interrupt.last().map(|step| step.pause_after_ms),
+                Some(0),
+                "{}: nothing follows the last interrupt step, so it waits for nothing",
+                agent.label
+            );
+        }
+    }
+
+    /// PRD #1541: the wire spelling of the keys — snake_case, the bytes as a
+    /// JSON string, absent limits as absent keys — and a round trip back.
+    #[test]
+    fn prompt_keys_round_trip_through_json() {
+        let claude = keys(AgentType::ClaudeCode);
+        let value = serde_json::to_value(claude).expect("serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "interrupt": [{"bytes": "\u{1b}", "pause_after_ms": 0}],
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "max_presses_per_write": 32},
+                "delete_char": {"bytes": "\u{7f}", "max_literal_write_chars": 800},
+            })
+        );
+        let back: PromptKeys = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(&back, claude);
+
+        let pi = serde_json::to_value(keys(AgentType::Pi)).expect("serializes");
+        assert!(pi["clear"].get("max_presses_per_write").is_none());
+        assert!(pi["delete_char"].get("max_literal_write_chars").is_none());
+    }
+
+    /// PRD #1541: a clear rule a NEWER daemon names decodes as `Unknown`
+    /// rather than failing the whole record — an older client must keep
+    /// listing agents, and treats the key as unsupported.
+    #[test]
+    fn an_unknown_clear_rule_decodes_as_unknown() {
+        let newer = serde_json::json!({
+            "interrupt": [{"bytes": "\u{1b}"}],
+            "clear": {"bytes": "\u{15}", "presses": "per_paragraph", "future_field": 1},
+            "delete_char": {"bytes": "\u{7f}"},
+        });
+        let keys: PromptKeys = serde_json::from_value(newer).expect("a newer shape decodes");
+        assert_eq!(keys.clear.presses, ClearPresses::Unknown);
+        assert_eq!(keys.interrupt[0].pause_after_ms, 0);
     }
 
     /// PRD #381 Open Question 4 / M6: the `hooks install --agent codex` adapter

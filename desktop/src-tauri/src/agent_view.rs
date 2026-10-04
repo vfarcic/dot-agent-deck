@@ -437,6 +437,7 @@ mod tests {
             live: None,
             spawned_at_ms: Some(1_700_000_000_000),
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         }

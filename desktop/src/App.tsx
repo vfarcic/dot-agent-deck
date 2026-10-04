@@ -43,6 +43,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "./lib/connectionRemedy";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
@@ -612,6 +613,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
       terminalHidden: paneTab !== "terminal" || undefined,
+      /* PRD #1541 — the agent's type, turn and the deck's prompt keys, for
+         the interrupt / clear / scratch commands. */
+      ...voicePaneAgent(paneShownAgent),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
   /**

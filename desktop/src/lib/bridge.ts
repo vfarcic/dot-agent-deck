@@ -6,6 +6,7 @@ import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
@@ -18,6 +19,7 @@ import type { HandoffEdge,
   AgentTarget,
   AgentStatus,
   AgentTab,
+  AgentTypeId,
   DaemonProjectListing,
   DaemonResolvedProject,
   DeckAction,
@@ -30,6 +32,7 @@ import type { HandoffEdge,
   EvidenceItem,
   NewAgentOptions,
   NewAgentOrchestrations,
+  PromptKeys,
   RuntimeMode,
   TerminalChunk,
   WorkflowStage,
@@ -224,7 +227,7 @@ export interface DesktopAgentDto {
   cwd?: string;
   rows: number;
   cols: number;
-  agentType: "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+  agentType: AgentTypeId;
   /**
    * The binary the agent registry says this type runs — `claude`, `opencode`,
    * `pi`, `codex`, `devin` (PRD #745). `agentType` above is the wire IDENTITY
@@ -291,6 +294,14 @@ export interface DesktopAgentDto {
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
+   * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
+   * `map_prompt_keys`. Absent when the deck has none for the agent (Devin, an
+   * unrecognised type), predates the field, or sent a set the crate refused;
+   * the voice surface then refuses the command rather than guessing.
+   */
+  promptKeys?: PromptKeys;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -2038,6 +2049,13 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     // — the load-bearing part — it means there is no local table left to fall
     // back to, which is the whole point of the issue.
     cli: agent.cliName,
+    // PRD #1541 — what the voice surface needs to press keys at this agent:
+    // its type (for naming it in a refusal), whether it is mid-turn (the
+    // interrupt guard), and the deck's own keys for it. Copied through; no
+    // local table fills an absent `promptKeys` (the #856 principle).
+    agentType: agent.agentType,
+    turn: agentTurn(agent.status),
+    promptKeys: agent.promptKeys,
     model: UNREPORTED,
     status,
     task: taskLine(agent),

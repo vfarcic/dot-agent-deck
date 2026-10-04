@@ -763,6 +763,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
     };
@@ -788,6 +789,7 @@ fn agent_record_omits_agent_type_when_none() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
     };
@@ -912,6 +914,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         },
@@ -927,6 +930,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         },

@@ -2482,6 +2482,7 @@ command = "cat"
             live: None,
             spawned_at_ms,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         }

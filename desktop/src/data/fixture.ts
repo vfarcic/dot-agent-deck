@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
@@ -193,7 +194,42 @@ const evidence: EvidenceItem[] = [
   },
 ];
 
-const agents: AgentSession[] = [
+/**
+ * PRD #1541 — the agent identity a deck reports beside the binary: its type,
+ * whether it is mid-turn, and its prompt keys.
+ *
+ * The keys come from `prompt-keys.json`, which the desktop crate's
+ * `the_browser_fixture_prompt_keys_match_the_registry` pins to what a deck
+ * built from this tree serves, so the preview presses the real keys. Devin
+ * and an unrecognised binary get no keys, as from a real deck.
+ */
+export const FIXTURE_PROMPT_KEYS = PROMPT_KEYS_JSON as Partial<Record<AgentTypeId, PromptKeys>>;
+
+const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
+  claude: "claude_code",
+  opencode: "open_code",
+  codex: "codex",
+  pi: "pi",
+  devin: "devin",
+};
+
+export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
+  const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
+  const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
+  // What `agentTurn` makes of the daemon status each fixture status stands for.
+  const turn = status === "running" ? "working" : status === "waiting" ? "idle" : undefined;
+  return {
+    agentType,
+    ...(turn ? { turn } : {}),
+    ...(promptKeys ? { promptKeys } : {}),
+  };
+}
+
+function withAgentIdentity(agent: AgentSession): AgentSession {
+  return { ...agent, ...fixtureAgentIdentity(agent.cli, agent.status) };
+}
+
+const agents: AgentSession[] = ([
   {
     id: "planner",
     daemonId: FIXTURE_DAEMON_ID,
@@ -312,7 +348,7 @@ const agents: AgentSession[] = [
     handoffIds: [],
     artifacts: [],
   },
-];
+] satisfies AgentSession[]).map(withAgentIdentity);
 
 /** One agent in the crowded scenario, described only by what a daemon reports. */
 interface CrowdedSeed {
@@ -374,6 +410,7 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     role: seed.role,
     displayName: seed.displayName,
     cli: seed.cli,
+    ...fixtureAgentIdentity(seed.cli, seed.status),
     model: "Unavailable",
     status: seed.status,
     task: seed.lastUserPrompt
