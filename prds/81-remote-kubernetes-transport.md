@@ -1,146 +1,60 @@
-# PRD #81: Remote Kubernetes Transport
+# PRD #81: Run decks in Kubernetes, managed from the desktop
 
-**Status**: Not started
+**Status**: Not started — rewritten 2026-10-04; the first milestone is an analysis of the current state
 **Priority**: Medium
-**Created**: 2026-05-09
+**Created**: 2026-05-09 (rewritten 2026-10-04)
 **GitHub Issue**: [#81](https://github.com/vfarcic/dot-agent-deck/issues/81)
-**Depends on**: PRD #76 (Remote Agent Environments — ssh transport, daemon protocol, registry) — **shipped**
+**Related**: [#632](https://github.com/vfarcic/dot-agent-deck/issues/632) (users and access control for decks — everything about *who* may do what is deferred there), [#634](https://github.com/vfarcic/dot-agent-deck/issues/634) (execution isolation and agent authority — agent credentials inside a pod), [#631](https://github.com/vfarcic/dot-agent-deck/issues/631) (authenticated remote boundary)
 
-## Validation refresh (2026-06-14)
+## Why this was rewritten
 
-Re-validated against current code — verdict: **status accurate (not started), but the transport mechanism described is stale**. The CLI scaffold is in place (`CliRemoteType::Kubernetes` in `src/main.rs`; `remote add` / `connect` return `KubernetesNotYetImplemented` / `KubernetesNotYetSupported`, both referencing this PRD). BUT this PRD assumes it carries over a "local Unix socket **bridge**" from #76 M2.4 — that bridge was **deleted** in #76 M2.7. Today `connect` is a thin `ssh -t` exec wrapper (`src/connect.rs`), so the K8s path should be the analogous thin exec — `kubectl exec -it <pod> -- env DOT_AGENT_DECK_VIA_DAEMON=1 <install_path>` inheriting stdio — **not** a socket relay. Registry note: `RemoteEntry` (`src/remote.rs`) has no `context` / `namespace` / `install_image` fields yet (correctly flagged as a gap). DEPENDENCY: #76 shipped, but **#93 (always-external daemon) is in flight and is actively reshaping the connect/attach architecture** — review the connect approach (M2.2) against #93's final shape before starting.
+The original PRD (May 2026) predates the desktop app, multi-deck support, daemon-owned dispatch and orchestration, and the hook-provenance work of October 2026, and its own 2026-06-14 validation note already called its transport design stale. Its technical conclusions are removed rather than updated: the first milestone below re-derives the design from the code as it is now. The original text is in git history (`git log -p -- prds/81-remote-kubernetes-transport.md`).
 
-## Problem Statement
+## Problem
 
-PRD #76 introduces remote agent environments with the ssh-to-VM transport as the v1 path. The daemon protocol, registry shape, and CLI surface are designed to support a Kubernetes (`kubectl exec`) transport with no protocol-layer changes — but the actual K8s plumbing (image, manifest, `remote add --type=kubernetes`, `connect` over `kubectl exec`, PVC-preserving upgrade) was deferred so the ssh MVP could ship first. This PRD picks that work back up.
+A deck today runs on the user's own machine, or on a host reached over SSH. Every agent it hosts competes for that one machine. Running several dispatched units at once on one box saturates it: on 2026-10-03/04, nine units on a 16-core host ran at load averages of 100–230, and several units attributed test failures to CPU starvation. There is no way to put a unit's work on separate, disposable compute, and no way for the desktop app to create, find or manage decks running in a cluster.
 
-Users with `kubectl` access to a cluster should be able to run `dot-agent-deck remote add --type=kubernetes` and get the same UX as the ssh path, with the only difference being how bytes traverse the wire.
+## Requirements (decided with the maintainer, 2026-10-04)
 
-## Solution Overview
+These are the product decisions this PRD is built on. Everything else is open.
 
-Add `type = "kubernetes"` as a second transport in `dot-agent-deck remote`. An opinionated manifest (StatefulSet + PVC + Service) ships in-repo, parameterized by name/namespace; a daemon container image (versioned to match the CLI) is the StatefulSet's container; project state lives on the per-environment PVC; `connect` uses `kubectl exec -- dot-agent-deck daemon attach` instead of `ssh`.
+1. **A product feature for any repository**, not something specific to this project's own development workflow: it is reached through the product's own surfaces (the desktop app, the `dispatch` verb), not through this repo's skills.
+2. **Two kinds of deck in a cluster:**
+   - a **long-lived deck** — a full daemon hosting any number of agents, which the user works in and returns to, like a local or SSH deck;
+   - **one deck per dispatched unit** — a daemon hosting exactly that unit, either a single agent or one orchestration team (an orchestration's agents share one daemon, which holds their roles and delegations), removed when the unit is done.
+3. **The desktop app manages them:** create a deck in the cluster, see what is running there, connect to it, operate its agents, and see each deck's lifecycle (running, done, failed). Decks created by a dispatch from another deck are shown in relation to the deck that created them.
+4. **Decks others started are discovered too:** a user whose credentials allow it sees and can open decks in the cluster that someone else (or another deck) started, without those decks having to announce themselves.
+5. **Connections are only ever opened from the user's machine.** The cluster never connects back to the laptop. Data may flow both ways over a connection the desktop opened (prompts out, events and state back), but nothing in the cluster initiates contact with the user's machine.
+6. **Access model for this PRD: whoever can access the cluster resources holding the decks can manage every deck there.** Finer-grained access (who may view versus operate, attribution, ownership, audit) is out of scope and belongs to #632.
+7. **Work continues without the laptop:** a deck keeps working while the desktop is closed or the laptop sleeps, and a per-unit deck is cleaned up when its work is done even if the desktop never reconnects.
 
-Architecturally this is a transport-only addition. The streaming attach protocol, the registry file format, the lifecycle semantics (Ctrl+W vs detach), and the failure-mode-aware connect UX all carry over from PRD #76 unchanged.
+## Out of scope
 
-## Scope
+- User management, roles, read-only access, attribution of prompts and spend to people — #632.
+- Provisioning VMs on cloud providers. SSH already reaches existing VMs; per-provider VM creation is a long tail this PRD does not take on.
+- One daemon hosting agents that run in other pods (an agent's PTY, hook socket and worktree live with its daemon; splitting them would mean rebuilding the daemon remotely).
 
-### In Scope
+## Technical options raised in discussion — to be evaluated in M1, not decided
 
-- Daemon container image (Dockerfile in-repo).
-- Opinionated Kubernetes manifest (StatefulSet + PVC + Service) shipped in `deploy/k8s/`, parameterized by name/namespace.
-- `dot-agent-deck remote add --type=kubernetes --context=<ctx> --namespace=<ns>` — verifies kubectl, applies manifest, waits for pod Ready, runs basic protocol roundtrip.
-- `dot-agent-deck connect <name>` over `kubectl exec` for kubernetes-typed entries (the picker already handles the type from PRD #76).
-- `dot-agent-deck remote upgrade <name>` for kubernetes-typed entries: re-applies manifest with new image tag; data on PVC preserved.
-- `dot-agent-deck remote remove <name>` for kubernetes-typed entries: registry-only (consistent with the ssh path); manifest teardown is documented as the user's responsibility (`kubectl delete`).
-- Registry schema extension: `type = "kubernetes"` with `context`, `namespace`, `install_image` fields (the schema is forward-compatible from PRD #76).
-- Documentation: `docs/remote-recipes.md` k3s recipe; `docs/remote-environments.md` Kubernetes section; updates to `docs/remote-requirements.md` for the cluster path.
-- Manual end-to-end validation on a Kubernetes cluster (kind or k3s on the dev VM is fine).
+The 2026-10-04 discussion raised these as candidates. They are recorded so M1 can weigh them against the current code, not as conclusions:
 
-### Out of Scope
+- **Per-unit decks as Kubernetes Jobs**, with the daemon exiting when its unit is done (it already has an idle shutdown), `ttlSecondsAfterFinished` for cleanup without the laptop, `activeDeadlineSeconds` for runaways, and a `ResourceQuota` on the namespace.
+- **Discovery through the Kubernetes API** using the user's kubeconfig: decks carry labels (and annotations for creator, unit, repository, parent deck), and the desktop lists and watches them, so the cluster itself is the registry and Kubernetes RBAC bounds what a user sees.
+- **Connections through the API server** (`port-forward` or `exec`), opened by the desktop, carrying the existing attach protocol.
+- **Shipped access scaffolding:** a namespace-scoped Role for the user's credentials and a `NetworkPolicy` isolating decks from each other.
+- **A CRD and controller** (an `AgentDeck` resource the desktop creates) as a possible later phase, for richer lifecycle: pre-warmed decks, shared build caches, policy.
+- **Measured cost of one daemon per unit** (2026-10-04, this project's dev host): a freshly started daemon is about 35–50 MB resident and about 1% CPU, against roughly 400 MB per Claude Code agent and 360–825 MB per OpenCode agent; the daemon hosting about 40 agents for 14.5 hours was 171 MB. The dominant per-unit costs are the agents and, for compiled projects, the cold build.
 
-- ssh-to-VM transport (already in PRD #76).
-- Helm chart (raw manifest is enough for v1; chart can land later).
-- Operator / CRD-based provisioning.
-- Cluster-side multi-tenancy beyond namespace separation.
-- Service mesh integration.
-- Auto-scaling the StatefulSet (single replica per environment by design).
+## Open questions for M1
 
-## Technical Approach
-
-### Image
-
-`Dockerfile` (in-repo) builds a small image whose ENTRYPOINT is `dot-agent-deck daemon` (the persistent daemon, not the one-shot `daemon attach`). Image tag matches the `dot-agent-deck` version (`DAD_VERSION`). Image hosted at `ghcr.io/vfarcic/dot-agent-deck:<version>`.
-
-### Manifest
-
-`deploy/k8s/dot-agent-deck.yaml` — opinionated StatefulSet + PVC + Service + ConfigMap (for daemon config). Parameterized via a tiny templating layer (envsubst / sed at apply time, not Helm). Fields the user can override: name, namespace, image tag, PVC size, resource limits.
-
-The Pod's container runs the daemon image. The PVC is mounted at `/workspace`. Hooks install at the same per-user path the ssh transport uses, but inside the container's filesystem.
-
-### `remote add --type=kubernetes`
-
-- Validate `--context` and `--namespace` arguments (must be non-empty; pass-through to `kubectl --context X --namespace Y`).
-- Run `kubectl --context X --namespace Y version --short` to verify reachability.
-- Render the manifest with the user's parameters and apply via `kubectl --context X --namespace Y apply -f -` (stdin, no temp file).
-- Wait for the StatefulSet's pod to become Ready (poll with backoff, timeout configurable).
-- Run a basic protocol roundtrip: `kubectl exec <pod> -- dot-agent-deck daemon attach` + send list-agents request + assert the empty-list response.
-- Write the registry entry.
-
-### `connect <name>` over `kubectl exec`
-
-- The PRD #76 `connect` picker already routes by type. Kubernetes entries currently emit "Phase 3 not yet supported" — replace that with the kubectl-exec path.
-- The bridge architecture from M2.4 carries over: spawn `kubectl --context X --namespace Y exec <pod> -- dot-agent-deck daemon attach` instead of ssh; bridge the local Unix socket; TUI mode-gating via `DOT_AGENT_DECK_VIA_DAEMON=1` is unchanged.
-- Failure modes (PRD #76 M2.6) extend with kubectl-specific cases: invalid kubeconfig, context not found, pod not Ready, image pull failure.
-
-### `remote upgrade <name>` for kubernetes type
-
-- Re-apply the manifest with the new image tag.
-- The StatefulSet rolls the pod; the PVC is reused so project state on `/workspace` is preserved.
-- Update the registry's `version` and `upgraded_at` fields (the ssh path already does this; same code path for kubernetes type once the kubectl-apply step replaces the ssh-install step).
-
-## Success Criteria
-
-- A user with `kubectl` access to a cluster can run `dot-agent-deck remote add --type=kubernetes --context=<ctx> --namespace=<ns>` and get the same UX as the ssh path; the only thing that changes is the transport.
-- `dot-agent-deck connect <name>` against a kubernetes-typed entry attaches via `kubectl exec`, the TUI shows running agents, Ctrl+W stops them, detach leaves them running — identical UX to the ssh transport.
-- `dot-agent-deck remote upgrade <name> --version V` re-applies the manifest with image tag `:V`; the pod rolls; project state on `/workspace` survives the roll.
-- The maintainer validates the full flow on a kind or k3s cluster running on the dev/test VM.
+- What, in the current code, already supports this (SSH remotes, the remote registry and its reserved `kubernetes` type, the desktop's multi-deck connections, daemon idle shutdown, dispatch, capability tokens and hook provenance), and what is missing?
+- How agents in a pod authenticate to their providers and to the repository (API keys or tokens as secrets) — the question #634 is discovering — and what that means for a credential stored in a cluster.
+- How a per-unit deck gets the repository and returns its result (clone, push a branch, open a PR), and how build caches are shared so each unit does not pay a cold build.
+- How the desktop presents many short-lived decks without overwhelming the deck list.
+- What the user-facing messages that currently point at this PRD (`src/connect.rs`: "kubernetes remotes are not yet supported (planned in PRD #81)") should say as the work lands.
+- CLAUDE.md rules 12 and 18: which daemon or protocol changes this needs, and how an older daemon and a newer desktop interoperate.
 
 ## Milestones
 
-### Phase 1: Image & manifest
-
-- [ ] **M1.1** — Daemon container image (Dockerfile in-repo, multi-stage build, distroless base).
-- [ ] **M1.2** — Opinionated manifest (StatefulSet + PVC + Service + ConfigMap) shipped in `deploy/k8s/`, parameterized by name/namespace/image-tag/PVC-size.
-
-### Phase 2: CLI integration
-
-- [ ] **M2.1** — `remote add --type=kubernetes` command: verifies kubectl, applies manifest, waits for pod Ready, runs basic roundtrip, writes registry entry.
-- [ ] **M2.2** — `connect <name>` over `kubectl exec` works equivalently to ssh path (bridge architecture from PRD #76 M2.4 reused; ssh swapped for kubectl).
-- [ ] **M2.3** — `remote upgrade <name>` for kubernetes-typed entries: re-applies manifest with new image tag; PVC data preserved.
-- [ ] **M2.4** — Failure-mode-aware connect for kubectl: invalid kubeconfig, context not found, pod not Ready, image pull failure — each surfaces a distinct, actionable message.
-
-### Phase 3: Validation & documentation
-
-- [ ] **M3.1** — Manual end-to-end validation on kind or k3s cluster (on the dev/test VM is fine).
-- [ ] **M3.2** — `docs/remote-recipes.md` k3s recipe.
-- [ ] **M3.3** — `docs/remote-environments.md` Kubernetes section: `kubectl exec` transport, PVC lifecycle, image versioning.
-- [ ] **M3.4** — `docs/remote-requirements.md` updates for the cluster path (kubectl version, RBAC, namespace permissions).
-- [ ] **M3.5** — Changelog fragment, release.
-
-## Key Files
-
-- `Dockerfile` — daemon image (extends or reuses any existing image work).
-- `deploy/k8s/` (new) — opinionated manifest.
-- `src/remote.rs` — extends `RemoteEntry` schema with kubernetes fields; adds kubectl-apply path to `add` and `upgrade`.
-- `src/connect.rs` — extends bridge to spawn `kubectl exec` instead of `ssh` when the entry's type is kubernetes.
-- `src/main.rs` — wire the `--type=kubernetes` arg variant (already accepted by clap from PRD #76, just needs the impl behind it).
-- `docs/remote-recipes.md`, `docs/remote-environments.md`, `docs/remote-requirements.md` — Kubernetes additions.
-
-## Design Decisions
-
-### 2026-05-09: Split Kubernetes transport into a separate PRD
-
-Originally PRD #76 covered both ssh and Kubernetes transports as Phase 2 / Phase 3 of the same PRD. Splitting Kubernetes into a standalone PRD keeps the ssh MVP releasable without dragging the K8s deployment story (image, manifest, PVC, RBAC) along with it. The protocol layer is shared and was already designed for transport-agnosticism in PRD #76, so the split is clean.
-
-### 2026-05-09: Manifest, not Helm chart, for v1
-
-Helm adds a templating language and a chart-versioning lifecycle. For v1, a single parameterized YAML file applied via `kubectl apply -f -` is enough and keeps the dependency surface minimal. A Helm chart can land later if users ask.
-
-## Open Decisions
-
-To be resolved during implementation, not blocking PRD acceptance:
-
-- **Daemon persistence inside the pod**: container restart policy (`Always`) is the default; the daemon needs to gracefully reconcile agent PTYs on restart. This is shared with PRD #76's ssh path's daemon-restart story; verify the same code path works inside a container.
-- **Image registry**: ghcr.io is the default. Whether to also publish to docker.io / quay.io is a docs question, not an implementation one.
-- **Namespace defaulting**: if `--namespace` is omitted, do we default to `default`, to `dot-agent-deck`, or require explicit input? Likely require explicit; less surprise.
-- **PVC size default**: 10 GiB? 50 GiB? Leave it parameterized with a default in the manifest; users can override.
-- **Resource limits**: no defaults vs. modest defaults. Likely modest defaults (1 CPU / 1 GiB request, no limit) — agents are bursty and limits cause OOM-kill surprises.
-
-## Risks & Mitigations
-
-| Risk | Mitigation |
-|------|------------|
-| Manifest drifts from production-realistic defaults | Validate on kind / k3s during M3.1; document any cluster-specific assumptions. |
-| Image build adds CI time | Multi-stage build, ship binary into a distroless base. CI builds only on tag, not on every PR. |
-| `kubectl exec` stream semantics differ subtly from ssh stdio (e.g., signal propagation, EOF) | Reuse PRD #76 M2.1 stdin-EOF-propagation tests against `kubectl exec` early; surface any divergence in M2.2. |
-| PVC migration / sizing problems on upgrade | Document that PVC resize is the user's responsibility (StorageClass-dependent); upgrade only changes image tag, not PVC spec. |
+- [ ] **M1 — Current-state analysis and design, decided with the maintainer.** Survey the code and docs listed in the open questions, evaluate the options above against it, and record the chosen design, its milestones, and the rule 9 experimental-flag answer in this PRD. Nothing is built before this is agreed.
+- [ ] **M2 onward — defined by M1.** Expected areas: a deck image and its Kubernetes resources; the long-lived deck; per-unit decks for dispatch; discovery and management in the desktop; tests (including a real cluster such as kind) and user docs.
