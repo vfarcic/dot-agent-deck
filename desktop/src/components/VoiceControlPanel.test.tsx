@@ -374,6 +374,7 @@ describe("voice control panel", () => {
       const command = commands.find((entry) => entry.said === said);
       const [action, invoke] = command ? [command.action, command.invoke]
         : said === "typing on" ? ["dictation_on", "startDictation"]
+        : said === "typing off" ? ["dictation_off", "stopDictation"]
         : said === "send it" ? ["submit_prompt", "submitAgentPrompt"]
         : ["dictate_to_agent", "dictateToAgent"];
       return result({
@@ -443,6 +444,15 @@ describe("voice control panel", () => {
     }
 
     function report() { return screen.getByTestId("voice-report"); }
+    /** Hold one transport acknowledgement so later prompt commands genuinely wait. */
+    function holdNextWrite(write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
+      let release!: () => void;
+      write.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+      return async () => {
+        await act(async () => { release(); });
+        await flush();
+      };
+    }
     function expectNoInterruptByte(write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
       expect(write.mock.calls.some(([, bytes]) => bytes.includes("\x03")), "Ctrl+C must never be sent").toBe(false);
     }
@@ -558,8 +568,8 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
 
-    /** Scenario: repeat interrupt before three seconds have passed while status still says working. The second utterance writes nothing, but a later interrupt is accepted. */
-    it("refuses a repeated interrupt within three seconds and allows it afterwards", async () => {
+    /** Scenario: repeat interrupt while the same working status persists, both before and after the three-second floor. Neither repeat sends Escape without evidence of a new turn. */
+    it("refuses a repeated interrupt until a new turn is evidenced even after three seconds", async () => {
       const { say, write } = await startPrompt();
       await say("interrupt");
       expect(write).toHaveBeenCalledTimes(1);
@@ -569,15 +579,96 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent(/already interrupted|just interrupted|wait|recent|too soon/i);
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
       await say("interrupt");
+      expect(write, "stale working status must not unlock another Escape").not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/already interrupted|just interrupted|new turn|wait|recent/i);
+    });
+
+    /// Scenario: queue interrupt behind a dictated write, then observe the turn finish before that write settles. Releasing the write sends no Escape to the idle editor and reports the stopped interrupt.
+    it("refuses queued interrupt when the turn ends before delivery", async () => {
+      const { say, write, target, updatePlanner } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("draft");
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, "draft "]]);
+      updatePlanner({ turn: "idle" });
+      await release();
+      expect(write.mock.calls, "idle editor must receive no queued Escape").toEqual([[target, "draft "]]);
+      expect(report()).toHaveTextContent(/not working|stopped interrupting|turn.*ended/i);
+    });
+
+    /// Scenario: OpenCode stops working during the pause after the first Escape. The second Escape is cancelled and the outcome row says the interrupt stopped.
+    it("stops OpenCode interrupt when the turn ends between steps", async () => {
+      const { say, write, target, updatePlanner } = await startPrompt("open_code");
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, "\x1b"]]);
+      updatePlanner({ turn: "idle" });
+      await act(async () => { await vi.advanceTimersByTimeAsync(FIXTURE_PROMPT_KEYS.open_code!.interrupt[0].pauseAfterMs); });
+      await flush();
+      expect(write.mock.calls, "second Escape must not reach an idle editor").toEqual([[target, "\x1b"]]);
+      expect(report()).toHaveTextContent(/not working|stopped interrupting|turn.*ended/i);
+    });
+
+    /// Scenario: keep the first interrupt queued or awaiting delivery longer than three seconds, then ask again. The second request is refused immediately and settling transport results in only one Escape.
+    it.each(["queued", "in flight"] as const)("reserves interrupt while the first is %s beyond three seconds", async (stage) => {
+      const { say, write, target } = await startPrompt();
+      const release = holdNextWrite(write);
+      if (stage === "queued") await say("draft");
+      await say("interrupt");
+      const before = [...write.mock.calls];
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_001); });
+      await say("interrupt");
+      expect(write.mock.calls).toEqual(before);
+      const refusal = report().textContent;
+      await release();
+      expect(write.mock.calls.filter(([, bytes]) => bytes === "\x1b"), "pending interrupt must reserve the pane against a second Escape").toEqual([[target, "\x1b"]]);
+      expect(refusal, "second request must be refused while first remains pending").toMatch(/pending|in flight|already|wait|still interrupting/i);
+    });
+
+    /// Scenario: interrupt, then observe a new turn through a voice send, keyboard Enter, or idle-to-working transition. A repeat is still refused before three seconds and accepted after that floor.
+    it.each(["voice send", "keyboard Enter", "idle then working"] as const)("allows another interrupt after new-turn evidence from %s and the floor", async (evidence) => {
+      const { say, write, keyboard, updatePlanner } = await startPrompt();
+      await say("interrupt");
+      if (evidence === "voice send") {
+        await say("send it");
+        await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+        expect(write.mock.calls.some(([, bytes]) => bytes === "\r")).toBe(true);
+      } else if (evidence === "keyboard Enter") await keyboard("\r");
+      else {
+        updatePlanner({ turn: "idle" });
+        await flush();
+        updatePlanner({ turn: "working" });
+        await flush();
+      }
+      write.mockClear();
+      await say("interrupt");
+      expect(write, "new-turn evidence must not remove the three-second floor").not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      await say("interrupt");
       expect(write).toHaveBeenCalledTimes(1);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
 
-    /** Scenario: clear each per-line editor's prompt. Sixteen verified clear presses reach the pane and the outcome row names the cleared prompt. */
-    it.each(["codex", "open_code", "pi"] as const)("clears %s with sixteen per-line presses", async (agentType) => {
+    /// Scenario: queue interrupt for a turn that ends without receiving Escape, then observe fresh work. The cancelled request creates no delivery timestamp and the new interrupt can run immediately.
+    it("does not stamp the interrupt repeat floor until Escape is delivered", async () => {
+      const { say, write, target, updatePlanner } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("draft");
+      await say("interrupt");
+      updatePlanner({ turn: "idle" });
+      await release();
+      expect(write.mock.calls).toEqual([[target, "draft "]]);
+      updatePlanner({ turn: "working" });
+      await flush();
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, "draft "], [target, "\x1b"]]);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /** Scenario: clear each per-line editor's prompt. Thirty-two verified clear presses reach the pane and the outcome row names the cleared prompt. */
+    it.each(["codex", "open_code", "pi"] as const)("clears %s with thirty-two per-line presses", async (agentType) => {
       const { say, write, target } = await startPrompt(agentType);
       await say("clear the prompt");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.clear.bytes.repeat(16)]]);
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.clear.bytes.repeat(32)]]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
     });
@@ -597,6 +688,87 @@ describe("voice control panel", () => {
       expect(write.mock.calls).toEqual([[target, chunk], [target, chunk]]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+    });
+
+    /// Scenario: stop typing by speech, the Stop typing button, or Voice off during Claude's clear pause. No further clear key is written after the user ends typing mode.
+    it.each(["typing off", "Stop typing", "Voice off"] as const)("cancels paced clear after %s", async (stop) => {
+      const { say, write, target } = await startPrompt("claude_code");
+      await say("clear the prompt");
+      const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+      const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
+      expect(write.mock.calls).toEqual([[target, chunk]]);
+      if (stop === "typing off") await say(stop);
+      else fireEvent.click(stop === "Stop typing" ? screen.getByRole("button", { name: /stop typing/i }) : voiceButton());
+      await flush();
+      expect(screen.queryByRole("button", { name: /stop typing/i })).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs!); });
+      await flush();
+      expect(write.mock.calls, "stopped typing mode must cancel the second clear write").toEqual([[target, chunk]]);
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+    });
+
+    /// Scenario: queue interrupt behind an outstanding dictated write, then stop typing by speech, button, or Voice off. Settling the earlier write sends no interrupt key.
+    it.each(["typing off", "Stop typing", "Voice off"] as const)("cancels queued interrupt after %s", async (stop) => {
+      const { say, write, target } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("draft");
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, "draft "]]);
+      if (stop === "typing off") await say(stop);
+      else fireEvent.click(stop === "Stop typing" ? screen.getByRole("button", { name: /stop typing/i }) : voiceButton());
+      await flush();
+      expect(screen.queryByRole("button", { name: /stop typing/i })).not.toBeInTheDocument();
+      await release();
+      expect(write.mock.calls, "queued interrupt must die with typing mode").toEqual([[target, "draft "]]);
+    });
+
+    /// Scenario: clear waits behind a dictated write and another prompt command is requested for the same pane. The extra command is refused immediately rather than accumulating more pending work.
+    it.each(commands)("bounds the pending prompt queue when $invoke follows a queued clear", async (command) => {
+      const { say, write, target } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("draft");
+      await say("clear the prompt");
+      await say(command.said);
+      expect(write.mock.calls).toEqual([[target, "draft "]]);
+      const refusal = report().textContent;
+      await release();
+      expect(write.mock.calls.slice(1), "only the original clear may leave the queue").toHaveLength(1);
+      expect(write.mock.calls[1][1]).toMatch(/^\x15+$/);
+      expect(refusal).toMatch(command.invoke === "scratchLastDictation" ? /pending|already|wait|in progress|busy|nothing to scratch/i : /pending|already|wait|in progress|busy/i);
+    });
+
+    /// Scenario: scratch waits behind an unfinished voice write while the user types a private draft by hand. Releasing the write leaves the keyboard text intact, sends no deletion bytes, and reports refusal.
+    it("refuses queued scratch after keyboard input changes the prompt revision", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("voice tail");
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, "voice tail "]]);
+      await keyboard("private keyboard draft");
+      await release();
+      expect(write.mock.calls, "scratch must not delete the keyboard draft").toEqual([[target, "voice tail "], [target, "private keyboard draft"]]);
+      expect(screen.getByRole("textbox", { name: "Planner terminal input" })).toHaveValue("private keyboard draft");
+      expect(report()).toHaveTextContent(/nothing.*(removed|scratch)|changed|keyboard|cannot|can't/i);
+    });
+
+    /// Scenario: a queued command holds two dictations apart in time but releases them together after a private prefix. Scratch refuses their combined over-limit burst without sending deletion bytes into the prefix.
+    it("guards scratch against dictated writes released together after a queued command", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("barrier draft");
+      await say("interrupt");
+      await keyboard("private prefix");
+      await say("a".repeat(400));
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      await say("b".repeat(399));
+      expect(write).toHaveBeenCalledTimes(2);
+      await release();
+      expect(write.mock.calls.slice(2)).toEqual([[target, "\x1b"], [target, `${"a".repeat(400)} `], [target, `${"b".repeat(399)} `]]);
+      write.mockClear();
+      await say("scratch that");
+      expect(write, "coalesced burst must not be scratched into a private prefix").not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/cannot|can't/i);
+      expect(report()).toHaveTextContent(/safely|safe|collapsed|paste|together/i);
     });
 
     /** Scenario: dictate two writes and scratch twice. Each scratch deletes only its last write, including the trailing space, and names the removed words in the row. */
@@ -799,11 +971,107 @@ describe("voice control panel", () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs!); });
       }
       const keys = FIXTURE_PROMPT_KEYS[agentType]!.clear;
-      const chunk = keys.bytes.repeat(agentType === "claude_code" ? keys.maxPressesPerWrite! : 16);
+      const chunk = keys.bytes.repeat(agentType === "claude_code" ? keys.maxPressesPerWrite! : 32);
       expect(write.mock.calls).toEqual(agentType === "claude_code" ? [[target, chunk], [target, chunk]] : [[target, chunk]]);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
       expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
       expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+    });
+
+    /// Scenario: establish an empty prompt, dictate and clear voice text, then type a private draft by hand. Undo disappears or refuses the click, and none of the old text is inserted into the new draft.
+    it("withdraws clear Undo after keyboard input changes the prompt revision", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await keyboard("\r");
+      await say("old voice draft");
+      await say("clear the prompt");
+      expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
+      write.mockClear();
+      await keyboard("private new draft");
+      const undo = screen.queryByRole("button", { name: "Undo" });
+      if (undo) {
+        fireEvent.click(undo);
+        await flush();
+      }
+      expect(write.mock.calls, "Undo must not retype into the edited prompt").toEqual([[target, "private new draft"]]);
+      if (undo) expect(report()).toHaveTextContent(/nothing.*restored|changed|keyboard|cannot|can't/i);
+      expect(screen.getByRole("textbox", { name: "Planner terminal input" })).toHaveValue("private new draft");
+    });
+
+    /// Scenario: type by hand between Claude's two paced clear writes after clearing a wholly known voice draft. The operation offers no Undo and a later clear still treats the prompt as unknown.
+    it.each(["immediate Undo", "later ownership"] as const)("does not offer Undo or mark known-empty after keyboard input during paced clear (%s)", async (check) => {
+      const { say, write, keyboard } = await startPrompt("claude_code");
+      await keyboard("\r");
+      await say("old voice draft");
+      await say("clear the prompt");
+      const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+      await keyboard("private input during clear");
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs!); });
+      await flush();
+      if (check === "immediate Undo") {
+        expect(screen.queryByRole("button", { name: "Undo" }), "keyboard edit during clear must invalidate saved restoration").not.toBeInTheDocument();
+        return;
+      }
+      await say("later voice draft");
+      await say("clear the prompt");
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs!); });
+      await flush();
+      expect(screen.queryByRole("button", { name: "Undo" }), "interrupted clear must not establish a known-empty prompt").not.toBeInTheDocument();
+      expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+      expect(write.mock.calls.some(([, bytes]) => bytes === "old voice draft ")).toBe(true);
+    });
+
+    /// Scenario: click Undo for two voice writes, then type by hand while the first restoration write is outstanding. Settling and pacing the restoration must not insert its second saved part into the edited prompt.
+    it("rechecks the Undo revision before later paced restoration writes", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await keyboard("\r");
+      await say("first old part");
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      await say("second old part");
+      await say("clear the prompt");
+      write.mockClear();
+      const release = holdNextWrite(write);
+      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      await flush();
+      expect(write.mock.calls).toEqual([[target, "first old part "]]);
+      await keyboard("private edit during Undo");
+      await release();
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      await flush();
+      expect(write.mock.calls, "Undo must recheck ownership after waiting").toEqual([[target, "first old part "], [target, "private edit during Undo"]]);
+      expect(report()).toHaveTextContent(/nothing.*restored|changed|keyboard|cannot|can't/i);
+    });
+
+    /// Scenario: clear a known voice draft with Undo available, then say typing off. Typing mode ends and the new outcome row removes Undo without retyping the cleared draft.
+    it("replaces revision-valid clear Undo after spoken typing off without retyping", async () => {
+      const { say, write, keyboard } = await startPrompt();
+      await keyboard("\r");
+      await say("old voice draft");
+      await say("clear the prompt");
+      expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+      write.mockClear();
+      await say("typing off");
+      await flush();
+      expect(screen.queryByRole("button", { name: /stop typing/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+      expect(report()).not.toHaveTextContent("Cleared Planner's prompt.");
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    /// Scenario: clear a known voice draft, then end typing mode with the Stop typing button. Undo remains a deliberate click and restores the unchanged prompt despite typing mode being off.
+    it("allows revision-valid clear Undo after Stop typing", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await keyboard("\r");
+      await say("old voice draft");
+      await say("clear the prompt");
+      fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+      await flush();
+      expect(screen.queryByRole("button", { name: /stop typing/i })).not.toBeInTheDocument();
+      write.mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      await flush();
+      expect(write.mock.calls).toEqual([[target, "old voice draft "]]);
+      expect(report()).toHaveTextContent("Restored Planner's prompt.");
     });
 
     /// Scenario: send with keyboard Enter to establish an empty prompt, then type by hand between voice writes and clear. No Undo is offered and the outcome row explains that the text cannot be restored.

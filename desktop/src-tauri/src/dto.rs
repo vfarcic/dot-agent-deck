@@ -1480,9 +1480,9 @@ const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
 const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
 /// PRD #1541: how many times the panel presses the clear key, by rule — a
 /// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
-/// which a clear's pause budget is computed against. `per_line` is 32 there
-/// once the panel's pending change lands (16 before it); counting the larger
-/// figure only makes the budget stricter.
+/// which a clear's pause budget is computed against; the two must move
+/// together, and `the_clear_press_mirror_matches_the_panel` fails when they
+/// do not.
 const PROMPT_KEY_CLEAR_PRESSES_PER_LINE: u64 = 32;
 const PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW: u64 = 64;
 
@@ -3608,6 +3608,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// PRD #1541 R-S2: the clear budget's press counts mirror the panel's
+    /// `VOICE_CLEAR_PRESSES`, so the budget is computed against the presses
+    /// the panel actually makes.
+    #[test]
+    fn the_clear_press_mirror_matches_the_panel() {
+        let panel = include_str!("../../src/components/VoiceControlPanel.tsx");
+        let declaration = panel
+            .lines()
+            .find(|line| line.starts_with("export const VOICE_CLEAR_PRESSES"))
+            .expect("the panel declares VOICE_CLEAR_PRESSES on one line");
+        let count = |rule: &str| -> u64 {
+            let at = declaration
+                .find(&format!("{rule}: "))
+                .unwrap_or_else(|| panic!("VOICE_CLEAR_PRESSES names {rule}"));
+            declaration[at + rule.len() + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("VOICE_CLEAR_PRESSES gives {rule} a number"))
+        };
+        assert_eq!(count("per_line"), PROMPT_KEY_CLEAR_PRESSES_PER_LINE);
+        assert_eq!(
+            count("per_wrapped_row"),
+            PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW
+        );
     }
 
     /// PRD #1541: the browser fixture's prompt keys
