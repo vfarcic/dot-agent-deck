@@ -224,6 +224,54 @@ impl RemoteResolver {
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
+            Protocol::OpenAiCompatible { reasoning_effort } => super::openai::request_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        let payload = self.post(body).await?;
+        match self.protocol {
+            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible { .. } => {
+                super::openai::parse_response(&payload, self.max_tokens)
+            }
+        }
+    }
+
+    /// PRD #1542: the question call — the same transport, credential and
+    /// failure wording as [`Self::run`], with [`super::question`]'s body and
+    /// reply reader for the protocol.
+    async fn run_question(
+        &self,
+        request: super::question::QuestionRequest<'_>,
+    ) -> Result<super::question::ModelAnswer, IntentError> {
+        let body = match self.protocol {
+            Protocol::Anthropic => {
+                super::question::anthropic_body(&request, self.model.as_str(), self.max_tokens)
+            }
+            Protocol::OpenAiCompatible { reasoning_effort } => super::question::openai_body(
+                &request,
+                self.model.as_str(),
+                self.max_tokens,
+                reasoning_effort,
+            ),
+        };
+        let payload = self.post(body).await?;
+        match self.protocol {
+            Protocol::Anthropic => super::question::parse_anthropic(&payload, self.max_tokens),
+            Protocol::OpenAiCompatible { .. } => {
+                super::question::parse_openai(&payload, self.max_tokens)
+            }
+        }
+    }
+
+    /// One request body to the endpoint, and its successful reply's JSON — the
+    /// transport both calls share.
+    async fn post(&self, body: Value) -> Result<Value, IntentError> {
         // **A loopback endpoint takes no credential, and the keychain is not
         // consulted at all.** The same rule Speech has, reached by a different
         // route: there the keyless choice is a backend token and the
@@ -264,15 +312,6 @@ impl RemoteResolver {
             ));
         };
 
-        let body = match self.protocol {
-            Protocol::Anthropic => request_body(&request, self.model.as_str(), self.max_tokens),
-            Protocol::OpenAiCompatible { reasoning_effort } => super::openai::request_body(
-                &request,
-                self.model.as_str(),
-                self.max_tokens,
-                reasoning_effort,
-            ),
-        };
         let mut post = client
             .post(self.endpoint.as_str())
             .timeout(REMOTE_TIMEOUT)
@@ -321,18 +360,20 @@ impl RemoteResolver {
         if !status.is_success() {
             return Err(IntentError::Backend(api_error_detail(status, &payload)));
         }
-        match self.protocol {
-            Protocol::Anthropic => parse_response(&payload, self.max_tokens),
-            Protocol::OpenAiCompatible { .. } => {
-                super::openai::parse_response(&payload, self.max_tokens)
-            }
-        }
+        Ok(payload)
     }
 }
 
 impl IntentResolver for RemoteResolver {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a> {
         Box::pin(self.run(request))
+    }
+
+    fn resolve_question<'a>(
+        &'a self,
+        request: super::question::QuestionRequest<'a>,
+    ) -> super::resolver::QuestionFuture<'a> {
+        Box::pin(self.run_question(request))
     }
 
     fn backend_name(&self) -> &'static str {

@@ -7025,6 +7025,17 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the handler's agent and id checks (`question/answer/001`).
 - **Platform coverage:** mac+linux.
 
+#### question/desktop
+
+The desktop half of answering by voice. These tests live in the desktop crate (`desktop/src-tauri/src/voice/question_tests.rs`, run by `cargo test-fast`) and the webview (`desktop/src/components/VoiceQuestion.test.tsx`, run by `pnpm test` in `desktop/`), which linkage-check does not walk, so they are named here by test rather than as `#[spec]` IDs.
+
+- **question/desktop/001** — `question_desktop_001_the_projection_is_safe_and_says_what_can_be_answered`: the agent DTO's `pendingQuestion` keeps every option in order, scrubs control and bidi characters from every text field, carries the always option's scope, and marks an option answerable only when it is not keyboard-only and the question's channel is one the deck can use; the key is absent when nothing is pending.
+- **question/desktop/002** — `question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it`: "go ahead" mapped by the (stub) Commands model to allow-once is taken and counts down as "Allow once — touch x"; a model answer naming an option not offered, two options on a single choice, a keyboard-only option, or a question the deck cannot answer is refused with a sentence; an exact label ("No") or position ("option two") is matched locally with no model call.
+- **question/desktop/003** — `question_desktop_003_the_form_fills_in_across_utterances`: a two-question form fills in over "red for colour" and "small and large" (multi-select), a later answer replaces an earlier one, a free-text option takes the next utterance verbatim with no model call, and an always option asks for the confirmation naming its scope and is never sent unconfirmed.
+- **question/desktop/004** — `question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_s`: a `not_answer` verdict leaves the utterance to ordinary command handling, which dispatches it; "no", a numbered choice's cancel phrase, is the pending question's deny option first; "cancel" calls a started answer off.
+- **question/desktop/005** — vitest `question/desktop/005: always allow is sent only after a confirmation naming its scope`: "always" opens the confirmation and starts no countdown; Cancel sends nothing; Confirm, by click or by saying "confirm", starts the five-second countdown and the send asserts `confirmedAlways`.
+- **question/desktop/006** — vitest `question/desktop/006: …` (three tests): the countdown is called off, with nothing sent, when the pending question's id changes; `questionLost` names each reason (question, pane, replaced, confirmation, deck); every outcome the deck can send back, each refusal and the withheld case included, is what the row says; a non-answer goes on to the command resolver. The Rust side of the sentences is `question_desktop_every_refusal_has_its_sentence`.
+
 #### question/hold
 
 ##### question/hold/001 — The held Claude Code hook prints exactly the decision for its own question.

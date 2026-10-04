@@ -11,6 +11,7 @@ import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
+import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -291,6 +292,13 @@ export interface DesktopAgentDto {
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * PRD #1542: the question this agent is waiting on
+   * (`SessionSnapshot.pending_question`), every text field scrubbed by the
+   * crate and still the agent's own words. Absent when it waits on nothing,
+   * and from a daemon that predates the field.
+   */
+  pendingQuestion?: PendingQuestionDto;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1743,6 +1751,20 @@ export interface DeckBridge {
    */
   answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto>;
   /**
+   * PRD #1542 — one utterance said on an agent's own screen while it waits on
+   * a question (`desktop_voice_question`): which options it picks, merged
+   * into `form`, or `not_answer`, which the panel then resolves as a command.
+   * The question is read Rust-side from the deck's snapshot; `target` names
+   * the one the panel saw.
+   */
+  resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto>;
+  /**
+   * PRD #1542 — send a whole answered form once the countdown ran out
+   * (`desktop_voice_answer_question`). Every outcome, a refusal included, is
+   * a sentence for the panel's row.
+   */
+  sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean): Promise<AnswerOutcomeDto>;
+  /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
    *
@@ -2063,6 +2085,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     lastActivityMs: agent.lastActivityMs,
     spawnedAtMs: agent.spawnedAtMs,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
+    ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -2802,6 +2825,18 @@ class FixtureDeckBridge implements DeckBridge {
   async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
     await Promise.resolve();
     return answerNumberLocally(utterance, heard, generation);
+  }
+
+  /** PRD #1542 — the preview's agents wait on no question, so nothing said is an answer. */
+  async resolveVoiceQuestion(): Promise<QuestionResultDto> {
+    await Promise.resolve();
+    return { verdict: { kind: "not_answer" }, resolveMs: null, backend: "fixture" };
+  }
+
+  /** PRD #1542 — and so there is never one to send to. */
+  async sendVoiceAnswer(): Promise<AnswerOutcomeDto> {
+    await Promise.resolve();
+    return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
   }
 
   /**
@@ -4400,6 +4435,16 @@ export class TauriDeckBridge implements DeckBridge {
   async answerVoiceNumber(utterance: string, heard: VoiceNumberedListDto, generation: number): Promise<VoiceNumberAnswerDto> {
     const invoke = await this.getInvoke();
     return invoke<VoiceNumberAnswerDto>("desktop_voice_number", { utterance, heard, generation });
+  }
+
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto> {
+    const invoke = await this.getInvoke();
+    return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null });
+  }
+
+  async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean): Promise<AnswerOutcomeDto> {
+    const invoke = await this.getInvoke();
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {

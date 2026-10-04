@@ -612,6 +612,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
       terminalHidden: paneTab !== "terminal" || undefined,
+      /* PRD #1542 — the question the agent is waiting on, which voice answers
+         from this pane, and only from this pane (decision 9). */
+      question: paneShownAgent.pendingQuestion,
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
   /**

@@ -8,6 +8,7 @@ import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
+import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
 import { isDelivered } from "../types";
 import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, RuntimeMode, SendResult, TerminalBuffer } from "../types";
@@ -404,6 +405,8 @@ export function useDeckRuntime(): DeckRuntimeState {
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const answerVoiceNumber = useCallback((utterance: string, heard: VoiceNumberedListDto, generation: number) => bridge.answerVoiceNumber(utterance, heard, generation), [bridge]);
+  const resolveVoiceQuestion = useCallback((target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto) => bridge.resolveVoiceQuestion(target, utterance, form, awaitingText), [bridge]);
+  const sendVoiceAnswer = useCallback((target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean) => bridge.sendVoiceAnswer(target, form, confirmedAlways), [bridge]);
   const voiceCommands = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto) => bridge.voiceCommands(screen, directories, newAgent), [bridge]);
   const voiceStart = useCallback(() => bridge.voiceStart(), [bridge]);
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
@@ -501,6 +504,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     resolveVoice,
     answerVoiceChoice,
     answerVoiceNumber,
+    resolveVoiceQuestion,
+    sendVoiceAnswer,
     voiceCommands,
     voiceStart,
     voiceStop,

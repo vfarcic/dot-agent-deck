@@ -177,6 +177,21 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "features",
     "platform",
     "prompt_delivery",
+    // PRD #1542, argued rather than added quietly. The desktop names the
+    // pending-question model the daemon carries on the snapshot
+    // (`PendingQuestion` and its parts, read to project it for the webview),
+    // the `QuestionAnswer` an `AnswerQuestion` sends, the `AnswerRefusal` it
+    // can come back with, and three bounds (`MAX_QUESTIONS`, `MAX_OPTIONS`,
+    // `MAX_ANSWER_TEXT_CHARS`) its IPC boundary checks a form against. These
+    // are wire types and their limits: a desktop-side copy would be a second
+    // definition of the contract to keep in step with the daemon's (CLAUDE.md
+    // rule 18). The module's producer helpers (`claude_permission_request` and
+    // the rest) build questions from hook payloads and are the daemon's and the
+    // hook's to call, not the desktop's. Checked against this rule's lines: the
+    // module resolves no project, reads no file, names no FORBIDDEN_SYMBOL or
+    // project-state literal, and contains no `std::env::current_dir` — all
+    // zero for it.
+    "question",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
     // schema is built from this module's validating ssh-argument newtypes
     // (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`), and

@@ -489,7 +489,173 @@ pub struct DesktopAgent {
     /// older daemon, which never reports the status either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<DesktopBlocked>,
+    /// PRD #1542: the question this agent is waiting on
+    /// (`SessionSnapshot.pending_question`), every text field made safe to
+    /// show, with whether each option can be answered by voice. Absent when
+    /// the agent waits on nothing, and from a daemon that predates the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<DesktopPendingQuestion>,
     pub tab: DesktopTab,
+}
+
+/// PRD #1542: the webview's view of the daemon's
+/// [`dot_agent_deck::question::PendingQuestion`].
+///
+/// **Every text field is untrusted agent or model output**
+/// (`docs/develop/voice-first-design.md` §6): the daemon caps and strips it on
+/// arrival, and it goes through [`safe_display_text`] again here, because this
+/// is the seam every desktop reader takes it from — the panel, and the voice
+/// model's data turn. It is shown verbatim and never interpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopPendingQuestion {
+    /// The daemon's id for the question — what an answer names, and what the
+    /// voice panel's staleness check compares.
+    pub id: String,
+    /// `permission`, `choice`, `plan`, `confirm` or `unknown`.
+    pub kind: String,
+    /// `held`, `keys`, `unsupported` or `unknown` — how the deck would answer.
+    pub channel: String,
+    pub questions: Vec<DesktopQuestion>,
+    /// What a permission or plan prompt is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<DesktopQuestionTool>,
+    /// Whether the deck can answer this question at all: its channel is one
+    /// the deck can use and at least one option is answerable.
+    pub answerable: bool,
+}
+
+/// The tool a [`DesktopPendingQuestion`] asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionTool {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One question of a [`DesktopPendingQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestion {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub multi_select: bool,
+    pub options: Vec<DesktopQuestionOption>,
+}
+
+/// One option of a [`DesktopQuestion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopQuestionOption {
+    /// 1-based, the number the agent shows beside it.
+    pub index: u32,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `allow_once`, `allow_always`, `deny`, `choice`, `free_text` or `unknown`.
+    pub role: String,
+    /// Whether the deck can send this option: not keyboard-only, a role this
+    /// build knows, and a question channel the deck can use.
+    pub answerable: bool,
+    /// For `allow_always`: what "always" covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl DesktopPendingQuestion {
+    /// The question `question_index` names, if there is one.
+    pub fn question(&self, question_index: u32) -> Option<&DesktopQuestion> {
+        self.questions.get(question_index as usize)
+    }
+}
+
+impl DesktopQuestion {
+    /// The option whose shown number is `index`, if there is one.
+    pub fn option(&self, index: u32) -> Option<&DesktopQuestionOption> {
+        self.options.iter().find(|option| option.index == index)
+    }
+}
+
+/// PRD #1542: [`DesktopPendingQuestion`] from the daemon's question.
+pub(crate) fn map_pending_question(
+    question: &dot_agent_deck::question::PendingQuestion,
+) -> DesktopPendingQuestion {
+    use dot_agent_deck::question::{AnswerChannel, OptionRole, QuestionKind};
+    let channel_answers = matches!(question.channel, AnswerChannel::Held | AnswerChannel::Keys);
+    let questions: Vec<DesktopQuestion> = question
+        .questions
+        .iter()
+        .map(|q| DesktopQuestion {
+            prompt: safe_display_text(&q.prompt),
+            header: q
+                .header
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|header| !header.is_empty()),
+            multi_select: q.multi_select,
+            options: q
+                .options
+                .iter()
+                .map(|option| DesktopQuestionOption {
+                    index: option.index,
+                    label: safe_display_text(&option.label),
+                    description: option
+                        .description
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|description| !description.is_empty()),
+                    role: match option.role {
+                        OptionRole::AllowOnce => "allow_once",
+                        OptionRole::AllowAlways => "allow_always",
+                        OptionRole::Deny => "deny",
+                        OptionRole::Choice => "choice",
+                        OptionRole::FreeText => "free_text",
+                        OptionRole::Unknown => "unknown",
+                    }
+                    .to_string(),
+                    answerable: channel_answers && option.answerable(),
+                    scope: option
+                        .scope
+                        .as_deref()
+                        .map(safe_display_text)
+                        .filter(|scope| !scope.is_empty()),
+                })
+                .collect(),
+        })
+        .collect();
+    let answerable = questions
+        .iter()
+        .any(|q| q.options.iter().any(|option| option.answerable));
+    DesktopPendingQuestion {
+        id: question.id.clone(),
+        kind: match question.kind {
+            QuestionKind::Permission => "permission",
+            QuestionKind::Choice => "choice",
+            QuestionKind::Plan => "plan",
+            QuestionKind::Confirm => "confirm",
+            QuestionKind::Unknown => "unknown",
+        }
+        .to_string(),
+        channel: match question.channel {
+            AnswerChannel::Held => "held",
+            AnswerChannel::Keys => "keys",
+            AnswerChannel::Unsupported => "unsupported",
+            AnswerChannel::Unknown => "unknown",
+        }
+        .to_string(),
+        questions,
+        tool: question.tool.as_ref().map(|tool| DesktopQuestionTool {
+            name: safe_display_text(&tool.name),
+            detail: tool
+                .detail
+                .as_deref()
+                .map(safe_display_text)
+                .filter(|detail| !detail.is_empty()),
+        }),
+        answerable,
+    }
 }
 
 /// Issue #714: the webview's view of a `BlockedReason`.
@@ -1516,6 +1682,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     // closes, and make the change cosmetic.
     let cli_name = record.cli_name;
     let tab = map_tab(record.tab_membership.as_ref());
+    let pending_question = live
+        .and_then(|snapshot| snapshot.pending_question.as_ref())
+        .map(map_pending_question);
 
     DesktopAgent {
         id: record.id,
@@ -1534,6 +1703,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_activity_ms,
         spawned_at_ms,
         blocked,
+        pending_question,
         tab,
     }
 }

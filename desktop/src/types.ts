@@ -683,6 +683,12 @@ export interface AgentSession {
   spawnedAtMs?: number;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
+  /**
+   * HONEST. PRD #1542: the question the agent is waiting on, from the daemon's
+   * snapshot. Every text field is the agent's own words, scrubbed by the
+   * crate; render it through `displayText` like any other free-form string.
+   */
+  pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
   /** HONEST. */
   rows: number;
   /** HONEST. */
@@ -1350,6 +1356,14 @@ export interface DeckRuntimeState {
    * `answerNumberLocally`, the webview's port of the same rule.
    */
   answerVoiceNumber?: (utterance: string, heard: import("./lib/voiceNumbers").VoiceNumberedListDto, generation: number) => Promise<import("./lib/voiceNumbers").VoiceNumberAnswerDto>;
+  /**
+   * PRD #1542 — an utterance said while the agent on screen waits on a
+   * question (`DeckBridge.resolveVoiceQuestion`), and the send of a whole
+   * answered form (`DeckBridge.sendVoiceAnswer`). Optional like the rest: a
+   * panel on a runtime without them treats nothing as an answer.
+   */
+  resolveVoiceQuestion?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, utterance: string, form: import("./lib/voiceQuestion").QuestionSelectionDto[], awaitingText?: import("./lib/voiceQuestion").QuestionTextSlotDto) => Promise<import("./lib/voiceQuestion").QuestionResultDto>;
+  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
   /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.

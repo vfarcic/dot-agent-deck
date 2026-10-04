@@ -3555,6 +3555,200 @@ async fn desktop_voice_number(
     Ok(voice::numbers::answer(&utterance, &heard, generation))
 }
 
+/// PRD #1542: the most selections a webview may send for one form —
+/// [`dot_agent_deck::question::MAX_QUESTIONS`], which is the most questions a
+/// form carries.
+const MAX_VOICE_FORM_SELECTIONS: usize = dot_agent_deck::question::MAX_QUESTIONS;
+
+/// Refuse a form no real question could have produced: more selections than a
+/// form has questions, more options than a question has, words longer than an
+/// answer may be, or ids no deck mints.
+fn validate_voice_question_form(
+    deck_id: &str,
+    agent_id: &str,
+    question_id: &str,
+    form: &[voice::question::Selection],
+) -> Result<(), String> {
+    let bad_id = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad_id(deck_id)
+        || bad_id(agent_id)
+        || question_id.is_empty()
+        || question_id.chars().count() > dot_agent_deck::question::MAX_ID_CHARS
+        || form.len() > MAX_VOICE_FORM_SELECTIONS
+        || form.iter().any(|selection| {
+            selection.option_indices.len() > dot_agent_deck::question::MAX_OPTIONS
+                || selection.text.as_deref().is_some_and(|text| {
+                    text.chars().count() > dot_agent_deck::question::MAX_ANSWER_TEXT_CHARS
+                })
+        })
+    {
+        return Err("the answer sent with that utterance is not one this app offers".to_string());
+    }
+    Ok(())
+}
+
+/// PRD #1542: the question `agent_id` on `deck_id` is waiting on, as the
+/// deck's snapshot has it now — never the webview's copy.
+async fn pending_question_on(
+    state: &DesktopState,
+    deck_id: &str,
+    agent_id: &str,
+) -> Result<Option<crate::dto::DesktopPendingQuestion>, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let snapshot = crate::daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
+    Ok(snapshot
+        .agents
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .and_then(|agent| agent.pending_question))
+}
+
+/// PRD #1542: one utterance said on an agent's own screen while that agent
+/// waits on a question — which of its options it picks, if it is about the
+/// question at all ([`voice::question::resolve`]).
+///
+/// The question is read HERE, from the deck's snapshot, for
+/// [`desktop_voice_resolve`]'s reason; the webview names which one it saw so
+/// a question that changed meanwhile is reported as that rather than answered.
+/// `form` and `awaiting_text` are the answer so far, the webview's state, and
+/// are held to the snapshot's question before anything uses them. `agent` is
+/// the name the pane shows, used only in a sentence.
+///
+/// A `not_answer` verdict is the webview's cue to resolve the utterance as a
+/// command ([`desktop_voice_resolve`]). Nothing here sends anything to the
+/// agent: [`desktop_voice_answer_question`] does, after the countdown.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_question(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    agent: String,
+    question_id: String,
+    utterance: String,
+    form: Vec<voice::question::Selection>,
+    awaiting_text: Option<voice::question::TextSlot>,
+) -> Result<voice::question::QuestionResult, String> {
+    ensure_main_webview(&webview)?;
+    if utterance.len() > MAX_UTTERANCE_BYTES {
+        return Err(format!(
+            "that answer is too long to send — {MAX_UTTERANCE_BYTES} bytes at most"
+        ));
+    }
+    validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
+    let agent = voice_agent_name(&agent);
+    let settings = crate::settings::load_settings_without_decks()
+        .voice
+        .unwrap_or_default();
+    let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
+    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+        // Nothing is waiting any more: the utterance is the user's next
+        // command, not an answer to a question that is gone.
+        return Ok(voice::question::QuestionResult {
+            verdict: voice::question::QuestionVerdict::NotAnswer,
+            resolve_ms: None,
+            backend: resolver.backend_name(),
+        });
+    };
+    if question.id != question_id {
+        return Ok(voice::question::QuestionResult {
+            verdict: voice::question::QuestionVerdict::Refused {
+                sentence: voice::question::QUESTION_MOVED_ON.to_string(),
+            },
+            resolve_ms: None,
+            backend: resolver.backend_name(),
+        });
+    }
+    Ok(voice::question::resolve(
+        resolver.as_ref(),
+        &agent,
+        &question,
+        &form,
+        awaiting_text,
+        voice::Transcript::new(utterance),
+    )
+    .await)
+}
+
+/// The bound on one answer once the deck's link is held, for
+/// `claim_focus_on`'s reason: a wedged daemon must not hold the command open.
+/// A held answer is written to a waiting producer and a keys answer types at
+/// most a few keys with a short gap, so this is generous.
+const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// PRD #1542: send a whole answered form, after the webview's countdown.
+///
+/// Checked against the deck's snapshot first — the same question, every
+/// selection still valid, every question answered, and the "always" option
+/// confirmed ([`voice::question::check_form`]) — and only then sent, through
+/// `DaemonClient::answer_question_while`, which withholds the request from a
+/// daemon that does not advertise `answer-question`. Every outcome, the
+/// daemon's refusals included, comes back as a sentence for the outcome row.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn desktop_voice_answer_question(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    agent_id: String,
+    agent: String,
+    question_id: String,
+    form: Vec<voice::question::Selection>,
+    confirmed_always: bool,
+) -> Result<voice::question::AnswerOutcome, String> {
+    ensure_main_webview(&webview)?;
+    validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
+    let agent = voice_agent_name(&agent);
+    let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
+        return Ok(voice::question::AnswerOutcome {
+            kind: "refused",
+            code: Some("no_pending_question"),
+            sentence: "No question is waiting in this agent.".to_string(),
+        });
+    };
+    if let Err(refused) =
+        voice::question::check_form(&agent, &question, &question_id, &form, confirmed_always)
+    {
+        return Ok(refused);
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let answers = voice::question::answers_of(&form);
+    let sent = daemon.client.answer_question_while(
+        || true,
+        &agent_id,
+        &question_id,
+        answers,
+        confirmed_always,
+    );
+    let report = match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
+        Ok(report) => report.map_err(|error| safe_message(error.to_string()))?,
+        Err(_) => return Err("the deck did not answer in time".to_string()),
+    };
+    Ok(voice::question::report_outcome(
+        &agent, &question, &form, &report,
+    ))
+}
+
+/// The pane's name as the webview sent it, made safe for a sentence and
+/// bounded — it is only ever quoted.
+fn voice_agent_name(agent: &str) -> String {
+    let name: String = crate::dto::safe_display_text(agent)
+        .chars()
+        .take(MAX_VOICE_AGENT_NAME_CHARS)
+        .collect();
+    if name.trim().is_empty() {
+        "This agent".to_string()
+    } else {
+        name
+    }
+}
+
+/// The longest pane name a voice sentence quotes.
+const MAX_VOICE_AGENT_NAME_CHARS: usize = 120;
+
 /// [`desktop_voice_choice`] once the live state is read. The decks are the
 /// ones a resolve would have offered; for [`voice::SWITCH_DECK_ROW`] they are
 /// keyed by the Deck selector's token, as that row's candidates are, and a
@@ -5418,6 +5612,8 @@ pub fn run() {
             desktop_voice_resolve,
             desktop_voice_choice,
             desktop_voice_number,
+            desktop_voice_question,
+            desktop_voice_answer_question,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())

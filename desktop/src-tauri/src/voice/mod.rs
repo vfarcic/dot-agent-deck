@@ -51,6 +51,7 @@ pub mod numbers;
 pub mod openai;
 pub mod outcome;
 pub mod prompt;
+pub mod question;
 pub mod remote;
 pub mod resolver;
 pub mod schema;
@@ -601,6 +602,7 @@ pub mod test_support {
             last_activity_ms: None,
             spawned_at_ms: None,
             blocked: None,
+            pending_question: None,
             tab: DesktopTab::Dashboard,
         }
     }

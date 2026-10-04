@@ -167,9 +167,28 @@ impl std::error::Error for IntentError {}
 pub type ResolveFuture<'a> =
     Pin<Box<dyn Future<Output = Result<IntentAnswer, IntentError>> + Send + 'a>>;
 
+/// The future [`IntentResolver::resolve_question`] returns (PRD #1542).
+pub type QuestionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<super::question::ModelAnswer, IntentError>> + Send + 'a>>;
+
 /// A backend that turns an utterance into a structured answer.
 pub trait IntentResolver: Send + Sync {
     fn resolve<'a>(&'a self, request: IntentRequest<'a>) -> ResolveFuture<'a>;
+
+    /// PRD #1542: the second question the Commands backend answers — which of
+    /// a pending agent question's options an utterance picks
+    /// ([`super::question`]). A backend that cannot ask it answers
+    /// [`IntentError::NotConfigured`], which the question path reports.
+    fn resolve_question<'a>(
+        &'a self,
+        _request: super::question::QuestionRequest<'a>,
+    ) -> QuestionFuture<'a> {
+        Box::pin(async {
+            Err(IntentError::NotConfigured(
+                "this command backend cannot answer an agent's questions".into(),
+            ))
+        })
+    }
 
     /// Which backend this is, for the surface to name.
     ///
@@ -239,6 +258,12 @@ pub fn resolver_for(
 #[derive(Debug, Clone, Default)]
 pub struct StubResolver {
     answers: BTreeMap<String, IntentAnswer>,
+    /// PRD #1542: scripted answers to the question call, keyed like `answers`.
+    /// An utterance with none answers `not_answer`.
+    question_answers: BTreeMap<String, super::question::ModelAnswer>,
+    /// How many question calls were made — so a test can assert a local path
+    /// spent none.
+    question_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     failure: Option<IntentError>,
 }
 
@@ -253,11 +278,27 @@ impl StubResolver {
         self
     }
 
+    /// PRD #1542: answer the question call with `answer` for `utterance`.
+    pub fn answering_question(
+        mut self,
+        utterance: &str,
+        answer: super::question::ModelAnswer,
+    ) -> Self {
+        self.question_answers.insert(normalize(utterance), answer);
+        self
+    }
+
+    /// PRD #1542: how many question calls this stub has answered.
+    pub fn question_calls(&self) -> usize {
+        self.question_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Fail every request, whatever was said.
     pub fn failing(error: IntentError) -> Self {
         Self {
-            answers: BTreeMap::new(),
             failure: Some(error),
+            ..Self::default()
         }
     }
 }
@@ -271,6 +312,23 @@ impl IntentResolver for StubResolver {
                 .get(&normalize(request.transcript.text()))
                 .cloned()
                 .unwrap_or_else(IntentAnswer::none)),
+        };
+        Box::pin(async move { outcome })
+    }
+
+    fn resolve_question<'a>(
+        &'a self,
+        request: super::question::QuestionRequest<'a>,
+    ) -> QuestionFuture<'a> {
+        self.question_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let outcome = match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(self
+                .question_answers
+                .get(&normalize(request.transcript.text()))
+                .cloned()
+                .unwrap_or_else(super::question::ModelAnswer::not_answer)),
         };
         Box::pin(async move { outcome })
     }
