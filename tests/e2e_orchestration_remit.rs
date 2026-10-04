@@ -1451,15 +1451,7 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
 
     // The daemon learns of the re-arm asynchronously (the TUI reports it off
     // its render thread), so wait for the record to follow before detaching.
-    // A barrier only: the assertion that matters is the reattached re-arm's
-    // content below, which is what a user would lose.
-    let rearmed_wire = run.rearmed_path.to_string_lossy().into_owned();
-    let _ = common::wait_until(Duration::from_secs(10), || {
-        role_agent_record(&run.daemon.attach_socket, "orchestrator")
-            .orchestrator_context_path
-            .as_deref()
-            == Some(rearmed_wire.as_str())
-    });
+    assert_record_follows(&run.daemon.attach_socket, &run.rearmed_path);
     // Move the start role off `Compacting`, so the fresh TUI below meets a
     // pane that is not already compacting and re-arms only on the second
     // injection.
@@ -1529,6 +1521,8 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
         second_path.display()
     );
 
+    // The second report is asynchronous too: end the run only once it landed.
+    assert_record_follows(&daemon.attach_socket, &second_path);
     for id in agent_ids {
         let stopped = daemon
             .send_attach_request(&AttachRequest::StopAgent { id })
@@ -1550,6 +1544,21 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
     assert!(
         context_dir.join("orchestrator-context.md").is_file(),
         "the compatibility mirror must remain"
+    );
+}
+
+/// Wait until the daemon advertises `path` as the start role's context file —
+/// the record following a re-arm the TUI reported.
+#[cfg(unix)]
+fn assert_record_follows(socket: &std::path::Path, path: &std::path::Path) {
+    let wire = path.to_string_lossy().into_owned();
+    let advertised = || role_agent_record(socket, "orchestrator").orchestrator_context_path;
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            advertised().as_deref() == Some(wire.as_str())
+        }),
+        "the daemon's recorded context never followed the re-arm to {wire}; it advertises {:?}",
+        advertised()
     );
 }
 

@@ -4197,11 +4197,20 @@ impl PaneController for EmbeddedPaneController {
                     "the daemon does not record re-arm publications; it keeps the context file \
                      it recorded at the start"
                 ),
-                Err(e) => tracing::warn!(
+                // The daemon logs its own refusals, at the level each deserves:
+                // most are routine (an orchestration opened with `Ctrl+n` has no
+                // recorded file to follow).
+                Err(e @ crate::daemon_client::ClientError::Server(_)) => tracing::debug!(
                     pane_id,
                     path = %context_path.display(),
                     error = %e,
                     "the daemon did not record the orchestrator's re-armed context file"
+                ),
+                Err(e) => tracing::warn!(
+                    pane_id,
+                    path = %context_path.display(),
+                    error = %e,
+                    "could not report the orchestrator's re-armed context file to the daemon"
                 ),
             }
         });

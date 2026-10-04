@@ -1179,6 +1179,8 @@ pub enum RearmedContextRefusal {
     NotBesideTheRecordedContext,
     /// Another orchestration records that file.
     AnotherOrchestrationsContext,
+    /// The recorded file changed after the caller compared against it.
+    RecordMoved,
 }
 
 impl std::fmt::Display for RearmedContextRefusal {
@@ -1190,6 +1192,7 @@ impl std::fmt::Display for RearmedContextRefusal {
                 "the path is not a per-publish context file beside the recorded one"
             }
             Self::AnotherOrchestrationsContext => "another orchestration records that file",
+            Self::RecordMoved => "the recorded file changed while the report was being checked",
         })
     }
 }
@@ -11425,13 +11428,43 @@ impl AppState {
     /// Issue #1395: record the per-publish context file `identity`'s
     /// coordinator was started with. Called by the daemon's start paths with
     /// the path from their own preparation binding or publish.
+    ///
+    /// A different file already recorded for `identity` is kept for deletion
+    /// when the orchestration ends ([`Self::orchestration_superseded_contexts`]),
+    /// as a re-arm's is (Qodo on PR #1554): a start recorded after a re-arm
+    /// must not drop that re-arm's file from the cleanup.
     pub fn record_orchestration_context(
         &mut self,
         identity: &OrchestrationIdentity,
         context_path: std::path::PathBuf,
     ) {
-        self.orchestration_context_paths
-            .insert(identity.clone(), context_path);
+        if let Some(displaced) = self
+            .orchestration_context_paths
+            .insert(identity.clone(), context_path.clone())
+            .filter(|displaced| *displaced != context_path)
+        {
+            self.supersede_context(identity, displaced, &context_path);
+        }
+    }
+
+    /// Issue #1445: remember `displaced`, which `newest` just replaced as
+    /// `identity`'s recorded file, for deletion at the end — once, and within
+    /// [`MAX_SUPERSEDED_CONTEXTS`].
+    fn supersede_context(
+        &mut self,
+        identity: &OrchestrationIdentity,
+        displaced: std::path::PathBuf,
+        newest: &std::path::Path,
+    ) {
+        let superseded = self
+            .orchestration_superseded_contexts
+            .entry(identity.clone())
+            .or_default();
+        superseded.retain(|path| path != newest && *path != displaced);
+        superseded.push(displaced);
+        if superseded.len() > MAX_SUPERSEDED_CONTEXTS {
+            superseded.remove(0);
+        }
     }
 
     /// Issue #1395 item 1: stamp each live start-role record with the context
@@ -11550,10 +11583,10 @@ impl AppState {
     /// Issue #1445: the context file a re-arm report from `pane_id` would
     /// replace — the newest file recorded for the orchestration that pane is
     /// the coordinator of — provided `reported` could follow it. Read-only, so
-    /// the daemon can check the two files' briefs
-    /// ([`crate::orchestrator_context::rearmed_context_carries_the_same_brief`])
-    /// off the state lock before [`Self::record_rearmed_orchestration_context`]
-    /// re-checks and records.
+    /// the daemon can compare the two files
+    /// ([`crate::orchestrator_context::compare_rearmed_context`]) off the state
+    /// lock before [`Self::record_rearmed_orchestration_context`] re-checks and
+    /// records.
     pub fn rearmed_context_target(
         &self,
         pane_id: &str,
@@ -11574,28 +11607,30 @@ impl AppState {
     /// state only: `pane_id` must be a registered orchestrator seat whose
     /// orchestration has a recorded file, and `reported` must be a per-publish
     /// file in that recorded file's own `.dot-agent-deck` that no other
-    /// orchestration records. That `reported` carries the same brief is the
-    /// caller's to establish first, off the lock — the daemon's dispatch does,
-    /// and refuses the report otherwise — because it reads both files.
+    /// orchestration records. That `reported` carries the same brief as, and
+    /// is not older than, the recorded file is the caller's to establish first,
+    /// off the lock, because it reads both files — the daemon's dispatch does
+    /// ([`crate::orchestrator_context::compare_rearmed_context`]) — and
+    /// `compared` is the recorded file it compared against. If the record has
+    /// moved since (another report, or a new start, recorded a file in
+    /// between), this refuses with [`RearmedContextRefusal::RecordMoved`] and
+    /// records nothing, so a comparison is never applied to a file it was not
+    /// made against (Qodo on PR #1554); the caller compares again.
     pub fn record_rearmed_orchestration_context(
         &mut self,
         pane_id: &str,
         reported: &std::path::Path,
+        compared: &std::path::Path,
     ) -> Result<bool, RearmedContextRefusal> {
         let (identity, current, reported) = self.check_rearmed_context(pane_id, reported)?;
         if reported == *current {
             return Ok(false);
         }
-        let (identity, current) = (identity.clone(), current.clone());
-        let superseded = self
-            .orchestration_superseded_contexts
-            .entry(identity.clone())
-            .or_default();
-        superseded.retain(|path| *path != reported && *path != current);
-        superseded.push(current);
-        if superseded.len() > MAX_SUPERSEDED_CONTEXTS {
-            superseded.remove(0);
+        if current != compared {
+            return Err(RearmedContextRefusal::RecordMoved);
         }
+        let (identity, current) = (identity.clone(), current.clone());
+        self.supersede_context(&identity, current, &reported);
         self.orchestration_context_paths.insert(identity, reported);
         Ok(true)
     }
@@ -15579,16 +15614,21 @@ mod tests {
             Ok(startup.clone())
         );
         assert_eq!(
-            state.record_rearmed_orchestration_context("a0", &first),
+            state.record_rearmed_orchestration_context("a0", &first, &startup),
             Ok(true)
         );
         assert_eq!(
-            state.record_rearmed_orchestration_context("a0", &first),
+            state.record_rearmed_orchestration_context("a0", &first, &first),
             Ok(false),
             "a repeated report changes nothing"
         );
         assert_eq!(
-            state.record_rearmed_orchestration_context("a0", &second),
+            state.record_rearmed_orchestration_context("a0", &second, &startup),
+            Err(RearmedContextRefusal::RecordMoved),
+            "a comparison against the startup file does not apply once the record moved"
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &second, &first),
             Ok(true)
         );
         assert_eq!(
@@ -15596,12 +15636,16 @@ mod tests {
             Some(&second),
             "the record names the newest re-arm"
         );
+        // A start recorded after the re-arms keeps them in the cleanup (Qodo
+        // on PR #1554).
+        let restarted = ctx('d');
+        state.record_orchestration_context(&instance("a"), restarted.clone());
 
         state.pane_orchestration_map.remove("a0");
         state.pane_orchestration_map.remove("a1");
         assert_eq!(
             state.take_ended_orchestration_context(&instance("a")),
-            vec![startup, first, second]
+            vec![startup, first, second, restarted]
         );
         assert!(
             state.orchestration_superseded_contexts.is_empty(),
@@ -15668,7 +15712,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                state.record_rearmed_orchestration_context(pane, &path),
+                state.record_rearmed_orchestration_context(pane, &path, &own),
                 Err(refusal),
                 "{case}"
             );

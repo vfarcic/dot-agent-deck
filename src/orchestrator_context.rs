@@ -698,6 +698,16 @@ pub(crate) fn own_context_file_name<'a>(
 /// guarantee [`open_context_dir`] already states for that platform. The size
 /// cap holds on both.
 fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Result<String> {
+    read_context_file_and_mtime(project_dir, name).map(|(content, _)| content)
+}
+
+/// [`read_context_file`], also answering the opened file's modification time
+/// (`None` where the platform cannot report one), taken from the same
+/// descriptor the content is read from.
+fn read_context_file_and_mtime(
+    project_dir: &std::path::Path,
+    name: &str,
+) -> std::io::Result<(String, Option<std::time::SystemTime>)> {
     let max = MAX_CONTEXT_BYTES as u64;
     let project = open_project_dir(project_dir)?;
     let dir = open_context_dir(&project).map_err(|e| match e {
@@ -730,7 +740,8 @@ fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Resu
             format!("longer than {max} bytes"),
         ));
     }
-    read_bounded(file, max)
+    let mtime = metadata.modified().ok();
+    read_bounded(file, max).map(|content| (content, mtime))
 }
 
 /// Re-run `prepare_orchestrator_prompt` for a re-assertion (compaction or
@@ -820,33 +831,55 @@ pub fn reassert_orchestrator_prompt(
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
 
-/// Issue #1445: whether `reported`, a context file a TUI says it re-armed an
-/// orchestration's coordinator from, carries the **same brief** — the same
-/// `## Your task` section and the same [`Attendance`] — as `current`, the file
-/// the daemon records for that orchestration.
+/// Issue #1445: how `reported`, a context file a TUI says it re-armed an
+/// orchestration's coordinator from, compares with `current`, the file the
+/// daemon records for that orchestration
+/// ([`compare_rearmed_context`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearmComparison {
+    /// Same brief, and not published before `current`: the record may follow.
+    Follows,
+    /// A different `## Your task` section or attendance.
+    DifferentBrief,
+    /// Same brief, but published before `current` — a report that arrived
+    /// after a later one (Qodo and Greptile on PR #1554). Following it would
+    /// move the record back to an older file, which the sweep reaches first.
+    Older,
+}
+
+/// Issue #1445: whether the daemon's record may follow `reported` from
+/// `current`.
 ///
-/// The daemon asks this before its record follows a re-arm publication, and it
-/// is the property that makes following safe rather than merely convenient: a
-/// re-arm reads the task and attendance back off the tab's own file and writes
-/// them unchanged into the new one ([`reassert_orchestrator_prompt`]), so a
-/// genuine re-arm of this orchestration always answers `true`, and a file that
-/// carries some other brief — another orchestration's preparation in the same
-/// project — answers `false` and is never recorded. Only the task and the
-/// attendance are compared, because they are all a later re-arm reads back
-/// ([`read_back_context`]); the rest of the file is composed from the tab's
-/// own configuration.
+/// **The brief must match**: the same `## Your task` section and the same
+/// [`Attendance`]. That is the property that makes following safe rather than
+/// merely convenient: a re-arm reads the task and attendance back off the tab's
+/// own file and writes them unchanged into the new one
+/// ([`reassert_orchestrator_prompt`]), so a genuine re-arm of this
+/// orchestration matches, and a file that carries some other brief — another
+/// orchestration's preparation in the same project — does not and is never
+/// recorded. Only the task and the attendance are compared, because they are
+/// all a later re-arm reads back ([`read_back_context`]); the rest of the file
+/// is composed from the tab's own configuration.
+///
+/// **And `reported` must not be older than `current`**, by modification time.
+/// A TUI sends each report on its own task, and two TUIs re-arming the same
+/// coordinator send theirs independently, so reports can arrive out of
+/// publication order. Each published file is written once and never touched
+/// again, so its modification time is its publication time; equal times are
+/// not ordered and are allowed. A time either file cannot report also allows
+/// it, the same answer as before this check existed.
 ///
 /// Both paths must name a per-publish file in the same `.dot-agent-deck`
 /// ([`own_context_file_name`]), and both are read through
-/// [`read_context_file`] — bounded, and on Unix never following a link at the
-/// last two components. An `Err` (a path of the wrong shape, a missing or
-/// unreadable file) means "not shown to be the same", and the caller refuses.
+/// [`read_context_file`]'s bounded read — on Unix never following a link at
+/// the last two components. An `Err` (a path of the wrong shape, a missing or
+/// unreadable file) means "not shown to follow", and the caller refuses.
 ///
 /// **Blocking.** Reads two files; the daemon calls it from a blocking task.
-pub fn rearmed_context_carries_the_same_brief(
+pub fn compare_rearmed_context(
     current: &std::path::Path,
     reported: &std::path::Path,
-) -> std::io::Result<bool> {
+) -> std::io::Result<RearmComparison> {
     let not_a_context_file = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -861,9 +894,15 @@ pub fn rearmed_context_carries_the_same_brief(
         own_context_file_name(project_dir, current).ok_or_else(not_a_context_file)?;
     let reported_name =
         own_context_file_name(project_dir, reported).ok_or_else(not_a_context_file)?;
-    let current = read_context_file(project_dir, current_name)?;
-    let reported = read_context_file(project_dir, reported_name)?;
-    Ok(read_back_context(Some(&current)) == read_back_context(Some(&reported)))
+    let (current, current_mtime) = read_context_file_and_mtime(project_dir, current_name)?;
+    let (reported, reported_mtime) = read_context_file_and_mtime(project_dir, reported_name)?;
+    if read_back_context(Some(&current)) != read_back_context(Some(&reported)) {
+        return Ok(RearmComparison::DifferentBrief);
+    }
+    Ok(match (current_mtime, reported_mtime) {
+        (Some(current), Some(reported)) if reported < current => RearmComparison::Older,
+        _ => RearmComparison::Follows,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3932,7 +3971,24 @@ mod tests {
         let rearmed = reassert_orchestrator_prompt(&config(), &cwd, Some(&current))
             .expect("re-armed")
             .context_path;
-        assert!(rearmed_context_carries_the_same_brief(&current, &rearmed).unwrap());
+        // Two publishes in one test can land in the same timestamp tick; date
+        // the earlier one back so the order the check reads is unambiguous.
+        std::fs::File::options()
+            .write(true)
+            .open(&current)
+            .and_then(|f| {
+                f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            })
+            .expect("date the startup file back");
+        assert_eq!(
+            compare_rearmed_context(&current, &rearmed).unwrap(),
+            RearmComparison::Follows
+        );
+        assert_eq!(
+            compare_rearmed_context(&rearmed, &current).unwrap(),
+            RearmComparison::Older,
+            "a report that arrives after a later one must not move the record back"
+        );
 
         for (case, other) in [
             (
@@ -3945,8 +4001,9 @@ mod tests {
             ),
             ("no task", publish(None, Attendance::Unattended)),
         ] {
-            assert!(
-                !rearmed_context_carries_the_same_brief(&current, &other).unwrap(),
+            assert_eq!(
+                compare_rearmed_context(&current, &other).unwrap(),
+                RearmComparison::DifferentBrief,
                 "{case}: must not be recorded as this orchestration's brief"
             );
         }
@@ -3962,7 +4019,7 @@ mod tests {
             ("a missing file", missing),
         ] {
             assert!(
-                rearmed_context_carries_the_same_brief(&current, &path).is_err(),
+                compare_rearmed_context(&current, &path).is_err(),
                 "{case}: must be refused, not compared"
             );
         }

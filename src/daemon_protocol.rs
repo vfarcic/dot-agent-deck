@@ -2035,15 +2035,18 @@ pub enum AttachRequest {
     /// moves the record to the reported file and keeps the one it replaces for
     /// deletion at the end.
     ///
-    /// **The daemon follows only a report it can check**, and answers `ok:
-    /// false` otherwise, leaving the record as it was: `pane_id` must be the
+    /// **The daemon follows only a report it can check**, and otherwise leaves
+    /// the record as it was — answering `ok: true` for a report older than the
+    /// recorded file (it lost a race with a later one, so the record is already
+    /// where it should be) and `ok: false` for every other refusal: `pane_id` must be the
     /// registered orchestrator seat of an orchestration the daemon records a
     /// file for; `context_path` must be `orchestrator-context-<32 hex>.md`
     /// directly in that recorded file's own `.dot-agent-deck`, recorded by no
     /// other orchestration; and it must carry the recorded file's brief — the
-    /// same `## Your task` section and attendance
-    /// (`orchestrator_context::rearmed_context_carries_the_same_brief`). So a
-    /// report can never point an orchestration at another one's brief. A
+    /// same `## Your task` section and attendance — and not be older than it
+    /// (`orchestrator_context::compare_rearmed_context`). So a report can never
+    /// point an orchestration at another one's brief, nor move its record back
+    /// to an older file when reports arrive out of order. A
     /// refusal is not an error the TUI acts on: its own tab keeps the file it
     /// published either way.
     ///
@@ -3646,61 +3649,100 @@ impl OrchestrationSpawnMeta {
 ///
 /// Three steps, so no file is read under the state lock: the lexical checks
 /// and the recorded file come from a read lock
-/// ([`crate::state::AppState::rearmed_context_target`]); the two files' briefs
-/// are compared on a blocking thread
-/// ([`crate::orchestrator_context::rearmed_context_carries_the_same_brief`]);
-/// and the write lock re-runs the lexical checks before recording
-/// ([`crate::state::AppState::record_rearmed_orchestration_context`]). A report
-/// that raced another one between the steps was compared against a file that
-/// carries the same brief as whichever file is recorded by then, since every
-/// file the record moves to was checked the same way. The refusal never echoes
-/// the path: it is the client's value, and it failed a check.
+/// ([`crate::state::AppState::rearmed_context_target`]); the two files are
+/// compared on a blocking thread — same brief, and the report not older than
+/// the recorded file ([`crate::orchestrator_context::compare_rearmed_context`]);
+/// and the write lock re-runs the lexical checks and records only if the
+/// recorded file is still the one compared against
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]),
+/// otherwise the three steps run again against the new file. A report older
+/// than the recorded file answers `ok`: it lost a race with a later one, and
+/// the record already names the newer file. The refusal never echoes the path:
+/// it is the client's value, and it failed a check.
 async fn record_rearmed_context(
     state: &SharedState,
     pane_id: &str,
     context_path: &str,
 ) -> Result<(), String> {
+    use crate::orchestrator_context::RearmComparison;
+    use crate::state::RearmedContextRefusal;
     if !crate::agent_pty::is_valid_pane_id_env(pane_id)
         || !crate::agent_pty::is_valid_orchestration_cwd(context_path)
     {
         return Err("record-orchestrator-context: invalid pane id or context path".into());
     }
     let reported = std::path::PathBuf::from(context_path);
-    let refused = |reason: &dyn std::fmt::Display| {
-        tracing::debug!(pane_id, reason = %reason, "not following a re-arm publication");
+    // An orchestration the daemon holds no file for — every one a TUI opened
+    // with `Ctrl+n` — is the routine refusal, so it is not worth a warning.
+    let refused = |reason: &dyn std::fmt::Display, routine: bool| {
+        if routine {
+            tracing::debug!(pane_id, reason = %reason, "not following a re-arm publication");
+        } else {
+            tracing::warn!(pane_id, reason = %reason, "not following a re-arm publication");
+        }
         format!("record-orchestrator-context: {reason}")
     };
-    let current = state
-        .read()
-        .await
-        .rearmed_context_target(pane_id, &reported)
-        .map_err(|r| refused(&r))?;
-    if current != reported {
-        let (current, reported) = (current.clone(), reported.clone());
-        let same = tokio::task::spawn_blocking(move || {
-            crate::orchestrator_context::rearmed_context_carries_the_same_brief(&current, &reported)
-        })
-        .await;
-        match same {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => return Err(refused(&"the file carries a different brief")),
-            Ok(Err(e)) => return Err(refused(&format!("could not compare the files: {e}"))),
-            Err(e) => return Err(refused(&format!("the comparison did not finish: {e}"))),
+    // Each pass compares against the file recorded when it started; a record
+    // that moves during the comparison sends it round again, against the new
+    // file. Bounded, since every move is a report or a start that won.
+    for _ in 0..REARM_RECORD_ATTEMPTS {
+        let current = state
+            .read()
+            .await
+            .rearmed_context_target(pane_id, &reported)
+            .map_err(|r| refused(&r, r == RearmedContextRefusal::NoRecordedContext))?;
+        if current != reported {
+            let (compared, candidate) = (current.clone(), reported.clone());
+            let comparison = tokio::task::spawn_blocking(move || {
+                crate::orchestrator_context::compare_rearmed_context(&compared, &candidate)
+            })
+            .await;
+            match comparison {
+                Ok(Ok(RearmComparison::Follows)) => {}
+                Ok(Ok(RearmComparison::DifferentBrief)) => {
+                    return Err(refused(&"the file carries a different brief", false));
+                }
+                // A report that lost a race with a later one: the record
+                // already names a newer file, which is the outcome wanted.
+                Ok(Ok(RearmComparison::Older)) => {
+                    refused(&"a newer file is already recorded", true);
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    return Err(refused(&format!("could not compare the files: {e}"), false));
+                }
+                Err(e) => {
+                    return Err(refused(
+                        &format!("the comparison did not finish: {e}"),
+                        false,
+                    ));
+                }
+            }
+        }
+        match state
+            .write()
+            .await
+            .record_rearmed_orchestration_context(pane_id, &reported, &current)
+        {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!(
+                        pane_id,
+                        "the orchestrator's recorded context followed a re-arm"
+                    );
+                }
+                return Ok(());
+            }
+            Err(RearmedContextRefusal::RecordMoved) => continue,
+            Err(r) => return Err(refused(&r, false)),
         }
     }
-    let changed = state
-        .write()
-        .await
-        .record_rearmed_orchestration_context(pane_id, &reported)
-        .map_err(|r| refused(&r))?;
-    if changed {
-        tracing::info!(
-            pane_id,
-            "the orchestrator's recorded context followed a re-arm"
-        );
-    }
-    Ok(())
+    Err(refused(&RearmedContextRefusal::RecordMoved, false))
 }
+
+/// Issue #1445: how many times [`record_rearmed_context`] compares again after
+/// the record moved under it before giving up on the report.
+const REARM_RECORD_ATTEMPTS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
