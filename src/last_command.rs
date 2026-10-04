@@ -40,7 +40,8 @@
 //! permissions are not checked. Windows gets the same check from the open
 //! handle: the file is opened without following a reparse point, a symbolic
 //! link or junction is refused, and the file's owner SID must be the current
-//! user's.
+//! user's, or the process token's default owner (which is what an elevated
+//! administrator's daemon gives the file it writes: `BUILTIN\Administrators`).
 //!
 //! **The state directory is the deck's persistence identity**, not its
 //! endpoint — the precedent `schedules.toml` (found by the config directory)
@@ -436,10 +437,14 @@ fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreF
 /// handle the same way: the file is opened `FILE_FLAG_OPEN_REPARSE_POINT`, so a
 /// symbolic link or junction at `path` is opened itself rather than followed,
 /// and is refused; the opened file must be regular, owned by the current user
-/// (its owner SID, read through
-/// [`crate::platform::fsperm::verify_object_owner_is_current_user`]), and at
-/// most [`MAX_FILE_BYTES`] long. A directory fails to open at all, which reads
-/// as an unreadable file.
+/// or by the token's default owner (its owner SID, read through
+/// [`crate::platform::fsperm::verify_file_owner_is_current_user`]), and at most
+/// [`MAX_FILE_BYTES`] long. A directory fails to open at all, which reads as an
+/// unreadable file.
+///
+/// The default owner is accepted because the store writes the file without an
+/// explicit owner, so under an elevated administrator token the file it just
+/// wrote is owned by `BUILTIN\Administrators`, not by the user's SID.
 #[cfg(windows)]
 fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
     use std::io::{Error, ErrorKind};
@@ -474,7 +479,7 @@ fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, Store
     // The helper's message names SIDs only, never contents, but `Refused`
     // carries a fixed description, so an unreadable owner is refused the same
     // way as a foreign one: either way the file is not offered.
-    if crate::platform::fsperm::verify_object_owner_is_current_user(file.as_raw_handle() as HANDLE)
+    if crate::platform::fsperm::verify_file_owner_is_current_user(file.as_raw_handle() as HANDLE)
         .is_err()
     {
         return Err(StoreFileError::Refused(
