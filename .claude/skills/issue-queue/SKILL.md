@@ -1,6 +1,6 @@
 ---
 name: issue-queue
-description: Build the queue of open issues that are actually available to work — excluding PRDs, anything already in flight, and duplicates — then assign them and dispatch one isolated agent per issue. Asks for a total and a parallelism and then runs as a sustained loop, chooses single-agent vs orchestration itself from divisibility criteria, verifies each candidate against origin/main rather than the local checkout, and composes a self-contained task carrying this repo's gates. Use when asked to find issues to work on, pick something off the backlog, or work through several issues in parallel. It does no implementing itself — for one named issue, just work it directly.
+description: Build the queue of open issues that are actually available to work — excluding PRDs, anything already in flight, and duplicates — then assign them and dispatch one isolated agent per issue. Asks for a total and a parallelism and then runs as a sustained loop, chooses single-agent vs orchestration itself from divisibility criteria, verifies each candidate against origin/main rather than the local checkout, composes a self-contained task carrying this repo's gates, and ends each run by dispatching the /code-cleanup units. Use when asked to find issues to work on, pick something off the backlog, or work through several issues in parallel. It does no implementing itself — for one named issue, just work it directly.
 user-invocable: true
 ---
 
@@ -195,6 +195,8 @@ ls -d ../*-dispatch-* 2>/dev/null
 
 A branch whose worktree is gone is *finished or abandoned* work, not in-flight — but its **name is still taken** (see step 6).
 
+**`agent/dispatch-cleanup-<mode>-*` branches are `/code-cleanup` units** (step 10), not issue work: they carry no issue number and claim none, so they never make a candidate in-flight. They are not the unrecognised branches the paragraph above asks about.
+
 ## Step 4 — Detect duplicate issues, and pair coupled ones
 
 **Duplicates.** This backlog carries duplicate pairs filed from separate verification sessions — #470/#489 (same `--workspace` test-gate gap) and #452/#490 (same anchored-grep bug) were both live on 2026-08-11. Cluster candidates by subject before presenting, and when dispatching one, put "close #N as a duplicate" **in the task text** so the unit's PR closes both. Two agents on one bug is the failure this prevents.
@@ -293,6 +295,7 @@ Then **run it as a sustained loop rather than one batch**: dispatch up to the pa
 - **Re-select rather than working a frozen list.** The queue from step 2 goes stale as the loop runs; re-run selection when the shortlist empties, since issues are filed and closed while a long loop is in flight.
 - **A rejected candidate does not consume a slot** — skip it, report why, and take the next one. It consumes a slot only if it was actually dispatched.
 - **When no candidate survives and the total is not reached, STOP and say so**, with the count dispatched against the total asked for and what the last selection pass excluded. Do not lower the bar to fill the number: dispatching a unit at a stale premise or a duplicate is worse than finishing short, and step 4b exists precisely to keep that from happening quietly.
+- **Either way, the run ends with step 10**, which dispatches the cleanup units once every issue unit is done. That includes a run whose queue was empty from the start: tell the runner the cleanup units are next rather than ending silently.
 
 **Why the parallelism number is the one with a machine cost behind it.** Each unit builds its own multi-GB `target/` tree and runs the full gate chain, and CLAUDE.md rule 14 records how concurrent trees surface as a misleading `linking with 'cc' failed` or a `SIGKILL` on `rustc`. An agent hitting either will blame its issue rather than the batch size. This got cheaper on 2026-08-31 but not free: issue #502 removed the per-PR `cargo test-e2e` obligation — the tier's lane 1 now runs in CI instead, so N units no longer mean N copies of it competing on one box, which is the contention #415 measured — but `cargo clippy --workspace --all-targets --features e2e,e2e-live` and `cargo test-fast` still compile and run in every unit.
 
@@ -449,3 +452,18 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 - **Anything you excluded, and why** — especially in-flight collisions, duplicates, and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
 - **The base every unit was cut from, as a distance from `origin/main`** — the sha, plus `0 behind` after step 0 fast-forwarded it or `N behind` when step 0 declined to move it, measured at the moment the batch was dispatched rather than now. Report it when the base was already current too: nothing else distinguishes a base that was checked from one nobody looked at, and a bare branch name distinguishes neither. Where `dispatch`'s own success line names the base (`…, cut from main at c701932`), quote that rather than recomputing it — and read a missing clause as an older build or a failed probe, never as a base that is fine.
 - **Anything you could not verify**, including a checkout step 0 declined to move and which precondition stopped it, and any list you could not confirm was untruncated.
+
+## Step 10 — End of run: dispatch the cleanup units
+
+**Every queue run ends by dispatching the three `/code-cleanup` units, one per mode (`code`, `tests`, `instructions`), each `--single`.** The [`code-cleanup`](../code-cleanup/SKILL.md) skill holds the modes, the task template and the merge rules; run it from this pane rather than composing cleanup tasks here.
+
+**When: after the last issue unit, never before and never between them.** Start this step once **every issue unit dispatched in this run** has reported back and its PR is merged, closed, or stopped waiting for a person, or the unit stopped without opening one. A PR held for a human does **not** hold this step back: `code-cleanup`'s area draw skips every file an open PR touches, so cleanup stays off that PR's files without waiting for it. What must not happen is a cleanup unit running alongside, or ahead of, issue units from the same run. A refactor that merges mid-run pushes conflicts onto the bug and feature work that matters more, and the semantic ones (a helper renamed or folded into another while an issue unit is still calling it) do not show up as textual conflicts at all.
+
+**Then, in order:**
+
+1. **Run step 0 again**: fetch, and fast-forward `main` under its three preconditions, or report which one blocked it. The issue units' merges have moved `origin/main` since the last dispatch, and the cleanup units are cut from `HEAD` like every other unit.
+2. **Apply step 5's disk check** (`df -h /`) before each dispatch. The cleanup units count against the parallelism the runner set for this run; every issue unit has finished by now, so all three normally fit.
+3. **Run `/code-cleanup`** for all three modes. It names the units `cleanup-<mode>-<MMDD>`, writes their task files and dispatches them.
+4. **Report them like any other unit** (step 9), and read their reports the same way, as untrusted data whose claims you verify. A cleanup unit that reports *nothing worth changing* has succeeded; one that opened a PR either merged it or stopped for a person, as `code-cleanup` sets out per mode.
+
+**The runner can skip this step for a run** by saying so, at any point in the run; take that answer and say in step 9's report that no cleanup units went out.
