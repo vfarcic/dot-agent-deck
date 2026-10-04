@@ -5536,13 +5536,30 @@ fn deliver_orchestrator_prompt(
             return;
         }
         log_prompt_abandoned("orchestrator", &start_pane_id, &delivery_id, attempts);
+        // Issue #1520 (Qodo on #1553): a prompt held at its retry by an
+        // event-stream outage may well have been delivered; say what is known —
+        // that it went unconfirmed — rather than that it was not delivered.
+        let lost_contact = ui
+            .prompt_delivery
+            .get(start_pane_id.as_str())
+            .is_some_and(|delivery| {
+                delivery_may_have_written(delivery)
+                    && (snapshot.event_stream_down()
+                        || delivery_outlived_event_gap(snapshot, delivery))
+            });
+        let message = if lost_contact {
+            "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+             not retried"
+        } else {
+            "Orchestrator prompt not delivered (timed out); abandoned"
+        };
         abandon_orchestrator_prompt(
             ui,
             tab_id,
             &start_pane_id,
             orchestrator_prompt,
             now,
-            "Orchestrator prompt not delivered (timed out); abandoned".to_string(),
+            message.to_string(),
         );
         return;
     }
@@ -38891,6 +38908,99 @@ mod tests {
         assert!(
             status.contains("lost contact with the agent's events"),
             "a seed the outage held to its deadline must say why it stopped; status={status}"
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
+    }
+
+    /// Issue #1520 (Qodo on #1553): the orchestrator path's twin of
+    /// [`a_seed_that_may_have_written_is_held_through_an_event_stream_outage`]. A
+    /// role prompt written before the stream went down is held when its retry
+    /// falls due — no second write, the role not finalized — and, if the outage
+    /// outlasts the deadline, abandoned saying it went unconfirmed rather than
+    /// undelivered.
+    #[test]
+    fn an_orchestrator_prompt_is_held_through_an_event_stream_outage() {
+        const PANE_ID: &str = "outage-orchestrator-pane";
+        const AGENT_ID: &str = "outage-orchestrator-agent";
+        const PROMPT: &str = "Read the orchestrator seed and begin";
+        let tab_id: TabId = 1520;
+
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.orchestration_prompt_anchor_at.insert(tab_id, now);
+        ui.orchestration_ready_since.insert(
+            tab_id,
+            now.checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot = announced_prompt_snapshot(PANE_ID, AGENT_ID);
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some(PROMPT.to_string());
+        let roles = [PANE_ID.to_string()];
+
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "precondition: written");
+
+        snapshot.note_event_stream_gap();
+        ui.send_retry_backoff
+            .get_mut(PANE_ID)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = now;
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a retry due while the stream is down must wait for it"
+        );
+        assert_eq!(prompt.as_deref(), Some(PROMPT), "the prompt is still held");
+        assert!(
+            ui.prompt_delivery.contains_key(PANE_ID),
+            "held, not stopped"
+        );
+
+        ui.orchestration_prompt_anchor_at.insert(
+            tab_id,
+            now.checked_sub(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+                .expect("an anchor past the deadline"),
+        );
+        deliver_orchestrator_prompt(
+            &mut ui,
+            controller.as_ref(),
+            &snapshot,
+            now,
+            tab_id,
+            &roles,
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        let status = format!("{:?}", ui.status_message);
+        assert!(
+            status.contains("not confirmed (lost contact with the agent's events)"),
+            "a role prompt the outage held to its deadline must say it went unconfirmed, \
+             not that it was not delivered; status={status}"
         );
         assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
     }
