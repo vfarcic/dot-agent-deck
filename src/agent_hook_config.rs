@@ -260,24 +260,25 @@ pub(crate) enum Backup {
 /// writer able to add an entry to the agent's config directory — `~/.claude`,
 /// `~/.codex`, `~/.config/devin` — could plant `<name>.bak` pointing at any file
 /// it could write and have the deck fill it with the malformed config's bytes.
-/// [`create_temp_excl`]'s `O_CREAT|O_EXCL` (`CREATE_NEW` on Windows) closes it:
-/// POSIX requires it to fail with `EEXIST` when the path names a symlink,
-/// dangling or not, so a planted link is never opened and is reported as
-/// [`Backup::Occupied`]. A symlink is never counted as an earlier copy either —
-/// the comparison reads only a regular file.
+/// Nothing at the backup name is ever opened for writing now: the bytes go to
+/// an unpredictable temp created with `O_CREAT|O_EXCL` ([`create_temp`]), and
+/// the name is taken by `link(2)`, which fails with `EEXIST` when the path
+/// names a symlink, dangling or not, without following it — so a planted link
+/// is reported as [`Backup::Occupied`]. A symlink is never counted as an
+/// earlier copy either — the comparison reads only a regular file.
 ///
 /// # Permissions
 ///
 /// The backup lands **owner-only, always** — not at the destination's mode. It
 /// is a byte-for-byte copy of a config that may hold an org id or an auth
-/// reference, so 0600 is the right answer on its merits (#360, #382), and since
-/// nothing that already holds the name is ever opened for writing, a planted
-/// link cannot choose the mode either (Greptile's P1 on PR #855).
+/// reference, so 0600 is the right answer on its merits (#360, #382). The mode
+/// is set on the temp, which the link shares an inode with, so a planted link
+/// at the name cannot choose it either (Greptile's P1 on PR #855).
 ///
-/// The write is not atomic: a crash part-way leaves a short `<name>.bak`, which
-/// a later refusal then reports as [`Backup::Occupied`] while the original is
-/// still intact. That is the cost of a create that cannot replace, and it is the
-/// cheap side — the alternative is a publish that can.
+/// The copy is published atomically, by a hard link from a fully written temp,
+/// so the name never holds a partial backup, and this function never unlinks
+/// it. A filesystem without hard links gets no backup ([`Backup::Failed`]),
+/// which costs nothing the refusal promised: the original is still on disk.
 ///
 /// # The name
 ///
@@ -294,17 +295,26 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
     let mut name = file_name.to_os_string();
     name.push(".bak");
     let backup = dest.with_file_name(name);
+    // `dest`'s OWN directory, so the temp and the backup share a filesystem —
+    // a hard link cannot cross one.
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
 
-    let mut file = match create_temp_excl(&backup) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return if holds_exactly(&backup, bytes) {
-                Backup::Preserved(backup)
-            } else {
-                Backup::Occupied(backup)
-            };
-        }
-        Err(_) => return Backup::Failed,
+    // The complete copy goes to an unpredictable temp first and is published
+    // by `hard_link`, which is atomic and never replaces: it fails with
+    // `EEXIST` (`ERROR_ALREADY_EXISTS` on Windows) when the name is taken, and
+    // does not follow a symlink there. So `<name>.bak` is either absent or
+    // whole — a crash leaves at most a stray temp, never a short backup that
+    // later refusals would have to report as an occupant, and a second deck
+    // process refusing the same file at the same moment sees the first one's
+    // finished copy rather than a half-written one.
+    let Ok((mut file, tmp)) = create_temp(
+        dir,
+        &backup.file_name().unwrap_or_default().to_string_lossy(),
+    ) else {
+        return Backup::Failed;
     };
     let written = (|| {
         #[cfg(unix)]
@@ -319,15 +329,25 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
         file.sync_all()
     })();
     drop(file);
-    match written {
+
+    let outcome = match written.and_then(|()| std::fs::hard_link(&tmp, &backup)) {
         Ok(()) => Backup::Preserved(backup),
-        Err(_) => {
-            // This call created the file a moment ago, so removing a partial
-            // copy takes nothing that was the user's.
-            let _ = std::fs::remove_file(&backup);
-            Backup::Failed
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if holds_exactly(&backup, bytes) {
+                Backup::Preserved(backup)
+            } else {
+                Backup::Occupied(backup)
+            }
         }
-    }
+        // Including a filesystem with no hard links (FAT, some network
+        // mounts): no copy, and the caller's message says so. The original is
+        // still untouched, which is what the refusal promises.
+        Err(_) => Backup::Failed,
+    };
+    // The temp is this call's own unpredictable name; the backup, published or
+    // not, is never unlinked here.
+    let _ = std::fs::remove_file(&tmp);
+    outcome
 }
 
 /// Whether `path` is a regular file holding exactly `bytes` — read without
@@ -1262,6 +1282,11 @@ mod tests {
             "the copy aside replaced a backup the user made themselves"
         );
         assert_eq!(outcome, Backup::Occupied(users_own.clone()));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("list dir").count(),
+            2,
+            "the copy that lost to the occupant left its temp behind"
+        );
         let phrase = preserved_phrase(&outcome);
         assert!(
             !phrase.starts_with("preserved at"),
