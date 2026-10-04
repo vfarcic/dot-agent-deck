@@ -4790,6 +4790,47 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
     }
 }
 
+/// Scenario: Build the reason the OpenCode preflight gives when the test model
+/// does not answer its probe. A developer must be able to find a model their
+/// login accepts from that text alone: how to list candidates and how to try
+/// one with the probe the preflight runs. The message must not send them to a
+/// model id the provider has been seen rejecting.
+#[test]
+fn the_opencode_probe_failure_says_how_to_find_a_reachable_model() {
+    let message = opencode_probe_failure_message(
+        "anthropic/claude-haiku-4-5-20251001",
+        "exited unsuccessfully (exit status: 1)",
+        "Error: no credentials",
+    );
+
+    // Listing alone is not enough: `opencode models openai` (1.18.34) lists
+    // ids that a ChatGPT login then refuses, so the message must also give
+    // the probe itself, runnable as written against a candidate id.
+    assert!(
+        message.contains("opencode models"),
+        "the message must say how to list candidate models:\n{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "opencode run --model <id> \"{OPENCODE_PROBE_PROMPT}\""
+        )),
+        "the message must give the probe command to try a candidate:\n{message}"
+    );
+    assert!(
+        message.contains(OPENCODE_TEST_MODEL_ENV),
+        "the message must name the override to set:\n{message}"
+    );
+
+    // Issue #1564: this id was the message's ChatGPT-login example, and on
+    // 2026-10-04 (OpenCode 1.18.34) such a login rejected it with "not
+    // supported when using Codex with a ChatGPT account". A developer who
+    // followed the hint failed the same preflight again.
+    assert!(
+        !message.contains("gpt-5.4-mini"),
+        "the message recommends a model ChatGPT logins reject:\n{message}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #807/#395 — the grid lookup re-reads, the single-shot one cannot
 // -----------------------------------------------------------------------
