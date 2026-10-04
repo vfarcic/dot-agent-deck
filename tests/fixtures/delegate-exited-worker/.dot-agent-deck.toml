@@ -1,12 +1,17 @@
 # Fixture for `orchestration/delegate/049` (issue #524) and
 # `orchestration/work-done/015` (issue #507).
 #
-# Two workers that end ON THEIR OWN — no `StopAgent`, no pane close — when the
-# test creates their trigger file. Each first reports `work-done` from inside
-# its own pane (so it owes nothing, and a later delegate cannot be refused as
-# busy for the wrong reason), then exits. The trigger is removed before the
-# report, so a `clear = true` replacement running the same command waits for a
-# NEW trigger instead of exiting at once.
+# Workers that end ON THEIR OWN — no `StopAgent`, no pane close — when the
+# test creates their trigger file. `steady` and `fresh` first report
+# `work-done` from inside their own pane (so neither owes anything, and a later
+# delegate cannot be refused as busy for the wrong reason), then exit. The
+# trigger is removed before the report, so a `clear = true` replacement running
+# the same command waits for a NEW trigger instead of exiting at once.
+#
+# Every worker is `worker.py` (beside this file), which logs each line it reads
+# from its PTY to `<role>-received.log`. That log, not the pane's echo, is how
+# the tests see a task pointer arrive: a resize drops the pane's replay ring,
+# and the TUI resizes every role pane once it lays out the new tab (#1539).
 #
 # `steady` is `clear = false`: a delegate to it after the exit has no live
 # worker to reach, and must say so. `fresh` is `clear = true`: a delegate to it
@@ -29,15 +34,15 @@ start = true
 
 [[orchestrations.roles]]
 name = "steady"
-command = "while [ ! -f ./steady-exit ]; do sleep 0.1; done; rm -f ./steady-exit; \"$DAD_TEST_BIN\" work-done --task steady-reported; exit 0"
+command = "python3 -u worker.py steady steady-reported"
 clear = false
 
 [[orchestrations.roles]]
 name = "fresh"
-command = "while [ ! -f ./fresh-exit ]; do sleep 0.1; done; rm -f ./fresh-exit; \"$DAD_TEST_BIN\" work-done --task fresh-reported; exit 0"
+command = "python3 -u worker.py fresh fresh-reported"
 clear = true
 
 [[orchestrations.roles]]
 name = "quitter"
-command = "while [ ! -f ./quitter-exit ]; do sleep 0.1; done; exit 0"
+command = "python3 -u worker.py quitter"
 clear = false

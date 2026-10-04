@@ -194,7 +194,7 @@ impl WorkDoneHarness {
     /// The real delegate path: same signal `dot-agent-deck delegate --to coder`
     /// puts on the hook socket, handled by the real daemon-side handler, so the
     /// commission ledger is armed the way production arms it.
-    async fn delegate(&self) {
+    async fn delegate(&self) -> dot_agent_deck::event::DelegateResponse {
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -208,7 +208,7 @@ impl WorkDoneHarness {
                 &self.registry,
                 &self.event_tx,
             )
-            .await;
+            .await
     }
 
     /// The real work-done path: the signal `dot-agent-deck work-done --task-file`
@@ -1567,6 +1567,105 @@ fn work_done_014_a_successor_in_an_exited_worker_s_pane_does_not_inherit_its_com
             filed.contains(COMMISSIONED_SENTINEL) && !filed.contains(FRESH_SENTINEL),
             "issue #507: the successor's uncommissioned completion overwrote the last report the \
              orchestrator DID commission; work-done-coder.md = {filed:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to `coder` and wait for the task pointer, then delegate again without `--supersede` and see it refused as busy, because that worker still owes a `work-done`. Let the worker's process EXIT ON ITS OWN without reporting and start a different agent in the same pane id; a delegate to `coder` must now be accepted without `--supersede`, and its task pointer must reach the successor.
+#[spec("orchestration/delegate/050")]
+#[test]
+fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_busy() {
+    runtime().block_on(async {
+        let harness = WorkDoneHarness::with_worker(
+            Some(
+                "worker_response_timeout_minutes = 0\n\n[[orchestrations]]\nname = \"unused\"\nroles = []\n",
+            ),
+            &format!("while [ ! -f ./{WORKER_EXIT_TRIGGER} ]; do sleep 0.05; done; exit 0"),
+        )
+        .await;
+        let first_worker = harness
+            .registry
+            .pane_current_agent_id(WORKER_PANE)
+            .expect("the first worker is live");
+
+        // ---- A DELEGATION OWED BY THE FIRST WORKER ---------------------------
+        let first = harness.delegate().await;
+        assert_eq!(
+            first.delivered,
+            vec![WORKER_ROLE.to_string()],
+            "control — a delegate to the idle first worker must be dispatched; reply = {first:?}"
+        );
+        let delivered = poll_until(Duration::from_secs(20), || {
+            squeezed_count(&harness.registry, &first_worker, WORKER_TASK_POINTER) >= 1
+        })
+        .await;
+        assert!(
+            delivered,
+            "control — the task pointer never reached the first worker's pane; snapshot = {:?}",
+            String::from_utf8_lossy(&harness.registry.snapshot(&first_worker).unwrap_or_default())
+        );
+
+        // ---- CONTROL: the busy refusal is live while that worker owes it ------
+        let refused = harness.delegate().await;
+        assert!(
+            refused.delivered.is_empty() && refused.busy.iter().any(|b| b.role == WORKER_ROLE),
+            "control — a second delegate to a LIVE worker that still owes a work-done must be \
+             refused as busy (#580), or the assertion below proves nothing; reply = {refused:?}"
+        );
+
+        // ---- THE NATURAL EXIT, NO REPORT --------------------------------------
+        std::fs::write(harness.cwd.path().join(WORKER_EXIT_TRIGGER), b"go\n")
+            .expect("release the worker's exit");
+        let exited = poll_until(Duration::from_secs(10), || {
+            harness.registry.pane_current_agent_id(WORKER_PANE).is_none()
+        })
+        .await;
+        assert!(
+            exited,
+            "the first worker never exited on its own, so the pane id was never free"
+        );
+
+        // ---- A SUCCESSOR IN THE SAME PANE, never delegated to ----------------
+        let cwd_str = harness.cwd.path().to_string_lossy().to_string();
+        let successor = harness
+            .registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd_str),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    ("SHELL".to_string(), "/bin/sh".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("a successor takes the exited worker's pane id");
+        assert_ne!(successor, first_worker, "the successor is a different agent");
+
+        // ---- A DELEGATE TO THE ROLE, WITHOUT --supersede ----------------------
+        let reply = harness.delegate().await;
+        assert!(
+            reply.busy.is_empty(),
+            "issue #1531: the successor owes nothing, yet the delegate was refused as busy because \
+             of the exited worker's outstanding commission; reply = {reply:?}"
+        );
+        assert_eq!(
+            reply.delivered,
+            vec![WORKER_ROLE.to_string()],
+            "the delegate must be dispatched to the successor; reply = {reply:?}"
+        );
+        assert!(
+            reply.superseded.is_empty(),
+            "the exited worker's commission is retired, not reported as superseded by this \
+             delegate; reply = {reply:?}"
+        );
+        let reached = poll_until(Duration::from_secs(20), || {
+            squeezed_count(&harness.registry, &successor, WORKER_TASK_POINTER) >= 1
+        })
+        .await;
+        assert!(
+            reached,
+            "the task pointer never reached the successor; snapshot = {:?}",
+            String::from_utf8_lossy(&harness.registry.snapshot(&successor).unwrap_or_default())
         );
     });
 }

@@ -440,7 +440,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 ### One task per worker at a time
 
-A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a card can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy.
+A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a card can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy, until a different agent takes over its pane: the new agent did not get the earlier task, so it is not busy with it.
 
 When the earlier task is not coming back:
 
