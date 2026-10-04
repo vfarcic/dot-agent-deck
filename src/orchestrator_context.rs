@@ -698,6 +698,16 @@ pub(crate) fn own_context_file_name<'a>(
 /// guarantee [`open_context_dir`] already states for that platform. The size
 /// cap holds on both.
 fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Result<String> {
+    read_context_file_and_mtime(project_dir, name).map(|(content, _)| content)
+}
+
+/// [`read_context_file`], also answering the opened file's modification time
+/// (`None` where the platform cannot report one), taken from the same
+/// descriptor the content is read from.
+fn read_context_file_and_mtime(
+    project_dir: &std::path::Path,
+    name: &str,
+) -> std::io::Result<(String, Option<std::time::SystemTime>)> {
     let max = MAX_CONTEXT_BYTES as u64;
     let project = open_project_dir(project_dir)?;
     let dir = open_context_dir(&project).map_err(|e| match e {
@@ -730,7 +740,8 @@ fn read_context_file(project_dir: &std::path::Path, name: &str) -> std::io::Resu
             format!("longer than {max} bytes"),
         ));
     }
-    read_bounded(file, max)
+    let mtime = metadata.modified().ok();
+    read_bounded(file, max).map(|content| (content, mtime))
 }
 
 /// Re-run `prepare_orchestrator_prompt` for a re-assertion (compaction or
@@ -818,6 +829,87 @@ pub fn reassert_orchestrator_prompt(
     };
     let (task, attendance) = read_back_context(content.as_deref());
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
+}
+
+/// Issue #1445: how `reported`, a context file a TUI says it re-armed an
+/// orchestration's coordinator from, compares with `current`, the file the
+/// daemon records for that orchestration
+/// ([`compare_rearmed_context`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearmComparison {
+    /// Same brief, and not dated before `current`: the record may follow.
+    Follows,
+    /// A different `## Your task` section or attendance.
+    DifferentBrief,
+    /// Same brief, but dated before `current` — ordinarily a report that
+    /// arrived after a later one (Qodo and Greptile on PR #1554). Following it
+    /// would move the record to a file the sweep reaches first.
+    Older,
+}
+
+/// Issue #1445: whether the daemon's record may follow `reported` from
+/// `current`.
+///
+/// **The brief must match**: the same `## Your task` section and the same
+/// [`Attendance`]. That is the property that makes following safe rather than
+/// merely convenient: a re-arm reads the task and attendance back off the tab's
+/// own file and writes them unchanged into the new one
+/// ([`reassert_orchestrator_prompt`]), so a genuine re-arm of this
+/// orchestration matches, and a file that carries some other brief — another
+/// orchestration's preparation in the same project — does not and is never
+/// recorded. Only the task and the attendance are compared, because they are
+/// all a later re-arm reads back ([`read_back_context`]); the rest of the file
+/// is composed from the tab's own configuration.
+///
+/// **And `reported` must not be older than `current`**, by modification time.
+/// A TUI sends each report on its own task, and two TUIs re-arming the same
+/// coordinator send theirs independently, so reports can arrive out of
+/// publication order. Each published file is written once and never touched
+/// again, so its modification time is when it was published by the wall clock
+/// — which is not a publication sequence: a clock stepped back between two
+/// re-arms dates the later one before the earlier (Qodo on PR #1554). The
+/// order is by modification time anyway because that is what the record has
+/// to survive: the retention sweep ages files by the same time
+/// ([`sweep_coordination_files`]), so the record stays on the file of the
+/// orchestration's brief that the sweep reaches last, whichever was published
+/// last. Equal times are not ordered and are allowed. A time either file
+/// cannot report also allows it, the same answer as before this check
+/// existed.
+///
+/// Both paths must name a per-publish file in the same `.dot-agent-deck`
+/// ([`own_context_file_name`]), and both are read through
+/// [`read_context_file`]'s bounded read — on Unix never following a link at
+/// the last two components. An `Err` (a path of the wrong shape, a missing or
+/// unreadable file) means "not shown to follow", and the caller refuses.
+///
+/// **Blocking.** Reads two files; the daemon calls it from a blocking task.
+pub fn compare_rearmed_context(
+    current: &std::path::Path,
+    reported: &std::path::Path,
+) -> std::io::Result<RearmComparison> {
+    let not_a_context_file = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a per-publish context path",
+        )
+    };
+    let project_dir = current
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(not_a_context_file)?;
+    let current_name =
+        own_context_file_name(project_dir, current).ok_or_else(not_a_context_file)?;
+    let reported_name =
+        own_context_file_name(project_dir, reported).ok_or_else(not_a_context_file)?;
+    let (current, current_mtime) = read_context_file_and_mtime(project_dir, current_name)?;
+    let (reported, reported_mtime) = read_context_file_and_mtime(project_dir, reported_name)?;
+    if read_back_context(Some(&current)) != read_back_context(Some(&reported)) {
+        return Ok(RearmComparison::DifferentBrief);
+    }
+    Ok(match (current_mtime, reported_mtime) {
+        (Some(current), Some(reported)) if reported < current => RearmComparison::Older,
+        _ => RearmComparison::Follows,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,15 +2205,19 @@ impl std::fmt::Display for ContextRemovalError {
     }
 }
 
-/// Delete the per-publish context an orchestration was started with, once
-/// that orchestration has ended (issue #1395 item 2).
+/// Delete a per-publish context of an orchestration that has ended (issue
+/// #1395 item 2): the one it was started with, or since issue #1445 one a
+/// re-arm published for it.
 ///
-/// `context_path` is the path the daemon recorded from its own preparation
-/// binding ([`crate::state::AppState::record_orchestration_context`]), never a
-/// value a client supplied — and it is validated anyway, because this deletes a
-/// file: the file name must be [`is_unique_context_file_name`] and its parent
-/// must be named [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror
-/// therefore can never be removed here.
+/// `context_path` is a path the daemon recorded: from its own preparation
+/// binding or publish ([`crate::state::AppState::record_orchestration_context`]),
+/// or a re-arm publication a TUI reported and the daemon checked against the
+/// recorded file — same directory, same brief
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]). It is
+/// validated again here anyway, because this deletes a file: the file name must
+/// be [`is_unique_context_file_name`] and its parent must be named
+/// [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror therefore can never be
+/// removed here.
 ///
 /// The removal goes through the same held-descriptor discipline as the publish:
 /// the project directory is opened once, `.dot-agent-deck` is opened relative
@@ -2777,8 +2873,10 @@ pub struct SweepReport {
 ///   residual, stated: a coordinator that re-reads its own file on its own
 ///   initiative more than the window after its last publish, with no re-arm in
 ///   between (a re-arm publishes a fresh file), finds it gone. It then reads
-///   nothing rather than something wrong. A daemon-started orchestration's file
-///   is also deleted when the orchestration ends
+///   nothing rather than something wrong. A daemon-started orchestration's
+///   files — the one it started with and, since issue #1445, each one a TUI's
+///   re-arm reported and the daemon followed — are also deleted when the
+///   orchestration ends
 ///   ([`remove_ended_orchestration_context`], issue #1395); this sweep is the
 ///   backstop for every file that path does not reach.
 /// * the mirror's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
@@ -3859,6 +3957,136 @@ mod tests {
             assert_eq!(id.len(), 32);
             assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
         }
+    }
+
+    /// Issue #1445: the daemon's record follows a re-arm publication only when
+    /// the reported file carries the recorded file's brief. A genuine re-arm
+    /// does; another preparation's file in the same project (a different task,
+    /// or the same task with a different attendance) does not; and a path that
+    /// is not a per-publish file beside the recorded one, or names a missing
+    /// file, is an error rather than a match.
+    #[test]
+    fn only_a_file_carrying_the_recorded_brief_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let publish = |task: Option<&str>, attendance| {
+            prepare_orchestrator_prompt(&config(), &cwd, task, attendance)
+                .expect("published")
+                .context_path
+        };
+        let current = publish(Some("TASK-ALPHA"), Attendance::Unattended);
+        let rearmed = reassert_orchestrator_prompt(&config(), &cwd, Some(&current))
+            .expect("re-armed")
+            .context_path;
+        // Two publishes in one test can land in the same timestamp tick; date
+        // the earlier one back so the order the check reads is unambiguous.
+        std::fs::File::options()
+            .write(true)
+            .open(&current)
+            .and_then(|f| {
+                f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            })
+            .expect("date the startup file back");
+        assert_eq!(
+            compare_rearmed_context(&current, &rearmed).unwrap(),
+            RearmComparison::Follows
+        );
+        assert_eq!(
+            compare_rearmed_context(&rearmed, &current).unwrap(),
+            RearmComparison::Older,
+            "a report that arrives after a later one must not move the record back"
+        );
+
+        for (case, other) in [
+            (
+                "another task",
+                publish(Some("TASK-BRAVO"), Attendance::Unattended),
+            ),
+            (
+                "another attendance",
+                publish(Some("TASK-ALPHA"), Attendance::Attended),
+            ),
+            ("no task", publish(None, Attendance::Unattended)),
+        ] {
+            assert_eq!(
+                compare_rearmed_context(&current, &other).unwrap(),
+                RearmComparison::DifferentBrief,
+                "{case}: must not be recorded as this orchestration's brief"
+            );
+        }
+
+        let mirror = context_dir_of(tmp.path()).join(CONTEXT_FILE_NAME);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = context_dir_of(elsewhere.path()).join(rearmed.file_name().unwrap());
+        let missing =
+            context_dir_of(tmp.path()).join(format!("{CONTEXT_FILE_PREFIX}{}.md", "0".repeat(32)));
+        for (case, path) in [
+            ("the mirror", mirror),
+            ("another directory", foreign),
+            ("a missing file", missing),
+        ] {
+            assert!(
+                compare_rearmed_context(&current, &path).is_err(),
+                "{case}: must be refused, not compared"
+            );
+        }
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): modification time is not a publication
+    /// sequence — a clock stepped back between two re-arms makes the later file
+    /// read as older, so the record stays on the earlier one. That is the file
+    /// worth staying on: the retention sweep orders by the same time, so the
+    /// file the record keeps is the last of the two it removes, and it carries
+    /// the same brief.
+    #[test]
+    fn after_a_backward_clock_step_the_record_keeps_the_file_the_sweep_removes_last() {
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let earlier = prepare_orchestrator_prompt(
+            &config(),
+            &cwd,
+            Some("TASK-ALPHA"),
+            Attendance::Unattended,
+        )
+        .expect("published")
+        .context_path;
+        let later = reassert_orchestrator_prompt(&config(), &cwd, Some(&earlier))
+            .expect("re-armed")
+            .context_path;
+        // The clock stepped back an hour between the two publishes.
+        std::fs::File::options()
+            .write(true)
+            .open(&later)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .expect("date the later publish back");
+        assert_eq!(
+            compare_rearmed_context(&earlier, &later).unwrap(),
+            RearmComparison::Older,
+            "the later publish reads as older, so the record stays on the earlier file"
+        );
+
+        // A sweep that reaches either of them reaches the later publish first.
+        let project = open_project_dir(tmp.path()).expect("open the project dir");
+        let held = open_publish_dir_in(&project, tmp.path()).expect("open the context dir");
+        let (report, _) = sweep_window(
+            &held,
+            Duration::from_secs(1800),
+            SystemTime::now(),
+            MAX_SWEEP_ENTRIES,
+            0,
+        );
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(
+            !later.exists(),
+            "the file the record did not follow goes first"
+        );
+        let kept = std::fs::read_to_string(&earlier).expect("the recorded file survives");
+        assert_eq!(
+            read_back_context(Some(&kept)),
+            (Some("TASK-ALPHA".to_string()), Attendance::Unattended),
+            "and still carries the orchestration's brief"
+        );
     }
 
     /// Issue #1233: a re-arm that knows its tab's own file reads the task back

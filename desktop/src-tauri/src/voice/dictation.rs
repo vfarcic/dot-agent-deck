@@ -131,18 +131,28 @@ pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "pres
 /// **Whole-utterance equality only**, for the reason [`SUBMIT_PHRASES`] is:
 /// entering changes how every later utterance is treated, so it must never
 /// ground on words said in passing — *"type on the tester's prompt that the
-/// build is on"* is dictation, not a mode switch. Answered locally ahead of
-/// [`DICTATION_OPENERS`], because *"type on"* opens with the opener `type` and
-/// would otherwise type the word `on`. The cost is stated rather than hidden: a
-/// bare *"type on"* can no longer dictate the single word `on`; *"type the word
-/// on"* still can.
-pub const DICTATION_ON_PHRASES: [&str; 6] = [
+/// build is on"* is dictation, not a mode switch, and so is *"I was talking on
+/// the phone"*. Answered locally ahead of [`DICTATION_OPENERS`], because *"type
+/// on"* and *"dictate on"* open with the openers `type` and `dictate` and would
+/// otherwise type the word `on`. The cost is stated rather than hidden: a bare
+/// *"type on"* can no longer dictate the single word `on`; *"type the word on"*
+/// still can.
+///
+/// Every entry has its counterpart in [`DICTATION_OFF_PHRASES`] (#1544): a
+/// phrasing that enters the mode but has no matching exit would be typed into
+/// the prompt when the user says it to leave.
+pub const DICTATION_ON_PHRASES: [&str; 11] = [
     "type on",
     "typing on",
     "start typing",
     "dictation on",
     "start dictation",
     "keep typing",
+    "talking on",
+    "start talking",
+    "speaking on",
+    "start speaking",
+    "dictate on",
 ];
 
 /// What leaves the dictation mode, said as the whole utterance.
@@ -152,13 +162,23 @@ pub const DICTATION_ON_PHRASES: [&str; 6] = [
 /// ever a whole utterance, which is what keeps a false positive from
 /// truncating somebody mid-sentence: *"we should stop typing the logs"* is
 /// typed.
-pub const DICTATION_OFF_PHRASES: [&str; 6] = [
+///
+/// *"stop talking"* is here rather than in [`VOICE_OFF_PHRASES`], though it
+/// could be meant as voice off: it is the counterpart of *"start talking"*, and
+/// heard as an exit it costs nothing a user cannot see — the mode ends, the
+/// microphone stays open, and *"voice off"* still turns it off.
+pub const DICTATION_OFF_PHRASES: [&str; 11] = [
     "type off",
     "typing off",
     "stop typing",
     "dictation off",
     "stop dictation",
     "done typing",
+    "talking off",
+    "stop talking",
+    "speaking off",
+    "stop speaking",
+    "dictate off",
 ];
 
 /// What turns voice off while the dictation mode is on, said as the whole
@@ -476,6 +496,11 @@ mod tests {
             "dictation on",
             "start dictation",
             "keep typing",
+            "talking on",
+            "start talking",
+            "speaking on",
+            "start speaking",
+            "dictate on",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_ON_PHRASES),
@@ -493,6 +518,11 @@ mod tests {
             "dictation off",
             "stop dictation",
             "done typing",
+            "talking off",
+            "stop talking",
+            "speaking off",
+            "stop speaking",
+            "dictate off",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_OFF_PHRASES),
@@ -514,6 +544,34 @@ mod tests {
             "we should stop typing the logs to the file",
             &DICTATION_OFF_PHRASES
         ));
+        // #1544's control, in both directions.
+        for phrases in [&DICTATION_ON_PHRASES[..], &DICTATION_OFF_PHRASES[..]] {
+            assert!(!whole_utterance_is("I was talking on the phone", phrases));
+            assert!(!whole_utterance_is(
+                "she was speaking off the record",
+                phrases
+            ));
+        }
+    }
+
+    /// Scenario: every phrasing that starts typing mode has a matching phrasing
+    /// that stops it, so a user who enters by one word can leave by the same
+    /// word instead of having it typed into the prompt.
+    #[test]
+    fn voice_dictation_every_on_phrase_has_its_off_counterpart() {
+        for on in DICTATION_ON_PHRASES {
+            let off = match on.split_once(' ') {
+                Some((verb, "on")) => format!("{verb} off"),
+                Some(("start", rest)) => format!("stop {rest}"),
+                Some(("keep", "typing")) => "done typing".to_string(),
+                _ => panic!("{on:?} has no counterpart rule"),
+            };
+            assert!(
+                DICTATION_OFF_PHRASES.contains(&off.as_str()),
+                "{on:?} enters typing mode but {off:?} does not leave it"
+            );
+        }
+        assert_eq!(DICTATION_ON_PHRASES.len(), DICTATION_OFF_PHRASES.len());
     }
 
     /// Scenario: each prompt-control phrase (interrupt, clear, scratch) is

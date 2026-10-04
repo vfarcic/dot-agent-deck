@@ -601,7 +601,81 @@ screen = "deck"
 action = "dictation_off"
 outcome = "unavailable"
 
-# A switch phrase said INSIDE a sentence is not a switch. The first two go
+# Issue #1544 — the talking, speaking and dictate phrasings, one fixture each,
+# so every phrasing the mode answers has its whole-pipeline answer pinned.
+# "dictate on" / "dictate off" open with the `dictate` opener and would type
+# the word "on" / "off" if the switches were not answered ahead of it.
+[[fixtures]]
+name = "dictation-on-talking-on"
+utterance = "talking on"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-talking"
+utterance = "Start talking."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-speaking-on"
+utterance = "Speaking on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-speaking"
+utterance = "start speaking"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-dictate-on"
+utterance = "Dictate on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-talking-off"
+utterance = "Talking off."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-talking"
+utterance = "stop talking"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-speaking-off"
+utterance = "speaking off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-speaking"
+utterance = "Stop speaking, please."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-dictate-off"
+utterance = "dictate off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+# A switch phrase said INSIDE a sentence is not a switch. The first three go
 # through the local `type` opener; the last three reach the model, through an
 # opener no list holds, with a reserved phrase in the middle of what is to be
 # typed — the case where another row stealing it would be a silent wrong
@@ -617,6 +691,14 @@ dictate_prefix = "type"
 [[fixtures]]
 name = "dictate-the-word-on"
 utterance = "type the word on"
+screen = "agent"
+action = "dictate_to_agent"
+outcome = "dispatch"
+dictate_prefix = "type"
+
+[[fixtures]]
+name = "dictate-talking-on-in-passing"
+utterance = "type I was talking on the phone"
 screen = "agent"
 action = "dictate_to_agent"
 outcome = "dispatch"

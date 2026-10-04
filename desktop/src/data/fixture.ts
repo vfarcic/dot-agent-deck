@@ -1218,7 +1218,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
     // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
     // the opener row, as `local_intercept` checks them.
-    phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
+    phrases: [
+      "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
+      "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+    ],
     action: "dictation_on",
     invoke: "startDictation",
     screens: ["agent"],
@@ -1226,7 +1229,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typing to the agent.",
   },
   {
-    phrases: ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"],
+    phrases: [
+      "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
+      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+    ],
     action: "dictation_off",
     invoke: "stopDictation",
     screens: ["agent"],

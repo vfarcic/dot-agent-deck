@@ -8125,7 +8125,9 @@ mod tests {
     }
 
     /// Scenario: the two spoken mode switches are answered locally before the
-    /// one-shot `type` opener can turn their last word into prompt text.
+    /// one-shot `type` opener can turn their last word into prompt text, for
+    /// every phrasing of either switch (#1544 added talking, speaking and
+    /// dictate). A sentence that merely contains one reaches the model instead.
     #[tokio::test]
     async fn voice_outcome_type_on_and_off_switch_mode_without_typing_or_resolving() {
         for (said, action) in [
@@ -8133,6 +8135,16 @@ mod tests {
             ("okay, type on please", "dictation_on"),
             ("type off", "dictation_off"),
             ("please type off now", "dictation_off"),
+            ("talking on", "dictation_on"),
+            ("Start talking.", "dictation_on"),
+            ("speaking on", "dictation_on"),
+            ("start speaking", "dictation_on"),
+            ("dictate on", "dictation_on"),
+            ("talking off", "dictation_off"),
+            ("stop talking", "dictation_off"),
+            ("speaking off", "dictation_off"),
+            ("Stop speaking.", "dictation_off"),
+            ("dictate off", "dictation_off"),
         ] {
             let resolver = NoCommandsResolver;
             let answer = handle_utterance(
@@ -8154,6 +8166,32 @@ mod tests {
             );
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
         }
+        // The control: a switch phrase said in passing is not a switch, in
+        // either direction. It is the model's to answer like any sentence.
+        for said in [
+            "I was talking on the phone",
+            "we should stop talking about the release",
+        ] {
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                !matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. }
+                if action == "dictation_on" || action == "dictation_off"),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(resolver.calls(), 1, "{said} was answered locally");
+        }
     }
 
     /// Scenario: a declared dictation target keeps every utterance local to
@@ -8169,6 +8207,21 @@ mod tests {
         for (said, action, text) in [
             ("voice off", "voice_off", None),
             ("type off", "dictation_off", None),
+            ("talking off", "dictation_off", None),
+            ("Stop talking.", "dictation_off", None),
+            ("speaking off", "dictation_off", None),
+            ("stop speaking", "dictation_off", None),
+            ("dictate off", "dictation_off", None),
+            (
+                "I was talking on the phone",
+                "dictate_to_agent",
+                Some("I was talking on the phone"),
+            ),
+            (
+                "we should stop talking about the release",
+                "dictate_to_agent",
+                Some("we should stop talking about the release"),
+            ),
             ("send it", "submit_prompt", None),
             ("go ahead", "submit_prompt", None),
             ("finished", "submit_prompt", None),

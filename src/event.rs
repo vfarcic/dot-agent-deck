@@ -2397,7 +2397,7 @@ pub struct OrchestrationSurface {
     /// of [`crate::agent_pty::AgentRecord::orchestrator_context_path`], filled
     /// by the daemon from what it recorded
     /// ([`crate::state::AppState::orchestration_context_paths`]), never from a
-    /// client-supplied value. Present only on a surface that carries the start
+    /// value the request carried. Present only on a surface that carries the start
     /// role; the TUI sets it on the tab so compaction and `/clear` re-arm from
     /// the tab's own file, and a later surface without it leaves the tab's path
     /// alone. The TUI accepts it only when it names a per-publish file directly

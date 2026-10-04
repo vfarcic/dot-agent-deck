@@ -1424,7 +1424,7 @@ fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() 
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
-    assert_attached_tab_rearms_from_own_context(false);
+    let _ = assert_attached_tab_rearms_from_own_context(false);
 }
 
 /// Scenario: Attach a TUI before the first orchestration starts, then prepare
@@ -1434,11 +1434,218 @@ fn orchestration_remit_008_hydrated_tab_rearms_from_its_own_context() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_009_live_surface_rearms_from_its_own_context() {
-    assert_attached_tab_rearms_from_own_context(true);
+    let _ = assert_attached_tab_rearms_from_own_context(true);
+}
+
+/// Scenario: Start a prepared orchestration headlessly, attach a TUI and let a
+/// compaction re-arm its start role, then detach that TUI, delete the startup
+/// context file as the retention sweep would, and attach a fresh TUI. A second
+/// compaction still carries the brief, and stopping every role removes every
+/// context file the run published.
+#[spec("orchestration/remit/010")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
+    let run = assert_attached_tab_rearms_from_own_context(false);
+    let context_dir = run.cwd.join(".dot-agent-deck");
+
+    // The daemon learns of the re-arm asynchronously (the TUI reports it off
+    // its render thread), so wait for the record to follow before detaching.
+    assert_record_follows(&run.daemon.attach_socket, &run.rearmed_path);
+    // Move the start role off `Compacting`, so the fresh TUI below meets a
+    // pane that is not already compacting and re-arms only on the second
+    // injection.
+    inject_status(&run, EventType::Thinking, "remit010-thinking");
+    let RearmedRun {
+        daemon,
+        _project,
+        pane_id,
+        agent_id,
+        first_brief,
+        startup_path,
+        rearmed_path,
+        deck,
+        title,
+        agent_ids,
+        ..
+    } = run;
+    drop(deck);
+
+    // Stand-in for the 14-day retention sweep reaching the startup file.
+    std::fs::remove_file(&startup_path).expect("remove the startup context file");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_until_grid("reattached orchestration tab", |grid| {
+        grid.lines().next().is_some_and(|tabs| tabs.contains(title))
+    });
+
+    let before = context_files(&context_dir);
+    let event = synthetic_event(
+        EventType::Compacting,
+        "remit010-second-compaction",
+        &pane_id,
+        &agent_id,
+    );
+    common::write_hook_line(
+        &daemon.hook_socket,
+        &serde_json::to_string(&event).expect("serialize compaction event"),
+    )
+    .expect("inject the second compaction into the daemon");
+    let second_rearm = || {
+        context_files(&context_dir)
+            .into_iter()
+            .find(|path| !before.contains(path))
+    };
+    assert!(
+        common::wait_until(REASSERTION_DELIVERY_TIMEOUT, || second_rearm().is_some()),
+        "the reattached tab never published a new context after compaction; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let second_path = second_rearm().expect("second re-arm path");
+    let content = std::fs::read_to_string(&second_path).expect("read the second re-arm");
+    assert!(
+        content.contains(first_brief),
+        "a TUI reattached after the startup context was swept must re-arm from the file \
+         the previous re-arm published ({}), so the brief survives; {} carries no brief:\n{content}",
+        rearmed_path.display(),
+        second_path.display()
+    );
+
+    // The second report is asynchronous too: end the run only once it landed.
+    assert_record_follows(&daemon.attach_socket, &second_path);
+    for id in agent_ids {
+        let stopped = daemon
+            .send_attach_request(&AttachRequest::StopAgent { id })
+            .expect("stop an orchestration role");
+        assert!(stopped.ok, "stop failed: {:?}", stopped.error);
+    }
+    let published = [&rearmed_path, &second_path];
+    assert!(
+        common::wait_until(Duration::from_secs(10), || published
+            .iter()
+            .all(|path| !path.exists())),
+        "ending the orchestration must remove every context file its re-arms published; \
+         still present: {:?}",
+        published
+            .iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        context_dir.join("orchestrator-context.md").is_file(),
+        "the compatibility mirror must remain"
+    );
+}
+
+/// Wait until the daemon advertises `path` as the start role's context file —
+/// the record following a re-arm the TUI reported.
+#[cfg(unix)]
+fn assert_record_follows(socket: &std::path::Path, path: &std::path::Path) {
+    let wire = path.to_string_lossy().into_owned();
+    let advertised = || role_agent_record(socket, "orchestrator").orchestrator_context_path;
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            advertised().as_deref() == Some(wire.as_str())
+        }),
+        "the daemon's recorded context never followed the re-arm to {wire}; it advertises {:?}",
+        advertised()
+    );
+}
+
+/// Every per-publish `orchestrator-context-*.md` in `dir`.
+#[cfg(unix)]
+fn context_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("orchestrator-context-") && name.ends_with(".md")
+                })
+        })
+        .collect()
 }
 
 #[cfg(unix)]
-fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
+fn synthetic_event(
+    event_type: EventType,
+    session_id: &str,
+    pane_id: &str,
+    agent_id: &str,
+) -> AgentEvent {
+    AgentEvent {
+        session_id: session_id.to_string(),
+        agent_type: AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata: std::collections::HashMap::new(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
+}
+
+/// Inject `event_type` for the run's start role and wait until the daemon
+/// reports the pane off `Compacting`.
+#[cfg(unix)]
+fn inject_status(run: &RearmedRun, event_type: EventType, session_id: &str) {
+    let event = synthetic_event(event_type, session_id, &run.pane_id, &run.agent_id);
+    common::write_hook_line(
+        &run.daemon.hook_socket,
+        &serde_json::to_string(&event).expect("serialize status event"),
+    )
+    .expect("inject status into the daemon");
+    assert!(
+        wait_for_applied(
+            &run.daemon.attach_socket,
+            &run.pane_id,
+            INJECTED_EVENT_APPLIED_TIMEOUT,
+            |s| s.status != dot_agent_deck::state::SessionStatus::Compacting
+        ),
+        "daemon did not move the start role off Compacting"
+    );
+}
+
+/// What [`assert_attached_tab_rearms_from_own_context`] leaves running, for a
+/// test that continues past the first re-arm.
+#[cfg(unix)]
+struct RearmedRun {
+    daemon: common::DaemonProc,
+    _project: tempfile::TempDir,
+    cwd: std::path::PathBuf,
+    pane_id: String,
+    agent_id: String,
+    first_brief: &'static str,
+    startup_path: std::path::PathBuf,
+    rearmed_path: std::path::PathBuf,
+    deck: TuiDeck,
+    title: &'static str,
+    agent_ids: Vec<String>,
+}
+
+#[cfg(unix)]
+fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun {
     let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
     let project = common::harness_tempdir().expect("create hydrated orchestration project");
     std::fs::write(
@@ -1500,6 +1707,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
         deck.wait_for_string("No active agents");
     }
 
+    let mut agent_ids = Vec::new();
     for (role_index, role) in first.roles.iter().enumerate() {
         let command = if role.start {
             "./orchestrator-remit.sh"
@@ -1537,6 +1745,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
             "start {} failed: {:?}",
             role.name, response.error
         );
+        agent_ids.push(response.id.expect("started role has an agent id"));
     }
     let record = role_agent_record(&daemon.attach_socket, "orchestrator");
     let pane_id = record.pane_id_env.expect("start role pane id");
@@ -1585,7 +1794,7 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
         user_prompt: None,
         metadata: std::collections::HashMap::new(),
         pane_id: Some(pane_id.clone()),
-        agent_id: Some(record.id),
+        agent_id: Some(record.id.clone()),
         agent_version: None,
         schema_version: None,
         live_target: None,
@@ -1637,4 +1846,17 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) {
         content.contains(first_brief),
         content.contains(second_brief)
     );
+    RearmedRun {
+        daemon,
+        _project: project,
+        cwd,
+        pane_id,
+        agent_id: record.id,
+        first_brief,
+        startup_path: std::path::PathBuf::from(&first.context_path),
+        rearmed_path,
+        deck,
+        title,
+        agent_ids,
+    }
 }
