@@ -39,6 +39,7 @@ import { CONFIRMATION_ALREADY_OPEN, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE } fr
 import {
   DIALOG_MOVED_ON,
   VOICE_CHOICE_DIALOG_MOVED_ON,
+  VOICE_SUBMIT_SETTLE_MS,
   VOICE_CHOICE_SCREEN_MOVED_ON,
   NOTHING_DISPATCHED,
   VOICE_CHOICE_DECK_MOVED_ON,
@@ -1816,6 +1817,8 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     voice.deliver("send it");
     await completeUtterance();
+    // The words landed a moment ago, so Enter waits for them to settle.
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
 
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId: DECK_ID, agentId: "planner" }, VOICE_DICTATION_SUBMIT);
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
@@ -1975,7 +1978,7 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, "one more prompt ");
   });
 
-  /** Scenario: one utterance ends with a separate send sentence in typing mode. The panel writes only the prompt, waits for that write, then presses Enter through the spoken-send path. */
+  /** Scenario: one utterance ends with a separate send sentence in typing mode. The panel writes only the prompt, waits for that write and then a moment more for the words to settle in the agent, so the agent reads Enter on its own and submits rather than starting a new line, then presses Enter through the spoken-send path. */
   it("types a trailing-send prompt before pressing Enter", async () => {
     const said = "What's the weather over there? Send it.";
     const prompt = "What's the weather over there?";
@@ -1994,6 +1997,10 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
     await act(async () => { finishWrite(); });
     await flush();
+    // PRD #1541 — an Enter in the same read as the words is a newline in
+    // Claude Code, so it does not follow the write straight away.
+    expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
     expect(deck.sendTerminalInput).toHaveBeenNthCalledWith(2, { deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(2);
   });
@@ -2437,6 +2444,7 @@ describe("sticky dictation in the open agent pane", () => {
       expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
       await act(async () => { settle(outcome === "succeeds"); });
       await flush();
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
       if (outcome === "fails") expect(deck.sendTerminalInput, outcome).not.toHaveBeenCalledWith(expect.anything(), VOICE_DICTATION_SUBMIT);
       else expect(deck.sendTerminalInput, outcome).toHaveBeenLastCalledWith({ deckId, agentId: coderId }, VOICE_DICTATION_SUBMIT);
       unmount();

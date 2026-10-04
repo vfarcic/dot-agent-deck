@@ -579,9 +579,16 @@ export interface PromptKeys {
    * The key that clears the prompt. `per_wrapped_row`: one press per wrapped
    * screen row (Claude Code); `per_line`: one per logical line. Extra presses
    * are harmless, so round up. Never more than `maxPressesPerWrite` in one
-   * write, when present.
+   * write, when present, and `pauseBetweenWritesMs` between two writes of
+   * one clear, when present (Claude Code reads two writes sent back to back
+   * as one, and ignores a read that large).
    */
-  clear: { bytes: string; presses: "per_wrapped_row" | "per_line"; maxPressesPerWrite?: number };
+  clear: {
+    bytes: string;
+    presses: "per_wrapped_row" | "per_line";
+    maxPressesPerWrite?: number;
+    pauseBetweenWritesMs?: number;
+  };
   /**
    * The key that deletes one character, and the longest single write (in
    * characters) the agent keeps as typed text — absent where no limit was

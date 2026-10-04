@@ -1,6 +1,6 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "../data/fixture";
+import { createFixtureSnapshot, FIXTURE_PROMPT_KEYS } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   fixtureDesktopFeatures,
@@ -10,11 +10,17 @@ import {
   type VoiceTranscriptionDto,
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
-import type { DeckActionResult, DeckRuntimeState } from "../types";
+import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
 
 vi.mock("./TerminalViewport", () => ({
-  TerminalViewport: ({ agentId, label }: { agentId: string; label: string }) => (
-    <div data-testid={`terminal-${agentId}`} role="group" aria-label={`${label} terminal`} />
+  TerminalViewport: ({ agentId, label, onInput }: { agentId: string; label: string; onInput: (data: string) => void }) => (
+    <div data-testid={`terminal-${agentId}`} role="group" aria-label={`${label} terminal`}>
+      <textarea
+        aria-label={`${label} terminal input`}
+        onInput={(event) => onInput(event.currentTarget.value)}
+        onKeyDown={(event) => { if (event.key === "Enter") onInput("\r"); }}
+      />
+    </div>
   ),
 }));
 
@@ -349,6 +355,426 @@ describe("voice control panel", () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  describe("voice prompt controls", () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    });
+
+    const commands = [
+      { said: "interrupt", action: "interrupt_agent", invoke: "interruptAgent", missing: "interrupt its turn" },
+      { said: "clear the prompt", action: "clear_prompt", invoke: "clearAgentPrompt", missing: "clear its prompt" },
+      { said: "scratch that", action: "scratch_that", invoke: "scratchLastDictation", missing: "remove dictated words" },
+    ] as const;
+
+    function dispatchPrompt(said: string): VoiceResultDto {
+      const command = commands.find((entry) => entry.said === said);
+      const [action, invoke] = command ? [command.action, command.invoke]
+        : said === "typing on" ? ["dictation_on", "startDictation"]
+        : said === "send it" ? ["submit_prompt", "submitAgentPrompt"]
+        : ["dictate_to_agent", "dictateToAgent"];
+      return result({
+        kind: "dispatch", transcript: said, action, invoke,
+        params: invoke === "dictateToAgent"
+          ? [{ name: "prefix", kind: "spoken_prefix", spoken: "", value: said, label: said }]
+          : [],
+        // A neutral resolver sentence leaves the panel responsible for reporting
+        // whether its terminal operation actually ran, including refusals.
+        sentence: "Prompt command pending.",
+      }, null, "local");
+    }
+
+    async function startPrompt(agentType: AgentTypeId = "codex", overrides: Partial<AgentSession> = {}) {
+      const steps: Parameters<typeof sequencedVoice>[0] = [{ outcome: heard("typing on") }];
+      const voice = sequencedVoice(steps);
+      const resolveVoice = vi.fn(async (said: string) => dispatchPrompt(said));
+      const deck = runtime(resolveVoice, voice);
+      const snapshot = {
+        ...deck.snapshot,
+        agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? {
+          ...agent, displayName: "Planner", status: "running" as const,
+          writeLease: "write" as const, agentType, turn: "working" as const,
+          promptKeys: FIXTURE_PROMPT_KEYS[agentType], spawnedAtMs: 100,
+          ...overrides,
+        } : agent),
+      };
+      deck.snapshot = snapshot;
+      deck.fleet = [snapshot];
+      const view = render(<DeckShell runtime={deck} />);
+      fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+      await turnVoiceOn(voice);
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+      await flush();
+      expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+      const write = vi.mocked(deck.sendTerminalInput);
+      const target = { deckId: snapshot.connection.deckId, agentId: "planner" };
+      const say = async (said: string) => {
+        const before = voice.voiceStop.mock.calls.length;
+        steps.push({ outcome: heard(said) });
+        await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+        await flush();
+        expect(voice.voiceStop).toHaveBeenCalledTimes(before + 1);
+      };
+      const keyboard = async (data: string) => {
+        const input = within(screen.getByTestId("agent-pane-overlay")).getByRole("textbox", { name: "Planner terminal input" });
+        if (data === "\r") fireEvent.keyDown(input, { key: "Enter" });
+        else fireEvent.input(input, { target: { value: data } });
+        await flush();
+        expect(write).toHaveBeenLastCalledWith(target, data);
+      };
+      const updatePlanner = (change: Partial<AgentSession>) => {
+        const next = { ...deck.snapshot, agents: deck.snapshot.agents.map((agent) => agent.id === "planner" ? { ...agent, ...change } : agent) };
+        deck.snapshot = next;
+        deck.fleet = [next];
+        view.rerender(<DeckShell runtime={{ ...deck }} />);
+      };
+      const changeDeck = () => {
+        const next = {
+          ...deck.snapshot,
+          connection: { ...deck.snapshot.connection, deckId: "deck-second" },
+          agents: deck.snapshot.agents.map((agent) => ({ ...agent, daemonId: "deck-second" })),
+        };
+        view.rerender(<DeckShell runtime={{ ...deck, snapshot: next, fleet: [next] }} />);
+      };
+      return { ...view, voice, resolveVoice, write, target, say, keyboard, updatePlanner, changeDeck };
+    }
+
+    function report() { return screen.getByTestId("voice-report"); }
+    function expectNoInterruptByte(write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
+      expect(write.mock.calls.some(([, bytes]) => bytes.includes("\x03")), "Ctrl+C must never be sent").toBe(false);
+    }
+
+    /** Scenario: issue each prompt command on an unsupported agent or an old deck. The row names the agent and no terminal write occurs. */
+    it.each(commands)("refuses $invoke without promptKeys and names Devin", async (command) => {
+      const { say, write } = await startPrompt("devin");
+      await say(command.said);
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(`Devin has no voice key to ${command.missing}.`);
+    });
+
+    /** Scenario: the daemon reports an unknown agent type without keys. Each refusal uses the pane label to identify the unsupported target. */
+    it.each(commands)("refuses $invoke without an agent label using the pane label", async (command) => {
+      const { say, write } = await startPrompt("none");
+      await say(command.said);
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(`Planner has no voice key to ${command.missing}.`);
+    });
+
+    /** Scenario: a prompt command resolves after the user closes its pane. It writes nothing and reports that the context moved on. */
+    it.each(commands)("refuses $invoke when its pane closes during resolution", async (command) => {
+      const { say, write, resolveVoice } = await startPrompt();
+      let release!: (answer: VoiceResultDto) => void;
+      resolveVoice.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+      await say(command.said);
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      await act(async () => { release(dispatchPrompt(command.said)); });
+      await flush();
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/nothing (ran|was sent)|say it again/i);
+      expect(report()).not.toHaveTextContent("Prompt command pending.");
+    });
+
+    /** Scenario: a stop confirmation opens while a prompt command is resolving. The confirmation prevents terminal writes and the row explains the refusal. */
+    it.each(commands)("refuses $invoke when a confirmation opens during resolution", async (command) => {
+      const { say, write, resolveVoice } = await startPrompt();
+      let release!: (answer: VoiceResultDto) => void;
+      resolveVoice.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+      await say(command.said);
+      fireEvent.click(screen.getByTestId("stop-run"));
+      expect(screen.getByRole("alertdialog")).toBeVisible();
+      await act(async () => { release(dispatchPrompt(command.said)); });
+      await flush();
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/confirmation|typing mode.*changed/i);
+      expect(report()).toHaveTextContent(/nothing (ran|was sent)|say it again/i);
+    });
+
+    /** Scenario: issue a prompt command after its agent is replaced while resolving. The replacement receives no bytes and the row explains the stale context. */
+    it.each(commands)("refuses $invoke when the agent is replaced during resolution", async (command) => {
+      const { say, write, resolveVoice, updatePlanner } = await startPrompt();
+      let release!: (answer: VoiceResultDto) => void;
+      resolveVoice.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+      await say(command.said);
+      updatePlanner({ spawnedAtMs: 200 });
+      await act(async () => { release(dispatchPrompt(command.said)); });
+      await flush();
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/replaced|typing mode.*changed/i);
+      expect(report()).toHaveTextContent(/nothing (ran|was sent)|say it again/i);
+    });
+
+    /** Scenario: the pane becomes unwritable, hides its terminal, changes deck, or leaves typing mode while resolving a prompt command. The stale command writes nothing and reports why it was dropped. */
+    it.each(commands.flatMap((command) => ["input blocked", "terminal hidden", "deck changed", "typing stopped"].map((change) => ({ ...command, change }))))(
+      "refuses $invoke after $change during resolution",
+      async ({ said, change }) => {
+        const { say, write, resolveVoice, updatePlanner, changeDeck } = await startPrompt();
+        let release!: (answer: VoiceResultDto) => void;
+        resolveVoice.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+        await say(said);
+        if (change === "input blocked") updatePlanner({ writeLease: "read" });
+        if (change === "terminal hidden") fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("tab", { name: "Diff" }));
+        if (change === "deck changed") changeDeck();
+        if (change === "typing stopped") fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+        await act(async () => { release(dispatchPrompt(said)); });
+        await flush();
+        expect(write).not.toHaveBeenCalled();
+        expect(report()).toHaveTextContent(/nothing (ran|was sent)|say it again/i);
+        expect(report()).not.toHaveTextContent("Prompt command pending.");
+      },
+    );
+
+    /** Scenario: interrupt an agent whose turn is idle or unreported. No key is sent and the row says the agent is not working. */
+    it.each(["idle", undefined] as const)("refuses interrupt when turn is %s", async (turn) => {
+      const { say, write } = await startPrompt("codex", { turn });
+      await say("interrupt");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent("Planner is not working on anything.");
+    });
+
+    /** Scenario: interrupt each agent with a single verified interrupt step. Exactly that key is written to the visible pane and the row reports success. */
+    it.each(["claude_code", "codex", "pi"] as const)("interrupts %s with its verified key", async (agentType) => {
+      const { say, write, target } = await startPrompt(agentType);
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.interrupt[0].bytes]]);
+      expectNoInterruptByte(write);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /** Scenario: interrupt OpenCode with its two-step key. The second write waits for the configured pause before the success row appears. */
+    it("honours OpenCode's pause between interrupt writes", async () => {
+      const { say, write, target } = await startPrompt("open_code");
+      const [first, second] = FIXTURE_PROMPT_KEYS.open_code!.interrupt;
+      await say("interrupt");
+      expect(write.mock.calls).toEqual([[target, first.bytes]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(first.pauseAfterMs - 1); });
+      expect(write).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      await flush();
+      expect(write.mock.calls).toEqual([[target, first.bytes], [target, second.bytes]]);
+      expectNoInterruptByte(write);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /** Scenario: repeat interrupt before three seconds have passed while status still says working. The second utterance writes nothing, but a later interrupt is accepted. */
+    it("refuses a repeated interrupt within three seconds and allows it afterwards", async () => {
+      const { say, write } = await startPrompt();
+      await say("interrupt");
+      expect(write).toHaveBeenCalledTimes(1);
+      write.mockClear();
+      await say("interrupt");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/already interrupted|just interrupted|wait|recent|too soon/i);
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      await say("interrupt");
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /** Scenario: clear each per-line editor's prompt. Sixteen verified clear presses reach the pane and the outcome row names the cleared prompt. */
+    it.each(["codex", "open_code", "pi"] as const)("clears %s with sixteen per-line presses", async (agentType) => {
+      const { say, write, target } = await startPrompt(agentType);
+      await say("clear the prompt");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.clear.bytes.repeat(16)]]);
+      expectNoInterruptByte(write);
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+    });
+
+    /** Scenario: clear Claude Code's wrapped editor in bounded writes. The next write waits for the deck-provided pause, and the outcome row confirms completion after both writes. */
+    it("clears wrapped rows in writes no larger than maxPressesPerWrite", async () => {
+      const { say, write, target } = await startPrompt("claude_code");
+      const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+      const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
+      await say("clear the prompt");
+      const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
+      expect(write.mock.calls).toEqual([[target, chunk]]);
+      expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs! - 1); });
+      expect(write.mock.calls).toEqual([[target, chunk]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(write.mock.calls).toEqual([[target, chunk], [target, chunk]]);
+      expectNoInterruptByte(write);
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+    });
+
+    /** Scenario: dictate two writes and scratch twice. Each scratch deletes only its last write, including the trailing space, and names the removed words in the row. */
+    it("scratches the last write including its trailing space then the previous write", async () => {
+      const { say, write, target } = await startPrompt();
+      await say("first sentence");
+      await say("second sentence");
+      expect(write.mock.calls).toEqual([[target, "first sentence "], [target, "second sentence "]]);
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("second sentence ".length)]]);
+      expect(report()).toHaveTextContent(/Removed ["“]second sentence ?["”] from Planner's prompt\./);
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("first sentence ".length)]]);
+      expect(report()).toHaveTextContent(/Removed ["“]first sentence ?["”] from Planner's prompt\./);
+      expectNoInterruptByte(write);
+      write.mockClear();
+      await say("scratch that");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/Nothing to scratch.*\S/i);
+    });
+
+    /** Scenario: scratch before any dictation has been written. No bytes reach the pane and the outcome row says there is nothing to remove. */
+    it("refuses scratch with empty dictation history", async () => {
+      const { say, write } = await startPrompt();
+      await say("scratch that");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/Nothing to scratch.*\S/i);
+    });
+
+    /** Scenario: change the prompt after dictation through each input path. Scratch refuses to delete text whose position is no longer known. */
+    it.each(["keyboard input", "keyboard send", "voice send", "clear", "interrupt", "agent replaced"])(
+      "refuses scratch after %s",
+      async (change) => {
+        const { say, write, keyboard, updatePlanner } = await startPrompt();
+        await say("keep these words");
+        expect(write).toHaveBeenLastCalledWith(expect.anything(), "keep these words ");
+        if (change === "keyboard input") await keyboard("typed by hand");
+        if (change === "keyboard send") await keyboard("\r");
+        if (change === "voice send") await say("send it");
+        if (change === "clear") await say("clear the prompt");
+        if (change === "interrupt") await say("interrupt");
+        if (change === "agent replaced") {
+          updatePlanner({ spawnedAtMs: 200 });
+          await flush();
+          await say("typing on");
+        }
+        write.mockClear();
+        await say("scratch that");
+        expect(write).not.toHaveBeenCalled();
+        expect(report()).toHaveTextContent(/Nothing to scratch.*\S/i);
+      },
+    );
+
+    /** Scenario: scratch a write whose editor may have collapsed it or whose characters require ambiguous deletion counts. Refuse and explain without sending any deletion key. */
+    it.each([
+      { name: "over the 800 floor despite Codex's 1000 limit", said: "a".repeat(800), limit: undefined },
+      { name: "over a lower agent limit", said: "a".repeat(10), limit: 10 },
+      { name: "a combining mark", said: "cafe\u0301", limit: undefined },
+      { name: "an astral character", said: "hello \u{1f600}", limit: undefined },
+    ])("refuses scratch of $name", async ({ said, limit }) => {
+      const keys = structuredClone(FIXTURE_PROMPT_KEYS.codex!);
+      if (limit !== undefined) keys.deleteChar.maxLiteralWriteChars = limit;
+      const { say, write, target } = await startPrompt("codex", { promptKeys: keys });
+      await say(said);
+      expect(write).toHaveBeenLastCalledWith(target, `${said} `);
+      write.mockClear();
+      await say("scratch that");
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/scratch|remove/i);
+      expect(report()).toHaveTextContent(/cannot|can't|too long|safely|unsafe|collapsed/i);
+    });
+
+    /** Scenario: a write exactly at the eight-hundred-character floor still has a literal deletion count. Scratch accepts it including the final space. */
+    it("allows scratch at the 800-character boundary including the trailing space", async () => {
+      const { say, write, target } = await startPrompt();
+      await say("a".repeat(799));
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800)]]);
+      expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
+    });
+
+    /** Scenario: scratch a short literal voice write in every supported editor. The pane receives its own verified delete-character key for each character including the trailing space. */
+    it.each(["claude_code", "codex", "open_code", "pi"] as const)("scratches %s with its verified deletion key", async (agentType) => {
+      const { say, write, target } = await startPrompt(agentType);
+      await say("a short write");
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat("a short write ".length)]]);
+      expectNoInterruptByte(write);
+      expect(report()).toHaveTextContent(/Removed ["“]a short write ?["”] from Planner's prompt\./);
+    });
+
+    /** Scenario: scratch a write exactly at a lower deck-provided literal limit. Counting the trailing space allows the boundary without relaxing that limit. */
+    it("allows scratch exactly at a lower maxLiteralWriteChars", async () => {
+      const keys = structuredClone(FIXTURE_PROMPT_KEYS.codex!);
+      keys.deleteChar.maxLiteralWriteChars = 10;
+      const { say, write, target } = await startPrompt("codex", { promptKeys: keys });
+      await say("a".repeat(9));
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, keys.deleteChar.bytes.repeat(10)]]);
+    });
+
+    /** Scenario: clear a prompt entirely dictated since its last reset, then press Undo after clearing finishes. Claude's paced clear writes finish before the button re-types precisely the cleared voice writes in order. */
+    it.each(["codex", "claude_code"] as const)("offers clear Undo for a wholly dictated prompt and restores its exact text (%s)", async (agentType) => {
+      const { say, write, target } = await startPrompt(agentType);
+      await say("first part");
+      await say("second part");
+      write.mockClear();
+      await say("clear the prompt");
+      if (agentType === "claude_code") {
+        const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+        const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
+        const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
+        expect(write.mock.calls).toEqual([[target, chunk]]);
+        expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+        expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs!); });
+        expect(write.mock.calls).toEqual([[target, chunk], [target, chunk]]);
+      }
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+      const undo = screen.getByRole("button", { name: "Undo" });
+      expect(undo).toBeVisible();
+      write.mockClear();
+      fireEvent.click(undo);
+      await flush();
+      expect(write.mock.calls).toEqual([[target, "first part second part "]]);
+    });
+
+    /** Scenario: type by hand between voice writes and clear the prompt. No Undo is offered and the outcome row explains that the text cannot be restored. */
+    it("does not offer clear Undo after keyboard input in the same pane", async () => {
+      const { say, keyboard } = await startPrompt();
+      await say("voice part");
+      await keyboard("hand typed part");
+      await say("another voice part");
+      await say("clear the prompt");
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+      expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+    });
+
+    /** Scenario: clear a prompt after interrupt has ended knowledge of its voice contents. The row admits it cannot be undone and shows no Undo button. */
+    it("does not offer clear Undo for voice text predating interrupt", async () => {
+      const { say } = await startPrompt();
+      await say("voice part");
+      await say("interrupt");
+      await say("clear the prompt");
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+      expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+    });
+
+    /** Scenario: clear a wholly dictated prompt and let its ten-second Undo window elapse. The restoration control disappears without typing anything. */
+    it("expires clear Undo after its existing ten-second window", async () => {
+      const { say, write } = await startPrompt();
+      await say("voice part");
+      await say("clear the prompt");
+      expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
+      write.mockClear();
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_UNDO_WINDOW_MS + 1); });
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+      expect(write).not.toHaveBeenCalled();
+    });
+
+    /** Scenario: clear voice text and close the pane before using Undo. The stale restoration writes nothing and reports that the pane changed. */
+    it("refuses clear Undo after the cleared pane closes", async () => {
+      const { say, write } = await startPrompt();
+      await say("voice part");
+      await say("clear the prompt");
+      const undo = screen.getByRole("button", { name: "Undo" });
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      write.mockClear();
+      fireEvent.click(undo);
+      await flush();
+      expect(write).not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent(/nothing (ran|was sent)|pane.*(closed|changed)|screen.*changed/i);
+    });
   });
 
   /** Scenario: Voice begins visibly off, one press turns it on, and the next press turns it off. */

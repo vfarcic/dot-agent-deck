@@ -1635,7 +1635,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### prompt/voice-keys/002 — The served clear key, pressed as the desktop presses it, empties a REAL interactive Claude prompt.
 - **Layer:** L2 PTY-attached, lane 2.
 - **Agent:** REAL interactive Claude Code on Haiku, set up as in `prompt/voice-keys/001`. Nothing is submitted, so no tokens are spent on a turn.
-- **Asserts:** a draft written on the attach stream appears in Claude's input row; the served clear key is `per_wrapped_row`, so it is pressed 64 times in writes of at most the served `max_presses_per_write` (two writes of 32, 1 s apart — see the section note on why the gap); the input row then holds none of the draft, a word written after it is the input row's whole text, and the agent is still registered and not `crashed`.
+- **Asserts:** a draft written on the attach stream appears in Claude's input row; the served clear key is `per_wrapped_row`, so it is pressed 64 times in writes of at most the served `max_presses_per_write` (two writes of 32, the served `pause_between_writes_ms` — 1 s — apart; see the section note on why the gap); the input row then holds none of the draft, a word written after it is the input row's whole text, and the agent is still registered and not `crashed`.
 - **Does not assert:** Undo of a clear (panel unit tests); a multi-line draft typed with Shift+Enter.
 - **Platform coverage:** mac+linux.
 

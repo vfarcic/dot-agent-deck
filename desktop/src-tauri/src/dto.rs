@@ -534,6 +534,10 @@ pub struct DesktopClearKey {
     pub presses: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one clear, when it takes more
+    /// than one; absent where back-to-back writes work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
 }
 
 /// PRD #1541: the key that deletes one character, and the longest write the
@@ -1522,12 +1526,20 @@ pub(crate) fn map_prompt_keys(
     if keys.clear.max_presses_per_write == Some(0) {
         return None;
     }
+    if keys
+        .clear
+        .pause_between_writes_ms
+        .is_some_and(|pause| pause > PROMPT_KEY_MAX_PAUSE_MS)
+    {
+        return None;
+    }
     Some(DesktopPromptKeys {
         interrupt,
         clear: DesktopClearKey {
             bytes: prompt_key_bytes(&keys.clear.bytes)?,
             presses,
             max_presses_per_write: keys.clear.max_presses_per_write,
+            pause_between_writes_ms: keys.clear.pause_between_writes_ms,
         },
         delete_char: DesktopDeleteCharKey {
             bytes: prompt_key_bytes(&keys.delete_char.bytes)?,
@@ -3304,7 +3316,7 @@ mod tests {
             value["promptKeys"],
             serde_json::json!({
                 "interrupt": [{"bytes": "\u{1b}", "pauseAfterMs": 0}],
-                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "maxPressesPerWrite": 32},
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "maxPressesPerWrite": 32, "pauseBetweenWritesMs": 1000},
                 "deleteChar": {"bytes": "\u{7f}", "maxLiteralWriteChars": 800},
             })
         );
@@ -3323,6 +3335,11 @@ mod tests {
         assert!(
             value["promptKeys"]["clear"]
                 .get("maxPressesPerWrite")
+                .is_none()
+        );
+        assert!(
+            value["promptKeys"]["clear"]
+                .get("pauseBetweenWritesMs")
                 .is_none()
         );
         assert!(
@@ -3418,6 +3435,10 @@ mod tests {
             (
                 "zero presses per write",
                 Box::new(|k| k.clear.max_presses_per_write = Some(0)),
+            ),
+            (
+                "a long pause between clear writes",
+                Box::new(|k| k.clear.pause_between_writes_ms = Some(60_000)),
             ),
         ];
         for (name, break_it) in cases {

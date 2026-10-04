@@ -34,12 +34,6 @@ const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const PER_WRAPPED_ROW_PRESSES: usize = 64;
 /// What the desktop presses for a `per_line` clear.
 const PER_LINE_PRESSES: usize = 16;
-/// The pause between two capped clear writes. Separate writes are not
-/// separate reads: measured against Claude Code 2.1.289 through this path, two
-/// writes of 32 Ctrl+U sent back to back left the prompt untouched exactly as
-/// one write of 64 does, and so did two 250 ms apart on a box at load 174; two
-/// 1 s apart cleared it. A single write of 32 always did.
-const BETWEEN_CLEAR_WRITES: Duration = Duration::from_secs(1);
 /// How long typed text must sit before Enter: an Enter that arrives in the
 /// same burst as the text is taken as part of a paste and inserts a newline.
 const BEFORE_SUBMIT: Duration = Duration::from_millis(750);
@@ -97,7 +91,12 @@ impl PaneWriter {
     }
 
     /// The clear key, pressed as many times as the desktop presses it for the
-    /// key's rule, in writes no larger than the key allows.
+    /// key's rule, in writes no larger than the key allows and the served
+    /// pause apart. Separate writes are not separate reads: measured against
+    /// Claude Code 2.1.289 through this path, two writes of 32 Ctrl+U sent back
+    /// to back left the prompt untouched exactly as one write of 64 does, and
+    /// so did two 250 ms apart on a box at load 174; two 1 s apart cleared it.
+    /// That is why the deck serves the pause rather than each sender guessing.
     fn clear(&mut self, keys: &PromptKeys) -> usize {
         let presses = match keys.clear.presses {
             ClearPresses::PerWrappedRow => PER_WRAPPED_ROW_PRESSES,
@@ -116,11 +115,10 @@ impl PaneWriter {
             left -= now;
         }
         let writes = chunks.len();
-        self.input.write_steps(
-            chunks
-                .iter()
-                .map(|chunk| (chunk.as_str(), BETWEEN_CLEAR_WRITES)),
-        );
+        let between =
+            Duration::from_millis(u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0)));
+        self.input
+            .write_steps(chunks.iter().map(|chunk| (chunk.as_str(), between)));
         writes
     }
 }
@@ -371,6 +369,11 @@ fn prompt_voice_keys_002_clear_empties_a_live_claude_prompt() {
         writes, 2,
         "64 presses in writes of at most {:?}",
         claude.keys.clear.max_presses_per_write
+    );
+    assert_eq!(
+        claude.keys.clear.pause_between_writes_ms,
+        Some(1000),
+        "the deck serves the gap Claude needs between two clear writes"
     );
     claude
         .deck

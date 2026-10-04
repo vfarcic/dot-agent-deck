@@ -245,6 +245,12 @@ pub struct ClearKey {
     /// 32. Codex, OpenCode and Pi took 300 in one write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_presses_per_write: Option<u32>,
+    /// How long to wait between two writes of one clear, in milliseconds;
+    /// `None` where back-to-back writes were measured to work. Claude Code
+    /// reads two 32-press writes sent back to back as ONE read of 64, which it
+    /// ignores whole like a single write of 64, so its writes are 1 s apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_between_writes_ms: Option<u32>,
 }
 
 /// What one [`ClearKey`] press removes.
@@ -562,6 +568,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
             bytes: Cow::Borrowed(CTRL_U),
             presses: ClearPresses::PerWrappedRow,
             max_presses_per_write: Some(32),
+            pause_between_writes_ms: Some(1000),
         },
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
@@ -597,6 +604,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
             bytes: Cow::Borrowed(CTRL_U),
             presses: ClearPresses::PerLine,
             max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
@@ -629,6 +637,7 @@ pub static PI: AgentSpec = AgentSpec {
             bytes: Cow::Borrowed(CTRL_U),
             presses: ClearPresses::PerLine,
             max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
@@ -676,6 +685,7 @@ pub static CODEX: AgentSpec = AgentSpec {
             bytes: Cow::Borrowed(CTRL_U),
             presses: ClearPresses::PerLine,
             max_presses_per_write: None,
+            pause_between_writes_ms: None,
         },
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
@@ -1109,6 +1119,7 @@ mod tests {
         assert_eq!(claude.clear.bytes, "\x15");
         assert_eq!(claude.clear.presses, ClearPresses::PerWrappedRow);
         assert_eq!(claude.clear.max_presses_per_write, Some(32));
+        assert_eq!(claude.clear.pause_between_writes_ms, Some(1000));
         assert_eq!(claude.delete_char.bytes, "\x7f");
         assert_eq!(claude.delete_char.max_literal_write_chars, Some(800));
 
@@ -1117,6 +1128,7 @@ mod tests {
         assert_eq!(codex.clear.bytes, "\x15");
         assert_eq!(codex.clear.presses, ClearPresses::PerLine);
         assert_eq!(codex.clear.max_presses_per_write, None);
+        assert_eq!(codex.clear.pause_between_writes_ms, None);
         assert_eq!(codex.delete_char.bytes, "\x7f");
         assert_eq!(codex.delete_char.max_literal_write_chars, Some(1000));
 
@@ -1129,6 +1141,7 @@ mod tests {
         assert_eq!(opencode.clear.bytes, "\x15");
         assert_eq!(opencode.clear.presses, ClearPresses::PerLine);
         assert_eq!(opencode.clear.max_presses_per_write, None);
+        assert_eq!(opencode.clear.pause_between_writes_ms, None);
         assert_eq!(opencode.delete_char.bytes, "\x7f");
         assert_eq!(opencode.delete_char.max_literal_write_chars, None);
 
@@ -1137,6 +1150,7 @@ mod tests {
         assert_eq!(pi.clear.bytes, "\x15");
         assert_eq!(pi.clear.presses, ClearPresses::PerLine);
         assert_eq!(pi.clear.max_presses_per_write, None);
+        assert_eq!(pi.clear.pause_between_writes_ms, None);
         assert_eq!(pi.delete_char.bytes, "\x7f");
         assert_eq!(pi.delete_char.max_literal_write_chars, None);
     }
@@ -1201,7 +1215,7 @@ mod tests {
             value,
             serde_json::json!({
                 "interrupt": [{"bytes": "\u{1b}", "pause_after_ms": 0}],
-                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "max_presses_per_write": 32},
+                "clear": {"bytes": "\u{15}", "presses": "per_wrapped_row", "max_presses_per_write": 32, "pause_between_writes_ms": 1000},
                 "delete_char": {"bytes": "\u{7f}", "max_literal_write_chars": 800},
             })
         );
@@ -1210,6 +1224,7 @@ mod tests {
 
         let pi = serde_json::to_value(keys(AgentType::Pi)).expect("serializes");
         assert!(pi["clear"].get("max_presses_per_write").is_none());
+        assert!(pi["clear"].get("pause_between_writes_ms").is_none());
         assert!(pi["delete_char"].get("max_literal_write_chars").is_none());
     }
 
