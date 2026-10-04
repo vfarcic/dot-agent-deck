@@ -225,6 +225,7 @@ fn orchestration_work_done_010_feedback_wait_does_not_stall_daemon() {
     let start = Instant::now();
     let event = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["agent-event", "--type", "running"])
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env(
             "DOT_AGENT_DECK_PANE_ID",
@@ -387,6 +388,7 @@ fn orchestration_delegate_040_cap_delivers_instead_of_dropping_pointer() {
     };
     let event = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["agent-event", "--type", "running"])
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
         .env(
             "DOT_AGENT_DECK_PANE_ID",

@@ -68,10 +68,11 @@ const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task
 const STUBBORN_WORKER_ARMED: &[u8] = b"STUBBORN-WORKER-ARMED";
 
 fn config(worker_command: &str) -> String {
+    let worker_command = common::capability_export_command(worker_command);
     format!(
         "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
          [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
-         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"{worker_command}\"\nclear = true\n"
+         [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = {worker_command:?}\nclear = true\n"
     )
 }
 
@@ -365,7 +366,7 @@ async fn wait_for_replacement_agent(
     }
 }
 
-fn session_start(pane_id: &str, agent_id: &str) -> String {
+async fn session_start(cwd: &std::path::Path, pane_id: &str, agent_id: &str) -> String {
     let event = AgentEvent {
         session_id: format!("session-{agent_id}"),
         agent_type: AgentType::None,
@@ -382,7 +383,13 @@ fn session_start(pane_id: &str, agent_id: &str) -> String {
         schema_version: None,
         live_target: None,
     };
-    serde_json::to_string(&event).expect("serialize synthetic SessionStart")
+    dot_agent_deck::event::agent_event_line(
+        &event,
+        common::recorded_hook_capability(cwd, agent_id)
+            .await
+            .as_deref(),
+    )
+    .expect("serialize synthetic SessionStart")
 }
 
 struct Fixture {
@@ -638,7 +645,7 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // agent's hook exactly as the rest of the fast delegate suite does.
     common::write_hook_line(
         &fx.daemon.hook_path,
-        &session_start(WORKER_PANE, &replacement),
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
@@ -1171,7 +1178,7 @@ async fn delegate_032_a_delegate_inside_the_pre_close_window_leaves_the_record_a
     // agent's hook exactly as the rest of the fast delegate suite does.
     common::write_hook_line(
         &fx.daemon.hook_path,
-        &session_start(WORKER_PANE, &replacement),
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
@@ -1267,7 +1274,7 @@ async fn delegate_033_a_close_that_outruns_the_settle_timeout_still_brings_the_r
 
     common::write_hook_line(
         &fx.daemon.hook_path,
-        &session_start(WORKER_PANE, &replacement),
+        &session_start(std::path::Path::new(&fx.cwd), WORKER_PANE, &replacement).await,
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
@@ -1795,7 +1802,12 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     .expect("the dispatched worker must be replaced by the clear=true delegate");
     common::write_hook_line(
         &daemon.hook_path,
-        &session_start(&dispatched_worker, &dispatched_replacement),
+        &session_start(
+            dispatch_dir.path(),
+            &dispatched_worker,
+            &dispatched_replacement,
+        )
+        .await,
     )
     .expect("deliver the dispatched replacement's SessionStart");
 
@@ -1810,7 +1822,12 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     .expect("the StartAgent-path worker must be replaced by the clear=true delegate");
     common::write_hook_line(
         &control.daemon.hook_path,
-        &session_start(WORKER_PANE, &control_replacement),
+        &session_start(
+            std::path::Path::new(&control.cwd),
+            WORKER_PANE,
+            &control_replacement,
+        )
+        .await,
     )
     .expect("deliver the control replacement's SessionStart");
 

@@ -728,9 +728,9 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/agent-event/003 — A Pi pane reports running/waiting/finished HEADLESS/UNATTENDED via `agent-event` against the real `daemon serve`, with NO hook installed and no `~/.claude/settings.json` mutation (PRD #201 M2.2).
-- **Layer:** L2 (headless `daemon serve` via the `DaemonProc` harness — no PTY, no attached TUI; spawns the real binary, so the `e2e` tier). The Pi extension is stood in for by the real `dot-agent-deck agent-event --type <state>` CLI subprocess; status is observed via an unattended `SubscribeEvents` consumer and the badge derived locally through `AppState::apply_event` (the same seam the production TUI subscriber uses). Hits no LLM.
-- **Agent:** synthetic (the `agent-event` CLI reporting `AgentType::Pi` from a pane carrying the daemon's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID`).
-- **Asserts:** each `agent-event --type running|waiting|finished` exits 0 and is re-broadcast by the daemon as a bare `AgentEvent` carrying the Pi identity + injected ids + the mapped `EventType`; fed through `AppState::apply_event` the unattended badge moves `Thinking` → `WaitingForInput` → `Idle`; and a seeded sentinel `~/.claude/settings.json` (whose presence makes the hook-install guard pass) is byte-for-byte unchanged afterward and never gains a `dot-agent-deck` hook entry — proving the daemon/agent-event path installs no Claude hook.
+- **Layer:** L2 (headless `daemon serve` via the `DaemonProc` harness — no attached TUI; spawns the real binary, so the `e2e` tier). The Pi pane is a stand-in the daemon spawns itself, which runs the real `dot-agent-deck agent-event --type <state>` CLI from inside the pane for each state typed into it, so each report presents the pane's hook capability token (issue #318) as a real Pi pane's does; status is observed via an unattended `SubscribeEvents` consumer and the badge derived locally through `AppState::apply_event` (the same seam the production TUI subscriber uses). Hits no LLM.
+- **Agent:** synthetic (a daemon-spawned `sh` loop running the `agent-event` CLI, reporting `AgentType::Pi` with the daemon's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` / `DOT_AGENT_DECK_PANE_CAPABILITY`).
+- **Asserts:** each `agent-event --type running|waiting|finished` sent from inside the pane is re-broadcast by the daemon as a bare, proven (not `daemon_unproven`) `AgentEvent` carrying the Pi identity + injected ids + the mapped `EventType`; fed through `AppState::apply_event` the unattended badge moves `Thinking` → `WaitingForInput` → `Idle`; and a seeded sentinel `~/.claude/settings.json` (whose presence makes the hook-install guard pass) is byte-for-byte unchanged afterward and never gains a `dot-agent-deck` hook entry — proving the daemon/agent-event path installs no Claude hook.
 - **Does not assert:** the real `pi` runtime + bundled extension end to end (real-`pi` e2e, M4.1); the daemon's own internal derived status over the wire (`AgentRecord` carries no status field; the broadcast is the observable).
 - **Platform coverage:** linux (headless daemon-serve harness).
 
@@ -3739,6 +3739,13 @@ without depending on the config struct API.
 - **Why it exists:** #712's delegate failed safe only because the stale pane no longer held an orchestration role; had it still been a live orchestrator, B's task would have been delivered to A's workers with exit 0. GREEN on `main` at `c7ef92f9`: the hook-token provenance gate (#1077) refuses a message whose token was minted for a different pane than the one it names. Verified load-bearing by admitting `Refusal::WrongPane` in `hook_provenance::admits`, which turns it red with `STALE-DELEGATE-EXIT=0`.
 - **Does not assert:** a process whose ENTIRE environment, token included, is a still-live pane's — that process is indistinguishable from the pane's own, which is the same-uid residual `docs/develop/hook-provenance.md` decides to accept; how #712's environment went stale, which was never established.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell role).
+
+##### orchestration/provenance/003 — An outside raw status or SessionStart cannot drive a deck-spawned pane's card (issue #318).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_hook_provenance.rs`).
+- **Agent:** none; shell role commands run the real status CLI inside daemon-spawned panes. Synthetic, deliberately not reel-marked.
+- **Asserts:** the pane's own waiting/running/waiting statuses render Needs Input/Thinking/Needs Input; an outside token-less running CLI and forged SessionStart cannot change or retire that card or reach attach clients; its own later finished event still renders Idle. Uses the shipped enforce policy.
+- **Does not assert:** real-agent hook installation, credential propagation, or resistance to a same-uid sender stealing the capability.
+- **Platform coverage:** mac+linux (Unix PTY and hook socket).
 
 #### orchestration/identity
 

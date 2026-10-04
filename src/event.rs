@@ -534,6 +534,73 @@ pub const DAEMON_PANE_CLOSED_METADATA_KEY: &str = "daemon_pane_closed";
 /// same reason as [`ORCHESTRATION_ORPHANED_METADATA_VALUE`].
 pub const DAEMON_PANE_CLOSED_METADATA_VALUE: &str = "1";
 
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict that a hook event is
+/// UNPROVEN (issues #601, #697): the hook-provenance gate admitted it for a pane
+/// (or a paneless agent) this daemon never issued a hook capability token for,
+/// so it comes from an agent this daemon did not spawn: an outside agent, or
+/// one a previous daemon spawned that survived a restart.
+///
+/// An attached client reads it to file the event's card as an outside agent's
+/// ([`crate::state::AppState::apply_event`]): such a card never makes its pane
+/// one of the client's own (`managed_pane_ids`), and it counts against
+/// [`crate::state::MAX_UNPROVEN_SESSIONS`]. On a pane the client registered
+/// itself it is refused, except that a report also stamped
+/// [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`] or
+/// [`ORCHESTRATION_ORPHANED_METADATA_KEY`] may update the bounded reporting
+/// state (and, with the latter, the badge) of the restart survivor's own card
+/// there, with no structural, per-pane or per-agent write.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only from the gate's
+/// own verdict.
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key and files the card as it always did.
+pub const UNPROVEN_METADATA_KEY: &str = "daemon_unproven";
+
+/// `AgentEvent.metadata` key marking the DAEMON's announcement that it evicted
+/// an unproven card to stay within [`crate::state::MAX_UNPROVEN_SESSIONS`]
+/// (issue #697). Carried on a `SessionEnd` for the evicted session, so an
+/// attached client that holds the card drops it too
+/// ([`crate::state::AppState::apply_event`]).
+///
+/// **Daemon-authoritative**: `ingest_event` REMOVES any incoming value, and the
+/// daemon broadcasts the announcement directly rather than ingesting it.
+///
+/// Additive on the wire: an older client reads it as an ordinary `SessionEnd`
+/// for the evicted session. That removes the same card, but an older client
+/// registered the outside pane as its own when the card was drawn, so it then
+/// restores an empty placeholder card for that pane as it does for any ended
+/// session.
+pub const UNPROVEN_EVICTED_METADATA_KEY: &str = "daemon_unproven_evicted";
+
+/// `AgentEvent.metadata` key carrying the DAEMON's verdict, on an UNPROVEN
+/// report naming a pane, that it holds no live agent on that pane (issue #318,
+/// round 3). Decided under the daemon's state lock, at the same point as
+/// [`ORCHESTRATION_ORPHANED_METADATA_KEY`], whose "no live agent" half it is
+/// without the role-pane half.
+///
+/// It is what lets a client that stayed attached across a daemon restart keep
+/// a PLAIN pane's restart survivor reporting: the new daemon never issued that
+/// pane a token, so its reports arrive unproven, and a client refuses an
+/// unproven report on a pane it registered. A report carrying this marker may
+/// update the bounded reporting state of the ONE card the client holds on that
+/// pane, and only when it names that card's agent
+/// ([`crate::state::AppState::apply_event`]); it confers nothing else, and the
+/// orphan badge still needs [`ORCHESTRATION_ORPHANED_METADATA_KEY`].
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only on a report it
+/// also marks [`UNPROVEN_METADATA_KEY`].
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key.
+pub const DAEMON_NO_LIVE_AGENT_METADATA_KEY: &str = "daemon_no_live_agent";
+
+/// The value of [`UNPROVEN_METADATA_KEY`], [`UNPROVEN_EVICTED_METADATA_KEY`]
+/// and [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`] meaning "yes".
+pub const UNPROVEN_METADATA_VALUE: &str = "1";
+
 /// `AgentEvent.metadata` key carrying the DAEMON's verdict on which generation
 /// of its pane a frame comes from (issue #320) — see [`GenerationVerdict`].
 ///
@@ -1054,6 +1121,35 @@ impl AgentEvent {
                 .is_some_and(|v| v == DAEMON_PANE_CLOSED_METADATA_VALUE)
     }
 
+    /// Issue #601: does this event carry the daemon's UNPROVEN marker (see
+    /// [`UNPROVEN_METADATA_KEY`])? `false` for every event without it, which
+    /// includes every event an older daemon relays.
+    pub fn is_unproven(&self) -> bool {
+        self.metadata
+            .get(UNPROVEN_METADATA_KEY)
+            .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
+    /// Issue #318: does this unproven event carry the daemon's verdict that it
+    /// holds no live agent on the event's pane (see
+    /// [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`])? `false` for every event without
+    /// it, which includes every event an older daemon relays.
+    pub fn is_daemon_no_live_agent(&self) -> bool {
+        self.metadata
+            .get(DAEMON_NO_LIVE_AGENT_METADATA_KEY)
+            .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
+    /// Issue #697: is this the daemon's announcement that it evicted an
+    /// unproven card (see [`UNPROVEN_EVICTED_METADATA_KEY`])?
+    pub fn is_unproven_eviction(&self) -> bool {
+        self.event_type == EventType::SessionEnd
+            && self
+                .metadata
+                .get(UNPROVEN_EVICTED_METADATA_KEY)
+                .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
     /// Issue #770: does this event carry the daemon's ORPHANED-ROLE marker (see
     /// [`ORCHESTRATION_ORPHANED_METADATA_KEY`])? `false` for every event
     /// without it, which is every event an older daemon relays and every event
@@ -1229,7 +1325,43 @@ impl AgentEvent {
                 .contains_key(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
+            || self.is_unproven_eviction()
     }
+}
+
+/// Issue #318: the hook capability token a raw [`AgentEvent`] line presents.
+///
+/// The token rides the same JSON object as the event under the key `token`, the
+/// name every [`DaemonMessage`] verb uses, but it is deliberately NOT a field of
+/// [`AgentEvent`]: the daemon reads it off the line with this struct and the
+/// event it keeps, journals and broadcasts never carries it, so no fan-out path
+/// has to remember to strip a capability. Every other key is ignored.
+#[derive(Debug, Default, Deserialize)]
+pub struct PresentedToken {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Issue #318: serialize `event` as the one-line JSON a producer writes to the
+/// hook socket, with `token` added when there is one.
+///
+/// With `None` the output is exactly `serde_json::to_string(event)`, so a
+/// producer without a token emits the bytes it always did and an older daemon
+/// receives nothing new. With a token, the key is added beside the event's own
+/// keys; an older daemon ignores it because [`AgentEvent`] does not deny
+/// unknown fields.
+pub fn agent_event_line(event: &AgentEvent, token: Option<&str>) -> serde_json::Result<String> {
+    let Some(token) = token else {
+        return serde_json::to_string(event);
+    };
+    let mut value = serde_json::to_value(event)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "token".to_string(),
+            serde_json::Value::String(token.to_string()),
+        );
+    }
+    serde_json::to_string(&value)
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.

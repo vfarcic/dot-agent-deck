@@ -371,7 +371,11 @@ fn spawn_005_delivery_gated_on_session_start() {
     std::fs::create_dir_all(&work).expect("create work dir");
 
     let toml = task_block("gated", &work.to_string_lossy(), Some("cat"));
-    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&toml),
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
 
     daemon.run_now("gated").expect("run-now gated");
 
@@ -523,7 +527,12 @@ fn spawn_007_scheduler_agent_event_joins_registry_record() {
     let work = scratch.path().join("status-join");
     std::fs::create_dir_all(&work).expect("create scheduled status-join working dir");
     let schedules = task_block("status-join", &work.to_string_lossy(), Some("cat"));
-    let daemon = common::spawn_daemon_serve(Some(&schedules), "0");
+    // This CLI is an outside sender impersonating the scheduled pane.
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&schedules),
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
 
     daemon
         .run_now("status-join")

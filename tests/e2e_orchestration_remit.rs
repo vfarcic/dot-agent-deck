@@ -449,6 +449,7 @@ payload = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "pane_id": pane,
     "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "token": os.environ.get("DOT_AGENT_DECK_PANE_CAPABILITY"),
     "live_target": {
         "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
         "writable": os.environ["WRITABLE"],
@@ -476,6 +477,7 @@ payload = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "pane_id": pane,
     "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "token": os.environ.get("DOT_AGENT_DECK_PANE_CAPABILITY"),
     "user_prompt": os.environ["SUBMITTED"],
 }
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -874,7 +876,9 @@ fn open_and_confirm_initial_delivery(
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
 
     inject_compacting(
@@ -914,7 +918,9 @@ fn orchestration_remit_001_start_role_compaction_reasserts_remit() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, orch_pane_id, orch_agent_id, log, baseline) =
         open_and_confirm_initial_delivery(&deck);
 
@@ -982,7 +988,9 @@ fn orchestration_remit_002_non_start_role_compaction_reasserts_nothing() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
 
     std::fs::write(deck.workdir().join("go-history-only"), "")
@@ -1090,7 +1098,9 @@ fn orchestration_remit_003_reassertion_waits_for_confirmed_delivery() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_004_start_role_clear_reasserts_remit() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
 
     // Arm the exactly-once detector BEFORE the trigger (see
@@ -1205,7 +1215,9 @@ fn orchestration_remit_004_start_role_clear_reasserts_remit() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, orch_pane_id, orch_agent_id, log, baseline) =
         open_and_confirm_initial_delivery(&deck);
 
@@ -1289,7 +1301,9 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     let (socket, pane_id, agent_id, log, baseline) = open_and_confirm_initial_delivery(&deck);
 
     inject_clear_session_start(
@@ -1338,7 +1352,9 @@ const CARRY_OUT_TASK_POINTER: &str = "Then carry out that task";
 #[test]
 #[cfg(unix)]
 fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() {
-    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .launch_with_fixture("remit-reassert-orchestration");
     // `_baseline` unused here alone: this test counts [`CARRY_OUT_TASK_POINTER`],
     // a needle the spawn-time delivery never writes — so a replacement payload
     // retry of that delivery cannot inflate it and there is nothing to count
@@ -1646,7 +1662,11 @@ struct RearmedRun {
 
 #[cfg(unix)]
 fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun {
-    let daemon = common::spawn_daemon_serve_with_env(None, "0", &[]);
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")],
+    );
     let project = common::harness_tempdir().expect("create hydrated orchestration project");
     std::fs::write(
         project.path().join(".dot-agent-deck.toml"),

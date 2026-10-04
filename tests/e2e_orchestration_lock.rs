@@ -423,6 +423,7 @@ fn lock_011_waiting_carve_out_on_real_panes() {
     const WORKER_RELOCKED_SENTINEL: &str = "LOCK011_RELOCKED_e814";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .with_pty_size(120, 40)
         .launch_with_fixture("orch-deck");

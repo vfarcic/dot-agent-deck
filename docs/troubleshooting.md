@@ -340,6 +340,18 @@ DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck
 
 An accepted `work-done` or `dispatch` means the daemon admitted the message, not that the work behind it succeeded.
 
+### An agent's card stops updating, and the daemon log says `refused a status event`
+
+An agent the deck started keeps working in its pane, but its card stays on an old status, and the daemon's log ([Enabling Debug Logs](#enabling-debug-logs) says how to turn it on) has a line like:
+
+```text
+hook socket: refused a status event whose hook capability token does not attest the pane it names … reason="missing_token"
+```
+
+The status updates that drive a card carry the same token as the commands in the entry above, and the daemon refuses an update that names a pane it started without that pane's token. The reasons and fixes are the ones in that table: `missing_token` almost always means the `dot-agent-deck` on the pane's `PATH` is older than the daemon, so [recycle the daemon](#recycling-the-daemon) from the binary on your `PATH`, or start the daemon with `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` to accept the updates with a warning. `token_names_another_agent` means the update carried this pane's token but named a different agent than the one the deck started there; run the agent with the environment the deck gave it. `token_generation_replaced` means the update named no agent and carried the token of an agent the deck has since replaced in that pane, usually a leftover process of the previous agent that is still running; the card keeps following the current agent, and stopping the leftover process ends the log lines.
+
+Agents you start yourself, outside the deck, need no token: their updates are accepted and they get a card of their own.
+
 ### An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
 
 An orchestrator that has been delegating cannot any more. Its `dot-agent-deck delegate` fails with:

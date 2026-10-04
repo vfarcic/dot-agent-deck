@@ -159,6 +159,7 @@ fn focus_007_lock_governed_focus_contract_on_real_binary() {
     const BETA_STICK_SENTINEL: &str = "FOCUS007_BETA_STICK_6d4e";
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(160, 45)
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("orch-focus-lifecycle");

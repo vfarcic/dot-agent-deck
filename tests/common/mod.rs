@@ -7493,6 +7493,12 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
 
 use std::sync::OnceLock;
 
+#[cfg(unix)]
+mod hook_capability;
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use hook_capability::{capability_export_command, recorded_hook_capability};
+
 #[allow(dead_code)]
 static LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -9761,6 +9767,9 @@ impl DaemonProc {
             cmd.env(k, v);
         }
         cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
+        // This helper sends from outside the pane. Never replay an ambient
+        // capability belonging to the pane running the test suite.
+        cmd.env_remove("DOT_AGENT_DECK_PANE_CAPABILITY");
         if let Some(id) = agent_id {
             cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
         }

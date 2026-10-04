@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{DaemonProc, TuiDeck, spawn_daemon_serve, write_hook_line};
+use common::{DaemonProc, TuiDeck, spawn_daemon_serve_with_env, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::state::SessionStatus;
@@ -33,7 +33,8 @@ use std::time::Duration;
 #[spec("hooks/delivery/007")]
 #[test]
 fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
 
     // Start a shell agent whose command yields no inferable `AgentType`
     // (`from_command("/bin/sh") == None`), tagged with a known pane id so the
@@ -129,7 +130,8 @@ fn launch_tui_against(daemon: &DaemonProc) -> TuiDeck {
 #[spec("session/live/006")]
 #[test]
 fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
 
     // A shell agent with no inferable type (`from_command("sh …") == None`),
     // tagged with a known pane id and a distinctive display name.
@@ -274,7 +276,8 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     const PANE_ID: &str = "pane-agent-event-reconnect";
     const LABEL: &str = "agent-event-reconnect-42";
 
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some("sh -c 'sleep 600'".into()),

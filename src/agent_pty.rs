@@ -3380,6 +3380,17 @@ impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
     fn pane_was_issued_a_hook_token(&self, pane_id: &str) -> bool {
         AgentPtyRegistry::pane_was_issued_a_hook_token(self, pane_id)
     }
+
+    fn paneless_agent_was_issued_a_hook_token(&self, agent_id: &str) -> bool {
+        AgentPtyRegistry::paneless_agent_was_issued_a_hook_token(self, agent_id)
+    }
+
+    fn token_owner_speaks_for_pane(&self, agent_id: &str, pane_id: &str) -> bool {
+        // The generation rule a tagged event is judged by (#1510): a lone
+        // retiree still speaks for its pane, a replaced generation does not.
+        // A registry that cannot answer is not evidence that it does.
+        self.generation_ownership(Some(pane_id), Some(agent_id)) == crate::state::Ownership::Owned
+    }
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -6514,6 +6525,16 @@ struct RegistryInner {
     /// pathname. Unix-only, like the prepared start that fills it.
     #[cfg(unix)]
     prepared_pane_dirs: HashMap<String, crate::prep_token::InodeIdentity>,
+    /// Issue #318: the paneless half of [`Self::hook_token_panes`] — the
+    /// registry id of every spawn this daemon minted a token for WITHOUT a pane
+    /// id. Read by [`AgentPtyRegistry::paneless_agent_was_issued_a_hook_token`]
+    /// so a paneless hook event naming one of these agents is held to the token
+    /// check rather than read as an outside agent's.
+    ///
+    /// Never pruned, for the same reason: registry ids are never reused within
+    /// a daemon, so an entry can only ever be true, and forgetting one would
+    /// re-open the forgery window that set exists to close.
+    hook_token_paneless_agents: HashSet<String>,
     /// Issue #320 — per pane id, the agent ids of every generation this
     /// registry has PUBLISHED on it.
     ///
@@ -6932,6 +6953,7 @@ impl AgentPtyRegistry {
                 hook_token_panes: HashSet::new(),
                 #[cfg(unix)]
                 prepared_pane_dirs: HashMap::new(),
+                hook_token_paneless_agents: HashSet::new(),
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
@@ -10077,6 +10099,10 @@ impl AgentPtyRegistry {
             // because nothing legitimate signals for a pane with no process.
             if let Some(ref pane) = pane_id_env {
                 inner.hook_token_panes.insert(pane.clone());
+            } else {
+                // Issue #318: the paneless counterpart, keyed by the id the
+                // spawn will carry. See `RegistryInner::hook_token_paneless_agents`.
+                inner.hook_token_paneless_agents.insert(id.clone());
             }
             // Issue #1396 item 3: bind the pane to the directory its prepared
             // start verified, under the same lock and before the fork, for the
@@ -14682,6 +14708,55 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// Issue #318 (round-2 audit finding 4): [`Self::set_agent_type`] for a
+    /// hook event, written onto the record of the GENERATION that sent it
+    /// rather than onto whichever record a pane scan meets first.
+    ///
+    /// `agent_id` is that generation — the agent the event's token was minted
+    /// for, else the one it names. It is written only while that generation
+    /// still speaks for `pane_id_env` (the rule [`Self::generation_ownership`]
+    /// applies), checked under the same lock as the write. With no generation
+    /// at all (a token-less report admitted under the `warn` provenance
+    /// policy), the pane's one generation that speaks for it is written, and
+    /// nothing when there is none or more than one. A replaced generation and
+    /// its successor are both records on the pane, and `agents` is a `HashMap`,
+    /// so the old pane scan typed the successor from the predecessor's report
+    /// on an arbitrary share of runs.
+    pub fn set_agent_type_for_generation(
+        &self,
+        pane_id_env: &str,
+        agent_id: Option<&str>,
+        agent_type: &AgentType,
+    ) {
+        if *agent_type == AgentType::None || pane_id_env.is_empty() {
+            return;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let speaks = |inner: &RegistryInner, id: &str| {
+            inner.agents.get(id).is_some_and(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env)
+                    && Self::generation_speaks_for_pane(inner, id, a, pane_id_env)
+            })
+        };
+        let target = match agent_id {
+            Some(id) => speaks(&inner, id).then(|| id.to_string()),
+            None => {
+                let mut speakers = inner.agents.keys().filter(|id| speaks(&inner, id));
+                match (speakers.next(), speakers.next()) {
+                    (Some(id), None) => Some(id.clone()),
+                    _ => None,
+                }
+            }
+        };
+        if let Some(agent) = target.and_then(|id| inner.agents.get_mut(&id))
+            && agent.agent_type.is_none()
+        {
+            agent.agent_type = Some(agent_type.clone());
+        }
+    }
+
     pub fn set_agent_type(&self, pane_id_env: &str, agent_type: &AgentType) {
         if *agent_type == AgentType::None || pane_id_env.is_empty() {
             return;
@@ -14890,6 +14965,18 @@ impl AgentPtyRegistry {
             .unwrap()
             .hook_token_panes
             .contains(pane_id)
+    }
+
+    /// Issue #318: whether this daemon has EVER issued a hook capability token
+    /// to a spawn with no pane id under the registry id `agent_id`. The paneless
+    /// counterpart of [`Self::pane_was_issued_a_hook_token`], read from
+    /// `RegistryInner::hook_token_paneless_agents` for the same reason.
+    pub fn paneless_agent_was_issued_a_hook_token(&self, agent_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .hook_token_paneless_agents
+            .contains(agent_id)
     }
 
     /// Test probe for the NATIVE pull, ignoring identity AND liveness: takes
