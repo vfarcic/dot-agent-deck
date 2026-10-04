@@ -4113,6 +4113,20 @@ fn process_pending_seed_prompts(
             } else {
                 log_prompt_abandoned("seed", &sp.pane_id, &delivery_id, attempts);
             }
+            // Issue #1520 (Qodo on #1553): a seed held at its retry by an
+            // event-stream outage reaches this deadline instead of the stop
+            // below, so it says the same thing here rather than vanishing.
+            if deliveries.get(&sp.pane_id).is_some_and(|delivery| {
+                delivery_may_have_written(delivery)
+                    && (snapshot.event_stream_down()
+                        || delivery_outlived_event_gap(snapshot, delivery))
+            }) {
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+            }
             backoff.remove(&sp.pane_id);
             deliveries.remove(&sp.pane_id);
             return false;
@@ -4196,10 +4210,15 @@ fn process_pending_seed_prompts(
             // down nothing can confirm it, so it is held rather than stopped
             // (Qodo on #1553); the deadline above still bounds the hold. See
             // [`delivery_outlived_event_gap`].
+            //
+            // The hold covers any delivery that may have written, not only one
+            // that outlived a gap: a first write made during an outage stamps
+            // the gap count it was made under, and its retry must wait for the
+            // stream as well (Qodo on #1553).
+            if delivery_may_have_written(delivery) && snapshot.event_stream_down() {
+                return true;
+            }
             if delivery_outlived_event_gap(snapshot, delivery) {
-                if snapshot.event_stream_down() {
-                    return true;
-                }
                 log_prompt_stopped("seed", &sp.pane_id, &delivery_id, "event-stream-gap");
                 feedback = Some(
                     "Seed prompt not confirmed (lost contact with the agent's events); \
@@ -5588,12 +5607,17 @@ fn deliver_orchestrator_prompt(
     }
     // Issue #1520: see the seed path's twin — at the write, held while the
     // stream is down — and [`delivery_outlived_event_gap`].
+    if ui
+        .prompt_delivery
+        .get(start_pane_id.as_str())
+        .is_some_and(delivery_may_have_written)
+        && snapshot.event_stream_down()
+    {
+        return;
+    }
     if let Some(delivery) = ui.prompt_delivery.get(start_pane_id.as_str())
         && delivery_outlived_event_gap(snapshot, delivery)
     {
-        if snapshot.event_stream_down() {
-            return;
-        }
         let delivery_id = delivery.delivery_id.clone();
         log_prompt_stopped(
             "orchestrator",
@@ -38792,6 +38816,83 @@ mod tests {
             race_delivered,
             "control: once the TUI observes the start itself, the seed binds it and is delivered"
         );
+    }
+
+    /// Issue #1520 (Qodo on #1553): an event-stream OUTAGE holds a seed that may
+    /// have written, however its stamp relates to the gap. A first write made
+    /// while the stream is already down is held at its retry too; and a seed
+    /// held until the delivery deadline says why it stopped instead of vanishing.
+    #[test]
+    fn a_seed_that_may_have_written_is_held_through_an_event_stream_outage() {
+        const PROMPT: &str = "seed written during an outage";
+
+        // The stream is already down when the fallback writes.
+        let pane_id = "written-during-outage-pane";
+        let agent_id = format!("{pane_id}-agent");
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(aged_seed_prompt(pane_id, PROMPT));
+        let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+        snapshot.note_event_stream_gap();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "precondition: a first write is not held by an outage"
+        );
+        apply_generation_event(
+            &mut snapshot,
+            pane_id,
+            &agent_id,
+            &announced_generation(pane_id),
+            EventType::SessionStart,
+        );
+        ui.send_retry_backoff
+            .get_mut(pane_id)
+            .expect("an unconfirmed write arms retry")
+            .next_attempt_at = std::time::Instant::now();
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(
+            writes.lock().unwrap().len(),
+            1,
+            "a retry due while the stream is still down must wait for it, even when the \
+             write it retries was made during the same outage"
+        );
+        assert!(
+            ui.prompt_delivery.contains_key(pane_id),
+            "held, not stopped"
+        );
+
+        // The outage outlasts the delivery deadline.
+        let pane_id = "outage-past-deadline-pane";
+        let agent_id = format!("{pane_id}-agent");
+        let controller = Arc::new(RecordingPaneController::default());
+        let writes = controller.writes.clone();
+        let pane: Arc<dyn PaneController> = controller;
+        let mut ui = default_ui();
+        ui.pending_seed_prompts
+            .push(aged_seed_prompt(pane_id, PROMPT));
+        let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert_eq!(writes.lock().unwrap().len(), 1, "precondition: written");
+        snapshot.note_event_stream_gap();
+        ui.pending_seed_prompts[0].created_at = std::time::Instant::now()
+            .checked_sub(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("a creation instant past the deadline");
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        assert!(
+            !ui.prompt_delivery.contains_key(pane_id),
+            "the deadline still ends a held delivery"
+        );
+        let status = format!("{:?}", ui.status_message);
+        assert!(
+            status.contains("lost contact with the agent's events"),
+            "a seed the outage held to its deadline must say why it stopped; status={status}"
+        );
+        assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
     }
 
     /// Issue #1520 (Qodo on #1553): which deliveries an event-stream gap stops.
