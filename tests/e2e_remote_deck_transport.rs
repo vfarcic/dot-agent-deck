@@ -807,11 +807,23 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
          built to avoid"
     );
     // The ssh child is this test process's own child, and Drop reaps it before
-    // returning. A zombie still accepts `kill(pid, 0)`, so only `ESRCH` shows
-    // the reap happened rather than just the exit.
-    // SAFETY: kill(pid, 0) only probes existence/permission.
-    let probe = unsafe { libc::kill(ssh_pid as libc::pid_t, 0) };
-    let reaped = probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // returning. `waitid` sees only this process's children, alive or zombie,
+    // so `ECHILD` shows the reap happened rather than just the exit, and an
+    // unrelated process that has since reused the pid cannot answer for it.
+    // `WNOWAIT` leaves a zombie unreaped, so the probe cannot do Drop's job.
+    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter; WNOHANG|WNOWAIT
+    // neither blocks nor reaps.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let probe = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            ssh_pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    let reaped =
+        probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
     assert!(
         reaped,
         "`EndpointConnection`'s Drop must also reap the ssh child (pid \
