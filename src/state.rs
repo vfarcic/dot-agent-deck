@@ -1757,6 +1757,11 @@ pub struct AppState {
     /// any per-pane map to bump. Only the TUI's subscriber bumps it; the daemon's
     /// own state consumes its events in-process and stays at 0. In memory only.
     event_stream_gaps: u64,
+    /// Issue #1520: whether the event stream is down right now — set by
+    /// [`Self::note_event_stream_gap`] and cleared by a successful
+    /// [`Self::resync_after_event_gap`]. A delivery's retry waits while it is
+    /// set, because no confirmation can reach this state until it clears.
+    event_stream_down: bool,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -11132,6 +11137,13 @@ impl AppState {
     /// [`Self::event_stream_gaps`].
     pub fn note_event_stream_gap(&mut self) {
         self.event_stream_gaps = self.event_stream_gaps.saturating_add(1);
+        self.event_stream_down = true;
+    }
+
+    /// Issue #1520: whether the event stream is down right now; see the
+    /// `event_stream_down` field.
+    pub fn event_stream_down(&self) -> bool {
+        self.event_stream_down
     }
 
     /// Issue #1520: bring this state back into agreement with the daemon after
@@ -11178,6 +11190,7 @@ impl AppState {
     /// daemon if that is not the pane's.
     pub fn resync_after_event_gap(&mut self, records: &[crate::agent_pty::AgentRecord]) {
         self.note_event_stream_gap();
+        self.event_stream_down = false;
         // Whether THIS daemon reports pane generations at all. The field shipped
         // in v0.45.1, and an older daemon omits it for a pane that has one, so a
         // missing value is proof of "no generation" only from a daemon that is

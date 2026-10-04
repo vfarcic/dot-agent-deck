@@ -4079,29 +4079,6 @@ fn process_pending_seed_prompts(
                 }
                 None => {}
             }
-            // Issue #1520: the event stream broke after this delivery may have
-            // written, and no confirmation is on record, so a retry would act
-            // on a history with a hole in it. Placed AFTER the target check,
-            // which the resync's closure count still feeds, and after the
-            // confirmation, which a submission reported before the gap still
-            // satisfies; only the write below is what it stops. See
-            // [`delivery_outlived_event_gap`].
-            if delivery_outlived_event_gap(snapshot, delivery) {
-                log_prompt_stopped(
-                    "seed",
-                    &sp.pane_id,
-                    &delivery.delivery_id,
-                    "event-stream-gap",
-                );
-                feedback = Some(
-                    "Seed prompt not confirmed (lost contact with the agent's events); \
-                     not retried"
-                        .to_string(),
-                );
-                backoff.remove(&sp.pane_id);
-                deliveries.remove(&sp.pane_id);
-                return false;
-            }
         }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
         // the readiness/backoff/delivery branches — so it is actually reachable.
@@ -4210,6 +4187,28 @@ fn process_pending_seed_prompts(
             // mode the retry policy exists to avoid.
             if already_written && capability != ConfirmationCapability::Reports {
                 return true;
+            }
+            // Issue #1520: a retry is due, and the event stream broke after an
+            // earlier request may have written. Checked HERE, at the write, and
+            // not on every pass: until a retry is actually due, the confirmation
+            // above can still finalize the delivery, from evidence that arrived
+            // before the gap or on the resumed stream. While the stream is still
+            // down nothing can confirm it, so it is held rather than stopped
+            // (Qodo on #1553); the deadline above still bounds the hold. See
+            // [`delivery_outlived_event_gap`].
+            if delivery_outlived_event_gap(snapshot, delivery) {
+                if snapshot.event_stream_down() {
+                    return true;
+                }
+                log_prompt_stopped("seed", &sp.pane_id, &delivery_id, "event-stream-gap");
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
             }
             // Issue #424 D1: we are past every hold, so this frame WILL write
             // into whatever conversation the pane currently has. Name it before
@@ -4697,14 +4696,16 @@ enum SubmissionEvidence {
 /// submitting them. Retrying could type the task into a successor conversation
 /// or submit it twice; confirming could take a successor's events as evidence.
 ///
-/// So a delivery with no confirmation on record stops, and writes nothing more —
-/// the same terminal outcome a counted closure already gives. Both callers check
-/// this AFTER the target check and the confirmation (Greptile and Qodo on
-/// #1553). A conversation the resync proved ended is still caught first, as a
-/// changed target. A submission the agent reported, whether before the gap or on
-/// the resumed stream, records something that already happened, and confirming
-/// it writes nothing; what this stops is the RETRY, the one step that writes on
-/// the strength of the history. Stopping is chosen over a daemon-side closure
+/// So a delivery with no confirmation on record stops instead of retrying, and
+/// writes nothing more — the same terminal outcome a counted closure already
+/// gives. Both callers check this at the WRITE, past every other hold, and not on
+/// every pass (Greptile and Qodo on #1553): until a retry is due the
+/// confirmation can still finalize the delivery, and a submission the agent
+/// reported, whether before the gap or on the resumed stream, records something
+/// that already happened, so confirming it writes nothing. While the stream is
+/// still down ([`AppState::event_stream_down`]) a due retry is held, since no
+/// confirmation can arrive yet; the deadline bounds that. A conversation the
+/// resync proved ended is caught earlier still, as a changed target. Stopping is chosen over a daemon-side closure
 /// counter
 /// because that needs a new wire field for an event (a broken subscription) that
 /// is rare, while stopping is safe with what the daemon already sends. A
@@ -5470,28 +5471,6 @@ fn deliver_orchestrator_prompt(
             );
             return;
         }
-        // Issue #1520: see the seed path's twin — after the target check and
-        // the confirmation, before anything that could write — and
-        // [`delivery_outlived_event_gap`].
-        if delivery_outlived_event_gap(snapshot, delivery) {
-            log_prompt_stopped(
-                "orchestrator",
-                &start_pane_id,
-                &delivery_id,
-                "event-stream-gap",
-            );
-            abandon_orchestrator_prompt(
-                ui,
-                tab_id,
-                &start_pane_id,
-                orchestrator_prompt,
-                now,
-                "Orchestrator prompt not confirmed (lost contact with the agent's events); \
-                 not retried"
-                    .to_string(),
-            );
-            return;
-        }
     }
 
     // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
@@ -5605,6 +5584,33 @@ fn deliver_orchestrator_prompt(
     // Reviewer finding B3: a prompt already written into a pane whose producer
     // is unknown is HELD, never rewritten — see the seed path's twin gate.
     if attempt > 1 && capability != ConfirmationCapability::Reports {
+        return;
+    }
+    // Issue #1520: see the seed path's twin — at the write, held while the
+    // stream is down — and [`delivery_outlived_event_gap`].
+    if let Some(delivery) = ui.prompt_delivery.get(start_pane_id.as_str())
+        && delivery_outlived_event_gap(snapshot, delivery)
+    {
+        if snapshot.event_stream_down() {
+            return;
+        }
+        let delivery_id = delivery.delivery_id.clone();
+        log_prompt_stopped(
+            "orchestrator",
+            &start_pane_id,
+            &delivery_id,
+            "event-stream-gap",
+        );
+        abandon_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            orchestrator_prompt,
+            now,
+            "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+             not retried"
+                .to_string(),
+        );
         return;
     }
     // Issue #424 D1: past every hold, so this frame WILL write into whatever
@@ -38393,7 +38399,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it, and a seed whose submission the agent reported before the stream broke is taken as delivered rather than reported unconfirmed.
+    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it, and a seed whose submission the agent reported, before the stream broke or on the resumed stream, is taken as delivered rather than reported unconfirmed; while the stream is still down a due retry is held.
     #[spec("prompt/pane-input/047")]
     #[test]
     fn pane_input_047_a_written_seed_stops_after_an_event_stream_gap() {
@@ -38403,14 +38409,24 @@ mod tests {
             Gap,
             Unbroken,
             ConfirmedBeforeGap,
+            ConfirmedOnResumedStream,
         }
-        for case_kind in [Case::Gap, Case::Unbroken, Case::ConfirmedBeforeGap] {
+        for case_kind in [
+            Case::Gap,
+            Case::Unbroken,
+            Case::ConfirmedBeforeGap,
+            Case::ConfirmedOnResumedStream,
+        ] {
             let (case, pane_id) = match case_kind {
                 Case::Gap => ("event-stream gap", "gap-pane"),
                 Case::Unbroken => ("control: unbroken stream", "unbroken-pane"),
                 Case::ConfirmedBeforeGap => {
                     ("confirmed before the gap", "confirmed-before-gap-pane")
                 }
+                Case::ConfirmedOnResumedStream => (
+                    "confirmed on the resumed stream",
+                    "confirmed-on-resumed-stream-pane",
+                ),
             };
             let gap = case_kind != Case::Unbroken;
             let agent_id = format!("{pane_id}-agent");
@@ -38453,8 +38469,29 @@ mod tests {
                 // resubscribing it re-reads the daemon's `ListAgents` reply,
                 // joined as the daemon joins it.
                 snapshot.note_event_stream_gap();
+                if case_kind == Case::ConfirmedOnResumedStream {
+                    // A retry falls due while the subscriber is still backing
+                    // off. Nothing can confirm the seed yet, so it must be HELD:
+                    // neither written again nor stopped.
+                    ui.send_retry_backoff
+                        .get_mut(pane_id)
+                        .expect("an unconfirmed write arms retry")
+                        .next_attempt_at = std::time::Instant::now();
+                    process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+                    assert_eq!(
+                        writes.lock().unwrap().len(),
+                        1,
+                        "{case}: no retry while the stream is down"
+                    );
+                    assert!(
+                        ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the delivery must be held while the stream is down, not \
+                         stopped before the resumed stream can confirm it; status={:?}",
+                        ui.status_message
+                    );
+                }
                 let mut daemon = snapshot.clone();
-                if case_kind == Case::Gap {
+                if matches!(case_kind, Case::Gap | Case::ConfirmedOnResumedStream) {
                     apply_generation_event(
                         &mut daemon,
                         pane_id,
@@ -38476,6 +38513,11 @@ mod tests {
                     Some(genuine.as_str()),
                     "{case}: the resync must leave the TUI on the daemon's conversation"
                 );
+                if case_kind == Case::ConfirmedOnResumedStream {
+                    // The first event on the resumed stream: the agent reports
+                    // submitting the seed.
+                    apply_prompt_confirmation(&mut snapshot, pane_id, &agent_id, PROMPT);
+                }
             } else {
                 apply_generation_event(
                     &mut snapshot,
@@ -38520,7 +38562,7 @@ mod tests {
                          conversation; writes={records:?}"
                     );
                 }
-                Case::ConfirmedBeforeGap => {
+                Case::ConfirmedBeforeGap | Case::ConfirmedOnResumedStream => {
                     assert_eq!(
                         records.len(),
                         1,
@@ -38533,8 +38575,8 @@ mod tests {
                     );
                     assert!(
                         !status.contains("lost contact"),
-                        "{case}: a submission the agent reported before the gap must be \
-                         taken as delivered, not reported as unconfirmed; status={status}"
+                        "{case}: a submission the agent reported must be taken as \
+                         delivered, not reported as unconfirmed; status={status}"
                     );
                 }
             }
