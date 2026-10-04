@@ -1097,6 +1097,16 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // `PrepareOrchestration` has since #1233. The `DispatchSignal` and its reply
     // are unchanged on the wire. What changed is which dispatches are refused.
     "1396-dispatch-refuses-ambiguous-orchestration",
+    // Issue #318, at 10 without moving it -- #1077's shape, extended from the
+    // `DaemonMessage` verbs to raw hook events. A status event naming a pane the
+    // daemon issued a hook capability token for must now present that token;
+    // a newer daemon refuses one that arrives without it, or with a token
+    // issued for another pane or agent, before it reaches any card or any
+    // attached client. `token` is an optional key an older daemon ignores, and
+    // the hook socket is not what PROTOCOL_VERSION versions. What changed is
+    // which events a NEWER daemon refuses, which a version number cannot
+    // express.
+    "318-hook-event-capability-token",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -4696,21 +4706,21 @@ async fn handle_connection(
                     //   Unchanged by round 2 and stated because it is the
                     //   residual;
                     // * the pane was explicitly registered by this process (an
-                    //   orchestration role below, or the auto-registration in
-                    //   the next line). Registration is pane-scoped by design —
-                    //   the registrant is asserting the pane, not a generation.
+                    //   orchestration role below). Registration is pane-scoped
+                    //   by design — the registrant is asserting the pane, not a
+                    //   generation.
                     //
                     // A `SessionStart` is weaker on purpose — `apply_event`
-                    // auto-registers a pane id it names, unless the id is the
-                    // synthetic `__dead-slot__-…` shape or the registry already
-                    // holds a generation for that pane — to cover the TUI
-                    // startup race where the hook beats `register_pane`. So a
-                    // same-uid process CAN mint a card for a pane NOBODY
-                    // spawned by forging one. That is pre-existing, it is not a
-                    // cross-user escalation (both sockets are owner-only and
-                    // an attach peer can already write to agents directly),
-                    // and closing it is tracked separately; it is stated here
-                    // rather than papered over.
+                    // admits one naming a pane id the registry holds no
+                    // generation for, unless the id is the synthetic
+                    // `__dead-slot__-…` shape, so an outside agent still gets a
+                    // card. So a same-uid process CAN mint a card for a pane
+                    // NOBODY spawned by forging one. Since issue #601 that card
+                    // is recorded as UNPROVEN, never in `managed_pane_ids`, so
+                    // it confers no ownership of the pane, and since #697 such
+                    // cards are bounded (`MAX_UNPROVEN_SESSIONS`). A pane this
+                    // daemon DID spawn cannot be named that way at all: the hook
+                    // gate refuses a token-less event for it (#318).
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -4736,6 +4746,9 @@ async fn handle_connection(
                             identity.clone(),
                             cwd_for_state.as_deref(),
                         );
+                        // Issue #697: outside cards the registration dropped
+                        // leave every attached client's view too.
+                        state.announce_unproven_evictions(&event_tx);
                         // Issue #555: the registered pane holds the title from
                         // here on, so this start's in-flight claim ends — under
                         // the same guard, so there is no instant in which
@@ -8062,9 +8075,11 @@ mod tests {
     /// FORGES for a pane it invented cannot witness against a victim agent that
     /// sits on a different pane.
     ///
-    /// The chain this closes, and every step of it is reachable over the
-    /// unauthenticated hook socket: a `SessionStart` for an invented pane id no
-    /// registry claims auto-registers that pane into `managed_pane_ids`
+    /// The chain this closes, as it stood before issue #601 (a daemon now
+    /// records an invented pane as an outside agent's, never in
+    /// `managed_pane_ids`, but the registry check pinned here is what holds in
+    /// every process, so it stays): a `SessionStart` for an invented pane id no
+    /// registry claims auto-registered that pane into `managed_pane_ids`
     /// (`AppState::apply_event`'s startup-race escape hatch); `managed_pane_ids`
     /// is permanent, so the NEXT event for that pane is admitted by the
     /// pane-scoped ground without the generation check looking at who sent it;
@@ -8138,8 +8153,9 @@ mod tests {
             .expect("spawn the victim agent");
 
         // Step 1: the forger establishes a pane nothing owns. This is admitted
-        // (the startup-race hatch) and is the pre-existing shape the fix does
-        // not try to close.
+        // as an outside agent's card (issue #601: recorded as unproven, never
+        // in `managed_pane_ids`) and is the shape the fix does not try to
+        // close.
         state.write().await.apply_event(frame(
             invented_pane,
             "forged-generation",
@@ -8176,11 +8192,14 @@ mod tests {
                  pane's generation — this test is about what it may WITNESS, not about \
                  admission"
             );
+            // Issue #697: the invented pane is an outside agent's, and its
+            // per-pane state is forgotten once its last card is gone — so the
+            // pane-local counter no longer even keeps the forger's own count.
             assert_eq!(
                 guard.pane_generation_closures(invented_pane),
-                1,
-                "precondition: the pane-keyed counter still counts it, on the forger's own \
-                 invented pane, which is where a pane-local poison stays"
+                0,
+                "an outside pane left with no card keeps no per-pane state, so a pane-local \
+                 poison does not stay on it either"
             );
             assert!(
                 !guard.agent_generation_ended(&victim),

@@ -239,7 +239,7 @@ Set these in the daemon's environment (see the start of this section). Milliseco
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` | `30` | The daemon exits this many seconds after it has no attached client, no agents and no pending schedules. `0` keeps it running. A value that is not a whole number uses the default. |
-| `DOT_AGENT_DECK_HOOK_PROVENANCE` | enforce | `warn` (any case) makes the daemon accept, with a warning, a `work-done`/`delegate`/`dispatch` from an agent pane that carries no hook capability token, which happens when the `dot-agent-deck` on the agent's `PATH` is older than the daemon. Any other value keeps refusing. See [Troubleshooting](troubleshooting.md). |
+| `DOT_AGENT_DECK_HOOK_PROVENANCE` | enforce | `warn` (any case) makes the daemon accept, with a warning, a `work-done`/`delegate`/`dispatch` or a status update from an agent pane that carries no hook capability token, which happens when the `dot-agent-deck` on the agent's `PATH` is older than the daemon. Any other value keeps refusing. See [Troubleshooting](troubleshooting.md). |
 | `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` | `1000`, or `5000`/`8000` for some agents | Extra wait between a worker looking ready and its task being typed in. `0` removes the wait; maximum `30000`. See [Orchestration](orchestration.md). |
 | `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS` | `20000,40000,80000` | When a delegated task shows no sign of being received, the waits before re-sending it, comma-separated. Each entry is kept within `100`–`300000`; at most 8 entries are read. `0` or an empty value turns re-sending off; any unparseable entry makes the whole value fall back to the default. |
 | `DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS` | `30000`, or `worker_response_timeout_minutes` if shorter; none when that is `0` | How long a worker that received a task may report nothing at all before its orchestrator is told. `0` turns the report off, and a non-zero value turns it on even when `worker_response_timeout_minutes = 0`; maximum `30000`. See [Idle Workers & Notifications](idle-workers-and-notifications.md). |
@@ -257,7 +257,7 @@ Set these in the daemon's environment (see the start of this section). Milliseco
 
 ### Set by the deck
 
-The deck puts these in each agent's environment; you do not set them. `DOT_AGENT_DECK_PANE_ID` names the pane and `DOT_AGENT_DECK_PANE_CAPABILITY` carries the token that lets that pane's `work-done`, `delegate` and `dispatch` be accepted. Running those commands in a shell the deck did not start (a plain terminal, or a tool that strips the environment) fails because these are missing; see [Orchestration](orchestration.md) and [Troubleshooting](troubleshooting.md).
+The deck puts these in each agent's environment; you do not set them. `DOT_AGENT_DECK_PANE_ID` names the pane and `DOT_AGENT_DECK_PANE_CAPABILITY` carries the token that lets that pane's `work-done`, `delegate`, `dispatch` and status updates be accepted. Running those commands in a shell the deck did not start (a plain terminal, or a tool that strips the environment) fails because these are missing; see [Orchestration](orchestration.md) and [Troubleshooting](troubleshooting.md).
 
 ## `desktop.toml` reference
 

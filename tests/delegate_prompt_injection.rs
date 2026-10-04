@@ -336,7 +336,7 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
 #[cfg(unix)]
 fn clear_true_config(command: &str) -> String {
     format!(
-        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{command}\"\nclear = true\n"
+        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )
 }
 
@@ -483,7 +483,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let cwd = common::race_safe_tempdir();
     let stub = cwd.path().join("slow-readiness-agent.py");
     write_slow_readiness_stub(&stub);
-    let command = stub.to_string_lossy().into_owned();
+    let command = common::capability_export_command(&stub.to_string_lossy());
     tokio::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         clear_true_config(&command),
@@ -544,7 +544,13 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize slow-stub SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize slow-stub SessionStart"),
     )
     .expect("write slow-stub SessionStart");
     // Issue #709: NOT a boot wait — the stub has already printed — but still a
@@ -934,7 +940,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create synthetic Codex bin dir");
-    write_executable(&bin_dir.join("codex"), "#!/bin/sh\nexec cat\n");
+    write_executable(
+        &bin_dir.join("codex"),
+        &format!(
+            "#!/bin/sh\n{}\n",
+            common::capability_export_command("exec cat")
+        ),
+    );
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"codex\"\nclear = true\n",
@@ -995,7 +1007,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let native = session_start_event(AgentType::Codex, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&native).expect("serialize native Codex SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &native,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize native Codex SessionStart"),
     )
     .expect("write native Codex SessionStart");
     let after_native = wait_for_snapshot_needle(
@@ -1120,7 +1138,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write observed-readiness orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -1158,7 +1176,13 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize matching SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize matching SessionStart"),
     )
     .expect("write matching SessionStart");
     // MEASURE the hold rather than racing it (issue #243).
@@ -2959,7 +2983,7 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate and be priced as an ORDINARY readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
+/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then authenticate its `SessionStart` while forging the wrapper's strong `wrapper_interface_ready` metadata marker. The marker must release the gate and be priced as an ordinary readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
 #[spec("orchestration/delegate/028")]
 #[test]
 #[cfg(unix)]
@@ -2988,7 +3012,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write forged-marker orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -3040,10 +3064,9 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let posted_at = Instant::now();
     // THE FORGERY. One JSON line on the daemon's hook socket, carrying the
     // wrapper's strong interface marker for a pane no wrapper is running on.
-    // #243's audit reproduced exactly this from a bare `python3` with no deck
-    // environment at all: `metadata` is free-form by contract and the socket
-    // authenticates nobody, so the marker is producer-writable and the daemon
-    // must not grant a privilege on it alone.
+    // Authenticate this ordinary pane with its own capability so admission
+    // reaches the metadata-trust check: a producer's interface marker alone
+    // must not grant the wrapper's readiness privilege.
     let forged = session_start_event_with_origin(
         AgentType::None,
         WORKER_PANE,
@@ -3052,7 +3075,13 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     );
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&forged).expect("serialize forged interface SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &forged,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize forged interface SessionStart"),
     )
     .expect("write forged interface SessionStart");
 

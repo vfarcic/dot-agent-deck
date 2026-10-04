@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 
@@ -30,6 +30,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[test]
 fn pane_input_004_history_only_send_reports_result_and_feedback() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_continue_session("history-codex", "cat")
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -124,6 +125,7 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
         ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
     ] {
         let deck = TuiDeck::builder()
+            .impersonating_pane_signals()
             .with_continue_session(format!("stream-rejection-{input_kind}"), "cat")
             .launch_with_fixture("minimal");
         deck.wait_for_string("[Command Mode Ctrl+D]");
@@ -204,6 +206,7 @@ payload = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "pane_id": pane,
     "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    "token": os.environ.get("DOT_AGENT_DECK_PANE_CAPABILITY"),
     "live_target": {
         "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
         "writable": os.environ["WRITABLE"],
@@ -300,6 +303,7 @@ fn prompt_pane_input_046_a_pane_that_stops_reading_does_not_hang_its_send_or_sta
     const SENTINEL: &str = "HEALTHY-PANE-SENTINEL-046";
     const HEALTHY_PANE: &str = "healthy-046";
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_continue_session(
             "wedged-046",
             "sh -c 'stty raw; printf WEDGE-READY; exec sleep 600'",

@@ -405,6 +405,7 @@ fn claude_hook_with_fields(deck: &TuiDeck, role: &str, event: &str, fields: Valu
         .expect("installed Claude command");
     let agent = role_agent(deck, role);
     let mut child = Command::new("sh")
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .args(["-c", command])
         .env("HOME", deck.home_dir())
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())

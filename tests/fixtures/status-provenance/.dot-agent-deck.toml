@@ -1,0 +1,12 @@
+# Synthetic pane commands exercise the shipped provenance policy without an LLM.
+[[orchestrations]]
+name = "demo-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+start = true
+command = "\"$DAD_TEST_BIN\" agent-event --type waiting; while [ ! -f ./status-running ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" agent-event --type running; while [ ! -f ./status-waiting ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" agent-event --type waiting; while [ ! -f ./status-finished ]; do sleep 0.1; done; \"$DAD_TEST_BIN\" agent-event --type finished; exec cat"
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
