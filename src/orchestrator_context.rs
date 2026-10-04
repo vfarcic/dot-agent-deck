@@ -837,13 +837,13 @@ pub fn reassert_orchestrator_prompt(
 /// ([`compare_rearmed_context`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RearmComparison {
-    /// Same brief, and not published before `current`: the record may follow.
+    /// Same brief, and not dated before `current`: the record may follow.
     Follows,
     /// A different `## Your task` section or attendance.
     DifferentBrief,
-    /// Same brief, but published before `current` — a report that arrived
-    /// after a later one (Qodo and Greptile on PR #1554). Following it would
-    /// move the record back to an older file, which the sweep reaches first.
+    /// Same brief, but dated before `current` — ordinarily a report that
+    /// arrived after a later one (Qodo and Greptile on PR #1554). Following it
+    /// would move the record to a file the sweep reaches first.
     Older,
 }
 
@@ -865,9 +865,16 @@ pub enum RearmComparison {
 /// A TUI sends each report on its own task, and two TUIs re-arming the same
 /// coordinator send theirs independently, so reports can arrive out of
 /// publication order. Each published file is written once and never touched
-/// again, so its modification time is its publication time; equal times are
-/// not ordered and are allowed. A time either file cannot report also allows
-/// it, the same answer as before this check existed.
+/// again, so its modification time is when it was published by the wall clock
+/// — which is not a publication sequence: a clock stepped back between two
+/// re-arms dates the later one before the earlier (Qodo on PR #1554). The
+/// order is by modification time anyway because that is what the record has
+/// to survive: the retention sweep ages files by the same time
+/// ([`sweep_coordination_files`]), so the record stays on the file of the
+/// orchestration's brief that the sweep reaches last, whichever was published
+/// last. Equal times are not ordered and are allowed. A time either file
+/// cannot report also allows it, the same answer as before this check
+/// existed.
 ///
 /// Both paths must name a per-publish file in the same `.dot-agent-deck`
 /// ([`own_context_file_name`]), and both are read through
@@ -4023,6 +4030,63 @@ mod tests {
                 "{case}: must be refused, not compared"
             );
         }
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): modification time is not a publication
+    /// sequence — a clock stepped back between two re-arms makes the later file
+    /// read as older, so the record stays on the earlier one. That is the file
+    /// worth staying on: the retention sweep orders by the same time, so the
+    /// file the record keeps is the last of the two it removes, and it carries
+    /// the same brief.
+    #[test]
+    fn after_a_backward_clock_step_the_record_keeps_the_file_the_sweep_removes_last() {
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let earlier = prepare_orchestrator_prompt(
+            &config(),
+            &cwd,
+            Some("TASK-ALPHA"),
+            Attendance::Unattended,
+        )
+        .expect("published")
+        .context_path;
+        let later = reassert_orchestrator_prompt(&config(), &cwd, Some(&earlier))
+            .expect("re-armed")
+            .context_path;
+        // The clock stepped back an hour between the two publishes.
+        std::fs::File::options()
+            .write(true)
+            .open(&later)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .expect("date the later publish back");
+        assert_eq!(
+            compare_rearmed_context(&earlier, &later).unwrap(),
+            RearmComparison::Older,
+            "the later publish reads as older, so the record stays on the earlier file"
+        );
+
+        // A sweep that reaches either of them reaches the later publish first.
+        let project = open_project_dir(tmp.path()).expect("open the project dir");
+        let held = open_publish_dir_in(&project, tmp.path()).expect("open the context dir");
+        let (report, _) = sweep_window(
+            &held,
+            Duration::from_secs(1800),
+            SystemTime::now(),
+            MAX_SWEEP_ENTRIES,
+            0,
+        );
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(
+            !later.exists(),
+            "the file the record did not follow goes first"
+        );
+        let kept = std::fs::read_to_string(&earlier).expect("the recorded file survives");
+        assert_eq!(
+            read_back_context(Some(&kept)),
+            (Some("TASK-ALPHA".to_string()), Attendance::Unattended),
+            "and still carries the orchestration's brief"
+        );
     }
 
     /// Issue #1233: a re-arm that knows its tab's own file reads the task back

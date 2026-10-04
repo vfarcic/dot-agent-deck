@@ -1583,7 +1583,9 @@ pub struct AppState {
     /// Daemon-only, like the routing map beside it.
     pub orchestration_context_paths: HashMap<OrchestrationIdentity, std::path::PathBuf>,
     /// Issue #1445: the files [`Self::orchestration_context_paths`] has moved
-    /// on from for each orchestration, oldest first, kept only so that
+    /// on from for each orchestration — and re-arm files whose report arrived
+    /// after a newer one's, which it never moved to — in the order the daemon
+    /// learnt of them, kept only so that
     /// [`Self::take_ended_orchestration_context`] deletes them along with the
     /// newest one. At most [`MAX_SUPERSEDED_CONTEXTS`] per orchestration; one
     /// pushed out of that bound is left to the retention sweep.
@@ -11447,9 +11449,10 @@ impl AppState {
         }
     }
 
-    /// Issue #1445: remember `displaced`, which `newest` just replaced as
-    /// `identity`'s recorded file, for deletion at the end — once, and within
-    /// [`MAX_SUPERSEDED_CONTEXTS`].
+    /// Issue #1445: remember `displaced` for deletion at the end — once, and
+    /// within [`MAX_SUPERSEDED_CONTEXTS`] — while `newest` is `identity`'s
+    /// recorded file: one `newest` just replaced, or an older re-arm file the
+    /// record never moved to ([`Self::keep_older_rearmed_orchestration_context`]).
     fn supersede_context(
         &mut self,
         identity: &OrchestrationIdentity,
@@ -11632,6 +11635,38 @@ impl AppState {
         let (identity, current) = (identity.clone(), current.clone());
         self.supersede_context(&identity, current, &reported);
         self.orchestration_context_paths.insert(identity, reported);
+        Ok(true)
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): keep `reported` for deletion at the end
+    /// without following it — the report of a re-arm file dated before the
+    /// recorded file, which reached the daemon after a later one. The record
+    /// stays where it is, and the file joins
+    /// ([`Self::orchestration_superseded_contexts`]), so ending the
+    /// orchestration removes it rather than leaving it to the retention sweep.
+    /// Answers whether it was added (`false` when it is the recorded file).
+    ///
+    /// The same checks and the same `compared` contract as
+    /// [`Self::record_rearmed_orchestration_context`]: the caller has
+    /// established, off the lock, that `reported` carries the brief of
+    /// `compared` and is older than it, and if the record has moved since this
+    /// refuses with [`RearmedContextRefusal::RecordMoved`] so the caller
+    /// compares again.
+    pub fn keep_older_rearmed_orchestration_context(
+        &mut self,
+        pane_id: &str,
+        reported: &std::path::Path,
+        compared: &std::path::Path,
+    ) -> Result<bool, RearmedContextRefusal> {
+        let (identity, current, reported) = self.check_rearmed_context(pane_id, reported)?;
+        if reported == *current {
+            return Ok(false);
+        }
+        if current != compared {
+            return Err(RearmedContextRefusal::RecordMoved);
+        }
+        let (identity, current) = (identity.clone(), current.clone());
+        self.supersede_context(&identity, reported, &current);
         Ok(true)
     }
 
@@ -15650,6 +15685,74 @@ mod tests {
         assert!(
             state.orchestration_superseded_contexts.is_empty(),
             "nothing is kept for an ended orchestration"
+        );
+    }
+
+    /// Issue #1445 (Qodo on PR #1554): an older re-arm file is kept for
+    /// deletion at the end without moving the record — once, never when it is
+    /// the recorded file, and only against the file it was compared with; a
+    /// report the shared checks refuse is not kept.
+    #[test]
+    fn an_older_rearm_file_is_kept_for_the_end_without_moving_the_record() {
+        let ctx = |hex: char| {
+            std::path::PathBuf::from(format!(
+                "/p/.dot-agent-deck/orchestrator-context-{}.md",
+                hex.to_string().repeat(32)
+            ))
+        };
+        let (startup, older, newer, other) = (ctx('a'), ctx('b'), ctx('c'), ctx('d'));
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        state.record_orchestration_context(&instance("a"), startup.clone());
+        state.record_orchestration_context(&instance("b"), other.clone());
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &newer, &startup),
+            Ok(true)
+        );
+
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &older, &startup),
+            Err(RearmedContextRefusal::RecordMoved),
+            "a comparison against a file no longer recorded does not apply"
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a1", &older, &newer),
+            Err(RearmedContextRefusal::NotACoordinator)
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &other, &newer),
+            Err(RearmedContextRefusal::AnotherOrchestrationsContext)
+        );
+        assert_eq!(
+            state.keep_older_rearmed_orchestration_context("a0", &newer, &newer),
+            Ok(false),
+            "the recorded file is not also kept as superseded"
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                state.keep_older_rearmed_orchestration_context("a0", &older, &newer),
+                Ok(true)
+            );
+        }
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&newer),
+            "keeping an older file never moves the record"
+        );
+
+        state.pane_orchestration_map.remove("a0");
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            vec![startup, older, newer],
+            "each file once, the older one included"
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("b")),
+            Some(&other),
+            "another orchestration's record is untouched"
         );
     }
 

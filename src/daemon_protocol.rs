@@ -2038,7 +2038,8 @@ pub enum AttachRequest {
     /// **The daemon follows only a report it can check**, and otherwise leaves
     /// the record as it was — answering `ok: true` for a report older than the
     /// recorded file (it lost a race with a later one, so the record is already
-    /// where it should be) and `ok: false` for every other refusal: `pane_id` must be the
+    /// where it should be; the file is still deleted when the orchestration
+    /// ends) and `ok: false` for every other refusal: `pane_id` must be the
     /// registered orchestrator seat of an orchestration the daemon records a
     /// file for; `context_path` must be `orchestrator-context-<32 hex>.md`
     /// directly in that recorded file's own `.dot-agent-deck`, recorded by no
@@ -3657,7 +3658,10 @@ impl OrchestrationSpawnMeta {
 /// ([`crate::state::AppState::record_rearmed_orchestration_context`]),
 /// otherwise the three steps run again against the new file. A report older
 /// than the recorded file answers `ok`: it lost a race with a later one, and
-/// the record already names the newer file. The refusal never echoes the path:
+/// the record already names the newer file. Its file is kept for deletion at
+/// the end under the same write-lock checks
+/// ([`crate::state::AppState::keep_older_rearmed_orchestration_context`]),
+/// without moving the record. The refusal never echoes the path:
 /// it is the client's value, and it failed a check.
 async fn record_rearmed_context(
     state: &SharedState,
@@ -3691,6 +3695,7 @@ async fn record_rearmed_context(
             .await
             .rearmed_context_target(pane_id, &reported)
             .map_err(|r| refused(&r, r == RearmedContextRefusal::NoRecordedContext))?;
+        let mut older = false;
         if current != reported {
             let (compared, candidate) = (current.clone(), reported.clone());
             let comparison = tokio::task::spawn_blocking(move || {
@@ -3703,11 +3708,10 @@ async fn record_rearmed_context(
                     return Err(refused(&"the file carries a different brief", false));
                 }
                 // A report that lost a race with a later one: the record
-                // already names a newer file, which is the outcome wanted.
-                Ok(Ok(RearmComparison::Older)) => {
-                    refused(&"a newer file is already recorded", true);
-                    return Ok(());
-                }
+                // already names a newer file, which is the outcome wanted, but
+                // this file is still the orchestration's own and goes with it
+                // at the end (Qodo on PR #1554).
+                Ok(Ok(RearmComparison::Older)) => older = true,
                 Ok(Err(e)) => {
                     return Err(refused(&format!("could not compare the files: {e}"), false));
                 }
@@ -3717,6 +3721,20 @@ async fn record_rearmed_context(
                         false,
                     ));
                 }
+            }
+        }
+        if older {
+            match state
+                .write()
+                .await
+                .keep_older_rearmed_orchestration_context(pane_id, &reported, &current)
+            {
+                Ok(_) => {
+                    refused(&"a newer file is already recorded", true);
+                    return Ok(());
+                }
+                Err(RearmedContextRefusal::RecordMoved) => continue,
+                Err(r) => return Err(refused(&r, false)),
             }
         }
         match state
@@ -6401,6 +6419,97 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
+    /// daemon in reverse publication order leave the record on the newer file,
+    /// and the older one is still deleted when the orchestration ends rather
+    /// than waiting for the retention sweep.
+    #[tokio::test]
+    async fn an_out_of_order_rearm_report_is_still_removed_when_the_orchestration_ends() {
+        use crate::orchestrator_context::{
+            Attendance, prepare_orchestrator_prompt, reassert_orchestrator_prompt,
+        };
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::state::{AppState, OrchestrationIdentity};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let config = OrchestrationConfig {
+            default: false,
+            name: "loop".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let startup =
+            prepare_orchestrator_prompt(&config, &cwd, Some("TASK-ALPHA"), Attendance::Unattended)
+                .expect("published")
+                .context_path;
+        let rearm = |known: &std::path::Path| {
+            reassert_orchestrator_prompt(&config, &cwd, Some(known))
+                .expect("re-armed")
+                .context_path
+        };
+        let first = rearm(&startup);
+        let second = rearm(&first);
+        // Three publishes in one test can share a timestamp tick; date the
+        // earlier two back so their publication order is unambiguous.
+        for (path, age) in [(&startup, 120), (&first, 60)] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| {
+                    f.set_modified(
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(age),
+                    )
+                })
+                .expect("date the file back");
+        }
+
+        let identity = OrchestrationIdentity::Instance {
+            id: "a".to_string(),
+            name: "loop".to_string(),
+        };
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().await;
+            s.orchestrator_pane_ids.insert("a0".to_string());
+            s.pane_orchestration_map
+                .insert("a0".to_string(), identity.clone());
+            s.record_orchestration_context(&identity, startup.clone());
+        }
+
+        // The second re-arm's report wins the race; the first arrives after it.
+        record_rearmed_context(&state, "a0", second.to_str().unwrap())
+            .await
+            .expect("the newer report is followed");
+        record_rearmed_context(&state, "a0", first.to_str().unwrap())
+            .await
+            .expect("an older report is answered ok");
+
+        let mut s = state.write().await;
+        assert_eq!(
+            s.orchestration_context_paths.get(&identity),
+            Some(&second),
+            "an older report must not move the record back"
+        );
+        s.pane_orchestration_map.remove("a0");
+        let mut ended = s.take_ended_orchestration_context(&identity);
+        ended.sort();
+        let mut expected = vec![startup, first, second];
+        expected.sort();
+        assert_eq!(
+            ended, expected,
+            "ending the orchestration must remove every file its re-arms published, \
+             including one whose report arrived out of order"
+        );
+    }
 
     /// PRD #819 audit fix: `PrepareOrchestration` is available exactly where the
     /// publish can deliver its owner-only guarantee, and the capability list
