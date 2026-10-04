@@ -10073,10 +10073,8 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
 
 /// The kept-card half of [`AppState::seed_hydrated_session`]: a card that
 /// already exists takes the daemon's snapshot only when the snapshot is the
-/// fresher evidence, plus the live-target tie exception. Shared with
-/// [`AppState::resync_after_event_gap`], which refreshes cards that already
-/// exist and must not mint any. See `seed_hydrated_session`'s doc comment for
-/// both rules.
+/// fresher evidence, plus the live-target tie exception. See
+/// `seed_hydrated_session`'s doc comment for both rules.
 fn overlay_snapshot_onto_kept_card(
     session: &mut SessionState,
     snap: &SessionSnapshot,
@@ -11156,15 +11154,23 @@ impl AppState {
     ///   transition the stream would have counted. Where the local view had no
     ///   generation, adopting one counts nothing, exactly as a first
     ///   `SessionStart` does not.
-    /// * **An existing card is refreshed** by the same newer-only rule hydration
-    ///   applies to a card it keeps. No card is minted: which panes this TUI
-    ///   hosts is the render loop's business, not this task's.
+    /// * **A pane the daemon has no generation for loses its local one**, and
+    ///   that counts as a closure, when the same reply shows the daemon reports
+    ///   generations at all. From a daemon predating #532 (v0.45.0 and earlier),
+    ///   which omits the field for a pane that has one, the local generation is
+    ///   left alone.
+    /// * **An existing card takes the snapshot's fields.** No card is minted:
+    ///   which panes this TUI hosts is the render loop's business, not this
+    ///   task's.
     ///
-    /// What it does NOT repair, deliberately. A snapshot with no
-    /// `hook_generation` leaves the local generation alone: a daemon predating
-    /// #532 omits the field for a pane that has one, so absence is not proof the
-    /// pane has none. A record with no live snapshot, and a pane this state does
-    /// not manage, are left as they are. None of these can mis-deliver a prompt:
+    /// What it does NOT repair, deliberately. A record with no live snapshot, and
+    /// a pane this state does not manage, are left as they are, and an agent the
+    /// reply no longer lists keeps its card: a pane whose agent is gone is ended
+    /// by its own attach stream closing, not by this one. Events already queued
+    /// on the new subscription are applied after the snapshot and can replay a
+    /// transition it already includes, counting a closure twice or briefly
+    /// moving the generation back until the rest of the queue lands; telling
+    /// them apart needs a stream position the wire does not carry. None of these can mis-deliver a prompt:
     /// a delivery that may have written before the gap stops on the gap itself
     /// ([`Self::event_stream_gaps`], bumped here as well, so one written while
     /// the subscriber was disconnected stops too), and one that has not written
@@ -11172,6 +11178,17 @@ impl AppState {
     /// daemon if that is not the pane's.
     pub fn resync_after_event_gap(&mut self, records: &[crate::agent_pty::AgentRecord]) {
         self.note_event_stream_gap();
+        // Whether THIS daemon reports pane generations at all. The field shipped
+        // in v0.45.1, and an older daemon omits it for a pane that has one, so a
+        // missing value is proof of "no generation" only from a daemon that is
+        // seen sending it. One daemon answers the whole reply, so a single record
+        // carrying one settles it for every record.
+        let reports_generations = records.iter().any(|record| {
+            record
+                .live
+                .as_ref()
+                .is_some_and(|snap| snap.hook_generation.is_some())
+        });
         for record in records {
             let Some(pane_id) = record.pane_id_env.as_deref() else {
                 continue;
@@ -11182,8 +11199,10 @@ impl AppState {
             let Some(snap) = record.live.as_ref() else {
                 continue;
             };
-            if let Some(generation) = snap.hook_generation.as_ref() {
-                self.resync_generation(pane_id, generation);
+            match snap.hook_generation.as_ref() {
+                Some(generation) => self.resync_generation(pane_id, generation),
+                None if reports_generations => self.resync_generation_ended(pane_id),
+                None => {}
             }
             let observed = snap
                 .last_activity_ms
@@ -11201,7 +11220,24 @@ impl AppState {
                         .then_with(|| a.session_id.cmp(&b.session_id))
                 })
             {
-                overlay_snapshot_onto_kept_card(card, snap, observed);
+                // Unconditionally, unlike hydration's kept-card rule (Greptile on
+                // #1553): that rule exists because events applied BEFORE
+                // hydration can be newer than the snapshot, and here none are —
+                // the reply was built after everything this state holds. So the
+                // snapshot's fields win whatever its stamp, which also covers an
+                // older daemon that sends no `last_activity_ms` and a stamp that
+                // millisecond truncation made equal. The stamp itself only ever
+                // moves forward, and never past now.
+                if let Some(agent_type) = snap.agent_type.clone() {
+                    card.agent_type = agent_type;
+                }
+                if let Some(observed) = observed
+                    && observed > card.last_activity
+                    && observed <= Utc::now()
+                {
+                    card.last_activity = observed;
+                }
+                overlay_snapshot_fields(card, snap);
             }
         }
     }
@@ -11219,11 +11255,7 @@ impl AppState {
                 established_at.max(*current_ts)
             }
             Some(_) => {
-                let closures = self
-                    .pane_generation_closures
-                    .entry(pane_id.to_string())
-                    .or_insert(0);
-                *closures = closures.saturating_add(1);
+                self.count_generation_closure(pane_id);
                 established_at
             }
             None => established_at,
@@ -11232,6 +11264,25 @@ impl AppState {
             pane_id.to_string(),
             (generation.session_id.clone(), established_at),
         );
+    }
+
+    /// Issue #1520 (Qodo on #1553): the daemon, which reports generations, has
+    /// none for `pane_id` — the conversation this state still holds ended while
+    /// the stream was down and nothing succeeded it. The same transition a
+    /// `SessionEnd` makes here: the generation goes and the closure counts.
+    fn resync_generation_ended(&mut self, pane_id: &str) {
+        self.pane_generation_announced.remove(pane_id);
+        if self.pane_hook_session.remove(pane_id).is_some() {
+            self.count_generation_closure(pane_id);
+        }
+    }
+
+    fn count_generation_closure(&mut self, pane_id: &str) {
+        let closures = self
+            .pane_generation_closures
+            .entry(pane_id.to_string())
+            .or_insert(0);
+        *closures = closures.saturating_add(1);
     }
 
     fn newest_activity_for(&self, pane_id: &str, agent_id: Option<&str>) -> Option<DateTime<Utc>> {

@@ -33,6 +33,11 @@ pub struct SubscriberConfig {
     /// instead of applied. `None` in a shipped binary — `main.rs` passes one only
     /// under the `e2e` feature.
     pub drop_event: Option<fn(&AgentEvent) -> bool>,
+    /// Issue #1520 e2e seam: an event this returns `true` for is discarded AND
+    /// the stream is torn down, the way a `KIND_STREAM_END "lagged"` loses the
+    /// events it never forwarded. `None` in a shipped binary, like
+    /// [`Self::drop_event`].
+    pub break_on_event: Option<fn(&AgentEvent) -> bool>,
 }
 
 impl Default for SubscriberConfig {
@@ -45,6 +50,7 @@ impl Default for SubscriberConfig {
             initial_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(5),
             drop_event: None,
+            break_on_event: None,
         }
     }
 }
@@ -59,17 +65,23 @@ pub async fn run(client: DaemonClient, state: SharedState, config: SubscriberCon
     loop {
         let resync = !std::mem::replace(&mut first_attempt, false);
         match client.subscribe_events().await {
+            Ok(_) if resync && !resync_after_gap(&client, &state).await => {
+                // Qodo on #1553: a snapshot that could not be read leaves this
+                // state unreconciled, so do not settle on the new stream as if
+                // it were. Drop it and resubscribe after the backoff, which
+                // resynchronizes again; the gap stays recorded meanwhile.
+            }
             Ok(mut sub) => {
-                // Reset backoff on a successful subscribe.
+                // Reset backoff on a successful subscribe (and resync).
                 delay = config.initial_delay;
-                if resync {
-                    resync_after_gap(&client, &state).await;
-                }
                 loop {
                     match sub.next_event().await {
                         Ok(Some(BroadcastMsg::Event(event))) => {
                             if config.drop_event.is_some_and(|drop| drop(&event)) {
                                 continue;
+                            }
+                            if config.break_on_event.is_some_and(|brk| brk(&event)) {
+                                break;
                             }
                             state.write().await.apply_event(event);
                         }
@@ -144,29 +156,33 @@ const RESYNC_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// ([`crate::state::AppState::resync_after_event_gap`]) BEFORE the new stream's
 /// first event is applied, so the snapshot lands under everything newer.
 ///
-/// A failed or timed-out read still records the gap, so a delivery written
-/// across it stops rather than trusting a history that is now known to be
-/// incomplete; only the snapshot refresh is lost, and the ordinary event flow
-/// repairs what it can from there.
-async fn resync_after_gap(client: &DaemonClient, state: &SharedState) {
-    let records = match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
-        Ok(Ok(records)) => records,
+/// Returns `false` when the daemon's agents could not be read. The gap is still
+/// recorded then, so a delivery written across it stops rather than trusting a
+/// history that is now known to be incomplete, and the caller resubscribes and
+/// tries again rather than settling on a stream it never reconciled with.
+async fn resync_after_gap(client: &DaemonClient, state: &SharedState) -> bool {
+    match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.list_agents()).await {
+        Ok(Ok(records)) => {
+            state.write().await.resync_after_event_gap(&records);
+            true
+        }
         Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
-                "subscribe_events: resync after reconnect could not list agents"
+                "subscribe_events: resync after reconnect could not list agents, retrying"
             );
-            Vec::new()
+            state.write().await.note_event_stream_gap();
+            false
         }
         Err(_) => {
             tracing::warn!(
                 timeout_ms = RESYNC_LIST_TIMEOUT.as_millis() as u64,
-                "subscribe_events: resync after reconnect timed out listing agents"
+                "subscribe_events: resync after reconnect timed out listing agents, retrying"
             );
-            Vec::new()
+            state.write().await.note_event_stream_gap();
+            false
         }
-    };
-    state.write().await.resync_after_event_gap(&records);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -190,8 +206,19 @@ mod tests {
 
     const PANE: &str = "pane-1";
     const AGENT: &str = "agent-1";
+    /// A second agent on its own pane, alive throughout. Its only job is to put
+    /// a `hook_generation` in the `ListAgents` reply, which is how the resync
+    /// learns this daemon reports generations at all.
+    const OTHER_PANE: &str = "pane-2";
+    const OTHER_AGENT: &str = "agent-2";
 
-    fn event(session: &str, event_type: EventType, secs: i64) -> AgentEvent {
+    fn event_on(
+        pane: &str,
+        agent: &str,
+        session: &str,
+        event_type: EventType,
+        secs: i64,
+    ) -> AgentEvent {
         AgentEvent {
             session_id: session.to_string(),
             agent_type: AgentType::ClaudeCode,
@@ -202,12 +229,16 @@ mod tests {
             timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
             user_prompt: None,
             metadata: Default::default(),
-            pane_id: Some(PANE.into()),
-            agent_id: Some(AGENT.into()),
+            pane_id: Some(pane.into()),
+            agent_id: Some(agent.into()),
             agent_version: None,
             schema_version: None,
             live_target: None,
         }
+    }
+
+    fn event(session: &str, event_type: EventType, secs: i64) -> AgentEvent {
+        event_on(PANE, AGENT, session, event_type, secs)
     }
 
     fn tool_start(session: &str, secs: i64) -> AgentEvent {
@@ -221,20 +252,31 @@ mod tests {
     /// `KIND_STREAM_END "lagged"` — the daemon's own reaction to a receiver that
     /// fell behind its broadcast. Every later one stays open and silent.
     /// `ListAgents` is answered from `daemon`, joined exactly the way the real
-    /// handler joins it ([`AppState::attach_live_sessions`]).
-    async fn scripted_daemon(
-        listener: tokio::net::UnixListener,
+    /// handler joins it ([`AppState::attach_live_sessions`]), except that the
+    /// first `failing_lists` of them are refused.
+    struct ScriptedDaemon {
         first_stream: Vec<AgentEvent>,
-        daemon: Arc<AppState>,
-        subscriptions: Arc<AtomicUsize>,
+        daemon: AppState,
+        agents: Vec<(&'static str, &'static str)>,
+        failing_lists: usize,
+    }
+
+    struct Counters {
+        subscriptions: AtomicUsize,
+        lists: AtomicUsize,
+    }
+
+    async fn serve(
+        listener: tokio::net::UnixListener,
+        script: Arc<ScriptedDaemon>,
+        n: Arc<Counters>,
     ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let first_stream = first_stream.clone();
-            let daemon = Arc::clone(&daemon);
-            let subscriptions = Arc::clone(&subscriptions);
+            let script = Arc::clone(&script);
+            let n = Arc::clone(&n);
             tokio::spawn(async move {
                 let (mut rd, mut wr) = stream.into_split();
                 let Ok(Some((KIND_REQ, payload))) = read_frame(&mut rd).await else {
@@ -246,9 +288,10 @@ mod tests {
                     AttachRequest::SubscribeEvents => {
                         let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
                         write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
-                        if subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
-                            for ev in first_stream {
-                                let msg = serde_json::to_vec(&BroadcastMsg::Event(ev)).unwrap();
+                        if n.subscriptions.fetch_add(1, Ordering::SeqCst) == 0 {
+                            for ev in &script.first_stream {
+                                let msg =
+                                    serde_json::to_vec(&BroadcastMsg::Event(ev.clone())).unwrap();
                                 write_frame(&mut wr, KIND_EVENT, &msg).await.unwrap();
                             }
                             write_frame(&mut wr, KIND_STREAM_END, b"lagged")
@@ -260,15 +303,25 @@ mod tests {
                         }
                     }
                     AttachRequest::ListAgents => {
-                        let mut records: Vec<AgentRecord> = vec![
-                            serde_json::from_value(
-                                serde_json::json!({ "id": AGENT, "pane_id_env": PANE }),
-                            )
-                            .unwrap(),
-                        ];
-                        daemon.attach_live_sessions(&mut records);
-                        let mut resp = AttachResponse::ok();
-                        resp.agent_records = Some(records);
+                        let resp = if n.lists.fetch_add(1, Ordering::SeqCst) < script.failing_lists
+                        {
+                            AttachResponse::err("scripted failure")
+                        } else {
+                            let mut records: Vec<AgentRecord> = script
+                                .agents
+                                .iter()
+                                .map(|(agent, pane)| {
+                                    serde_json::from_value(
+                                        serde_json::json!({ "id": agent, "pane_id_env": pane }),
+                                    )
+                                    .unwrap()
+                                })
+                                .collect();
+                            script.daemon.attach_live_sessions(&mut records);
+                            let mut resp = AttachResponse::ok();
+                            resp.agent_records = Some(records);
+                            resp
+                        };
                         let resp = serde_json::to_vec(&resp).unwrap();
                         write_frame(&mut wr, KIND_RESP, &resp).await.unwrap();
                     }
@@ -280,7 +333,9 @@ mod tests {
 
     /// Issue #1520: what the TUI's `AppState` reads for `PANE` — its
     /// generation, the card's status, and the closure count.
-    async fn tui_view(state: &SharedState) -> (Option<String>, Option<SessionStatus>, u64) {
+    type View = (Option<String>, Option<SessionStatus>, u64);
+
+    async fn tui_view(state: &SharedState) -> View {
         let st = state.read().await;
         let status = st
             .sessions
@@ -294,15 +349,54 @@ mod tests {
         )
     }
 
-    /// Scenario: Run the TUI's event subscriber against a daemon that sends one conversation's start and then tears the stream down as `lagged`, while that conversation ends and a second one starts and gets to work. After the subscriber reconnects, the TUI's state must name the second conversation as the pane's, show the card working, and count the conversation that ended while it was away.
-    #[spec("session/live/018")]
-    #[tokio::test]
-    async fn a_reconnect_brings_the_client_state_back_to_the_daemons() {
+    /// Run the production subscriber against `script` until the TUI's view of
+    /// `PANE` equals `expected` or 5 s pass, and return the last view seen and
+    /// the request counts.
+    async fn run_until(
+        script: ScriptedDaemon,
+        panes: &[&str],
+        expected: &View,
+    ) -> (View, Arc<Counters>) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("attach.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        let counters = Arc::new(Counters {
+            subscriptions: AtomicUsize::new(0),
+            lists: AtomicUsize::new(0),
+        });
+        let server = tokio::spawn(serve(listener, Arc::new(script), Arc::clone(&counters)));
 
-        // The daemon's own state: everything, in order.
+        let mut tui = AppState::default();
+        for pane in panes {
+            tui.register_pane(pane.to_string());
+        }
+        let state: SharedState = Arc::new(RwLock::new(tui));
+        let config = SubscriberConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+            drop_event: None,
+            break_on_event: None,
+        };
+        let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = tui_view(&state).await;
+        while seen != *expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen = tui_view(&state).await;
+        }
+        subscriber.abort();
+        server.abort();
+        assert!(
+            counters.subscriptions.load(Ordering::SeqCst) >= 2,
+            "the subscriber never reconnected, so this did not test a reconnect"
+        );
+        (seen, counters)
+    }
+
+    /// The daemon of `live_018`: `gen-a` started, ended and was succeeded by
+    /// `gen-b`, which is working — everything, in order.
+    fn rolled_over_daemon() -> AppState {
         let mut daemon = AppState::default();
         daemon.register_pane(PANE.to_string());
         daemon.apply_event(event("gen-a", EventType::SessionStart, 1));
@@ -310,44 +404,164 @@ mod tests {
         daemon.apply_event(event("gen-b", EventType::SessionStart, 3));
         daemon.apply_event(tool_start("gen-b", 4));
         assert_eq!(daemon.pane_hook_session_id(PANE).as_deref(), Some("gen-b"));
+        daemon
+    }
 
-        let subscriptions = Arc::new(AtomicUsize::new(0));
-        let server = tokio::spawn(scripted_daemon(
-            listener,
-            vec![event("gen-a", EventType::SessionStart, 1)],
-            Arc::new(daemon),
-            Arc::clone(&subscriptions),
-        ));
-
-        let mut tui = AppState::default();
-        tui.register_pane(PANE.to_string());
-        let state: SharedState = Arc::new(RwLock::new(tui));
-        let config = SubscriberConfig {
-            initial_delay: Duration::from_millis(10),
-            max_delay: Duration::from_millis(50),
-            drop_event: None,
-        };
-        let subscriber = tokio::spawn(run(DaemonClient::new(socket), Arc::clone(&state), config));
-
+    /// Scenario: Run the TUI's event subscriber against a daemon that sends one conversation's start and then tears the stream down as `lagged`, while that conversation ends and a second one starts and gets to work. After the subscriber reconnects, the TUI's state must name the second conversation as the pane's, show the card working, and count the conversation that ended while it was away.
+    #[spec("session/live/018")]
+    #[tokio::test]
+    async fn live_018_a_reconnect_brings_the_client_state_back_to_the_daemons() {
         let expected = (Some("gen-b".to_string()), Some(SessionStatus::Working), 1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut seen = tui_view(&state).await;
-        while seen != expected && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            seen = tui_view(&state).await;
-        }
-        subscriber.abort();
-        server.abort();
-        assert!(
-            subscriptions.load(Ordering::SeqCst) >= 2,
-            "the subscriber never reconnected, so this did not test a reconnect"
-        );
+        let (seen, _) = run_until(
+            ScriptedDaemon {
+                first_stream: vec![event("gen-a", EventType::SessionStart, 1)],
+                daemon: rolled_over_daemon(),
+                agents: vec![(AGENT, PANE)],
+                failing_lists: 0,
+            },
+            &[PANE],
+            &expected,
+        )
+        .await;
         assert_eq!(
             seen, expected,
             "after resubscribing, the TUI must agree with the daemon about the pane's \
              conversation (gen-b), the card's status (Working) and the one conversation that \
              ended while it was disconnected — not carry on from the stream it lost \
              (generation, status, closures)"
+        );
+    }
+
+    /// Issue #1520 (Qodo on #1553): a `ListAgents` that fails right after the
+    /// resubscribe must not leave the TUI on the stream it never reconciled
+    /// with. The subscriber resubscribes and resynchronizes again.
+    #[tokio::test]
+    async fn a_snapshot_that_could_not_be_read_is_retried_on_a_new_subscription() {
+        let expected = (Some("gen-b".to_string()), Some(SessionStatus::Working), 1);
+        let (seen, counters) = run_until(
+            ScriptedDaemon {
+                first_stream: vec![event("gen-a", EventType::SessionStart, 1)],
+                daemon: rolled_over_daemon(),
+                agents: vec![(AGENT, PANE)],
+                failing_lists: 1,
+            },
+            &[PANE],
+            &expected,
+        )
+        .await;
+        assert_eq!(
+            seen, expected,
+            "a failed snapshot must be retried, not taken as an empty one \
+             (generation, status, closures)"
+        );
+        assert!(
+            counters.lists.load(Ordering::SeqCst) >= 2
+                && counters.subscriptions.load(Ordering::SeqCst) >= 3,
+            "the retry must come from a fresh subscription and a second ListAgents"
+        );
+    }
+
+    /// Issue #1520 (Qodo on #1553): a conversation that ended while the stream
+    /// was down, with nothing succeeding it. The daemon's reply carries no
+    /// generation for the pane, and a second agent's generation in the same
+    /// reply shows that is an answer rather than an older daemon's silence, so
+    /// the TUI drops `gen-a` and counts it as closed. Control: with no record
+    /// that carries a generation — what a daemon from before the field sends —
+    /// the TUI's generation is left alone, since there absence proves nothing.
+    #[tokio::test]
+    async fn a_conversation_that_ended_during_the_gap_leaves_the_pane_without_one() {
+        let ended_daemon = || {
+            let mut daemon = AppState::default();
+            daemon.register_pane(PANE.to_string());
+            daemon.register_pane(OTHER_PANE.to_string());
+            daemon.apply_event(event("gen-a", EventType::SessionStart, 1));
+            daemon.apply_event(event("gen-a", EventType::SessionEnd, 2));
+            daemon.apply_event(event_on(
+                OTHER_PANE,
+                OTHER_AGENT,
+                "gen-x",
+                EventType::SessionStart,
+                3,
+            ));
+            assert_eq!(daemon.pane_hook_session_id(PANE), None);
+            daemon
+        };
+
+        let expected = (None, Some(SessionStatus::Idle), 1);
+        let (seen, _) = run_until(
+            ScriptedDaemon {
+                first_stream: vec![tool_start("gen-a", 1)],
+                daemon: ended_daemon(),
+                agents: vec![(AGENT, PANE), (OTHER_AGENT, OTHER_PANE)],
+                failing_lists: 0,
+            },
+            &[PANE, OTHER_PANE],
+            &expected,
+        )
+        .await;
+        assert_eq!(
+            seen, expected,
+            "the conversation that ended unseen must leave the pane, idle, counted as \
+             closed (generation, status, closures)"
+        );
+
+        // Control: the same daemon, but only the pane without a generation is
+        // listed, so nothing in the reply shows the field is supported.
+        let unchanged = (Some("gen-a".to_string()), Some(SessionStatus::Idle), 0);
+        let (seen, _) = run_until(
+            ScriptedDaemon {
+                first_stream: vec![tool_start("gen-a", 1)],
+                daemon: ended_daemon(),
+                agents: vec![(AGENT, PANE)],
+                failing_lists: 0,
+            },
+            &[PANE, OTHER_PANE],
+            &unchanged,
+        )
+        .await;
+        assert_eq!(
+            seen, unchanged,
+            "control: a reply with no generation anywhere cannot tell an ended conversation \
+             from an older daemon, so the TUI's generation must be left alone"
+        );
+    }
+
+    /// Issue #1520 (Greptile on #1553): the resync takes the snapshot's card
+    /// fields even when its stamp is not newer than the card's — absent, as from
+    /// a daemon before `last_activity_ms`, or equal after millisecond
+    /// truncation. The reply was built after everything the card holds, so it is
+    /// the newer account whatever its stamp says.
+    #[test]
+    fn a_resync_refreshes_the_card_without_a_newer_stamp() {
+        let mut tui = AppState::default();
+        tui.register_pane(PANE.to_string());
+        tui.apply_event(event("gen-a", EventType::SessionStart, 1));
+        tui.apply_event(tool_start("gen-a", 2));
+        let mut daemon = tui.clone();
+        daemon.apply_event(event("gen-a", EventType::Idle, 3));
+
+        let mut records: Vec<AgentRecord> = vec![
+            serde_json::from_value(serde_json::json!({ "id": AGENT, "pane_id_env": PANE }))
+                .unwrap(),
+        ];
+        daemon.attach_live_sessions(&mut records);
+        let snap = records[0]
+            .live
+            .as_mut()
+            .expect("the daemon has a live session");
+        assert_eq!(snap.status, SessionStatus::Idle);
+        snap.last_activity_ms = None;
+
+        tui.resync_after_event_gap(&records);
+        let status = tui
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(PANE))
+            .map(|s| s.status.clone());
+        assert_eq!(
+            status,
+            Some(SessionStatus::Idle),
+            "the card must show the daemon's status after a resync, stamp or no stamp"
         );
     }
 }

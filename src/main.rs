@@ -2460,6 +2460,8 @@ fn spawn_event_subscriber(
     let config = SubscriberConfig {
         #[cfg(feature = "e2e")]
         drop_event: Some(e2e_subscriber_drops),
+        #[cfg(feature = "e2e")]
+        break_on_event: Some(e2e_subscriber_breaks),
         ..SubscriberConfig::default()
     };
     tokio::spawn(run(DaemonClient::new(attach_path), state, config));
@@ -2488,6 +2490,29 @@ fn spawn_event_subscriber(
 fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
     std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
         .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
+}
+
+/// Issue #1520 e2e seam: tear this subscriber's stream down ONCE, losing the
+/// event that triggered it, the way a `KIND_STREAM_END "lagged"` loses whatever
+/// the daemon never forwarded — so a PTY test can make the deck reconnect at a
+/// moment it chooses, which neither a real lag (1024 unread broadcasts) nor a
+/// daemon restart (which takes the agents with it) gives it.
+/// `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` names `<pane id>/<EventType>`, the
+/// event type spelled as its `Debug` name (`Thinking`); `session/live/019`
+/// uses it. Compiled only into the `e2e` build, like the seam above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let Ok(target) = std::env::var("DOT_AGENT_DECK_E2E_BREAK_STREAM_ON") else {
+        return false;
+    };
+    let Some((pane, kind)) = target.split_once('/') else {
+        return false;
+    };
+    event.pane_id.as_deref() == Some(pane)
+        && format!("{:?}", event.event_type) == kind
+        && !FIRED.swap(true, Ordering::SeqCst)
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an

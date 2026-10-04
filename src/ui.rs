@@ -4032,25 +4032,6 @@ fn process_pending_seed_prompts(
             // Neither retyping into its successor nor accepting that successor's
             // events as confirmation is safe, so the delivery stops here with a
             // visible reason.
-            // Issue #1520: the event stream broke after this delivery may have
-            // written, so neither its target check nor its confirmation can
-            // trust the history below. See [`delivery_outlived_event_gap`].
-            if delivery_outlived_event_gap(snapshot, delivery) {
-                log_prompt_stopped(
-                    "seed",
-                    &sp.pane_id,
-                    &delivery.delivery_id,
-                    "event-stream-gap",
-                );
-                feedback = Some(
-                    "Seed prompt not confirmed (lost contact with the agent's events); \
-                     not retried"
-                        .to_string(),
-                );
-                backoff.remove(&sp.pane_id);
-                deliveries.remove(&sp.pane_id);
-                return false;
-            }
             if delivery_target_changed(snapshot, &sp.pane_id, delivery) {
                 log_prompt_stopped(
                     "seed",
@@ -4094,6 +4075,29 @@ fn process_pending_seed_prompts(
                     return false;
                 }
                 None => {}
+            }
+            // Issue #1520: the event stream broke after this delivery may have
+            // written, and no confirmation is on record, so a retry would act
+            // on a history with a hole in it. Placed AFTER the target check,
+            // which the resync's closure count still feeds, and after the
+            // confirmation, which a submission reported before the gap still
+            // satisfies; only the write below is what it stops. See
+            // [`delivery_outlived_event_gap`].
+            if delivery_outlived_event_gap(snapshot, delivery) {
+                log_prompt_stopped(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery.delivery_id,
+                    "event-stream-gap",
+                );
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
             }
         }
         // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
@@ -4685,8 +4689,15 @@ enum SubmissionEvidence {
 /// submitting them. Retrying could type the task into a successor conversation
 /// or submit it twice; confirming could take a successor's events as evidence.
 ///
-/// So the delivery stops, and writes nothing more — the same terminal outcome a
-/// counted closure already gives, chosen over a daemon-side closure counter
+/// So a delivery with no confirmation on record stops, and writes nothing more —
+/// the same terminal outcome a counted closure already gives. Both callers check
+/// this AFTER the target check and the confirmation (Greptile and Qodo on
+/// #1553). A conversation the resync proved ended is still caught first, as a
+/// changed target. A submission the agent reported, whether before the gap or on
+/// the resumed stream, records something that already happened, and confirming
+/// it writes nothing; what this stops is the RETRY, the one step that writes on
+/// the strength of the history. Stopping is chosen over a daemon-side closure
+/// counter
 /// because that needs a new wire field for an event (a broken subscription) that
 /// is rare, while stopping is safe with what the daemon already sends. A
 /// delivery that has written nothing (`None`) is untouched: it binds against the
@@ -5391,27 +5402,6 @@ fn deliver_orchestrator_prompt(
         // Reviewer findings B1/B2: the conversation we wrote into is GONE.
         // Neither retyping into its successor nor accepting that successor's
         // events as confirmation is safe.
-        // Issue #1520: see the seed path's twin and
-        // [`delivery_outlived_event_gap`].
-        if delivery_outlived_event_gap(snapshot, delivery) {
-            log_prompt_stopped(
-                "orchestrator",
-                &start_pane_id,
-                &delivery_id,
-                "event-stream-gap",
-            );
-            abandon_orchestrator_prompt(
-                ui,
-                tab_id,
-                &start_pane_id,
-                orchestrator_prompt,
-                now,
-                "Orchestrator prompt not confirmed (lost contact with the agent's events); \
-                 not retried"
-                    .to_string(),
-            );
-            return;
-        }
         if delivery_target_changed(snapshot, &start_pane_id, delivery) {
             log_prompt_stopped(
                 "orchestrator",
@@ -5458,6 +5448,28 @@ fn deliver_orchestrator_prompt(
                 start_role_index,
                 role_statuses,
                 orchestrator_prompt,
+            );
+            return;
+        }
+        // Issue #1520: see the seed path's twin — after the target check and
+        // the confirmation, before anything that could write — and
+        // [`delivery_outlived_event_gap`].
+        if delivery_outlived_event_gap(snapshot, delivery) {
+            log_prompt_stopped(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "event-stream-gap",
+            );
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+                 not retried"
+                    .to_string(),
             );
             return;
         }
@@ -38359,18 +38371,26 @@ mod tests {
         }
     }
 
-    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it.
+    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it, and a seed whose submission the agent reported before the stream broke is taken as delivered rather than reported unconfirmed.
     #[spec("prompt/pane-input/047")]
     #[test]
     fn pane_input_047_a_written_seed_stops_after_an_event_stream_gap() {
         const PROMPT: &str = "seed written before an event-stream gap";
-        for gap in [true, false] {
-            let case = if gap {
-                "event-stream gap"
-            } else {
-                "control: unbroken stream"
+        #[derive(Clone, Copy, PartialEq)]
+        enum Case {
+            Gap,
+            Unbroken,
+            ConfirmedBeforeGap,
+        }
+        for case_kind in [Case::Gap, Case::Unbroken, Case::ConfirmedBeforeGap] {
+            let (case, pane_id) = match case_kind {
+                Case::Gap => ("event-stream gap", "gap-pane"),
+                Case::Unbroken => ("control: unbroken stream", "unbroken-pane"),
+                Case::ConfirmedBeforeGap => {
+                    ("confirmed before the gap", "confirmed-before-gap-pane")
+                }
             };
-            let pane_id = if gap { "gap-pane" } else { "unbroken-pane" };
+            let gap = case_kind != Case::Unbroken;
             let agent_id = format!("{pane_id}-agent");
             let controller = Arc::new(RecordingPaneController::default());
             let writes = controller.writes.clone();
@@ -38391,20 +38411,36 @@ mod tests {
                  itself"
             );
 
-            let genuine = format!("{pane_id}-genuine-generation");
-            if gap {
-                // The subscriber's stream ends; while it is down the daemon sees
-                // the agent announce `genuine`. On resubscribing it re-reads the
-                // daemon's `ListAgents` reply, joined as the daemon joins it.
-                snapshot.note_event_stream_gap();
-                let mut daemon = snapshot.clone();
+            let genuine = announced_generation(pane_id);
+            if case_kind == Case::ConfirmedBeforeGap {
+                // The agent announces itself and reports submitting the seed, and
+                // the stream delivers both BEFORE it breaks; the render pass that
+                // would have confirmed it simply has not run yet.
                 apply_generation_event(
-                    &mut daemon,
+                    &mut snapshot,
                     pane_id,
                     &agent_id,
                     &genuine,
                     EventType::SessionStart,
                 );
+                apply_prompt_confirmation(&mut snapshot, pane_id, &agent_id, PROMPT);
+            }
+            if gap {
+                // The subscriber's stream ends; while it is down the daemon sees
+                // the agent announce `genuine` (if it had not already). On
+                // resubscribing it re-reads the daemon's `ListAgents` reply,
+                // joined as the daemon joins it.
+                snapshot.note_event_stream_gap();
+                let mut daemon = snapshot.clone();
+                if case_kind == Case::Gap {
+                    apply_generation_event(
+                        &mut daemon,
+                        pane_id,
+                        &agent_id,
+                        &genuine,
+                        EventType::SessionStart,
+                    );
+                }
                 let mut records: Vec<crate::agent_pty::AgentRecord> = vec![
                     serde_json::from_value(
                         serde_json::json!({ "id": agent_id, "pane_id_env": pane_id }),
@@ -38428,37 +38464,57 @@ mod tests {
                 );
             }
 
-            ui.send_retry_backoff
-                .get_mut(pane_id)
-                .expect("an unconfirmed write arms retry")
-                .next_attempt_at = std::time::Instant::now();
+            if let Some(backoff) = ui.send_retry_backoff.get_mut(pane_id) {
+                backoff.next_attempt_at = std::time::Instant::now();
+            }
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
             let records = writes.lock().unwrap().clone();
-            if gap {
-                assert_eq!(
-                    records.len(),
-                    1,
-                    "{case}: a seed written before the gap must not be written again — \
-                     the TUI cannot tell whether `{genuine}` is the conversation its bytes \
-                     entered or a successor of one that ended unseen; writes={records:?}"
-                );
-                assert!(
-                    !ui.prompt_delivery.contains_key(pane_id),
-                    "{case}: the delivery must stop, not stay armed"
-                );
-                let status = format!("{:?}", ui.status_message);
-                assert!(
-                    status.contains("lost contact with the agent's events"),
-                    "{case}: the stop must say why; status={status}"
-                );
-            } else {
-                assert_eq!(
-                    records.len(),
-                    2,
-                    "{case}: with no gap the retry goes into the announced conversation; \
-                     writes={records:?}"
-                );
+            let status = format!("{:?}", ui.status_message);
+            match case_kind {
+                Case::Gap => {
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "{case}: a seed written before the gap must not be written again — \
+                         the TUI cannot tell whether `{genuine}` is the conversation its \
+                         bytes entered or a successor of one that ended unseen; \
+                         writes={records:?}"
+                    );
+                    assert!(
+                        !ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the delivery must stop, not stay armed"
+                    );
+                    assert!(
+                        status.contains("lost contact with the agent's events"),
+                        "{case}: the stop must say why; status={status}"
+                    );
+                }
+                Case::Unbroken => {
+                    assert_eq!(
+                        records.len(),
+                        2,
+                        "{case}: with no gap the retry goes into the announced \
+                         conversation; writes={records:?}"
+                    );
+                }
+                Case::ConfirmedBeforeGap => {
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "{case}: a confirmed seed is never written again; \
+                         writes={records:?}"
+                    );
+                    assert!(
+                        !ui.prompt_delivery.contains_key(pane_id),
+                        "{case}: the confirmation finalizes the delivery"
+                    );
+                    assert!(
+                        !status.contains("lost contact"),
+                        "{case}: a submission the agent reported before the gap must be \
+                         taken as delivered, not reported as unconfirmed; status={status}"
+                    );
+                }
             }
         }
     }
