@@ -352,7 +352,7 @@ The status updates that drive a card carry the same token as the commands in the
 
 If an agent was restarted in its pane and its card keeps showing the previous agent, with no such line in the log, the new agent's updates are not saying which agent sent them: make sure `DOT_AGENT_DECK_AGENT_ID` is still set in the agent's environment (a wrapper script that resets the environment drops it), or detach and reattach the deck (in the desktop app, reconnect to the daemon) to refresh its cards.
 
-Agents you start yourself, outside the deck, need no token: their updates are accepted and they get a card of their own.
+Agents you start yourself, outside the deck, need no token: their updates are accepted and, in the TUI, they get a card of their own. The desktop app lists only the agents the deck started, so such an agent has no card there (see [Agents the deck did not start](session-management.md#agents-the-deck-did-not-start)).
 
 ### An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
 
