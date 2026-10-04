@@ -506,6 +506,7 @@ fn question_desktop_every_refusal_has_its_sentence() {
             "write_failed",
         ),
         (AnswerRefusal::KeyboardStarted, "keyboard_started"),
+        (AnswerRefusal::AnswerInProgress, "answer_in_progress"),
         (AnswerRefusal::Unknown, "unknown"),
     ];
     let mut sentences = std::collections::BTreeSet::new();
@@ -518,6 +519,7 @@ fn question_desktop_every_refusal_has_its_sentence() {
     }
     assert!(sentences.contains("No question is waiting in this agent."));
     assert!(sentences.contains("Couldn't send the answer: pane closed."));
+    assert!(sentences.contains("Another answer to tester is still being sent — nothing was sent."));
     // The agent did not confirm it took the answer: unknown, never "nothing
     // was sent" — and the same when the deck's report never came back after
     // the request was written.

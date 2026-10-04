@@ -1750,6 +1750,14 @@ where
     event
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
+    // PRD #1542 (Qodo #1561): a question from a session the pane has moved
+    // past is neither applied nor fanned out.
+    if state.strip_superseded_question(question_pane.as_deref(), &mut event, registry) {
+        debug!(
+            pane_id = ?question_pane.as_deref().map(escape_id_for_log),
+            "question: a question from a session the pane has moved past is not applied"
+        );
+    }
     // PRD #1542 (audit A4): the question's revision is the daemon's, stamped
     // here under the state lock that applies it, before the fan-out — so every
     // client's copy and the snapshot carry the same one.
@@ -11276,7 +11284,7 @@ mod question_hold_tests {
         assert!(
             deck.registry
                 .question_answers()
-                .is_answered(&a.pane, "per_silent"),
+                .is_answered(&a.pane, "per_silent", None),
             "an unconfirmed answer may have been taken, so it is not offered again"
         );
     }

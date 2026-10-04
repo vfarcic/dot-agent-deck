@@ -75,6 +75,7 @@ Nothing is sent, and the row says why, when:
 - the option you chose cannot be answered by voice: *“Chat about this” has to be answered by keyboard.*
 - the agent's questions cannot be answered by voice at all: *… 's questions have to be answered by keyboard.*
 - the daemon is older than the app and cannot answer questions: *This deck cannot answer questions by voice — update the deck to use it. Nothing was sent.*
+- another answer to the same agent is still being sent, for example from a second window: *Another answer to … is still being sent — nothing was sent.* Wait for that one to finish, then look at the pane before answering again.
 
 Two outcomes are not "nothing was sent":
 

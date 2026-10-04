@@ -5835,12 +5835,18 @@ pub(crate) async fn answer_question(
 ///
 /// **One answer per agent at a time, and not the same question twice in a
 /// row.** The agent's [`crate::agent_pty::QuestionAnswers::slot`] is held from
-/// the first read of the pending question to the last write, so a second
-/// client's answer waits and then finds the question gone; the pane's
-/// last-answered id ([`crate::agent_pty::QuestionAnswers::mark_answered`])
-/// refuses the question the deck last emitted an answer for there as stale even
-/// if its clearing event was not applied, or the producer raised it again under
-/// the same id. It is one id per pane, not a history.
+/// the first read of the pending question to the last write, and taken
+/// without waiting: a second client's answer that finds it held is refused at
+/// once with [`AnswerRefusal::AnswerInProgress`], never queued behind a slow
+/// delivery. The pane's last-answered mark
+/// ([`crate::agent_pty::QuestionAnswers::mark_answered`]) refuses the revision
+/// the deck last emitted an answer for there as stale even if its clearing
+/// event was not applied, and — once the answer is over and settled
+/// ([`crate::agent_pty::QuestionAnswers::settle_answered`]) — the same id at
+/// any revision, so the producer raising it again is refused too. A same-id
+/// replacement registered while the answer was being sent, and still pending
+/// when it ends, leaves the mark unsettled and stays answerable. It is one mark
+/// per pane, not a history.
 ///
 /// **The keys channel refuses a pane a human has typed into since the
 /// question arrived** ([`AnswerRefusal::KeyboardStarted`]): the daemon owns the
@@ -5871,7 +5877,11 @@ pub(crate) async fn answer_question_at(
     let pane_id = record.pane_id_env.clone();
     let pane = pane_id.as_deref().unwrap_or_default();
     let slot = registry.question_answers().slot(agent_id);
-    let _answering = slot.lock().await;
+    // Not waited for (Qodo #1561): an answer behind a slow delivery would only
+    // find its question gone or changed once that delivery ended.
+    let _answering = slot
+        .try_lock()
+        .map_err(|_| AnswerRefusal::AnswerInProgress)?;
     let (session_id, agent_type, question) = {
         let guard = state.read().await;
         let (session_id, question) = guard
@@ -5891,7 +5901,10 @@ pub(crate) async fn answer_question_at(
             current_id: Some(question.id),
         });
     }
-    if registry.question_answers().is_answered(pane, &question.id) {
+    if registry
+        .question_answers()
+        .is_answered(pane, &question.id, question.revision)
+    {
         // The deck already answered this one; its clear has not landed, or
         // the producer raised it again.
         return Err(AnswerRefusal::Stale { current_id: None });
@@ -5926,7 +5939,9 @@ pub(crate) async fn answer_question_at(
             if current
                 .as_ref()
                 .is_none_or(|q| q.id != question.id || q.revision != revision)
-                || registry.question_answers().is_answered(pane, &question.id)
+                || registry
+                    .question_answers()
+                    .is_answered(pane, &question.id, revision)
             {
                 return Err(AnswerRefusal::Stale {
                     current_id: current.map(|q| q.id),
@@ -5957,7 +5972,7 @@ pub(crate) async fn answer_question_at(
             };
             registry
                 .question_answers()
-                .mark_answered(pane, &question.id);
+                .mark_answered(pane, &question.id, revision);
             registry
                 .question_answers()
                 .barrier("answer_question:delivered")
@@ -5970,6 +5985,20 @@ pub(crate) async fn answer_question_at(
             // The human-input sequence number the deck's own last key was
             // committed at (audit N1); `None` until one is.
             let mut committed: Option<u64> = None;
+            // The mark this answer made covers the whole id from here, unless a
+            // same-id replacement registered while the keys were being typed is
+            // what is pending: that one was never answered (Qodo #1561). Asked
+            // under the pane's lifecycle, so nothing registers in between.
+            let settle_unless_replaced = |s: &crate::state::AppState| {
+                let replaced = s
+                    .pending_question_for(agent_id, pane_id.as_deref())
+                    .is_some_and(|(_, q)| q.id == question.id && q.revision != revision);
+                if !replaced {
+                    registry
+                        .question_answers()
+                        .settle_answered(pane, &question.id, revision);
+                }
+            };
             let typed_since = |committed: Option<u64>| {
                 registry.user_typed_since_question(pane, &question.id, revision, committed)
             };
@@ -6008,7 +6037,7 @@ pub(crate) async fn answer_question_at(
                         committed = Some(at);
                         registry
                             .question_answers()
-                            .mark_answered(pane, &question.id);
+                            .mark_answered(pane, &question.id, revision);
                     }
                     Err(detail) => {
                         // Audit T1: with nothing typed, a question that is no
@@ -6050,11 +6079,9 @@ pub(crate) async fn answer_question_at(
                             // stored question no longer describes what is on
                             // screen, so it is the keyboard's from here (S2).
                             let _lifecycle = registry.question_answers().lock_lifecycle(pane).await;
-                            state.write().await.mark_pending_question_keyboard_only(
-                                pane,
-                                &question.id,
-                                revision,
-                            );
+                            let mut guard = state.write().await;
+                            settle_unless_replaced(&guard);
+                            guard.mark_pending_question_keyboard_only(pane, &question.id, revision);
                             warn!(
                                 agent_id = %agent_id,
                                 question_id = %question.id,
@@ -6111,6 +6138,16 @@ pub(crate) async fn answer_question_at(
         state, event_tx, registry, &lifecycle, event, None, replaced,
     )
     .await;
+    // The answer is over: its mark covers the whole id from here, so the
+    // producer raising it again is refused — unless the same-id replacement
+    // `replaced` left pending is what is there, which was never answered and
+    // stays answerable (Qodo #1561). Under the lifecycle, so nothing registers
+    // between this check and the settle.
+    if !replaced(&*state.read().await) {
+        registry
+            .question_answers()
+            .settle_answered(pane, &question.id, revision);
+    }
     drop(lifecycle);
     // A held answer is reported only once its handler has written it — and,
     // for a producer that acknowledges (OpenCode's plugin), once the agent has
@@ -11291,6 +11328,208 @@ mod question_answer_tests {
             fx.state.read().await.sessions[LATE].status,
             SessionStatus::Idle
         );
+    }
+
+    /// A Codex question with one multiple-choice question, answered by a
+    /// single key.
+    fn codex_single(id: &str, prompt: &str) -> PendingQuestion {
+        let input = serde_json::json!({"questions": [
+            {"id": "colour", "question": prompt, "options": [{"label": "Red"}, {"label": "Green"}]}
+        ]});
+        crate::question::codex_request_user_input(Some(id), Some(&input), 1, None).unwrap()
+    }
+
+    /// Scenario: A voice answer to a Codex prompt is held up part way through
+    /// being sent when a second answer to the same agent arrives. The second
+    /// is refused at once with "an answer is already being sent" instead of
+    /// waiting behind the first, and the first then completes, typing its key
+    /// once.
+    #[spec("question/answer/016")]
+    #[tokio::test]
+    async fn question_answer_016_a_second_answer_is_refused_while_one_is_being_sent() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_busy", "Which colour?"))
+            .await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let first = fx.answer_task("call_busy", vec![one(0, 2)], false);
+        reached.await.expect("the first answer is being sent");
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.answer("call_busy", &[(0, &[1], None)], false),
+        )
+        .await
+        .expect("the second answer is refused at once, not queued behind the first");
+        assert_eq!(second, Err(AnswerRefusal::AnswerInProgress));
+        resume.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Ok(()), "the first answer completes");
+        assert!(
+            fx.screen_shows("2").await,
+            "the first answer's key was typed"
+        );
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "the refused answer typed nothing"
+        );
+        assert_eq!(fx.pending().await, None);
+    }
+
+    /// Scenario: The deck has just typed the key answering a Codex prompt when,
+    /// before it records that it answered, the agent raises a new prompt under
+    /// the same id. The new prompt stays pending and is answered by voice as
+    /// usual — it is not refused as already answered — while the same prompt
+    /// raised again once that answer is over is still refused.
+    #[spec("question/answer/017")]
+    #[tokio::test]
+    async fn question_answer_017_a_replacement_during_a_key_answer_stays_answerable() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_mark", "Which colour?"))
+            .await;
+        let first_revision = fx.pending_question().await.unwrap().revision;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:key_written");
+        let answering = fx.answer_task("call_mark", vec![one(0, 2)], false);
+        reached.await.expect("the key was written");
+        let replacement = codex_single("call_mark", "Which shade?");
+        fx.ask_ingested(&replacement).await;
+        let replaced_revision = fx.pending_question().await.unwrap().revision;
+        assert_ne!(replaced_revision, first_revision);
+        resume.send(()).unwrap();
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("2").await);
+        let pending = fx.pending_question().await.expect("the replacement");
+        assert_eq!(pending.revision, replaced_revision);
+        assert_eq!(pending.questions[0].prompt, "Which shade?");
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "call_mark",
+                replaced_revision,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Ok(()),
+            "the replacement is answerable"
+        );
+        assert!(
+            fx.screen_shows("21").await,
+            "the replacement's key was typed"
+        );
+        // That answer is over: the same id raised again is refused.
+        fx.ask(&replacement).await;
+        assert_eq!(
+            fx.answer("call_mark", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+    }
+
+    /// Scenario: An agent's pane has moved on to a new conversation, which is
+    /// holding a permission prompt for an answer. A question event from the
+    /// conversation the pane left then arrives late, stamped with the current
+    /// time. The live prompt stays the pane's question at its revision and
+    /// stays held — the late question neither replaces it nor lets its holder
+    /// go — and the live prompt is still answered by voice.
+    #[spec("question/hold/017")]
+    #[tokio::test]
+    async fn question_hold_017_a_late_question_from_a_superseded_session_leaves_the_live_one() {
+        const NEW: &str = "question-answer-new-session";
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut moved = fx.event(EventType::SessionStart);
+        moved.session_id = NEW.into();
+        moved.agent_type = AgentType::ClaudeCode;
+        crate::daemon::ingest_event(&fx.state, &fx.event_tx, &fx.registry, moved).await;
+        let mut asked = fx.event(EventType::PermissionRequest);
+        asked.session_id = NEW.into();
+        asked.set_question(&claude_bash());
+        let mut held = crate::daemon::register_and_publish_held(
+            &fx.state,
+            &fx.event_tx,
+            &fx.registry,
+            PANE,
+            &fx.agent_id,
+            asked,
+        )
+        .await
+        .expect("the live question is held")
+        .rx;
+        let live = fx
+            .state
+            .read()
+            .await
+            .pending_question_on_pane(PANE)
+            .unwrap();
+        assert_eq!(live.id, "q-bash");
+
+        let mut late = fx.event(EventType::PermissionRequest);
+        late.set_question(
+            &crate::question::claude_permission_request(
+                "q-late".into(),
+                "Bash",
+                None,
+                Some("rm -rf build".into()),
+                None,
+                1,
+                None,
+            )
+            .question,
+        );
+        assert_eq!(late.session_id, SESSION, "from the session the pane left");
+        let mut clients = fx.event_tx.subscribe();
+        crate::daemon::ingest_event(&fx.state, &fx.event_tx, &fx.registry, late).await;
+        while let Ok(msg) = clients.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                assert_eq!(
+                    event.question(),
+                    None,
+                    "no client is shown the late question"
+                );
+            }
+        }
+
+        let now = fx.state.read().await.pending_question_on_pane(PANE);
+        assert_eq!(
+            now.as_ref().map(|q| (q.id.as_str(), q.revision)),
+            Some(("q-bash", live.revision)),
+            "the live question is still the pane's"
+        );
+        assert!(fx.registry.question_holds().is_held(PANE, "q-bash"));
+        assert!(
+            matches!(
+                held.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the live question's holder was not let go"
+        );
+        // Stands in for the hook loop's handler, as `hold_ingested` does.
+        let producer = tokio::spawn(async move {
+            let held = held.await.expect("the live holder hears the answer");
+            if let Some(delivery) = held.delivery {
+                let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+            }
+            held.reply
+        });
+        answer_question_at(
+            &fx.registry,
+            &fx.state,
+            &fx.event_tx,
+            &fx.agent_id,
+            "q-bash",
+            live.revision,
+            &[one(0, 1)],
+            false,
+        )
+        .await
+        .expect("the live question is answered");
+        assert_eq!(producer.await.unwrap().outcome, ReplyOutcome::Answered);
     }
 
     /// Scenario: The user answers a permission prompt with "no" by voice. The

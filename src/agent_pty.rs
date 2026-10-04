@@ -5425,19 +5425,27 @@ impl HeldQuestions {
 /// two answers can never both reach the agent.
 ///
 /// - **One answer at a time per agent.** [`Self::slot`] is a lock the handler
-///   holds from its first read of the pending question to its last write, so a
-///   second client's answer waits and then re-reads a question the first one
-///   has already cleared. A slot holds nothing else, so pruning an idle one
-///   loses nothing.
+///   holds from its first read of the pending question to its last write. It
+///   is taken with `try_lock`, never waited for: a second client's answer that
+///   finds it held is refused at once
+///   ([`crate::question::AnswerRefusal::AnswerInProgress`]) rather than queued
+///   behind a delivery that may be slow, since by the time that delivery
+///   lands the question it names is gone or changed. A slot holds nothing
+///   else, so pruning an idle one loses nothing.
 /// - **Not answered twice in a row.** [`Self::mark_answered`] remembers, per
-///   pane, the id of the LAST question the deck emitted an answer for, so that
-///   question is refused even if the event that clears it was not applied, or
-///   if the producer raises it again under the same id before anything else is
-///   answered there. It is one id per pane, not a history: once the deck
-///   answers another question on the pane, an earlier id raised again is no
-///   longer recognised. Kept per pane and never pruned while the daemon runs —
-///   one id per pane ever seen, the same bound the registry's per-pane dispatch
-///   locks accept.
+///   pane, the LAST question the deck emitted an answer for — its id and the
+///   revision answered — so that revision is refused even if the event that
+///   clears it was not applied. Once the answer is settled
+///   ([`Self::settle_answered`]) the mark covers the id at every revision, so
+///   the producer raising it again under the same id before anything else is
+///   answered there is refused too. A same-id replacement registered while the
+///   answer was still being sent is not covered: the mark is not settled when
+///   the replacement is what is pending at the end (audit A4, Qodo #1561), so
+///   the replacement stays answerable. It is one id per pane, not a history:
+///   once the deck answers another question on the pane, an earlier id raised
+///   again is no longer recognised. Kept per pane and never pruned while the
+///   daemon runs — one mark per pane ever seen, the same bound the registry's
+///   per-pane dispatch locks accept.
 /// - **When the question arrived.** [`Self::note_pending`] records, per pane,
 ///   the pending question's id and revision and the human-input sequence
 ///   number at the moment the daemon first saw that revision (audit N1), so the
@@ -5490,7 +5498,7 @@ pub struct QuestionAnswers {
     lifecycles: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Shared with every [`AnswerGate`], which reads it on a PTY thread.
     raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
-    answered: Mutex<HashMap<String, String>>,
+    answered: Mutex<HashMap<String, AnsweredMark>>,
     #[cfg(test)]
     barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
 }
@@ -5499,6 +5507,16 @@ pub struct QuestionAnswers {
 /// "resume" receiver of one armed barrier.
 #[cfg(test)]
 type QuestionBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// The last question the deck answered on a pane — see
+/// [`QuestionAnswers::mark_answered`].
+struct AnsweredMark {
+    id: String,
+    revision: Option<u64>,
+    /// Covers `id` at every revision, not only `revision` — set by
+    /// [`QuestionAnswers::settle_answered`].
+    settled: bool,
+}
 
 /// The question pending on a pane, as [`QuestionAnswers::note_pending`] saw it
 /// arrive.
@@ -5684,23 +5702,48 @@ impl QuestionAnswers {
             .map(|seen| seen.input_seq)
     }
 
-    /// Whether the deck already emitted an answer for `question_id` on
-    /// `pane_id`.
-    pub fn is_answered(&self, pane_id: &str, question_id: &str) -> bool {
+    /// Whether the deck already emitted an answer for `question_id` at
+    /// `revision` on `pane_id` — or for `question_id` at any revision, once
+    /// that answer was settled ([`Self::settle_answered`]).
+    pub fn is_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) -> bool {
         self.answered
             .lock()
             .unwrap()
             .get(pane_id)
-            .is_some_and(|id| id == question_id)
+            .is_some_and(|mark| {
+                mark.id == question_id && (mark.settled || mark.revision == revision)
+            })
     }
 
-    /// Record that the deck emitted (part of) an answer for `question_id` on
-    /// `pane_id`.
-    pub fn mark_answered(&self, pane_id: &str, question_id: &str) {
-        self.answered
-            .lock()
-            .unwrap()
-            .insert(pane_id.to_string(), question_id.to_string());
+    /// Record that the deck emitted (part of) an answer for `question_id` at
+    /// `revision` on `pane_id`. Until it is settled the mark covers that
+    /// revision only, so a same-id replacement registered while the answer is
+    /// still being sent is not refused as already answered.
+    pub fn mark_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
+        self.answered.lock().unwrap().insert(
+            pane_id.to_string(),
+            AnsweredMark {
+                id: question_id.to_string(),
+                revision,
+                settled: false,
+            },
+        );
+    }
+
+    /// Widen the mark [`Self::mark_answered`] made for `question_id` at
+    /// `revision` on `pane_id` to the id at every revision, when it is still
+    /// the pane's mark — so the producer raising the answered question again
+    /// is refused. Called under the pane's question lifecycle once the answer
+    /// is over, and only when the pane's pending question is not a same-id
+    /// replacement registered while it was being sent: that one was never
+    /// answered and stays answerable.
+    pub fn settle_answered(&self, pane_id: &str, question_id: &str, revision: Option<u64>) {
+        if let Some(mark) = self.answered.lock().unwrap().get_mut(pane_id)
+            && mark.id == question_id
+            && mark.revision == revision
+        {
+            mark.settled = true;
+        }
     }
 
     /// Forget that the deck answered `question_id` on `pane_id`, when it is
@@ -5708,7 +5751,10 @@ impl QuestionAnswers {
     /// the answer, so the same question raised again must be answerable.
     pub fn unmark_answered(&self, pane_id: &str, question_id: &str) {
         let mut answered = self.answered.lock().unwrap();
-        if answered.get(pane_id).is_some_and(|id| id == question_id) {
+        if answered
+            .get(pane_id)
+            .is_some_and(|mark| mark.id == question_id)
+        {
             answered.remove(pane_id);
         }
     }

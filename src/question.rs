@@ -259,6 +259,10 @@ pub enum AnswerRefusal {
     /// (OpenCode's plugin), and no report came back in time: the agent may or
     /// may not have it. The user checks the agent before answering again.
     Unconfirmed,
+    /// Another answer to the same agent is still being sent. Refused at once
+    /// rather than queued behind it: once that answer lands, the question this
+    /// one names is gone or changed. Nothing was sent.
+    AnswerInProgress,
     #[serde(other)]
     Unknown,
 }
@@ -283,6 +287,7 @@ impl std::fmt::Display for AnswerRefusal {
                 f,
                 "the agent did not confirm it took the answer; it may have — check the agent"
             ),
+            Self::AnswerInProgress => write!(f, "another answer to this agent is being sent"),
             Self::Unknown => write!(f, "refused"),
         }
     }
@@ -2495,6 +2500,8 @@ mod tests {
             AnswerRefusal::ChannelGone,
             AnswerRefusal::WriteFailed { detail: "w".into() },
             AnswerRefusal::KeyboardStarted,
+            AnswerRefusal::Unconfirmed,
+            AnswerRefusal::AnswerInProgress,
         ] {
             let resp = crate::daemon_protocol::AttachResponse {
                 ok: false,

@@ -943,6 +943,10 @@ pub fn refusal_outcome(
                 "{agent}'s prompt was typed into after it asked, so the deck won't type the answer there — finish it by keyboard."
             ),
         ),
+        AnswerRefusal::AnswerInProgress => (
+            "answer_in_progress",
+            format!("Another answer to {agent} is still being sent — nothing was sent."),
+        ),
         // Reported by `report_outcome` as `unconfirmed`, not as a refusal.
         AnswerRefusal::Unconfirmed => return unconfirmed_outcome(agent, Some("unconfirmed")),
         AnswerRefusal::Unknown => (

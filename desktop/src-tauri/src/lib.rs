@@ -3638,9 +3638,16 @@ async fn desktop_voice_question(
     }
     validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
     let agent = voice_agent_name(&agent);
-    let settings = crate::settings::load_settings_without_decks()
-        .voice
-        .unwrap_or_default();
+    // Read per call, for `desktop_voice_resolve`'s reason, and off the async
+    // runtime: it is a file read, and a stalled one must not hold up the
+    // runtime every other command shares.
+    let settings = tauri::async_runtime::spawn_blocking(|| {
+        crate::settings::load_settings_without_decks()
+            .voice
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| safe_message(format!("reading the voice settings failed: {error}")))?;
     let resolver = voice::resolver_for(&settings.intent, Arc::new(KeychainSecretStore::new()));
     let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
         // Nothing is waiting any more: the utterance is the user's next

@@ -7183,6 +7183,20 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** a session leaving a pane, which no event can do while the pane's lifecycle is held.
 - **Platform coverage:** mac+linux.
 
+##### question/answer/016 — A second answer while one is being sent is refused at once.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after the first answer is validated).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** while one answer to an agent is stopped part way, a second answer to the same agent is refused with `answer_in_progress` within 2 s instead of waiting for the agent's answer slot; the first then completes and its key is typed once, and the refused answer types nothing.
+- **Does not assert:** answers to two different agents, which never share a slot.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/017 — A same-id replacement during a key answer stays answerable.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after the key is written and before the answer is marked).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a question raised again under the same id with other content, at the moment the deck's key has been written, stays pending at its new revision and is answered by its own key rather than refused as already answered; once that answer is over, the same id raised again is refused as stale.
+- **Does not assert:** whether the replacement was a new prompt or a redraw of the answered one, which the deck cannot tell apart.
+- **Platform coverage:** mac+linux.
+
 #### question/desktop
 
 The desktop half of answering by voice. These tests live in the desktop crate (`desktop/src-tauri/src/voice/question_tests.rs`, run by `cargo test-fast`) and the webview (`desktop/src/components/VoiceQuestion.test.tsx`, run by `pnpm test` in `desktop/`), which linkage-check does not walk, so they are named here by test rather than as `#[spec]` IDs.
@@ -7312,6 +7326,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Agent:** none (captured OpenCode 1.18.34 `permission.asked`).
 - **Asserts:** `await-answer --ack`'s hold carries `ack`; the child prints OpenCode's `once` reply, then passes the plugin's report — OpenCode refused it, and why — to the daemon on the same connection; a report that never comes or does not parse is passed on as nothing.
 - **Does not assert:** the daemon's handling of the report (`question/hold/015`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/017 — A late question from a superseded session leaves the live one.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the daemon's own ingest and hold registration).
+- **Agent:** none (`/bin/cat` stand-in for Claude Code).
+- **Asserts:** after the pane moves to a new hook session that holds a permission prompt, a question event from the session it left — with a fresh timestamp — neither becomes the pane's question nor reaches a client's copy of the event; the live question keeps its revision and its hold, and is then answered.
+- **Does not assert:** a late event from the current session with an older timestamp, which is applied as before.
 - **Platform coverage:** mac+linux.
 
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]

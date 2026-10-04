@@ -4153,12 +4153,8 @@ impl AppState {
         // a new session's start whatever its clock says, and a report on a pane
         // with no generation yet.
         let live_agent_id = registry.pane_current_agent_id(&pane_id);
-        let superseded = self
-            .waiting_superseded_sessions
-            .get(&pane_id)
-            .is_some_and(|superseded| {
-                superseded.agent_id == live_agent_id && superseded.contains(&event_session_id)
-            });
+        let superseded =
+            self.is_superseded_session(&pane_id, live_agent_id.as_deref(), &event_session_id);
         let from_current_generation = !superseded
             && match &generation_before {
                 Some((current, current_ts)) if *current == event_session_id => {
@@ -4231,6 +4227,52 @@ impl AppState {
                 "waiting notice: the worker left WaitingForInput; episode closed"
             );
         }
+    }
+
+    /// PRD #1542 (Qodo #1561): drop the question `event` raises when it comes
+    /// from a hook session its pane has moved past — a late OpenCode
+    /// `question.asked` from the conversation before a `/clear`, say. That
+    /// conversation is over: applied, its question would be the newest pending
+    /// one on the pane (its timestamp is fresh) and reconciliation would let
+    /// the live question's holder go. The rest of the event is applied as
+    /// before. The daemon calls this under the `AppState` write lock that
+    /// applies the event, before it is broadcast, so no client sees the
+    /// question either. `pane_id` is the pane the event lands on — the one it
+    /// names, or its session's. Returns whether a question was dropped.
+    pub fn strip_superseded_question(
+        &self,
+        pane_id: Option<&str>,
+        event: &mut AgentEvent,
+        registry: &AgentPtyRegistry,
+    ) -> bool {
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+        if event.question().is_none() {
+            return false;
+        }
+        let live_agent_id = registry.pane_current_agent_id(pane_id);
+        if !self.is_superseded_session(pane_id, live_agent_id.as_deref(), &event.session_id) {
+            return false;
+        }
+        event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        true
+    }
+
+    /// Issue #447: whether `session_id` is a hook session `pane_id` has moved
+    /// past while `live_agent_id` owned it — see
+    /// [`Self::waiting_superseded_sessions`].
+    fn is_superseded_session(
+        &self,
+        pane_id: &str,
+        live_agent_id: Option<&str>,
+        session_id: &str,
+    ) -> bool {
+        self.waiting_superseded_sessions
+            .get(pane_id)
+            .is_some_and(|superseded| {
+                superseded.agent_id.as_deref() == live_agent_id && superseded.contains(session_id)
+            })
     }
 
     /// Issue #447: open a waiting episode for `pane_id`, whose status is
