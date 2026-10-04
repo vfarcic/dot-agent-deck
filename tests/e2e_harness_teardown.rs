@@ -15,8 +15,46 @@
 
 mod common;
 
+use std::path::PathBuf;
+
 use common::TuiDeck;
 use spec::spec;
+
+const DELIBERATE_PANIC: &str = "deliberate panic with a live deck (issue #1566)";
+
+/// Moves an existing paired `test.md` out of the way and restores it on drop,
+/// so the test can observe whether the drop under test writes one without
+/// destroying a doc a developer generated. Leaves the path untouched when there
+/// was nothing to set aside.
+struct RestorePairedDoc {
+    path: PathBuf,
+    saved: Option<Vec<u8>>,
+}
+
+impl RestorePairedDoc {
+    fn set_aside(path: PathBuf) -> Self {
+        let saved = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("read existing {}: {e}", path.display()),
+        };
+        if saved.is_some() {
+            std::fs::remove_file(&path)
+                .unwrap_or_else(|e| panic!("set aside {}: {e}", path.display()));
+        }
+        Self { path, saved }
+    }
+}
+
+impl Drop for RestorePairedDoc {
+    fn drop(&mut self) {
+        if let Some(bytes) = &self.saved
+            && let Err(e) = std::fs::write(&self.path, bytes)
+        {
+            eprintln!("could not restore {}: {e}", self.path.display());
+        }
+    }
+}
 
 /// Scenario: On a thread named after this test, start the deck on the minimal
 /// fixture, wait for the dashboard, and panic with the deck still alive, as a
@@ -29,12 +67,10 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
     let recordings = common::current_test_recordings_dir();
     let paired_doc = recordings.join("test.md");
     // A previous `DOT_AGENT_DECK_RECORD=1` run or `cargo xtask docs --tests`
-    // may have left one; the assertion below is about THIS drop writing it.
-    match std::fs::remove_file(&paired_doc) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("remove stale {}: {e}", paired_doc.display()),
-    }
+    // may have left one, and the launch-time discard keeps it on purpose so a
+    // developer browsing it does not lose it. The assertion below is about THIS
+    // drop writing it, so set it aside and put it back however the test ends.
+    let _restore = RestorePairedDoc::set_aside(paired_doc.clone());
 
     // The harness names the deck, and so its recordings directory and the
     // `#[spec]` function the regeneration looks up, after the current thread.
@@ -50,13 +86,22 @@ fn teardown_001_a_panicking_test_skips_the_paired_doc_regeneration() {
         .spawn(|| {
             let deck = TuiDeck::builder().launch_with_fixture("minimal");
             deck.wait_for_string("No active agents");
-            panic!("deliberate panic with a live deck (issue #1566)");
+            panic!("{DELIBERATE_PANIC}");
         })
         .expect("spawn the panicking thread")
         .join();
-    assert!(
-        joined.is_err(),
-        "the deck thread must have panicked, or its drop never took the failure path"
+    // The deliberate panic specifically: a launch or `wait_for_string` timeout
+    // also panics with the deck alive and takes the same failure path, so
+    // accepting any panic would let a deck that never started pass this test.
+    let payload = joined.expect_err("the deck thread must have panicked");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert_eq!(
+        message, DELIBERATE_PANIC,
+        "the deck thread panicked before reaching the deliberate panic"
     );
 
     // Control: the drop really ran its failure dump, so the doc's absence below
