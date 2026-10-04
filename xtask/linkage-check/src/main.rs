@@ -68,6 +68,10 @@
 //!   behind by SIGKILLed test processes. Decides by whether the owning PID
 //!   in the `dad-tests-<pid>-*` name is still alive rather than by age
 //!   (issue #461). Dry-run unless `--apply`.
+//! - `affected-checks` — issue #1575: prints the checks a change needs,
+//!   from the merge-base with `origin/main` to the working tree (or the paths
+//!   given): CLAUDE.md rule 2's and rule 5's full gates for code or a build
+//!   input, and the tests that read them for text. See [`affected_checks`].
 //! - `list-tests` — PRD #77 Decision 31: emits a Markdown report of
 //!   every `#[spec]` test created or modified in this branch versus
 //!   `origin/main`, plus per-catalog-entry prose diffs and any
@@ -82,6 +86,10 @@
 /// lives in the scripts, and their whole value is runtime behaviour, so a
 /// compile-time gate proves nothing about them (the same reason `clean_tmp`'s
 /// deletion-safety properties are tested here rather than trusted).
+/// Issue #1575: `cargo xtask affected-checks`, which says which of CLAUDE.md
+/// rule 2's and rule 5's gates a change needs — the full gates for code or a
+/// build input, the tests that read them for text.
+mod affected_checks;
 #[cfg(all(test, unix))]
 mod build_gate;
 mod clean_tmp;
@@ -1538,6 +1546,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("site")) {
         return xtask_site::run(&repo_root(), &args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("affected-checks")) {
+        return affected_checks::run(&repo_root(), &args[1..]);
     }
     // Accepted anywhere in the remaining args, because the `linkage-check`
     // subcommand name itself is optional: `cargo xtask --list-rules` and
