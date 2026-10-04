@@ -13,12 +13,13 @@
 //! allowlist — the stimulus moves, the isolation does not.
 //!
 //! A probe is named with `--probe`, or selected by `--probe auto` from the
-//! branch's `dispatch-issue-<n>` path component ([`Probe::for_branch`]), and
-//! ONLY runs in the reverse direction: that is the pairing that executes a
-//! daemon-side change. Auto never falls back: a branch it cannot tie to one
-//! probe — no such component, more than one, or an issue no probe was written
-//! for — is refused, and `--probe generic` (the four tells plus the `role-set`
-//! tell, and no stimulus) is how to ask for that run on purpose. The evidence
+//! issue number in the branch's `dispatch-issue-<n>[-<slug>]` path component
+//! ([`Probe::for_branch`]), and ONLY runs in the reverse direction: that is the
+//! pairing that executes a daemon-side change. Auto never falls back: a branch
+//! it cannot tie to one probe — no such component, more than one issue, or an
+//! issue no probe was written for — is refused, and `--probe generic` (the
+//! four tells plus the `role-set` tell, and no stimulus) is how to ask for that
+//! run on purpose. The evidence
 //! file names the probe and how it was chosen, so it never implies more was
 //! measured.
 
@@ -64,18 +65,29 @@ pub enum Probe {
 }
 
 /// The path component a dispatched branch carries its issue number in, as
-/// `dispatch-issue-<n>` (`agent/dispatch-issue-1181`).
+/// `dispatch-issue-<n>` (`agent/dispatch-issue-1181`), or
+/// `dispatch-issue-<n>-<slug>` when the unit's name carries a slug
+/// (`agent/dispatch-issue-1540-shared-last-command`).
 const ISSUE_COMPONENT: &str = "dispatch-issue-";
 
-/// The issue number in one path component, when the WHOLE component is
-/// `dispatch-issue-<digits>` — so `dispatch-issue-1181-v2` and
-/// `dispatch-issue-1109-1121` name none.
-fn component_issue(component: &str) -> Option<u32> {
-    let digits = component.strip_prefix(ISSUE_COMPONENT)?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+/// The issue numbers one path component names: the `-`-separated segments
+/// after `dispatch-issue-` that are all digits, up to the first that is not,
+/// which starts the slug and ends the list (issue #1563). So
+/// `dispatch-issue-1181-v2` names #1181, a coupled unit's
+/// `dispatch-issue-1109-1121` names both, and `dispatch-issue-11a81` none. A
+/// number later in the slug (`dispatch-issue-1181-v2-1109`) is never taken as an
+/// issue.
+fn component_issues(component: &str) -> Vec<u32> {
+    let Some(rest) = component.strip_prefix(ISSUE_COMPONENT) else {
+        return Vec::new();
+    };
+    rest.split('-')
+        .map_while(|seg| {
+            (!seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| seg.parse().ok())
+                .flatten()
+        })
+        .collect()
 }
 
 impl Probe {
@@ -91,36 +103,40 @@ impl Probe {
     /// the issue it was selected by — or why auto cannot select one, for the
     /// caller to refuse the run with.
     ///
-    /// The issue is read from exactly one path component that is exactly
-    /// `dispatch-issue-<n>`, never from wherever digits happen to appear:
-    /// taking the last run of digits selected `generic` for
+    /// The issue is read from the path components that start
+    /// `dispatch-issue-` ([`component_issues`]), never from wherever digits
+    /// happen to appear: taking the last run of digits selected `generic` for
     /// `agent/dispatch-issue-1181-v2` and #1121's probe for
-    /// `agent/dispatch-issue-1109-1121` (Greptile, PR #1210). Anything short
-    /// of one component naming an issue a probe was written for is refused
-    /// rather than run as `generic`, because in reverse the branch-specific
-    /// probe is the point: a silent downgrade would produce an evidence file
-    /// that measured nothing the branch changed. Every refusal names each
-    /// issue with a probe whose number the branch name contains anywhere, as a
-    /// hint, never as a selection.
+    /// `agent/dispatch-issue-1109-1121` (Greptile, PR #1210). The branch must
+    /// name exactly one issue: a coupled unit's `dispatch-issue-<a>-<b>` names
+    /// two and is refused like two components are, because a run carries one
+    /// probe and neither number is more likely the branch's than the other.
+    /// Anything short of one issue a probe was written for is refused rather
+    /// than run as `generic`, because in reverse the branch-specific probe is
+    /// the point: a silent downgrade would produce an evidence file that
+    /// measured nothing the branch changed. Every refusal names each issue with
+    /// a probe whose number the branch name contains anywhere, as a hint, never
+    /// as a selection.
     pub fn for_branch(branch: &str) -> Result<(Probe, u32), String> {
         const ASK: &str = "Pass `--probe <name>` for the probe written for this branch's change, \
                            or `--probe generic` for the four tells plus `role-set` and no \
                            branch-specific stimulus.";
-        let issues: BTreeSet<u32> = branch.split('/').filter_map(component_issue).collect();
+        let issues: BTreeSet<u32> = branch.split('/').flat_map(component_issues).collect();
         let issue = match issues.iter().copied().collect::<Vec<_>>()[..] {
             [issue] => issue,
             [] => {
                 return Err(format!(
                     "`--probe auto` cannot identify the probe for `{branch}`: no path component \
-                     of it is exactly `{ISSUE_COMPONENT}<n>`, the form a dispatched branch carries \
-                     its issue number in.{} {ASK}",
+                     of it is `{ISSUE_COMPONENT}<n>` or `{ISSUE_COMPONENT}<n>-<slug>`, the forms a \
+                     dispatched branch carries its issue number in.{} {ASK}",
                     mentioned(branch)
                 ));
             }
             ref several => {
                 return Err(format!(
-                    "`--probe auto` cannot identify the probe for `{branch}`: it has more than \
-                     one `{ISSUE_COMPONENT}<n>` component (issues {}).{} {ASK}",
+                    "`--probe auto` cannot identify the probe for `{branch}`: it names more than \
+                     one issue (issues {}) — a coupled unit's `{ISSUE_COMPONENT}<a>-<b>`, or more \
+                     than one `{ISSUE_COMPONENT}` component — and a run carries one probe.{} {ASK}",
                     several
                         .iter()
                         .map(|i| format!("#{i}"))
@@ -487,36 +503,58 @@ mod tests {
         }
     }
 
-    /// Greptile's finding on PR #1210: the last run of digits selected
-    /// `generic` here, silently.
+    /// Issue #1563: a dispatched unit is named `issue-<n>-<slug>` as often as
+    /// `issue-<n>`, and refusing the slugged form sent every such unit to
+    /// `--probe generic`. Greptile's finding on PR #1210 still holds: the issue
+    /// is the number the component STARTS with, never the last run of digits,
+    /// which selected `generic` for `1181-v2`.
     #[test]
-    fn a_suffixed_branch_is_refused_not_downgraded_to_generic() {
-        let err =
-            Probe::for_branch("agent/dispatch-issue-1181-v2").expect_err("no exact component");
-        assert!(err.contains("exactly `dispatch-issue-<n>`"), "{err}");
-        assert!(
-            err.contains("#1181 (`git-env`)"),
-            "names the likely probe: {err}"
-        );
-        assert!(err.contains("--probe generic"), "{err}");
+    fn a_slugged_branch_selects_the_probe_of_the_issue_it_starts_with() {
+        for branch in [
+            "agent/dispatch-issue-1181-v2",
+            "agent/dispatch-issue-1181-git-env-hardening",
+            "agent/dispatch-issue-1181-1109x",
+            "agent/dispatch-issue-1181-0925x-retry",
+        ] {
+            assert_eq!(
+                Probe::for_branch(branch),
+                Ok((Probe::GitEnv, 1181)),
+                "{branch}"
+            );
+        }
     }
 
-    /// Greptile's finding on PR #1210: the last run of digits selected #1121's
-    /// probe here, for what is at least as likely a #1109 branch.
+    /// A coupled unit's `issue-<a>-<b>` names two issues, and a run carries one
+    /// probe, so it is refused rather than resolved to either: Greptile's
+    /// finding on PR #1210 was that the last run of digits picked #1121's probe
+    /// here, for what is at least as likely a #1109 branch, and picking the
+    /// first would be the same guess the other way round. The same holds for two
+    /// `dispatch-issue-` components.
     #[test]
-    fn a_branch_naming_two_issues_is_refused_not_resolved_to_the_last() {
+    fn a_branch_naming_two_issues_is_refused_not_resolved_to_either() {
         let err = Probe::for_branch("agent/dispatch-issue-1109-1121").expect_err("ambiguous");
+        assert!(
+            err.contains("more than one issue") && err.contains("#1109, #1121"),
+            "{err}"
+        );
         assert!(
             err.contains("#1109 (`teardown-inventory`) and #1121 (`discovery-fallback`)"),
             "{err}"
         );
+        let err = Probe::for_branch("agent/dispatch-issue-1562-1563-xver").expect_err("coupled");
+        assert!(err.contains("#1562, #1563"), "{err}");
         let err = Probe::for_branch("dispatch-issue-1109/dispatch-issue-1121")
             .expect_err("two components");
         assert!(
-            err.contains("more than one") && err.contains("#1109, #1121"),
+            err.contains("more than one issue") && err.contains("#1109, #1121"),
             "{err}"
         );
         assert!(err.contains("#1109 (`teardown-inventory`)"), "{err}");
+        assert_eq!(
+            Probe::for_branch("agent/dispatch-issue-1109-1109"),
+            Ok((Probe::TeardownInventory, 1109)),
+            "one issue named twice is still one issue"
+        );
     }
 
     #[test]
@@ -530,6 +568,8 @@ mod tests {
             "agent/xdispatch-issue-1181",
             "agent/dispatch-issue-",
             "agent/dispatch-issue-11a81",
+            "agent/dispatch-issue--1181",
+            "agent/dispatch-issue-v2-1181",
             "agent/issue-1181",
         ] {
             assert!(Probe::for_branch(branch).is_err(), "{branch}");
