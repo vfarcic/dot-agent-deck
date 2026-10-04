@@ -12,15 +12,18 @@ import { fixtureDesktopFeatures, type VoiceResultDto, type VoiceStatusDto, type 
 import type { DeckRuntimeState } from "../types";
 import {
   QUESTION_ALWAYS_DECLINED,
+  QUESTION_COUNTDOWN_STOPPED,
   QUESTION_MOVED_ON,
+  QUESTION_SAY_CONFIRM,
   questionLost,
+  saysConfirm,
   type AnswerOutcomeDto,
   type PendingQuestionDto,
   type QuestionResultDto,
   type QuestionSelectionDto,
   type VoiceQuestionTarget,
 } from "../lib/voiceQuestion";
-import { VOICE_DICTATION_SEND_MS, VOICE_STATUS_POLL_MS, VoiceControlPanel, type VoicePane } from "./VoiceControlPanel";
+import { VOICE_DICTATION_SEND_MS, VOICE_JOIN_WINDOW_MS, VOICE_STATUS_POLL_MS, VoiceControlPanel, type VoicePane } from "./VoiceControlPanel";
 
 function microphone() {
   const queue: string[] = [];
@@ -78,13 +81,14 @@ function questionAnswers(said: string): QuestionResultDto {
   return { verdict: { kind: "not_answer" }, resolveMs: 12, backend: "stub" };
 }
 
-function runtime(voice: ReturnType<typeof microphone>, sent: (form: QuestionSelectionDto[], confirmed: boolean) => AnswerOutcomeDto) {
+function runtime(voice: Pick<ReturnType<typeof microphone>, "voiceStart" | "voiceStatus" | "voiceStop" | "voiceCancel">, sent: (form: QuestionSelectionDto[], confirmed: boolean) => AnswerOutcomeDto | Promise<AnswerOutcomeDto>) {
   const resolveVoice = vi.fn(async (transcript: string): Promise<VoiceResultDto> => ({
     backend: "stub", resolveMs: 21,
     outcome: { kind: "no_match", transcript, sentence: `Heard: “${transcript}” — no matching action.` },
   }));
   const resolveVoiceQuestion = vi.fn(async (_target: VoiceQuestionTarget, utterance: string) => questionAnswers(utterance));
-  const sendVoiceAnswer = vi.fn(async (_target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmed: boolean) => sent(form, confirmed));
+  const sendVoiceAnswer = vi.fn(async (_target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmed: boolean, _lease: string) => sent(form, confirmed));
+  const cancelVoiceAnswer = vi.fn(async (_lease: string) => undefined);
   return {
     rt: {
       desktopFeatures: fixtureDesktopFeatures(),
@@ -93,11 +97,13 @@ function runtime(voice: ReturnType<typeof microphone>, sent: (form: QuestionSele
       resolveVoice,
       resolveVoiceQuestion,
       sendVoiceAnswer,
+      cancelVoiceAnswer,
       ...voice,
     } as unknown as DeckRuntimeState,
     resolveVoice,
     resolveVoiceQuestion,
     sendVoiceAnswer,
+    cancelVoiceAnswer,
   };
 }
 
@@ -165,6 +171,7 @@ describe("answering an agent's question by voice", () => {
       { deckId: "local", agentId: "a1", agent: "tester", questionId: "q-1" },
       [{ questionIndex: 0, optionIndices: [2] }],
       true,
+      expect.any(String),
     );
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Always allowed: commands matching `touch *`");
 
@@ -249,5 +256,187 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, pane: { ...pane(), spawnedAtMs: 2 } })?.code).toBe("replaced");
     expect(questionLost(aim, { ...now, confirmation: true })?.code).toBe("confirmation");
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
+  });
+
+  /**
+   * Scenario (question/desktop/008, audit A1): with the "always allow"
+   * confirmation open, the user says "yes". That is not a confirmation: the
+   * dialog stays open, the row says to say "confirm", and no countdown starts.
+   * Saying "always allow" again confirms it.
+   */
+  it("question/desktop/008: a bare yes does not confirm always allow", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => SENT);
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "always");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent(ALWAYS);
+    const asked = resolveVoiceQuestion.mock.calls.length;
+    for (const word of ["yes", "sure", "ok", "yes please"]) {
+      await speak(voice, word);
+      expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+      expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_SAY_CONFIRM);
+      expect(screen.getByTestId("voice-question")).not.toHaveTextContent("sending in");
+    }
+    expect(resolveVoiceQuestion.mock.calls.length).toBe(asked);
+    await waitOut(VOICE_DICTATION_SEND_MS + 1_000);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    await speak(voice, "always allow");
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    expect(saysConfirm("yes")).toBe(false);
+    expect(saysConfirm("Confirm.")).toBe(true);
+  });
+
+  /**
+   * Scenario (question/desktop/009, audit A3): the countdown to "Allow once"
+   * is a second from its end when the user starts saying "cancel". The
+   * microphone reports speech, and the countdown stops at once — though
+   * transcribing and working out the words then take far longer than the
+   * second that was left — so nothing is sent. Likewise when the words come
+   * back unreadable or refused: the countdown stays stopped until a fresh,
+   * complete answer re-arms it.
+   */
+  it("question/desktop/009: speaking stops the answer countdown before the words are worked out", async () => {
+    let speaking = false;
+    let ended = false;
+    let release: ((text: string) => void) | undefined;
+    const idle = (state: VoiceStatusDto["state"]): VoiceStatusDto => ({ state, capturedMs: 900, maxMs: 30_000, capped: false, speech: speaking, available: true, backend: "remote" });
+    const voice = {
+      voiceStart: vi.fn(async () => idle("recording")),
+      voiceStatus: vi.fn(async () => idle(ended ? "done" : "recording")),
+      voiceStop: vi.fn(() => new Promise<VoiceTranscriptionDto>((resolve) => {
+        release = (transcript) => resolve({ outcome: { kind: "heard", transcript, sentence: `Heard: “${transcript}”.` }, transcribeMs: 11, backend: "stub", audioMs: 900 });
+      })),
+      voiceCancel: vi.fn(async () => idle("idle")),
+    };
+    /** One utterance, its transcription released straight away. */
+    const utter = async (words: string) => {
+      speaking = true;
+      ended = true;
+      await waitOut(VOICE_STATUS_POLL_MS);
+      speaking = false;
+      ended = false;
+      release?.(words);
+      await flush();
+    };
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => SENT);
+    let resolveLater: ((result: QuestionResultDto) => void) | undefined;
+    resolveVoiceQuestion.mockImplementation(async (_target: VoiceQuestionTarget, said: string) => {
+      if (said === "cancel" || said === "mumble") return new Promise<QuestionResultDto>((resolve) => { resolveLater = resolve; });
+      if (said === "garbled") throw new Error("the command backend answered the question unreadably");
+      return questionAnswers(said);
+    });
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await utter("yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    await waitOut(VOICE_DICTATION_SEND_MS - 1_000);
+
+    // Speech starts a second before the end: stopped on the spot.
+    speaking = true;
+    await waitOut(VOICE_STATUS_POLL_MS);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(QUESTION_COUNTDOWN_STOPPED.trim());
+    // The words take far longer than the second that was left.
+    ended = true;
+    await waitOut(VOICE_STATUS_POLL_MS);
+    speaking = false;
+    ended = false;
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    release?.("cancel");
+    await flush();
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    resolveLater?.({ verdict: { kind: "cancelled", sentence: "Answer cancelled — nothing was sent." }, resolveMs: 9000, backend: "stub" });
+    await flush();
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+
+    // A failed resolve leaves it disarmed; a refusal too.
+    await utter("yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    await utter("garbled");
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    await utter("mumble");
+    resolveLater?.({ verdict: { kind: "refused", sentence: "Heard: “mumble” — I couldn't tell which option that chooses, so nothing was chosen." }, resolveMs: 12, backend: "stub" });
+    await flush();
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(QUESTION_COUNTDOWN_STOPPED.trim());
+
+    // A fresh complete answer arms it again.
+    await utter("yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Scenario (question/desktop/010, audit A7): the agent's pane is showing its
+   * Diff tab, so the prompt is not on screen. "Yes" is not offered to the
+   * question at all and goes on as an ordinary command. With the terminal
+   * showing, "yes" starts the countdown; switching to another tab before it
+   * ends calls it off and nothing is sent.
+   */
+  it("question/desktop/010: an answer needs the agent's terminal on screen", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion, resolveVoice } = runtime(voice, () => SENT);
+    const hidden = { ...pane(), terminalHidden: true };
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={hidden} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    expect(resolveVoiceQuestion).not.toHaveBeenCalled();
+    expect(resolveVoice).toHaveBeenCalledWith("yes");
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    // An unmatched command is held for the rest of its sentence; let it go.
+    await waitOut(VOICE_JOIN_WINDOW_MS + 1_000);
+
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await flush();
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    await waitOut(2_000);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={hidden} selectedDeckId="local" />);
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("its terminal is not shown");
+    await waitOut(VOICE_DICTATION_SEND_MS * 2);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+    expect(questionLost(
+      { deckId: "local", agentId: "a1", questionId: "q-1", spawnedAtMs: 1, deck: "local" },
+      { pane: hidden, confirmation: false, deck: "local" },
+    )?.code).toBe("hidden");
+  });
+
+  /**
+   * Scenario (question/desktop/011, audit A8): the countdown runs out and the
+   * answer is on its way, but the deck is slow to take it. The row keeps the
+   * answer and its Cancel while it is sending. The user changes pane: the
+   * lease the answer was sent under is cancelled at once, and the row reports
+   * what Rust says became of it — here, too late to cancel.
+   */
+  it("question/desktop/011: an answer on its way is cancelled by its lease and its outcome is always told", async () => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    const lease = sendVoiceAnswer.mock.calls[0][3];
+    expect(lease).toMatch(/^[A-Za-z0-9-]{1,64}$/);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending…");
+    expect(screen.getByTestId("voice-question-cancel")).toBeInTheDocument();
+
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={{ ...pane(), agentId: "a2" }} selectedDeckId="local" />);
+    await flush();
+    expect(cancelVoiceAnswer).toHaveBeenCalledWith(lease);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("cancelling…");
+    deliver?.({ kind: "too_late", sentence: "Too late to cancel — Allowed: touch x" });
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Too late to cancel — Allowed: touch x");
+    view.unmount();
   });
 });

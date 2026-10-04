@@ -71,7 +71,8 @@ export type QuestionResultDto = { verdict: QuestionVerdictDto; resolveMs: number
 
 /** What sending a form came to (`voice::question::AnswerOutcome`). */
 export type AnswerOutcomeDto = {
-  kind: "answered" | "refused" | "withheld" | "superseded";
+  /** `cancelled`: the panel's lease was cancelled before the answer went; `too_late`: after. */
+  kind: "answered" | "refused" | "withheld" | "superseded" | "cancelled" | "too_late";
   /** The daemon's refusal code, for a refusal. */
   code?: string;
   sentence: string;
@@ -87,16 +88,21 @@ export const QUESTION_ANSWER_CANCELLED = "Answer cancelled — nothing was sent.
 /** The "always allow" confirmation was declined or closed. */
 export const QUESTION_ALWAYS_DECLINED = "Always allow was not confirmed — nothing was sent.";
 
+/** While the "always allow" confirmation is open, anything but its own words. */
+export const QUESTION_SAY_CONFIRM = "Say “confirm” to always allow, or “cancel”.";
+/** The microphone heard speech while the answer was counting down (audit A3). */
+export const QUESTION_COUNTDOWN_STOPPED = " — stopped because you spoke. Say the answer again to send it.";
+
 /** Any other reason a running answer countdown was called off. */
 export function questionCalledOff(why: string): string {
   return `Nothing was sent — ${why}.`;
 }
 
-/** The pane on screen, as far as a question countdown needs it. */
-export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; question?: PendingQuestionDto };
+/** The pane on screen, as far as a question countdown needs it. `terminalHidden`: another tab of the pane is showing, so the agent's prompt is not on screen. */
+export type QuestionPane = { deckId: string; agentId: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto };
 
 /** Why {@link questionLost} called a countdown off: a code, and the reason in words. */
-export type QuestionLost = { code: "question" | "pane" | "replaced" | "confirmation" | "deck"; why: string };
+export type QuestionLost = { code: "question" | "pane" | "replaced" | "hidden" | "confirmation" | "deck"; why: string };
 
 /**
  * PRD #1542 — the gate a running answer countdown is held to, on every
@@ -104,8 +110,9 @@ export type QuestionLost = { code: "question" | "pane" | "replaced" | "confirmat
  * `undefined` while the answer still holds, or why not: the question waiting
  * is no longer the one answered (`question`), the pane on screen shows another
  * agent or none (`pane`), the agent was replaced under the same id
- * (`replaced`), a confirmation is open (`confirmation`), or the selected deck
- * changed (`deck`).
+ * (`replaced`), the pane shows another tab so the prompt being answered is not
+ * on screen (`hidden`, audit A7), a confirmation is open (`confirmation`), or
+ * the selected deck changed (`deck`).
  */
 export function questionLost(
   aim: { deckId: string; agentId: string; questionId: string; spawnedAtMs?: number; deck?: string },
@@ -114,6 +121,7 @@ export function questionLost(
   const pane = now.pane;
   if (!pane || pane.deckId !== aim.deckId || pane.agentId !== aim.agentId) return { code: "pane", why: pane ? "the pane on screen changed" : "the pane closed" };
   if (aim.spawnedAtMs !== undefined && pane.spawnedAtMs !== undefined && aim.spawnedAtMs !== pane.spawnedAtMs) return { code: "replaced", why: "the agent in the pane was replaced" };
+  if (pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   if (pane.question?.id !== aim.questionId) return { code: "question", why: "the question changed" };
   if (now.confirmation) return { code: "confirmation", why: "a confirmation is open" };
   if (now.deck !== aim.deck) return { code: "deck", why: "the deck changed" };
@@ -125,9 +133,14 @@ export function questionLostSentence(lost: QuestionLost): string {
   return lost.code === "question" ? QUESTION_MOVED_ON : questionCalledOff(lost.why);
 }
 
-/** Whether `utterance` is, whole, a confirmation of the "always allow" dialog. */
+/**
+ * Whether `utterance` is, whole, a confirmation of the "always allow" dialog:
+ * the dedicated word "confirm", or "always allow" said again (audit A1). A
+ * bare "yes", "sure" or "ok" is NOT one — a lasting grant must not ride on the
+ * most generic affirmative there is.
+ */
 export function saysConfirm(utterance: string): boolean {
-  return ["confirm", "confirm it", "yes confirm", "confirmed", "yes"].includes(spoken(utterance));
+  return ["confirm", "confirm it", "yes confirm", "i confirm", "confirmed", "always allow", "always allow it", "yes always allow"].includes(spoken(utterance));
 }
 
 /** Whether `utterance` is, whole, a refusal of the "always allow" dialog or of a running countdown. */

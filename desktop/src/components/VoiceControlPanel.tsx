@@ -88,7 +88,7 @@ import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNe
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
-import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_MOVED_ON, questionLost, questionLostSentence, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
+import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
@@ -555,7 +555,7 @@ export function dictationRefused(label: string, reason: string): string {
 }
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "answerVoiceNumber" | "resolveVoiceQuestion" | "sendVoiceAnswer" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "answerVoiceNumber" | "resolveVoiceQuestion" | "sendVoiceAnswer" | "cancelVoiceAnswer" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures">;
 
 /**
  * PRD #1542 — the answer to the question the agent on screen is waiting on,
@@ -580,7 +580,22 @@ type QuestionForm = {
   confirming: boolean;
   /** The user confirmed it: the send asserts so to the daemon. */
   confirmedAlways: boolean;
+  /** The countdown was stopped because the microphone heard speech (audit A3): a draft until a fresh complete answer re-arms it. */
+  stopped?: boolean;
+  /** The countdown ran out and the answer is on its way, under `lease` (audit A8); Cancel still works until it returns. */
+  sending?: boolean;
+  lease?: string;
+  /** Cancel was asked for while sending; the outcome says whether it was in time. */
+  cancelling?: boolean;
 };
+
+/** A fresh name for one send's lease — see `voice/lease.rs`. */
+function newAnswerLease(): string {
+  const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return random.replace(/[^A-Za-z0-9-]/g, "").slice(0, 64) || "lease";
+}
 
 /** The command table's row for the deck, whose screen issue #1198 hides by default. */
 const OPEN_DECK_COMMAND = "open_deck";
@@ -1091,7 +1106,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * other answer, even when the numbered rows still look the same.
    */
   const heardContext = useRef<VoiceContext | undefined>(undefined);
-  const { declareVoiceScreen, resolveVoice, answerVoiceChoice, answerVoiceNumber, resolveVoiceQuestion, sendVoiceAnswer, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
+  const { declareVoiceScreen, resolveVoice, answerVoiceChoice, answerVoiceNumber, resolveVoiceQuestion, sendVoiceAnswer, cancelVoiceAnswer, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
      it is not there. The crate withholds the row from the model as well
@@ -1396,14 +1411,43 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     answerTimer.current = undefined;
     setAnswerIn(undefined);
   }, []);
-  /** Drop the answer, saying why when there is something to say. Sends nothing. */
+  /**
+   * Drop the answer, saying why when there is something to say. Sends nothing.
+   *
+   * While the answer is already on its way (audit A8) it cannot be taken back
+   * here: its lease is cancelled — synchronously on this side — and the row
+   * waits for Rust to say whether that was in time ("Answer cancelled" or
+   * "Too late to cancel"), which the send then reports.
+   */
   const dropQuestion = useCallback((why?: string) => {
     stopAnswerCountdown();
+    const held = questionFormRef.current;
+    if (held?.sending) {
+      if (!held.cancelling) {
+        if (held.lease) void cancelVoiceAnswer?.(held.lease).catch(() => undefined);
+        setQuestionForm({ ...held, cancelling: true });
+      }
+      return;
+    }
     setQuestionForm(undefined);
     if (why !== undefined) {
       setResult(undefined);
       setProblem(why);
     }
+  }, [cancelVoiceAnswer, setQuestionForm, stopAnswerCountdown]);
+  /**
+   * PRD #1542 (audit A3) — the microphone heard speech while the answer was
+   * counting down: the countdown stops NOW, before anything is transcribed or
+   * resolved, so "cancel" said a second before the end is never too late. The
+   * form stays as a draft; only a fresh, complete, validated answer arms it
+   * again (`answerQuestion`), so a failed transcription or a refused verdict
+   * leaves it disarmed.
+   */
+  const stopAnswerForSpeech = useCallback(() => {
+    const held = questionFormRef.current;
+    if (answerTimer.current === undefined || !held || held.sending) return;
+    stopAnswerCountdown();
+    setQuestionForm({ ...held, stopped: true });
   }, [setQuestionForm, stopAnswerCountdown]);
   /** {@link questionLost} for the answer being given, against what stands now. */
   const answerLost = useCallback(() => {
@@ -1417,28 +1461,31 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /**
    * Send the answered form — the countdown's end. Held to {@link questionLost}
    * immediately before, so a change no effect has seen yet still calls it off.
+   *
+   * Sent under a lease (audit A8) that every later change cancels: the form
+   * stays on the row, with its Cancel, until Rust says what became of it, and
+   * that outcome is always reported — "too late to cancel" included.
    */
   const sendAnswer = useCallback(async () => {
     const held = questionFormRef.current;
-    if (!held || !sendVoiceAnswer) return;
+    if (!held || held.sending || !sendVoiceAnswer) return;
     const lost = answerLost();
     if (lost) {
       dropQuestion(questionLostSentence(lost));
       return;
     }
     stopAnswerCountdown();
-    setQuestionForm(undefined);
-    const epoch = answerEpoch.current;
+    const lease = newAnswerLease();
+    setQuestionForm({ ...held, sending: true, lease, stopped: false });
+    let sentence: string;
     try {
-      const outcome = await sendVoiceAnswer(held.target, held.form, held.confirmedAlways);
-      if (answerEpoch.current !== epoch) return;
-      setResult(undefined);
-      setProblem(outcome.sentence);
+      sentence = (await sendVoiceAnswer(held.target, held.form, held.confirmedAlways, lease)).sentence;
     } catch (cause) {
-      if (answerEpoch.current !== epoch) return;
-      setResult(undefined);
-      setProblem(sentenceOf(cause));
+      sentence = sentenceOf(cause);
     }
+    if (questionFormRef.current?.lease === lease) setQuestionForm(undefined);
+    setResult(undefined);
+    setProblem(sentence);
   }, [answerLost, dropQuestion, sendVoiceAnswer, setQuestionForm, stopAnswerCountdown]);
   /** Start the visible countdown to sending the answer — `armSend`'s five seconds, for the same reason. */
   const armAnswer = useCallback(() => {
@@ -1467,8 +1514,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const declineAlways = useCallback(() => {
     if (questionFormRef.current?.confirming) dropQuestion(QUESTION_ALWAYS_DECLINED);
   }, [dropQuestion]);
-  /* A countdown must not survive this panel, nor voice being turned off. */
-  useEffect(() => () => stopAnswerCountdown(), [stopAnswerCountdown]);
+  /* A countdown must not survive this panel, nor voice being turned off — and
+     an answer on its way is cancelled with it (audit A8). */
+  useEffect(() => () => {
+    stopAnswerCountdown();
+    const lease = questionFormRef.current?.sending ? questionFormRef.current.lease : undefined;
+    if (lease) void cancelVoiceAnswer?.(lease).catch(() => undefined);
+  }, [cancelVoiceAnswer, stopAnswerCountdown]);
   useEffect(() => {
     if (!on && questionFormRef.current) dropQuestion();
   }, [dropQuestion, on]);
@@ -1483,10 +1535,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const paneQuestionDeck = pane?.deckId;
   const paneQuestionAgent = pane?.agentId;
   const paneQuestionSpawned = pane?.spawnedAtMs;
+  const paneQuestionHidden = pane?.terminalHidden;
   useEffect(() => {
     const lost = answerLost();
     if (lost) dropQuestion(questionLostSentence(lost));
-  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionId, paneQuestionSpawned, selectedDeckId]);
+  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionSpawned, selectedDeckId]);
 
   /**
    * PRD #1542 — an utterance said while the agent on screen waits on a
@@ -1497,18 +1550,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * caller resolves it as an ordinary utterance.
    *
    * Not while typing mode is on, where every utterance is the user's words for
-   * the prompt.
+   * the prompt, and not while the pane shows another tab (audit A7): the user
+   * must be able to see the prompt they are answering, so there the utterance
+   * is an ordinary command.
    */
   const answerQuestion = useCallback(async (utterance: string, ours: () => boolean): Promise<boolean> => {
     const shown = paneRef.current;
     const question = shown?.question;
-    if (!shown || !question || !resolveVoiceQuestion || panelStateRef.current.kind === "dictating") return false;
+    if (!shown || !question || shown.terminalHidden || !resolveVoiceQuestion || panelStateRef.current.kind === "dictating") return false;
     let held = questionFormRef.current;
+    /* On its way already: only a cancel is the question's. */
+    if (held?.sending) {
+      if (!saysCancel(utterance)) return false;
+      dropQuestion(QUESTION_ANSWER_CANCELLED);
+      return true;
+    }
     if (held && (held.target.questionId !== question.id || held.target.deckId !== shown.deckId || held.target.agentId !== shown.agentId)) {
       dropQuestion();
       held = undefined;
     }
-    /* The confirmation, answered by voice: "confirm", or a refusal. */
+    /* The confirmation, answered by voice: "confirm" (or "always allow" said
+       again), or a refusal. Anything else leaves it open and says what to
+       say — a lasting grant never rides on a bare "yes" (audit A1). */
     if (held?.confirming) {
       if (saysConfirm(utterance)) {
         confirmAlways();
@@ -1518,6 +1581,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         declineAlways();
         return true;
       }
+      setResult(undefined);
+      setProblem(QUESTION_SAY_CONFIRM);
+      return true;
     }
     const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.label, questionId: question.id };
     const spawnedAtMs = shown.spawnedAtMs;
@@ -2454,6 +2520,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        mode to ask about any more, and a pending send is a pending send whatever
        the next utterance turns out to be. */
     cancelPendingSend();
+    /* PRD #1542 (audit A3) — and an answer's countdown stops here too, before
+       the transcription is awaited: whatever was just said may be "cancel". */
+    stopAnswerForSpeech();
     setPhase("transcribing");
     try {
       const transcription = await voiceStop();
@@ -2507,7 +2576,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     if (!ours()) return;
     await listen(ours);
-  }, [cancelPendingSend, claim, clearHeld, forget, listen, reportHeld, resolveOne, setPhase, voiceStop]);
+  }, [cancelPendingSend, claim, clearHeld, forget, listen, reportHeld, resolveOne, setPhase, stopAnswerForSpeech, voiceStop]);
 
   /**
    * The capped utterance: thrown away unheard, and said so — see
@@ -2573,6 +2642,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       send.
     */
     if (status.speech && (deferredSubmit.current || (pendingRef.current && sendTimer.current !== undefined))) cancelPendingSend();
+    /* PRD #1542 (audit A3) — the same seam stops an answer's countdown the
+       moment speech starts, not once the words are worked out. */
+    if (status.speech) stopAnswerForSpeech();
     /* PR #1451 — the nudge to send: speaking takes it down, and a pause with
        words still unsent starts its clock again. The clock is otherwise started
        by the write that typed them, so this re-arms it only after a pause that
@@ -2597,7 +2669,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     if (status.state === "done") await takeUtterance();
-  }, [armNudge, cancelPendingSend, discardCapped, hearNumbers, stopNudge, takeUtterance, voiceStatus]);
+  }, [armNudge, cancelPendingSend, discardCapped, hearNumbers, stopAnswerForSpeech, stopNudge, takeUtterance, voiceStatus]);
 
   /*
     The poll, reached through a ref so the interval below survives a re-render.
@@ -3265,10 +3337,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
             {questionForm && (
               <p className="voice-dictation" data-testid="voice-question" role="timer">
                 {displayText(questionForm.summary, DISPLAY_LIMITS.message)}
-                {answerIn !== undefined
-                  ? ` — sending in ${answerIn} s. Say “cancel” to stop.`
-                  : questionForm.confirming ? " — waiting for your confirmation." : ""}
-                {answerIn !== undefined && (
+                {questionForm.cancelling
+                  ? " — cancelling…"
+                  : questionForm.sending
+                    ? " — sending…"
+                    : answerIn !== undefined
+                      ? ` — sending in ${answerIn} s. Say “cancel” to stop.`
+                      : questionForm.confirming
+                        ? " — waiting for your confirmation."
+                        : questionForm.stopped ? QUESTION_COUNTDOWN_STOPPED : ""}
+                {(answerIn !== undefined || (questionForm.sending && !questionForm.cancelling)) && (
                   <button type="button" className="button secondary compact" data-testid="voice-question-cancel" onClick={() => dropQuestion(QUESTION_ANSWER_CANCELLED)}>
                     <X size={13} /> Cancel
                   </button>

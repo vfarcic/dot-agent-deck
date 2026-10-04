@@ -15,6 +15,14 @@
 //! — and projected through the desktop's production projection, so the model
 //! sees the labels, roles and scopes a user's question would carry.
 //!
+//! The model now answers each selection with `evidence` — the user's words
+//! that chose it, copied verbatim — and `voice::question::resolve` refuses any
+//! answer whose evidence, or whose free text, is not a run of the utterance's
+//! own words (audit A1). So a fixture passes only when the real model both
+//! picks the right options AND quotes the utterance faithfully; a model that
+//! paraphrases its evidence fails here as "refused", which is the regression
+//! this file exists to catch.
+//!
 //! Some utterances below ("yes", "no", "blue") equal an option's label and
 //! never reach the model: `voice::question` matches those locally. They are
 //! kept because they are what a user says, and the fixture pins that they keep
@@ -79,6 +87,13 @@ enum Expect {
     Answer {
         form: Vec<(u32, Vec<u32>)>,
         always: bool,
+    },
+    /// One free-text option chosen, with exactly these words — the
+    /// transcript's own, never the model's rendering of them.
+    Text {
+        question: u32,
+        option: u32,
+        text: &'static str,
     },
     /// Not about the question — on to ordinary command handling.
     NotAnswer,
@@ -221,6 +236,16 @@ fn fixtures() -> Vec<Fixture> {
         ),
         f("form-label", ClaudeForm, "blue", answer(&[(0, &[3])])),
         f(
+            "form-free-text",
+            ClaudeForm,
+            "type my own colour: a hamster named Bob",
+            Expect::Text {
+                question: 0,
+                option: 4,
+                text: "a hamster named Bob",
+            },
+        ),
+        f(
             "form-unrelated-command",
             ClaudeForm,
             "open the dashboard",
@@ -302,7 +327,11 @@ fn observed(verdict: &QuestionVerdict) -> String {
         QuestionVerdict::Answered { form, always, .. } => format!(
             "answer {:?} always={}",
             form.iter()
-                .map(|selection| (selection.question_index, selection.option_indices.clone()))
+                .map(|selection| (
+                    selection.question_index,
+                    selection.option_indices.clone(),
+                    selection.text.clone()
+                ))
                 .collect::<Vec<_>>(),
             always.is_some()
         ),
@@ -332,6 +361,17 @@ fn matches(expect: &Expect, verdict: &QuestionVerdict) -> bool {
                 .collect();
             got == *expected && always.is_some() == *expected_always
         }
+        (
+            Expect::Text {
+                question,
+                option,
+                text,
+            },
+            QuestionVerdict::Answered { form, .. },
+        ) => matches!(form.as_slice(), [selection]
+            if selection.question_index == *question
+                && selection.option_indices == [*option]
+                && selection.text.as_deref() == Some(*text)),
         _ => false,
     }
 }
@@ -341,7 +381,9 @@ fn matches(expect: &Expect, verdict: &QuestionVerdict) -> bool {
 /// payloads by the daemon's own builders — is given what a user would say to
 /// it. The shipping default Commands backend maps every utterance onto the
 /// expected options (with the "always allow" confirmation raised where it
-/// must be), and an unrelated command is left to ordinary command handling.
+/// must be), citing words that are really in the utterance, takes a free-text
+/// answer as the user's own words, and leaves an unrelated command to
+/// ordinary command handling.
 #[tokio::test]
 async fn voice_question_fixtures_match_the_default_backend() {
     let fixtures = fixtures();
@@ -355,8 +397,15 @@ async fn voice_question_fixtures_match_the_default_backend() {
             "{}: the planted question must be answerable",
             fixture.name
         );
-        if let Expect::Answer { form, .. } = &fixture.expect {
-            for (at, options) in form {
+        let form = match &fixture.expect {
+            Expect::Answer { form, .. } => form.clone(),
+            Expect::Text {
+                question, option, ..
+            } => vec![(*question, vec![*option])],
+            Expect::NotAnswer => Vec::new(),
+        };
+        {
+            for (at, options) in &form {
                 let q = question
                     .question(*at)
                     .unwrap_or_else(|| panic!("{}: no question {at}", fixture.name));

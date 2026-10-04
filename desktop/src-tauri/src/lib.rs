@@ -3685,6 +3685,13 @@ const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// `DaemonClient::answer_question_while`, which withholds the request from a
 /// daemon that does not advertise `answer-question`. Every outcome, the
 /// daemon's refusals included, comes back as a sentence for the outcome row.
+///
+/// **Sent under the panel's lease** (`lease`, audit A8): the panel cancels it
+/// ([`desktop_voice_answer_cancel`]) the moment the answer stops being wanted,
+/// and the lease is `answer_question_while`'s `still_wanted` gate, checked
+/// immediately before the request is written — so a pane change during a
+/// stalled snapshot read or link sends nothing, and one that lands after the
+/// write is reported as too late rather than as nothing sent.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn desktop_voice_answer_question(
@@ -3696,9 +3703,14 @@ async fn desktop_voice_answer_question(
     question_id: String,
     form: Vec<voice::question::Selection>,
     confirmed_always: bool,
+    lease: String,
 ) -> Result<voice::question::AnswerOutcome, String> {
     ensure_main_webview(&webview)?;
     validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
+    if !voice::lease::is_valid_lease(&lease) {
+        return Err("the answer sent with that utterance is not one this app offers".to_string());
+    }
+    let lease = state.voice_answer_leases.begin(&lease);
     let agent = voice_agent_name(&agent);
     let Some(question) = pending_question_on(&state, &deck_id, &agent_id).await? else {
         return Ok(voice::question::AnswerOutcome {
@@ -3712,24 +3724,46 @@ async fn desktop_voice_answer_question(
     {
         return Ok(refused);
     }
-    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
-    let daemon = state.daemon.trusted(scope.endpoint()).await?;
-    daemon.require_compatible()?;
     let answers = voice::question::answers_of(&form);
-    let sent = daemon.client.answer_question_while(
-        || true,
-        &agent_id,
-        &question_id,
-        answers,
-        confirmed_always,
-    );
-    let report = match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
-        Ok(report) => report.map_err(|error| safe_message(error.to_string()))?,
-        Err(_) => return Err("the deck did not answer in time".to_string()),
-    };
-    Ok(voice::question::report_outcome(
-        &agent, &question, &form, &report,
+    let leased = voice::lease::send_leased(&lease, |still_wanted| async {
+        if !still_wanted() {
+            return Ok(dot_agent_deck::daemon_client::AnswerReport::Superseded);
+        }
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+        let daemon = state.daemon.trusted(scope.endpoint()).await?;
+        daemon.require_compatible()?;
+        let sent = daemon.client.answer_question_while(
+            still_wanted,
+            &agent_id,
+            &question_id,
+            answers,
+            confirmed_always,
+        );
+        match tokio::time::timeout(VOICE_ANSWER_TIMEOUT, sent).await {
+            Ok(report) => report.map_err(|error| safe_message(error.to_string())),
+            Err(_) => Err("the deck did not answer in time".to_string()),
+        }
+    })
+    .await?;
+    Ok(voice::question::leased_outcome(
+        &agent, &question, &form, leased,
     ))
+}
+
+/// PRD #1542 (audit A8): the voice panel no longer wants the answer it is
+/// sending under `lease` — see [`desktop_voice_answer_question`]. Never
+/// refused, and a no-op for a lease no send names.
+#[tauri::command]
+fn desktop_voice_answer_cancel(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    lease: String,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    if voice::lease::is_valid_lease(&lease) {
+        state.voice_answer_leases.cancel(&lease);
+    }
+    Ok(())
 }
 
 /// The pane's name as the webview sent it, made safe for a sentence and
@@ -5614,6 +5648,7 @@ pub fn run() {
             desktop_voice_number,
             desktop_voice_question,
             desktop_voice_answer_question,
+            desktop_voice_answer_cancel,
             desktop_voice_commands,
         ])
         .build(tauri::generate_context!())

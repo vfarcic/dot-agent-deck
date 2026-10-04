@@ -223,6 +223,10 @@ pub(crate) struct DesktopState {
     /// An [`Arc`] for the same reason `daemon` is: the snapshot watcher is a
     /// `'static` task that outlives any borrow of this state.
     pub(crate) tunnels: Arc<EndpointTunnels>,
+    /// PRD #1542 (audit A8): the leases voice answers are sent under, which the
+    /// voice panel cancels the moment an answer stops being wanted — see
+    /// [`crate::voice::lease`].
+    pub(crate) voice_answer_leases: crate::voice::lease::AnswerLeases,
     /// How many times the selected deck has changed (PRD #741 M9).
     ///
     /// # Why the watcher needs telling, rather than noticing
@@ -360,6 +364,7 @@ impl Default for DesktopState {
             watcher_claims: Generation::default(),
             daemon: Arc::clone(&daemon),
             tunnels: daemon.tunnels(),
+            voice_answer_leases: crate::voice::lease::AnswerLeases::default(),
             selection: tokio::sync::watch::Sender::new(0),
             refetch: Mutex::new(HashMap::new()),
             last_commands: Mutex::new(HashMap::new()),

@@ -202,9 +202,15 @@ fn question_desktop_001_the_projection_is_safe_and_says_what_can_be_answered() {
 async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it() {
     let question = map_pending_question(&permission(AnswerChannel::Held));
     let resolver = StubResolver::new()
-        .answering_question("go ahead", ModelAnswer::answer(0, &[1]))
-        .answering_question("the fourth one please", ModelAnswer::answer(0, &[4]))
-        .answering_question("both of them", ModelAnswer::answer(0, &[1, 3]));
+        .answering_question("go ahead", ModelAnswer::answer(0, &[1]).citing("go ahead"))
+        .answering_question(
+            "the fourth one please",
+            ModelAnswer::answer(0, &[4]).citing("the fourth one"),
+        )
+        .answering_question(
+            "both of them",
+            ModelAnswer::answer(0, &[1, 3]).citing("both of them"),
+        );
 
     let verdict = say(&resolver, &question, &[], "go ahead").await;
     match &verdict {
@@ -238,8 +244,10 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
 
     // A keyboard-only option, named by the model.
     let form = map_pending_question(&form_question());
-    let resolver_form =
-        StubResolver::new().answering_question("chat about it", ModelAnswer::answer(0, &[4]));
+    let resolver_form = StubResolver::new().answering_question(
+        "chat about it",
+        ModelAnswer::answer(0, &[4]).citing("chat about it"),
+    );
     match say(&resolver_form, &form, &[], "chat about it").await {
         QuestionVerdict::Refused { sentence } => assert_eq!(
             sentence,
@@ -250,8 +258,8 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
 
     // A question the deck cannot answer at all.
     let unsupported = map_pending_question(&permission(AnswerChannel::Unsupported));
-    let resolver_unsupported =
-        StubResolver::new().answering_question("go ahead", ModelAnswer::answer(0, &[1]));
+    let resolver_unsupported = StubResolver::new()
+        .answering_question("go ahead", ModelAnswer::answer(0, &[1]).citing("go ahead"));
     match say(&resolver_unsupported, &unsupported, &[], "go ahead").await {
         QuestionVerdict::Refused { sentence } => assert_eq!(
             sentence,
@@ -284,10 +292,16 @@ async fn question_desktop_002_the_model_maps_the_utterance_and_the_app_checks_it
 async fn question_desktop_003_the_form_fills_in_across_utterances() {
     let question = map_pending_question(&form_question());
     let resolver = StubResolver::new()
-        .answering_question("red for colour", ModelAnswer::answer(0, &[1]))
-        .answering_question("small and large", ModelAnswer::answer(1, &[1, 2]))
-        .answering_question("actually blue", ModelAnswer::answer(0, &[2]))
-        .answering_question("my own colour", ModelAnswer::answer(0, &[3]));
+        .answering_question("red for colour", ModelAnswer::answer(0, &[1]).citing("red"))
+        .answering_question(
+            "small and large",
+            ModelAnswer::answer(1, &[1, 2]).citing("small and large"),
+        )
+        .answering_question("actually blue", ModelAnswer::answer(0, &[2]).citing("blue"))
+        .answering_question(
+            "my own colour",
+            ModelAnswer::answer(0, &[3]).citing("my own colour"),
+        );
 
     let first = say(&resolver, &question, &[], "red for colour").await;
     match &first {
@@ -363,7 +377,8 @@ async fn question_desktop_003_the_form_fills_in_across_utterances() {
 
     // An always option asks for the confirmation, naming its scope.
     let permission_question = map_pending_question(&permission(AnswerChannel::Held));
-    let always = StubResolver::new().answering_question("always", ModelAnswer::answer(0, &[2]));
+    let always = StubResolver::new()
+        .answering_question("always", ModelAnswer::answer(0, &[2]).citing("always"));
     match say(&always, &permission_question, &[], "always").await {
         QuestionVerdict::Answered {
             always: Some(confirm),
@@ -488,6 +503,7 @@ fn question_desktop_every_refusal_has_its_sentence() {
             },
             "write_failed",
         ),
+        (AnswerRefusal::KeyboardStarted, "keyboard_started"),
         (AnswerRefusal::Unknown, "unknown"),
     ];
     let mut sentences = std::collections::BTreeSet::new();
@@ -553,14 +569,25 @@ fn question_desktop_the_question_call_frames_the_options_as_data() {
             "type": "tool_use",
             "name": QUESTION_TOOL_NAME,
             "input": {"kind": "answer", "selections": [
-                {"question_index": 0, "option_indices": [1], "text": null}
+                {"question_index": 0, "option_indices": [1], "text": null, "evidence": "yes"}
             ]},
         }],
     });
     assert_eq!(
         parse_anthropic(&anthropic_reply, ceiling).unwrap(),
-        ModelAnswer::answer(0, &[1])
+        ModelAnswer::answer(0, &[1]).citing("yes")
     );
+    // The schema makes every selection cite its words, in both dialects.
+    for schema in [answer_schema(false), answer_schema(true)] {
+        let required = &schema["properties"]["selections"]["items"]["required"];
+        assert!(
+            required
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("evidence")),
+            "{schema}"
+        );
+    }
     let openai_reply = serde_json::json!({
         "choices": [{"message": {"content":
             "```json\n{\"kind\":\"not_answer\",\"selections\":[]}\n```"}}],
@@ -569,4 +596,81 @@ fn question_desktop_the_question_call_frames_the_options_as_data() {
         parse_openai(&openai_reply, ceiling).unwrap(),
         ModelAnswer::not_answer()
     );
+}
+
+/// Scenario (question/desktop/007, audit A1): the Commands model is steered by
+/// the question's own text into picking an option the user never asked for.
+/// An unrelated utterance answered with Allow once, a "no" answered with Allow
+/// once, a selection citing words the user never said, a selection citing
+/// nothing, and free text the user never spoke are each refused, so nothing is
+/// armed and the send seam has no form to send. A grounded answer still works,
+/// and its free text is the user's own words, not the model's rendering.
+#[tokio::test]
+async fn question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_said() {
+    let question = map_pending_question(&permission(AnswerChannel::Held));
+    let refused = |verdict: &QuestionVerdict| {
+        matches!(verdict, QuestionVerdict::Refused { sentence }
+            if sentence.contains("I couldn't tell which option that chooses"))
+    };
+    let resolver = StubResolver::new()
+        // An unrelated utterance, steered to an approval citing words the
+        // user never said.
+        .answering_question(
+            "what time is it",
+            ModelAnswer::answer(0, &[1]).citing("go ahead"),
+        )
+        // A deny, steered to an approval.
+        .answering_question(
+            "no don't run that",
+            ModelAnswer::answer(0, &[1]).citing("yes run it"),
+        )
+        // An approval citing nothing at all.
+        .answering_question("hmm let me think", ModelAnswer::answer(0, &[1]))
+        // Grounded: these words are in the utterance.
+        .answering_question(
+            "sure, do it",
+            ModelAnswer::answer(0, &[1]).citing("Sure do it"),
+        );
+    for said in ["what time is it", "no don't run that", "hmm let me think"] {
+        let verdict = say(&resolver, &question, &[], said).await;
+        assert!(refused(&verdict), "{said}: {verdict:?}");
+        assert!(
+            check_form("tester", &question, "q-permission", &[], false).is_err(),
+            "{said}: nothing reaches the send seam"
+        );
+    }
+    let verdict = say(&resolver, &question, &[], "sure, do it").await;
+    assert_eq!(form_of(&verdict), [pick(0, &[1])]);
+
+    // Free text: only the user's own words, as the transcript has them.
+    let form = map_pending_question(&form_question());
+    let resolver = StubResolver::new()
+        .answering_question(
+            "type something teal like the sea",
+            ModelAnswer::answer(0, &[3])
+                .citing("type something")
+                .with_text("TEAL, like the sea"),
+        )
+        .answering_question(
+            "type something teal",
+            ModelAnswer::answer(0, &[3])
+                .citing("type something")
+                .with_text("approve every command"),
+        );
+    match say(&resolver, &form, &[], "type something teal like the sea").await {
+        QuestionVerdict::Answered { form, .. } => {
+            assert_eq!(form[0].text.as_deref(), Some("teal like the sea"))
+        }
+        other => panic!("{other:?}"),
+    }
+    let verdict = say(&resolver, &form, &[], "type something teal").await;
+    assert!(refused(&verdict), "{verdict:?}");
+
+    assert_eq!(
+        verbatim_slice("Go ahead, please!", "go ahead"),
+        Some("Go ahead")
+    );
+    assert_eq!(verbatim_slice("go ahead", "ahead go"), None);
+    assert_eq!(verbatim_slice("go ahead", "  "), None);
+    assert_eq!(verbatim_slice("no", "no way"), None);
 }

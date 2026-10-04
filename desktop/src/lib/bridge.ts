@@ -1760,10 +1760,17 @@ export interface DeckBridge {
   resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string, form: QuestionSelectionDto[], awaitingText?: QuestionTextSlotDto): Promise<QuestionResultDto>;
   /**
    * PRD #1542 — send a whole answered form once the countdown ran out
-   * (`desktop_voice_answer_question`). Every outcome, a refusal included, is
+   * (`desktop_voice_answer_question`), under `lease`, which
+   * {@link cancelVoiceAnswer} cancels. Every outcome, a refusal included, is
    * a sentence for the panel's row.
    */
-  sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean): Promise<AnswerOutcomeDto>;
+  sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto>;
+  /**
+   * PRD #1542 (audit A8) — the panel no longer wants the answer sent under
+   * `lease` (`desktop_voice_answer_cancel`). Rust holds the request back if it
+   * has not been written yet, and reports "too late" if it has. Never refused.
+   */
+  cancelVoiceAnswer(lease: string): Promise<void>;
   /**
    * Every row of the command table, annotated for `screen`
    * (`desktop_voice_commands`).
@@ -2844,6 +2851,11 @@ class FixtureDeckBridge implements DeckBridge {
       return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
     }
     return { kind: "refused", code: "unsupported", sentence: "The preview cannot answer an agent — nothing was sent." };
+  }
+
+  /** PRD #1542 — the preview sends no answer, so there is nothing to cancel. */
+  async cancelVoiceAnswer(): Promise<void> {
+    await Promise.resolve();
   }
 
   private pendingQuestionOf(target: VoiceQuestionTarget): PendingQuestionDto | undefined {
@@ -4454,9 +4466,14 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<QuestionResultDto>("desktop_voice_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, utterance, form, awaitingText: awaitingText ?? null });
   }
 
-  async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean): Promise<AnswerOutcomeDto> {
+  async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
     const invoke = await this.getInvoke();
-    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways });
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease });
+  }
+
+  async cancelVoiceAnswer(lease: string): Promise<void> {
+    const invoke = await this.getInvoke();
+    await invoke<void>("desktop_voice_answer_cancel", { lease });
   }
 
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {

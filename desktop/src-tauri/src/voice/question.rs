@@ -26,6 +26,17 @@
 //! question gets exactly one, a free-text option stands alone. Anything else is
 //! refused with a sentence of this file's own.
 //!
+//! **And the model's choice must be grounded in what the user said** (audit
+//! A1). The question's own text reaches the model, so a prompt or an option
+//! description can steer it towards a valid but unwanted option — an approval
+//! — whatever the user said. So every selection the model makes carries
+//! `evidence`, the user's words that chose it copied verbatim, and [`ground`]
+//! refuses the whole answer unless each one is a run of words of the
+//! transcript itself; a free-text answer must be such a run too, and is
+//! replaced by the transcript's own words. This is no phrase list — the model
+//! still decides what the words mean — but a model that answers an unrelated
+//! utterance, or quotes words the user never said, cannot arm a send.
+//!
 //! # Every text field of the question is untrusted
 //!
 //! It is the agent's words (`docs/develop/voice-first-design.md` §6). It goes
@@ -70,8 +81,11 @@ the option's words, or by a synonym — \"yes\", \"go ahead\", \"sure\", \"do it
 an `allow_once` option; \"no\", \"don't\", \"stop\" pick a `deny` option; \"always\", \
 \"don't ask again\" pick an `allow_always` option. One utterance may answer several \
 questions (\"red for colour and large for size\"), and a question with `multi_select` \
-true takes several options at once. For a `free_text` option, put the user's own \
-words for it in `text`, or null when they gave none. Answer `cancel`, with no \
+true takes several options at once. Every selection carries `evidence`: the words \
+of the utterance that chose it, copied EXACTLY as the user said them — never \
+paraphrased, never words from the question; make no selection the utterance has no \
+words for. For a `free_text` option, put the user's own words for it in `text`, \
+copied exactly from the utterance, or null when they gave none. Answer `cancel`, with no \
 selections, when the user calls the answer off (\"cancel\", \"never mind\"). Answer \
 `not_answer`, with no selections, when the utterance is not about this question — a \
 command to the app, or anything else.";
@@ -177,13 +191,17 @@ pub enum ModelKind {
 }
 
 /// One selection as the model names it — integers it chose, held to the
-/// snapshot by [`validate`] before anything trusts them.
+/// snapshot by [`validate`], and the words it chose them for, held to the
+/// transcript by [`ground`], before anything trusts them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModelSelection {
     pub question_index: i64,
     pub option_indices: Vec<i64>,
     #[serde(default)]
     pub text: Option<String>,
+    /// The user's words that chose this selection, verbatim (audit A1).
+    #[serde(default)]
+    pub evidence: Option<String>,
 }
 
 impl ModelAnswer {
@@ -201,7 +219,8 @@ impl ModelAnswer {
         }
     }
 
-    /// One question answered with `options`.
+    /// One question answered with `options`, citing no words yet — see
+    /// [`Self::citing`].
     pub fn answer(question_index: i64, options: &[i64]) -> Self {
         Self {
             kind: ModelKind::Answer,
@@ -209,6 +228,7 @@ impl ModelAnswer {
                 question_index,
                 option_indices: options.to_vec(),
                 text: None,
+                evidence: None,
             }],
         }
     }
@@ -219,9 +239,93 @@ impl ModelAnswer {
             question_index,
             option_indices: options.to_vec(),
             text: None,
+            evidence: None,
         });
         self
     }
+
+    /// The last selection, citing `evidence` as the words that chose it.
+    pub fn citing(mut self, evidence: &str) -> Self {
+        if let Some(last) = self.selections.last_mut() {
+            last.evidence = Some(evidence.to_string());
+        }
+        self
+    }
+
+    /// The last selection, with `text` as its free-text words.
+    pub fn with_text(mut self, text: &str) -> Self {
+        if let Some(last) = self.selections.last_mut() {
+            last.text = Some(text.to_string());
+        }
+        self
+    }
+}
+
+/// The words of `text` — runs of letters and digits — each with its byte range
+/// in `text`.
+fn word_spans(text: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (at, c) in text.char_indices() {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                words.push((text[from..at].to_lowercase(), from..at));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        words.push((text[from..].to_lowercase(), from..text.len()));
+    }
+    words
+}
+
+/// Where `quoted`'s words appear, contiguous and in order, among the words of
+/// `transcript` — case, punctuation and spacing aside — as the transcript's own
+/// slice. `None` when they do not, or `quoted` has no words.
+pub fn verbatim_slice<'a>(transcript: &'a str, quoted: &str) -> Option<&'a str> {
+    let said = word_spans(transcript);
+    let quoted: Vec<String> = word_spans(quoted).into_iter().map(|(w, _)| w).collect();
+    if quoted.is_empty() || quoted.len() > said.len() {
+        return None;
+    }
+    said.windows(quoted.len())
+        .find(|window| window.iter().map(|(w, _)| w).eq(quoted.iter()))
+        .map(|window| &transcript[window[0].1.start..window[window.len() - 1].1.end])
+}
+
+/// PRD #1542 (audit A1): hold a model's answer to what the user actually said.
+/// Every selection must cite `evidence` that is a run of the transcript's own
+/// words, and a free-text `text` must be one too — and is replaced by the
+/// transcript's words, so what is sent is what was said, not the model's
+/// rendering of it. `Err` with the sentence to show when anything is not.
+/// A `cancel` or `not_answer` sends nothing and is not checked.
+pub fn ground(transcript: &str, answer: &mut ModelAnswer) -> Result<(), String> {
+    if answer.kind != ModelKind::Answer {
+        return Ok(());
+    }
+    let refused = || {
+        format!(
+            "Heard: \u{201c}{}\u{201d} — I couldn't tell which option that chooses, so nothing was chosen.",
+            safe_message(transcript)
+        )
+    };
+    for selection in &mut answer.selections {
+        let grounded = selection
+            .evidence
+            .as_deref()
+            .and_then(|evidence| verbatim_slice(transcript, evidence));
+        if grounded.is_none() {
+            return Err(refused());
+        }
+        if let Some(text) = selection.text.as_deref().filter(|t| !t.trim().is_empty()) {
+            let slice = verbatim_slice(transcript, text).ok_or_else(refused)?;
+            selection.text = Some(slice.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Take one utterance to a verdict about the pending `question`.
@@ -290,7 +394,10 @@ pub async fn resolve(
         .await;
     let resolve_ms = Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
     let verdict = match answered {
-        Ok(answer) => judge(agent, question, &form, answer),
+        Ok(mut answer) => match ground(transcript.text(), &mut answer) {
+            Ok(()) => judge(agent, question, &form, answer),
+            Err(sentence) => QuestionVerdict::Refused { sentence },
+        },
         Err(error) => QuestionVerdict::Refused {
             sentence: format!(
                 "Heard: \u{201c}{}\u{201d} — could not work out the answer ({}).",
@@ -701,7 +808,9 @@ pub fn answers_of(form: &[Selection]) -> Vec<QuestionAnswer> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnswerOutcome {
-    /// `answered`, `refused`, `withheld` or `superseded`.
+    /// `answered`, `refused`, `withheld`, `superseded`, `cancelled` (the
+    /// panel's lease was cancelled before the request was written) or
+    /// `too_late` (it was cancelled after).
     pub kind: &'static str,
     /// The refusal's code (`no_pending_question`, `stale`, …) for a refusal.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -738,6 +847,34 @@ pub fn report_outcome(
             sentence: QUESTION_MOVED_ON.to_string(),
         },
         AnswerReport::Refused(refusal) => refusal_outcome(agent, question, refusal),
+    }
+}
+
+/// The outcome of a send whose lease the panel cancelled (audit A8): nothing
+/// went when the cancel beat the request, and the answer's own outcome, said
+/// to be too late, when it did not.
+pub fn leased_outcome(
+    agent: &str,
+    question: &DesktopPendingQuestion,
+    form: &[Selection],
+    leased: super::lease::Leased,
+) -> AnswerOutcome {
+    use super::lease::Leased;
+    match leased {
+        Leased::Cancelled => AnswerOutcome {
+            kind: "cancelled",
+            code: None,
+            sentence: "Answer cancelled — nothing was sent.".to_string(),
+        },
+        Leased::TooLate(report) => {
+            let outcome = report_outcome(agent, question, form, &report);
+            AnswerOutcome {
+                kind: "too_late",
+                code: outcome.code,
+                sentence: format!("Too late to cancel — {}", outcome.sentence),
+            }
+        }
+        Leased::Sent(report) => report_outcome(agent, question, form, &report),
     }
 }
 
@@ -897,12 +1034,12 @@ pub fn answer_schema(nullable_text: bool) -> Value {
     let (text, required) = if nullable_text {
         (
             json!({ "type": ["string", "null"] }),
-            json!(["question_index", "option_indices", "text"]),
+            json!(["question_index", "option_indices", "text", "evidence"]),
         )
     } else {
         (
             json!({ "type": "string" }),
-            json!(["question_index", "option_indices"]),
+            json!(["question_index", "option_indices", "evidence"]),
         )
     };
     json!({
@@ -922,6 +1059,10 @@ pub fn answer_schema(nullable_text: bool) -> Value {
                         "question_index": { "type": "integer" },
                         "option_indices": { "type": "array", "items": { "type": "integer" } },
                         "text": text,
+                        "evidence": {
+                            "type": "string",
+                            "description": "The words of the utterance that chose this selection, copied exactly as the user said them.",
+                        },
                     },
                     "required": required,
                     "additionalProperties": false,

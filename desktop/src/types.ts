@@ -1363,7 +1363,9 @@ export interface DeckRuntimeState {
    * panel on a runtime without them treats nothing as an answer.
    */
   resolveVoiceQuestion?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, utterance: string, form: import("./lib/voiceQuestion").QuestionSelectionDto[], awaitingText?: import("./lib/voiceQuestion").QuestionTextSlotDto) => Promise<import("./lib/voiceQuestion").QuestionResultDto>;
-  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
+  sendVoiceAnswer?: (target: import("./lib/voiceQuestion").VoiceQuestionTarget, form: import("./lib/voiceQuestion").QuestionSelectionDto[], confirmedAlways: boolean, lease: string) => Promise<import("./lib/voiceQuestion").AnswerOutcomeDto>;
+  /** PRD #1542 (audit A8): cancel the lease an answer is being sent under (`DeckBridge.cancelVoiceAnswer`). */
+  cancelVoiceAnswer?: (lease: string) => Promise<void>;
   /**
    * Every command in the table, annotated for one screen (PRD #802 D7) — what
    * the discovery overlay lists.
