@@ -5438,9 +5438,9 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// mentions usage limits — would silently delete real coverage. A host
 /// capability question belongs in a preflight, and this is the preflight.
 ///
-/// Two tests pay the probe — `orchestration/delegate/015` and
-/// `opencode_auto_submits_daemon_injected_prompt` (the only two callers) — each
-/// in its own nextest process, so the cost is two cheap turns per lane-2 run.
+/// Every test gated on this function pays the probe, each in its own nextest
+/// process, so the cost is one cheap turn per gated test that a lane-2 run
+/// selects (`grep -rn 'check_opencode_available()' tests/` lists them).
 /// [`check_devin_available`] documents the case where that trade goes the other
 /// way.
 pub fn check_opencode_available() -> Result<(), String> {
@@ -5481,7 +5481,7 @@ pub fn check_opencode_available() -> Result<(), String> {
 /// but a probe whose pass condition survives only while that stays true is a
 /// probe that can silently become vacuous, and a vacuous availability gate is
 /// strictly worse than none: it converts every skip into a confusing failure.
-const OPENCODE_PROBE_PROMPT: &str =
+pub(crate) const OPENCODE_PROBE_PROMPT: &str =
     "Reply with only the number equal to 4000 plus 444. Do not use tools.";
 const OPENCODE_PROBE_ANSWER: &str = "4444";
 
@@ -5494,10 +5494,11 @@ const OPENCODE_PROBE_ANSWER: &str = "4444";
 ///
 /// FINITE, which the sibling [`check_codex_available`] probe is not. An
 /// unbounded probe that wedges spends the test's entire nextest kill window
-/// (3 x 60 s by default here, and neither of the two callers has an override),
-/// after which the process is SIGKILLed — producing no skip, no failure message
-/// and no diagnostics whatever. 60 s leaves two thirds of that window for the
-/// scenario the probe is only the gate for.
+/// (3 x 60 s by default here; some callers widen theirs in
+/// `.config/nextest.toml`), after which the process is SIGKILLed — producing
+/// no skip, no failure message and no diagnostics whatever. 60 s leaves two
+/// thirds of the default window for the scenario the probe is only the gate
+/// for.
 const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
@@ -5554,16 +5555,35 @@ fn opencode_model_probe() -> Result<(), String> {
         Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
         Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
     };
-    Err(format!(
+    Err(opencode_probe_failure_message(
+        model,
+        &observed,
+        &redact_credentials_for_output(text.trim()),
+    ))
+}
+
+/// The SKIP reason [`opencode_model_probe`] returns, split out so its advice
+/// can be unit-tested without spawning `opencode`. `probe_output` must already
+/// be redacted.
+pub(crate) fn opencode_probe_failure_message(
+    model: &str,
+    observed: &str,
+    probe_output: &str,
+) -> String {
+    format!(
         "OpenCode cannot reach model `{model}` with this host's credentials: the probe \
          {observed}. An exhausted subscription quota, a login for a different provider, and \
-         a retired model id all land here — read the probe output below. Point \
-         {OPENCODE_TEST_MODEL_ENV} at a model these credentials can reach (e.g. \
-         `openai/gpt-5.4-mini` for a ChatGPT-subscription `opencode auth login`, or an \
-         `openrouter/…` id for an OpenRouter key), or authorise the default with \
-         {ANTHROPIC_API_KEY_ENV} or `opencode auth login`.\nProbe output:\n{}",
-        redact_credentials_for_output(text.trim())
-    ))
+         a retired model id all land here — read the probe output below. Authorise the \
+         default with {ANTHROPIC_API_KEY_ENV} or `opencode auth login`, or point \
+         {OPENCODE_TEST_MODEL_ENV} at a model these credentials can reach. To find one, \
+         list candidates with `opencode models <provider>` (`openai` for a \
+         ChatGPT-subscription `opencode auth login`, `openrouter` for an OpenRouter key). \
+         A login can still reject a listed id (ChatGPT logins answer \"not supported when \
+         using Codex with a ChatGPT account\"), so try each candidate with this check's own \
+         probe, with MODEL_ID replaced by an id from that listing, and keep one that \
+         answers {OPENCODE_PROBE_ANSWER}: \
+         `opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\"`.\nProbe output:\n{probe_output}"
+    )
 }
 
 /// Whether an ambient `ANTHROPIC_API_KEY` is enough to run the OpenCode tests —
@@ -5607,10 +5627,12 @@ pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 /// came up on it).
 ///
 /// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
-/// same day and **also still works**, by both routes. It is named here rather
-/// than silently dropped because the swap is a refresh of a dated claim, not the
-/// retirement of a dead model id: if you are already exporting it, nothing is
-/// wrong. (The probe that appeared to condemn it was measuring its own defect —
+/// same day and still worked then, by both routes. **It no longer does on a
+/// ChatGPT login:** on 2026-10-04 codex-cli 0.160.0 answered `The
+/// 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
+/// account` while `gpt-5.6-luna` answered (issue #1564), so a host still
+/// exporting it now fails [`check_codex_available`]'s probe. (The 2026-08-26 probe
+/// that appeared to condemn it was measuring its own defect —
 /// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
 /// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
 /// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
@@ -5695,9 +5717,16 @@ pub fn codex_test_model() -> &'static str {
 ///   surfaces as a `SKIP:` naming the model (a hard failure under
 ///   `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
 ///
-/// **A subscription host keeps its old behaviour by exporting
-/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini`** — verified
-/// reachable on 2026-09-08, so this is a live route and not a historical note.
+/// **A subscription host with no Anthropic key exports an `openai/…`
+/// override its login accepts**, e.g.
+/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna`. Which ids those
+/// are changes on OpenAI's schedule: `openai/gpt-5.4-mini`, verified here on
+/// 2026-09-08, was rejected for a ChatGPT login on 2026-10-04 (OpenCode
+/// 1.18.34: "not supported when using Codex with a ChatGPT account", as were
+/// `openai/gpt-5.4` and `openai/gpt-5.3-codex-spark`) while
+/// `openai/gpt-5.6-luna` passed (issue #1564). So the probe's SKIP reason
+/// ([`opencode_probe_failure_message`]) says how to find an accepted id
+/// rather than naming one.
 ///
 /// Nothing OpenCode-specific is lost by the provider move. What these two tests
 /// assert is OpenCode's own surface — its composer paint, its auto-submit, its
@@ -5715,10 +5744,10 @@ pub(crate) const OPENCODE_TEST_MODEL_DEFAULT: &str = "anthropic/claude-haiku-4-5
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
 /// credentials cannot reach the default — e.g. one holding a
 /// ChatGPT-subscription `opencode auth` login and no Anthropic key, which
-/// exports `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini` (the
-/// default until issue #922; still reachable, see
-/// [`OPENCODE_TEST_MODEL_DEFAULT`]), or one authenticated to OpenRouter alone,
-/// which exports `openrouter/openai/gpt-4o-mini`.
+/// exports an `openai/…` id that login accepts (`openai/gpt-5.6-luna` on
+/// 2026-10-04; see [`OPENCODE_TEST_MODEL_DEFAULT`] for why no id is pinned
+/// here), or one authenticated to OpenRouter alone, which exports
+/// `openrouter/openai/gpt-4o-mini`.
 pub const OPENCODE_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_MODEL";
 
 /// Cheap provider-qualified model used by real-agent OpenCode e2e coverage —
