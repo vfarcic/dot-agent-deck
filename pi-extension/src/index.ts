@@ -64,9 +64,19 @@ async function runDeck(
 	}
 	const failure = execFailureMessage(argv, outcome, deckBin);
 	if (failure) {
-		throw new Error(failure);
+		throw new DeckExecError(failure, outcome);
 	}
 	return outcome;
+}
+
+/** A non-zero exit from the deck CLI, keeping the exec result it came from. */
+class DeckExecError extends Error {
+	readonly outcome: { code: number; stdout: string; stderr: string };
+
+	constructor(message: string, outcome: { code: number; stdout: string; stderr: string }) {
+		super(message);
+		this.outcome = outcome;
+	}
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
@@ -157,7 +167,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			if (fallback) {
 				try {
 					await runDeck(pi, fallback, ctx.signal);
-					legacyCli = err instanceof Error && isUnsupportedFlagFailure(err.message);
+					legacyCli = err instanceof DeckExecError && isUnsupportedFlagFailure(err.outcome);
 				} catch {
 					// Intentionally ignored — card reporting is best-effort.
 				}

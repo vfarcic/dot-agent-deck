@@ -463,18 +463,22 @@ describe("issue #622: falling back for a CLI older than the extension", () => {
 		assert.equal(legacyAgentEventArgv({ type: "tool-end", detail: {} }), null);
 	});
 
-	test("only an unknown-flag refusal marks the CLI as older", () => {
-		// The released CLI's own stderr, as execFailureMessage carries it.
+	test("only the CLI's own unknown-flag refusal marks it as older", () => {
+		// The released 0.45.1 CLI's exact refusal.
+		const refusal =
+			"error: unexpected argument '--cwd' found\n\nUsage: dot-agent-deck agent-event --type <TYPE>\n";
+		assert.ok(isUnsupportedFlagFailure({ code: 2, stderr: refusal }));
+		// Not a usage error, or not this one.
+		assert.ok(!isUnsupportedFlagFailure({ code: 1, stderr: "Failed to send agent-event to daemon socket." }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 1, stderr: refusal }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 2, stderr: "error: invalid value 'x' for '--type <TYPE>'" }));
+		assert.ok(!isUnsupportedFlagFailure({ code: 2 }));
+		// The phrase appearing elsewhere (e.g. in a directory echoed back) is not a refusal.
 		assert.ok(
-			isUnsupportedFlagFailure(
-				"`dot-agent-deck agent-event --type running --cwd=/w` failed with exit code 2: error: unexpected argument '--cwd' found",
-			),
+			!isUnsupportedFlagFailure({
+				code: 1,
+				stderr: "Failed to send agent-event for /work/error: unexpected argument '--x'",
+			}),
 		);
-		assert.ok(
-			!isUnsupportedFlagFailure(
-				"`dot-agent-deck agent-event --type running --cwd=/w` failed with exit code 1: Failed to send agent-event to daemon socket.",
-			),
-		);
-		assert.ok(!isUnsupportedFlagFailure("Failed to run `dot-agent-deck agent-event`: spawn ENOENT"));
 	});
 });

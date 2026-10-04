@@ -405,14 +405,17 @@ export function legacyAgentEventArgv(report: AgentEventReport): string[] | null 
 }
 
 /**
- * Whether a failed report's error says the CLI does not know one of the flags
- * — clap's `unexpected argument` — i.e. the CLI is older than this extension.
- * Only that may switch the session to lifecycle-only reporting: a transient
- * failure (daemon restarting, socket busy) must not cost the card its detail
- * for the rest of the session.
+ * Whether a failed report was the CLI refusing one of its flags as unknown —
+ * clap's usage error, exit code 2 with stderr opening `error: unexpected
+ * argument '--…` — i.e. the CLI is older than this extension. Only that may
+ * switch the session to lifecycle-only reporting: a transient failure (daemon
+ * restarting, socket busy) must not cost the card its detail for the rest of
+ * the session. Reads the CLI's own exit code and stderr, never a message built
+ * from the argv, so a directory or prompt that happens to contain the phrase
+ * cannot trigger it.
  */
-export function isUnsupportedFlagFailure(message: string): boolean {
-	return message.includes("unexpected argument");
+export function isUnsupportedFlagFailure(outcome: ExecOutcome): boolean {
+	return outcome.code === 2 && /^error: unexpected argument '--/.test((outcome.stderr ?? "").trimStart());
 }
 
 /** Minimal shape of a `dot-agent-deck` CLI exec result (subset of Pi's ExecResult). */
