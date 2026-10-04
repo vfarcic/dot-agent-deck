@@ -466,6 +466,20 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the capability is the desktop, which bounds its preparation call against a
 /// deck naming it and keeps waiting an older one out.
 ///
+/// **Issue #1445 contributes no bump for
+/// [`AttachRequest::RecordOrchestratorContext`]**, for the reason `focus-gained`
+/// needed none: its one sender,
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`], withholds
+/// it unless [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is advertised, and the residual
+/// pairing — a cached capability set that outlived a daemon replaced by an older
+/// build — fails closed: that daemon refuses the unknown variant and records
+/// nothing, which is exactly the pre-#1445 behaviour. No existing field changed
+/// meaning: [`crate::agent_pty::AgentRecord::orchestrator_context_path`] still
+/// names the coordinator's own context file, now the newest one rather than the
+/// first, and its one reader, the TUI, already takes it as "this tab's own
+/// file". So no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -660,6 +674,16 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
+/// #1445).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`] holds the
+/// check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated, and the two reads it makes go through
+/// the same bounded context-file read the TUI's re-arm uses on every platform.
+pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -823,7 +847,9 @@ fn invalid_client_id_message() -> String {
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
 /// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb — and so is
 /// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
-/// [`CAP_PREPARE_ORCHESTRATION`].
+/// [`CAP_PREPARE_ORCHESTRATION`]. Issue #1445's
+/// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
+/// not `#[cfg]`-gated.
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -839,6 +865,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -850,6 +877,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1991,6 +2019,46 @@ pub enum AttachRequest {
         /// with no identity names nothing. Must satisfy [`is_valid_client_id`];
         /// an invalid one is refused and changes no state.
         client_id: String,
+    },
+    /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
+    /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
+    /// per-publish context file for that coordinator
+    /// (`orchestrator_context::reassert_orchestrator_prompt`).
+    ///
+    /// The daemon records the context file each orchestration's coordinator
+    /// was started with and hands it to every TUI that later hydrates the tab
+    /// (`AgentRecord::orchestrator_context_path`), and deletes it when the
+    /// orchestration ends. A re-arm writes a new file the daemon would
+    /// otherwise never hear of, so a reattached tab was handed the startup file
+    /// — gone once the retention sweep reached it, after which the next re-arm
+    /// carried no task — and the re-arm files outlived the orchestration. This
+    /// moves the record to the reported file and keeps the one it replaces for
+    /// deletion at the end.
+    ///
+    /// **The daemon follows only a report it can check**, and answers `ok:
+    /// false` otherwise, leaving the record as it was: `pane_id` must be the
+    /// registered orchestrator seat of an orchestration the daemon records a
+    /// file for; `context_path` must be `orchestrator-context-<32 hex>.md`
+    /// directly in that recorded file's own `.dot-agent-deck`, recorded by no
+    /// other orchestration; and it must carry the recorded file's brief — the
+    /// same `## Your task` section and attendance
+    /// (`orchestrator_context::rearmed_context_carries_the_same_brief`). So a
+    /// report can never point an orchestration at another one's brief. A
+    /// refusal is not an error the TUI acts on: its own tab keeps the file it
+    /// published either way.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RECORD_ORCHESTRATOR_CONTEXT`]**,
+    /// by [`crate::daemon_client::DaemonClient::record_orchestrator_context`].
+    /// An older daemon has no such variant and would answer `malformed
+    /// request: …`, changing nothing.
+    ///
+    /// Its own short-lived connection: one request, one response, close.
+    RecordOrchestratorContext {
+        /// The coordinator's pane, as the daemon knows it
+        /// ([`crate::agent_pty::AgentRecord::pane_id_env`]).
+        pane_id: String,
+        /// The absolute path of the context file the re-arm published.
+        context_path: String,
     },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
@@ -3572,6 +3640,68 @@ impl OrchestrationSpawnMeta {
     }
 }
 
+/// Issue #1445: [`AttachRequest::RecordOrchestratorContext`]'s handling — check
+/// the report and, if it holds, move the orchestration's recorded context file
+/// to the one the re-arm published.
+///
+/// Three steps, so no file is read under the state lock: the lexical checks
+/// and the recorded file come from a read lock
+/// ([`crate::state::AppState::rearmed_context_target`]); the two files' briefs
+/// are compared on a blocking thread
+/// ([`crate::orchestrator_context::rearmed_context_carries_the_same_brief`]);
+/// and the write lock re-runs the lexical checks before recording
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]). A report
+/// that raced another one between the steps was compared against a file that
+/// carries the same brief as whichever file is recorded by then, since every
+/// file the record moves to was checked the same way. The refusal never echoes
+/// the path: it is the client's value, and it failed a check.
+async fn record_rearmed_context(
+    state: &SharedState,
+    pane_id: &str,
+    context_path: &str,
+) -> Result<(), String> {
+    if !crate::agent_pty::is_valid_pane_id_env(pane_id)
+        || !crate::agent_pty::is_valid_orchestration_cwd(context_path)
+    {
+        return Err("record-orchestrator-context: invalid pane id or context path".into());
+    }
+    let reported = std::path::PathBuf::from(context_path);
+    let refused = |reason: &dyn std::fmt::Display| {
+        tracing::debug!(pane_id, reason = %reason, "not following a re-arm publication");
+        format!("record-orchestrator-context: {reason}")
+    };
+    let current = state
+        .read()
+        .await
+        .rearmed_context_target(pane_id, &reported)
+        .map_err(|r| refused(&r))?;
+    if current != reported {
+        let (current, reported) = (current.clone(), reported.clone());
+        let same = tokio::task::spawn_blocking(move || {
+            crate::orchestrator_context::rearmed_context_carries_the_same_brief(&current, &reported)
+        })
+        .await;
+        match same {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return Err(refused(&"the file carries a different brief")),
+            Ok(Err(e)) => return Err(refused(&format!("could not compare the files: {e}"))),
+            Err(e) => return Err(refused(&format!("the comparison did not finish: {e}"))),
+        }
+    }
+    let changed = state
+        .write()
+        .await
+        .record_rearmed_orchestration_context(pane_id, &reported)
+        .map_err(|r| refused(&r))?;
+    if changed {
+        tracing::info!(
+            pane_id,
+            "the orchestrator's recorded context followed a re-arm"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -4881,6 +5011,16 @@ async fn handle_connection(
                 )
                 .await?
             }
+        }
+        AttachRequest::RecordOrchestratorContext {
+            pane_id,
+            context_path,
+        } => {
+            let resp = match record_rearmed_context(&state, &pane_id, &context_path).await {
+                Ok(()) => AttachResponse::ok(),
+                Err(refusal) => AttachResponse::err(refusal),
+            };
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::WriteAndSubmit { pane_id, text } => {
             // PRD #20 M3: deliver input honestly. A dashboard-visible session is

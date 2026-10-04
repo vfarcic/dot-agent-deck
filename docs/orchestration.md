@@ -513,7 +513,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts | What the orchestrator is told: its `prompt_template`, the available workers, and how to delegate. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |

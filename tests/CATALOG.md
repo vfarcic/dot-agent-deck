@@ -4007,6 +4007,13 @@ without depending on the config struct API.
 - **Does not assert:** a real agent or the `/clear` trigger, which shares the re-arm helper with compaction.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`).
 
+##### orchestration/remit/010 — A reattached start-role tab re-arms from the latest re-arm's context file, and ending the run removes every context file it published.
+- **Layer:** L2 lane 1 (real-binary PTY TUI, detached and reattached, against a headless daemon that started a prepared orchestration).
+- **Agent:** synthetic shell start role and `cat` worker, as `008`; no credential.
+- **Asserts:** continues `008`'s run past its first compaction re-arm. That TUI is dropped, the startup context file is deleted (a stand-in for the 14-day retention sweep reaching it), and a fresh TUI attaches. A second compaction publishes a new context that still carries the run's brief, because the daemon's record followed the first re-arm (issue #1445). Stopping every role then removes both re-arm files within a bounded wait, while the compatibility mirror remains.
+- **Does not assert:** the retention sweep itself (covered by the sweep unit tests in `src/orchestrator_context.rs`); the daemon's refusals of a report that names another orchestration's brief, a foreign directory or a non-orchestrator pane (unit tests beside `AppState::record_rearmed_orchestration_context` in `src/state.rs` and `only_a_file_carrying_the_recorded_brief_matches` in `src/orchestrator_context.rs`); an older daemon, against which the report is withheld and the tab behaves as before; the `/clear` trigger, which reports through the same call.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`).
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).

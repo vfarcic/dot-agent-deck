@@ -4453,9 +4453,11 @@ fn schedule_send_retry(
 /// review): the coordinator may still be reading it — the re-arm is triggered
 /// by a compaction or `/clear` it is recovering from, and nothing tells the tab
 /// when the coordinator has finished with the previous brief. A file this
-/// leaves behind is removed by the coordination sweep once it ages past the
-/// retention window (`orchestrator_context::is_sweepable_coordination_name`);
-/// deleting each file when its orchestration ends is follow-up #1395.
+/// leaves behind is deleted when the orchestration ends if the daemon records
+/// the orchestration's context — the re-arm site reports each new file to it
+/// ([`crate::pane::PaneController::report_orchestrator_context`], issue #1445)
+/// — and otherwise by the coordination sweep once it ages past the retention
+/// window (`orchestrator_context::is_sweepable_coordination_name`).
 fn replace_orchestration_context_path(
     slot: &mut Option<std::path::PathBuf>,
     new: std::path::PathBuf,
@@ -14398,6 +14400,10 @@ pub fn run_tui(
                         ui.orchestration_ready_since.remove(id);
 
                         *orchestrator_prompt = Some(published.prompt);
+                        // Issue #1445: tell the daemon, so a TUI attaching
+                        // later re-arms from this file and the end of the
+                        // orchestration removes it.
+                        pane.report_orchestrator_context(&start_pane_id, &published.context_path);
                         replace_orchestration_context_path(context_path, published.context_path);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
@@ -14540,6 +14546,11 @@ pub fn run_tui(
                             ui.orchestration_ready_since.remove(id);
 
                             *orchestrator_prompt = Some(published.prompt);
+                            // Issue #1445: as the compaction re-arm above.
+                            pane.report_orchestrator_context(
+                                &start_pane_id,
+                                &published.context_path,
+                            );
                             replace_orchestration_context_path(
                                 context_path,
                                 published.context_path,

@@ -820,6 +820,52 @@ pub fn reassert_orchestrator_prompt(
     prepare_orchestrator_prompt(config, cwd, task.as_deref(), attendance)
 }
 
+/// Issue #1445: whether `reported`, a context file a TUI says it re-armed an
+/// orchestration's coordinator from, carries the **same brief** — the same
+/// `## Your task` section and the same [`Attendance`] — as `current`, the file
+/// the daemon records for that orchestration.
+///
+/// The daemon asks this before its record follows a re-arm publication, and it
+/// is the property that makes following safe rather than merely convenient: a
+/// re-arm reads the task and attendance back off the tab's own file and writes
+/// them unchanged into the new one ([`reassert_orchestrator_prompt`]), so a
+/// genuine re-arm of this orchestration always answers `true`, and a file that
+/// carries some other brief — another orchestration's preparation in the same
+/// project — answers `false` and is never recorded. Only the task and the
+/// attendance are compared, because they are all a later re-arm reads back
+/// ([`read_back_context`]); the rest of the file is composed from the tab's
+/// own configuration.
+///
+/// Both paths must name a per-publish file in the same `.dot-agent-deck`
+/// ([`own_context_file_name`]), and both are read through
+/// [`read_context_file`] — bounded, and on Unix never following a link at the
+/// last two components. An `Err` (a path of the wrong shape, a missing or
+/// unreadable file) means "not shown to be the same", and the caller refuses.
+///
+/// **Blocking.** Reads two files; the daemon calls it from a blocking task.
+pub fn rearmed_context_carries_the_same_brief(
+    current: &std::path::Path,
+    reported: &std::path::Path,
+) -> std::io::Result<bool> {
+    let not_a_context_file = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a per-publish context path",
+        )
+    };
+    let project_dir = current
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(not_a_context_file)?;
+    let current_name =
+        own_context_file_name(project_dir, current).ok_or_else(not_a_context_file)?;
+    let reported_name =
+        own_context_file_name(project_dir, reported).ok_or_else(not_a_context_file)?;
+    let current = read_context_file(project_dir, current_name)?;
+    let reported = read_context_file(project_dir, reported_name)?;
+    Ok(read_back_context(Some(&current)) == read_back_context(Some(&reported)))
+}
+
 // ---------------------------------------------------------------------------
 // PRD #819 M4: the publish
 //
@@ -2113,15 +2159,19 @@ impl std::fmt::Display for ContextRemovalError {
     }
 }
 
-/// Delete the per-publish context an orchestration was started with, once
-/// that orchestration has ended (issue #1395 item 2).
+/// Delete a per-publish context of an orchestration that has ended (issue
+/// #1395 item 2): the one it was started with, or since issue #1445 one a
+/// re-arm published for it.
 ///
-/// `context_path` is the path the daemon recorded from its own preparation
-/// binding ([`crate::state::AppState::record_orchestration_context`]), never a
-/// value a client supplied — and it is validated anyway, because this deletes a
-/// file: the file name must be [`is_unique_context_file_name`] and its parent
-/// must be named [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror
-/// therefore can never be removed here.
+/// `context_path` is a path the daemon recorded: from its own preparation
+/// binding or publish ([`crate::state::AppState::record_orchestration_context`]),
+/// or a re-arm publication a TUI reported and the daemon checked against the
+/// recorded file — same directory, same brief
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]). It is
+/// validated again here anyway, because this deletes a file: the file name must
+/// be [`is_unique_context_file_name`] and its parent must be named
+/// [`CONTEXT_DIR_NAME`]. The [`CONTEXT_FILE_NAME`] mirror therefore can never be
+/// removed here.
 ///
 /// The removal goes through the same held-descriptor discipline as the publish:
 /// the project directory is opened once, `.dot-agent-deck` is opened relative
@@ -2777,8 +2827,10 @@ pub struct SweepReport {
 ///   residual, stated: a coordinator that re-reads its own file on its own
 ///   initiative more than the window after its last publish, with no re-arm in
 ///   between (a re-arm publishes a fresh file), finds it gone. It then reads
-///   nothing rather than something wrong. A daemon-started orchestration's file
-///   is also deleted when the orchestration ends
+///   nothing rather than something wrong. A daemon-started orchestration's
+///   files — the one it started with and, since issue #1445, each one a TUI's
+///   re-arm reported and the daemon followed — are also deleted when the
+///   orchestration ends
 ///   ([`remove_ended_orchestration_context`], issue #1395); this sweep is the
 ///   backstop for every file that path does not reach.
 /// * the mirror's own leftover temp files, `.orchestrator-context.md.<pid>.<seq>.tmp`,
@@ -3858,6 +3910,61 @@ mod tests {
                 .expect("a per-publish name");
             assert_eq!(id.len(), 32);
             assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+    }
+
+    /// Issue #1445: the daemon's record follows a re-arm publication only when
+    /// the reported file carries the recorded file's brief. A genuine re-arm
+    /// does; another preparation's file in the same project (a different task,
+    /// or the same task with a different attendance) does not; and a path that
+    /// is not a per-publish file beside the recorded one, or names a missing
+    /// file, is an error rather than a match.
+    #[test]
+    fn only_a_file_carrying_the_recorded_brief_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let publish = |task: Option<&str>, attendance| {
+            prepare_orchestrator_prompt(&config(), &cwd, task, attendance)
+                .expect("published")
+                .context_path
+        };
+        let current = publish(Some("TASK-ALPHA"), Attendance::Unattended);
+        let rearmed = reassert_orchestrator_prompt(&config(), &cwd, Some(&current))
+            .expect("re-armed")
+            .context_path;
+        assert!(rearmed_context_carries_the_same_brief(&current, &rearmed).unwrap());
+
+        for (case, other) in [
+            (
+                "another task",
+                publish(Some("TASK-BRAVO"), Attendance::Unattended),
+            ),
+            (
+                "another attendance",
+                publish(Some("TASK-ALPHA"), Attendance::Attended),
+            ),
+            ("no task", publish(None, Attendance::Unattended)),
+        ] {
+            assert!(
+                !rearmed_context_carries_the_same_brief(&current, &other).unwrap(),
+                "{case}: must not be recorded as this orchestration's brief"
+            );
+        }
+
+        let mirror = context_dir_of(tmp.path()).join(CONTEXT_FILE_NAME);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = context_dir_of(elsewhere.path()).join(rearmed.file_name().unwrap());
+        let missing =
+            context_dir_of(tmp.path()).join(format!("{CONTEXT_FILE_PREFIX}{}.md", "0".repeat(32)));
+        for (case, path) in [
+            ("the mirror", mirror),
+            ("another directory", foreign),
+            ("a missing file", missing),
+        ] {
+            assert!(
+                rearmed_context_carries_the_same_brief(&current, &path).is_err(),
+                "{case}: must be refused, not compared"
+            );
         }
     }
 

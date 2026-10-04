@@ -1153,6 +1153,47 @@ pub fn orchestration_identity_of_record(
     })
 }
 
+/// Issue #1445: how many replaced context files
+/// [`AppState::orchestration_superseded_contexts`] keeps per orchestration.
+///
+/// A re-arm follows a compaction or a `/clear`, so a long run reaches a few
+/// dozen at most; the bound only keeps a client that reports in a loop from
+/// growing daemon memory without limit. A file pushed out of it is not deleted
+/// at the end and is left to the retention sweep, as every re-arm file was
+/// before issue #1445.
+pub const MAX_SUPERSEDED_CONTEXTS: usize = 256;
+
+/// Issue #1445: why [`AppState::record_rearmed_orchestration_context`] did not
+/// follow a reported re-arm publication. Each refusal leaves the record as it
+/// was, so the orchestration keeps the file it already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RearmedContextRefusal {
+    /// The pane is not a registered orchestrator seat of a live orchestration.
+    NotACoordinator,
+    /// The daemon records no context file for that orchestration — it was
+    /// started by a client that published its own context, or by an older
+    /// path — so there is nothing to follow.
+    NoRecordedContext,
+    /// The path is not `orchestrator-context-<32 hex>.md` directly in the
+    /// recorded file's own `.dot-agent-deck`.
+    NotBesideTheRecordedContext,
+    /// Another orchestration records that file.
+    AnotherOrchestrationsContext,
+}
+
+impl std::fmt::Display for RearmedContextRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotACoordinator => "the pane is not a live orchestration's coordinator",
+            Self::NoRecordedContext => "no context file is recorded for that orchestration",
+            Self::NotBesideTheRecordedContext => {
+                "the path is not a per-publish context file beside the recorded one"
+            }
+            Self::AnotherOrchestrationsContext => "another orchestration records that file",
+        })
+    }
+}
+
 /// Issue #1395 item 2: delete an ended orchestration's context file off the
 /// caller's thread — on Tokio's blocking pool when a runtime is current, else
 /// on a plain thread — so [`AppState::unregister_pane`], which runs under the
@@ -1524,17 +1565,28 @@ pub struct AppState {
     pub orchestration_titles: HashMap<OrchestrationIdentity, OrchestrationTitle>,
     /// Issue #1395: the per-publish orchestrator context file each
     /// orchestration's coordinator was started with, keyed by the same
-    /// identity as [`Self::orchestration_titles`]. Written only by the daemon's
+    /// identity as [`Self::orchestration_titles`]. Created only by the daemon's
     /// own start paths from what THEY published or bound
-    /// ([`Self::record_orchestration_context`]) — never from a client-supplied
-    /// value — and read twice: the `ListAgents` reply stamps it onto the start
-    /// role's record ([`Self::attach_orchestrator_context_paths`]) so a
-    /// hydrated tab re-arms from its own file, and [`Self::unregister_pane`]
-    /// deletes the file once the orchestration's last pane closes
+    /// ([`Self::record_orchestration_context`]). Issue #1445: then moved to
+    /// each file a TUI reports re-arming the coordinator from, once the daemon
+    /// has checked the report ([`Self::record_rearmed_orchestration_context`]),
+    /// so the entry names the newest file. Read twice: the `ListAgents` reply
+    /// stamps it onto the start role's record
+    /// ([`Self::attach_orchestrator_context_paths`]) so a hydrated tab re-arms
+    /// from its own file, and [`Self::unregister_pane`] deletes the file once
+    /// the orchestration's last pane closes
     /// ([`Self::take_ended_orchestration_context`]).
     ///
     /// Daemon-only, like the routing map beside it.
     pub orchestration_context_paths: HashMap<OrchestrationIdentity, std::path::PathBuf>,
+    /// Issue #1445: the files [`Self::orchestration_context_paths`] has moved
+    /// on from for each orchestration, oldest first, kept only so that
+    /// [`Self::take_ended_orchestration_context`] deletes them along with the
+    /// newest one. At most [`MAX_SUPERSEDED_CONTEXTS`] per orchestration; one
+    /// pushed out of that bound is left to the retention sweep.
+    ///
+    /// Daemon-only, like the map it belongs to.
+    pub orchestration_superseded_contexts: HashMap<OrchestrationIdentity, Vec<std::path::PathBuf>>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -11407,10 +11459,12 @@ impl AppState {
     }
 
     /// Issue #1395 item 2: once no pane maps to `identity` any more, forget
-    /// its context file and answer it for deletion — unless another live
-    /// orchestration still references the same file, in which case the entry
-    /// is dropped and `None` is answered. Never the fixed-path mirror (the
-    /// deletion helper refuses any other name shape too).
+    /// its context files and answer them for deletion — the newest one and,
+    /// since issue #1445, every file a re-arm replaced
+    /// ([`Self::orchestration_superseded_contexts`]) — except any file another
+    /// live orchestration still references, which is forgotten and kept. Never
+    /// the fixed-path mirror (the deletion helper refuses any other name shape
+    /// too).
     ///
     /// Bookkeeping under the state lock; the caller does the unlink after
     /// releasing it ([`Self::unregister_pane`]).
@@ -11442,7 +11496,7 @@ impl AppState {
     pub fn take_ended_orchestration_context(
         &mut self,
         identity: &OrchestrationIdentity,
-    ) -> Option<std::path::PathBuf> {
+    ) -> Vec<std::path::PathBuf> {
         // Still running, or another of its roles is mid-start (the same
         // in-flight claim that keeps its title held).
         let held = self
@@ -11454,18 +11508,141 @@ impl AppState {
                 .get(identity)
                 .is_some_and(|held| held.pending_claims > 0);
         if held {
-            return None;
+            return Vec::new();
         }
-        let path = self.orchestration_context_paths.remove(identity)?;
-        let still_referenced = self
+        let superseded = self
+            .orchestration_superseded_contexts
+            .remove(identity)
+            .unwrap_or_default();
+        let Some(current) = self.orchestration_context_paths.remove(identity) else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        for path in superseded.into_iter().chain(std::iter::once(current)) {
+            if released.contains(&path) || self.context_path_recorded(&path, None) {
+                continue;
+            }
+            crate::prep_token::revoke_context_path(&path);
+            released.push(path);
+        }
+        released
+    }
+
+    /// Issue #1445: whether any orchestration other than `except` records
+    /// `path`, as its newest context file or as one a re-arm replaced.
+    fn context_path_recorded(
+        &self,
+        path: &std::path::Path,
+        except: Option<&OrchestrationIdentity>,
+    ) -> bool {
+        let other = |identity: &OrchestrationIdentity| except != Some(identity);
+        self.orchestration_context_paths
+            .iter()
+            .any(|(identity, recorded)| other(identity) && recorded == path)
+            || self
+                .orchestration_superseded_contexts
+                .iter()
+                .any(|(identity, files)| {
+                    other(identity) && files.iter().any(|recorded| recorded == path)
+                })
+    }
+
+    /// Issue #1445: the context file a re-arm report from `pane_id` would
+    /// replace — the newest file recorded for the orchestration that pane is
+    /// the coordinator of — provided `reported` could follow it. Read-only, so
+    /// the daemon can check the two files' briefs
+    /// ([`crate::orchestrator_context::rearmed_context_carries_the_same_brief`])
+    /// off the state lock before [`Self::record_rearmed_orchestration_context`]
+    /// re-checks and records.
+    pub fn rearmed_context_target(
+        &self,
+        pane_id: &str,
+        reported: &std::path::Path,
+    ) -> Result<std::path::PathBuf, RearmedContextRefusal> {
+        self.check_rearmed_context(pane_id, reported)
+            .map(|(_, current, _)| current.clone())
+    }
+
+    /// Issue #1445: follow a re-arm publication. `pane_id` reported that it
+    /// re-armed its orchestration's coordinator from `reported`; make that the
+    /// file the orchestration's start role is advertised with, and keep the one
+    /// it replaces for deletion at the end
+    /// ([`Self::orchestration_superseded_contexts`]). Answers whether the record
+    /// changed (`false` when `reported` already is the newest file).
+    ///
+    /// The checks ([`RearmedContextRefusal`]) are lexical and against this
+    /// state only: `pane_id` must be a registered orchestrator seat whose
+    /// orchestration has a recorded file, and `reported` must be a per-publish
+    /// file in that recorded file's own `.dot-agent-deck` that no other
+    /// orchestration records. That `reported` carries the same brief is the
+    /// caller's to establish first, off the lock — the daemon's dispatch does,
+    /// and refuses the report otherwise — because it reads both files.
+    pub fn record_rearmed_orchestration_context(
+        &mut self,
+        pane_id: &str,
+        reported: &std::path::Path,
+    ) -> Result<bool, RearmedContextRefusal> {
+        let (identity, current, reported) = self.check_rearmed_context(pane_id, reported)?;
+        if reported == *current {
+            return Ok(false);
+        }
+        let (identity, current) = (identity.clone(), current.clone());
+        let superseded = self
+            .orchestration_superseded_contexts
+            .entry(identity.clone())
+            .or_default();
+        superseded.retain(|path| *path != reported && *path != current);
+        superseded.push(current);
+        if superseded.len() > MAX_SUPERSEDED_CONTEXTS {
+            superseded.remove(0);
+        }
+        self.orchestration_context_paths.insert(identity, reported);
+        Ok(true)
+    }
+
+    /// The shared checks of [`Self::rearmed_context_target`] and
+    /// [`Self::record_rearmed_orchestration_context`]: the orchestration
+    /// `pane_id` coordinates, its newest recorded file, and `reported` rebuilt
+    /// from that file's directory and `reported`'s own file name.
+    fn check_rearmed_context(
+        &self,
+        pane_id: &str,
+        reported: &std::path::Path,
+    ) -> Result<
+        (
+            &OrchestrationIdentity,
+            &std::path::PathBuf,
+            std::path::PathBuf,
+        ),
+        RearmedContextRefusal,
+    > {
+        let identity = Some(pane_id)
+            .filter(|pane| self.orchestrator_pane_ids.contains(*pane))
+            .and_then(|pane| self.pane_orchestration_map.get(pane))
+            .ok_or(RearmedContextRefusal::NotACoordinator)?;
+        let current = self
             .orchestration_context_paths
-            .values()
-            .any(|other| *other == path);
-        if still_referenced {
-            return None;
+            .get(identity)
+            .ok_or(RearmedContextRefusal::NoRecordedContext)?;
+        let dir = current
+            .parent()
+            .ok_or(RearmedContextRefusal::NotBesideTheRecordedContext)?;
+        let name = reported
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| crate::orchestrator_context::is_unique_context_file_name(name))
+            .filter(|_| {
+                reported.parent() == Some(dir)
+                    && reported
+                        .components()
+                        .all(|c| !matches!(c, std::path::Component::ParentDir))
+            })
+            .ok_or(RearmedContextRefusal::NotBesideTheRecordedContext)?;
+        let reported = dir.join(name);
+        if self.context_path_recorded(&reported, Some(identity)) {
+            return Err(RearmedContextRefusal::AnotherOrchestrationsContext);
         }
-        crate::prep_token::revoke_context_path(&path);
-        Some(path)
+        Ok((identity, current, reported))
     }
 
     fn prune_orchestration_title(&mut self, identity: &OrchestrationIdentity) {
@@ -11650,7 +11827,7 @@ impl AppState {
             // Issue #1395 item 2: and so does its per-publish context file.
             // Decided here, under the caller's lock; the unlink runs on a
             // blocking thread so no caller holds the state lock across IO.
-            if let Some(path) = self.take_ended_orchestration_context(&identity) {
+            for path in self.take_ended_orchestration_context(&identity) {
                 spawn_context_removal(path);
             }
         }
@@ -15291,7 +15468,10 @@ mod tests {
 
         // `a` still has a pane: nothing is released and its entry stays.
         state.pane_orchestration_map.remove("a0");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             state
                 .orchestration_context_paths
@@ -15300,7 +15480,10 @@ mod tests {
 
         // `a` ends, but live `b` references the same file: forget, keep file.
         state.pane_orchestration_map.remove("a1");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             !state
                 .orchestration_context_paths
@@ -15311,7 +15494,7 @@ mod tests {
         state.pane_orchestration_map.remove("c0");
         assert_eq!(
             state.take_ended_orchestration_context(&instance("c")),
-            Some(own)
+            vec![own]
         );
         // `b` still runs, untouched.
         assert_eq!(
@@ -15351,7 +15534,10 @@ mod tests {
 
         // `a` ends while `b` still records the file: kept, token still live.
         state.pane_orchestration_map.remove("a0");
-        assert_eq!(state.take_ended_orchestration_context(&instance("a")), None);
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            Vec::<std::path::PathBuf>::new()
+        );
         assert!(
             crate::prep_token::binding(&token).is_some(),
             "a file still in use keeps the token that minted it"
@@ -15362,12 +15548,141 @@ mod tests {
         state.pane_orchestration_map.remove("b0");
         assert_eq!(
             state.take_ended_orchestration_context(&instance("b")),
-            Some(path)
+            vec![path]
         );
         assert!(
             crate::prep_token::binding(&token).is_none(),
             "a reused token must not re-verify against a file answered for deletion"
         );
+    }
+
+    /// Issue #1445: a re-arm report from the coordinator's pane moves the
+    /// record to the reported file, keeps every file it replaces, and the end
+    /// of the orchestration answers all of them for deletion — so a reattached
+    /// tab is handed the newest file and none of them waits for the sweep.
+    #[test]
+    fn the_recorded_context_follows_rearms_and_all_of_them_end_together() {
+        let ctx = |hex: char| {
+            std::path::PathBuf::from(format!(
+                "/p/.dot-agent-deck/orchestrator-context-{}.md",
+                hex.to_string().repeat(32)
+            ))
+        };
+        let (startup, first, second) = (ctx('a'), ctx('b'), ctx('c'));
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        state.record_orchestration_context(&instance("a"), startup.clone());
+
+        assert_eq!(
+            state.rearmed_context_target("a0", &first),
+            Ok(startup.clone())
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &first),
+            Ok(true)
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &first),
+            Ok(false),
+            "a repeated report changes nothing"
+        );
+        assert_eq!(
+            state.record_rearmed_orchestration_context("a0", &second),
+            Ok(true)
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&second),
+            "the record names the newest re-arm"
+        );
+
+        state.pane_orchestration_map.remove("a0");
+        state.pane_orchestration_map.remove("a1");
+        assert_eq!(
+            state.take_ended_orchestration_context(&instance("a")),
+            vec![startup, first, second]
+        );
+        assert!(
+            state.orchestration_superseded_contexts.is_empty(),
+            "nothing is kept for an ended orchestration"
+        );
+    }
+
+    /// Issue #1445: a report the daemon cannot attribute to the reporting
+    /// coordinator's own orchestration is refused and leaves every record as
+    /// it was — a worker's pane, an unknown pane, an orchestration with no
+    /// recorded file, a file outside the recorded `.dot-agent-deck`, the
+    /// fixed-path mirror, and a file another orchestration records.
+    #[test]
+    fn a_rearm_report_that_is_not_the_coordinators_own_is_refused() {
+        let own = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-0123456789abcdef0123456789abcdef.md",
+        );
+        let other = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-fedcba9876543210fedcba9876543210.md",
+        );
+        let fresh = std::path::PathBuf::from(
+            "/p/.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+        );
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "a0", "orchestrator", true, instance("a"));
+        register_role_pane(&mut state, "a1", "worker", false, instance("a"));
+        register_role_pane(&mut state, "b0", "orchestrator", true, instance("b"));
+        register_role_pane(&mut state, "c0", "orchestrator", true, instance("c"));
+        state.record_orchestration_context(&instance("a"), own.clone());
+        state.record_orchestration_context(&instance("c"), other.clone());
+
+        use RearmedContextRefusal::*;
+        for (case, pane, path, refusal) in [
+            ("a worker's pane", "a1", fresh.clone(), NotACoordinator),
+            ("an unknown pane", "zz", fresh.clone(), NotACoordinator),
+            ("no recorded file", "b0", fresh.clone(), NoRecordedContext),
+            (
+                "another project",
+                "a0",
+                std::path::PathBuf::from(
+                    "/q/.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+                ),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "a parent-directory escape",
+                "a0",
+                std::path::PathBuf::from(
+                    "/p/.dot-agent-deck/../.dot-agent-deck/orchestrator-context-11111111111111111111111111111111.md",
+                ),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "the mirror",
+                "a0",
+                std::path::PathBuf::from("/p/.dot-agent-deck/orchestrator-context.md"),
+                NotBesideTheRecordedContext,
+            ),
+            (
+                "another orchestration's file",
+                "a0",
+                other.clone(),
+                AnotherOrchestrationsContext,
+            ),
+        ] {
+            assert_eq!(
+                state.record_rearmed_orchestration_context(pane, &path),
+                Err(refusal),
+                "{case}"
+            );
+            assert_eq!(state.rearmed_context_target(pane, &path), Err(refusal));
+        }
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("a")),
+            Some(&own)
+        );
+        assert_eq!(
+            state.orchestration_context_paths.get(&instance("c")),
+            Some(&other)
+        );
+        assert!(state.orchestration_superseded_contexts.is_empty());
     }
 
     /// Issue #1395 item 1: the `ListAgents` stamp lands on the start role's
