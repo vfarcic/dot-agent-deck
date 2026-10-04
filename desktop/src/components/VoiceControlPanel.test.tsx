@@ -451,6 +451,10 @@ describe("voice control panel", () => {
     }
 
     function report() { return screen.getByTestId("voice-report"); }
+    /** Control writes, including Undo restoration, must carry a send-time guard. */
+    function guardedWrite(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], data: string) {
+      return [target, data, expect.any(Function)];
+    }
     /** Hold one transport acknowledgement so later prompt commands genuinely wait. */
     function holdNextWrite(write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
       let release!: () => void;
@@ -555,7 +559,7 @@ describe("voice control panel", () => {
     it.each(["claude_code", "codex", "pi"] as const)("interrupts %s with its verified key", async (agentType) => {
       const { say, write, target } = await startPrompt(agentType);
       await say("interrupt");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.interrupt[0].bytes]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS[agentType]!.interrupt[0].bytes)]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
@@ -565,12 +569,12 @@ describe("voice control panel", () => {
       const { say, write, target } = await startPrompt("open_code");
       const [first, second] = FIXTURE_PROMPT_KEYS.open_code!.interrupt;
       await say("interrupt");
-      expect(write.mock.calls).toEqual([[target, first.bytes]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, first.bytes)]);
       await act(async () => { await vi.advanceTimersByTimeAsync(first.pauseAfterMs - 1); });
       expect(write).toHaveBeenCalledTimes(1);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
       await flush();
-      expect(write.mock.calls).toEqual([[target, first.bytes], [target, second.bytes]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, first.bytes), guardedWrite(target, second.bytes)]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
@@ -654,11 +658,11 @@ describe("voice control panel", () => {
     it("stops OpenCode interrupt when the turn ends between steps", async () => {
       const { say, write, target, updatePlanner } = await startPrompt("open_code");
       await say("interrupt");
-      expect(write.mock.calls).toEqual([[target, "\x1b"]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, "\x1b")]);
       updatePlanner({ turn: "idle" });
       await act(async () => { await vi.advanceTimersByTimeAsync(FIXTURE_PROMPT_KEYS.open_code!.interrupt[0].pauseAfterMs); });
       await flush();
-      expect(write.mock.calls, "second Escape must not reach an idle editor").toEqual([[target, "\x1b"]]);
+      expect(write.mock.calls, "second Escape must not reach an idle editor").toEqual([guardedWrite(target, "\x1b")]);
       expect(report()).toHaveTextContent(/not working|stopped interrupting|turn.*ended/i);
     });
 
@@ -674,7 +678,7 @@ describe("voice control panel", () => {
       expect(write.mock.calls).toEqual(before);
       const refusal = report().textContent;
       await release();
-      expect(write.mock.calls.filter(([, bytes]) => bytes === "\x1b"), "pending interrupt must reserve the pane against a second Escape").toEqual([[target, "\x1b"]]);
+      expect(write.mock.calls.filter(([, bytes]) => bytes === "\x1b"), "pending interrupt must reserve the pane against a second Escape").toEqual([guardedWrite(target, "\x1b")]);
       expect(refusal, "second request must be refused while first remains pending").toMatch(/pending|in flight|already|wait|still interrupting/i);
     });
 
@@ -756,7 +760,7 @@ describe("voice control panel", () => {
       updatePlanner({ turn: "working" });
       await flush();
       await say("interrupt");
-      expect(write.mock.calls).toEqual([[target, "draft "], [target, "\x1b"]]);
+      expect(write.mock.calls).toEqual([[target, "draft "], guardedWrite(target, "\x1b")]);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
 
@@ -764,7 +768,7 @@ describe("voice control panel", () => {
     it.each(["codex", "open_code", "pi"] as const)("clears %s with thirty-two per-line presses", async (agentType) => {
       const { say, write, target } = await startPrompt(agentType);
       await say("clear the prompt");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.clear.bytes.repeat(32)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS[agentType]!.clear.bytes.repeat(32))]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
     });
@@ -776,12 +780,12 @@ describe("voice control panel", () => {
       const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
       await say("clear the prompt");
       const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
-      expect(write.mock.calls).toEqual([[target, chunk]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, chunk)]);
       expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
       await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs! - 1); });
-      expect(write.mock.calls).toEqual([[target, chunk]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, chunk)]);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      expect(write.mock.calls).toEqual([[target, chunk], [target, chunk]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, chunk), guardedWrite(target, chunk)]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
     });
@@ -792,14 +796,14 @@ describe("voice control panel", () => {
       await say("clear the prompt");
       const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
       const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
-      expect(write.mock.calls).toEqual([[target, chunk]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, chunk)]);
       if (stop === "typing off") await say(stop);
       else fireEvent.click(stop === "Stop typing" ? screen.getByRole("button", { name: /stop typing/i }) : voiceButton());
       await flush();
       expect(screen.queryByRole("button", { name: /stop typing/i })).not.toBeInTheDocument();
       await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs!); });
       await flush();
-      expect(write.mock.calls, "stopped typing mode must cancel the second clear write").toEqual([[target, chunk]]);
+      expect(write.mock.calls, "stopped typing mode must cancel the second clear write").toEqual([guardedWrite(target, chunk)]);
       expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
     });
 
@@ -864,7 +868,7 @@ describe("voice control panel", () => {
       }
       expect(write).toHaveBeenCalledTimes(2);
       await release();
-      expect(write.mock.calls.slice(2)).toEqual([[target, "\x1b"], ...texts.map((text) => [target, `${text} `])]);
+      expect(write.mock.calls.slice(2)).toEqual([guardedWrite(target, "\x1b"), ...texts.map((text) => [target, `${text} `])]);
       write.mockClear();
       await say("scratch that");
       expect(write, "coalesced burst must not be scratched into a private prefix").not.toHaveBeenCalled();
@@ -888,7 +892,7 @@ describe("voice control panel", () => {
         expect(report()).toHaveTextContent(/cannot|can't/i);
         expect(report()).toHaveTextContent(/safe|collapsed|paste|together/i);
       } else {
-        expect(write).toHaveBeenCalledWith(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800));
+        expect(write).toHaveBeenCalledWith(...guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800)));
         expect(report()).toHaveTextContent(/Removed/);
       }
       expect(screen.getByRole("textbox", { name: "Planner terminal input" })).toHaveValue("private prefix");
@@ -902,11 +906,11 @@ describe("voice control panel", () => {
       expect(write.mock.calls).toEqual([[target, "first sentence "], [target, "second sentence "]]);
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("second sentence ".length)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("second sentence ".length))]);
       expect(report()).toHaveTextContent(/Removed ["“]second sentence ?["”] from Planner's prompt\./);
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("first sentence ".length)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("first sentence ".length))]);
       expect(report()).toHaveTextContent(/Removed ["“]first sentence ?["”] from Planner's prompt\./);
       expectNoInterruptByte(write);
       write.mockClear();
@@ -972,7 +976,7 @@ describe("voice control panel", () => {
       await say("a".repeat(799));
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800))]);
       expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
     });
 
@@ -982,7 +986,7 @@ describe("voice control panel", () => {
       await say("a short write");
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat("a short write ".length)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat("a short write ".length))]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent(/Removed ["“]a short write ?["”] from Planner's prompt\./);
     });
@@ -995,7 +999,7 @@ describe("voice control panel", () => {
       await say("a".repeat(9));
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, keys.deleteChar.bytes.repeat(10)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, keys.deleteChar.bytes.repeat(10))]);
     });
 
     /// Scenario: scratch two voice writes that together exceed the literal limit when they landed just before or exactly at the settle boundary, and a pair within the limit. Only the too-close, oversized pair is refused with an explanation and no deletion bytes.
@@ -1028,7 +1032,7 @@ describe("voice control panel", () => {
         expect(report()).toHaveTextContent(/cannot|can't/i);
         expect(report()).toHaveTextContent(/safely|safe|collapsed|paste|together/i);
       } else {
-        expect(write.mock.calls).toEqual([[target, keys.deleteChar.bytes.repeat(last.length)]]);
+        expect(write.mock.calls).toEqual([guardedWrite(target, keys.deleteChar.bytes.repeat(last.length))]);
         expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
       }
     });
@@ -1056,11 +1060,11 @@ describe("voice control panel", () => {
         const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
         const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
         const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
-        expect(write.mock.calls).toEqual([[target, chunk]]);
+        expect(write.mock.calls).toEqual([guardedWrite(target, chunk)]);
         expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
         expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
         await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs!); });
-        expect(write.mock.calls).toEqual([[target, chunk], [target, chunk]]);
+        expect(write.mock.calls).toEqual([guardedWrite(target, chunk), guardedWrite(target, chunk)]);
       }
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
       const undo = screen.getByRole("button", { name: "Undo" });
@@ -1068,15 +1072,15 @@ describe("voice control panel", () => {
       write.mockClear();
       fireEvent.click(undo);
       await flush();
-      expect(write.mock.calls).toEqual([[target, first]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, first)]);
       await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS - 1); });
-      expect(write.mock.calls).toEqual([[target, first]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, first)]);
       await act(async () => { await vi.advanceTimersByTimeAsync(1); });
-      expect(write.mock.calls).toEqual([[target, first], [target, second]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, first), guardedWrite(target, second)]);
       expect(report()).toHaveTextContent("Restored Planner's prompt.");
       write.mockClear();
       await say("scratch that");
-      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat(second.length)]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat(second.length))]);
       expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
     });
 
@@ -1095,7 +1099,7 @@ describe("voice control panel", () => {
       }
       const keys = FIXTURE_PROMPT_KEYS[agentType]!.clear;
       const chunk = keys.bytes.repeat(agentType === "claude_code" ? keys.maxPressesPerWrite! : 32);
-      expect(write.mock.calls).toEqual(agentType === "claude_code" ? [[target, chunk], [target, chunk]] : [[target, chunk]]);
+      expect(write.mock.calls).toEqual(agentType === "claude_code" ? [guardedWrite(target, chunk), guardedWrite(target, chunk)] : [guardedWrite(target, chunk)]);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
       expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
       expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
@@ -1155,12 +1159,12 @@ describe("voice control panel", () => {
       const release = holdNextWrite(write);
       fireEvent.click(screen.getByRole("button", { name: "Undo" }));
       await flush();
-      expect(write.mock.calls).toEqual([[target, "first old part "]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, "first old part ")]);
       await keyboard("private edit during Undo");
       await release();
       await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
       await flush();
-      expect(write.mock.calls, "Undo must recheck ownership after waiting").toEqual([[target, "first old part "], [target, "private edit during Undo"]]);
+      expect(write.mock.calls, "Undo must recheck ownership after waiting").toEqual([guardedWrite(target, "first old part "), [target, "private edit during Undo"]]);
       expect(report()).toHaveTextContent(/nothing.*restored|changed|keyboard|cannot|can't/i);
     });
 
@@ -1193,7 +1197,7 @@ describe("voice control panel", () => {
       write.mockClear();
       fireEvent.click(screen.getByRole("button", { name: "Undo" }));
       await flush();
-      expect(write.mock.calls).toEqual([[target, "old voice draft "]]);
+      expect(write.mock.calls).toEqual([guardedWrite(target, "old voice draft ")]);
       expect(report()).toHaveTextContent("Restored Planner's prompt.");
     });
 
