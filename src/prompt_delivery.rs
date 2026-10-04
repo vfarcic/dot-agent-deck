@@ -945,13 +945,17 @@ pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
 ///
 /// Reviewer finding B4. Claude Code, Devin and Codex post `UserPromptSubmit`
 /// through their native hook engines, and OpenCode forwards `session.prompt` —
-/// all four land as an event carrying `user_prompt` (`crate::hook`). **Pi
-/// cannot**: its extension reaches the
-/// daemon through the `agent-event` subcommand, which hardcodes
-/// `user_prompt: None`, so a Pi pane emits perfectly well-formed status frames
-/// carrying the right pane and agent ids and never a single submitted prompt.
-/// Arming re-submission off those frames retypes the prompt until the deadline
-/// into an agent that may already be working on it.
+/// all four land as an event carrying `user_prompt` (`crate::hook`). **Pi is
+/// answered `false`.** Until issue #622 it could not report one at all: its
+/// extension reaches the daemon through the `agent-event` subcommand, which
+/// hardcoded `user_prompt: None`, so a Pi pane emitted perfectly well-formed
+/// status frames and never a single submitted prompt, and arming re-submission
+/// off those frames retyped the prompt until the deadline into an agent that
+/// may already be working on it. Since #622 the bundled extension reports the
+/// prompt Pi's `before_agent_start` hands it, which is what the card's `Prmt:`
+/// row shows — but turning that into a delivery capability is a change to
+/// which panes the deck re-submits into and which get the quiet-unit notice,
+/// and #622 deliberately did not make it.
 ///
 /// **This answers for the AGENT, and a type is not always the agent speaking.**
 /// Issue #559: `dot-agent-deck wrap`'s own events declare `AgentType::Codex` on

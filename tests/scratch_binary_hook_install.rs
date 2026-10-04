@@ -286,3 +286,52 @@ fn install_008_a_scratch_copy_with_no_install_pins_itself_as_a_last_resort() {
         );
     }
 }
+
+/// Scenario: Seed `~/.claude/settings.json` with a trailing comma — the user is
+/// mid-edit — and, beside it, the `settings.json.bak` they copied aside before
+/// they started. Run `hooks install --agent claude-code` with an install
+/// seeded. The command must refuse with a non-zero exit, leave both files
+/// byte-for-byte as they were, and not claim the user's own `.bak` as the
+/// deck's backup (issue #537 items 1 and 2).
+#[spec("hooks/install/010")]
+#[test]
+fn install_010_a_refused_install_exits_non_zero_and_leaves_a_users_backup_alone() {
+    let fixture = Fixture::new();
+    fixture.seed_install();
+    let scratch = fixture.scratch_deck();
+
+    let settings = fixture.settings();
+    let malformed = "{\n  \"model\": \"opus\",\n  \"hooks\": {},\n}\n";
+    std::fs::write(&settings, malformed).expect("seed malformed settings.json");
+    let users_backup = settings.with_file_name("settings.json.bak");
+    let good = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
+    std::fs::write(&users_backup, good).expect("seed the user's own settings.json.bak");
+
+    let out = fixture.run(&scratch, &["hooks", "install", "--agent", "claude-code"]);
+    let report = combined(&out);
+
+    assert!(
+        !out.status.success(),
+        "`hooks install` refused the settings file but exited 0, so a script or a \
+         provisioning step cannot see the refusal:\n{report}"
+    );
+    assert!(
+        report.contains("not valid JSON"),
+        "the refusal must say why:\n{report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("read settings.json"),
+        malformed,
+        "a refused install rewrote the settings file it refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&users_backup).expect("read settings.json.bak"),
+        good,
+        "the refusal replaced the user's own settings.json.bak — the one copy of their \
+         config that still parsed:\n{report}"
+    );
+    assert!(
+        !report.contains("preserved at"),
+        "the message claims a backup the deck did not make:\n{report}"
+    );
+}

@@ -29,7 +29,7 @@ A newer daemon can report a status this build does not know; the TUI shows it as
 
 ### Which agents report which status
 
-The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports only running (shown as **Thinking**), waiting (**Needs Input**) and finished (**Idle**). Error, Blocked and when Needs Input appears depend on the agent:
+The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports **Thinking**, **Working** while a tool runs, **Idle**, and **Needs Input** while a dialog another Pi extension shows is waiting; Pi asks no permission prompts of its own. Error, Blocked and when Needs Input appears depend on the agent:
 
 | Status | Claude Code | Codex | OpenCode | Pi | Devin |
 |---|---|---|---|---|---|

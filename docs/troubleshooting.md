@@ -121,7 +121,7 @@ Hooks are how an agent tells the deck what it is doing: prompts, tool use, waiti
 | Devin | `devin` is on the `PATH` | a `"hooks"` object in `$XDG_CONFIG_HOME/devin/config.json` (when `XDG_CONFIG_HOME` is an absolute path), else `~/.config/devin/config.json` |
 | Pi | `pi` is on the `PATH` | no hooks; the daemon writes the deck's Pi extension to `$PI_CODING_AGENT_DIR/extensions/dot-agent-deck` (default `~/.pi/agent/extensions/dot-agent-deck`) when it starts. `dot-agent-deck orchestrator setup` does the same on demand |
 
-Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
+Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. For Claude Code, an install also removes the deck's entries from hook types it no longer installs, such as `StopFailure` after Claude Code is downgraded below 2.1.78. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
 
 On Windows, `$HOME` is usually unset, so Codex hooks are installed only when `CODEX_HOME` is set.
 
@@ -181,7 +181,7 @@ A hook command whose binary still **exists** is left alone, even when it names a
 
 `dot-agent-deck hooks install` or `hooks uninstall` fails with one of:
 
-- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. Fix the syntax and run the install again. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
+- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. If a `<name>.bak` already exists, for example a copy you made before editing, the deck leaves it alone and the message says `original not copied: <path>.bak already exists and was left as it was` instead. Fix the syntax and run the install again; the command exits with a non-zero status until it succeeds. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
 - `<path> is a symlink (left unchanged): …` — the config is a symbolic link, as in a dotfiles setup. The deck neither replaces the link nor writes through it. Point it at a regular file, or add the deck's hooks to the linked file yourself.
 
 At startup the same problems are logged instead of printed, and the hooks are not installed.

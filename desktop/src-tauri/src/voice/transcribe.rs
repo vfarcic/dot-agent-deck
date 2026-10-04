@@ -72,6 +72,7 @@ use crate::settings::{
 
 use super::Transcript;
 use super::capture::{MIN_SPEECH, Pcm16, SPEECH_WINDOW, SpeechMeasure};
+use super::human_voice::{self, MIN_VOICE, VoiceMeasure};
 
 /// How long the request gets before the attempt is abandoned.
 ///
@@ -152,6 +153,39 @@ fn not_enough_speech(measure: SpeechMeasure) -> (String, String) {
         MIN_SPEECH.as_millis()
     );
     (detail, NOTHING_HEARD.into())
+}
+
+/// The detail for a segment that rose out of the room but held no voice
+/// ([`human_voice`]): a breath, a cough, a knock, a beep — issue #1450.
+fn no_voice(measure: VoiceMeasure) -> String {
+    format!(
+        "no voice — {} ms of the segment scored as voice, where {} ms is needed (the highest \
+         score was {:.2})",
+        measure.voice.as_millis(),
+        MIN_VOICE.as_millis(),
+        measure.peak_score
+    )
+}
+
+/// Whether `audio` is worth sending to any backend, and if not, the detail and
+/// the sentence its refusal carries.
+///
+/// Two questions, cheapest first: did enough of it rise out of the room to be
+/// a word ([`MIN_SPEECH`]), and is what rose a human voice ([`human_voice`]).
+///
+/// CPU-bound — the voice check runs a model over every 16 ms of the segment,
+/// up to [`super::capture::MAX_UTTERANCE`] of it — so [`handle_audio`] runs it
+/// on a blocking worker rather than on the async runtime (Qodo on PR #1550).
+fn ineligible(audio: &Pcm16) -> Option<(String, String)> {
+    let measure = audio.measure_speech();
+    if measure.voiced < MIN_SPEECH {
+        return Some(not_enough_speech(measure));
+    }
+    let voice = human_voice::measure(audio);
+    if !voice.heard() {
+        return Some((no_voice(voice), NOTHING_HEARD.into()));
+    }
+    None
 }
 
 /// `Heard “<transcript>”.` — with no full stop of its own after a transcript
@@ -370,6 +404,13 @@ impl HttpTranscriber {
         // and a caller that went straight to it would otherwise post the audio.
         // Reported as a BACKEND failure rather than as a not-configured one: the
         // setup is fine, which is a different thing to do next.
+        //
+        // **The cheap half only.** [`handle_audio`]'s second question, whether
+        // the audio holds a voice ([`ineligible`]), runs a model over the
+        // whole segment; asking it again here would score every utterance the
+        // app sends twice (Qodo on PR #1550). [`handle_audio`] is the one
+        // entry point this app transcribes through, so the voice check is
+        // there and only there.
         let measure = audio.measure_speech();
         if measure.voiced < MIN_SPEECH {
             return Err(TranscriptionError::Backend(not_enough_speech(measure).0));
@@ -627,47 +668,68 @@ pub fn response_format_for(model: &str) -> &'static str {
     }
 }
 
-/// Above this `no_speech_prob`, a whisper segment is the model saying there
-/// was no speech in that stretch of audio, and its text is dropped.
+/// Above this `no_speech_prob`, a whisper segment is the model leaning towards
+/// there having been no speech in that stretch of audio — and its text is
+/// dropped when the model is also unsure of the words ([`LOW_CONFIDENCE`]), or
+/// whatever the words when it is sure ([`CERTAIN_NO_SPEECH`]).
 ///
-/// # Why this guard, and why on its own
+/// # Why this guard
 ///
 /// Whisper models are trained on captioned video, and on non-speech — a quiet
 /// room, a keyboard, a breath — they emit the captions' boilerplate as if it
 /// had been said: *"Thanks for watching"*, *"Go to Beadaholique.com for all of
 /// your beading supply needs!"* (PR #1451's hand test, typed into an agent's
-/// prompt in typing mode). The audio gate in front of every call
-/// ([`super::capture::MIN_SPEECH`]) is a level-and-density heuristic, and
-/// non-speech can clear it: thirty seconds of fast typing does. So the model's
-/// own verdict on each segment is the second check, and it is the standard
-/// one. **No list of known artefacts is kept**, for the reason
+/// prompt in typing mode). Since issue #1450 most of that audio never gets
+/// here — [`super::human_voice`] refuses a segment with no voice in it before
+/// any backend is called — so this is the second check, for a voice-like sound
+/// the first one passes. **No list of known artefacts is kept**, for the reason
 /// [`super::capture::MIN_SPEECH`] gives: it would be endless and wrong the
 /// first time somebody said one.
 ///
-/// `0.6` is openai/whisper's own default `no_speech_threshold`. **Its other
-/// half is deliberately not used**: the reference implementation keeps a
-/// no-speech segment anyway when `avg_logprob` is above `-1.0`, and whisper-1's
-/// reply to a quiet room with one burst in it, measured 2026-10-01, was exactly
-/// that — `no_speech_prob` 0.918 with `avg_logprob` -0.515. With the combined
-/// rule the artefact passes.
+/// `0.6` is openai/whisper's own default `no_speech_threshold`.
+///
+/// # Why two conditions, and why the first one changed
+///
+/// PR #1451 dropped every segment over `0.6` whatever its other numbers, and
+/// that refused real commands: measured 2026-10-04 against the default local
+/// container (`faster-whisper-tiny.en`), "Send it." scored 0.665-0.699,
+/// "Yes." 0.691 and a fast "Stop." 0.705-0.757 (transcribed "step.") — all
+/// with an `avg_logprob` over -1.0. openai/whisper's own rule is the combined one (drop when over `0.6`
+/// AND under `-1.0`), and PR #1451 rejected it for one measurement: whisper-1
+/// answered a quiet room with one burst in it at `no_speech_prob` 0.918 with an
+/// `avg_logprob` of -0.515, which the combined rule keeps. So both apply:
+///
+/// | `no_speech_prob` | dropped when |
+/// | --- | --- |
+/// | over [`CERTAIN_NO_SPEECH`] (0.85) | always |
+/// | over `0.6` | `avg_logprob` under [`LOW_CONFIDENCE`] (-1.0), or absent |
 ///
 /// # What it was measured against
 ///
-/// Measured 2026-10-01 with real calls. Non-speech — thirty seconds of a quiet
-/// room, the same with a 250 ms burst, two seconds of keystrokes — scored
-/// 0.918-0.976 on whisper-1 and 0.896 on `faster-whisper-tiny.en`. Speech at
-/// a peak of 400 and 250 against a room at 64, the quiet end of what the audio
-/// gate passes, scored 0.089-0.202 on whisper-1 and 0.166-0.377 on the local
-/// model. The speech was synthesised (OpenAI TTS, attenuated, room tone
-/// added); a real quiet speaker on a real microphone is the remaining
-/// unknown, and the margin to 0.6 is what is betting on it.
+/// Non-speech: whisper-1 scored 0.918-0.976 (2026-10-01); the local model
+/// scored 0.818-0.963 on every sound but a synthetic creak, and those under
+/// 0.85 had an `avg_logprob` of -1.228 or lower — the creak, 0.716 at -0.639,
+/// is kept, and it is a voice-like tone [`super::human_voice`] also passes
+/// (2026-10-04). Speech: 0.089-0.202 on whisper-1 and 0.166-0.377 on the
+/// local model for quiet synthesised sentences (2026-10-01), and up to 0.757
+/// for the local model's short commands (2026-10-04), all of it kept. A real
+/// quiet speaker on a real microphone is the remaining unknown.
 pub const NO_SPEECH_LIMIT: f64 = 0.6;
+
+/// The `avg_logprob` under which a segment over [`NO_SPEECH_LIMIT`] is
+/// dropped — openai/whisper's own `logprob_threshold`.
+pub const LOW_CONFIDENCE: f64 = -1.0;
+
+/// The `no_speech_prob` over which a segment is dropped whatever its
+/// `avg_logprob`. Between every short command measured (0.757 at most) and
+/// every non-speech reply with a confident-looking `avg_logprob` (0.918).
+pub const CERTAIN_NO_SPEECH: f64 = 0.85;
 
 /// The transcript, out of the reply.
 ///
 /// A whisper-family `verbose_json` reply also carries `segments`, each with
-/// the model's `no_speech_prob`. Segments over [`NO_SPEECH_LIMIT`] are
-/// dropped; when none is, `text` is taken verbatim, so speech reaches the
+/// the model's `no_speech_prob` and `avg_logprob`. Segments [`NO_SPEECH_LIMIT`]
+/// marks as no-speech are dropped; when none is, `text` is taken verbatim, so speech reaches the
 /// pipeline exactly as before. A reply with no `segments` — plain `json`, or a
 /// server that ignored the format — is read from `text` alone.
 pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError> {
@@ -679,8 +741,14 @@ pub fn parse_response(payload: &Value) -> Result<Transcript, TranscriptionError>
     let Some(segments) = payload["segments"].as_array() else {
         return Ok(Transcript::new(text.trim()));
     };
-    let no_speech =
-        |segment: &Value| segment["no_speech_prob"].as_f64().unwrap_or(0.0) > NO_SPEECH_LIMIT;
+    let no_speech = |segment: &Value| {
+        let probability = segment["no_speech_prob"].as_f64().unwrap_or(0.0);
+        // An absent `avg_logprob` counts as unsure, so a server that reports
+        // only the probability gets PR #1451's rule rather than none.
+        let confidence = segment["avg_logprob"].as_f64().unwrap_or(f64::NEG_INFINITY);
+        probability > CERTAIN_NO_SPEECH
+            || (probability > NO_SPEECH_LIMIT && confidence < LOW_CONFIDENCE)
+    };
     if !segments.iter().any(no_speech) {
         return Ok(Transcript::new(text.trim()));
     }
@@ -928,9 +996,43 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     // `transcribe_ms` is `None` for [`VoiceTranscription::transcribe_ms`]'s own
     // rule — no call was made, and a number here would claim a measurement
     // nobody took — while `backend` still names what would have answered.
-    let measure = audio.measure_speech();
-    if measure.voiced < MIN_SPEECH {
-        let (detail, sentence) = not_enough_speech(measure);
+    //
+    // Since issue #1450 it asks a second question as well — whether what rose
+    // out of the room is a voice at all — for the same reason it sits here:
+    // a backend's own no-speech verdict is missing from some backends and
+    // wrong on others, so the audio is judged before any of them is called.
+    //
+    // On a blocking worker, because the voice check is CPU work over the whole
+    // segment ([`ineligible`]). The copy is at most
+    // [`super::capture::MAX_UTTERANCE`] of 16-bit audio, under a megabyte. A
+    // worker that panics refuses the segment as a failure, never as silence:
+    // "could not check" is not "nothing was said".
+    let checked = audio.clone();
+    let verdict = match tokio::task::spawn_blocking(move || ineligible(&checked)).await {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            // Logged the way this crate logs a blocking task that did not
+            // complete (`lib.rs`'s settings save). A `JoinError` carries the
+            // task's panic message and never the audio, which this module
+            // does not log at any level.
+            eprintln!("desktop voice: the audio check did not complete: {error}");
+            let detail = if error.is_panic() {
+                "the audio check failed unexpectedly".to_string()
+            } else {
+                "the audio check was cancelled".to_string()
+            };
+            return VoiceTranscription {
+                outcome: TranscriptionOutcome::Failed {
+                    sentence: format!("Could not turn that into text ({detail})."),
+                    detail,
+                },
+                transcribe_ms: None,
+                backend,
+                audio_ms,
+            };
+        }
+    };
+    if let Some((detail, sentence)) = verdict {
         return VoiceTranscription {
             outcome: TranscriptionOutcome::Silent { detail, sentence },
             transcribe_ms: None,
@@ -1018,22 +1120,31 @@ mod tests {
     /// **The room is not decoration.** PRD #802 made the speech rule relative
     /// to the buffer's own noise floor, so a buffer of nothing but tone has
     /// nothing to be measured against and is refused by design — see
-    /// `SpeechDetector`. This used to be a bare 9 000-level square wave, which
-    /// is a signal no microphone produces.
+    /// `SpeechDetector`.
+    ///
+    /// **And the speech is speech**, since issue #1450: a real (synthesised)
+    /// "go back" from `fixtures/speech/`, 100 ms into a room at 120 and cut or
+    /// padded with room to length. This used to be a 9 000-level square wave
+    /// at 8 kHz, which cleared the audio gate and is not a voice, so
+    /// `human_voice` now refuses it exactly as it should.
     fn audio(samples: usize) -> Pcm16 {
-        let lead = samples / 8;
-        Pcm16::new(
-            (0..samples)
-                .map(|i| {
-                    let level = if i < lead || i + lead >= samples {
-                        180
-                    } else {
-                        9_000
-                    };
-                    if i % 2 == 0 { level } else { -level }
-                })
-                .collect(),
-        )
+        let speech = spoken(
+            include_bytes!("fixtures/speech/go-back-john.pcm"),
+            3_000.0,
+            120.0,
+            1,
+        );
+        // `spoken` leads with 600 ms of room; keep the last 100 ms of it.
+        let mut cut: Vec<f64> = speech.samples()[8_000..]
+            .iter()
+            .map(|&sample| f64::from(sample))
+            .collect();
+        if cut.len() < samples {
+            let pad = room_tone((samples - cut.len()) as f64 / 16_000.0 + 0.001, 120.0, 2);
+            cut.extend(pad);
+        }
+        cut.truncate(samples);
+        pcm(cut)
     }
 
     fn store() -> Arc<MemorySecretStore> {
@@ -1643,6 +1754,24 @@ mod tests {
         assert_eq!(transcript.text(), "Add a test for the parser.");
     }
 
+    /// Scenario: a segment the model leans towards calling no-speech, but
+    /// not past [`CERTAIN_NO_SPEECH`], is dropped only when the model is also
+    /// unsure of its words — the local model's reply to a 1 kHz beep, measured
+    /// 2026-10-04 at 0.818 and -1.228, goes; a reply that reports no
+    /// `avg_logprob` at all is treated as unsure and goes too.
+    #[test]
+    fn voice_transcribe_drops_an_unsure_no_speech_segment_under_the_certain_limit() {
+        // The reply was a one-word exclamation; the numbers are the measured ones.
+        let beep = parse_response(&verbose(&[(" Oh!", 0.818, -1.228)])).expect("parses");
+        assert!(!beep.has_words(), "{:?}", beep.text());
+        let unreported = parse_response(&json!({
+            "text": "Thank you.",
+            "segments": [{ "text": " Thank you.", "no_speech_prob": 0.7 }],
+        }))
+        .expect("parses");
+        assert!(!unreported.has_words(), "{:?}", unreported.text());
+    }
+
     /// Scenario: a no-speech segment is removed from a verbose reply between
     /// spoken segments whose text has no boundary spaces. The remaining words
     /// stay separated, while a segment already starting with space or
@@ -1985,16 +2114,348 @@ mod tests {
     async fn voice_transcribe_real_speech_still_reaches_the_backend() {
         let result = handle_audio(
             &StubTranscriber::hearing("go back"),
-            // Loud enough to be speech, and only 200 ms of it (3 200 samples at
-            // 16 kHz) — a bare "back" on the overview is a real command and
-            // must not be refused.
-            &audio(3_200),
+            // The shortest real command among the fixtures: a one-syllable
+            // "Yes." at one and a half times speed. A bare word is a real
+            // command and must not be refused. (This was 200 ms of a square
+            // wave until issue #1450's voice check, which rightly refuses one.)
+            &spoken(
+                include_bytes!("fixtures/speech/yes-kristin.pcm"),
+                3_000.0,
+                120.0,
+                3,
+            ),
         )
         .await;
 
         assert!(result.outcome.is_heard(), "{:?}", result.outcome);
         assert_eq!(result.transcript().map(Transcript::text), Some("go back"));
         assert!(result.transcribe_ms.is_some(), "the backend was called");
+    }
+
+    // -- issue #1450: non-speech that clears the audio gate ----------------
+
+    /// The sentence the maintainer found typed into an agent's prompt in
+    /// typing mode, having said nothing (issue #1450, 2026-10-03).
+    const REPORTED_ARTEFACT: &str =
+        "Until then, I'm signing off. I hope you have a wonderful day, and God bless you.";
+
+    /// A deterministic noise source in `[-1, 1]` — the same linear
+    /// congruential generator [`typing_on_a_keyboard`] uses, so every
+    /// fixture below is the same buffer on every run.
+    fn noise(seed: u32) -> impl FnMut() -> f64 {
+        let mut seed = seed;
+        move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from((seed >> 8) as i32 % 2_001 - 1_000) / 1_000.0
+        }
+    }
+
+    /// `seconds` of a room at an RMS of `level`. Uniform noise has an RMS of
+    /// `1/√3` of its amplitude, hence the scale.
+    fn room_tone(seconds: f64, level: f64, seed: u32) -> Vec<f64> {
+        let mut noise = noise(seed);
+        (0..(seconds * 16_000.0) as usize)
+            .map(|_| noise() * level * 3f64.sqrt())
+            .collect()
+    }
+
+    fn pcm(samples: Vec<f64>) -> Pcm16 {
+        Pcm16::new(
+            samples
+                .into_iter()
+                .map(|sample| sample.round().clamp(-32_768.0, 32_767.0) as i16)
+                .collect(),
+        )
+    }
+
+    fn add(base: &mut [f64], sound: &[f64], at_seconds: f64) {
+        let start = (at_seconds * 16_000.0) as usize;
+        for (slot, sample) in base[start..].iter_mut().zip(sound) {
+            *slot += sample;
+        }
+    }
+
+    /// Three seconds of a quiet room with one sound in it, at one second —
+    /// the shape of a segment a non-speech sound opens: the capture starts on
+    /// the sound and ends [`super::super::capture::SILENCE_HOLD`] after it.
+    /// Each sound is one a room produces while nobody speaks, and each clears
+    /// the audio gate (asserted where it is used, so a fixture that stopped
+    /// clearing it would fail loudly rather than prove nothing).
+    fn non_speech() -> Vec<(&'static str, Pcm16)> {
+        let mut sounds: Vec<(&'static str, Vec<f64>)> = Vec::new();
+        let mut n = noise(11);
+        // A 250 ms broadband burst — a bag put down, a door, a rustle. The
+        // case PR #1451 measured whisper-1 answering with an artefact.
+        sounds.push((
+            "a 250 ms burst",
+            (0..4_000).map(|_| n() * 2_500.0 * 3f64.sqrt()).collect(),
+        ));
+        // A breath: 450 ms of noise under a raised-cosine envelope.
+        let breath = 7_200;
+        sounds.push((
+            "a breath",
+            (0..breath)
+                .map(|i| {
+                    let envelope =
+                        0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / breath as f64).cos();
+                    n() * 900.0 * 3f64.sqrt() * envelope
+                })
+                .collect(),
+        ));
+        // A cough-like pair: low-passed decaying noise, twice.
+        let mut cough = Vec::new();
+        for _ in 0..2 {
+            let mut previous = 0.0;
+            for i in 0..2_880 {
+                let x = n() * 5_000.0 * 3f64.sqrt() * (-(i as f64) / 960.0).exp();
+                previous = 0.6 * previous + 0.4 * x;
+                cough.push(previous * 2.0);
+            }
+            cough.extend(std::iter::repeat_n(0.0, 2_400));
+        }
+        sounds.push(("a cough-like pair of bursts", cough));
+        // A knock on a hollow desk: a damped 90 Hz thump with a click on its
+        // front, ringing long enough to fill the gate's window.
+        let mut knock: Vec<f64> = (0..4_800)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                3_500.0 * (-t / 0.08).exp() * (std::f64::consts::TAU * 90.0 * t).sin()
+                    + if i < 40 { n() * 4_000.0 } else { 0.0 }
+            })
+            .collect();
+        knock.extend(knock.clone());
+        sounds.push(("two knocks", knock));
+        // A notification beep: 300 ms of 1 kHz.
+        sounds.push((
+            "a 1 kHz beep",
+            (0..4_800)
+                .map(|i| 3_000.0 * (std::f64::consts::TAU * 1_000.0 * i as f64 / 16_000.0).sin())
+                .collect(),
+        ));
+
+        sounds
+            .into_iter()
+            .enumerate()
+            .map(|(seed, (name, sound))| {
+                let mut room = room_tone(3.0, 70.0, 100 + seed as u32);
+                add(&mut room, &sound, 1.0);
+                (name, pcm(room))
+            })
+            .chain(std::iter::once((
+                "thirty seconds of typing",
+                typing_on_a_keyboard(),
+            )))
+            .collect()
+    }
+
+    /// The two shapes a backend's answer to that audio arrives in when nothing
+    /// in it says "no speech": OpenAI's `gpt-*` transcription models answer
+    /// plain `json` with no segments at all (and so does any server that
+    /// ignores `verbose_json`), and a whisper model can mark its own artefact
+    /// as speech — the reported sentence reached the prompt past the
+    /// per-segment guard, so its `no_speech_prob` was under [`NO_SPEECH_LIMIT`].
+    fn artefact_replies() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "a reply with no segments",
+                json!({ "text": REPORTED_ARTEFACT }),
+            ),
+            (
+                "a whisper reply that calls its artefact speech",
+                verbose(&[(&format!(" {REPORTED_ARTEFACT}"), 0.45, -0.3)]),
+            ),
+        ]
+    }
+
+    /// Scenario: issue #1450 — with typing mode on, the maintainer said
+    /// nothing and "Until then, I'm signing off. I hope you have a wonderful
+    /// day, and God bless you." was typed into the agent's prompt. Here a
+    /// quiet room with one non-speech sound in it (a burst, a breath, a cough,
+    /// a knock, a beep, a keyboard) clears the audio gate, and the backend
+    /// answers with that sentence and no sign that it is not speech. Nothing
+    /// may be heard: no text to type in typing mode and no command outside it.
+    #[tokio::test]
+    async fn voice_transcribe_non_speech_that_clears_the_audio_gate_is_never_heard() {
+        for (sound, audio) in non_speech() {
+            assert!(
+                audio.has_speech(),
+                "the premise: {sound} clears the audio gate ({:?})",
+                audio.measure_speech()
+            );
+            for (shape, reply) in artefact_replies() {
+                let result = handle_audio(&StubTranscriber::replying(&reply), &audio).await;
+                assert!(
+                    !result.outcome.is_heard(),
+                    "{sound}, {shape}: {:?}",
+                    result.outcome
+                );
+                assert_eq!(result.transcript(), None, "{sound}, {shape}");
+                assert!(
+                    !result.sentence().contains("signing off"),
+                    "{sound}, {shape}: {}",
+                    result.sentence()
+                );
+            }
+        }
+    }
+
+    /// One utterance from `fixtures/speech/`: real (synthesised) speech
+    /// scaled so its loudest 20 ms reaches `peak`, inside `room` of room tone
+    /// with 600 ms before it and 900 ms after — what a finished segment holds.
+    fn spoken(fixture: &[u8], peak: f64, room: f64, seed: u32) -> Pcm16 {
+        let speech: Vec<f64> = fixture
+            .chunks_exact(2)
+            .map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])))
+            .collect();
+        let loudest = speech
+            .chunks_exact(320)
+            .map(|frame| (frame.iter().map(|s| s * s).sum::<f64>() / 320.0).sqrt())
+            .fold(0.0, f64::max);
+        let gain = peak / loudest.max(1.0);
+        let scaled: Vec<f64> = speech.iter().map(|s| s * gain).collect();
+        let mut samples = room_tone(1.5 + scaled.len() as f64 / 16_000.0, room, seed);
+        add(&mut samples, &scaled, 0.6);
+        pcm(samples)
+    }
+
+    /// Every short command fixture, with the text it says. Two voices — a
+    /// male one at normal speed and a female one at one and a half times —
+    /// and the reserved typing-mode phrases among the commands.
+    const COMMANDS: &[(&str, &[u8])] = &[
+        (
+            "Send it.",
+            include_bytes!("fixtures/speech/send-it-john.pcm"),
+        ),
+        (
+            "Send it.",
+            include_bytes!("fixtures/speech/send-it-kristin.pcm"),
+        ),
+        (
+            "Type off.",
+            include_bytes!("fixtures/speech/type-off-john.pcm"),
+        ),
+        (
+            "Type off.",
+            include_bytes!("fixtures/speech/type-off-kristin.pcm"),
+        ),
+        (
+            "Type on.",
+            include_bytes!("fixtures/speech/type-on-john.pcm"),
+        ),
+        (
+            "Type on.",
+            include_bytes!("fixtures/speech/type-on-kristin.pcm"),
+        ),
+        ("Stop.", include_bytes!("fixtures/speech/stop-john.pcm")),
+        ("Stop.", include_bytes!("fixtures/speech/stop-kristin.pcm")),
+        ("Yes.", include_bytes!("fixtures/speech/yes-john.pcm")),
+        ("Yes.", include_bytes!("fixtures/speech/yes-kristin.pcm")),
+        ("Next.", include_bytes!("fixtures/speech/next-john.pcm")),
+        ("Next.", include_bytes!("fixtures/speech/next-kristin.pcm")),
+        (
+            "Go back.",
+            include_bytes!("fixtures/speech/go-back-john.pcm"),
+        ),
+        (
+            "Go back.",
+            include_bytes!("fixtures/speech/go-back-kristin.pcm"),
+        ),
+        (
+            "Please add a unit test for the parser.",
+            include_bytes!("fixtures/speech/dictation-joe.pcm"),
+        ),
+    ];
+
+    /// Scenario: the control for issue #1450's fix — somebody says a short
+    /// command ("send it", "type off", "type on", "stop", "yes", "next", "go
+    /// back") or a dictated sentence, loudly and at the quiet end of what the
+    /// audio gate passes, in a room with tone in it. Every one still reaches
+    /// the backend and is heard word for word, so typing mode still types and
+    /// still stops, and commands still run.
+    #[tokio::test]
+    async fn voice_transcribe_real_short_commands_still_reach_the_backend() {
+        for (seed, (said, fixture)) in COMMANDS.iter().enumerate() {
+            // Loud: a peak of 3 000 over a room at 120. Quiet: a peak of 800
+            // over a room at 80, 20 dB — near the quiet end of what the audio
+            // gate in front of this fix passes for a one-syllable word.
+            for (level, peak, room) in [("loud", 3_000.0, 120.0), ("quiet", 800.0, 80.0)] {
+                let audio = spoken(fixture, peak, room, seed as u32);
+                let result = handle_audio(&StubTranscriber::hearing(*said), &audio).await;
+                assert_eq!(
+                    result.transcript().map(Transcript::text),
+                    Some(*said),
+                    "{said} ({level}): {:?}",
+                    result.outcome
+                );
+                assert!(result.transcribe_ms.is_some(), "{said} ({level})");
+            }
+        }
+    }
+
+    /// Scenario: somebody knocks on the desk or puts a mug down, and a moment
+    /// later says a short command quietly, all in one segment. The loud sound
+    /// must not drown the command: it still reaches the backend and is heard
+    /// (Greptile on PR #1550 — the level is normalised before the voice check,
+    /// and a normalisation taken from the loudest moment of the whole segment
+    /// would turn the command down by the knock's level).
+    #[tokio::test]
+    async fn voice_transcribe_a_quiet_command_after_a_loud_knock_is_still_heard() {
+        let mut n = noise(23);
+        let knock: Vec<f64> = (0..4_800)
+            .map(|i| {
+                let t = i as f64 / 16_000.0;
+                9_000.0 * (-t / 0.08).exp() * (std::f64::consts::TAU * 90.0 * t).sin()
+                    + if i < 40 { n() * 9_000.0 } else { 0.0 }
+            })
+            .collect();
+        for (seed, (said, fixture)) in COMMANDS.iter().enumerate().take(14) {
+            // Quiet, at a peak of 1 200 over a room at 80, and under a knock
+            // at 9 000 — clear of the audio gate, so only the voice check can
+            // refuse it.
+            let command = spoken(fixture, 1_200.0, 80.0, 40 + seed as u32);
+            let mut samples: Vec<f64> = command.samples().iter().map(|&s| f64::from(s)).collect();
+            // Room before the command (`spoken` leads with 600 ms) holds the
+            // knock at 100 ms, so 500 ms separate it from the first word.
+            add(&mut samples, &knock[..1_600.min(knock.len())], 0.1);
+            let audio = pcm(samples);
+            let result = handle_audio(&StubTranscriber::hearing(*said), &audio).await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some(*said),
+                "{said} after a knock: {:?}",
+                result.outcome
+            );
+        }
+    }
+
+    /// Scenario: a real short command the local speech model is unsure of.
+    /// Measured 2026-10-04 against the default local container
+    /// (`faster-whisper-tiny.en`): "Send it." came back with a no-speech
+    /// probability of 0.699 and 0.678 and "Yes." with 0.691 — over the 0.6 the
+    /// per-segment guard used alone, so a command somebody really said was
+    /// dropped, while every non-speech sound measured scored an average log
+    /// probability under -1.0 or a no-speech probability over 0.8. The
+    /// command is heard.
+    #[tokio::test]
+    async fn voice_transcribe_a_short_command_the_local_model_doubts_is_still_heard() {
+        let audio = spoken(COMMANDS[0].1, 3_000.0, 120.0, 7);
+        for (said, no_speech, logprob) in [
+            (" Send it.", 0.699, -0.607),
+            (" Send it.", 0.678, -0.935),
+            (" Yes.", 0.691, -0.313),
+        ] {
+            let result = handle_audio(
+                &StubTranscriber::replying(&verbose(&[(said, no_speech, logprob)])),
+                &audio,
+            )
+            .await;
+            assert_eq!(
+                result.transcript().map(Transcript::text),
+                Some(said.trim()),
+                "{said} at no_speech_prob {no_speech}, avg_logprob {logprob}: {:?}",
+                result.outcome
+            );
+        }
     }
 
     #[test]

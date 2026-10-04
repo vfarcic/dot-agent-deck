@@ -580,14 +580,15 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
             Err(parse_err) => {
                 // Preserve the user's bytes (best-effort backup) and refuse to
                 // overwrite — never discard content we couldn't parse. The copy
-                // is published, not `std::fs::write`n: that followed a symlink
-                // planted at this predictable `.bak` name (#731).
+                // is created exclusively, not `std::fs::write`n: that followed a
+                // symlink planted at this predictable `.bak` name (#731), and it
+                // never replaces a `.bak` that is already there (#537).
                 let backup = crate::agent_hook_config::backup_malformed(&path, &bytes);
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "existing hooks.json is not valid JSON ({}): {parse_err}",
-                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
+                        crate::agent_hook_config::preserved_phrase(&backup)
                     ),
                 ));
             }
@@ -2719,16 +2720,15 @@ mod tests {
             "the backup was written through the planted symlink and overwrote the victim"
         );
         assert!(
-            !std::fs::symlink_metadata(&backup)
+            std::fs::symlink_metadata(&backup)
                 .expect("stat backup")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "something already at the backup name is left as it was (#537)"
         );
-        assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            malformed,
-            "the user's bytes must still be preserved beside the original"
+        assert!(
+            !err.to_string().contains("preserved at"),
+            "the planted link must not be claimed as the backup: {err}"
         );
     }
 

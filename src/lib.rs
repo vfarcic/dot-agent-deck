@@ -44,6 +44,7 @@ pub mod endpoint_resolve;
 pub mod env_override;
 pub mod error;
 pub mod event;
+pub mod event_subscriber;
 pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).

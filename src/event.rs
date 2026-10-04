@@ -422,19 +422,39 @@ pub enum SendResult {
 /// [`EventType`] that drives the target pane's card status. This is the single
 /// production seam the CLI subcommand and the fast-tier status tests share.
 ///
-/// The canonical `--type` vocabulary is exactly three states — `running`,
-/// `waiting`, `finished`. Anything else returns `None` so the subcommand can
-/// reject an unknown `--type` with a clear non-zero error instead of silently
-/// emitting a wrong (or default) status. The Phase 2 extension and the docs
-/// MUST use the same three strings.
+/// The canonical `--type` vocabulary is three lifecycle states — `running`,
+/// `waiting`, `finished` — plus, since issue #622, three detail reports that
+/// give a card what every other native integration's card shows: `prompt` (a
+/// submitted prompt, [`EventType::Thinking`] carrying `user_prompt`),
+/// `tool-start` and `tool-end` ([`EventType::ToolStart`] / [`EventType::ToolEnd`]
+/// carrying the tool name and detail). All six land on variants the
+/// [`AgentEvent`] schema already has, so the wire is unchanged. Anything else
+/// returns `None` so the subcommand can reject an unknown `--type` with a clear
+/// non-zero error instead of silently emitting a wrong (or default) status.
+/// The bundled Pi extension (`pi-extension/src/orchestrator.ts`,
+/// `AGENT_EVENT_TYPES`) and the docs MUST use the same six strings.
 pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
     match state {
         "running" => Some(EventType::Thinking),
         "waiting" => Some(EventType::WaitingForInput),
         "finished" => Some(EventType::Idle),
+        "prompt" => Some(EventType::Thinking),
+        "tool-start" => Some(EventType::ToolStart),
+        "tool-end" => Some(EventType::ToolEnd),
         _ => None,
     }
 }
+
+/// Every `--type` [`agent_event_type_from_state`] accepts, in the order the
+/// CLI's error message lists them.
+pub const AGENT_EVENT_TYPES: [&str; 6] = [
+    "running",
+    "waiting",
+    "finished",
+    "prompt",
+    "tool-start",
+    "tool-end",
+];
 
 /// `AgentEvent.metadata` key carrying a human-friendly card title (PRD #127
 /// finding #2). The daemon's live-surface path (`surface_spawned_pane`) sets
@@ -3357,6 +3377,23 @@ mod tests {
         );
         // Unknown / malformed states map to None (the CLI turns this into a
         // clear non-zero error). Includes casing and near-miss variants.
+        // Issue #622: the detail reports.
+        assert_eq!(
+            agent_event_type_from_state("prompt"),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            agent_event_type_from_state("tool-start"),
+            Some(EventType::ToolStart)
+        );
+        assert_eq!(
+            agent_event_type_from_state("tool-end"),
+            Some(EventType::ToolEnd)
+        );
+        for t in AGENT_EVENT_TYPES {
+            assert!(agent_event_type_from_state(t).is_some(), "{t} must map");
+        }
+        assert_eq!(agent_event_type_from_state("tool_start"), None);
         assert_eq!(agent_event_type_from_state("idle"), None);
         assert_eq!(agent_event_type_from_state("Running"), None);
         assert_eq!(agent_event_type_from_state("done"), None);
