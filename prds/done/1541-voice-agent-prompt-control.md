@@ -1,6 +1,7 @@
 # PRD #1541: Voice control of the open agent's prompt — interrupt, clear, scratch that
 
-**Status**: In Progress
+**Status**: Complete
+**Completed**: 2026-10-04
 **Priority**: Medium
 **Created**: 2026-10-03
 **Issue**: [#1541](https://github.com/vfarcic/dot-agent-deck/issues/1541)
@@ -95,11 +96,11 @@ Extra `Ctrl+U` presses on an empty prompt are harmless in all four measured agen
 ## Milestones
 
 - [x] **M1 — Decisions recorded.** (See "M1 decisions" above.) The rule 9 experimental-flag answer; the phrases for each command and what a bare "stop" means in a pane; the verified per-agent key table (Claude Code, OpenCode, Codex, Pi, Devin) with the agent versions checked and the unsupported cells named; where the key definitions live (desktop vs deck, rule 18); which commands work during typing mode; whether "clear the prompt" offers Undo by re-typing the cleared text when the app knows all of it; local vs Commands-service matching.
-- [ ] **M2 — Interrupt.** The voice row, the per-agent keys, the outcome reports and refusals; works on every agent M1 marked as supported.
-- [ ] **M3 — Clear the prompt.** Same shape as M2.
-- [ ] **M4 — Scratch that.** Tracking what the app last typed per pane, the "still the end of the prompt" check, and the refusals when it cannot be sure.
-- [ ] **M5 — Tests.** Phrase fixtures and `voiceActions` unit tests for every command and refusal; desktop tests for the outcome row; a real-agent test (lane 2, CLAUDE.md rules 4 and 5) that interrupts a cheap-model agent mid-turn and confirms it is still running and accepts the next prompt.
-- [ ] **M6 — Docs and release notes.** `docs/desktop/voice.md` (the agent-screen row of the command table, the typing-mode list, "What is sent where", the coverage of each agent), `docs/develop/voice-first-design.md` for the per-agent keys, the docs-screenshots-review skill, and a changelog fragment (rule 19).
+- [x] **M2 — Interrupt.** The voice row, the per-agent keys, the outcome reports and refusals; works on every agent M1 marked as supported. Done: deck-served keys (`AgentRecord.prompt_keys`, `src/agent_registry.rs`), exact per-operation allowlist and pause budgets at the desktop seam, interrupt sent only while the agent is working, checked again immediately before each key is handed to the daemon, latched until a new turn is seen, one pending prompt command per pane, cancelled with typing mode.
+- [x] **M3 — Clear the prompt.** Same shape as M2. Done: Ctrl+U presses (32 per line, 64 per wrapped row for Claude Code in writes of 32 a deck-served 1 s apart), Undo only when the app has seen the prompt emptied and nothing but voice typed since, bound to a prompt revision any keyboard input invalidates.
+- [x] **M4 — Scratch that.** Tracking what the app last typed per pane, the "still the end of the prompt" check, and the refusals when it cannot be sure. Done: per-pane voice-write history per agent incarnation; scratch re-checks the prompt revision and the burst of writes around the last one just before sending DEL × its length, and refuses over the 800-character floor, on combining or astral characters, and when the writes around it may have been read as one paste.
+- [x] **M5 — Tests.** Phrase fixtures and `voiceActions` unit tests for every command and refusal; desktop tests for the outcome row; a real-agent test (lane 2, CLAUDE.md rules 4 and 5) that interrupts a cheap-model agent mid-turn and confirms it is still running and accepts the next prompt. Done: phrase fixtures (typing mode on/off), `voiceActions` and panel vitest suites (incl. real-bridge queue tests), registry/DTO/protocol unit tests, and lane-2 `prompt/voice-keys/001–005` (Claude Code on Haiku, Codex, OpenCode) run locally. Pi has no lane-2 coverage on the box it was built on (no credential route for Pi in the harness); Devin is unsupported.
+- [x] **M6 — Docs and release notes.** `docs/desktop/voice.md` (the agent-screen row of the command table, the typing-mode list, "What is sent where", the coverage of each agent), `docs/develop/voice-first-design.md` for the per-agent keys, the docs-screenshots-review skill, and a changelog fragment (rule 19). Done: `docs/desktop/voice.md`, `docs/develop/voice-first-design.md`, `changelog.d/1541.feature.md` and `1541.bugfix.md` (the Enter-settle fix found along the way), `settings-voice-desktop.png` regenerated.
 
 ## Risks
 

@@ -168,7 +168,7 @@ impl PrePromptReadiness {
 ///
 /// **Measured, per agent and per version, and only for the versions named.**
 /// Each value below was driven against the real agent in a private tmux server
-/// on 2026-10-03 (`prds/1541-voice-agent-prompt-control.md`, "Verified per-agent
+/// on 2026-10-03 (`prds/done/1541-voice-agent-prompt-control.md`, "Verified per-agent
 /// key table"): Claude Code 2.1.289, Codex 0.160.0, OpenCode 1.18.34 and Pi
 /// 0.87.1. An agent upgrade can move a key, so a reader citing one of these
 /// should cite the version beside it, and a change here is a re-measurement, not
