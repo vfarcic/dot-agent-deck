@@ -14958,6 +14958,46 @@ impl AppState {
             return AppliedEvent::Rejected;
         }
 
+        // Issue #318 (Greptile, PR #1559): a frame the daemon attested to one
+        // agent that names no agent itself may not reach a card of ANOTHER
+        // agent's. The daemon re-checks that such a frame's token generation
+        // still holds its pane, but a successor can claim the pane between that
+        // check and the broadcast, and this client — which has no registry —
+        // would then land the replaced generation's report on the successor's
+        // card: the direct key (Pi reports every generation under one
+        // pane-derived key), or the one card on the pane the untagged adoption
+        // below picks. For a `SessionEnd` that would remove the successor's card
+        // and restore a bare placeholder. Checked before anything below mutates,
+        // and only in a client: the daemon judges the same frame by the token's
+        // generation (`attested_agent`). The frame's own absent `agent_id` is
+        // left as it is, so the untagged rules downstream are unchanged. See
+        // [`crate::event::ATTESTED_OWNER_METADATA_KEY`].
+        if self.agent_ownership.is_none()
+            && event.agent_id.is_none()
+            && let Some(owner) = event.attested_owner()
+        {
+            let foreign = |session: &SessionState| {
+                session
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|agent| agent != owner)
+            };
+            let direct_is_foreign = self.sessions.get(&event.session_id).is_some_and(foreign);
+            let adopted_is_foreign = claims_generation
+                && event.pane_id.as_deref().is_some_and(|pane_id| {
+                    let mut others = self.sessions.iter().filter(|(id, session)| {
+                        session.pane_id.as_deref() == Some(pane_id) && **id != event.session_id
+                    });
+                    match (others.next(), others.next()) {
+                        (Some((_, only)), None) => foreign(only),
+                        _ => false,
+                    }
+                });
+            if direct_is_foreign || adopted_is_foreign {
+                return AppliedEvent::Rejected;
+            }
+        }
+
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -16310,6 +16350,12 @@ impl AppState {
         }
         let asserted = Self::apply_status_transition(session, &event);
         event.session_id = card_id.to_string();
+        // Qodo, PR #1559: the card's live target is not reporting state, so the
+        // report carries the card's own — never one of its own, which would
+        // let an unproven report make the card writable — and it stays durable
+        // once the declaring event ages out of the bounded journal, as the
+        // owner's path keeps it (PRD #20 blocker-2).
+        event.live_target = session.live_target();
         session.recent_events.push_back(event);
         while session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
@@ -26387,6 +26433,74 @@ while True:
         client.apply_event(unmarked);
         assert_eq!(client.sessions["survivor-card"].status, SessionStatus::Idle);
         assert_eq!(client.agent_generation_closures.len(), 0);
+    }
+
+    /// Scenario: A client stayed attached across a daemon restart and still
+    /// shows a plain pane's surviving agent, whose start declared a
+    /// history-only live target. The survivor then reports more times than the
+    /// card's journal holds, and finally sends a report declaring a live,
+    /// writable target. The card must stay history-only throughout: a restart
+    /// survivor's reports move reporting state, never what the card accepts.
+    #[test]
+    fn hook_provenance_audit_survivor_reports_keep_the_cards_live_target() {
+        let history_only = crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Process,
+            writable: crate::event::Writable::HistoryOnly,
+        };
+        let mut client = AppState::default();
+        client.register_pane(AUDIT_PLAIN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_PLAIN_PANE, AUDIT_PLAIN_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        survivor.live_target = Some(history_only);
+        client.apply_event(survivor);
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "precondition: a history-only card"
+        );
+
+        for round in 0..MAX_RECENT_EVENTS + 5 {
+            let kind = if round % 2 == 0 {
+                EventType::Thinking
+            } else {
+                EventType::Idle
+            };
+            client.apply_event(hook_provenance_audit_plain_frame(
+                "survivor-card",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                kind,
+            ));
+        }
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(card.recent_events.len(), MAX_RECENT_EVENTS);
+        assert_eq!(
+            card.live_target(),
+            Some(history_only),
+            "the declaration must outlive the journal's capacity"
+        );
+        assert_eq!(card.writable(), crate::event::Writable::HistoryOnly);
+
+        let mut redeclare = hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        );
+        redeclare.live_target = Some(crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Pty,
+            writable: crate::event::Writable::Live,
+        });
+        client.apply_event(redeclare);
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Thinking,
+            "precondition: the report landed"
+        );
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "an unproven survivor report must not make its card writable"
+        );
     }
 
     /// Scenario: Round after round, a client holds an outside card and the

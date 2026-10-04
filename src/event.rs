@@ -597,6 +597,30 @@ pub const UNPROVEN_EVICTED_METADATA_KEY: &str = "daemon_unproven_evicted";
 /// bump: an older client ignores the key.
 pub const DAEMON_NO_LIVE_AGENT_METADATA_KEY: &str = "daemon_no_live_agent";
 
+/// `AgentEvent.metadata` key carrying the agent the DAEMON's hook provenance
+/// gate attested a frame to — the spawn its hook capability token was minted
+/// for (issue #318, Greptile on PR #1559).
+///
+/// The daemon re-checks, under its state lock, that a frame naming no agent
+/// still comes from its pane's current generation, but a respawn is not
+/// ordered against that check, so a successor can claim the pane between the
+/// check and the broadcast. An attached client has no registry to judge the
+/// frame by, and would land it on the pane's card, which may by then be the
+/// successor's. With this marker it refuses a frame that names no agent when
+/// the card it would land on carries a different agent id
+/// ([`crate::state::AppState::apply_event`]); the frame's own absent
+/// `agent_id` is left as it is, so the rules for untagged status are
+/// unchanged.
+///
+/// **Daemon-authoritative**, like [`ORCHESTRATION_ORPHANED_METADATA_KEY`]:
+/// `ingest_event` REMOVES any incoming value and sets it only from the gate's
+/// own verdict.
+///
+/// Additive on the wire, so no [`crate::daemon_protocol::PROTOCOL_VERSION`]
+/// bump: an older client ignores the key, and a frame an older daemon relays
+/// carries none, which a client reads as it did before this key existed.
+pub const ATTESTED_OWNER_METADATA_KEY: &str = "daemon_attested_owner";
+
 /// The value of [`UNPROVEN_METADATA_KEY`], [`UNPROVEN_EVICTED_METADATA_KEY`]
 /// and [`DAEMON_NO_LIVE_AGENT_METADATA_KEY`] meaning "yes".
 pub const UNPROVEN_METADATA_VALUE: &str = "1";
@@ -1138,6 +1162,15 @@ impl AgentEvent {
         self.metadata
             .get(DAEMON_NO_LIVE_AGENT_METADATA_KEY)
             .is_some_and(|v| v == UNPROVEN_METADATA_VALUE)
+    }
+
+    /// Issue #318: the agent the daemon's hook provenance gate attested this
+    /// frame to (see [`ATTESTED_OWNER_METADATA_KEY`]), or `None` for a frame
+    /// without the marker, which includes every frame an older daemon relays.
+    pub fn attested_owner(&self) -> Option<&str> {
+        self.metadata
+            .get(ATTESTED_OWNER_METADATA_KEY)
+            .map(String::as_str)
     }
 
     /// Issue #697: is this the daemon's announcement that it evicted an

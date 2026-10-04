@@ -1567,7 +1567,11 @@ pub async fn ingest_event(
 /// judged by (audit finding 2), and it is asked again here, under the state
 /// lock and before the fan-out: the gate asked first, but a successor can
 /// claim the pane in between, and an attached client — which has no registry —
-/// would then credit the untagged report to that successor.
+/// would then credit the untagged report to that successor. Asking again
+/// narrows that window without closing it, since a respawn is not ordered
+/// against this lock; what closes it on a client is the attested-owner marker
+/// stamped in [`ingest_event_unless`] (`ATTESTED_OWNER_METADATA_KEY`). A report
+/// the second asking drops is logged with its reason code.
 async fn ingest_hook_event(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -1589,7 +1593,9 @@ async fn ingest_hook_event(
             )
         })
     };
-    ingest_event_unless(
+    let event_type = event.event_type.clone();
+    let claimed_pane = event.pane_id.clone();
+    let ingested = ingest_event_unless(
         state,
         event_tx,
         registry,
@@ -1599,6 +1605,20 @@ async fn ingest_hook_event(
         replaced,
     )
     .await;
+    if !ingested {
+        // Qodo, PR #1559: logged like the gate's own refusals — the escaped
+        // pane and a stable reason code, never the token — so a report the
+        // under-lock re-check drops does not vanish without a trace.
+        warn!(
+            verb = "agent_event",
+            event_type = ?event_type,
+            claimed_pane = %escape_id_for_log(claimed_pane.as_deref().unwrap_or("<none>")),
+            reason = "token_generation_replaced",
+            "hook socket: dropped a status event naming no agent whose hook \
+             capability token's generation no longer holds the pane it names; \
+             see docs/develop/hook-provenance.md"
+        );
+    }
 }
 
 /// [`ingest_event`], except that `stale` is asked once the `AppState` write
@@ -1712,6 +1732,22 @@ async fn ingest_event_unless(
     event
         .metadata
         .remove(crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY);
+    // Greptile, PR #1559: the agent an attested frame's token was minted for,
+    // stamped on the frame for attached clients — the daemon's alone like the
+    // rest. The generation re-check above and this broadcast are not ordered
+    // against a respawn, so a successor can claim the pane in between; a
+    // client, which has no registry, refuses a marked frame that names no
+    // agent when the card it would land on belongs to another agent. See
+    // `ATTESTED_OWNER_METADATA_KEY`.
+    event
+        .metadata
+        .remove(crate::event::ATTESTED_OWNER_METADATA_KEY);
+    if let Some(owner) = attested_agent {
+        event.metadata.insert(
+            crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+            owner.to_string(),
+        );
+    }
     if unproven {
         event.metadata.insert(
             crate::event::UNPROVEN_METADATA_KEY.to_string(),
@@ -3215,26 +3251,78 @@ fn hook_line_for_log(line: &str) -> String {
 
 /// Issue #318: `line` with any hook capability token taken out, for a log.
 ///
-/// A line that parses as a JSON object loses its top-level `token` member and
-/// is re-serialized. That is the decoded key, so an escaped spelling of it is
-/// caught as well, and every other member — the `event_type` a diagnostic is
-/// about — survives. A line that does not parse cannot be reasoned about that
-/// way: every run of a token's length or more of hex digits is masked, and a
-/// line containing a `\u` escape, which could spell a token in a form no mask
-/// recognises, is not logged at all beyond saying so.
+/// A line that parses as JSON is walked whole (Greptile, PR #1559): every
+/// `token` member is removed at any depth, and every run of a token's length or
+/// more of hex digits in any other string — or in a member's name — is masked,
+/// so a capability nested under a field the daemon does not know, or inside a
+/// metadata map, is caught as well as the top-level one. It works on the
+/// decoded values, so an escaped spelling is caught too, and every other
+/// member — the `event_type` a diagnostic is about — survives. A line that does
+/// not parse cannot be reasoned about that way: every such hex run in it is
+/// masked, and a line containing a `\u` escape, which could spell a token in a
+/// form no mask recognises, is not logged at all beyond saying so.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
-    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(line)
-    {
-        if map.remove("token").is_none() {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+        if !redact_json_capabilities(&mut value) {
             return std::borrow::Cow::Borrowed(line);
         }
-        return std::borrow::Cow::Owned(serde_json::Value::Object(map).to_string());
+        return std::borrow::Cow::Owned(value.to_string());
     }
     if line.contains("\\u") {
         return std::borrow::Cow::Borrowed("<withheld: an unparseable line with a \\u escape>");
     }
-    let bytes = line.as_bytes();
-    let mut out = String::with_capacity(line.len());
+    match mask_capability_runs(line) {
+        Some(masked) => std::borrow::Cow::Owned(masked),
+        None => std::borrow::Cow::Borrowed(line),
+    }
+}
+
+/// [`redact_hook_token`]'s walk over a parsed line: removes every `token`
+/// member and masks capability-length hex runs in every string and member
+/// name, at any depth. Returns whether anything changed.
+fn redact_json_capabilities(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => match mask_capability_runs(text) {
+            Some(masked) => {
+                *text = masked;
+                true
+            }
+            None => false,
+        },
+        // Every item is visited: a short-circuiting `any` would stop at the
+        // first redaction and log whatever followed it.
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= redact_json_capabilities(item);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = map.remove("token").is_some();
+            let entries = std::mem::take(map);
+            for (key, mut item) in entries {
+                changed |= redact_json_capabilities(&mut item);
+                let key = match mask_capability_runs(&key) {
+                    Some(masked) => {
+                        changed = true;
+                        masked
+                    }
+                    None => key,
+                };
+                map.insert(key, item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// `text` with every run of [`crate::hook_provenance::TOKEN_LEN`] or more hex
+/// digits replaced by `<redacted>`, or `None` when it holds no such run.
+fn mask_capability_runs(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
     let mut changed = false;
     let mut i = 0;
     while i < bytes.len() {
@@ -3247,19 +3335,15 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
             changed = true;
             i += run;
         } else if run > 0 {
-            out.push_str(&line[i..i + run]);
+            out.push_str(&text[i..i + run]);
             i += run;
         } else {
-            let ch = line[i..].chars().next().expect("i is on a char boundary");
+            let ch = text[i..].chars().next().expect("i is on a char boundary");
             out.push(ch);
             i += ch.len_utf8();
         }
     }
-    if changed {
-        std::borrow::Cow::Owned(out)
-    } else {
-        std::borrow::Cow::Borrowed(line)
-    }
+    changed.then_some(out)
 }
 
 /// Issue #1383: act on a worker's `ack` for a delegated task's delivery id.
@@ -5910,6 +5994,42 @@ mod hook_ingestion_tests {
 
         let split = format!("{{\"token\":\"\\u0030{}\"", &token[1..]);
         assert!(!hook_line_for_log(&split).contains(&token[1..]));
+    }
+
+    /// Issue #318 (Greptile, PR #1559): a capability nested anywhere in a line
+    /// that parses — a `token` member below the top level, or a token-shaped
+    /// string under any key, including inside a metadata map of an event type
+    /// the daemon does not recognise — never reaches the log either.
+    #[test]
+    fn hook_line_for_log_never_logs_a_nested_token() {
+        let token = "0123456789abcdef".repeat(4);
+        let nested = serde_json::json!({
+            "event_type": "sessoin_start",
+            "pane_id": "p",
+            "session_id": "s",
+            "extra": { "token": token },
+            "list": [ { "deep": { "token": token } } ],
+            "metadata": { "capability": token, "note": format!("cap={token}") },
+        })
+        .to_string();
+        let got = hook_line_for_log(&nested);
+        assert!(!got.contains(&token), "{got}");
+        assert!(got.contains("sessoin_start"), "{got}");
+        assert!(got.contains("capability"), "the key survives: {got}");
+
+        let under_a_token_key = serde_json::json!({
+            "event_type": "unknown_kind",
+            "metadata": { "token": "not-a-capability" },
+        })
+        .to_string();
+        let got = hook_line_for_log(&under_a_token_key);
+        assert!(
+            !got.contains("not-a-capability"),
+            "a token member is withheld at any depth whatever it holds: {got}"
+        );
+
+        let as_a_key = serde_json::json!({ "metadata": { token.clone(): 1 } }).to_string();
+        assert!(!hook_line_for_log(&as_a_key).contains(&token));
     }
 
     /// Scenario: Open `MAX_CONCURRENT_HOOK_CONNECTIONS` hook connections, each sending one `session_start` and then staying open, then open one more and send an event on it. The extra event must not be applied while every slot is held, and must be applied — not dropped — as soon as one of the held connections closes.
@@ -10627,6 +10747,247 @@ mod hook_provenance_audit_tests {
             latched,
             "a report attested to the replaced generation must not lift its \
              successor's quota block"
+        );
+    }
+
+    /// Scenario: Agent A exits and agent B replaces it on a pane, and an
+    /// attached client already shows B's card. A's reports with no agent id —
+    /// a running report under B's card key, one under a key of A's own, and a
+    /// session end under B's card key — are ingested as if the replacement
+    /// happened just after the under-lock check passed, and relayed to the
+    /// client. B's card on the client must keep its status and must not be
+    /// removed.
+    #[tokio::test]
+    async fn hook_provenance_audit_untagged_relay_cannot_reach_a_successors_client_card() {
+        const PANE: &str = "audit-relay-pane";
+        const SHARED: &str = "audit-relay-pane-session";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn(&registry, Some(PANE), "/usr/bin/true");
+        wait_until_nothing_lives(&registry).await;
+        let new = spawn(&registry, Some(PANE), "cat");
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let mut client = AppState::default();
+        client.register_pane(PANE.to_string());
+        client.apply_event(event_of(line(
+            SHARED,
+            Some(PANE),
+            Some(&new),
+            "session_start",
+            None,
+        )));
+
+        for (session, kind) in [
+            (SHARED, "thinking"),
+            ("audit-relay-old-key", "thinking"),
+            (SHARED, "session_end"),
+        ] {
+            ingest_event_unless(
+                &state,
+                &event_tx,
+                &registry,
+                event_of(line(session, Some(PANE), None, kind, None)),
+                false,
+                Some(&old),
+                || false,
+            )
+            .await;
+            let mut relayed = 0;
+            while let Ok(message) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = message {
+                    relayed += 1;
+                    client.apply_event(event);
+                }
+            }
+            assert_eq!(relayed, 1, "{session}/{kind}: precondition: relayed");
+            let card = client.sessions.get(SHARED);
+            assert_eq!(
+                card.map(|card| (&card.status, card.agent_id.as_deref())),
+                Some((&SessionStatus::Idle, Some(new.as_str()))),
+                "{session}/{kind}: a replaced generation's untagged report must \
+                 not drive or remove its successor's card on a client"
+            );
+            assert_eq!(
+                client.sessions.len(),
+                1,
+                "{session}/{kind}: no card may be drawn"
+            );
+        }
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Agent A exits on a pane with no successor, and an attached
+    /// client shows A's card. A's running report and session end, attested to
+    /// A's token but naming no agent, are relayed to the client. The report
+    /// must update A's card and the end must remove it, as before the
+    /// attested-owner marker existed.
+    #[tokio::test]
+    async fn hook_provenance_audit_untagged_relay_still_reaches_its_own_client_card() {
+        const PANE: &str = "audit-relay-lone-pane";
+        const CARD: &str = "audit-relay-lone-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/usr/bin/true");
+        wait_until_nothing_lives(&registry).await;
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let mut client = AppState::default();
+        client.register_pane(PANE.to_string());
+        client.apply_event(event_of(line(
+            CARD,
+            Some(PANE),
+            Some(&agent),
+            "session_start",
+            None,
+        )));
+        let mut relay = |client: &mut AppState| {
+            while let Ok(message) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = message {
+                    assert_eq!(event.attested_owner(), Some(agent.as_str()));
+                    client.apply_event(event);
+                }
+            }
+        };
+        ingest_hook_event(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(line(CARD, Some(PANE), None, "thinking", None)),
+            false,
+            Some(agent.clone()),
+        )
+        .await;
+        relay(&mut client);
+        assert_eq!(
+            client.sessions.get(CARD).map(|card| card.status.clone()),
+            Some(SessionStatus::Thinking),
+            "a lone retiree's untagged report must still reach its own card"
+        );
+        ingest_hook_event(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(line(CARD, Some(PANE), None, "session_end", None)),
+            false,
+            Some(agent.clone()),
+        )
+        .await;
+        relay(&mut client);
+        assert!(
+            !client.sessions.contains_key(CARD),
+            "a lone retiree's untagged end must still remove its own card"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A producer puts its own attested-owner marker on a report.
+    /// Ingested without a token, the broadcast frame carries no marker; ingested
+    /// attested to agent A, it carries A and not the producer's value.
+    #[tokio::test]
+    async fn hook_provenance_audit_attested_owner_marker_is_the_daemons_alone() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let forged = || {
+            let mut payload = line("forged-card", Some("forged-pane"), None, "thinking", None);
+            payload["metadata"] = serde_json::json!({
+                crate::event::ATTESTED_OWNER_METADATA_KEY: "forged-owner",
+            });
+            event_of(payload)
+        };
+        for (unproven, attested, expected) in [
+            (true, None, None),
+            (false, None, None),
+            (false, Some("agent-a"), Some("agent-a")),
+        ] {
+            ingest_event_unless(
+                &state,
+                &event_tx,
+                &registry,
+                forged(),
+                unproven,
+                attested,
+                || false,
+            )
+            .await;
+            let Ok(BroadcastMsg::Event(event)) = events.try_recv() else {
+                panic!("the report was broadcast");
+            };
+            assert_eq!(
+                event.attested_owner(),
+                expected,
+                "unproven={unproven} attested={attested:?}"
+            );
+        }
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Agent A exits and agent B replaces it on a pane. A report
+    /// attested to A's token that names no agent reaches the daemon's under-lock
+    /// re-check after B claimed the pane. It must be dropped, broadcast nowhere,
+    /// and logged with the escaped pane and the reason code, never silently.
+    #[tokio::test]
+    async fn hook_provenance_audit_late_replaced_untagged_report_is_logged() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        const PANE: &str = "audit-late-replaced-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn(&registry, Some(PANE), "/usr/bin/true");
+        let old_token = registry.hook_token_of(&old).expect("old token");
+        wait_until_nothing_lives(&registry).await;
+        let _new = spawn(&registry, Some(PANE), "cat");
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        ingest_hook_event(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(line("late-card", Some(PANE), None, "thinking", None)),
+            false,
+            Some(old.clone()),
+        )
+        .await;
+        registry.shutdown_all();
+        assert!(
+            events.try_recv().is_err(),
+            "a dropped report reaches no client"
+        );
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|line| line.contains("token_generation_replaced"))
+            .unwrap_or_else(|| panic!("no refusal logged: {log}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("verb=\"agent_event\""), "{line}");
+        assert!(line.contains("Thinking"), "{line}");
+        assert!(line.contains(PANE), "{line}");
+        assert!(
+            !log.contains(&old_token),
+            "the token is never logged: {log}"
         );
     }
 }
