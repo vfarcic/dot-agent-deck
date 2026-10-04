@@ -63,6 +63,8 @@ use serde_json::{Value, json};
 
 use super::Transcript;
 use super::choice::ordinal;
+use super::dictation::{DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES};
+use super::outcome::said_whole;
 use super::resolver::{IntentError, IntentResolver};
 use super::table::spoken_words;
 use crate::dto::{DesktopPendingQuestion, DesktopQuestion, DesktopQuestionOption, safe_message};
@@ -363,6 +365,13 @@ pub async fn resolve(
         .filter_map(|selection| check_selection(question, selection).ok())
         .collect();
     let words = spoken_words(transcript.text());
+    // A typing-mode switch said on its own is never the question's, not even
+    // the words a free-text option waits for: it goes on to switch the mode,
+    // as it does with no question pending. An option the agent labelled with
+    // exactly those words is still that option.
+    if is_typing_mode_switch(transcript.text()) && !names_an_option(question, &words) {
+        return finish(QuestionVerdict::NotAnswer, None);
+    }
     let cancels = CANCEL_PHRASES.contains(&words.join(" ").as_str());
     if cancels && (!form.is_empty() || awaiting_text.is_some()) {
         return finish(cancelled(), None);
@@ -412,6 +421,24 @@ pub async fn resolve(
         },
     };
     finish(verdict, resolve_ms)
+}
+
+/// Whether the whole utterance enters or leaves typing mode
+/// ([`DICTATION_ON_PHRASES`], [`DICTATION_OFF_PHRASES`]), compared exactly as
+/// the command path compares it (`outcome::said_whole`, an edge politeness
+/// word ignored), so the two never disagree about what is a switch.
+fn is_typing_mode_switch(text: &str) -> bool {
+    said_whole(text, DICTATION_ON_PHRASES.iter().copied())
+        || said_whole(text, DICTATION_OFF_PHRASES.iter().copied())
+}
+
+/// Whether `words` are exactly some option's label, on any question.
+fn names_an_option(question: &DesktopPendingQuestion, words: &[String]) -> bool {
+    question
+        .questions
+        .iter()
+        .flat_map(|q| q.options.iter())
+        .any(|option| spoken_words(&option.label) == words)
 }
 
 /// The local fast path: an utterance that is exactly one option's label, or

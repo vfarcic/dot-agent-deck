@@ -2124,7 +2124,7 @@ fn local_intercept(
 /// Whether the whole utterance, less an edge politeness word, is one of
 /// `phrases` — the comparison `heard_as_whole` grounding makes, so a phrase
 /// answered locally is answered for exactly the words its row would accept.
-fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) -> bool {
+pub(super) fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) -> bool {
     let said = whole_utterance(transcript);
     !said.is_empty()
         && phrases

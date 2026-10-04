@@ -482,6 +482,80 @@ async fn question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_
     );
 }
 
+/// Scenario (question/desktop/013): With a question pending, a typing-mode
+/// switch said on its own ("type on", "talking on", "stop speaking", "dictate
+/// off", …) is a non-answer decided locally, with no model call, even while a
+/// free-text option waits for its words, so it goes on to switch typing mode.
+/// An option whose label is exactly that phrase is still answered.
+#[tokio::test]
+async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
+    use crate::voice::dictation::{DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES};
+
+    let permission_question = map_pending_question(&permission(AnswerChannel::Held));
+    let form = map_pending_question(&form_question());
+    let free_text = TextSlot {
+        question_index: 0,
+        option_index: 3,
+    };
+    let resolver = StubResolver::new();
+    let switches = DICTATION_ON_PHRASES
+        .iter()
+        .chain(DICTATION_OFF_PHRASES.iter())
+        .flat_map(|phrase| [phrase.to_string(), format!("Okay, {phrase}, please.")]);
+    for said in switches {
+        assert_eq!(
+            say(&resolver, &permission_question, &[], &said).await,
+            QuestionVerdict::NotAnswer,
+            "{said:?} with nothing answered"
+        );
+        assert_eq!(
+            say(&resolver, &form, &[pick(1, &[1])], &said).await,
+            QuestionVerdict::NotAnswer,
+            "{said:?} with an answer started"
+        );
+        let waiting = resolve(
+            &resolver,
+            "tester",
+            &form,
+            &[],
+            Some(free_text),
+            Transcript::new(&said),
+        )
+        .await;
+        assert_eq!(
+            waiting.verdict,
+            QuestionVerdict::NotAnswer,
+            "{said:?} is not the free-text option's words"
+        );
+    }
+    assert_eq!(resolver.question_calls(), 0, "no switch asks the model");
+
+    // Said inside a sentence it is not a switch, and the free text takes it.
+    let words = resolve(
+        &resolver,
+        "tester",
+        &form,
+        &[],
+        Some(free_text),
+        Transcript::new("I was talking on the phone"),
+    )
+    .await;
+    match &words.verdict {
+        QuestionVerdict::Answered { form, .. } => {
+            assert_eq!(form[0].text.as_deref(), Some("I was talking on the phone"))
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // An option the agent itself labelled with the phrase is that option.
+    let mut labelled = permission(AnswerChannel::Held);
+    labelled.questions[0].options[0].label = "Start typing".to_string();
+    let labelled = map_pending_question(&labelled);
+    let verdict = say(&resolver, &labelled, &[], "start typing").await;
+    assert_eq!(form_of(&verdict), [pick(0, &[1])]);
+    assert_eq!(resolver.question_calls(), 0);
+}
+
 /// Every refusal the daemon can send has its own plain sentence and code, and
 /// a form for a question that has since changed is refused before sending.
 #[test]
