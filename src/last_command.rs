@@ -25,8 +25,9 @@
 //! is written, see `write_atomic`) and written atomically —
 //! the discipline `session.toml` follows, for its reason: a command line is
 //! where people put credentials. Loaded once when the daemon starts; after
-//! that the in-memory copy is authoritative and every change is written
-//! through.
+//! that the in-memory copy is authoritative, and every change is written to
+//! disk after the daemon has answered the request that made it, so a start or
+//! a seed never waits for the state directory.
 //!
 //! **What the loader refuses.** The file is a value the form offers back and
 //! the user then starts, so on Unix the loader opens it `O_NOFOLLOW` and
@@ -36,9 +37,10 @@
 //! who can write the state directory can delete or replace the file, but a
 //! file they put there, or a link they point it through, is not offered. The
 //! check is made on the file at load only; the state directory's own
-//! permissions are not checked. On Windows the loader applies only the
-//! regular-file and size checks and follows a symlink; no ownership check is
-//! made there.
+//! permissions are not checked. Windows gets the same check from the open
+//! handle: the file is opened without following a reparse point, a symbolic
+//! link or junction is refused, and the file's owner SID must be the current
+//! user's.
 //!
 //! **The state directory is the deck's persistence identity**, not its
 //! endpoint — the precedent `schedules.toml` (found by the config directory)
@@ -97,32 +99,55 @@ pub fn is_recordable(command: &str) -> bool {
 /// The daemon's copy of the deck's last command, and the file it persists to.
 ///
 /// One per daemon, installed on its `AppState` at startup
-/// ([`crate::state::AppState::set_last_command_store`]). Every method that
-/// writes is **blocking** file I/O, so the dispatch calls them from a blocking
-/// thread. Writers are serialised by one lock held across the write, so the
-/// file always ends up holding the last value set, even when two starts race.
-/// Readers never take that lock: [`Self::get`] reads a separate snapshot that
-/// is only ever held for a clone or an assignment, so a form asking for the
-/// value never waits on a disk write.
+/// ([`crate::state::AppState::set_last_command_store`]). Changing the value and
+/// writing it to disk are separate steps, so a start never waits for the disk:
+///
+/// * [`Self::remember`] / [`Self::remember_if_empty`] change the in-memory
+///   snapshot only — a brief lock, no I/O — so the dispatch calls them inline,
+///   before it replies, and the next [`Self::get`] already sees the value;
+/// * [`Self::persist`] is the **blocking** write, which the dispatch runs on a
+///   detached blocking task after deciding the reply.
+///
+/// Every change bumps a generation. `persist` takes the writer lock, then writes
+/// whatever the snapshot holds **at that moment**, not the value it was spawned
+/// for, and skips a generation already on disk — so two persists that run out
+/// of order can never leave an older value on disk over a newer one. Readers
+/// never take the writer lock, so a form asking for the value never waits on a
+/// disk write either.
 #[derive(Debug)]
 pub struct LastCommandStore {
     path: PathBuf,
-    /// What [`Self::get`] returns. Locked only briefly, never across I/O.
-    value: RwLock<Option<String>>,
-    /// Held by a writer for the whole of a record or seed, file write
-    /// included. `true` while `value` holds something the last write failed
-    /// to persist, so the next record or seed of that same value writes it
-    /// again rather than reporting it unchanged.
-    writer: Mutex<bool>,
+    /// What [`Self::get`] returns, and how far it has been persisted. Locked
+    /// only briefly, never across I/O.
+    snapshot: RwLock<Snapshot>,
+    /// Held by [`Self::persist`] for the whole of a file write, so writes are
+    /// serialised and each one writes the latest snapshot.
+    writer: Mutex<()>,
 }
 
-/// What [`LastCommandStore::record`] / [`LastCommandStore::seed`] did.
+#[derive(Debug, Default)]
+struct Snapshot {
+    value: Option<String>,
+    /// Bumped by every change to `value`.
+    generation: u64,
+    /// The generation the file on disk holds. Below `generation` while a write
+    /// is pending or the last one failed, so an equal [`LastCommandStore::remember`]
+    /// asks for the write again instead of reporting the value unchanged.
+    persisted: u64,
+}
+
+/// What [`LastCommandStore::remember`] / [`LastCommandStore::remember_if_empty`]
+/// (and the blocking [`LastCommandStore::record`] / [`LastCommandStore::seed`])
+/// did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOutcome {
-    /// The value was set in memory and written to disk — including a retry
-    /// that persisted a value an earlier failed write left only in memory.
+    /// The value is set in memory and not yet known to be on disk — a new
+    /// value, or one an earlier write has not persisted — so the caller owes a
+    /// [`LastCommandStore::persist`]. From `record` / `seed`, the write has
+    /// been made.
     Set,
-    /// Nothing changed: the command is not recordable, or — for a seed — the
+    /// Nothing changed and nothing needs writing: the command is not
+    /// recordable, it is already the persisted value, or — for a seed — the
     /// daemon already has a value.
     Unchanged,
 }
@@ -179,8 +204,11 @@ impl LastCommandStore {
         };
         Self {
             path,
-            value: RwLock::new(value),
-            writer: Mutex::new(false),
+            snapshot: RwLock::new(Snapshot {
+                value,
+                ..Snapshot::default()
+            }),
+            writer: Mutex::new(()),
         }
     }
 
@@ -192,75 +220,134 @@ impl LastCommandStore {
     /// The deck's last command, if it has one. Never waits on I/O: it takes
     /// only the snapshot lock, which no writer holds across a file write.
     pub fn get(&self) -> Option<String> {
-        self.read_value().clone()
+        self.read_snapshot().value.clone()
     }
 
-    /// Record `command` as the deck's last command, replacing any value.
-    /// **Blocking.**
+    /// Make `command` the deck's last command, replacing any value, **in memory
+    /// only** — no I/O, so it is safe to call before a reply. `Set` means the
+    /// caller owes a [`Self::persist`].
     ///
-    /// A command [`is_recordable`] rejects changes nothing. When the write to
-    /// disk fails the in-memory value is still updated — the clients of this
-    /// daemon still share it until it restarts — and the error is returned for
-    /// the caller to log; the next record of the same command then writes it
-    /// again instead of reporting it unchanged.
+    /// A command [`is_recordable`] rejects changes nothing. Remembering the
+    /// value already held answers `Set` again while it is not on disk (a write
+    /// pending or failed), so a failed write is retried by the next equal
+    /// record instead of being reported unchanged.
+    pub fn remember(&self, command: &str) -> StoreOutcome {
+        if !is_recordable(command) {
+            return StoreOutcome::Unchanged;
+        }
+        let mut snapshot = self.write_snapshot();
+        if snapshot.value.as_deref() != Some(command) {
+            snapshot.value = Some(command.to_string());
+            snapshot.generation += 1;
+        }
+        snapshot.outcome()
+    }
+
+    /// Set `command` only when the daemon has no last command yet, in memory
+    /// only — how a client hands over a value it kept before the daemon owned
+    /// one, without overwriting a newer one another client already recorded.
+    /// `Set` means the caller owes a [`Self::persist`]; seeding the value the
+    /// daemon already holds answers `Set` while that value is not on disk, so
+    /// it retries a failed write like [`Self::remember`] does.
+    pub fn remember_if_empty(&self, command: &str) -> StoreOutcome {
+        if !is_recordable(command) {
+            return StoreOutcome::Unchanged;
+        }
+        let mut snapshot = self.write_snapshot();
+        match snapshot.value.as_deref() {
+            None => {
+                snapshot.value = Some(command.to_string());
+                snapshot.generation += 1;
+                snapshot.outcome()
+            }
+            Some(held) if held == command => snapshot.outcome(),
+            Some(_) => StoreOutcome::Unchanged,
+        }
+    }
+
+    /// Write the current value to disk unless that generation is already
+    /// there. **Blocking.**
+    ///
+    /// It writes what the snapshot holds when the writer lock is taken, so a
+    /// persist that runs after a newer change writes the newer value, and one
+    /// that runs after the newer value was persisted writes nothing. On failure
+    /// the value stays in memory — the clients of this daemon still share it
+    /// until it restarts — and the error is returned for the caller to log
+    /// (it names a path, never the command).
+    pub fn persist(&self) -> Result<(), String> {
+        let _writer = self.lock_writer();
+        let (value, generation) = {
+            let snapshot = self.read_snapshot();
+            if snapshot.persisted >= snapshot.generation {
+                return Ok(());
+            }
+            (snapshot.value.clone(), snapshot.generation)
+        };
+        // Only a recordable value ever enters the snapshot after load, and a
+        // change always sets one, so a pending generation always has a value.
+        let Some(value) = value else {
+            return Ok(());
+        };
+        write_atomic(&self.path, &value)?;
+        let mut snapshot = self.write_snapshot();
+        snapshot.persisted = snapshot.persisted.max(generation);
+        Ok(())
+    }
+
+    /// [`Self::remember`] then, when it answers `Set`, [`Self::persist`].
+    /// **Blocking** — for callers that may wait on the disk; the dispatch does
+    /// not, and calls the two halves itself.
     pub fn record(&self, command: &str) -> Result<StoreOutcome, String> {
-        if !is_recordable(command) {
-            return Ok(StoreOutcome::Unchanged);
-        }
-        let mut unsaved = self.lock_writer();
-        if !*unsaved && self.read_value().as_deref() == Some(command) {
-            return Ok(StoreOutcome::Unchanged);
-        }
-        self.write_through(&mut unsaved, command)
+        self.remember_then_persist(Self::remember, command)
     }
 
-    /// Set `command` only when the daemon has no last command yet — how a
-    /// client hands over a value it kept before the daemon owned one, without
-    /// overwriting a newer one another client already recorded. **Blocking.**
-    ///
-    /// A failed write behaves as it does for [`Self::record`]: the value is
-    /// kept in memory, and a later seed of the same command writes it again.
+    /// [`Self::remember_if_empty`] then, when it answers `Set`,
+    /// [`Self::persist`]. **Blocking**, like [`Self::record`].
     pub fn seed(&self, command: &str) -> Result<StoreOutcome, String> {
-        if !is_recordable(command) {
-            return Ok(StoreOutcome::Unchanged);
-        }
-        let mut unsaved = self.lock_writer();
-        let retry = *unsaved && self.read_value().as_deref() == Some(command);
-        if !retry && self.read_value().is_some() {
-            return Ok(StoreOutcome::Unchanged);
-        }
-        self.write_through(&mut unsaved, command)
+        self.remember_then_persist(Self::remember_if_empty, command)
     }
 
-    /// Publish `command` to readers, then write it to disk, with the writer
-    /// lock (`unsaved`) held by the caller throughout. The snapshot is updated
-    /// first so the clients share the value even if the write fails.
-    fn write_through(&self, unsaved: &mut bool, command: &str) -> Result<StoreOutcome, String> {
-        *self.write_value() = Some(command.to_string());
-        let written = write_atomic(&self.path, command);
-        *unsaved = written.is_err();
-        written.map(|()| StoreOutcome::Set)
+    fn remember_then_persist(
+        &self,
+        remember: fn(&Self, &str) -> StoreOutcome,
+        command: &str,
+    ) -> Result<StoreOutcome, String> {
+        match remember(self, command) {
+            StoreOutcome::Set => self.persist().map(|()| StoreOutcome::Set),
+            StoreOutcome::Unchanged => Ok(StoreOutcome::Unchanged),
+        }
     }
 
-    // All three locks are poison-tolerant: an `Option<String>` or a `bool`
-    // has nothing a panic could leave half-written.
+    // Both locks are poison-tolerant: a `Snapshot` is only ever changed by
+    // single assignments, so a panic cannot leave it half-written.
 
-    fn read_value(&self) -> std::sync::RwLockReadGuard<'_, Option<String>> {
-        self.value
+    fn read_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Snapshot> {
+        self.snapshot
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn write_value(&self) -> std::sync::RwLockWriteGuard<'_, Option<String>> {
-        self.value
+    fn write_snapshot(&self) -> std::sync::RwLockWriteGuard<'_, Snapshot> {
+        self.snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_writer(&self) -> std::sync::MutexGuard<'_, bool> {
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, ()> {
         self.writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Snapshot {
+    /// `Set` while the held value is not yet on disk.
+    fn outcome(&self) -> StoreOutcome {
+        if self.persisted < self.generation {
+            StoreOutcome::Set
+        } else {
+            StoreOutcome::Unchanged
+        }
     }
 }
 
@@ -270,9 +357,10 @@ enum StoreFileError {
     /// The file could not be read, or is not a regular file within
     /// [`MAX_FILE_BYTES`].
     Io(std::io::Error),
-    /// The file is one the daemon declines to trust (Unix only): a symlink,
-    /// or owned by another user. A fixed description, never file contents.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// The file is one the daemon declines to trust (Unix and Windows): a
+    /// symlink (on Windows any reparse point), or owned by another user. A
+    /// fixed description, never file contents.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     Refused(&'static str),
 }
 
@@ -289,6 +377,8 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Unused off Unix: Windows compares owner SIDs instead (see the Windows
+/// `read_store_file`).
 #[cfg(not(unix))]
 fn current_uid() -> u32 {
     0
@@ -300,12 +390,11 @@ fn current_uid() -> u32 {
 /// open handle, so what is checked is what is read: a symlink at `path` is
 /// refused rather than followed, and the opened file must be regular, owned by
 /// `owner_uid`, and at most [`MAX_FILE_BYTES`] long. `owner_uid` is a parameter
-/// so a test can stand in for "another user" without being root. Elsewhere this
-/// is [`crate::bounded_read::read_config_file`], which follows symlinks and
-/// checks no owner.
+/// so a test can stand in for "another user" without being root. The Windows
+/// counterpart is the next function.
 #[cfg(unix)]
 fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreFileError> {
-    use std::io::{Error, ErrorKind, Read as _};
+    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let mut options = std::fs::OpenOptions::new();
@@ -340,13 +429,80 @@ fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreF
             "it is owned by another user than the daemon's",
         ));
     }
+    read_opened(file, metadata.len()).map(Some)
+}
+
+/// The Windows counterpart of the Unix reader above, judged from the open
+/// handle the same way: the file is opened `FILE_FLAG_OPEN_REPARSE_POINT`, so a
+/// symbolic link or junction at `path` is opened itself rather than followed,
+/// and is refused; the opened file must be regular, owned by the current user
+/// (its owner SID, read through
+/// [`crate::platform::fsperm::verify_object_owner_is_current_user`]), and at
+/// most [`MAX_FILE_BYTES`] long. A directory fails to open at all, which reads
+/// as an unreadable file.
+#[cfg(windows)]
+fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StoreFileError::Io(error)),
+    };
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(StoreFileError::Refused(
+            "it is a reparse point (a symbolic link or junction)",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(StoreFileError::Io(Error::new(
+            ErrorKind::InvalidInput,
+            "it is not a regular file",
+        )));
+    }
+    // The helper's message names SIDs only, never contents, but `Refused`
+    // carries a fixed description, so an unreadable owner is refused the same
+    // way as a foreign one: either way the file is not offered.
+    if crate::platform::fsperm::verify_object_owner_is_current_user(file.as_raw_handle() as HANDLE)
+        .is_err()
+    {
+        return Err(StoreFileError::Refused(
+            "it is owned by another user than the daemon's, or its owner cannot be read",
+        ));
+    }
+    read_opened(file, metadata.len()).map(Some)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
+    Ok(crate::bounded_read::read_config_file(path, MAX_FILE_BYTES)?)
+}
+
+/// Read an already-vetted store file of reported length `len`, refusing one
+/// over [`MAX_FILE_BYTES`] — by its length first, then by what is actually
+/// read, in case it grew — and one that is not UTF-8.
+#[cfg(any(unix, windows))]
+fn read_opened(file: std::fs::File, len: u64) -> Result<String, StoreFileError> {
+    use std::io::{Error, ErrorKind, Read as _};
+
     let too_large = || {
         StoreFileError::Io(Error::new(
             ErrorKind::InvalidData,
             format!("it is larger than the {MAX_FILE_BYTES}-byte limit"),
         ))
     };
-    if metadata.len() > MAX_FILE_BYTES {
+    if len > MAX_FILE_BYTES {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
@@ -356,13 +512,7 @@ fn read_store_file(path: &Path, owner_uid: u32) -> Result<Option<String>, StoreF
         return Err(too_large());
     }
     String::from_utf8(bytes)
-        .map(Some)
         .map_err(|error| StoreFileError::Io(Error::new(ErrorKind::InvalidData, error.utf8_error())))
-}
-
-#[cfg(not(unix))]
-fn read_store_file(path: &Path, _owner_uid: u32) -> Result<Option<String>, StoreFileError> {
-    Ok(crate::bounded_read::read_config_file(path, MAX_FILE_BYTES)?)
 }
 
 /// The 1-based line a parse of [`LAST_COMMAND_FILE`] failed on, or `0` when the
@@ -728,6 +878,62 @@ mod tests {
             .expect("get blocked on the writer lock");
         drop(writer);
         assert_eq!(got.as_deref(), Some("claude"));
+    }
+
+    /// Scenario (issue #1540): remember one command, then a second, and run
+    /// the persist owed for the SECOND before the one owed for the first — the
+    /// order two detached writes can finish in. The file ends up holding the
+    /// second command, and the late persist for the first neither writes the
+    /// first back nor rewrites the file at all.
+    #[test]
+    fn persists_run_out_of_order_leave_the_newest_value_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        assert_eq!(store.remember("first"), StoreOutcome::Set);
+        assert_eq!(store.remember("second"), StoreOutcome::Set);
+        assert_eq!(
+            store.get().as_deref(),
+            Some("second"),
+            "the snapshot changes before any write"
+        );
+        assert!(!store.path().exists(), "remembering does no I/O");
+
+        store.persist().unwrap(); // the persist owed for "second"
+        assert_eq!(store_in(&dir).get().as_deref(), Some("second"));
+
+        // Prove the late persist for "first" writes nothing: anything it wrote
+        // would replace this marker file.
+        std::fs::write(store.path(), "last_command = \"marker\"\n").unwrap();
+        store.persist().unwrap(); // the persist owed for "first", finishing last
+        assert_eq!(store_in(&dir).get().as_deref(), Some("marker"));
+        assert_eq!(store.remember("second"), StoreOutcome::Unchanged);
+    }
+
+    /// Scenario (issue #1540): many threads each remember a command and then
+    /// persist, racing one another; once all are done the file holds exactly
+    /// the value the forms are offered, never an older one.
+    #[test]
+    fn racing_records_leave_the_offered_value_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(store_in(&dir));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for round in 0..4 {
+                        if store.remember(&format!("cmd-{i}-{round}")) == StoreOutcome::Set {
+                            store.persist().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let offered = store.get();
+        assert!(offered.is_some());
+        assert_eq!(store_in(&dir).get(), offered);
     }
 
     /// Scenario (issue #1540): a last-command file reached through a symlink

@@ -1604,7 +1604,7 @@ pub enum AttachRequest {
         /// TUI's `Ctrl+n`, the desktop's New agent dialog), plain or authoring,
         /// so once the daemon has ACCEPTED it — the spawn succeeded — `command`
         /// becomes the deck's last command
-        /// ([`crate::last_command::LastCommandStore::record`]). A start that is
+        /// ([`crate::last_command::LastCommandStore::remember`]). A start that is
         /// refused records nothing, and so does one with no `command` (the
         /// default shell) or a command [`crate::last_command::is_recordable`]
         /// rejects.
@@ -2225,7 +2225,7 @@ pub enum AttachRequest {
     /// the same no-bump basis as [`Self::ListDirectories`].
     NewAgentOptions {},
     /// Issue #1540: offer `command` as the deck's last command **only if the
-    /// daemon has none yet** ([`crate::last_command::LastCommandStore::seed`]) —
+    /// daemon has none yet** ([`crate::last_command::LastCommandStore::remember_if_empty`]) —
     /// how a client hands over a value it kept before the daemon owned one
     /// (the TUI's `session.toml`) without overwriting a newer command another
     /// client already recorded. Answers `ok` whether or not the value was
@@ -4743,11 +4743,13 @@ async fn handle_connection(
                         );
                     }
                     // Issue #1540: the start is accepted, so a form start's
-                    // command becomes the deck's last command — before the
-                    // reply, so a form that reopens on the reply already sees
-                    // it. A failed write is logged and does not fail the start.
+                    // command becomes the deck's last command — in memory
+                    // before the reply, so a form that reopens on the reply
+                    // already sees it, and on disk after, on a detached task,
+                    // so the reply never waits for the state directory. A
+                    // failed write is logged and does not fail the start.
                     if let Some(command) = last_command_to_record {
-                        record_last_command(&state, command).await;
+                        record_last_command(&state, &command).await;
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
@@ -5744,17 +5746,14 @@ async fn handle_connection(
         // whether or not it was taken — the caller has nothing to do either way.
         AttachRequest::SeedLastCommand { command } => {
             // Bound in its own statement so the `AppState` read guard is
-            // dropped before the blocking seed is awaited.
+            // dropped before the store is used. The value is taken in memory
+            // and written on a detached task, so the answer never waits for
+            // the disk — the same shape as a form start's record.
             let store = state.read().await.last_command_store();
-            if let Some(store) = store {
-                let outcome = tokio::task::spawn_blocking(move || store.seed(&command)).await;
-                match outcome {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        warn!(%error, "seed-last-command: could not persist the last command")
-                    }
-                    Err(_) => warn!("seed-last-command: the store task did not complete"),
-                }
+            if let Some(store) = store
+                && store.remember_if_empty(&command) == crate::last_command::StoreOutcome::Set
+            {
+                persist_last_command(store, "seed-last-command");
             }
             write_resp(&mut stream, &AttachResponse::ok()).await?
         }
@@ -5762,21 +5761,34 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Issue #1540: record `command` as the deck's last command, on a blocking
-/// thread (the store writes its file). A daemon with no store installed — a
-/// test harness — records nothing. Never fails the caller: the start it follows
-/// has already been accepted.
-async fn record_last_command(state: &SharedState, command: String) {
+/// Issue #1540: make `command` the deck's last command in memory — no I/O, so
+/// the caller may reply straight after — and write it to disk on a detached
+/// blocking task ([`persist_last_command`]). A daemon with no store installed —
+/// a test harness — records nothing. Never fails the caller: the start it
+/// follows has already been accepted.
+async fn record_last_command(state: &SharedState, command: &str) {
     // `let … else` drops the `AppState` read guard at the end of this
-    // statement, before the blocking record is awaited.
+    // statement.
     let Some(store) = state.read().await.last_command_store() else {
         return;
     };
-    match tokio::task::spawn_blocking(move || store.record(&command)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => warn!(%error, "start-agent: could not persist the last command"),
-        Err(_) => warn!("start-agent: the last-command store task did not complete"),
+    if store.remember(command) == crate::last_command::StoreOutcome::Set {
+        persist_last_command(store, "start-agent");
     }
+}
+
+/// Issue #1540: write the store's current value to disk on a detached blocking
+/// task, so no reply waits for the state directory. The store writes whatever
+/// value is newest when the task runs and skips one already on disk, so tasks
+/// finishing out of order cannot leave an older command on disk. A failure is
+/// logged under `verb` with the store's error, which names a path and never the
+/// command.
+fn persist_last_command(store: Arc<crate::last_command::LastCommandStore>, verb: &'static str) {
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(error) = store.persist() {
+            warn!(verb, %error, "could not persist the last command");
+        }
+    }));
 }
 
 /// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
@@ -10221,11 +10233,17 @@ mod tests {
             .expect("form start");
         assert_eq!(form.last_command, LastCommandKeeper::Daemon);
         assert_eq!(last_command().await.as_deref(), Some("cat -u"));
-        assert_eq!(
-            LastCommandStore::load(store_path.clone()).get().as_deref(),
-            Some("cat -u"),
-            "recorded to disk, so it survives a daemon restart"
-        );
+        // The disk write runs after the reply, on a detached task, so wait for
+        // it — bounded, since it is a small local file.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("cat -u") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recorded command never reached disk, so it would not survive a \
+                 daemon restart"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // A form-marked ORCHESTRATION role start is ignored, whatever the marker.
         let role = StartAgentOptions {
@@ -10333,10 +10351,15 @@ mod tests {
             panic!("this build advertises the options query");
         };
         assert_eq!(options.last_command.as_deref(), Some("claude"));
-        assert_eq!(
-            LastCommandStore::load(store_path).get().as_deref(),
-            Some("claude")
-        );
+        // Persisted after the answer, on a detached task: wait for it, bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("claude") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seeded command never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         server.abort();
     }
 }
