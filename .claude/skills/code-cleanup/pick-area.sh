@@ -39,7 +39,8 @@
 #      cleanup should open as an area (snapshots, the catalog, generated or
 #      binary files);
 #   2. BUSY files: every file an open PR changes, and every file a running
-#      dispatch unit on this machine has changed, committed or not. A running
+#      dispatch unit on this machine has changed, committed or not, with both
+#      sides of a rename counted as busy. A running
 #      unit is a linked worktree on an `agent/dispatch-*` branch; this unit's
 #      own worktree is left out. A unit on another machine that has not pushed
 #      is invisible here — accepted, since its PR will show up in (2) once it
@@ -47,6 +48,9 @@
 #   3. RECENT files: every file the 20 most recent `cleanup`-labelled PRs
 #      changed, in any state, so a closed-unmerged cleanup is not retried at
 #      once either.
+#
+# A failed GitHub lookup for (2) or (3) stops the draw with ERROR= rather than
+# drawing from a filter that silently lost entries.
 #
 # PR file names come from GitHub and on a public repository a fork chooses
 # them. They are only ever used as exact-match exclusion lines here and are
@@ -114,14 +118,18 @@ case "$mode" in
       >"$tmp/owned"
     ;;
   instructions)
+    # Skill Markdown one level down only (a SKILL.md and its siblings), the
+    # same rule --check applies: nested Markdown under a skill is a test
+    # fixture, not an instruction (demo-reel-adapter/tests/fixtures/...).
     git ls-files -- CLAUDE.md .claude/skills docs/develop \
-      | grep -E '\.md$' \
+      | grep -E '^CLAUDE\.md$|^docs/develop/.*\.md$|^\.claude/skills/[^/]+/[^/]+\.md$' \
       | grep -vE '^\.claude/skills/dot-ai-' >"$tmp/owned"
     ;;
 esac
 [ -s "$tmp/owned" ] || die "the $mode owned set is empty; has the layout moved?"
 
-# 2. Busy files: open PRs ...
+# 2. Busy files: open PRs ... (a renamed file's old path is `previous_filename`)
+files_jq='.[] | .filename, (.previous_filename // empty)'
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "gh repo view failed"
 gh pr list --repo "$repo" --state open --limit 300 --json number --jq '.[].number' >"$tmp/open" \
   || die "gh pr list failed"
@@ -129,7 +137,7 @@ gh pr list --repo "$repo" --state open --limit 300 --json number --jq '.[].numbe
 : >"$tmp/busy"
 while read -r n; do
   [ -n "$n" ] || continue
-  gh api "repos/$repo/pulls/$n/files" --paginate --jq '.[].filename' >>"$tmp/busy" \
+  gh api "repos/$repo/pulls/$n/files" --paginate --jq "$files_jq" >>"$tmp/busy" \
     || die "cannot read the files of PR #$n"
 done <"$tmp/open"
 
@@ -139,17 +147,20 @@ git worktree list --porcelain | awk '
   /^branch refs\/heads\/agent\/dispatch-/{print wt "\t" substr($0,19)}' \
   | while IFS=$'\t' read -r wt branch; do
       [ "$wt" = "$top" ] && continue
-      git diff --name-only "origin/main...$branch" 2>/dev/null
-      git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null | cut -c4- | sed 's/.* -> //'
+      git diff --no-renames --name-only "origin/main...$branch" 2>/dev/null
+      git -C "$wt" diff --no-renames --name-only HEAD 2>/dev/null
     done >>"$tmp/busy"
 
-# 3. Recent cleanup PRs.
-: >"$tmp/recent"
+# 3. Recent cleanup PRs. Read the list into a file first: a `die` inside a
+# piped loop would only end the pipeline's subshell.
 gh pr list --repo "$repo" --label cleanup --state all --limit 20 --json number --jq '.[].number' \
-  2>/dev/null | while read -r n; do
-    [ -n "$n" ] || continue
-    gh api "repos/$repo/pulls/$n/files" --paginate --jq '.[].filename' 2>/dev/null
-  done >"$tmp/recent"
+  >"$tmp/recent-prs" || die "cannot list recent cleanup PRs"
+: >"$tmp/recent"
+while read -r n; do
+  [ -n "$n" ] || continue
+  gh api "repos/$repo/pulls/$n/files" --paginate --jq "$files_jq" >>"$tmp/recent" \
+    || die "cannot read the files of cleanup PR #$n"
+done <"$tmp/recent-prs"
 
 sort -u "$tmp/busy" -o "$tmp/busy"
 sort -u "$tmp/recent" -o "$tmp/recent"

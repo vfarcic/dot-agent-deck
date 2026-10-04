@@ -136,6 +136,10 @@ say in your report which you did for each one — rerunning it until green and m
 report is neither. Before fixing a red your change did not cause, check whether an open PR already
 fixes it (`gh pr list --search '<test name>'`); if one does, name that PR in your report and leave
 the red to it.
+If the only fix or quarantine for such a red lies in a file your mode does not own (a red test
+under tests/ met in code mode, say), do not make it in this PR, and do not merge this PR while that
+red stands: report the red, your diagnosis and the file the remedy needs, so the dispatcher can
+start a unit that owns it. Say in your report that this is what you did.
 
 PR: open it with the /pr-create skill, with the `cleanup` label (`--label cleanup`), a title of the
 form `refactor(<area>): ...`, `test(<area>): ...` or `docs(develop): ...`, and the body layout in
@@ -172,6 +176,8 @@ Dispatch each unit, deleting its task file after each success. Then tell the run
 - **No PR**: the area it examined and why nothing was worth changing. That is a complete, successful run.
 - **A merged PR** (code or instructions mode): `gh pr view <n> --json state,mergeCommit,labels` reads `MERGED` and carries `cleanup`.
 - **A PR stopped for a person** (tests mode, a `CLAUDE.md` change, or any stop the merge procedure hit): the PR URL and the reason, for the runner.
+
+- **A red it could not own**: a red whose remedy lies outside the unit's mode, reported with its diagnosis instead of fixed. Check for an open PR that already fixes it (`gh pr list --search '<test name>'`); otherwise put it to the runner, who decides whether to dispatch a fix. It is still a red under CLAUDE.md rule 6 and still needs an owner; the cleanup unit's file boundary only means it was not the one to fix it.
 
 Nothing is re-dispatched when a cleanup unit finishes. One unit per mode per run is the whole batch.
 

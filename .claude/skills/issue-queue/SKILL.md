@@ -281,7 +281,7 @@ jq -r '.[] | select(.number==<n>) | .body' "$ISSUES"
 
 Show what was excluded and why — in-flight exclusions especially, since that is where the runner is most likely to know something the queries cannot see.
 
-**If nothing survives, stop there.** After PRD exclusion, in-flight elimination and duplicate clustering the candidate list can legitimately be empty. Report the counts at each stage and what they removed, and do not go on to ask for a total — there is nothing to dispatch, and asking implies otherwise.
+**If nothing survives, stop there.** After PRD exclusion, in-flight elimination and duplicate clustering the candidate list can legitimately be empty. Report the counts at each stage and what they removed, and do not go on to ask for a total — there is no issue to dispatch, and asking implies otherwise. Then go straight to step 10: an empty queue still ends the run with the cleanup units.
 
 Otherwise ask **two numbers, in one prompt**, because they are different decisions and only one of them is about this machine:
 
