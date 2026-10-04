@@ -3249,23 +3249,34 @@ fn hook_line_for_log(line: &str) -> String {
         .into_owned()
 }
 
-/// Issue #318: `line` with any hook capability token taken out, for a log.
+/// Issue #318: `line` with the hook capability token taken out, for a log.
 ///
 /// A line that parses as JSON is walked whole (Greptile, PR #1559): every
-/// `token` member is removed at any depth, and every run of a token's length or
-/// more of hex digits in any other string — or in a member's name — is masked,
-/// so a capability nested under a field the daemon does not know, or inside a
-/// metadata map, is caught as well as the top-level one. It works on the
-/// decoded values, so an escaped spelling is caught too, and every other
-/// member — the `event_type` a diagnostic is about — survives. A line that does
-/// not parse cannot be reasoned about that way: every such hex run in it is
-/// masked, and a line containing a `\u` escape, which could spell a token in a
-/// form no mask recognises, is not logged at all beyond saying so.
+/// member named `token` is removed at any depth that survives parsing, and
+/// every contiguous run of a token's length or more of hex digits in any other
+/// string — or in a member's name — is masked, so a capability nested under a
+/// field the daemon does not know, or inside a metadata map, is caught as well
+/// as the top-level one. It works on the decoded values, so a JSON-escaped
+/// spelling is caught too, and every other member — the `event_type` a
+/// diagnostic is about — survives.
+///
+/// What is logged for such a line is always the RE-SERIALIZED value, never the
+/// raw text, even when the walk changed nothing: parsing keeps only the last of
+/// a set of duplicate members, so an earlier occurrence holding a capability is
+/// invisible to the walk and would come back with the raw line (round-5 audit,
+/// PR #1559). Re-serializing also normalises the line, which a diagnostic does
+/// not need preserved.
+///
+/// The masking is shape-based, not a decoder: a capability re-encoded some
+/// other way — base64, percent-encoding, hex split by separators — under a key
+/// other than `token` is not recognised, and a legitimate value of the same
+/// shape, such as a SHA-256 digest, is masked along with a real one. A line
+/// that does not parse cannot be walked: every such hex run in it is masked,
+/// and a line containing a `\u` escape, which could spell a token in a form
+/// the mask does not recognise, is not logged at all beyond saying so.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
-        if !redact_json_capabilities(&mut value) {
-            return std::borrow::Cow::Borrowed(line);
-        }
+        redact_json_capabilities(&mut value);
         return std::borrow::Cow::Owned(value.to_string());
     }
     if line.contains("\\u") {
@@ -3278,8 +3289,8 @@ fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// [`redact_hook_token`]'s walk over a parsed line: removes every `token`
-/// member and masks capability-length hex runs in every string and member
-/// name, at any depth. Returns whether anything changed.
+/// member and masks contiguous capability-length hex runs in every string and
+/// member name, at every depth parsing kept. Returns whether anything changed.
 fn redact_json_capabilities(value: &mut serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(text) => match mask_capability_runs(text) {
@@ -6030,6 +6041,36 @@ mod hook_ingestion_tests {
 
         let as_a_key = serde_json::json!({ "metadata": { token.clone(): 1 } }).to_string();
         assert!(!hook_line_for_log(&as_a_key).contains(&token));
+    }
+
+    /// Issue #318 (round-5 audit, PR #1559): parsing keeps only the LAST of a
+    /// set of duplicate members, so a capability inside an earlier occurrence
+    /// is invisible to the walk — and must not come back by way of the raw
+    /// line. Covers an overwritten parent holding a nested `token`, a repeated
+    /// nested key whose first value is the token, and a duplicate name spelled
+    /// with an escape that decodes to the same key.
+    #[test]
+    fn hook_line_for_log_never_logs_a_token_in_a_discarded_duplicate_member() {
+        let token = "0123456789abcdef".repeat(4);
+
+        let overwritten_parent = format!(
+            "{{\"event_type\":\"sessoin_start\",\"extra\":{{\"token\":\"{token}\"}},\"extra\":null}}"
+        );
+        let got = hook_line_for_log(&overwritten_parent);
+        assert!(!got.contains(&token), "overwritten parent: {got}");
+        assert!(got.contains("sessoin_start"), "{got}");
+
+        let duplicate_nested_value = format!(
+            "{{\"event_type\":\"sessoin_start\",\"metadata\":{{\"capability\":\"{token}\",\"capability\":\"x\"}}}}"
+        );
+        let got = hook_line_for_log(&duplicate_nested_value);
+        assert!(!got.contains(&token), "duplicate nested value key: {got}");
+
+        let escaped_duplicate_name = format!(
+            "{{\"event_type\":\"sessoin_start\",\"extra\":{{\"token\":\"{token}\"}},\"\\u0065xtra\":null}}"
+        );
+        let got = hook_line_for_log(&escaped_duplicate_name);
+        assert!(!got.contains(&token), "escaped duplicate name: {got}");
     }
 
     /// Scenario: Open `MAX_CONCURRENT_HOOK_CONNECTIONS` hook connections, each sending one `session_start` and then staying open, then open one more and send an event on it. The extra event must not be applied while every slot is held, and must be applied — not dropped — as soon as one of the held connections closes.
@@ -10875,6 +10916,100 @@ mod hook_provenance_audit_tests {
         assert!(
             !client.sessions.contains_key(CARD),
             "a lone retiree's untagged end must still remove its own card"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Agent A exits and agent B replaces it on a pane, but an
+    /// attached client still shows A's card. B's running reports with no agent
+    /// id — under A's card key, and under a fresh key — are attested to B and
+    /// relayed. The client refuses both and keeps A's card as it was; a report
+    /// from B that names B then reaches the client and draws B's card.
+    ///
+    /// This pins a deliberate fail-closed trade rather than a defect: accepting
+    /// an untagged report onto a card of another agent's would reopen the
+    /// late-A-onto-B case `..._cannot_reach_a_successors_client_card` closes,
+    /// and the client has no registry to tell the two directions apart. The
+    /// recovery is a tagged report (`DOT_AGENT_DECK_AGENT_ID` in the agent's
+    /// environment) or a client resynchronisation, as
+    /// `docs/develop/hook-provenance.md` records.
+    #[tokio::test]
+    async fn hook_provenance_audit_current_owner_untagged_report_is_refused_on_a_predecessors_client_card()
+     {
+        const PANE: &str = "audit-owner-pane";
+        const SHARED: &str = "audit-owner-pane-session";
+        const FRESH: &str = "audit-owner-fresh-key";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn(&registry, Some(PANE), "/usr/bin/true");
+        wait_until_nothing_lives(&registry).await;
+        let new = spawn(&registry, Some(PANE), "cat");
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let mut client = AppState::default();
+        client.register_pane(PANE.to_string());
+        client.apply_event(event_of(line(
+            SHARED,
+            Some(PANE),
+            Some(&old),
+            "session_start",
+            None,
+        )));
+
+        for session in [SHARED, FRESH] {
+            ingest_hook_event(
+                &state,
+                &event_tx,
+                &registry,
+                event_of(line(session, Some(PANE), None, "thinking", None)),
+                false,
+                Some(new.clone()),
+            )
+            .await;
+            let mut relayed = 0;
+            while let Ok(message) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = message {
+                    relayed += 1;
+                    assert_eq!(event.attested_owner(), Some(new.as_str()));
+                    client.apply_event(event);
+                }
+            }
+            assert_eq!(
+                relayed, 1,
+                "{session}: the daemon admits the owner's report"
+            );
+            assert_eq!(
+                client
+                    .sessions
+                    .get(SHARED)
+                    .map(|card| (&card.status, card.agent_id.as_deref())),
+                Some((&SessionStatus::Idle, Some(old.as_str()))),
+                "{session}: the client refuses an untagged report onto another \
+                 agent's card, even from the pane's current owner"
+            );
+            assert_eq!(client.sessions.len(), 1, "{session}: no card may be drawn");
+        }
+
+        ingest_hook_event(
+            &state,
+            &event_tx,
+            &registry,
+            event_of(line(SHARED, Some(PANE), Some(&new), "thinking", None)),
+            false,
+            Some(new.clone()),
+        )
+        .await;
+        while let Ok(message) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = message {
+                client.apply_event(event);
+            }
+        }
+        assert!(
+            client.sessions.values().any(|card| {
+                card.agent_id.as_deref() == Some(new.as_str())
+                    && card.status == SessionStatus::Thinking
+            }),
+            "a report naming the owner is the recovery: {:?}",
+            client.sessions
         );
         registry.shutdown_all();
     }
