@@ -7348,6 +7348,46 @@ impl AgentPtyRegistry {
         // Issue #1531: read before the tracker lock, which is never held
         // together with the registry's own (the same order as crediting).
         let occupant = self.pane_current_agent_id(worker_pane_id);
+        let arm = self.arm_delegation_commission_for_occupant(
+            worker_pane_id,
+            orchestrator_pane_id,
+            orchestrator_agent_id,
+            supersede,
+            now,
+            occupant.as_deref(),
+        );
+        // Qodo (#1551): the pane can change hands between that read and the
+        // lock, and a refusal decided for the agent that just left would turn
+        // away its successor. A refusal records nothing, so it is decided once
+        // more, against the agent holding the pane now, when that has changed.
+        if matches!(arm, CommissionArm::Busy { .. }) {
+            let current = self.pane_current_agent_id(worker_pane_id);
+            if current != occupant {
+                return self.arm_delegation_commission_for_occupant(
+                    worker_pane_id,
+                    orchestrator_pane_id,
+                    orchestrator_agent_id,
+                    supersede,
+                    now,
+                    current.as_deref(),
+                );
+            }
+        }
+        arm
+    }
+
+    /// [`Self::arm_delegation_commission_at`] for a known pane occupant,
+    /// `occupant` — the pane's current live agent, read by the caller without
+    /// the tracker lock held.
+    fn arm_delegation_commission_for_occupant(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        orchestrator_agent_id: Option<&str>,
+        supersede: bool,
+        now: Instant,
+        occupant: Option<&str>,
+    ) -> CommissionArm {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
@@ -7361,11 +7401,8 @@ impl AgentPtyRegistry {
         // Without it a live successor in the pane of a worker that exited on
         // its own was refused as busy until `--supersede` or its own first
         // `work-done`.
-        let retired = Self::retire_commissions_of_a_previous_occupant(
-            &mut tracker,
-            worker_pane_id,
-            occupant.as_deref(),
-        );
+        let retired =
+            Self::retire_commissions_of_a_previous_occupant(&mut tracker, worker_pane_id, occupant);
         if retired > 0 {
             tracing::info!(
                 pane_id = %worker_pane_id,

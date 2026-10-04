@@ -1614,7 +1614,8 @@ fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
         );
 
         // ---- THE NATURAL EXIT, NO REPORT --------------------------------------
-        std::fs::write(harness.cwd.path().join(WORKER_EXIT_TRIGGER), b"go\n")
+        tokio::fs::write(harness.cwd.path().join(WORKER_EXIT_TRIGGER), b"go\n")
+            .await
             .expect("release the worker's exit");
         let exited = poll_until(Duration::from_secs(10), || {
             harness.registry.pane_current_agent_id(WORKER_PANE).is_none()
@@ -1626,10 +1627,12 @@ fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
         );
 
         // ---- A SUCCESSOR IN THE SAME PANE, never delegated to ----------------
+        // Off the runtime: `spawn_agent` forks and waits on the PTY synchronously,
+        // and the dispatch tasks this test polls share the runtime (Qodo, #1551).
         let cwd_str = harness.cwd.path().to_string_lossy().to_string();
-        let successor = harness
-            .registry
-            .spawn_agent(SpawnOptions {
+        let registry = std::sync::Arc::clone(&harness.registry);
+        let successor = tokio::task::spawn_blocking(move || {
+            registry.spawn_agent(SpawnOptions {
                 command: Some("cat"),
                 cwd: Some(&cwd_str),
                 env: vec![
@@ -1638,7 +1641,10 @@ fn delegate_050_a_live_successor_in_an_exited_worker_s_pane_is_not_refused_as_bu
                 ],
                 ..SpawnOptions::default()
             })
-            .expect("a successor takes the exited worker's pane id");
+        })
+        .await
+        .expect("the successor spawn task")
+        .expect("a successor takes the exited worker's pane id");
         assert_ne!(successor, first_worker, "the successor is a different agent");
 
         // ---- A DELEGATE TO THE ROLE, WITHOUT --supersede ----------------------
