@@ -5200,6 +5200,7 @@ async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
 
     for (what, cwd) in [("a regular file", &file), ("a missing path", &missing)] {
