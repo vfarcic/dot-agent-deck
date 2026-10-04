@@ -1,4 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
+import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
 import { voicePagesFleet } from "./fixtureCrowded";
 
@@ -44,7 +45,7 @@ export const FIXTURE_UNREACHABLE_DAEMON_ID = "ci@runner-7";
 export const FIXTURE_PENDING_DAEMON_ID = "ops@edge-3";
 
 /** Which scenario `createFixtureFleet` builds; selected by `?state=`. */
-export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages";
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded" | "fleet" | "docs" | "docs-fleet" | "voice-pages" | "docs-question";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -714,6 +715,85 @@ const docsAgents: AgentSession[] = [
   crowdedAgent({ id: "4", displayName: "User-path verification", role: "Open code", cli: "opencode", status: "waiting", cwd: DOCS_CWD, toolCount: 0, upForMinutes: DOCS_UP_MINUTES.verify, quietForMinutes: DOCS_QUIET_MINUTES, lastUserPrompt: "Walk the checkout path and report failures.", tab: { kind: "dashboard" } }),
 ];
 
+/**
+ * PRD #1542 — the docs fleet with the Desktop implementation agent (Codex)
+ * stopped on a command approval, as the daemon would project it: Codex's three
+ * options from its per-version table, answered by keys. Its pane shows the
+ * prompt Codex draws, so the `voice-question` screenshot pairs the question the
+ * voice row answers with the one on screen.
+ */
+const DOCS_QUESTION_COMMAND = "npm install --save-dev msw";
+const DOCS_QUESTION_TRANSCRIPT = [
+  // The pane's first two rows sit under its header in the preview, as the
+  // typing-mode image shows of the docs transcript; keep the prompt below them.
+  "",
+  "",
+  "  Would you like to run the following command?",
+  "",
+  "  Reason: install msw to mock the payments API in tests",
+  "",
+  `  $ ${DOCS_QUESTION_COMMAND}`,
+  "",
+  "\u001b[36m› 1. Yes, proceed (y)\u001b[0m",
+  "  2. Yes, and don't ask again for commands that start with `npm install` (p)",
+  "  3. No, and tell Codex what to do differently (esc)",
+  "",
+  "  Press enter to confirm or esc to cancel",
+].join("\r\n");
+export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
+  id: "q-docs-question",
+  kind: "permission",
+  channel: "keys",
+  questions: [{
+    prompt: "Allow Bash?",
+    multiSelect: false,
+    options: [
+      { index: 1, label: "Yes, proceed", role: "allow_once", answerable: true },
+      { index: 2, label: "Yes, and don't ask again for commands that start with the prefix shown", role: "allow_always", answerable: true, scope: `commands that start with the prefix Codex shows for \`${DOCS_QUESTION_COMMAND}\`` },
+      { index: 3, label: "No, and tell Codex what to do differently", role: "deny", answerable: true },
+    ],
+  }],
+  tool: { name: "Bash", detail: DOCS_QUESTION_COMMAND },
+  answerable: true,
+};
+const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
+  agent.id === "2"
+    ? { ...agent, status: "waiting", activeTool: "Bash", activeToolDetail: DOCS_QUESTION_COMMAND, transcript: DOCS_QUESTION_TRANSCRIPT, pendingQuestion: DOCS_PENDING_QUESTION }
+    : agent,
+);
+
+/**
+ * PRD #1542 — the preview's answer to an utterance said over a pane with a
+ * question waiting. The preview has no Commands model, so it knows the three
+ * replies a permission prompt is given most ("yes" / "go ahead" / "allow it",
+ * "no" / "deny", "always allow") and calls anything else not an answer, which
+ * hands it on to the preview's ordinary vocabulary.
+ */
+export function resolveFixtureQuestion(question: PendingQuestionDto | undefined, utterance: string): QuestionResultDto {
+  const notAnswer: QuestionResultDto = { verdict: { kind: "not_answer" }, resolveMs: null, backend: "fixture" };
+  const said = utterance.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const role = ["yes", "go ahead", "allow it", "allow"].includes(said)
+    ? "allow_once"
+    : ["no", "deny", "deny it"].includes(said)
+      ? "deny"
+      : said === "always allow" ? "allow_always" : undefined;
+  const option = role && question?.questions.length === 1 ? question.questions[0].options.find((candidate) => candidate.role === role && candidate.answerable) : undefined;
+  if (!question || !option) return notAnswer;
+  const what = question.tool?.detail ?? question.tool?.name ?? question.questions[0].prompt;
+  const summary = role === "allow_once" ? `Allow once — ${what}` : role === "deny" ? `Deny — ${what}` : `Always allow — ${option.scope ?? what}`;
+  return {
+    verdict: {
+      kind: "answered",
+      form: [{ questionIndex: 0, optionIndices: [option.index] }],
+      complete: true,
+      ...(role === "allow_always" ? { always: `This will always allow ${option.scope ?? what}. Confirm?` } : {}),
+      summary,
+    },
+    resolveMs: 1,
+    backend: "fixture",
+  };
+}
+
 /** Two answering daemons with synthetic projects and no demo-run paths. */
 function docsFleet(): DeckSnapshot[] {
   const local = createFixtureSnapshot("docs");
@@ -951,17 +1031,17 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
   // asking for one gets the deck the single-deck screens are on — never the
   // disconnected fall-through an unlisted state would otherwise land in.
   if (state === "fleet" || state === "docs-fleet" || state === "voice-pages") return createFixtureFleet(state)[0];
-  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs";
+  const connected = state === "connected" || state === "crowded" || state === "empty" || state === "docs" || state === "docs-question";
   const connection = connected
     ? { status: "connected" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
       ? { status: "error" as const, deckId: FIXTURE_DAEMON_ID, socketPath: FIXTURE_DAEMON_ID, daemonDetected: true, message: "This daemon is older than this app, and the two cannot work together. Update the daemon to this app's version.", detail: "The app speaks protocol 6; the daemon reports protocol 5." }
       : { status: "disconnected" as const, message: "No daemon is listening on the configured socket." };
 
-  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : agents;
+  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : state === "docs" ? docsAgents : state === "docs-question" ? docsQuestionAgents : agents;
   // The docs scenario carries only what its screenshots show, so nothing from
   // the demo run (its worktree, stages, handoffs, evidence) leaks into one.
-  const docs = state === "docs";
+  const docs = state === "docs" || state === "docs-question";
 
   return {
     runId: "run_7f24a",

@@ -19,7 +19,7 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 | **Thinking** | `Thinking` | running | The agent is reasoning before it acts. | Nothing. |
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
-| **Needs Input** | `WaitingForInput` | waiting | The agent is waiting for a permission answer or other input. | Answer it in the pane. In the TUI's command mode, `y` / `n` on the selected card sends approve / deny to a pending permission request. |
+| **Needs Input** | `WaitingForInput` | waiting | The agent is waiting for a permission answer, a choice from a menu, or other input. | Answer it in the pane. In the desktop app you can also [answer it by voice](desktop/voice.md#answering-an-agents-question). In the TUI's command mode, `y` / `n` on the selected card types `y` or `n` into the pane: Codex takes that as approve / deny, while Claude Code and OpenCode ignore it. |
 | **Idle** | `Idle` | waiting | The agent finished its turn and is waiting for a prompt. | Give it the next prompt. |
 | **Error** | `Error` | failed | The agent reported a failure, including a turn its provider rejected for a reason other than a usage limit (an API error, a model the account cannot use). | Read the pane. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
@@ -29,15 +29,20 @@ A newer daemon can report a status this build does not know; the TUI shows it as
 
 ### Which agents report which status
 
-The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports only running (shown as **Thinking**), waiting (**Needs Input**) and finished (**Idle**). Error and Blocked depend on the agent:
+The first five statuses come from each agent's hooks, plugin or extension, and how finely an agent separates them depends on what it reports: Pi's extension, for example, reports only running (shown as **Thinking**), waiting (**Needs Input**) and finished (**Idle**). Error, Blocked and when Needs Input appears depend on the agent:
 
 | Status | Claude Code | Codex | OpenCode | Pi | Devin |
 |---|---|---|---|---|---|
 | **Error** for a failed provider turn | Yes, 2.1.78 or newer | Yes, a few seconds after the failure | Yes | No | No |
 | **Blocked** | Yes, 2.1.78 or newer | Yes | Yes, once OpenCode stops retrying (it shows **Thinking** while it retries) | No | No |
 | A subagent's permission prompt told apart from the main agent's | Yes | Yes | No | No | No |
+| **Needs Input** for a permission prompt | Yes | Yes | Yes | Pi asks none of its own | Yes |
+| **Needs Input** for a multiple-choice question or form | Yes | Yes, in Plan mode | Yes | Yes, for dialogs other Pi extensions show | Unverified |
+| The question and its options known to the deck, so it can be [answered by voice](desktop/voice.md#which-questions-each-agent-can-answer-by-voice) | Yes, 2.1.136 or newer | Yes | Yes | Yes, for dialogs other Pi extensions show | Permission prompts only, untested |
 
 - For Claude Code, Error and Blocked need the `StopFailure` hook, which the deck installs only when `claude --version` reports 2.1.78 or newer. After upgrading Claude Code to 2.1.78 or newer, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- For Claude Code, the question and its options need the `PermissionRequest` hook, which the deck installs only when `claude --version` reports 2.1.136 or newer. Older versions still show **Needs Input**, without the question. After upgrading, run `dot-agent-deck hooks install` (or restart the daemon) to add it.
+- Pi's dialogs are known through behaviour Pi does not document, checked with Pi 0.87.1; a later Pi release may stop it working. Whether Devin reports its multiple-choice questions has not been checked.
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
 - Where a subagent is told apart: when a subagent's permission prompt is abandoned (the subagent stops or fails without it being answered), the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running.
 

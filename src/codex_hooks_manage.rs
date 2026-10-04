@@ -125,7 +125,9 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     // PRD #1542: fires when a turn is interrupted — after a keyboard "No" on
     // Codex's approval prompt [observed on 0.160.0] — so the deck can clear
     // the question that prompt raised. Adding it changes the installed hook
-    // set, which Codex asks the user to review and trust again once.
+    // set; the install trusts it with the deck's other hooks
+    // (`trust_deck_hooks_in`). Whether a Codex session already running when
+    // the set changes asks the user to review it was not measured.
     "Interrupt",
 ];
 

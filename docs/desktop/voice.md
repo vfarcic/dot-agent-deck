@@ -1,6 +1,6 @@
 # Voice Control
 
-The desktop app can be driven by voice: open screens and agents, switch daemons, fill in and submit the New agent dialog, stop agents (after you confirm on screen), and type or dictate into an agent. The TUI has no voice control.
+The desktop app can be driven by voice: open screens and agents, switch daemons, fill in and submit the New agent dialog, stop agents (after you confirm on screen), type or dictate into an agent, and answer the question an agent is waiting on. The TUI has no voice control.
 
 Voice needs two services, set in **Settings → Voice**: **Speech** turns your audio into text, and **Commands** turns that text into one of the app's commands. Read [What is sent where](#what-is-sent-where) before turning it on. Voice understands English: what you say is always transcribed as English, whatever your accent.
 
@@ -36,7 +36,7 @@ What you can do by voice, by screen:
 | Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
 | Dashboard | Open Settings; switch which daemon the app shows; open an agent's pane; open New agent; stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
-| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; [answer the question the agent is waiting on](#answering-an-agents-question) |
 
 While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). A list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
 
@@ -47,6 +47,47 @@ A command that names an agent, such as "stop the planner" or "close the review o
 Nothing is typed or sent, and the app says why, if a confirmation is open, if the pane is showing another tab instead of the agent's terminal, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 **While voice is on, the app keeps the computer from going to sleep from inactivity**, because speaking produces no keyboard or mouse input. The display can still turn off. On Linux this goes through systemd-logind; a desktop environment whose power manager ignores logind may still suspend.
+
+## Answering an agent's question
+
+When an agent stops to ask you something — a permission prompt such as "Allow this command?", a menu of options, or a form of several questions — its card shows **Needs Input** (see [Session statuses](../session-management.md#session-statuses)). Open that agent's [pane](dashboard.md#the-agent-pane) and answer it by voice, saying what you would say to a person:
+
+- **A permission prompt:** "yes", "go ahead" or "allow it" allows it once; "no" or "don't" denies it; "always allow" chooses the agent's "always" option, after you confirm it (below).
+- **A menu:** the option's number or position, such as "option 2" or "the second one", or its words, such as "blue".
+- **A form of several questions:** answer them in any order, in one sentence or several, such as "red for colour and large for size". On a question that takes several answers, name them together: "small and large". Answering a question again replaces your earlier answer. The row at the bottom of the window shows the form filling in, for example *So far — Colour: Red. Still to answer: Sizes.*
+- **An option that asks for your own words**, such as Claude Code's "Type something.": choose it, and the row asks you to *Say the words for “Type something.”*; what you say next is taken as your answer, word for word.
+
+![An agent's pane with Codex asking whether to run npm install --save-dev msw, its three options listed in the pane, and at the bottom of the window the voice row after "yes" was heard: Allow once — npm install --save-dev msw — sending in 5 s, with a Cancel button](/img/voice-question-desktop.png)
+
+Once every question has an answer, the row shows it with a five-second countdown, for example *Allow once — touch notes.txt — sending in 5 s. Say “cancel” to stop.* Say "cancel" or "never mind", or press **Cancel**, to call it off: nothing is sent. Saying another answer before the countdown ends replaces the one shown and starts the countdown again. When the countdown ends, the deck answers the agent and the row says what it sent: *Allowed: touch notes.txt*, *Denied: touch notes.txt*, or *Answered: Colour → Red; Sizes → Small, Large*.
+
+**Always allow.** Choosing an "always" option opens a confirmation, **Always allow?**, that says what it will always allow, for example *This will always allow access to /work/proj from this project. Confirm?* Press **Confirm** or say "confirm", and the countdown starts. Press **Cancel**, close the confirmation, or say "cancel" or "no", and nothing is sent.
+
+Anything you say that is not about the question, such as "open settings", is handled as an ordinary command. While [typing mode](#typing-mode) is on, what you say is typed into the prompt instead: say "type off" first. You can answer only the agent whose pane is on screen, not from the dashboard, so that you can see what you are approving. Answering in the pane with the keyboard works as it always has.
+
+Nothing is sent, and the row says why, when:
+
+- the question was answered, for example with the keyboard, or changed before the answer went: *That question was answered or changed before I could send it — nothing was sent.*
+- you close the pane, open another agent or screen, switch daemons, a confirmation opens, or the agent in the pane is replaced, while the countdown runs;
+- what you said does not match an option: *I couldn't match that to the options: …*, listing what you can say;
+- the option you chose cannot be answered by voice: *“Chat about this” has to be answered by keyboard.*
+- the agent's questions cannot be answered by voice at all: *… 's questions have to be answered by keyboard.*
+- the daemon is older than the app and cannot answer questions: *This deck cannot answer questions by voice — update the deck to use it. Nothing was sent.*
+
+### Which questions each agent can answer by voice
+
+| Agent | By voice | By keyboard only |
+| --- | --- | --- |
+| Claude Code 2.1.136 or newer | Permission prompts: **Yes**, the "always" option, **No**. Multiple-choice questions and forms, including questions with several answers and **Type something.** Plan approval: **Yes, auto-accept edits** and **Yes, manually approve edits**. | **Chat about this**; plan approval's **Tell Claude what to change**; forms from MCP servers; the folder-trust question when Claude Code starts. |
+| Codex | Command approvals: **Yes, proceed**, the "don't ask again" option, **No**. Multiple-choice questions and forms in Plan mode, one answer per question. | **None of the above**; the folder-trust question when Codex starts. |
+| OpenCode | Permission prompts: **Allow once**, **Allow always**, **Reject**. Question menus and forms, including questions with several answers and **Type your own answer**. | — |
+| Pi | Pi asks no questions of its own. The dialogs other Pi extensions show: a choice from a list, a yes-or-no confirmation, and a box to type into. | Other extension dialogs, such as an editor or a custom screen. |
+| Devin | Permission prompts: **Allow once** and deny. **Untested**: built from Devin's documentation and not yet tried with a running Devin. | Every other permission option. |
+
+- **Claude Code older than 2.1.136:** the deck does not know its questions. The card still shows **Needs Input**; answer in the pane. After upgrading Claude Code, run `dot-agent-deck hooks install` (or restart the daemon), then restart Claude Code.
+- **Codex:** its questions reach the deck through the deck's hooks, which have to be installed and trusted ([Codex events not showing](../troubleshooting.md#codex-events-not-showing)). This version of the deck adds one more Codex hook; it is installed and trusted with the others when the daemon starts or when you run `dot-agent-deck hooks install --agent codex`. Restart Codex sessions that were already running.
+- **Pi:** answering rests on behaviour Pi does not document, checked with Pi 0.87.1. A later Pi release may stop it working; its dialogs then have to be answered in the pane.
+- **The labels the app shows for Claude Code's and Codex's permission prompts, and the keys the deck presses to answer Codex,** were checked against Claude Code 2.1.289 and Codex 0.160.0. If a newer release changes those prompts, check the pane before the countdown ends.
 
 ## Filtering directories
 
@@ -142,7 +183,7 @@ A bare "type on" or "type off" always switches typing mode, so it cannot be used
 
 ## Settings → Voice
 
-![Settings → Voice with the default services: Speech on this machine, through a local speech container, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, then Names set to Shared and Max tokens](/img/settings-voice-desktop.png)
+![Settings → Voice with the default services: Speech on this machine, through a local speech container, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, then what Commands sends and Names set to Shared](/img/settings-voice-desktop.png)
 
 | Row | What it sets | Default |
 | --- | --- | --- |
@@ -170,7 +211,8 @@ Keys are stored in your operating system's credential store (the macOS Keychain,
 
 - **To the Speech service:** your audio, the model name and the language (English). With the default local container, it stays on this machine. The OpenAI speech option also sends your Speech key.
 - **To the Commands service, for each utterance it decides:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands (each command's id, description, parameter names and kinds, whether it can run on the current screen, and the hint shown when it cannot). When the endpoint is not on this machine, the request also carries your Commands API key.
-- **Decided on this machine, sending nothing:** an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; and "type on" and "type off" themselves. While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work, handled on this machine. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". Silence sends nothing.
+- **To the Commands service, while the pane on screen has a [question waiting](#answering-an-agents-question):** what you said and the question itself — each question's text and heading, each option's words, description and what an "always" option covers, the tool the question is about with its detail (for example the command the agent wants to run), and the answer you have given so far. This is sent whether **Names** is shared or withheld, because the question cannot be answered without it.
+- **Decided on this machine, sending nothing:** while a question is waiting, an utterance that is exactly one option's words, a position on a one-question menu ("two", "option two"), the words for an option that asks for your own words, or "cancel" or "confirm" while the answer's countdown or confirmation is showing; an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; and "type on" and "type off" themselves. While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work, handled on this machine. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". Silence sends nothing.
 - **With Names shared**, each request also sends the names on screen: each agent on the selected daemon with its name, role, CLI name, status and running tool; each daemon's name, and for a remote daemon with no name its ssh user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. The app adds no filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path.
 - **With Names withheld**, none of those names is sent, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. Your words are still sent as heard.
 
@@ -188,6 +230,8 @@ What went wrong is shown beside the Voice button.
 | A command is refused as not available here | It works on another screen. | Say "what can I say?" to see where each command works. |
 | Commands that name agents or directories never work | **Names** is set to **Withheld**. | Set it to **Shared**, or use the screen instead. |
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
+| "yes" to an agent showing **Needs Input** finds no matching action | The deck does not know that question: the agent or its version is not covered, or its hooks are missing. | Check [which questions each agent can answer](#which-questions-each-agent-can-answer-by-voice), and answer in the pane. |
+| An answer to a question is refused with "has to be answered by keyboard" | That option, or that agent's questions, cannot be answered by voice. | Answer in the pane. |
 | A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
 | "Select daemon 13" chooses nothing and says no daemon shows 13 | The number belongs to another list, such as the directories. | Say that list's name with the number, for example "directory 13". |
 | A name is refused with "is on page 2: say “next page”" | The item is on another page of a list shown in pages. | Turn to that page and say it again, or narrow a directory list with "filter …". |

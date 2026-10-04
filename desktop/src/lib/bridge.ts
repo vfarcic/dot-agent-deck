@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, createFixtureStartedAgent, DEFAULT_PROFILES, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -2347,7 +2347,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
  * reachable from the URL — the previous inline `||` chain had to be edited in
  * lockstep with the fixture and was not.
  */
-const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages"];
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty", "fleet", "docs", "docs-fleet", "voice-pages", "docs-question"];
 
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
@@ -2827,16 +2827,28 @@ class FixtureDeckBridge implements DeckBridge {
     return answerNumberLocally(utterance, heard, generation);
   }
 
-  /** PRD #1542 — the preview's agents wait on no question, so nothing said is an answer. */
-  async resolveVoiceQuestion(): Promise<QuestionResultDto> {
+  /**
+   * PRD #1542 — the question the agent waits on, answered by the preview's
+   * canned replies (`resolveFixtureQuestion`). Only the `docs-question` state
+   * has an agent waiting on one; everywhere else nothing said is an answer.
+   */
+  async resolveVoiceQuestion(target: VoiceQuestionTarget, utterance: string): Promise<QuestionResultDto> {
     await Promise.resolve();
-    return { verdict: { kind: "not_answer" }, resolveMs: null, backend: "fixture" };
+    return resolveFixtureQuestion(this.pendingQuestionOf(target), utterance);
   }
 
-  /** PRD #1542 — and so there is never one to send to. */
-  async sendVoiceAnswer(): Promise<AnswerOutcomeDto> {
+  /** PRD #1542 — the preview answers no agent, so it says so rather than pretending it did. */
+  async sendVoiceAnswer(target: VoiceQuestionTarget): Promise<AnswerOutcomeDto> {
     await Promise.resolve();
-    return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
+    if (this.pendingQuestionOf(target)?.id !== target.questionId) {
+      return { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." };
+    }
+    return { kind: "refused", code: "unsupported", sentence: "The preview cannot answer an agent — nothing was sent." };
+  }
+
+  private pendingQuestionOf(target: VoiceQuestionTarget): PendingQuestionDto | undefined {
+    const deck = this.fleet.find((candidate) => candidate.connection.deckId === target.deckId);
+    return deck?.agents.find((agent) => agent.id === target.agentId)?.pendingQuestion;
   }
 
   /**

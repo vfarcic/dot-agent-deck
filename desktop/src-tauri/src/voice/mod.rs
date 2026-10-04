@@ -582,6 +582,17 @@ pub mod test_support {
         }
     }
 
+    /// PRD #1542: the daemon's pending question as the voice panel sees it,
+    /// through the projection the snapshot takes in production
+    /// (`dto::map_pending_question`). `tests/voice_question_fixtures.rs`
+    /// cannot call that itself because `dto` is private, which is the same
+    /// reason [`agent`] exists.
+    pub fn pending_question(
+        question: &dot_agent_deck::question::PendingQuestion,
+    ) -> crate::dto::DesktopPendingQuestion {
+        crate::dto::map_pending_question(question)
+    }
+
     /// A snapshot agent. Only the fields a spoken reference can reach are
     /// interesting; the rest are what the daemon would have reported.
     pub fn agent(id: &str, display_name: Option<&str>, agent_type: &str) -> DesktopAgent {

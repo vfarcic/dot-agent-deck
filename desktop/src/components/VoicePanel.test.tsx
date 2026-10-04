@@ -231,7 +231,12 @@ describe("VoicePanel", () => {
     // no such field — because a name is arbitrary text and can itself be a
     // path; and the words go with a command that REACHES the endpoint, since
     // the locally decided ones named above send nothing.
-    expect(disclosure).toHaveTextContent("This app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments");
+    expect(disclosure).toHaveTextContent("Apart from a question an agent is waiting on (above), this app adds no field of its own for a filesystem path, a daemon or agent id, prompt text or a tool's arguments");
+    // PRD #1542: a pending question goes with what is said, Names or not, and
+    // for a permission prompt it carries the command — a tool's arguments.
+    expect(disclosure).toHaveTextContent("what you say is first sent with that question");
+    expect(disclosure).toHaveTextContent("usually the command the agent wants to run");
+    expect(disclosure).toHaveTextContent("whether Names is shared or withheld");
     expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
     expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
     expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");

@@ -122,6 +122,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "voice-question",
+        description: "The desktop agent pane with a Codex command approval waiting and \"yes\" heard: the voice row shows the answer, Allow once and the command, with its five-second countdown and Cancel.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "voice-numbers",
         description: "The desktop agent dashboard with voice on: a number before each agent row, one sequence across the daemons, ready to be said or pressed.",
         clients: &[Client::Desktop],
