@@ -695,23 +695,40 @@ describe("voice control panel", () => {
       }
     });
 
-    /// Scenario: dictate a write whose acknowledgement is held and queue a clear behind it, then stop typing before any clear byte is sent. Re-entering typing mode and scratching must remove the original dictated write, just as when no clear was queued.
-    it.each(["cancelled clear", "no clear"] as const)("preserves scratch history after %s before delivery", async (change) => {
-      const { say, write, target } = await startPrompt();
+    /// Scenario: establish a known-empty prompt, dictate two parts and queue clear or interrupt behind the second part's held acknowledgement, then stop typing before any control byte is sent. Re-entering typing mode must allow scratch of the last part and a later clear's Undo must restore the first part, just as without a queued command.
+    it.each(["cancelled clear", "cancelled interrupt", "no command"] as const)("preserves scratch history and clear Undo after %s before delivery", async (change) => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await keyboard("\r");
+      await say("earlier dictated words");
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      write.mockClear();
       const release = holdNextWrite(write);
       await say("kept dictated words");
       if (change === "cancelled clear") await say("clear the prompt");
+      if (change === "cancelled interrupt") await say("interrupt");
       expect(write.mock.calls).toEqual([[target, "kept dictated words "]]);
       fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
       await flush();
       await release();
-      expect(write.mock.calls, "a clear cancelled before delivery sends no clear keys").toEqual([[target, "kept dictated words "]]);
+      expect(write.mock.calls, "a command cancelled before delivery sends no control keys").toEqual([[target, "kept dictated words "]]);
       await say("typing on");
       await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
       write.mockClear();
       await say("scratch that");
-      expect.soft(write.mock.calls, "undelivered clear must preserve the last dictated write for scratch").toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("kept dictated words ".length))]);
+      expect.soft(write.mock.calls, "undelivered command must preserve the last dictated write for scratch").toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("kept dictated words ".length))]);
       expect.soft(report()).toHaveTextContent(/Removed .*kept dictated words.*from Planner's prompt\./);
+      write.mockClear();
+      await say("clear the prompt");
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.clear.bytes.repeat(32))]);
+      const undo = screen.queryByRole("button", { name: "Undo" });
+      expect.soft(undo, "undelivered command must preserve ownership so a later clear offers Undo").toBeInTheDocument();
+      if (undo) {
+        write.mockClear();
+        fireEvent.click(undo);
+        await flush();
+        expect(write.mock.calls, "Undo must restore exactly the earlier part left after scratch").toEqual([guardedWrite(target, "earlier dictated words ")]);
+        expect(report()).toHaveTextContent("Restored Planner's prompt.");
+      }
     });
 
     /// Scenario: a keyboard write holds the real Tauri bridge queue while the panel requests interrupt or clear. Idle or Stop typing before the keyboard write settles cancels the control at transport dispatch, so no stale Escape or clear bytes reach invoke.
@@ -1024,6 +1041,27 @@ describe("voice control panel", () => {
       expect(write.mock.calls).toEqual([guardedWrite(target, chunk), guardedWrite(target, chunk)]);
       expectNoInterruptByte(write);
       expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+    });
+
+    /// Scenario: Claude's first clear batch goes out with its acknowledgement held, then keyboard input edits the draft and send it waits behind the clear. Releasing the batch stops the remaining clear and drops the queued Enter with a failed-write explanation.
+    it("drops queued send after a partially delivered Claude clear is stopped by keyboard input", async () => {
+      const { say, write, target, keyboard } = await startPrompt("claude_code");
+      await say("old voice draft");
+      write.mockClear();
+      const release = holdNextWrite(write);
+      await say("clear the prompt");
+      const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+      const chunk = keys.bytes.repeat(keys.maxPressesPerWrite!);
+      expect(write.mock.calls).toEqual([guardedWrite(target, chunk)]);
+      await keyboard("private input during clear");
+      await say("send it");
+      expect(write.mock.calls, "send must wait behind the in-flight clear").toEqual([guardedWrite(target, chunk), [target, "private input during clear"]]);
+      await release();
+      await act(async () => { await vi.advanceTimersByTimeAsync(keys.pauseBetweenWritesMs! + VOICE_SUBMIT_SETTLE_MS); });
+      await flush();
+      expect.soft(write.mock.calls, "a partially delivered clear must block the queued Enter").toEqual([guardedWrite(target, chunk), [target, "private input during clear"]]);
+      expect.soft(report()).toHaveTextContent(/(?:send|Enter).*(?:dropped|cancelled|canceled|not sent|skipped)|(?:dropped|cancelled|canceled|skipped).*(?:send|Enter)/i);
+      expect.soft(report()).toHaveTextContent(/clear|write/i);
     });
 
     /// Scenario: stop typing by speech, the Stop typing button, or Voice off during Claude's clear pause. No further clear key is written after the user ends typing mode.

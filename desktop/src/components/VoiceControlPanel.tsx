@@ -714,6 +714,19 @@ class PaneMoved extends Error {
   }
 }
 
+/**
+ * PRD #1541 (PR #1558 review) — what a spoken send's wait settles to: every
+ * write landed (`true`), one failed and said so (`false`), or why the send
+ * must be dropped and say so — a prompt command that stopped partway.
+ */
+type WriteOutcome = boolean | string;
+/** PRD #1541 (PR #1558 review) — a prompt command that delivered some of its writes and then stopped; a send waiting behind it drops its Enter. */
+class StoppedPartway extends Error {
+  constructor(readonly why: string) {
+    super(why);
+  }
+}
+
 /** The key one agent's prompt record and terminal writes are kept under. */
 function paneKey(aim: { deckId: string; agentId: string }): string {
   return `${aim.deckId}\u0000${aim.agentId}`;
@@ -1512,8 +1525,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * behind a write that then fails would submit whatever was in the prompt
    * before. A send consumes it, and typing mode's entry and exit clear it, so
    * one failure is not held against every later send.
+   *
+   * PRD #1541 (PR #1558 review) — settled to `true` when all landed, `false`
+   * when one failed and has said so, or the sentence a send dropped behind a
+   * prompt command that stopped partway must explain itself with.
    */
-  const lastWrite = useRef<Promise<boolean> | undefined>(undefined);
+  const lastWrite = useRef<Promise<WriteOutcome> | undefined>(undefined);
   /**
    * PRD #1541 (PR #1558 review) — how many keyboard edits each agent's prompt
    * has had, by {@link paneKey}. A spoken send notes it when said and presses
@@ -1524,9 +1541,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** When the last tracked write landed ({@link VOICE_SUBMIT_SETTLE_MS} counts from it). */
   const lastLanded = useRef(0);
   const trackWrite = useCallback((write: Promise<unknown>) => {
-    const landed = write.then(() => { lastLanded.current = Date.now(); return true; }, () => false);
+    const landed = write.then((): WriteOutcome => { lastLanded.current = Date.now(); return true; }, (cause): WriteOutcome => (cause instanceof StoppedPartway ? cause.why : false));
     const before = lastWrite.current;
-    lastWrite.current = before === undefined ? landed : Promise.all([before, landed]).then(([a, b]) => a && b);
+    lastWrite.current = before === undefined ? landed : Promise.all([before, landed]).then(([a, b]) => (a === true ? b : a));
   }, []);
   /**
    * PRD #1541 — each agent incarnation's write line: everything this panel
@@ -2117,8 +2134,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     };
     void written.then((ok) => {
       if (sendEpoch.current !== epoch) return;
-      if (!ok || stale()) {
+      if (ok !== true || stale()) {
         deferredSubmit.current = false;
+        if (typeof ok === "string" && !stale()) setProblem(`Cancelled the send to ${aim.label} — ${ok}.`);
         return;
       }
       const settle = lastLanded.current + VOICE_SUBMIT_SETTLE_MS - Date.now();
@@ -3333,8 +3351,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     writes: () => AsyncGenerator<string | number, void, void>,
     done: () => string,
     stopped: (why: string) => string,
-    after?: { onDone?: () => void; onFail?: (cause: unknown) => void; holds?: () => string | undefined },
+    after?: { onDone?: () => void; onFail?: (cause: unknown) => void; holds?: () => string | undefined; partway?: string },
   ) => {
+    let delivered = 0;
     const check = () => {
       if (modeGeneration.current !== run.generation) return "typing mode ended";
       const lost = contextLost(run.declared, current(), { pane: run.aim });
@@ -3346,14 +3365,21 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         const why = check();
         if (why !== undefined) throw new PaneMoved(why);
         if (typeof step === "number") await sleep(step);
-        else await guardedSend(run.aim, step, check).done;
+        else {
+          await guardedSend(run.aim, step, check).done;
+          delivered += 1;
+        }
       }
       after?.onDone?.();
     });
     /* A spoken send waits for it, but its outcome is its own (PR #1558
-       review): a command called off or failed reports itself, and must not
-       make a later send drop its Enter as if a dictated write had failed. */
-    trackWrite(command.catch(() => undefined));
+       review): a command called off or failed before any of its writes went
+       out reports itself, and must not make a later send drop its Enter as if
+       a dictated write had failed. One that stopped partway left the prompt
+       half-changed, so the send drops its Enter and says why. */
+    trackWrite(command.catch(() => {
+      if (delivered > 0) throw new StoppedPartway(after?.partway ?? "a prompt command stopped partway through its writes");
+    }));
     void command.then(
       () => { if (reportGeneration.current === run.reported) setProblem(done()); },
       (cause) => {
@@ -3377,7 +3403,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * evidenced ({@link PromptRecord}'s `interrupt`), and never within
    * {@link VOICE_INTERRUPT_REPEAT_MS} of the delivery. An interrupt ends what
    * voice knows about the prompt, because an agent may hand an interrupted
-   * prompt back.
+   * prompt back — unless its first key never went out, which leaves the
+   * prompt, and so its record, as it was (PR #1558 review).
    */
   const interruptAgent = useCallback((target: VoiceDispatchTarget) => {
     const run = promptCommand(target, "interrupt");
@@ -3398,7 +3425,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const { record, aim, label } = run;
     /* The turn this interrupt was said for. */
     const epoch = record.epoch;
+    const forgotten = { writes: record.writes, whole: record.whole, why: record.why };
     emptyRecord(record, false, PROMPT_EMPTIED.interrupted);
+    const revision = record.revision;
     const steps = run.keys.interrupt;
     const working = () => {
       const shown = paneRef.current;
@@ -3431,8 +3460,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (latch?.at === undefined && record.epoch !== epoch) return `${label} started something new before the interrupt could be sent`;
         return undefined;
       },
-      /* The first key never went out: nothing was interrupted, so nothing latches. */
-      onFail: () => { if (latch?.at === undefined && record.interrupt === latch) record.interrupt = before; },
+      partway: `the interrupt to ${label} stopped partway`,
+      /* The first key never went out: nothing was interrupted, so nothing
+         latches, and the prompt is as it was, so its record is too — at a
+         new revision, as for a clear called off before its first key. */
+      onFail: (cause) => {
+        if (latch?.at !== undefined) return;
+        if (record.interrupt === latch) record.interrupt = before;
+        if (!(cause instanceof PaneMoved) || record.revision !== revision) return;
+        emptyRecord(record, forgotten.whole, forgotten.why);
+        record.writes = forgotten.writes;
+      },
     });
   }, [promptCommand, reportRefused, runPromptCommand]);
 
@@ -3543,6 +3581,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       return sentence;
     }, (why) => `Stopped clearing ${run.label}'s prompt — ${why}.`, {
+      partway: `clearing ${run.label}'s prompt stopped partway through its writes`,
       holds: () => (record.revision === revision ? undefined : PROMPT_CHANGED_WHILE_CLEARING),
       /* Cleared within its reach, with nothing else written in between: the
          prompt is empty, and known to be. */
