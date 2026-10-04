@@ -3111,8 +3111,9 @@ export class TauriDeckBridge implements DeckBridge {
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
   /**
-   * The tail of each terminal's input queue, by the same composite key as
-   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   * The tail of each terminal session's input queue, by the `sessionId` of the
+   * session the input was accepted for. See {@link sendTerminalInput} for why
+   * input is queued, and why per session rather than per agent.
    */
   private inputTails = new Map<string, Promise<void>>();
   /**
@@ -4504,6 +4505,13 @@ export class TauriDeckBridge implements DeckBridge {
    * longer exists, and it rejects as not attached rather than landing in the
    * replacement.
    *
+   * PRD #1541 — the queue is the accepted SESSION's, not the agent's: a chunk
+   * waits only for earlier chunks accepted for the same session. A session
+   * whose last write never settles therefore holds back only the chunks typed
+   * into it — which reject as not attached once their turn comes — and never
+   * the session that replaced it. A re-attach that is handed the same
+   * `sessionId` back shares that session's queue, so its order is kept.
+   *
    * PRD #1541 — a chunk with a `precondition` asks it when its turn comes,
    * after the previous chunk settled and before `desktop_terminal_write` is
    * invoked; a false answer rejects it with {@link TerminalInputCancelled} and
@@ -4514,7 +4522,8 @@ export class TauriDeckBridge implements DeckBridge {
     const accepted = this.sessions.get(key);
     const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
     if (!accepted) throw notAttached();
-    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const queue = accepted.result.sessionId;
+    const previous = this.inputTails.get(queue) ?? Promise.resolve();
     const write = previous.then(async () => {
       const invoke = await this.getInvoke();
       if (this.sessions.get(key) !== accepted) throw notAttached();
@@ -4522,9 +4531,9 @@ export class TauriDeckBridge implements DeckBridge {
       await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
     });
     const tail = write.catch(() => undefined);
-    this.inputTails.set(key, tail);
+    this.inputTails.set(queue, tail);
     void tail.then(() => {
-      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+      if (this.inputTails.get(queue) === tail) this.inputTails.delete(queue);
     });
     return write;
   }

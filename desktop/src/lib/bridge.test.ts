@@ -2559,13 +2559,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
-   * Scenario: a keystroke is still queued behind a slow write when the daemon
-   * ends that terminal's session, and the pane reattaches before the queue
-   * reaches it. The queued keystroke was typed into the OLD attachment and must
-   * never be written through the new one — it rejects as not attached, and the
-   * replacement session only ever receives what was typed after it existed.
-   * (Review finding on #953's input queue: it used to look the session up when
-   * the write ran rather than when the keystroke was accepted.)
+   * Scenario: a keyboard write and guarded Escape are queued behind an unresolved
+   * old-session write when the daemon ends that session and the pane reattaches.
+   * Fresh keyboard input invokes through the new session without waiting for the
+   * old acknowledgement. The obsolete keyboard write and control reject without
+   * crossing into the replacement, including after the old write finally settles.
    */
   it("never writes a keystroke queued for an ended session through the session that replaced it", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -2589,6 +2587,9 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     const slow = bridge.sendTerminalInput(on("agent-1"), "a");
     const queued = bridge.sendTerminalInput(on("agent-1"), "b");
     queued.catch(() => undefined);
+    const precondition = vi.fn(() => true);
+    const obsoleteControl = bridge.sendTerminalInput(on("agent-1"), "\x1b", precondition);
+    obsoleteControl.catch(() => undefined);
     await vi.waitFor(() => expect(release).toBeDefined());
 
     listeners.get("desktop://terminal-state")?.({
@@ -2599,14 +2600,26 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await settle();
     const reattachGeneration = attachCalls().length;
 
-    release?.();
-    await slow;
-    await expect(queued).rejects.toThrow(/not attached/);
-    const writesToReplacement = invoke.mock.calls.filter(
-      ([command, args]) => command === "desktop_terminal_write" && args.sessionId === `session-agent-1-${reattachGeneration}`,
-    );
-    expect(writesToReplacement).toEqual([]);
-    await bridge.dispose();
+    const fresh = bridge.sendTerminalInput(on("agent-1"), "fresh");
+    try {
+      await settle();
+      const replacementWrites = () => invoke.mock.calls.filter(
+        ([command, args]) => command === "desktop_terminal_write" && args.sessionId === `session-agent-1-${reattachGeneration}`,
+      );
+      expect(replacementWrites(), "new session input must invoke without waiting for the old session's unresolved write").toEqual([
+        ["desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [102, 114, 101, 115, 104] }],
+      ]);
+      await fresh;
+      expect(precondition, "obsolete control must not evaluate its guard or cross into the replacement").not.toHaveBeenCalled();
+    } finally {
+      release?.();
+      await slow;
+      await expect(queued).rejects.toThrow(/not attached/);
+      await expect(obsoleteControl).rejects.toThrow(/not attached/);
+      await fresh;
+      expect(invoke.mock.calls.filter(([command, args]) => command === "desktop_terminal_write" && args.data.includes(27)), "obsolete queued Escape must never reach either session").toEqual([]);
+      await bridge.dispose();
+    }
   });
 
   /**

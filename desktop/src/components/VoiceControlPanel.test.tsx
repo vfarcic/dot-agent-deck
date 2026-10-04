@@ -447,13 +447,54 @@ describe("voice control panel", () => {
         };
         view.rerender(<DeckShell runtime={{ ...deck, snapshot: next, fleet: [next] }} />);
       };
-      return { ...view, voice, resolveVoice, write, target, say, keyboard, updatePlanner, changeDeck };
+      const setAgents = (agents: AgentSession[]) => {
+        const next = { ...deck.snapshot, agents };
+        deck.snapshot = next;
+        deck.fleet = [next];
+        view.rerender(<DeckShell runtime={{ ...deck }} />);
+      };
+      return { ...view, voice, resolveVoice, write, target, say, keyboard, updatePlanner, changeDeck, setAgents, agents: snapshot.agents };
     }
 
     function report() { return screen.getByTestId("voice-report"); }
     /** Control writes, including Undo restoration, must carry a send-time guard. */
     function guardedWrite(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], data: string) {
       return [target, data, expect.any(Function)];
+    }
+    /** Wrap the real bridge FIFO and hold only its first keyboard acknowledgement. */
+    async function realInputQueue(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
+      let release!: () => void;
+      terminalInvoke.mockReset();
+      terminalInvoke.mockImplementation((command: string, args?: { data?: number[] }) => {
+        if (command === "desktop_bootstrap") return Promise.resolve({
+          connection: { status: "connected", deckId: target.deckId, deckKind: "local", socketPath: "/tmp/deck.sock", clientProtocolVersion: 6, serverProtocolVersion: 6, clientBuildVersion: "test", daemonBuildVersion: "test", runningAgentCount: 1 },
+          agents: [{ id: "planner", paneId: "pane-planner", displayName: "Planner", rows: 32, cols: 120, agentType: "codex", status: "working", toolCount: 0, tab: { kind: "orchestration", name: "test", roleIndex: 0, roleName: "planner", isStartRole: false, displayTitle: "test" } }],
+          protocolVersion: 6, source: "daemon",
+        });
+        if (command === "desktop_terminal_attach") return Promise.resolve({ sessionId: "voice-session", agentId: "planner", generation: 1, reused: false });
+        if (command === "desktop_terminal_write" && args?.data?.length === 1 && args.data[0] === 107) {
+          return new Promise<void>((resolve) => { release = resolve; });
+        }
+        return Promise.resolve({ ok: true });
+      });
+      const { TauriDeckBridge } = await import("../lib/bridge");
+      const bridge = new TauriDeckBridge();
+      await bridge.subscribe(vi.fn(), vi.fn());
+      await bridge.connect();
+      await bridge.setShownTerminals([target]);
+      write.mockImplementation(bridge.sendTerminalInput.bind(bridge));
+      return {
+        bridge,
+        release: async () => {
+          expect(release, "keyboard input must hold the real bridge queue").toBeTypeOf("function");
+          await act(async () => { release(); });
+          await flush();
+          await Promise.all(write.mock.results.map((entry) => Promise.resolve(entry.value).catch(() => undefined)));
+          await flush();
+        },
+        delivered: () => terminalInvoke.mock.calls.filter(([command]) => command === "desktop_terminal_write").map(([, args]) => args.data as number[]),
+        dispose: async () => { release?.(); await bridge.dispose(); },
+      };
     }
     /** Hold one transport acknowledgement so later prompt commands genuinely wait. */
     function holdNextWrite(write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
@@ -654,6 +695,32 @@ describe("voice control panel", () => {
       }
     });
 
+    /// Scenario: keyboard input holds the real bridge queue while interrupt is armed, then the desktop observes idle followed by fresh work before dispatch. The obsolete Escape is cancelled with a new-work explanation, and a later interrupt is evaluated fresh.
+    it("cancels real bridge queued interrupt across an observed new turn", async () => {
+      const { say, write, target, keyboard, updatePlanner } = await startPrompt();
+      const queue = await realInputQueue(target, write);
+      try {
+        await keyboard("k");
+        await say("interrupt");
+        expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b")]);
+        expect(queue.delivered()).toEqual([[107]]);
+        updatePlanner({ turn: "idle" });
+        await flush();
+        updatePlanner({ turn: "working" });
+        await flush();
+        await queue.release();
+        expect(queue.delivered(), "first Escape armed for an obsolete turn must never reach invoke").toEqual([[107]]);
+        expect(report()).toHaveTextContent(/started.*(new|something)|new.*(turn|work).*before/i);
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_001); });
+        await say("interrupt");
+        expect(queue.delivered(), "cancelled interrupt must restore the prior latch so a fresh request can run").toEqual([[107], [27]]);
+        expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b"), guardedWrite(target, "\x1b")]);
+        expect(report()).toHaveTextContent("Interrupted Planner.");
+      } finally {
+        await queue.dispose();
+      }
+    });
+
     /// Scenario: OpenCode stops working during the pause after the first Escape. The second Escape is cancelled and the outcome row says the interrupt stopped.
     it("stops OpenCode interrupt when the turn ends between steps", async () => {
       const { say, write, target, updatePlanner } = await startPrompt("open_code");
@@ -746,6 +813,72 @@ describe("voice control panel", () => {
       await say("interrupt");
       expect(write.mock.calls.map(([, data]) => data), "replacement must have a fresh command line and reservation").toEqual(["old incarnation draft ", "\x1b"]);
       expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /// Scenario: repeatedly replace an incarnation with a stalled dictated write and a queued clear. The final incarnation starts with a fresh history, can scratch its short new dictation, and releasing retired writes never delivers their queued clears.
+    it("starts fresh scratch history after repeatedly replacing stalled incarnations", async () => {
+      const { say, write, target, updatePlanner } = await startPrompt();
+      const releases: Array<() => void> = [];
+      try {
+        for (let incarnation = 0; incarnation < 12; incarnation += 1) {
+          write.mockImplementationOnce(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+          await say(`retired draft ${incarnation}`);
+          await say("clear the prompt");
+          updatePlanner({ spawnedAtMs: 200 + incarnation, turn: "working" });
+          await flush();
+          await say("typing on");
+        }
+        write.mockClear();
+        await say("fresh words");
+        expect(write.mock.calls).toEqual([[target, "fresh words "]]);
+        write.mockClear();
+        await say("scratch that");
+        expect(write.mock.calls, `retired pending histories must not contaminate the fresh incarnation; row: ${report().textContent}`).toEqual([
+          guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("fresh words ".length)),
+        ]);
+        expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
+      } finally {
+        await act(async () => { releases.forEach((release) => release()); });
+        await flush();
+        expect(write.mock.calls.some(([, data]) => data.includes("\x15")), "retiring an index must not authorize a late clear from an old incarnation").toBe(false);
+      }
+    });
+
+    /// Scenario: create and retire twelve distinct panes after each receives an oversized keyboard draft. Recreating the last pane as a new incarnation must allow scratch of its fresh short dictation instead of inheriting the retired pane's burst history.
+    it("starts fresh scratch history after creating and removing many distinct panes", async () => {
+      const { say, write, target, setAgents, agents } = await startPrompt();
+      const planner = agents.find((agent) => agent.id === "planner")!;
+      const others = agents.filter((agent) => agent.id !== "planner");
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      setAgents(others);
+      await flush();
+      for (let index = 0; index < 12; index += 1) {
+        const pane = { ...planner, id: `retired-${index}`, paneId: `pane-retired-${index}`, spawnedAtMs: 200 + index };
+        setAgents([...others, pane]);
+        await flush();
+        fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+        await say("typing on");
+        const input = within(screen.getByTestId("agent-pane-overlay")).getByRole("textbox", { name: "Planner terminal input" });
+        fireEvent.input(input, { target: { value: "a".repeat(1_000) } });
+        await flush();
+        expect(write).toHaveBeenLastCalledWith({ ...target, agentId: pane.id }, "a".repeat(1_000));
+        fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+        setAgents(others);
+        await flush();
+      }
+      const fresh = { ...planner, id: "retired-11", paneId: "pane-retired-11", spawnedAtMs: 1_000 };
+      setAgents([...others, fresh]);
+      await flush();
+      fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+      await say("typing on");
+      await say("fresh words");
+      expect(write).toHaveBeenLastCalledWith({ ...target, agentId: fresh.id }, "fresh words ");
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls, `removed pane history must not contaminate a recreated pane; row: ${report().textContent}`).toEqual([
+        guardedWrite({ ...target, agentId: fresh.id }, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("fresh words ".length)),
+      ]);
+      expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
     });
 
     /// Scenario: queue interrupt for a turn that ends without receiving Escape, then observe fresh work. The cancelled request creates no delivery timestamp and the new interrupt can run immediately.
@@ -968,6 +1101,32 @@ describe("voice control panel", () => {
       expect(write).not.toHaveBeenCalled();
       expect(report()).toHaveTextContent(/scratch|remove/i);
       expect(report()).toHaveTextContent(/cannot|can't|too long|safely|unsafe|collapsed/i);
+    });
+
+    /// Scenario: queue an oversized keyboard prefix, 255 small keyboard writes and a short dictated tail behind a held real bridge write, overflowing the 256-entry history. A delayed drain must not certify that truncated burst as safe to scratch or invoke any deletion bytes.
+    it("refuses scratch after real bridge delayed drain evicts an unresolved oversized prefix", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      const queue = await realInputQueue(target, write);
+      try {
+        await keyboard("k");
+        await keyboard("a".repeat(1_000));
+        for (let index = 0; index < 255; index += 1) await keyboard("q");
+        await say("b".repeat(299));
+        expect(write.mock.calls).toHaveLength(258);
+        expect(queue.delivered(), "all subsequent writes must still be queued behind the held predecessor").toEqual([[107]]);
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+        await queue.release();
+        expect(queue.delivered()).toHaveLength(258);
+        expect(queue.delivered().at(-1)).toEqual(Array.from(new TextEncoder().encode(`${"b".repeat(299)} `)));
+        write.mockClear();
+        await say("scratch that");
+        expect(queue.delivered().filter((data) => data.includes(127)).map((data) => data.length), "evicted unresolved oversized prefix must prevent any DEL invoke").toEqual([]);
+        expect(write, "truncated burst must refuse scratch before accepting a guarded deletion").not.toHaveBeenCalled();
+        expect(report()).toHaveTextContent(/cannot|can't/i);
+        expect(report()).toHaveTextContent(/safe|paste|together|arrived/i);
+      } finally {
+        await queue.dispose();
+      }
     });
 
     /** Scenario: a write exactly at the eight-hundred-character floor still has a literal deletion count. Scratch accepts it including the final space. */

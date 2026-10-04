@@ -89,7 +89,7 @@ import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type Voice
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
 import type { VoicePaneAgent } from "../lib/promptKeys";
-import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
+import { desktopFeaturesOf, type DeckFleet, type DeckRuntimeState } from "../types";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -585,14 +585,18 @@ const PROMPT_EMPTIED = {
  * run of these to tell whether the agent may have read the write it would
  * remove together with the input before it ({@link scratchCollapse}).
  */
-type PaneWrite = { chars: number; landedAt?: number };
+type PaneWrite = { chars: number; landedAt?: number; evicted?: boolean };
 /**
- * PRD #1541 — the recent writes into one agent's terminal, oldest first, and
- * when the newest write dropped off the front of the list settled — so a run
- * that reaches past what is kept is known to, rather than assumed not to.
+ * PRD #1541 — the recent writes into one incarnation of an agent's terminal
+ * (`spawnedAtMs`), oldest first, and the boundary of what dropped off the
+ * front of the list: when the latest of those writes settled
+ * (`droppedLandedAt`), and how many of them have not settled yet
+ * (`droppedInFlight`). While any has not, the boundary is unknown — a write
+ * still on its way can land after everything kept — so a run that reaches
+ * past what is kept is known to, rather than assumed not to.
  */
-type PaneWrites = { writes: PaneWrite[]; droppedLandedAt?: number };
-/** How many writes {@link PaneWrites} keeps per agent. */
+type PaneWrites = { writes: PaneWrite[]; droppedLandedAt?: number; droppedInFlight: number; spawnedAtMs?: number };
+/** How many writes {@link PaneWrites} keeps per agent incarnation. */
 const PANE_WRITES_KEPT = 256;
 
 /** PRD #1541 — one voice write into a prompt: its text, and the terminal write that carried it. */
@@ -635,6 +639,16 @@ type PromptRecord = {
    * may name the turn that was already interrupted.
    */
   interrupt?: { at?: number; latched: boolean; sawIdle: boolean };
+  /**
+   * The pane's turn epoch: a new value whenever a new turn is evidenced here —
+   * a send seen (voice's Enter or the user's own), or the turn seen working
+   * again after it was seen not working (`turn` is the last turn seen). An
+   * interrupt captures it when it is said, and its first key goes out only
+   * while it is unchanged, so an interrupt meant for one turn is never
+   * delivered into the next.
+   */
+  epoch: number;
+  turn?: string;
 };
 
 let promptRevisions = 0;
@@ -708,14 +722,15 @@ function scratchRefusal(write: string, limit: number): string | undefined {
  * {@link VOICE_SUBMIT_SETTLE_MS} after the one before it. Refused when that
  * run, from its start through `last`, is over `limit` characters, or when its
  * size cannot be told: a write in it still in flight, or a run that reaches
- * past the writes {@link PaneWrites} keeps.
+ * past the writes {@link PaneWrites} keeps, or while a write dropped off the
+ * front of those has not settled (its boundary is then unknown).
  */
 function scratchCollapse(history: PaneWrites | undefined, last: PromptWrite, limit: number): string | undefined {
   const together = `Cannot scratch that — ${quoted(last.text)} followed other input so closely that the agent may have read them together as one paste, so it cannot safely tell what to remove.`;
   const unknown = `Cannot scratch that — the input around ${quoted(last.text)} has not all arrived yet, so it is not safe to tell whether the agent read it together as one paste.`;
   const writes = history?.writes ?? [];
   let index = writes.lastIndexOf(last.sent);
-  if (index < 0) return unknown;
+  if (index < 0 || (history?.droppedInFlight ?? 0) > 0) return unknown;
   let chars = 0;
   let next: PaneWrite | undefined;
   for (; index >= 0; index -= 1) {
@@ -1182,6 +1197,14 @@ interface VoiceControlPanelProps {
    * or stops taking input.
    */
   pane?: VoicePane;
+  /**
+   * PRD #1541 — every deck the host observes, with its agents. What the panel
+   * keeps per agent — its write line, its terminal-write history, its prompt
+   * record — is let go when the agent leaves its deck or is replaced
+   * ({@link VoiceControlPanel}'s fleet effect). Optional: a panel rendered
+   * without a host keeps them for as long as it is mounted.
+   */
+  fleet?: DeckFleet;
   /** PRD #1260 — the selected deck, whose change ends the dictation mode. */
   selectedDeckId?: string;
   /**
@@ -1269,7 +1292,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1469,7 +1492,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * by the second. Dictated writes do not otherwise wait for each other, which
    * is how typing mode has always written them.
    */
-  const paneLines = useRef(new Map<string, { tail: Promise<void>; inflight: number; commands: number }>());
+  const paneLines = useRef(new Map<string, { tail: Promise<void>; inflight: number; commands: number; pane: string; spawnedAtMs?: number }>());
   /** The host's view of the pane and the deck, for the entry check. */
   const paneRef = useRef(pane);
   paneRef.current = pane;
@@ -1484,10 +1507,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * does not hand that stuck line to its replacement.
    */
   const onPane = useCallback((aim: AgentAddress, kind: "write" | "command", write: () => Promise<void>): Promise<void> => {
-    const key = lineKey(aim, incarnationOf(aim));
+    const spawnedAtMs = incarnationOf(aim);
+    const key = lineKey(aim, spawnedAtMs);
     let line = paneLines.current.get(key);
     if (!line) {
-      line = { tail: Promise.resolve(), inflight: 0, commands: 0 };
+      line = { tail: Promise.resolve(), inflight: 0, commands: 0, pane: paneKey(aim), spawnedAtMs };
       paneLines.current.set(key, line);
     }
     const waits = kind === "command" ? line.inflight > 0 : line.commands > 0;
@@ -1510,35 +1534,47 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * that nothing which empties the record forgets them ({@link scratchCollapse}).
    */
   const paneWrites = useRef(new Map<string, PaneWrites>());
-  /** Note a write of `chars` characters handed to `aim`'s terminal, settling with `sent`. A write called off before it went out is forgotten. */
+  /**
+   * Note a write of `chars` characters handed to `aim`'s terminal, settling
+   * with `sent`. A write called off before it went out is forgotten. A write
+   * to an incarnation other than the one the kept history is for starts a
+   * history of its own: what was written to the agent it replaced cannot be
+   * read together with it.
+   */
   const notePaneWrite = useCallback((aim: AgentAddress, chars: number, sent: Promise<unknown>): PaneWrite => {
     const key = paneKey(aim);
+    const spawnedAtMs = incarnationOf(aim);
     let history = paneWrites.current.get(key);
-    if (!history) {
-      history = { writes: [] };
+    if (!history || incarnationsDiffer(history.spawnedAtMs, spawnedAtMs)) {
+      history = { writes: [], droppedInFlight: 0, spawnedAtMs };
       paneWrites.current.set(key, history);
     }
+    history.spawnedAtMs ??= spawnedAtMs;
     const entry: PaneWrite = { chars };
     const kept = history;
     kept.writes.push(entry);
     while (kept.writes.length > PANE_WRITES_KEPT) {
-      const dropped = kept.writes.shift();
-      /* One still in flight is taken as settling now: later than it can have. */
-      kept.droppedLandedAt = dropped?.landedAt ?? Date.now();
+      const dropped = kept.writes.shift()!;
+      /* One still in flight leaves the boundary unknown until it settles —
+         never a guess at when it will. */
+      if (dropped.landedAt === undefined) {
+        dropped.evicted = true;
+        kept.droppedInFlight += 1;
+      } else kept.droppedLandedAt = Math.max(kept.droppedLandedAt ?? dropped.landedAt, dropped.landedAt);
     }
-    void sent.then(
-      () => { entry.landedAt = Date.now(); },
-      (cause) => {
-        if (!(cause instanceof TerminalInputCancelled)) {
-          entry.landedAt = Date.now();
-          return;
-        }
+    const settled = (landed: boolean) => {
+      if (landed) entry.landedAt = Date.now();
+      if (entry.evicted) {
+        kept.droppedInFlight -= 1;
+        if (entry.landedAt !== undefined) kept.droppedLandedAt = Math.max(kept.droppedLandedAt ?? entry.landedAt, entry.landedAt);
+      } else if (!landed) {
         const at = kept.writes.indexOf(entry);
         if (at >= 0) kept.writes.splice(at, 1);
-      },
-    );
+      }
+    };
+    void sent.then(() => settled(true), (cause) => settled(!(cause instanceof TerminalInputCancelled)));
     return entry;
-  }, []);
+  }, [incarnationOf]);
   /**
    * PRD #1541 — hand one prompt-command write to `aim`'s terminal, guarded by
    * `check` at the last moment the app controls: immediately before the
@@ -1570,7 +1606,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       was.spawnedAtMs ??= spawnedAtMs;
       return was;
     }
-    const fresh: PromptRecord = { writes: [], whole: false, why: was ? PROMPT_EMPTIED.replaced : PROMPT_EMPTIED.fresh, spawnedAtMs, revision: nextRevision() };
+    const shown = paneRef.current;
+    const fresh: PromptRecord = {
+      writes: [],
+      whole: false,
+      why: was ? PROMPT_EMPTIED.replaced : PROMPT_EMPTIED.fresh,
+      spawnedAtMs,
+      revision: nextRevision(),
+      epoch: 0,
+      turn: shows(shown, aim) && !incarnationsDiffer(shown.spawnedAtMs, spawnedAtMs) ? shown.turn : undefined,
+    };
     prompts.current.set(key, fresh);
     return fresh;
   }, []);
@@ -1605,8 +1650,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * no longer latches the next one (the repeat floor still applies).
    */
   const noteSent = useCallback((aim: AgentAddress) => {
-    const interrupted = promptFor(aim, incarnationOf(aim)).interrupt;
-    if (interrupted) interrupted.latched = false;
+    const record = promptFor(aim, incarnationOf(aim));
+    record.epoch += 1;
+    if (record.interrupt) record.interrupt.latched = false;
   }, [incarnationOf, promptFor]);
   const selectedDeckRef = useRef(selectedDeckId);
   selectedDeckRef.current = selectedDeckId;
@@ -3284,6 +3330,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     const { record, aim, label } = run;
+    /* The turn this interrupt was said for. */
+    const epoch = record.epoch;
     emptyRecord(record, false, PROMPT_EMPTIED.interrupted);
     const steps = run.keys.interrupt;
     const working = () => {
@@ -3310,7 +3358,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (index < steps.length - 1 && step.pauseAfterMs > 0) yield step.pauseAfterMs;
       }
     }, () => `Interrupted ${label}.`, (why) => `Stopped interrupting ${label} — ${why}.`, {
-      holds: () => (working() ? undefined : `${label} is not working on anything anymore`),
+      holds: () => {
+        if (!working()) return `${label} is not working on anything anymore`;
+        /* Until the first key is delivered: a new turn seen since the
+           interrupt was said is not the turn it was meant for. */
+        if (latch?.at === undefined && record.epoch !== epoch) return `${label} started something new before the interrupt could be sent`;
+        return undefined;
+      },
       /* The first key never went out: nothing was interrupted, so nothing latches. */
       onFail: () => { if (latch?.at === undefined && record.interrupt === latch) record.interrupt = before; },
     });
@@ -3474,18 +3528,71 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     } else resetPrompt(target, false, PROMPT_EMPTIED.keyboard);
   }, [notePaneWrite, noteSent, resetPrompt]);
 
-  /* PRD #1541 — the open agent's turn seen stopped and then working again
-     after an interrupt was delivered is evidence of a new turn, which
-     releases that interrupt's latch. */
+  /* PRD #1541 — the open agent's turn seen stopped and then working again is
+     evidence of a new turn: it moves the record's turn epoch, and after an
+     interrupt it releases that interrupt's latch. */
   const paneTurn = pane?.turn;
   useEffect(() => {
     const shown = paneRef.current;
     if (!shown) return;
-    const interrupted = prompts.current.get(paneKey(shown))?.interrupt;
+    const record = prompts.current.get(paneKey(shown));
+    if (record && !incarnationsDiffer(record.spawnedAtMs, shown.spawnedAtMs)) {
+      if (paneTurn === "working" && record.turn !== undefined && record.turn !== "working") record.epoch += 1;
+      record.turn = paneTurn;
+    }
+    const interrupted = record?.interrupt;
     if (!interrupted?.latched) return;
     if (paneTurn !== "working") interrupted.sawIdle = true;
     else if (interrupted.sawIdle) interrupted.latched = false;
   }, [paneDeckId, paneAgentId, paneSpawnedAtMs, paneTurn]);
+  /*
+    PRD #1541 — let go of what is kept for agents the fleet no longer has
+    (retired: gone from its deck, or its deck gone) and for incarnations it
+    shows replaced, on every fleet update. Each index is let go only
+    once nothing can be authorized by forgetting it: what is still outstanding
+    keeps its own guards, which close over the operation and not over these
+    maps.
+
+    - A write line is dropped when its incarnation is replaced, even with
+      writes still stuck on it: a command for the replacement runs on a line of
+      its own anyway, and each stuck write is still held to the pane it was
+      said for. A retired agent's line goes when its last write settles, as
+      every line does — a stuck write to an agent that left keeps its line.
+    - A terminal-write history is dropped when its incarnation is replaced, and
+      when its agent is retired once it is quiet: nothing in flight, nothing
+      dropped off its front still in flight, and its newest write settled at
+      least VOICE_SUBMIT_SETTLE_MS ago — from then on an empty history answers
+      every "scratch that" the same way, even if the same agent comes back.
+    - A retired agent's prompt record is moved to a new revision and epoch,
+      so every command or Undo still holding it is called off, and dropped —
+      unless it is still latched by an interrupt, which forgetting would let a
+      second interrupt past. A replaced incarnation's record is replaced by
+      the next one ({@link promptFor}), one per agent the fleet has.
+  */
+  useEffect(() => {
+    if (!fleet) return;
+    const live = new Map<string, number | undefined>();
+    for (const { connection: { deckId }, agents } of fleet) {
+      if (deckId !== undefined) for (const agent of agents) live.set(paneKey({ deckId, agentId: agent.id }), agent.spawnedAtMs);
+    }
+    /* The pane on screen is live whatever the fleet says. */
+    const shown = paneRef.current;
+    if (shown && !live.has(paneKey(shown))) live.set(paneKey(shown), shown.spawnedAtMs);
+    const replaced = (pane: string, spawnedAtMs: number | undefined) => live.has(pane) && incarnationsDiffer(spawnedAtMs, live.get(pane));
+    for (const [key, line] of paneLines.current) if (replaced(line.pane, line.spawnedAtMs)) paneLines.current.delete(key);
+    const now = Date.now();
+    for (const [key, history] of paneWrites.current) {
+      const quiet = history.droppedInFlight === 0
+        && history.writes.every((write) => write.landedAt !== undefined && now - write.landedAt >= VOICE_SUBMIT_SETTLE_MS);
+      if (replaced(key, history.spawnedAtMs) || (!live.has(key) && quiet)) paneWrites.current.delete(key);
+    }
+    for (const [key, record] of prompts.current) {
+      if (live.has(key) || record.interrupt?.latched) continue;
+      emptyRecord(record, false, PROMPT_EMPTIED.replaced);
+      record.epoch += 1;
+      prompts.current.delete(key);
+    }
+  }, [fleet]);
   useEffect(() => {
     if (!keyboard) return;
     keyboard.current = noteKeyboard;
