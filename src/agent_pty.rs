@@ -12015,24 +12015,46 @@ impl AgentPtyRegistry {
         // entry is the place the new agent's identity (display_name,
         // tab_membership, etc.) lives, and `clear = true` on a
         // crashed agent should still produce a fresh worker.
-        // Issue #1396 item 3: a pane a prepared start created is respawned only
-        // into the directory that start verified. Checked here, BEFORE the
-        // record is lifted out and its child terminated, so a refusal leaves the
-        // running agent in place; `spawn_agent` repeats the check and is the one
-        // the child's directory actually comes from.
+        // Issue #1396 items 2 and 3: decide where the replacement may start
+        // BEFORE the record is lifted out and its child terminated, so a
+        // refusal leaves the running agent in place rather than an empty pane.
+        //
+        // * A pane a prepared start created is respawned only into the directory
+        //   object that start verified. The descriptor opened for that check is
+        //   carried through the teardown below and is what the replacement
+        //   enters, so a swap of the pathname while the old child is being
+        //   terminated cannot land it elsewhere, nor refuse it after the old
+        //   agent is gone (Greptile / Qodo, PR #1557). What can still refuse
+        //   late is the pathname stopping being a directory at all in that
+        //   window — `spawn_in`'s own check — and on non-Linux Unix any swap,
+        //   which is #1396 item 1's residual.
+        // * Any other pane is refused when its recorded cwd is no longer a
+        //   directory, the check `spawn` would otherwise make only after the old
+        //   agent was gone.
+        //
+        // A pane with no record skips this, and step 1 reports `NotFound`.
+        let recorded_cwd = self
+            .inner
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            .map(|a| a.cwd.clone());
         #[cfg(unix)]
+        let verified_dir = match recorded_cwd.as_ref() {
+            Some(cwd) => self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?,
+            None => None,
+        };
+        #[cfg(unix)]
+        let prepared = verified_dir.is_some();
+        #[cfg(not(unix))]
+        let prepared = false;
+        if !prepared
+            && let Some(Some(cwd)) = recorded_cwd.as_ref()
+            && !std::path::Path::new(cwd).is_dir()
         {
-            let cwd = self
-                .inner
-                .lock()
-                .unwrap()
-                .agents
-                .values()
-                .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
-                .map(|a| a.cwd.clone());
-            if let Some(cwd) = cwd {
-                self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?;
-            }
+            return Err(AgentPtyError::CwdNotADirectory(cwd.clone()));
         }
 
         let removed = {
@@ -12300,6 +12322,9 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type: respawn_agent_type,
         };
+        #[cfg(unix)]
+        let new_agent_id = self.spawn_agent_with_dir(opts, verified_dir.as_ref())?;
+        #[cfg(not(unix))]
         let new_agent_id = self.spawn_agent(opts)?;
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
         // card keeps the agent label the previous child taught us (`list_agents`
@@ -19055,6 +19080,55 @@ mod spawn_tests {
             !home.join("marker").exists(),
             "nothing may have run in $HOME"
         );
+    }
+
+    /// Issue #1396 item 2, on a respawn (Greptile / Qodo, PR #1557): a pane whose
+    /// recorded cwd has been deleted is refused BEFORE the respawn lifts its
+    /// record out and terminates its child, so `pane restart` or a `clear = true`
+    /// delegate reports the refusal and leaves the running agent in place rather
+    /// than an empty pane. Control: with the directory back, the same respawn is
+    /// served.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_respawn_into_a_deleted_cwd_is_refused_and_keeps_the_running_agent() {
+        const PANE: &str = "deleted-cwd-respawn-1396";
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the pane's dir");
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&path),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane's agent");
+
+        std::fs::remove_dir(&dir).expect("delete the pane's dir");
+        match registry.respawn_agent_for_pane(PANE, "cat").await {
+            Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path),
+            other => panic!("expected CwdNotADirectory, got {other:?}"),
+        }
+        assert_eq!(
+            registry.pane_current_agent_id(PANE).as_deref(),
+            Some(id.as_str()),
+            "the refused respawn must leave the pane's record in place"
+        );
+        assert!(
+            registry.agent_is_live(&id),
+            "and its child running: a respawn that terminated it and then refused would leave \
+             the pane empty"
+        );
+
+        std::fs::create_dir(&dir).expect("restore the pane's dir");
+        let replacement = registry
+            .respawn_agent_for_pane(PANE, "cat")
+            .await
+            .expect("control: a directory cwd is respawned");
+        assert_ne!(replacement, id);
+        registry.shutdown_all();
     }
 
     /// Issue #1396 item 3: a pane a prepared start created keeps its verified
