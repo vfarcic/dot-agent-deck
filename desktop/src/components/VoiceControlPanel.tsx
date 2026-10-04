@@ -645,7 +645,7 @@ type PromptRecord = {
    * again after it was seen not working (`turn` is the last turn seen). An
    * interrupt captures it when it is said, and its first key goes out only
    * while it is unchanged, so an interrupt meant for one turn is never
-   * delivered into the next.
+   * delivered into the next observed turn.
    */
   epoch: number;
   turn?: string;
@@ -3565,8 +3565,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       every "scratch that" the same way, even if the same agent comes back.
     - A retired agent's prompt record is moved to a new revision and epoch,
       so every command or Undo still holding it is called off, and dropped —
-      unless it is still latched by an interrupt, which forgetting would let a
-      second interrupt past. A replaced incarnation's record is replaced by
+      unless it is still latched by an interrupt, or its last interrupt is
+      still inside VOICE_INTERRUPT_REPEAT_MS: forgetting either would let a
+      second interrupt past. Such a record goes on the first fleet update
+      after both have cleared that still finds its agent gone. A replaced incarnation's record is replaced by
       the next one ({@link promptFor}), one per agent the fleet has.
   */
   useEffect(() => {
@@ -3587,7 +3589,9 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (replaced(key, history.spawnedAtMs) || (!live.has(key) && quiet)) paneWrites.current.delete(key);
     }
     for (const [key, record] of prompts.current) {
-      if (live.has(key) || record.interrupt?.latched) continue;
+      const interrupt = record.interrupt;
+      const cooling = interrupt?.at !== undefined && now - interrupt.at < VOICE_INTERRUPT_REPEAT_MS;
+      if (live.has(key) || interrupt?.latched || cooling) continue;
       emptyRecord(record, false, PROMPT_EMPTIED.replaced);
       record.epoch += 1;
       prompts.current.delete(key);

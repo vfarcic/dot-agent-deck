@@ -41,6 +41,7 @@ import {
   NOTHING_DISPATCHED,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
+  VOICE_INTERRUPT_REPEAT_MS,
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
   VOICE_SUBMIT_SETTLE_MS,
@@ -770,6 +771,43 @@ describe("voice control panel", () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
       await say("interrupt");
       expect(write).toHaveBeenCalledTimes(1);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /// Scenario: interrupt Planner and observe idle followed by fresh work to release the latch, then close its pane while it disappears and returns as the same incarnation. A repeat interrupt sends nothing before the three-second floor expires and succeeds afterward.
+    it("preserves the interrupt repeat floor across same-incarnation fleet disappearance", async () => {
+      const { say, write, target, updatePlanner, setAgents, agents } = await startPrompt();
+      await say("interrupt");
+      const deliveredAt = Date.now();
+      expect(write.mock.calls).toEqual([guardedWrite(target, "\x1b")]);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+
+      updatePlanner({ turn: "idle" });
+      await flush();
+      updatePlanner({ turn: "working" });
+      await flush();
+      write.mockClear();
+      await say("interrupt");
+      expect(write, "new-turn evidence must leave the repeat floor active before retirement").not.toHaveBeenCalled();
+      expect(report()).toHaveTextContent("Planner was just interrupted — wait a moment before interrupting it again.");
+
+      fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+      setAgents(agents.filter((agent) => agent.id !== "planner"));
+      await flush();
+      expect(screen.queryByRole("button", { name: "Open Planner agent" })).not.toBeInTheDocument();
+      setAgents(agents);
+      await flush();
+      fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+      await say("typing on");
+      expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+      await say("interrupt");
+      expect(Date.now() - deliveredAt, "the returned incarnation must still be inside the repeat floor").toBeLessThan(VOICE_INTERRUPT_REPEAT_MS);
+      expect(write.mock.calls, `fleet disappearance must not admit an early Escape; row: ${report().textContent}`).toEqual([]);
+      expect(report()).toHaveTextContent("Planner was just interrupted — wait a moment before interrupting it again.");
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_INTERRUPT_REPEAT_MS - (Date.now() - deliveredAt)); });
+      await say("interrupt");
+      expect(write.mock.calls, "the released latch must allow Escape once the repeat floor expires").toEqual([guardedWrite(target, "\x1b")]);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
 
