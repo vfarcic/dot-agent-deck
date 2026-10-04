@@ -1466,39 +1466,42 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
 
 /// PRD #1541: the most steps an interrupt may take. The longest measured is
 /// two (OpenCode's `ESC`, pause, `ESC`).
-const PROMPT_KEY_MAX_STEPS: usize = 4;
-/// PRD #1541: the longest single key, in bytes. Every measured key is one byte;
-/// this leaves room for an escape sequence without admitting text.
-const PROMPT_KEY_MAX_BYTES: usize = 16;
-/// PRD #1541: the longest pause between interrupt steps. The measured one is
-/// 300 ms; anything near this bound would leave a voice command hanging.
-const PROMPT_KEY_MAX_PAUSE_MS: u32 = 2_000;
-
-/// PRD #1541: one key the daemon served, accepted only when it is a KEY: it
-/// starts with a control byte (a C0 control or `DEL` — which admits an escape
-/// sequence and rejects a line of text), is short, never contains `Ctrl+C`
-/// (`0x03`), and never contains a CR or LF, which would submit the prompt.
-fn prompt_key_bytes(bytes: &str) -> Option<String> {
-    let starts_with_control = bytes
-        .bytes()
-        .next()
-        .is_some_and(|first| first < 0x20 || first == 0x7f);
-    let ok = starts_with_control
-        && bytes.len() <= PROMPT_KEY_MAX_BYTES
-        && !bytes.contains(['\u{3}', '\r', '\n']);
-    ok.then(|| bytes.to_string())
-}
+const PROMPT_KEY_MAX_STEPS: usize = 2;
+/// PRD #1541: the bytes of every interrupt step — one `ESC`, alone in its write.
+const PROMPT_KEY_INTERRUPT: &str = "\x1b";
+/// PRD #1541: the clear key — `Ctrl+U` (NAK).
+const PROMPT_KEY_CLEAR: &str = "\x15";
+/// PRD #1541: the keys that delete one character — `DEL`, or `Backspace` as
+/// `0x08`.
+const PROMPT_KEY_DELETE_CHAR: [&str; 2] = ["\x7f", "\x08"];
+/// PRD #1541: the most an interrupt may pause in total, summed over every step.
+const PROMPT_KEY_INTERRUPT_BUDGET_MS: u64 = 2_000;
+/// PRD #1541: the most a clear may pause in total between its writes.
+const PROMPT_KEY_CLEAR_BUDGET_MS: u64 = 3_000;
+/// PRD #1541: how many times the panel presses the clear key, by rule — a
+/// mirror of `VOICE_CLEAR_PRESSES` in `desktop/src/components/VoiceControlPanel.tsx`,
+/// which a clear's pause budget is computed against. `per_line` is 32 there
+/// once the panel's pending change lands (16 before it); counting the larger
+/// figure only makes the budget stricter.
+const PROMPT_KEY_CLEAR_PRESSES_PER_LINE: u64 = 32;
+const PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW: u64 = 64;
 
 /// PRD #1541: the daemon's prompt keys as the webview receives them — or
 /// `None` when any part is out of bounds, so the voice surface refuses the
-/// command rather than pressing half a key set.
+/// command rather than pressing half a key set. There is no local fallback.
 ///
 /// The bounds are this client's own promises, kept at the seam where the
-/// daemon's data enters: it never presses `Ctrl+C` (it quits Codex and
-/// OpenCode on an empty prompt), never waits long between steps, never writes
-/// a "key" that is really a line of text, and never counts presses by a rule
-/// it does not know. A daemon owns the PTY these keys are written to, so the
-/// bounds protect the desktop's behaviour rather than the agent from its deck.
+/// daemon's data enters, and they are an exact allowlist rather than a shape
+/// check: an interrupt is one or two steps of exactly one `ESC` each, the
+/// clear key is exactly `Ctrl+U`, and the delete key is exactly `DEL` or
+/// `0x08`. Anything else — text after a control byte, `Ctrl+C` or `Ctrl+D`,
+/// two `ESC`s in one write, an escape-encoded Enter or `Ctrl+C` (CSI-u), the
+/// clear key offered as the delete key — drops the set. So do pauses over
+/// budget (an interrupt's, summed, over 2 s; a clear's, over the writes the
+/// panel would make, over 3 s), a per-write cap of zero, and a clear rule this
+/// build does not know. A daemon owns the PTY these keys are written to, so
+/// the bounds protect the desktop's behaviour rather than the agent from its
+/// deck.
 pub(crate) fn map_prompt_keys(
     keys: &dot_agent_deck::agent_registry::PromptKeys,
 ) -> Option<DesktopPromptKeys> {
@@ -1507,42 +1510,60 @@ pub(crate) fn map_prompt_keys(
     if keys.interrupt.is_empty() || keys.interrupt.len() > PROMPT_KEY_MAX_STEPS {
         return None;
     }
-    let interrupt = keys
+    if keys
         .interrupt
         .iter()
-        .map(|step| {
-            (step.pause_after_ms <= PROMPT_KEY_MAX_PAUSE_MS).then_some(())?;
-            Some(DesktopKeyStep {
-                bytes: prompt_key_bytes(&step.bytes)?,
-                pause_after_ms: step.pause_after_ms,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let presses = match keys.clear.presses {
-        ClearPresses::PerWrappedRow => "per_wrapped_row",
-        ClearPresses::PerLine => "per_line",
-        ClearPresses::Unknown => return None,
-    };
-    if keys.clear.max_presses_per_write == Some(0) {
-        return None;
-    }
-    if keys
-        .clear
-        .pause_between_writes_ms
-        .is_some_and(|pause| pause > PROMPT_KEY_MAX_PAUSE_MS)
+        .any(|step| step.bytes != PROMPT_KEY_INTERRUPT)
     {
         return None;
     }
+    let interrupt_pause: u64 = keys
+        .interrupt
+        .iter()
+        .map(|step| u64::from(step.pause_after_ms))
+        .sum();
+    if interrupt_pause > PROMPT_KEY_INTERRUPT_BUDGET_MS {
+        return None;
+    }
+    if keys.clear.bytes != PROMPT_KEY_CLEAR
+        || !PROMPT_KEY_DELETE_CHAR.contains(&keys.delete_char.bytes.as_ref())
+    {
+        return None;
+    }
+    let (presses, total) = match keys.clear.presses {
+        ClearPresses::PerWrappedRow => {
+            ("per_wrapped_row", PROMPT_KEY_CLEAR_PRESSES_PER_WRAPPED_ROW)
+        }
+        ClearPresses::PerLine => ("per_line", PROMPT_KEY_CLEAR_PRESSES_PER_LINE),
+        ClearPresses::Unknown => return None,
+    };
+    let per_write = match keys.clear.max_presses_per_write {
+        Some(0) => return None,
+        Some(cap) => u64::from(cap),
+        None => total,
+    };
+    let clear_pause = (total.div_ceil(per_write) - 1)
+        * u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0));
+    if clear_pause > PROMPT_KEY_CLEAR_BUDGET_MS {
+        return None;
+    }
     Some(DesktopPromptKeys {
-        interrupt,
+        interrupt: keys
+            .interrupt
+            .iter()
+            .map(|step| DesktopKeyStep {
+                bytes: step.bytes.to_string(),
+                pause_after_ms: step.pause_after_ms,
+            })
+            .collect(),
         clear: DesktopClearKey {
-            bytes: prompt_key_bytes(&keys.clear.bytes)?,
+            bytes: keys.clear.bytes.to_string(),
             presses,
             max_presses_per_write: keys.clear.max_presses_per_write,
             pause_between_writes_ms: keys.clear.pause_between_writes_ms,
         },
         delete_char: DesktopDeleteCharKey {
-            bytes: prompt_key_bytes(&keys.delete_char.bytes)?,
+            bytes: keys.delete_char.bytes.to_string(),
             max_literal_write_chars: keys.delete_char.max_literal_write_chars,
         },
     })
@@ -3298,6 +3319,16 @@ mod tests {
         assert!(value.get("cliName").is_none());
     }
 
+    fn key_step(
+        bytes: &'static str,
+        pause_after_ms: u32,
+    ) -> dot_agent_deck::agent_registry::KeyStep {
+        dot_agent_deck::agent_registry::KeyStep {
+            bytes: std::borrow::Cow::Borrowed(bytes),
+            pause_after_ms,
+        }
+    }
+
     fn registry_keys(agent_type: AgentType) -> dot_agent_deck::agent_registry::PromptKeys {
         dot_agent_deck::agent_registry::spec(&agent_type)
             .prompt_keys
@@ -3440,6 +3471,85 @@ mod tests {
                 "a long pause between clear writes",
                 Box::new(|k| k.clear.pause_between_writes_ms = Some(60_000)),
             ),
+            // A-B1: the allowlist is exact, so a key that merely starts with
+            // a control byte is not enough.
+            (
+                "text after the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x15INJECTED")),
+            ),
+            (
+                "text after the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x7fINJECTED")),
+            ),
+            (
+                "Ctrl+D as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x04")),
+            ),
+            (
+                "Ctrl+D as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x04", 0)])),
+            ),
+            (
+                "two ESCs in one interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b\x1b", 0)])),
+            ),
+            (
+                "a CSI-u Enter as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[13u", 0)])),
+            ),
+            (
+                "a CSI-u Ctrl+C as an interrupt step",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b[99;5u", 0)])),
+            ),
+            (
+                "a CSI-u Enter as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x1b[13u")),
+            ),
+            (
+                "the clear key as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x15")),
+            ),
+            (
+                "the delete key as the clear key",
+                Box::new(|k| k.clear.bytes = Cow::Borrowed("\x7f")),
+            ),
+            (
+                "ESC as the delete key",
+                Box::new(|k| k.delete_char.bytes = Cow::Borrowed("\x1b")),
+            ),
+            (
+                "a good step after a bad one",
+                Box::new(|k| {
+                    k.interrupt = Cow::Owned(vec![key_step("\x1b", 300), key_step("\x1b[13u", 0)]);
+                }),
+            ),
+            (
+                "three ESC steps",
+                Box::new(|k| k.interrupt = Cow::Owned(vec![key_step("\x1b", 0); 3])),
+            ),
+            // A-S1: pauses are budgeted in aggregate, not only per step.
+            (
+                "an interrupt pausing over 2 s in total",
+                Box::new(|k| {
+                    k.interrupt =
+                        Cow::Owned(vec![key_step("\x1b", 1_500), key_step("\x1b", 1_500)]);
+                }),
+            ),
+            (
+                "a clear of one press per write, 2 s apart",
+                Box::new(|k| {
+                    k.clear.max_presses_per_write = Some(1);
+                    k.clear.pause_between_writes_ms = Some(2_000);
+                }),
+            ),
+            (
+                "a clear pausing just over 3 s in total",
+                Box::new(|k| {
+                    // 64 presses in writes of 16 is four writes, three pauses.
+                    k.clear.max_presses_per_write = Some(16);
+                    k.clear.pause_between_writes_ms = Some(1_001);
+                }),
+            ),
         ];
         for (name, break_it) in cases {
             let mut keys = registry_keys(AgentType::ClaudeCode);
@@ -3449,6 +3559,55 @@ mod tests {
         // And the untouched set passes, so the cases above fail for their own
         // reason.
         assert!(map_prompt_keys(&registry_keys(AgentType::ClaudeCode)).is_some());
+    }
+
+    /// PRD #1541 A-B1/A-S1: the values just inside the allowlist and the
+    /// budgets pass, so the bounds are exactly where the docs put them.
+    #[test]
+    fn prompt_keys_at_the_edge_of_the_bounds_pass() {
+        use dot_agent_deck::agent_registry::ClearPresses;
+        use std::borrow::Cow;
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.delete_char.bytes = Cow::Borrowed("\x08");
+        assert!(map_prompt_keys(&keys).is_some(), "0x08 deletes a character");
+
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.interrupt = Cow::Owned(vec![key_step("\x1b", 1_000), key_step("\x1b", 1_000)]);
+        assert!(map_prompt_keys(&keys).is_some(), "2 s of interrupt pause");
+
+        let mut keys = registry_keys(AgentType::ClaudeCode);
+        keys.clear.max_presses_per_write = Some(16);
+        keys.clear.pause_between_writes_ms = Some(1_000);
+        assert!(map_prompt_keys(&keys).is_some(), "3 s of clear pause");
+
+        // One write never pauses, however long the pause it names.
+        let mut keys = registry_keys(AgentType::OpenCode);
+        keys.clear.presses = ClearPresses::PerLine;
+        keys.clear.max_presses_per_write = Some(32);
+        keys.clear.pause_between_writes_ms = Some(60_000);
+        assert!(map_prompt_keys(&keys).is_some(), "a one-write clear");
+        keys.clear.max_presses_per_write = Some(31);
+        assert_eq!(
+            map_prompt_keys(&keys),
+            None,
+            "per_line is budgeted at 32 presses"
+        );
+    }
+
+    /// PRD #1541 A-B1: every key set this tree's registry serves passes the
+    /// allowlist, so a deck built from the same tree is never refused.
+    #[test]
+    fn every_registry_key_set_passes_the_allowlist() {
+        for agent in dot_agent_deck::agent_registry::ALL {
+            if let Some(keys) = agent.prompt_keys.as_ref() {
+                assert!(
+                    map_prompt_keys(keys).is_some(),
+                    "{}'s keys must pass the desktop's allowlist",
+                    agent.label
+                );
+            }
+        }
     }
 
     /// PRD #1541: the browser fixture's prompt keys

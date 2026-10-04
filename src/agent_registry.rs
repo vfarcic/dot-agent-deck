@@ -1205,6 +1205,48 @@ mod tests {
         }
     }
 
+    /// PRD #1541 A-B1: every entry's keys are within the desktop's exact
+    /// allowlist (`map_prompt_keys` in `desktop/src-tauri/src/dto.rs`), which
+    /// drops a whole set that strays from it: one or two interrupt steps of a
+    /// single `ESC` each, pausing 2 s at most in total; `Ctrl+U` to clear;
+    /// `DEL` or `0x08` to delete. A new key here needs that allowlist widened
+    /// in the same change, or the desktop refuses every voice prompt command
+    /// for the agent.
+    #[test]
+    fn prompt_keys_stay_within_the_desktop_allowlist() {
+        let entries = ALL.iter().copied().chain(std::iter::once(&NONE));
+        for agent in entries {
+            let Some(keys) = agent.prompt_keys.as_ref() else {
+                continue;
+            };
+            assert!(
+                (1..=2).contains(&keys.interrupt.len()),
+                "{}: an interrupt is one or two steps",
+                agent.label
+            );
+            for step in keys.interrupt.iter() {
+                assert_eq!(
+                    step.bytes, ESC,
+                    "{}: each interrupt step is one ESC",
+                    agent.label
+                );
+            }
+            let pause: u64 = keys
+                .interrupt
+                .iter()
+                .map(|step| u64::from(step.pause_after_ms))
+                .sum();
+            assert!(pause <= 2_000, "{}: interrupt pauses over 2 s", agent.label);
+            assert_eq!(keys.clear.bytes, CTRL_U, "{}: the clear key", agent.label);
+            assert!(
+                [DEL, "\x08"].contains(&keys.delete_char.bytes.as_ref()),
+                "{}: the delete key",
+                agent.label
+            );
+            assert_ne!(keys.clear.presses, ClearPresses::Unknown);
+        }
+    }
+
     /// PRD #1541: the wire spelling of the keys — snake_case, the bytes as a
     /// JSON string, absent limits as absent keys — and a round trip back.
     #[test]
