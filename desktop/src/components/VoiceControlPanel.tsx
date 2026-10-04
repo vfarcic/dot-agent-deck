@@ -570,12 +570,29 @@ export function clearCovers(text: string, rule: "per_line" | "per_wrapped_row", 
  * xterm focus in and out (`ESC [ I`, `ESC [ O`), SGR mouse reports
  * (`ESC [ < b ; x ; y M` or `m`) and X10/normal mouse reports (`ESC [ M` and
  * three bytes), alone or run together. The terminal sends them for a click or
- * a focus change; they do not edit the prompt, so they leave what voice knows
- * about it as it was. Anything else in the same input counts as an edit.
+ * a focus change; they do not type into the prompt. Anything else in the same
+ * input counts as an edit. Whether one of them may still have moved the
+ * prompt's cursor is {@link mouseButtonReported}.
  */
 const TERMINAL_REPORTS = /^(?:\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\x20-￿]{3})+$/;
 export function terminalReportsOnly(data: string): boolean {
   return TERMINAL_REPORTS.test(data);
+}
+/** Each mouse report in input, capturing an SGR report's button code or an X10 report's button byte. */
+const MOUSE_REPORT = /\x1b\[<(\d+);\d+;\d+[Mm]|\x1b\[M([\x20-￿])[\x20-￿]{2}/g;
+/**
+ * PRD #1541 (PR #1558 review) — whether terminal reports include a mouse
+ * button press or release: a report whose button code is neither motion
+ * (bit 32) nor the wheel (64 to 127). A click can move the cursor of an
+ * agent's prompt, so voice no longer knows where its words are; focus,
+ * motion and wheel reports leave the cursor where it was.
+ */
+export function mouseButtonReported(data: string): boolean {
+  for (const [, sgr, x10] of data.matchAll(MOUSE_REPORT)) {
+    const button = sgr !== undefined ? Number(sgr) : x10.codePointAt(0)! - 32;
+    if ((button & 32) === 0 && (button & 0xc0) !== 64) return true;
+  }
+  return false;
 }
 /**
  * PRD #1541 — a second interrupt to the same pane this soon after the last
@@ -618,6 +635,7 @@ const PROMPT_EMPTIED = {
   replaced: "the agent in this pane was replaced",
   failed: "a write to the prompt failed",
   scratched: "every dictation since the prompt was last sent has been removed",
+  clicked: "the agent's terminal was clicked after the last dictation, which may have moved its cursor",
 } as const;
 
 /**
@@ -3634,12 +3652,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     runPromptCommand(run, async function* () {
       if (record.revision !== revision) throw new PaneMoved(record.why);
       if (record.writes.at(-1) !== lastWrite) throw new PaneMoved("the words voice typed there changed");
+      const why = record.why;
       record.writes.pop();
       if (record.writes.length === 0) record.why = PROMPT_EMPTIED.scratched;
-      yield deletes;
+      let landed = false;
+      try {
+        yield deletes;
+        landed = true;
+      } finally {
+        /* Called off before the deletes went out (PR #1558 review): the
+           prompt is as it was, so its record is too, and a later "scratch
+           that" still removes the write. Put back before the line moves on,
+           so a dictation queued behind lands on top of it. */
+        if (!landed && record.revision === revision) {
+          record.writes.push(lastWrite);
+          record.why = why;
+        }
+      }
     }, () => `Removed ${quoted(last)} from ${run.label}'s prompt.`, (why) => `Nothing was removed — ${why}.`, {
       holds: () => (record.revision === revision ? undefined : record.why),
-      onFail: () => resetPrompt(run.aim, false, PROMPT_EMPTIED.failed),
+      /* Called off, nothing was deleted and the record says so already; only
+         a write that failed leaves the prompt unknown. */
+      onFail: (cause) => { if (!(cause instanceof PaneMoved)) resetPrompt(run.aim, false, PROMPT_EMPTIED.failed); },
     });
   }, [promptCommand, reportRefused, resetPrompt, runPromptCommand]);
 
@@ -3648,12 +3682,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * no longer knows what that prompt holds, so nothing can be scratched from
    * it and a clear cannot be undone — except after a plain Enter, which sent
    * it and left it empty. Terminal reports alone ({@link terminalReportsOnly})
-   * are not an edit and change nothing here.
+   * are not an edit: a pending spoken send still goes out. A mouse button
+   * among them ({@link mouseButtonReported}) may have moved the cursor, so it
+   * still ends what voice knows about the prompt; focus, motion and wheel
+   * reports change nothing here.
    */
   const noteKeyboard = useCallback((target: AgentAddress, data: string, sent: Promise<void>) => {
     notePaneWrite(target, data.length, sent);
     /* A click or a focus change in the terminal, not an edit (PR #1558 review). */
-    if (terminalReportsOnly(data)) return;
+    if (terminalReportsOnly(data)) {
+      if (mouseButtonReported(data)) resetPrompt(target, false, PROMPT_EMPTIED.clicked);
+      return;
+    }
     const key = paneKey(target);
     keyboardEdits.current.set(key, (keyboardEdits.current.get(key) ?? 0) + 1);
     if (data === VOICE_DICTATION_SUBMIT) {

@@ -462,8 +462,8 @@ describe("voice control panel", () => {
     function guardedWrite(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], data: string) {
       return [target, data, expect.any(Function)];
     }
-    /** Wrap the real bridge FIFO and hold only its first keyboard acknowledgement. */
-    async function realInputQueue(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>) {
+    /** Wrap the real bridge FIFO and hold only the selected keyboard acknowledgement. */
+    async function realInputQueue(target: Parameters<DeckRuntimeState["sendTerminalInput"]>[0], write: ReturnType<typeof vi.mocked<DeckRuntimeState["sendTerminalInput"]>>, heldInput = "k") {
       let release!: () => void;
       terminalInvoke.mockReset();
       terminalInvoke.mockImplementation((command: string, args?: { data?: number[] }) => {
@@ -473,7 +473,7 @@ describe("voice control panel", () => {
           protocolVersion: 6, source: "daemon",
         });
         if (command === "desktop_terminal_attach") return Promise.resolve({ sessionId: "voice-session", agentId: "planner", generation: 1, reused: false });
-        if (command === "desktop_terminal_write" && args?.data?.length === 1 && args.data[0] === 107) {
+        if (command === "desktop_terminal_write" && args?.data?.join(",") === Array.from(heldInput, (char) => char.charCodeAt(0)).join(",")) {
           return new Promise<void>((resolve) => { release = resolve; });
         }
         return Promise.resolve({ ok: true });
@@ -1111,6 +1111,34 @@ describe("voice control panel", () => {
       expect(refusal).toMatch(command.invoke === "scratchLastDictation" ? /pending|already|wait|in progress|busy|nothing to scratch/i : /pending|already|wait|in progress|busy/i);
     });
 
+    /// Scenario: dictate a write, then hold a focus report in the real bridge FIFO and queue scratch behind it. Stop typing before its DELs reach the daemon; after the focus report settles, typing on and scratch must still remove exactly that undelivered scratch's dictated write.
+    it("preserves dictation after queued scratch is cancelled by the bridge before delivery", async () => {
+      const { say, write, target, keyboard } = await startPrompt();
+      const queue = await realInputQueue(target, write, "\x1b[O");
+      const text = "kept dictated words ";
+      const deletes = FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(text.length);
+      try {
+        await say("kept dictated words");
+        await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+        await keyboard("\x1b[O");
+        await say("scratch that");
+        expect(write.mock.calls).toEqual([[target, text], [target, "\x1b[O"], guardedWrite(target, deletes)]);
+        expect(queue.delivered().some((bytes) => bytes.includes(127)), "scratch must still be queued at the bridge").toBe(false);
+        await say("typing off");
+        await queue.release();
+        expect(queue.delivered().some((bytes) => bytes.includes(127)), "cancelled scratch must deliver no DEL").toBe(false);
+        await say("typing on");
+        await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+        write.mockClear();
+        await say("scratch that");
+        expect.soft(write.mock.calls, "undelivered scratch must retain its dictated write for a later scratch").toEqual([guardedWrite(target, deletes)]);
+        expect.soft(queue.delivered().filter((bytes) => bytes.includes(127)), "only the retried scratch may deliver DELs").toEqual([Array.from(deletes, (char) => char.charCodeAt(0))]);
+        expect.soft(report()).toHaveTextContent(/Removed .*kept dictated words.*from Planner's prompt\./);
+      } finally {
+        await queue.dispose();
+      }
+    });
+
     /// Scenario: scratch waits behind an unfinished voice write while the user types a private draft by hand. Releasing the write leaves the keyboard text intact, sends no deletion bytes, and reports refusal.
     it("refuses queued scratch after keyboard input changes the prompt revision", async () => {
       const { say, write, target, keyboard } = await startPrompt();
@@ -1491,16 +1519,93 @@ describe("voice control panel", () => {
       expect.soft(screen.queryByRole("button", { name: "Undo" }), "unknown clear cannot establish a known-empty prompt").not.toBeInTheDocument();
     });
 
+    const mouseButtonReports = [
+      { name: "SGR press", data: "\x1b[<0;12;8M" },
+      { name: "SGR release", data: "\x1b[<0;12;8m" },
+      { name: "SGR click", data: "\x1b[<0;12;8M\x1b[<0;12;8m" },
+      { name: "SGR modified click", data: "\x1b[<20;12;8M\x1b[<20;12;8m" },
+      { name: "X10 press", data: "\x1b[M !!" },
+      { name: "X10 release", data: "\x1b[M#!!" },
+    ];
+
+    /// Scenario: after dictating into an empty prompt, receive a mouse button report that could move the cursor, then request scratch or clear, or use a previously offered clear Undo. Scratch sends no deletion keys and Undo cannot restore old words; clearing a cursor-moved prompt must not certify the next draft as wholly known.
+    it.each(mouseButtonReports.flatMap((entry) => ["scratch", "clear", "Undo"].map((action) => ({ ...entry, action }))))("ends prompt ownership after $name before $action", async ({ data, action }) => {
+      const { say, write, target, keyboard } = await startPrompt("open_code");
+      await keyboard("\r");
+      await say("remembered voice words");
+      if (action === "Undo") {
+        await say("clear the prompt");
+        expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
+      }
+      await keyboard(data);
+      write.mockClear();
+      if (action === "scratch") {
+        await say("scratch that");
+        expect.soft(write, "a mouse button may move the cursor, so scratch must send no DEL").not.toHaveBeenCalled();
+        expect.soft(report()).toHaveTextContent(/nothing.*scratch|cursor|changed/i);
+      } else if (action === "clear") {
+        await say("clear the prompt");
+        expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.open_code!.clear.bytes.repeat(32))]);
+        expect.soft(screen.queryByRole("button", { name: "Undo" }), "clear after a cursor move must not offer Undo").not.toBeInTheDocument();
+        expect.soft(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+        await say("later voice words");
+        await say("clear the prompt");
+        expect.soft(screen.queryByRole("button", { name: "Undo" }), "clear after a cursor move must not mark the prompt known-empty").not.toBeInTheDocument();
+      } else {
+        const undo = screen.queryByRole("button", { name: "Undo" });
+        if (undo) fireEvent.click(undo);
+        await flush();
+        expect.soft(write, "a mouse button must prevent restoration at the moved cursor").not.toHaveBeenCalled();
+        if (undo) expect.soft(report()).toHaveTextContent(/nothing.*restored|cursor|changed|cannot|can't/i);
+      }
+    });
+
+    /// Scenario: request voice send and receive a mouse button report during its settle delay. Although a button report ends scratch ownership, the unchanged text still receives exactly one voice Enter when the delay finishes.
+    it.each(mouseButtonReports)("keeps voice send pending after $name during the settle", async ({ data }) => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await say("dictated words");
+      await say("send it");
+      expect(write.mock.calls).toEqual([[target, "dictated words "]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      await keyboard(data);
+      expect(write.mock.calls.filter(([, bytes]) => bytes === "\r"), "a mouse button must not shorten the settle delay").toEqual([]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      await flush();
+      expect(write.mock.calls).toEqual([[target, "dictated words "], [target, data], [target, "\r"]]);
+    });
+
+    /// Scenario: after dictation, receive focus, pure mouse motion or wheel reports, including modified and concatenated reports. These leave the cursor ownership intact so scratch deletes exactly the dictated write.
+    it.each([
+      { name: "focus in", data: "\x1b[I" },
+      { name: "focus out", data: "\x1b[O" },
+      { name: "SGR motion", data: "\x1b[<32;12;8M" },
+      { name: "SGR modified motion", data: "\x1b[<52;12;8M" },
+      { name: "SGR wheel up", data: "\x1b[<64;12;8M" },
+      { name: "SGR wheel down", data: "\x1b[<65;12;8M" },
+      { name: "SGR modified wheel", data: "\x1b[<84;12;8M" },
+      { name: "X10 motion", data: "\x1b[M@!!" },
+      { name: "X10 wheel", data: "\x1b[M`!!" },
+      { name: "concatenated focus and motion", data: "\x1b[I\x1b[O\x1b[<32;12;8M\x1b[<64;12;8M" },
+    ])("preserves scratch after non-edit $name", async ({ data }) => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await say("remembered voice words");
+      await keyboard(data);
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([guardedWrite(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat("remembered voice words ".length))]);
+      expect(report()).toHaveTextContent(/Removed .*remembered voice words.*from Planner's prompt\./);
+    });
+
     const terminalReports = [
       { name: "focus in", data: "\x1b[I" },
       { name: "focus out", data: "\x1b[O" },
-      { name: "SGR mouse press", data: "\x1b[<0;12;8M" },
-      { name: "SGR mouse release", data: "\x1b[<0;12;8m" },
-      { name: "X10 mouse", data: "\x1b[M !!" },
-      { name: "concatenated reports", data: "\x1b[I\x1b[O\x1b[<0;12;8M\x1b[<0;12;8m\x1b[M !!" },
+      { name: "SGR mouse motion", data: "\x1b[<35;12;8M" },
+      { name: "SGR mouse wheel", data: "\x1b[<64;12;8M" },
+      { name: "X10 mouse motion", data: "\x1b[M@!!" },
+      { name: "concatenated reports", data: "\x1b[I\x1b[O\x1b[<35;12;8M\x1b[<64;12;8M\x1b[M@!!" },
     ];
 
-    /// Scenario: a terminal emits focus, SGR mouse or X10 mouse reports after dictation or after clear, including concatenated reports. Scratch still removes the dictated write and clear Undo still restores it because those reports do not edit the prompt.
+    /// Scenario: a terminal emits focus, SGR mouse motion or wheel, or X10 mouse motion reports after dictation or after clear, including concatenated reports. Scratch still removes the dictated write and clear Undo still restores it because those reports do not edit the prompt.
     it.each(terminalReports.flatMap((entry) => ["scratch", "Undo"].map((action) => ({ ...entry, action }))))("preserves $action after terminal-only $name", async ({ data, action }) => {
       const { say, write, target, keyboard } = await startPrompt();
       await keyboard("\r");
