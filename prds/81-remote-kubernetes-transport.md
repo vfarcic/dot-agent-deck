@@ -4,6 +4,8 @@
 **Priority**: Medium
 **Created**: 2026-05-09 (rewritten 2026-10-04)
 **GitHub Issue**: [#81](https://github.com/vfarcic/dot-agent-deck/issues/81)
+**Depends on**: [#1258](https://github.com/vfarcic/dot-agent-deck/issues/1258) (resource-aware decks — each daemon serves its host's disk, CPU and memory, and the desktop recommends a deck when starting an agent; choosing where a unit runs, locally, over SSH or in a cluster, builds on it)
+**Inputs to M1**: [#635](https://github.com/vfarcic/dot-agent-deck/issues/635) (execution budgets and stop conditions), [#927](https://github.com/vfarcic/dot-agent-deck/issues/927), [#864](https://github.com/vfarcic/dot-agent-deck/issues/864) and [#906](https://github.com/vfarcic/dot-agent-deck/issues/906) (cold builds, shared build caches, build cost — the dominant per-unit cost)
 **Related**: [#632](https://github.com/vfarcic/dot-agent-deck/issues/632) (users and access control for decks — everything about *who* may do what is deferred there), [#634](https://github.com/vfarcic/dot-agent-deck/issues/634) (execution isolation and agent authority — agent credentials inside a pod), [#631](https://github.com/vfarcic/dot-agent-deck/issues/631) (authenticated remote boundary)
 
 ## Why this was rewritten
@@ -56,5 +58,5 @@ The 2026-10-04 discussion raised these as candidates. They are recorded so M1 ca
 
 ## Milestones
 
-- [ ] **M1 — Current-state analysis and design, decided with the maintainer.** Survey the code and docs listed in the open questions, evaluate the options above against it, and record the chosen design, its milestones, and the rule 9 experimental-flag answer in this PRD. Nothing is built before this is agreed.
+- [ ] **M1 — Current-state analysis and design, decided with the maintainer.** Starts once #1258 has landed, and reads #635, #927, #864 and #906 for what they measured or decided about budgets and build cost. Survey the code and docs listed in the open questions, evaluate the options above against it, and record the chosen design, its milestones, and the rule 9 experimental-flag answer in this PRD. Nothing is built before this is agreed.
 - [ ] **M2 onward — defined by M1.** Expected areas: a deck image and its Kubernetes resources; the long-lived deck; per-unit decks for dispatch; discovery and management in the desktop; tests (including a real cluster such as kind) and user docs.
