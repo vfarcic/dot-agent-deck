@@ -536,6 +536,48 @@ export const VOICE_SUBMIT_SETTLE_MS = 750;
  */
 export const VOICE_CLEAR_PRESSES: Record<"per_line" | "per_wrapped_row", number> = { per_line: 32, per_wrapped_row: 64 };
 /**
+ * PRD #1541 (PR #1558 review) — how much of a known prompt a clear is
+ * counted as covering, by the deck's rule: two presses per logical line for
+ * a per-line editor (one empties the line, one joins it to the line above),
+ * and one per row of a pane this many columns wide for a wrapped one — a
+ * conservatively narrow pane, since this app cannot see the agent's width.
+ * Only a prompt within that reach is marked empty after a clear, or offered
+ * an Undo ({@link clearCovers}).
+ */
+export const VOICE_CLEAR_PRESSES_PER_LINE = 2;
+export const VOICE_CLEAR_ROW_COLUMNS = 20;
+
+/**
+ * PRD #1541 (PR #1558 review) — whether `presses` of the clear key, under the
+ * deck's rule, reach the whole of `text`. Counts every `\r` or `\n` as a line
+ * break and every character outside ASCII as two columns, so a wide character
+ * never makes a prompt look shorter than it is.
+ */
+export function clearCovers(text: string, rule: "per_line" | "per_wrapped_row", presses: number): boolean {
+  const lines = text.split(/[\r\n]/);
+  if (rule === "per_line") return lines.length * VOICE_CLEAR_PRESSES_PER_LINE <= presses;
+  let rows = 0;
+  for (const line of lines) {
+    let columns = 0;
+    for (let index = 0; index < line.length; index += 1) columns += line.charCodeAt(index) < 0x7f ? 1 : 2;
+    rows += Math.max(1, Math.ceil(columns / VOICE_CLEAR_ROW_COLUMNS));
+  }
+  return rows <= presses;
+}
+
+/**
+ * PRD #1541 (PR #1558 review) — input made of nothing but terminal reports:
+ * xterm focus in and out (`ESC [ I`, `ESC [ O`), SGR mouse reports
+ * (`ESC [ < b ; x ; y M` or `m`) and X10/normal mouse reports (`ESC [ M` and
+ * three bytes), alone or run together. The terminal sends them for a click or
+ * a focus change; they do not edit the prompt, so they leave what voice knows
+ * about it as it was. Anything else in the same input counts as an edit.
+ */
+const TERMINAL_REPORTS = /^(?:\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\x20-￿]{3})+$/;
+export function terminalReportsOnly(data: string): boolean {
+  return TERMINAL_REPORTS.test(data);
+}
+/**
  * PRD #1541 — a second interrupt to the same pane this soon after the last
  * is refused: on an agent that has already stopped, a repeated `Esc` opens
  * Rewind, the transcript browser or the Session Tree instead.
@@ -1472,6 +1514,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * one failure is not held against every later send.
    */
   const lastWrite = useRef<Promise<boolean> | undefined>(undefined);
+  /**
+   * PRD #1541 (PR #1558 review) — how many keyboard edits each agent's prompt
+   * has had, by {@link paneKey}. A spoken send notes it when said and presses
+   * Enter only while it is unchanged, so input typed (or an Enter pressed) by
+   * hand while the send waits for its writes and their settle calls it off.
+   */
+  const keyboardEdits = useRef(new Map<string, number>());
   /** When the last tracked write landed ({@link VOICE_SUBMIT_SETTLE_MS} counts from it). */
   const lastLanded = useRef(0);
   const trackWrite = useCallback((write: Promise<unknown>) => {
@@ -2039,6 +2088,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * {@link VOICE_SUBMIT_SETTLE_MS} since the last of them, so the agent reads
    * it apart from the words and submits instead of starting a new line. The
    * wait is held to the same checks as the wait for the writes.
+   *
+   * PR #1558 review — and to the prompt not being edited by hand meanwhile:
+   * keyboard input (an Enter included) while the send waits calls it off and
+   * says so, because the Enter would submit a prompt the user is still
+   * changing, or press a second Enter after their own.
    */
   const submitAfterWrites = useCallback((aim: Pending) => {
     const written = lastWrite.current;
@@ -2050,8 +2104,17 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const declared = current();
     const generation = modeGeneration.current;
     const epoch = sendEpoch.current;
+    const edits = keyboardEdits.current.get(paneKey(aim)) ?? 0;
     deferredSubmit.current = true;
     const stale = () => sendEpoch.current !== epoch || modeGeneration.current !== generation || contextLost(declared, current(), { pane: aim }) !== undefined;
+    /* Press Enter, unless the prompt was edited by hand since the send was said. */
+    const submit = () => {
+      if ((keyboardEdits.current.get(paneKey(aim)) ?? 0) !== edits) {
+        setProblem(`Cancelled the send to ${aim.label} — the prompt was changed by hand while the send waited.`);
+        return;
+      }
+      void submitDictation(aim);
+    };
     void written.then((ok) => {
       if (sendEpoch.current !== epoch) return;
       if (!ok || stale()) {
@@ -2061,14 +2124,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       const settle = lastLanded.current + VOICE_SUBMIT_SETTLE_MS - Date.now();
       if (settle <= 0) {
         deferredSubmit.current = false;
-        void submitDictation(aim);
+        submit();
         return;
       }
       window.setTimeout(() => {
         if (sendEpoch.current !== epoch) return;
         deferredSubmit.current = false;
         if (stale()) return;
-        void submitDictation(aim);
+        submit();
       }, settle);
     });
   }, [current, submitDictation]);
@@ -3270,7 +3333,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     writes: () => AsyncGenerator<string | number, void, void>,
     done: () => string,
     stopped: (why: string) => string,
-    after?: { onDone?: () => void; onFail?: () => void; holds?: () => string | undefined },
+    after?: { onDone?: () => void; onFail?: (cause: unknown) => void; holds?: () => string | undefined },
   ) => {
     const check = () => {
       if (modeGeneration.current !== run.generation) return "typing mode ended";
@@ -3287,11 +3350,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       }
       after?.onDone?.();
     });
-    trackWrite(command);
+    /* A spoken send waits for it, but its outcome is its own (PR #1558
+       review): a command called off or failed reports itself, and must not
+       make a later send drop its Enter as if a dictated write had failed. */
+    trackWrite(command.catch(() => undefined));
     void command.then(
       () => { if (reportGeneration.current === run.reported) setProblem(done()); },
       (cause) => {
-        after?.onFail?.();
+        after?.onFail?.(cause);
         if (reportGeneration.current === run.reported) setProblem(cause instanceof PaneMoved ? stopped(cause.why) : sentenceOf(cause));
       },
     );
@@ -3414,7 +3480,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         restored += 1;
       }
     });
-    trackWrite(restore);
+    /* As for every prompt command, its own outcome (PR #1558 review). */
+    trackWrite(restore.catch(() => undefined));
     void restore.then(
       () => setProblem(`Restored ${label}'s prompt.`),
       (cause) => {
@@ -3431,10 +3498,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * `maxPressesPerWrite` and `pauseBetweenWritesMs` apart.
    *
    * Undo is offered only when voice typed the WHOLE prompt (see
-   * {@link PromptRecord}) and nothing changed the prompt while it was being
+   * {@link PromptRecord}), what it typed is within the clear's reach
+   * ({@link clearCovers}) and nothing changed the prompt while it was being
    * cleared, and types exactly those words back; otherwise the report says
-   * the clear cannot be undone. A clear the user typed into part-way also
-   * leaves the prompt unknown rather than known to be empty.
+   * the clear cannot be undone, and that some of the prompt may remain when
+   * voice cannot tell it was all reached. Only that covered case leaves the
+   * prompt known to be empty.
+   *
+   * PR #1558 review — keyboard input (or anything else that moves the
+   * prompt's revision) between paced writes stops the clear before its next
+   * write, so the user's new words are not cleared by it. A clear called off
+   * before any of its keys went out puts the record back as it was, so
+   * "scratch that" still reaches the last dictation.
    */
   const clearAgentPrompt = useCallback((target: VoiceDispatchTarget) => {
     const run = promptCommand(target, "clear");
@@ -3443,9 +3518,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const total = VOICE_CLEAR_PRESSES[presses];
     const perWrite = maxPressesPerWrite ?? total;
     const { record } = run;
+    const before = { writes: record.writes, whole: record.whole, why: record.why };
     const restorable = record.whole ? record.writes.map((write) => write.text) : undefined;
+    const covered = restorable !== undefined && clearCovers(restorable.join(""), presses, total);
     emptyRecord(record, false, PROMPT_EMPTIED.cleared);
     const revision = record.revision;
+    let delivered = false;
     stopNudge(true);
     reportRefused(`Clearing ${run.label}'s prompt…`);
     const sentence = `Cleared ${run.label}'s prompt.`;
@@ -3453,18 +3531,30 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       for (let left = total; left > 0; left -= perWrite) {
         if (left < total && pauseBetweenWritesMs) yield pauseBetweenWritesMs;
         yield bytes.repeat(Math.min(left, perWrite));
+        /* Resumed only once that write has settled: delivered. */
+        delivered = true;
       }
     }, () => {
       if (record.revision !== revision) return `${sentence} It cannot be undone — ${PROMPT_CHANGED_WHILE_CLEARING}.`;
-      if (restorable === undefined) return `${sentence} It cannot be undone — voice does not know everything that was in it.`;
+      if (restorable === undefined) return `${sentence} Some of it may remain, and it cannot be undone — voice does not know everything that was in it.`;
+      if (!covered) return `${sentence} Some of it may remain, and it cannot be undone — it was longer than a clear is sure to reach.`;
       if (restorable.length > 0 && reportGeneration.current === run.reported) {
         setUndo({ run: () => restorePrompt(run.aim, run.declared, restorable, run.label, revision) });
       }
       return sentence;
     }, (why) => `Stopped clearing ${run.label}'s prompt — ${why}.`, {
-      /* Cleared, with nothing else written in between: the prompt is empty,
-         and known to be. */
-      onDone: () => { if (record.revision === revision) record.whole = true; },
+      holds: () => (record.revision === revision ? undefined : PROMPT_CHANGED_WHILE_CLEARING),
+      /* Cleared within its reach, with nothing else written in between: the
+         prompt is empty, and known to be. */
+      onDone: () => { if (record.revision === revision && covered) record.whole = true; },
+      /* Not one key went out: the prompt is as it was before the clear, so
+         its record is too — at a new revision, so nothing that held the
+         record across the clear acts on it. */
+      onFail: (cause) => {
+        if (delivered || !(cause instanceof PaneMoved) || record.revision !== revision) return;
+        emptyRecord(record, before.whole, before.why);
+        record.writes = before.writes;
+      },
     });
   }, [promptCommand, reportRefused, restorePrompt, runPromptCommand, stopNudge]);
 
@@ -3518,10 +3608,15 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * PRD #1541 — what the user typed into an agent's terminal by hand. Voice
    * no longer knows what that prompt holds, so nothing can be scratched from
    * it and a clear cannot be undone — except after a plain Enter, which sent
-   * it and left it empty.
+   * it and left it empty. Terminal reports alone ({@link terminalReportsOnly})
+   * are not an edit and change nothing here.
    */
   const noteKeyboard = useCallback((target: AgentAddress, data: string, sent: Promise<void>) => {
     notePaneWrite(target, data.length, sent);
+    /* A click or a focus change in the terminal, not an edit (PR #1558 review). */
+    if (terminalReportsOnly(data)) return;
+    const key = paneKey(target);
+    keyboardEdits.current.set(key, (keyboardEdits.current.get(key) ?? 0) + 1);
     if (data === VOICE_DICTATION_SUBMIT) {
       resetPrompt(target, true, PROMPT_EMPTIED.sent);
       noteSent(target);
@@ -3592,6 +3687,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       const interrupt = record.interrupt;
       const cooling = interrupt?.at !== undefined && now - interrupt.at < VOICE_INTERRUPT_REPEAT_MS;
       if (live.has(key) || interrupt?.latched || cooling) continue;
+      keyboardEdits.current.delete(key);
       emptyRecord(record, false, PROMPT_EMPTIED.replaced);
       record.epoch += 1;
       prompts.current.delete(key);
