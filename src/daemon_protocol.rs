@@ -2034,11 +2034,12 @@ pub enum AttachRequest {
         /// PRD #1542 (audit A4): the question's revision as the client saw it
         /// ([`crate::question::PendingQuestion::revision`] on the snapshot).
         /// When given, the daemon refuses the answer as stale unless it is the
-        /// revision pending now, so a question replaced under the same id since
-        /// the client read it is never answered with a choice made for the old
-        /// one. Additive optional: a client that omits it gets the id check
-        /// alone at the request, and the daemon still binds its own delivery to
-        /// the revision it validated against.
+        /// revision pending now, so a question replaced under the same id
+        /// between the client's read and the request is never answered with a
+        /// choice made for the old one. Additive optional: a client that omits
+        /// it gets the id check alone at the request, and the daemon still
+        /// binds its own delivery to the revision it validated against, within
+        /// the limits `answer_question_at`'s doc states for keys.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
     },
@@ -5811,22 +5812,26 @@ pub(crate) async fn answer_question(
 ///
 /// **Bound to one revision of the question (audit A4, R1–R3).** The answer is
 /// validated against the pending question's daemon-minted revision
-/// ([`crate::question::PendingQuestion::revision`]) and delivered only to that
-/// revision, revalidated at each commit point under the pane's question
-/// lifecycle ([`crate::agent_pty::QuestionAnswers::lock_lifecycle`]), which
-/// every event ingested for the pane also holds: a held reply goes only to the
-/// hold whose generation it is, and nothing can register, replace or clear the
-/// question between its revalidation, the reply and the deck's clearing event;
-/// each key is queued on the PTY only while its revision is still pending, so
-/// an event that replaces or clears the question is ordered either before the
-/// check (and the key is refused) or after the queueing — and then the PTY
-/// thread, which checks the revision again immediately before writing the key
-/// ([`crate::agent_pty::AnswerGate`]), drops the key if the change was applied
-/// first; a change applied after that check is not stopped, and the next key's
-/// check sees it. The deck's own clearing event and every clear on a failure name
-/// the revision too. A same-id replacement that registers between validation
+/// ([`crate::question::PendingQuestion::revision`]) and revalidated at each
+/// commit point under the pane's question lifecycle
+/// ([`crate::agent_pty::QuestionAnswers::lock_lifecycle`]), which every event
+/// ingested for the pane also holds. A held reply is delivered only to that
+/// revision: it goes only to the hold whose generation it is, and nothing can
+/// register, replace or clear the question between its revalidation, the reply
+/// and the deck's clearing event. A key is bound more loosely: it is queued on
+/// the PTY only while its revision is still pending, so an event that replaces
+/// or clears the question is ordered either before the check (and the key is
+/// refused) or after the queueing — and then the PTY thread, which checks the
+/// revision again immediately before writing the key
+/// ([`crate::agent_pty::AnswerGate`]), drops the key if the change was recorded
+/// first. A change recorded after that check is not stopped and receives the
+/// key; the next key's check detects it if it was ingested, and a redraw the
+/// agent makes with no hook stays undetectable, for that key and the ones after
+/// it. The deck's own clearing event and every clear on a failure name the
+/// revision too. So a same-id replacement that registers between validation
 /// and delivery is refused as stale, never answered with a choice made for the
-/// question it replaced.
+/// question it replaced, when the answer is a held reply or when the
+/// replacement is recorded before the PTY thread's check of the key.
 ///
 /// **One answer per agent at a time, and not the same question twice in a
 /// row.** The agent's [`crate::agent_pty::QuestionAnswers::slot`] is held from
@@ -10939,10 +10944,10 @@ mod question_answer_tests {
     /// that the form is still the pending question when an event replacing the
     /// form arrives — the same id with other questions — or one that clears it.
     /// That event waits until the deck's digit is queued for the terminal. The
-    /// digit is then either typed into the form it was checked against, or —
-    /// when the change is applied before the terminal takes it — not typed at
-    /// all and the answer refused as stale; either way the deck's next digit is
-    /// never typed into the changed prompt.
+    /// digit is then either written after passing the terminal's check, or —
+    /// when the change reaches that check first — not typed at all and the
+    /// answer refused as stale; either way the deck's next digit is never
+    /// typed into the changed prompt.
     #[spec("question/answer/012")]
     #[tokio::test]
     async fn question_answer_012_no_question_change_lands_between_a_key_s_check_and_its_queueing() {
@@ -11092,9 +11097,11 @@ mod question_answer_tests {
     /// and is about to queue its first digit when an Idle event arrives that
     /// names the agent's session but no pane. That event clears the pane's
     /// question, so it waits for the deck's digit to be queued exactly as an
-    /// event naming the pane would; the digit is then either typed before the
-    /// clear or dropped, never typed after it, and the next digit is never
-    /// typed. The same event also lets a held question's producer go.
+    /// event naming the pane would, and then clears that pane's question and
+    /// record; the first digit is either written after passing the terminal's
+    /// check or dropped if the clear reached that check first, and the next
+    /// digit is never typed. The same event also lets a held question's
+    /// producer go.
     #[spec("question/answer/014")]
     #[tokio::test]
     async fn question_answer_014_an_event_naming_no_pane_waits_for_its_session_s_pane() {
@@ -11127,14 +11134,14 @@ mod question_answer_tests {
         {
             assert!(
                 matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
-                "the checked key was typed before the clear: {refused:?}"
+                "a first key written after passing the PTY thread's check leaves the answer to fail at the second: {refused:?}"
             );
         } else {
             assert_eq!(refused, Err(AnswerRefusal::Stale { current_id: None }));
         }
         assert!(
             !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
-            "no key was typed after the clear"
+            "the second key was not typed once the clear was ingested"
         );
         assert_eq!(
             fx.pending_question().await,

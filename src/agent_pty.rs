@@ -7613,7 +7613,8 @@ impl AgentPtyRegistry {
     /// only if that is still the question pending on the pane when it comes to
     /// it; a replacement or clear ingested in between drops it unwritten. One
     /// ingested after that check is not stopped: the key is already going to
-    /// the PTY, and the next key's check sees the change.
+    /// the PTY, and only the next key's check detects the change. A redraw the
+    /// agent makes with no hook is detected by neither check.
     pub async fn write_answer_keys<Fut>(
         &self,
         agent_id: &str,

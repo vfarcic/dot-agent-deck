@@ -7098,8 +7098,8 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/answer/014 — An event naming no pane waits for its session's pane.
 - **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the registry's ownership oracle installed and the pane outside the managed set, as on an ordinary daemon pane; a barrier after a key's revalidation).
 - **Agent:** none (`/bin/cat` stand-ins for Codex and Claude Code).
-- **Asserts:** a bare `Idle` naming the session but no pane, ingested through `ingest_event`, waits while the deck's first digit is between its check and its queueing (audit T2); after it the question is cleared, the digit was typed before the clear or dropped, and the second digit is never typed; the pane's record of its pending question is reconciled; the same event releases a held question's producer.
-- **Does not assert:** the hook socket's framing (the event enters at `ingest_event`, which the hook loop calls); a real agent.
+- **Asserts:** a bare `Idle` naming the session but no pane, ingested through `ingest_event`, waits while the deck's first digit is between its check and its queueing (audit T2) — the pane-less event is serialised with the key's check-to-queue window; after it the question is cleared on the pane the session resolves to and that pane's record of its pending question is reconciled; the first digit is either written after passing the PTY thread's check or dropped if the clear reached that check first, and the second digit is refused after the ingested clear and never typed; the same event releases a held question's producer.
+- **Does not assert:** whether the first digit is written before or after the clear is applied (only that it passed the PTY thread's check or was dropped; the accepted residual in `docs/develop/agent-questions.md`); the hook socket's framing (the event enters at `ingest_event`, which the hook loop calls); a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### question/answer/015 — An event naming no pane follows its session onto a pane.
