@@ -26,6 +26,17 @@ function fixturePhrases(action: string): string[] {
   return phrases(row[1]);
 }
 
+/** PRD #1541 — interrupt's fixture row is Rust's two lists, in order. */
+function interruptPhrases(): string[] {
+  return [...rustPhrases("INTERRUPT_PHRASES"), ...rustPhrases("TYPING_STOP_PHRASES")];
+}
+
+function expectedPhrases(name: string): string[] {
+  if (name === "SUBMIT_PHRASES") return submitPhrases();
+  if (name === "INTERRUPT_PHRASES") return interruptPhrases();
+  return rustPhrases(name);
+}
+
 function submitPhrases(): string[] {
   const row = commandsSource.match(/id\s*=\s*"submit_prompt"[\s\S]*?heard_as_whole\s*=\s*\[([\s\S]*?)\]/);
   if (!row) throw new Error("Rust submit_prompt heard_as_whole list was not found");
@@ -97,6 +108,63 @@ describe("browser fixture voice in typing mode", () => {
   });
 });
 
+describe("browser fixture prompt commands (PRD #1541)", () => {
+  const sentence = (hint: string) => `${hint[0].toUpperCase()}${hint.slice(1)}.`;
+  // `voice::outcome::TYPING_MODE_FIRST_HINT`, read off the Rust source with
+  // its `\`-continuations folded the way the compiler folds them.
+  const declared = outcomeSource.match(/pub const TYPING_MODE_FIRST_HINT: &str = "([^"]*)";/);
+  if (!declared) throw new Error("Rust TYPING_MODE_FIRST_HINT was not found");
+  const hint = declared[1].replace(/\\\n\s*/g, "");
+
+  /** Scenario: with typing mode on, every interrupt, clear and scratch phrase dispatches its own row, the bare stops interrupting. */
+  it.each([
+    ...interruptPhrases().map((phrase) => [phrase, "interrupt_agent"]),
+    ...rustPhrases("CLEAR_PROMPT_PHRASES").map((phrase) => [phrase, "clear_prompt"]),
+    ...rustPhrases("SCRATCH_PHRASES").map((phrase) => [phrase, "scratch_that"]),
+  ])("dispatches %s in typing mode as %s", (said, action) => {
+    expect(matchesAction(said, action, true)).toBe(true);
+  });
+
+  /** Scenario: with typing mode on, a sentence holding a command word, or a phrase after a dictation opener, is typed whole. */
+  it.each([
+    "we should work on the scratch feature",
+    "stop the build when tests fail",
+    "clear the cache please and then run it",
+    "type scratch that",
+    "say stop",
+  ])("types %s in typing mode", (said) => {
+    expect(resolveFixtureVoice(said, "agent", true).outcome).toMatchObject({
+      kind: "dispatch", action: "dictate_to_agent", params: [{ value: said }],
+    });
+  });
+
+  /** Scenario: with typing mode off in an agent's pane, an interrupt, clear or scratch phrase runs nothing and says to turn typing on first, with Rust's sentence. */
+  it.each([
+    ...rustPhrases("INTERRUPT_PHRASES").map((phrase) => [phrase, "interrupt_agent"]),
+    ...rustPhrases("CLEAR_PROMPT_PHRASES").map((phrase) => [phrase, "clear_prompt"]),
+    ...rustPhrases("SCRATCH_PHRASES").map((phrase) => [phrase, "scratch_that"]),
+  ])("asks for typing mode on %s outside it", (said, action) => {
+    expect(hint).toContain("typing on");
+    expect(resolveFixtureVoice(`okay, ${said} please`, "agent", false).outcome).toEqual({
+      kind: "unavailable", transcript: `okay, ${said} please`, action, hint, sentence: sentence(hint),
+    });
+  });
+
+  /** Scenario: with typing mode off, a bare stop is not taken as an interrupt or a typing-mode hint. */
+  it.each(rustPhrases("TYPING_STOP_PHRASES"))("leaves %s alone outside typing mode", (said) => {
+    const outcome = resolveFixtureVoice(said, "agent", false).outcome;
+    expect(outcome.kind === "unavailable" && outcome.hint === hint).toBe(false);
+    expect(outcome.kind === "dispatch" && outcome.action === "interrupt_agent").toBe(false);
+  });
+
+  /** Scenario: on the dashboard a prompt command is refused with the row's own hint, as commands.toml words it. */
+  it("refuses a prompt command on another screen with the row's hint", () => {
+    expect(resolveFixtureVoice("clear the prompt", "overview", false).outcome).toMatchObject({
+      kind: "unavailable", action: "clear_prompt", hint: rowField("clear_prompt", "unavailable_hint"),
+    });
+  });
+});
+
 function matchesAction(utterance: string, action: string, dictating: boolean): boolean {
   const outcome = resolveFixtureVoice(utterance, "agent", dictating).outcome;
   return outcome.kind === "dispatch" && outcome.action === action && outcome.params.length === 0;
@@ -108,12 +176,15 @@ describe("browser fixture reserved phrase parity with Rust", () => {
     ["DICTATION_OFF_PHRASES", "dictation_off", true],
     ["VOICE_OFF_PHRASES", "voice_off", true],
     ["SUBMIT_PHRASES", "submit_prompt", true],
+    ["INTERRUPT_PHRASES", "interrupt_agent", true],
+    ["CLEAR_PROMPT_PHRASES", "clear_prompt", true],
+    ["SCRATCH_PHRASES", "scratch_that", true],
   ] as const;
 
   /** Scenario: the preview and Rust carry the same reserved lists, including submit aliases declared on Rust's command row. The failure identifies missing and extra phrases by action. */
   it("has the same reserved phrases as Rust", () => {
     const differences = lists.flatMap(([name, action]) => {
-      const expected = name === "SUBMIT_PHRASES" ? submitPhrases() : rustPhrases(name);
+      const expected = expectedPhrases(name);
       const actual = fixturePhrases(action);
       return [
         ...expected.filter((phrase) => !actual.includes(phrase)).map((phrase) => `${action}: missing ${phrase}`),
@@ -127,7 +198,7 @@ describe("browser fixture reserved phrase parity with Rust", () => {
   it("classifies every Rust phrase with edge politeness", () => {
     const polite = rustPhrases("WHOLE_UTTERANCE_POLITENESS", outcomeSource);
     const wrong = lists.flatMap(([name, action, dictating]) => {
-      const expected = name === "SUBMIT_PHRASES" ? submitPhrases() : rustPhrases(name);
+      const expected = expectedPhrases(name);
       return expected.flatMap((phrase) => [phrase, ...polite.map((word) => `${word}, ${phrase} ${word}`)]
         .filter((utterance) => !matchesAction(utterance, action, dictating))
         .map((utterance) => `${action}: ${utterance}`));

@@ -1,0 +1,25 @@
+{
+  "claude_code": {
+    "interrupt": [{ "bytes": "\u001b", "pauseAfterMs": 0 }],
+    "clear": { "bytes": "\u0015", "presses": "per_wrapped_row", "maxPressesPerWrite": 32, "pauseBetweenWritesMs": 1000 },
+    "deleteChar": { "bytes": "\u007f", "maxLiteralWriteChars": 800 }
+  },
+  "open_code": {
+    "interrupt": [
+      { "bytes": "\u001b", "pauseAfterMs": 300 },
+      { "bytes": "\u001b", "pauseAfterMs": 0 }
+    ],
+    "clear": { "bytes": "\u0015", "presses": "per_line" },
+    "deleteChar": { "bytes": "\u007f" }
+  },
+  "pi": {
+    "interrupt": [{ "bytes": "\u001b", "pauseAfterMs": 0 }],
+    "clear": { "bytes": "\u0015", "presses": "per_line" },
+    "deleteChar": { "bytes": "\u007f" }
+  },
+  "codex": {
+    "interrupt": [{ "bytes": "\u001b", "pauseAfterMs": 0 }],
+    "clear": { "bytes": "\u0015", "presses": "per_line" },
+    "deleteChar": { "bytes": "\u007f", "maxLiteralWriteChars": 1000 }
+  }
+}
