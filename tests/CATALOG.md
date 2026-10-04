@@ -6912,6 +6912,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the real Tauri window or its form controls (no `tauri-driver` tier, #953); alternate agents or models; authoring and orchestration modes; desktop fallback against missing capabilities; model prose beyond the literal sentinel filename.
 - **Platform coverage:** mac+linux, developer machine only (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2 needs a developer's Claude credential and the harness uses Unix-domain sockets and Unix PTYs).
 
+### Test harness teardown (issue #1566)
+
+#### harness/teardown
+
+##### harness/teardown/001 — A test that panics with a live deck gets its failure dump but not a regenerated paired doc, so its process exits promptly instead of lingering until nextest's slow-timeout.
+- **Layer:** L2 lane 1, PTY-attached (the real `dot-agent-deck` binary on the `minimal` fixture, launched and panicked on a spawned thread named after the test so `TuiDeck`'s `Drop` runs its failure path).
+- **Agent:** none.
+- **Asserts:** the thread ends in the deliberate panic, not a launch or `wait_for_string` timeout, which would take the same failure path; the drop still writes the failure dump (`provenance.json` with `outcome: failed`, `final-grid.txt`); the paired `test.md` is not written. A `test.md` already in the recordings directory is set aside for the run and restored afterwards. Before the fix, the panicking drop called `regenerate_paired_doc`, which syn-parses every `#[spec]`-bearing source file and wrote this test's `test.md`; it took 8–24s on a loaded 16-core box and kept CI's `manager_016` alive past nextest's 180s timeout on starved 4-CPU runners.
+- **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:
