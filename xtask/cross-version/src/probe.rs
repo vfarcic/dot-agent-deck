@@ -76,17 +76,15 @@ const ISSUE_COMPONENT: &str = "dispatch-issue-";
 /// `dispatch-issue-1181-v2` names #1181, a coupled unit's
 /// `dispatch-issue-1109-1121` names both, and `dispatch-issue-11a81` none. A
 /// number later in the slug (`dispatch-issue-1181-v2-1109`) is never taken as an
-/// issue.
-fn component_issues(component: &str) -> Vec<u32> {
+/// issue. An all-digit segment too large to be an issue number is the error,
+/// naming it: ending the list there would drop it and select from the rest.
+fn component_issues(component: &str) -> Result<Vec<u32>, String> {
     let Some(rest) = component.strip_prefix(ISSUE_COMPONENT) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     rest.split('-')
-        .map_while(|seg| {
-            (!seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| seg.parse().ok())
-                .flatten()
-        })
+        .take_while(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+        .map(|seg| seg.parse().map_err(|_| seg.to_string()))
         .collect()
 }
 
@@ -121,7 +119,20 @@ impl Probe {
         const ASK: &str = "Pass `--probe <name>` for the probe written for this branch's change, \
                            or `--probe generic` for the four tells plus `role-set` and no \
                            branch-specific stimulus.";
-        let issues: BTreeSet<u32> = branch.split('/').flat_map(component_issues).collect();
+        let mut issues = BTreeSet::new();
+        for component in branch.split('/') {
+            match component_issues(component) {
+                Ok(named) => issues.extend(named),
+                Err(seg) => {
+                    return Err(format!(
+                        "`--probe auto` cannot identify the probe for `{branch}`: its \
+                         `{ISSUE_COMPONENT}` component has the segment `{seg}`, all digits and \
+                         too large to be an issue number.{} {ASK}",
+                        mentioned(branch)
+                    ));
+                }
+            }
+        }
         let issue = match issues.iter().copied().collect::<Vec<_>>()[..] {
             [issue] => issue,
             [] => {
@@ -135,8 +146,10 @@ impl Probe {
             ref several => {
                 return Err(format!(
                     "`--probe auto` cannot identify the probe for `{branch}`: it names more than \
-                     one issue (issues {}) — a coupled unit's `{ISSUE_COMPONENT}<a>-<b>`, or more \
-                     than one `{ISSUE_COMPONENT}` component — and a run carries one probe.{} {ASK}",
+                     one issue (issues {}) — a coupled unit's `{ISSUE_COMPONENT}<a>-<b>`, a slug \
+                     whose first word is a number (`{ISSUE_COMPONENT}<n>-404-fix` reads as two \
+                     issues), or more than one `{ISSUE_COMPONENT}` component — and a run carries \
+                     one probe.{} {ASK}",
                     several
                         .iter()
                         .map(|i| format!("#{i}"))
@@ -555,6 +568,36 @@ mod tests {
             Ok((Probe::TeardownInventory, 1109)),
             "one issue named twice is still one issue"
         );
+    }
+
+    /// Qodo on PR #1570: a slug whose first word is all digits cannot be told
+    /// apart from a coupled unit's second issue, so it is refused too — and the
+    /// refusal says that is the likely reason, rather than only "coupled".
+    #[test]
+    fn a_slug_starting_with_a_number_is_refused_and_says_why() {
+        let err = Probe::for_branch("agent/dispatch-issue-1181-404-fix").expect_err("ambiguous");
+        assert!(err.contains("#404, #1181"), "{err}");
+        assert!(
+            err.contains("slug whose first word is a number"),
+            "names the slug reading as well as the coupled one: {err}"
+        );
+        assert!(err.contains("#1181 (`git-env`)"), "{err}");
+    }
+
+    /// Qodo on PR #1570: an all-digit segment too large for an issue number
+    /// used to END the list like a slug does, so this selected #1109's probe
+    /// alone. It is an issue-number segment that cannot be read, and refused.
+    #[test]
+    fn an_issue_segment_too_large_to_read_is_refused_not_dropped() {
+        for branch in [
+            "agent/dispatch-issue-1109-4294967296",
+            "agent/dispatch-issue-4294967296",
+            "agent/dispatch-issue-4294967296-1109",
+        ] {
+            let err = Probe::for_branch(branch).expect_err("an unreadable issue number");
+            assert!(err.contains("`4294967296`"), "{branch}: {err}");
+            assert!(err.contains("--probe generic"), "{branch}: {err}");
+        }
     }
 
     #[test]
