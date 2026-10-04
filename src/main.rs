@@ -2449,109 +2449,28 @@ async fn run_tui_session() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
-/// long-lived `SubscribeEvents` connection against the daemon and
-/// route each [`BroadcastMsg::Event`] into the TUI's `AppState` via
-/// `apply_event`.
-///
-/// PRD #93 round-5: the delegate / work-done variants used to ride this
-/// channel too — the daemon couldn't dispatch them locally and the TUI
-/// re-ran the role-validation guards. The daemon now owns dispatch end
-/// to end (writes the prompt directly into the target pane's PTY), so
-/// only hook events flow through here.
-///
-/// Reconnects with a small backoff on transport errors so a daemon
-/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
-/// automatically.
+/// PRD #76 M2.17: spawn the TUI's event subscriber — see
+/// [`dot_agent_deck::event_subscriber`].
 fn spawn_event_subscriber(
     attach_path: std::path::PathBuf,
     state: dot_agent_deck::state::SharedState,
 ) {
-    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
 
-    tokio::spawn(async move {
-        // Backoff parameters tuned for "daemon briefly unavailable" rather
-        // than long outages: a fresh-daemon ready window is sub-second, so
-        // a 500ms initial delay catches most transient cases, and we cap
-        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
-        let mut delay = std::time::Duration::from_millis(500);
-        let max_delay = std::time::Duration::from_secs(5);
-        let client = DaemonClient::new(attach_path);
-        loop {
-            match client.subscribe_events().await {
-                Ok(mut sub) => {
-                    // Reset backoff on a successful subscribe.
-                    delay = std::time::Duration::from_millis(500);
-                    loop {
-                        match sub.next_event().await {
-                            Ok(Some(BroadcastMsg::Event(event))) => {
-                                #[cfg(feature = "e2e")]
-                                if e2e_subscriber_drops(&event) {
-                                    continue;
-                                }
-                                state.write().await.apply_event(event);
-                            }
-                            // PRD #120: a daemon-spawned orchestration (issue
-                            // dispatch). Queue it for the render loop, which owns
-                            // the TabManager + pane controller and builds the
-                            // live tab. The subscriber task can't touch those.
-                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
-                                state.write().await.queue_orchestration_surface(surface);
-                            }
-                            // Issue #717: a close left a dispatched worktree on
-                            // disk. Queue it for the render loop for the same
-                            // reason as the surface above — the status line is
-                            // `UiState`, which this task cannot touch.
-                            Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
-                                state.write().await.queue_worktree_kept(kept);
-                            }
-                            // PRD #741 M8 (issue #801 item 3): a `kind` tag this
-                            // build does not know, from a newer daemon. Ignored
-                            // rather than escalated — there is no payload to act
-                            // on, and the TUI's own state is rebuilt from
-                            // `list_agents` at hydration and reconciled by the
-                            // ordinary event flow, so a message it cannot read
-                            // costs it nothing it can name.
-                            //
-                            // What the variant buys is the line above this one:
-                            // before it, such a frame failed its whole decode
-                            // and arrived at the `Err` arm below, which breaks
-                            // the loop and reconnects. A daemon pushing the new
-                            // variant regularly therefore took the TUI's event
-                            // stream down every time it did.
-                            Ok(Some(BroadcastMsg::Unknown)) => {
-                                tracing::debug!(
-                                    "subscribe_events: ignoring a broadcast kind this build does                                      not know"
-                                );
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "subscribe_events: stream error, reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "subscribe_events: subscribe failed, retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, max_delay);
-        }
-    });
+    let config = SubscriberConfig {
+        #[cfg(feature = "e2e")]
+        drop_event: Some(e2e_subscriber_drops),
+        ..SubscriberConfig::default()
+    };
+    tokio::spawn(run(DaemonClient::new(attach_path), state, config));
 }
 
 /// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
-/// way it does when they arrive while it is reconnecting — it resubscribes
-/// without replaying what it missed, so the daemon knows the conversation and
-/// the TUI never learns it. A reconnect cannot be timed against an agent's boot
+/// way it did when they arrived while it was reconnecting — it resubscribed
+/// without replaying what it missed, so the daemon knew the conversation and
+/// the TUI never learned it. (Since issue #1520 a reconnect re-reads the
+/// daemon's state, so this seam now models a gap the subscriber does not see,
+/// which the daemon's `stale` refusal still covers.) A reconnect cannot be timed against an agent's boot
 /// from a PTY test, so the test names a session-id prefix in
 /// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
 /// asserts the prompt is still delivered.

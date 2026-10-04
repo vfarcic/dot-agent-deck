@@ -1732,6 +1732,31 @@ pub struct AppState {
     /// caller-steerable; the count is bounded by the conversations ended by
     /// agents this daemon spawned.
     agent_generation_closures: HashMap<String, u64>,
+    /// Issue #1520: how many times this state's event stream has broken — the
+    /// TUI's subscriber lost its `SubscribeEvents` connection (a `KIND_STREAM_END
+    /// "lagged"`, a daemon restart, a transport error) and so missed whatever the
+    /// daemon broadcast until it resubscribed. Bumped by
+    /// [`Self::note_event_stream_gap`] when the stream ends and again by
+    /// [`Self::resync_after_event_gap`] once it is back.
+    ///
+    /// Every TUI-side delivery check that reads this state's history rests on
+    /// that history being in order and complete: [`Self::pane_generation_closures`]
+    /// ("how many conversations ended since we wrote"), the announced-generation
+    /// witness, and the per-pane event journal that confirms a submission. A
+    /// snapshot re-read after the reconnect repairs what the pane's state IS, but
+    /// cannot say what happened while nobody was listening — whether a
+    /// conversation the delivery wrote into ended, or whether the agent already
+    /// reported submitting it. So a delivery that may have written before a gap
+    /// stops rather than retrying or confirming against a history with a hole in
+    /// it (`ui::delivery_outlived_event_gap`). That is the same terminal outcome a
+    /// counted closure already produces, and it never writes again.
+    ///
+    /// Global rather than per pane because a gap is: it drops every pane's events
+    /// at once, including a pane this state had not yet heard from — the
+    /// no-generation launcher pane at the centre of #621, which has no entry in
+    /// any per-pane map to bump. Only the TUI's subscriber bumps it; the daemon's
+    /// own state consumes its events in-process and stays at 0. In memory only.
+    event_stream_gaps: u64,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -10046,6 +10071,48 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
     }
 }
 
+/// The kept-card half of [`AppState::seed_hydrated_session`]: a card that
+/// already exists takes the daemon's snapshot only when the snapshot is the
+/// fresher evidence, plus the live-target tie exception. Shared with
+/// [`AppState::resync_after_event_gap`], which refreshes cards that already
+/// exist and must not mint any. See `seed_hydrated_session`'s doc comment for
+/// both rules.
+fn overlay_snapshot_onto_kept_card(
+    session: &mut SessionState,
+    snap: &SessionSnapshot,
+    observed: Option<DateTime<Utc>>,
+) {
+    if let Some(observed) = observed
+        && observed > session.last_activity
+        && observed <= Utc::now()
+    {
+        // PRD #1223 with issue #804: a card the upsert kept takes the
+        // snapshot only when the snapshot is the fresher evidence, by the
+        // same clock bar as the minted branch: strictly newer than what the
+        // card holds, and no later than now. See the doc comment.
+        if let Some(agent_type) = snap.agent_type.clone() {
+            session.agent_type = agent_type;
+        }
+        // The stamp moves BEFORE the carrier is built, so the carrier sits
+        // at the snapshot's instant: the newest evidence the card now
+        // holds, and still no later than now.
+        session.last_activity = observed;
+        overlay_snapshot_fields(session, snap);
+    } else if let Some(observed) = observed
+        && observed == session.last_activity
+        && session.live_target().is_none()
+        && let Some(live_target) = snap.live_target
+    {
+        // PRD #1223: the tie exception in the doc comment. Only the
+        // live-target carrier moves, because a missing one lets a card
+        // that should refuse input accept it; the display fields stay,
+        // since an equal stamp gives no reason to prefer the snapshot's.
+        // The carrier is stamped at the card's `last_activity`, which is
+        // the snapshot's instant too, so it moves no watermark.
+        push_live_target_carrier(session, live_target);
+    }
+}
+
 /// The snapshot fields [`AppState::seed_hydrated_session`] copies onto a card:
 /// status, tool fields, prompt context and the live-target carrier. Everything
 /// but `agent_type` and `last_activity`, which the two callers decide
@@ -10992,34 +11059,8 @@ impl AppState {
             {
                 session.last_activity = observed;
             }
-        } else if let Some(observed) = observed
-            && observed > session.last_activity
-            && observed <= Utc::now()
-        {
-            // PRD #1223 with issue #804: a card the upsert kept takes the
-            // snapshot only when the snapshot is the fresher evidence, by the
-            // same clock bar as the minted branch: strictly newer than what the
-            // card holds, and no later than now. See the doc comment.
-            if let Some(agent_type) = snap.agent_type.clone() {
-                session.agent_type = agent_type;
-            }
-            // The stamp moves BEFORE the carrier is built, so the carrier sits
-            // at the snapshot's instant: the newest evidence the card now
-            // holds, and still no later than now.
-            session.last_activity = observed;
-            overlay_snapshot_fields(session, snap);
-        } else if let Some(observed) = observed
-            && observed == session.last_activity
-            && session.live_target().is_none()
-            && let Some(live_target) = snap.live_target
-        {
-            // PRD #1223: the tie exception in the doc comment. Only the
-            // live-target carrier moves, because a missing one lets a card
-            // that should refuse input accept it; the display fields stay,
-            // since an equal stamp gives no reason to prefer the snapshot's.
-            // The carrier is stamped at the card's `last_activity`, which is
-            // the snapshot's instant too, so it moves no watermark.
-            push_live_target_carrier(session, live_target);
+        } else {
+            overlay_snapshot_onto_kept_card(session, snap, observed);
         }
     }
 
@@ -11073,6 +11114,119 @@ impl AppState {
                 self.pane_generation_announced.remove(pane_id);
                 established_at
             }
+        };
+        self.pane_hook_session.insert(
+            pane_id.to_string(),
+            (generation.session_id.clone(), established_at),
+        );
+    }
+
+    /// Issue #1520: see [`Self::event_stream_gaps`].
+    pub fn event_stream_gaps(&self) -> u64 {
+        self.event_stream_gaps
+    }
+
+    /// Issue #1520: the event stream just broke, so from now until
+    /// [`Self::resync_after_event_gap`] this state is missing whatever the
+    /// daemon broadcasts. Counted at the break rather than only at the
+    /// resubscribe so a delivery written before it stops at once instead of
+    /// acting on missing evidence while the subscriber is backing off. See
+    /// [`Self::event_stream_gaps`].
+    pub fn note_event_stream_gap(&mut self) {
+        self.event_stream_gaps = self.event_stream_gaps.saturating_add(1);
+    }
+
+    /// Issue #1520: bring this state back into agreement with the daemon after
+    /// the event subscriber resubscribed, from the daemon's `ListAgents` reply.
+    ///
+    /// Called with the new subscription already open and BEFORE any of its
+    /// events are applied, so the reply was built after everything this state
+    /// holds and is the newer account of every pane it covers.
+    ///
+    /// For each record whose pane this state manages and which carries a live
+    /// snapshot:
+    ///
+    /// * **The pane's generation becomes the daemon's**
+    ///   ([`SessionSnapshot::hook_generation`]), whoever set the local one. Unlike
+    ///   [`Self::adopt_hydrated_generation`], a local announcement does not
+    ///   outrank it: that rule protects an announcement applied AFTER the snapshot
+    ///   was built, and nothing here was. Where the local generation was a
+    ///   different one, that conversation ended or was superseded while the
+    ///   stream was down, and [`Self::pane_generation_closures`] counts it — the
+    ///   transition the stream would have counted. Where the local view had no
+    ///   generation, adopting one counts nothing, exactly as a first
+    ///   `SessionStart` does not.
+    /// * **An existing card is refreshed** by the same newer-only rule hydration
+    ///   applies to a card it keeps. No card is minted: which panes this TUI
+    ///   hosts is the render loop's business, not this task's.
+    ///
+    /// What it does NOT repair, deliberately. A snapshot with no
+    /// `hook_generation` leaves the local generation alone: a daemon predating
+    /// #532 omits the field for a pane that has one, so absence is not proof the
+    /// pane has none. A record with no live snapshot, and a pane this state does
+    /// not manage, are left as they are. None of these can mis-deliver a prompt:
+    /// a delivery that may have written before the gap stops on the gap itself
+    /// ([`Self::event_stream_gaps`], bumped here as well, so one written while
+    /// the subscriber was disconnected stops too), and one that has not written
+    /// binds the generation it is about to name and is refused `stale` by the
+    /// daemon if that is not the pane's.
+    pub fn resync_after_event_gap(&mut self, records: &[crate::agent_pty::AgentRecord]) {
+        self.note_event_stream_gap();
+        for record in records {
+            let Some(pane_id) = record.pane_id_env.as_deref() else {
+                continue;
+            };
+            if !self.managed_pane_ids.contains(pane_id) {
+                continue;
+            }
+            let Some(snap) = record.live.as_ref() else {
+                continue;
+            };
+            if let Some(generation) = snap.hook_generation.as_ref() {
+                self.resync_generation(pane_id, generation);
+            }
+            let observed = snap
+                .last_activity_ms
+                .and_then(DateTime::<Utc>::from_timestamp_millis);
+            if let Some(card) = self
+                .sessions
+                .values_mut()
+                .filter(|s| {
+                    s.pane_id.as_deref() == Some(pane_id)
+                        && s.agent_id.as_deref() == Some(record.id.as_str())
+                })
+                .max_by(|a, b| {
+                    a.last_activity
+                        .cmp(&b.last_activity)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                })
+            {
+                overlay_snapshot_onto_kept_card(card, snap, observed);
+            }
+        }
+    }
+
+    /// Issue #1520: the generation half of [`Self::resync_after_event_gap`].
+    fn resync_generation(&mut self, pane_id: &str, generation: &HookGeneration) {
+        let Some(established_at) =
+            DateTime::<Utc>::from_timestamp_millis(generation.established_ms)
+        else {
+            return;
+        };
+        self.pane_generation_announced.remove(pane_id);
+        let established_at = match self.pane_hook_session.get(pane_id) {
+            Some((current, current_ts)) if *current == generation.session_id => {
+                established_at.max(*current_ts)
+            }
+            Some(_) => {
+                let closures = self
+                    .pane_generation_closures
+                    .entry(pane_id.to_string())
+                    .or_insert(0);
+                *closures = closures.saturating_add(1);
+                established_at
+            }
+            None => established_at,
         };
         self.pane_hook_session.insert(
             pane_id.to_string(),

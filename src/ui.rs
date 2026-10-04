@@ -1894,11 +1894,14 @@ struct PromptDelivery {
     /// Issue #621: the generation the DAEMON named when it refused this
     /// delivery `stale` for naming none — the pane's current conversation as
     /// the authoritative state saw it, which this TUI's own view may never
-    /// learn. The event subscriber does not replay what it missed across a
-    /// reconnect, so a dropped `SessionStart` leaves
+    /// learn. A `SessionStart` this view's stream dropped leaves
     /// `AppState::pane_hook_session_id` at `None` for an agent that is sitting
     /// idle, waiting for exactly the prompt it would take to make it emit
-    /// anything else.
+    /// anything else. Since issue #1520 the event subscriber re-reads the
+    /// daemon's generations when it reconnects
+    /// (`AppState::resync_after_event_gap`), which repairs the reconnect case;
+    /// this still covers a gap that subscriber cannot see, and a daemon whose
+    /// snapshot omits the generation.
     ///
     /// Recorded only while the delivery is unbound AND has written nothing
     /// (`attempts == 0`), and consumed by [`bind_delivery_generation`] under
@@ -1909,6 +1912,8 @@ struct PromptDelivery {
     /// tell the conversation it wrote into from a successor whose predecessor
     /// ended while it was not looking (the #424 H4 sequence), which is what the
     /// closure count exists to see and what a dropped event stream also drops.
+    /// Such a delivery stops at a reconnect instead
+    /// ([`delivery_outlived_event_gap`]).
     ///
     /// [`delivery_target_changed`] reads it as the pane's current generation
     /// while the snapshot has none, which is the one place the snapshot's
@@ -1923,9 +1928,7 @@ struct PromptDelivery {
     /// adopted at hydration — the snapshot wins in both places. On the daemon
     /// side the value it carries IS the `pane_hook_session` entry that rule
     /// governs, read by the guard that refused, so it is exactly what a named
-    /// retry is compared against. Hydration runs when the TUI starts or attaches
-    /// a pane, not when the event subscriber reconnects, which is why a running
-    /// TUI still needs this.
+    /// retry is compared against.
     refusal_generation: Option<String>,
     /// Issue #621 (review): some request of this delivery failed after it may
     /// have reached the daemon's write, so it may have written although
@@ -1972,6 +1975,11 @@ struct PromptDelivery {
     /// the identity of a generation this delivery saw, the count is the number of
     /// conversations it MISSED.
     closures_at_write: Option<u64>,
+    /// Issue #1520: [`crate::state::AppState::event_stream_gaps`] at the instant
+    /// of the FIRST write — stamped beside [`Self::closures_at_write`], at the
+    /// same moment (before the RPC) and for the same reason. `None` until then.
+    /// See [`delivery_outlived_event_gap`].
+    gaps_at_write: Option<u64>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
     /// is on.
@@ -4024,6 +4032,25 @@ fn process_pending_seed_prompts(
             // Neither retyping into its successor nor accepting that successor's
             // events as confirmation is safe, so the delivery stops here with a
             // visible reason.
+            // Issue #1520: the event stream broke after this delivery may have
+            // written, so neither its target check nor its confirmation can
+            // trust the history below. See [`delivery_outlived_event_gap`].
+            if delivery_outlived_event_gap(snapshot, delivery) {
+                log_prompt_stopped(
+                    "seed",
+                    &sp.pane_id,
+                    &delivery.delivery_id,
+                    "event-stream-gap",
+                );
+                feedback = Some(
+                    "Seed prompt not confirmed (lost contact with the agent's events); \
+                     not retried"
+                        .to_string(),
+                );
+                backoff.remove(&sp.pane_id);
+                deliveries.remove(&sp.pane_id);
+                return false;
+            }
             if delivery_target_changed(snapshot, &sp.pane_id, delivery) {
                 log_prompt_stopped(
                     "seed",
@@ -4151,6 +4178,7 @@ fn process_pending_seed_prompts(
                     refusal_generation: None,
                     write_unacknowledged: false,
                     closures_at_write: None,
+                    gaps_at_write: None,
                     // PRD #20 finding #3: globally-unique id (process nonce +
                     // global counter), not a per-process `seed-<pane>-N`.
                     delivery_id: mint_delivery_id(&sp.pane_id),
@@ -4232,6 +4260,9 @@ fn process_pending_seed_prompts(
                 && delivery.closures_at_write.is_none()
             {
                 delivery.closures_at_write = Some(closures);
+                // Issue #1520: and the event-stream gap count, at the same
+                // instant — see [`PromptDelivery::gaps_at_write`].
+                delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
             }
             let issued = IssuedPromptSend {
                 delivery_id: Some(delivery_id),
@@ -4493,6 +4524,7 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
             refusal_generation: None,
             write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             // PRD #20 finding #3: globally-unique id (process nonce + global
             // counter) so a TUI restart can't collide with the daemon's still-live
             // dedup ledger.
@@ -4637,6 +4669,32 @@ enum SubmissionEvidence {
     /// dispatch task twice. See [`prompt_submission_accumulated`] for why this is
     /// a safety net rather than the remedy.
     Accumulated,
+}
+
+/// Issue #1520: the TUI's event stream broke after this delivery may have
+/// written — [`crate::state::AppState::event_stream_gaps`] has moved since
+/// [`PromptDelivery::gaps_at_write`].
+///
+/// Every other check on a written delivery reads the history the subscriber
+/// built: [`delivery_target_changed`]'s closure count and generation witness,
+/// and the per-pane journal [`prompt_submission_evidence`] confirms from. After a
+/// gap that history has a hole of unknown content. The subscriber re-reads the
+/// daemon's state when it reconnects, which tells this delivery what the pane's
+/// conversation IS, but not whether the one its bytes entered ended while nobody
+/// was listening (the #424 H4 sequence), nor whether the agent already reported
+/// submitting them. Retrying could type the task into a successor conversation
+/// or submit it twice; confirming could take a successor's events as evidence.
+///
+/// So the delivery stops, and writes nothing more — the same terminal outcome a
+/// counted closure already gives, chosen over a daemon-side closure counter
+/// because that needs a new wire field for an event (a broken subscription) that
+/// is rare, while stopping is safe with what the daemon already sends. A
+/// delivery that has written nothing (`None`) is untouched: it binds against the
+/// resynchronized state like any other.
+fn delivery_outlived_event_gap(snapshot: &AppState, delivery: &PromptDelivery) -> bool {
+    delivery
+        .gaps_at_write
+        .is_some_and(|at_write| snapshot.event_stream_gaps() > at_write)
 }
 
 /// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
@@ -5333,6 +5391,27 @@ fn deliver_orchestrator_prompt(
         // Reviewer findings B1/B2: the conversation we wrote into is GONE.
         // Neither retyping into its successor nor accepting that successor's
         // events as confirmation is safe.
+        // Issue #1520: see the seed path's twin and
+        // [`delivery_outlived_event_gap`].
+        if delivery_outlived_event_gap(snapshot, delivery) {
+            log_prompt_stopped(
+                "orchestrator",
+                &start_pane_id,
+                &delivery_id,
+                "event-stream-gap",
+            );
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                "Orchestrator prompt not confirmed (lost contact with the agent's events); \
+                 not retried"
+                    .to_string(),
+            );
+            return;
+        }
         if delivery_target_changed(snapshot, &start_pane_id, delivery) {
             log_prompt_stopped(
                 "orchestrator",
@@ -5548,6 +5627,9 @@ fn deliver_orchestrator_prompt(
         && delivery.closures_at_write.is_none()
     {
         delivery.closures_at_write = Some(closures);
+        // Issue #1520: see the seed path's twin and
+        // [`PromptDelivery::gaps_at_write`].
+        delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
     }
     let issued = IssuedPromptSend {
         delivery_id,
@@ -38277,6 +38359,110 @@ mod tests {
         }
     }
 
+    /// Scenario: Write a seed into a pane through the readiness fallback while its agent has announced no conversation, then break the TUI's event stream and reconnect it, the daemon having seen the agent announce one meanwhile. The TUI's state must agree with the daemon again, and the seed must stop with a visible reason rather than be typed a second time into a conversation the TUI cannot vouch for; a control where the same announcement arrives on an unbroken stream retries into it.
+    #[spec("prompt/pane-input/047")]
+    #[test]
+    fn pane_input_047_a_written_seed_stops_after_an_event_stream_gap() {
+        const PROMPT: &str = "seed written before an event-stream gap";
+        for gap in [true, false] {
+            let case = if gap {
+                "event-stream gap"
+            } else {
+                "control: unbroken stream"
+            };
+            let pane_id = if gap { "gap-pane" } else { "unbroken-pane" };
+            let agent_id = format!("{pane_id}-agent");
+            let controller = Arc::new(RecordingPaneController::default());
+            let writes = controller.writes.clone();
+            let pane: Arc<dyn PaneController> = controller;
+            let mut ui = default_ui();
+            // The `devbox run claude …` launcher case issue #424 exists for, and
+            // the one #1520 names: the fallback writes while the pane has no
+            // generation, so the agent's first announcement after it is the
+            // conversation the seed is waiting to reach.
+            ui.pending_seed_prompts
+                .push(aged_seed_prompt(pane_id, PROMPT));
+            let mut snapshot = ready_prompt_snapshot(pane_id, &agent_id);
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+            assert_eq!(
+                writes.lock().unwrap().len(),
+                1,
+                "{case}: precondition — the fallback writes before the agent announces \
+                 itself"
+            );
+
+            let genuine = format!("{pane_id}-genuine-generation");
+            if gap {
+                // The subscriber's stream ends; while it is down the daemon sees
+                // the agent announce `genuine`. On resubscribing it re-reads the
+                // daemon's `ListAgents` reply, joined as the daemon joins it.
+                snapshot.note_event_stream_gap();
+                let mut daemon = snapshot.clone();
+                apply_generation_event(
+                    &mut daemon,
+                    pane_id,
+                    &agent_id,
+                    &genuine,
+                    EventType::SessionStart,
+                );
+                let mut records: Vec<crate::agent_pty::AgentRecord> = vec![
+                    serde_json::from_value(
+                        serde_json::json!({ "id": agent_id, "pane_id_env": pane_id }),
+                    )
+                    .unwrap(),
+                ];
+                daemon.attach_live_sessions(&mut records);
+                snapshot.resync_after_event_gap(&records);
+                assert_eq!(
+                    snapshot.pane_hook_session_id(pane_id).as_deref(),
+                    Some(genuine.as_str()),
+                    "{case}: the resync must leave the TUI on the daemon's conversation"
+                );
+            } else {
+                apply_generation_event(
+                    &mut snapshot,
+                    pane_id,
+                    &agent_id,
+                    &genuine,
+                    EventType::SessionStart,
+                );
+            }
+
+            ui.send_retry_backoff
+                .get_mut(pane_id)
+                .expect("an unconfirmed write arms retry")
+                .next_attempt_at = std::time::Instant::now();
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            let records = writes.lock().unwrap().clone();
+            if gap {
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "{case}: a seed written before the gap must not be written again — \
+                     the TUI cannot tell whether `{genuine}` is the conversation its bytes \
+                     entered or a successor of one that ended unseen; writes={records:?}"
+                );
+                assert!(
+                    !ui.prompt_delivery.contains_key(pane_id),
+                    "{case}: the delivery must stop, not stay armed"
+                );
+                let status = format!("{:?}", ui.status_message);
+                assert!(
+                    status.contains("lost contact with the agent's events"),
+                    "{case}: the stop must say why; status={status}"
+                );
+            } else {
+                assert_eq!(
+                    records.len(),
+                    2,
+                    "{case}: with no gap the retry goes into the announced conversation; \
+                     writes={records:?}"
+                );
+            }
+        }
+    }
+
     /// Scenario: Start an agent whose daemon has recorded its conversation while the TUI's own view never received that `SessionStart` (the event stream dropped it across a reconnect), then let the seed and orchestrator prompts go out. Every unnamed write is refused `stale`, and the prompt must still reach the agent's pane, naming the conversation the daemon reported; a control where the TUI does see the start after one `stale` delivers too, without counting that refusal as an attempt.
     #[cfg(unix)]
     #[spec("prompt/pane-input/045")]
@@ -38505,6 +38691,7 @@ mod tests {
             refusal_generation: None,
             write_unacknowledged: false,
             closures_at_write: Some(0),
+            gaps_at_write: None,
             delivery_id: "refusal-policy".to_string(),
             epoch: 0,
             wire_issued: true,
@@ -41023,6 +41210,7 @@ mod tests {
             refusal_generation: None,
             write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             delivery_id: "delivery-7".into(),
             attempts: 0,
             watermark: None,
@@ -41131,6 +41319,7 @@ mod tests {
             refusal_generation: None,
             write_unacknowledged: false,
             closures_at_write: None,
+            gaps_at_write: None,
             delivery_id: "legacy-1".into(),
             attempts: 1,
             watermark: pane_event_watermark(&snapshot, PANE_ID),

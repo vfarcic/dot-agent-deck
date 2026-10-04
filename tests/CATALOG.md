@@ -1607,7 +1607,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L1 (in-process seed and orchestrator consumers driven through the production `begin_guarded_submit` against the production attach handler over a real socket, with a `/bin/cat` target whose PTY buffer is the delivery evidence; the daemon's `AppState` and the TUI's snapshot are separate, so they can disagree).
 - **Agent:** none (a synthetic Codex `SessionStart` applied to the daemon's state only).
 - **Asserts:** with the daemon holding a generation the TUI's snapshot never received, the first unnamed write is refused `stale`, the delivery binds the generation the refusal named, and the prompt reaches the pane on both TUI paths; on the pass after the write the delivery is still held for confirmation rather than abandoned as a changed conversation. Control: when the snapshot observes the start after one `stale`, the seed is delivered and the refusal did not count as an attempt. Reverting the daemon recording the generation, the client recording it, the bind using it, or the target check honouring it each turns the test red.
-- **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start, or one whose earlier request's response was lost — neither binds from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`), and both are still abandoned at the deadline (#1520); event-stream resynchronization after a reconnect, which this does not add; the wire field in isolation (`prompt/pane-input/009`); the spawned binary (`prompt/pane-input/044`).
+- **Does not assert:** a delivery that already WROTE into a pane with no generation and then missed the start, or one whose earlier request's response was lost — neither binds from a refusal by design (`ui::tests::refusal_generation_binds_only_an_unwritten_unbound_delivery`), and a reconnect now stops both (`prompt/pane-input/047`, issue #1520); event-stream resynchronization after a reconnect (`session/live/018`); the wire field in isolation (`prompt/pane-input/009`); the spawned binary (`prompt/pane-input/044`).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/pane-input/046 — A send into a pane that stopped reading comes back as possibly delivered instead of hanging, and does not hold up other panes (issue #525).
@@ -1616,6 +1616,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Asserts:** an identified `WriteAndSubmit` of a 200 KB line into the stuck pane returns `ambiguous` within 30 s rather than never; a send to the `cat` pane made while that one is pending returns `applied` within 8 s and its text reaches the pane; and the dashboard shows `Error` once the stuck send is reported. Before #525 the stuck send never came back, because its `write(2)` blocked the daemon's runtime worker until the pane read.
 - **Does not assert:** which card carries the `Error` (the grid is searched as a whole); the exact stall bound; a real agent that stops reading (no agent can be made to on demand); the unit-level accounting of a stalled write (`a_stalled_guarded_write_is_ambiguous_and_later_writes_add_nothing_behind_it` and the other issue #525 tests in `src/agent_pty.rs`).
 - **Platform coverage:** linux (the stuck-pane shape needs a kernel that blocks the master's writer on a full raw-mode input queue, which the macOS runner's did not).
+
+##### prompt/pane-input/047 — A seed written before the TUI's event stream broke stops after the reconnect instead of being typed again into a conversation the TUI cannot vouch for (issue #1520).
+- **Layer:** L1 (the production seed consumer `process_pending_seed_prompts` against a recording pane controller; the reconnect is the production `AppState::note_event_stream_gap` and `AppState::resync_after_event_gap` fed a `ListAgents` reply joined from a separate daemon-side `AppState` by `attach_live_sessions`).
+- **Agent:** none (a synthetic Codex `SessionStart`).
+- **Asserts:** a seed written by the readiness fallback while the pane had no generation; the stream breaks and, after the resync, the TUI holds the daemon's newly announced generation; the next pass then writes nothing more, drops the delivery, and says `lost contact with the agent's events`. Control: the same announcement on an unbroken stream retries into it (two writes). Removing the gap check from the seed path turns the test red.
+- **Does not assert:** the orchestrator path, which carries the same check at its own target-check site; the real subscriber reconnecting (`session/live/018`); a delivery that had written nothing before the gap, which binds against the resynchronized state as any unwritten delivery does.
+- **Platform coverage:** mac+linux.
 
 #### prompt/quit
 
@@ -4568,6 +4575,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Agent:** none (synthetic wrapped Codex: wrapper frames under `<pane>-session`, native frames under Codex's own session).
 - **Asserts:** the daemon holds the conversation Codex announced; a fresh TUI state that applied a wrapper frame before seeding, then sees a Codex `ToolStart`, holds that same conversation (before the fix: the wrapper's id); a fresh TUI state that applied a genuine `SessionStart` for a new session before seeding keeps it rather than rolling back to the reply (Qodo on #1515). Control: the same reply with `hook_generation` removed — an older daemon — leaves the TUI on the id it built from events.
 - **Does not assert:** a PTY-attached reconnect or the real event subscriber's timing (the pre-seed frames are applied directly to stand for what it delivered); the daemon's hook-socket admission of the frames.
+- **Platform coverage:** mac+linux.
+
+##### session/live/018 — A TUI event subscriber that reconnects after its stream is torn down brings the client state back into agreement with the daemon (issue #1520).
+- **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`; the `ListAgents` reply is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
+- **Agent:** none (synthetic Claude Code hook events).
+- **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected. Before the fix it stayed on `(gen-a, Idle, 0)`.
+- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a pane whose conversation ended with no successor, or a snapshot without `hook_generation` — the resync leaves the local generation alone for both (see `AppState::resync_after_event_gap`); a card for a pane this TUI does not manage, which the resync never mints.
 - **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
