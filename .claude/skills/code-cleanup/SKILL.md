@@ -73,7 +73,7 @@ Read the label back if it was just created; a unit whose `gh pr create --label c
 
 ## Step 2: disk and parallelism
 
-Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: `df -h /` before each dispatch, and below ~100G free, reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run; on their own, dispatch all three unless the runner says otherwise.
+Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: `df -h /` before each dispatch, and below ~100G free, reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run. Run on its own, this skill asks the runner how many may run at once (recommend 2–3, as `/issue-queue` does) before dispatching more than one, and dispatches the rest as units finish.
 
 ## Step 3: name each unit
 
