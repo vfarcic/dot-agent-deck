@@ -812,7 +812,9 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        std::fs::remove_file(&socket).expect("the daemon's socket goes with it");
+        tokio::fs::remove_file(&socket)
+            .await
+            .expect("the daemon's socket goes with it");
         // A dozen or more retries at this backoff.
         tokio::time::sleep(Duration::from_millis(400)).await;
         let gaps = state.read().await.event_stream_gaps();
