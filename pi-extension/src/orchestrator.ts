@@ -47,15 +47,41 @@ export function resolveDeckBin(env: Readonly<Record<string, string | undefined>>
  *
  * MUST stay in sync with the Rust `agent_event_type_from_state` vocabulary
  * (src/event.rs): `running` → Thinking, `waiting` → WaitingForInput,
- * `finished` → Idle. Anything else is rejected by the CLI, so the extension
- * must only ever emit one of these three strings.
+ * `finished` → Idle.
  */
 export const AGENT_STATES = ["running", "waiting", "finished"] as const;
 export type AgentState = (typeof AGENT_STATES)[number];
 
-/** Type guard: is `value` one of the three canonical states? */
+/** Type guard: is `value` one of the three canonical lifecycle states? */
 export function isAgentState(value: string): value is AgentState {
 	return (AGENT_STATES as readonly string[]).includes(value);
+}
+
+/**
+ * The card-detail reports `agent-event` accepts beside the lifecycle states
+ * (issue #622): `prompt` → Thinking carrying the submitted prompt,
+ * `tool-start` → ToolStart, `tool-end` → ToolEnd. Together with
+ * {@link AGENT_STATES} these are every `--type` the CLI accepts, and they MUST
+ * stay in sync with the Rust `AGENT_EVENT_TYPES` (src/event.rs).
+ */
+export const DETAIL_TYPES = ["prompt", "tool-start", "tool-end"] as const;
+export const AGENT_EVENT_TYPES = [...AGENT_STATES, ...DETAIL_TYPES] as const;
+export type AgentEventType = (typeof AGENT_EVENT_TYPES)[number];
+
+/** Type guard: is `value` a `--type` the CLI accepts? */
+export function isAgentEventType(value: string): value is AgentEventType {
+	return (AGENT_EVENT_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * The optional card detail an `agent-event` report carries (issue #622). Each
+ * becomes its own flag; a blank or missing value is left off entirely.
+ */
+export interface AgentEventDetail {
+	cwd?: string;
+	prompt?: string;
+	toolName?: string;
+	toolDetail?: string;
 }
 
 function requireNonBlank(value: unknown, label: string): string {
@@ -108,19 +134,35 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 }
 
 /**
- * Build the argv for `dot-agent-deck agent-event`. Rejects any non-canonical
- * state so a bogus `--type` can never reach the CLI.
+ * Build the argv for `dot-agent-deck agent-event`. Rejects any type the CLI
+ * does not accept so a bogus `--type` can never reach it, and appends each
+ * non-blank detail as its own flag in a fixed order. With no detail, a
+ * lifecycle report is exactly the argv it has always been.
  *
  * @example buildAgentEventArgv("running")
  *   → ["agent-event", "--type", "running"]
+ * @example buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "ls" })
+ *   → ["agent-event", "--type", "tool-start", "--tool-name", "bash", "--tool-detail", "ls"]
  */
-export function buildAgentEventArgv(state: string): string[] {
-	if (!isAgentState(state)) {
+export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {}): string[] {
+	if (!isAgentEventType(type)) {
 		throw new Error(
-			`dot-agent-deck agent-event: unknown state "${state}". Expected one of: ${AGENT_STATES.join(", ")}.`,
+			`dot-agent-deck agent-event: unknown type "${type}". Expected one of: ${AGENT_EVENT_TYPES.join(", ")}.`,
 		);
 	}
-	return ["agent-event", "--type", state];
+	const argv = ["agent-event", "--type", type];
+	const flags: Array<[string, string | undefined]> = [
+		["--cwd", detail.cwd],
+		["--prompt", detail.prompt],
+		["--tool-name", detail.toolName],
+		["--tool-detail", detail.toolDetail],
+	];
+	for (const [flag, value] of flags) {
+		if (typeof value === "string" && value.trim().length > 0) {
+			argv.push(flag, value);
+		}
+	}
+	return argv;
 }
 
 /**
@@ -215,6 +257,147 @@ export function piEventToAgentState(eventName: string): AgentState | null {
 		default:
 			return null;
 	}
+}
+
+/**
+ * The Pi events the extension subscribes to for card detail (issue #622), on
+ * top of {@link STATUS_EVENTS}. Pi hands each handler what the card needs:
+ * `before_agent_start` carries the submitted prompt before the agent loop
+ * begins, `tool_execution_start` the tool name and its arguments, and
+ * `tool_execution_end` marks the call finished; every handler's context
+ * carries the session's `cwd`.
+ */
+export const DETAIL_EVENTS = ["before_agent_start", "tool_execution_start", "tool_execution_end"] as const;
+export type DetailEvent = (typeof DETAIL_EVENTS)[number];
+
+/**
+ * The longest prompt put on argv. The deck keeps only the first 200 characters
+ * of a reported prompt, so this bound only keeps a huge paste well clear of the
+ * OS's per-argument limit; it never decides what the card shows.
+ */
+export const MAX_PROMPT_CHARS = 4000;
+
+/** Cut `text` to at most `max` code points, never splitting a surrogate pair. */
+function clip(text: string, max: number): string {
+	const chars = Array.from(text);
+	return chars.length <= max ? text : chars.slice(0, max).join("");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function nonBlankString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+/**
+ * A short description of a Pi tool call for the card's tool line — the same
+ * shape the deck derives for other agents' tools: a shell call's first command
+ * line (120 characters), a file tool's path, a search tool's pattern, and for
+ * anything else its first string argument (80 characters). `undefined` when the
+ * arguments carry nothing to show. Keyed on Pi's built-in tool names and
+ * argument shapes (`bash {command}`, `read|write|edit|ls {path}`,
+ * `grep|find {pattern}`).
+ */
+export function piToolDetail(toolName: string, args: unknown): string | undefined {
+	const input = asRecord(args);
+	if (!input) {
+		return undefined;
+	}
+	switch (toolName) {
+		case "bash": {
+			const command = nonBlankString(input.command);
+			return command === undefined ? undefined : clip(command.split("\n")[0], 120);
+		}
+		case "read":
+		case "write":
+		case "edit":
+		case "ls":
+			return nonBlankString(input.path);
+		case "grep":
+		case "find":
+			return nonBlankString(input.pattern);
+		default: {
+			const first = Object.values(input).find((v) => nonBlankString(v) !== undefined) as string | undefined;
+			return first === undefined ? undefined : clip(first, 80);
+		}
+	}
+}
+
+/** What the extension reports for one Pi event: the `--type` and its detail. */
+export interface AgentEventReport {
+	type: AgentEventType;
+	detail: AgentEventDetail;
+}
+
+/**
+ * Decide what to report for a Pi event, or `null` to report nothing. Every
+ * report carries the session `cwd` (so the card keeps its directory however it
+ * was created). Lifecycle events map through {@link piEventToAgentState}; the
+ * detail events report the prompt, or the tool and its detail. A
+ * `before_agent_start` with no usable prompt reports nothing — the
+ * `agent_start` that follows still moves the card to Thinking.
+ */
+export function piEventReport(eventName: string, event: unknown, cwd: string | undefined): AgentEventReport | null {
+	const detail: AgentEventDetail = {};
+	const dir = nonBlankString(cwd);
+	if (dir !== undefined) {
+		detail.cwd = dir;
+	}
+	const state = piEventToAgentState(eventName);
+	if (state) {
+		return { type: state, detail };
+	}
+	const payload = asRecord(event) ?? {};
+	switch (eventName) {
+		case "before_agent_start": {
+			const prompt = nonBlankString(payload.prompt);
+			if (prompt === undefined) {
+				return null;
+			}
+			detail.prompt = clip(prompt, MAX_PROMPT_CHARS);
+			return { type: "prompt", detail };
+		}
+		case "tool_execution_start":
+		case "tool_execution_end": {
+			const toolName = nonBlankString(payload.toolName);
+			if (toolName !== undefined) {
+				detail.toolName = toolName;
+			}
+			if (eventName === "tool_execution_end") {
+				return { type: "tool-end", detail };
+			}
+			const toolDetail = toolName === undefined ? undefined : piToolDetail(toolName, payload.args);
+			if (toolDetail !== undefined) {
+				detail.toolDetail = toolDetail;
+			}
+			return { type: "tool-start", detail };
+		}
+		default:
+			return null;
+	}
+}
+
+/**
+ * The argv to retry a report with when the full one failed, or `null` when
+ * there is nothing to fall back to. The extension can run against a CLI older
+ * than itself: the daemon writes the extension into Pi's directory when it
+ * starts, so a newer daemon starting on the same machine hands its extension
+ * to the Pi panes an older, still-running daemon spawns, and those name the
+ * older binary in `DOT_AGENT_DECK_EXE`. That CLI refuses every flag added for
+ * issue #622, which would cost the card its status too, so a lifecycle report
+ * is retried as the bare `--type <state>` every CLI accepts. A detail report
+ * has no older equivalent and is dropped.
+ */
+export function legacyAgentEventArgv(report: AgentEventReport): string[] | null {
+	if (!isAgentState(report.type)) {
+		return null;
+	}
+	const bare = buildAgentEventArgv(report.type);
+	return buildAgentEventArgv(report.type, report.detail).length > bare.length ? bare : null;
 }
 
 /** Minimal shape of a `dot-agent-deck` CLI exec result (subset of Pi's ExecResult). */

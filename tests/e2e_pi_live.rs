@@ -133,6 +133,47 @@ fn path_with_binary_dir() -> String {
     format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
 }
 
+/// The text of the Pi card's own rectangle on `grid` — every row from the one
+/// carrying its `Pi ·` title down to its bottom border, cut at the card's
+/// right edge — or `None` while no complete card is drawn. Issue #622: the
+/// live pi pane renders to the right of the card on the same rows and prints
+/// its own tool calls, so a whole-grid search could not tell the card's tool
+/// line from pi's.
+fn pi_card_text(grid: &str) -> Option<String> {
+    let rows: Vec<Vec<char>> = grid.lines().map(|l| l.chars().collect()).collect();
+    let (top, title_col) = rows.iter().enumerate().find_map(|(i, row)| {
+        let text: String = row.iter().collect();
+        let byte = text.find("Pi ·")?;
+        Some((i, text[..byte].chars().count()))
+    })?;
+    let border = common::BORDER_WEIGHTS
+        .iter()
+        .find(|w| rows[top][..title_col].contains(&w.top_left))?;
+    let right = (title_col..rows[top].len()).find(|&c| rows[top][c] == border.top_right)?;
+    let mut card = Vec::new();
+    for row in &rows[top..] {
+        let edge = *row.get(right)?;
+        card.push(row[..=right].iter().collect::<String>());
+        if edge == border.bottom_right {
+            return Some(card.join("\n"));
+        }
+        if edge != border.vertical && edge != border.top_right {
+            return None;
+        }
+    }
+    None
+}
+
+/// The completed-tool count on a card's bottom border (`Tools: N`).
+fn card_tool_count(card: &str) -> Option<u32> {
+    let (_, rest) = card.split_once("Tools: ")?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 /// Scenario: Launch the REAL `dot-agent-deck` binary (via the vt100 `TuiDeck`
 /// harness) with `DOT_AGENT_DECK_EXPERIMENTAL=1` and a restored saved session
 /// whose one pane runs a REAL interactive `pi` — the per-test HOME starts
@@ -152,7 +193,10 @@ fn path_with_binary_dir() -> String {
 /// produces on its own for a hook-less Pi pane, then a settle back to `Idle`
 /// (extension `agent_settled`→finished, the mapping this fix changed — a
 /// regression to "Needs Input" would show here) — and its title carries the
-/// experimental-gated first-class Pi identity (`Pi ·`). Best-effort (logged, not
+/// experimental-gated first-class Pi identity (`Pi ·`). The settled card also
+/// carries the detail every other native integration's card does (issue #622):
+/// `Dir:`, the submitted prompt (`Prmt:`), the `bash — <command>` call Pi ran,
+/// and `Tools: N` with N > 0. Best-effort (logged, not
 /// gating): the directed sentinel file appears in the pane cwd. PTY-attached, so
 /// it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
 /// (real LLM) — run once, not looped.
@@ -306,6 +350,42 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
          the rendered grid, even though the extension drove real status transitions — the \
          gated `features::show_pi_agent` render seam did not surface the Pi identity.\n\
          Final grid:\n{grid}"
+    );
+
+    // --- Issue #622: the SETTLED card carries the same detail every other
+    // native integration's card does — its directory, the submitted prompt
+    // (`Prmt:`), the tool Pi ran (`bash — <command>`), and a completed-tool
+    // count above zero — beside the Pi identity and the final `Idle`. Before
+    // the fix the extension reported lifecycle only, so the card kept `Dir:`
+    // from the spawn placeholder, had no `Prmt:` row and read `Tools: 0` even
+    // though Pi visibly ran its shell tool in the pane. Read off the CARD's
+    // own rectangle, not the whole grid, because the live pi pane renders on
+    // the right of the same grid and prints its own tool calls. The directive
+    // names the shell tool, so a turn that never calls one is the model
+    // ignoring a directive, not a deck defect — the panic says which.
+    let settled = std::cell::RefCell::new(String::new());
+    let complete = deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| {
+        let Some(card) = pi_card_text(grid) else {
+            return false;
+        };
+        let ok = card.contains("Dir:")
+            && card.contains("Prmt:")
+            && card.contains("bash —")
+            && card.contains("Idle")
+            && card_tool_count(&card).is_some_and(|n| n > 0);
+        settled.replace(card);
+        ok
+    });
+    assert!(
+        complete,
+        "the settled Pi card does not carry the prompt and tool detail every other native \
+         integration's card does: expected `Dir:`, `Prmt:`, a `bash — …` tool line, `Idle` and \
+         `Tools: N` with N > 0 on the card. sentinel_created={} (false means the model never ran \
+         the directed shell tool, so a missing tool line is not evidence against the extension).\n\
+         Card:\n{}\nFinal grid:\n{}",
+        deck.workdir().join(SENTINEL_NAME).exists(),
+        settled.borrow(),
+        deck.snapshot_grid()
     );
 
     // --- Best-effort (logged, not gating): the directed sentinel appears in the

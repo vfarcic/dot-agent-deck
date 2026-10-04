@@ -17,8 +17,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
+	AGENT_EVENT_TYPES,
 	AGENT_STATES,
 	buildAgentEventArgv,
+	DETAIL_EVENTS,
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
@@ -26,7 +28,11 @@ import {
 	DECK_EXE_ENV,
 	execFailureMessage,
 	isAgentState,
+	legacyAgentEventArgv,
+	MAX_PROMPT_CHARS,
+	piEventReport,
 	piEventToAgentState,
+	piToolDetail,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
 	seedToDeliver,
@@ -113,10 +119,147 @@ describe("row 8: agent-event argv", () => {
 		assert.deepEqual(buildAgentEventArgv("finished"), ["agent-event", "--type", "finished"]);
 	});
 
-	test("throws a clear error on a non-canonical state, listing the allowed ones", () => {
-		assert.throws(() => buildAgentEventArgv("idle"), /unknown state "idle".*running, waiting, finished/s);
-		assert.throws(() => buildAgentEventArgv("Running"), /unknown state "Running"/);
-		assert.throws(() => buildAgentEventArgv(""), /unknown state ""/);
+	test("throws a clear error on a non-canonical type, listing the allowed ones", () => {
+		assert.throws(
+			() => buildAgentEventArgv("idle"),
+			/unknown type "idle".*running, waiting, finished, prompt, tool-start, tool-end/s,
+		);
+		assert.throws(() => buildAgentEventArgv("Running"), /unknown type "Running"/);
+		assert.throws(() => buildAgentEventArgv("tool_start"), /unknown type "tool_start"/);
+		assert.throws(() => buildAgentEventArgv(""), /unknown type ""/);
+	});
+
+	// Issue #622: the card detail rides the same verb as optional flags.
+	test("appends each supplied detail as its own flag, in a fixed order", () => {
+		assert.deepEqual(
+			buildAgentEventArgv("tool-start", {
+				cwd: "/work/repo",
+				toolName: "bash",
+				toolDetail: "touch x.txt",
+			}),
+			["agent-event", "--type", "tool-start", "--cwd", "/work/repo", "--tool-name", "bash", "--tool-detail", "touch x.txt"],
+		);
+		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "fix it" }), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--cwd",
+			"/w",
+			"--prompt",
+			"fix it",
+		]);
+	});
+
+	test("omits blank or missing details rather than sending empty flags", () => {
+		assert.deepEqual(buildAgentEventArgv("running", { cwd: "  ", prompt: "", toolName: undefined }), [
+			"agent-event",
+			"--type",
+			"running",
+		]);
+	});
+
+	test("a lifecycle report keeps its exact legacy argv when no detail is given", () => {
+		assert.deepEqual(buildAgentEventArgv("finished", {}), ["agent-event", "--type", "finished"]);
+	});
+});
+
+describe("issue #622: Pi tool detail", () => {
+	test("bash shows the first line of its command", () => {
+		assert.equal(piToolDetail("bash", { command: "touch a.txt\necho done", timeout: 5 }), "touch a.txt");
+	});
+
+	test("bash clips a long command to 120 characters", () => {
+		assert.equal(piToolDetail("bash", { command: "x".repeat(300) })?.length, 120);
+	});
+
+	test("file tools show their path, search tools their pattern", () => {
+		assert.equal(piToolDetail("read", { path: "src/a.rs", offset: 3 }), "src/a.rs");
+		assert.equal(piToolDetail("write", { content: "body first", path: "out.txt" }), "out.txt");
+		assert.equal(piToolDetail("edit", { path: "b.ts", edits: [] }), "b.ts");
+		assert.equal(piToolDetail("ls", { path: "docs" }), "docs");
+		assert.equal(piToolDetail("grep", { path: "src", pattern: "fn main" }), "fn main");
+		assert.equal(piToolDetail("find", { pattern: "*.md" }), "*.md");
+	});
+
+	test("an unknown tool falls back to its first string argument, clipped to 80", () => {
+		assert.equal(piToolDetail("delegate", { role: "coder", task: "t" }), "coder");
+		assert.equal(piToolDetail("custom", { n: 1, s: "y".repeat(200) })?.length, 80);
+	});
+
+	test("arguments that carry nothing to show yield no detail", () => {
+		assert.equal(piToolDetail("ls", {}), undefined);
+		assert.equal(piToolDetail("bash", null), undefined);
+		assert.equal(piToolDetail("bash", "touch x"), undefined);
+		assert.equal(piToolDetail("custom", { n: 1 }), undefined);
+	});
+
+	test("clipping never splits a surrogate pair", () => {
+		const detail = piToolDetail("bash", { command: "😀".repeat(200) }) as string;
+		assert.equal(Array.from(detail).length, 120);
+		assert.ok(!/[\uD800-\uDBFF]$/.test(detail));
+	});
+});
+
+describe("issue #622: Pi event → agent-event report", () => {
+	test("a lifecycle event reports its state plus the session cwd", () => {
+		assert.deepEqual(piEventReport("agent_start", {}, "/w"), { type: "running", detail: { cwd: "/w" } });
+		assert.deepEqual(piEventReport("session_start", {}, "/w"), { type: "finished", detail: { cwd: "/w" } });
+	});
+
+	test("before_agent_start reports the submitted prompt", () => {
+		assert.deepEqual(piEventReport("before_agent_start", { prompt: "list the files" }, "/w"), {
+			type: "prompt",
+			detail: { cwd: "/w", prompt: "list the files" },
+		});
+	});
+
+	test("a prompt is clipped before it reaches argv", () => {
+		const report = piEventReport("before_agent_start", { prompt: "p".repeat(MAX_PROMPT_CHARS + 50) }, "/w");
+		assert.equal(report?.detail.prompt?.length, MAX_PROMPT_CHARS);
+	});
+
+	test("a blank or missing prompt reports nothing (agent_start still reports the turn)", () => {
+		assert.equal(piEventReport("before_agent_start", { prompt: "   " }, "/w"), null);
+		assert.equal(piEventReport("before_agent_start", {}, "/w"), null);
+		assert.equal(piEventReport("before_agent_start", undefined, "/w"), null);
+	});
+
+	test("tool_execution_start reports the tool and its detail", () => {
+		assert.deepEqual(
+			piEventReport("tool_execution_start", { toolCallId: "c1", toolName: "bash", args: { command: "ls -la" } }, "/w"),
+			{ type: "tool-start", detail: { cwd: "/w", toolName: "bash", toolDetail: "ls -la" } },
+		);
+	});
+
+	test("tool_execution_end reports the tool finishing, failed or not", () => {
+		assert.deepEqual(
+			piEventReport("tool_execution_end", { toolCallId: "c1", toolName: "bash", result: {}, isError: true }, "/w"),
+			{ type: "tool-end", detail: { cwd: "/w", toolName: "bash" } },
+		);
+	});
+
+	test("a missing cwd is simply left off", () => {
+		assert.deepEqual(piEventReport("agent_settled", {}, undefined), { type: "finished", detail: {} });
+	});
+
+	test("unsubscribed events report nothing", () => {
+		assert.equal(piEventReport("agent_end", {}, "/w"), null);
+		assert.equal(piEventReport("tool_execution_update", { toolName: "bash" }, "/w"), null);
+		assert.equal(piEventReport("tool_call", { toolName: "bash" }, "/w"), null);
+	});
+
+	test("every subscribed event yields a report whose argv the CLI accepts", () => {
+		const payloads: Record<string, unknown> = {
+			before_agent_start: { prompt: "go" },
+			tool_execution_start: { toolName: "bash", args: { command: "ls" } },
+			tool_execution_end: { toolName: "bash" },
+		};
+		for (const event of [...STATUS_EVENTS, ...DETAIL_EVENTS]) {
+			const report = piEventReport(event, payloads[event] ?? {}, "/w");
+			assert.notEqual(report, null, `${event} should report`);
+			const argv = buildAgentEventArgv(report!.type, report!.detail);
+			assert.ok((AGENT_EVENT_TYPES as readonly string[]).includes(argv[2]));
+		}
 	});
 });
 
@@ -282,5 +425,26 @@ describe("row 9: Pi event → agent state mapping", () => {
 		assert.ok(isAgentState("running"));
 		assert.ok(!isAgentState("idle"));
 		assert.ok(!isAgentState("RUNNING"));
+	});
+});
+
+describe("issue #622: falling back for a CLI older than the extension", () => {
+	test("a lifecycle report with detail falls back to the bare argv every CLI accepts", () => {
+		assert.deepEqual(legacyAgentEventArgv({ type: "running", detail: { cwd: "/w" } }), [
+			"agent-event",
+			"--type",
+			"running",
+		]);
+	});
+
+	test("a lifecycle report that is already bare has nothing to fall back to", () => {
+		assert.equal(legacyAgentEventArgv({ type: "finished", detail: {} }), null);
+		assert.equal(legacyAgentEventArgv({ type: "finished", detail: { cwd: "  " } }), null);
+	});
+
+	test("a detail report has no older equivalent and is dropped", () => {
+		assert.equal(legacyAgentEventArgv({ type: "prompt", detail: { prompt: "p" } }), null);
+		assert.equal(legacyAgentEventArgv({ type: "tool-start", detail: { toolName: "bash" } }), null);
+		assert.equal(legacyAgentEventArgv({ type: "tool-end", detail: {} }), null);
 	});
 });

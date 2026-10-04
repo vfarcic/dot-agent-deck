@@ -211,14 +211,27 @@ enum Commands {
         /// The delivery id from the task file, e.g. `d-7f3a9c21`.
         delivery_id: String,
     },
-    /// Report an agent lifecycle state so the pane's card status updates
-    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
-    /// extension) to drive status with NO hook installed: it rides the
-    /// existing raw-`AgentEvent` socket path.
+    /// Report an agent lifecycle state, a submitted prompt or a tool call so
+    /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
+    /// extension (e.g. the bundled Pi extension) to drive its card with NO
+    /// hook installed: it rides the existing raw-`AgentEvent` socket path.
     AgentEvent {
-        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        /// One of `running`, `waiting`, `finished` (lifecycle), `prompt`,
+        /// `tool-start`, `tool-end` (card detail).
         #[arg(long = "type")]
         r#type: String,
+        /// The agent's working directory, shown as the card's `Dir:`.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// The prompt being submitted (with `--type prompt`).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// The tool starting or finishing (with `--type tool-start|tool-end`).
+        #[arg(long = "tool-name")]
+        tool_name: Option<String>,
+        /// A short description of the tool call, e.g. its command or path.
+        #[arg(long = "tool-detail")]
+        tool_detail: Option<String>,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
     /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
@@ -1462,7 +1475,13 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::AgentEvent { r#type }) => {
+        Some(Commands::AgentEvent {
+            r#type,
+            cwd,
+            prompt,
+            tool_name,
+            tool_detail,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -1479,8 +1498,9 @@ fn main() -> ExitCode {
                 Some(et) => et,
                 None => {
                     eprintln!(
-                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
-                        r#type
+                        "Error: unknown agent-event --type {:?}. Expected one of: {}.",
+                        r#type,
+                        dot_agent_deck::event::AGENT_EVENT_TYPES.join(", ")
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1489,28 +1509,18 @@ fn main() -> ExitCode {
             // a bare AgentEvent with no `message_type` envelope, keyed on a
             // stable session id derived from the pane so repeated events update
             // the same card. The daemon's `run_hook_loop` falls back to
-            // `AgentEvent` and `apply_event` drives the status.
-            let event = dot_agent_deck::event::AgentEvent {
-                session_id: format!("{pane_id}-session"),
-                // TODO(companion PRD): derive agent type from the pane instead
-                // of hard-coding Pi. Safe today because the daemon's
-                // `apply_event` only UPGRADES `None` → a concrete type (never
-                // downgrades), so a hard-coded `Pi` from the `agent-event`
-                // subcommand can't clobber an already-known type.
-                agent_type: dot_agent_deck::event::AgentType::Pi,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id),
+            // `AgentEvent` and `apply_event` drives the card.
+            let event = dot_agent_deck::hook::build_agent_event_cli(
+                pane_id,
                 agent_id,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            };
+                event_type,
+                dot_agent_deck::hook::AgentEventDetail {
+                    cwd,
+                    prompt,
+                    tool_name,
+                    tool_detail,
+                },
+            );
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,
                 Err(e) => {

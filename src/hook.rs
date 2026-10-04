@@ -829,6 +829,60 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
     })
 }
 
+/// The optional card detail `dot-agent-deck agent-event` carries beside its
+/// `--type` (issue #622). Each is what an extension already has in hand when it
+/// reports: the session's directory, the prompt it is about to run, the tool it
+/// is starting or finishing and a short description of that call.
+#[derive(Debug, Default, Clone)]
+pub struct AgentEventDetail {
+    pub cwd: Option<String>,
+    pub prompt: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_detail: Option<String>,
+}
+
+/// Build the raw [`AgentEvent`] `dot-agent-deck agent-event` sends for a pane
+/// (PRD #201 M1.2; detail since issue #622).
+///
+/// The event is keyed on `<pane_id>-session` so repeated reports update one
+/// card, and typed [`AgentType::Pi`] — safe because `apply_event` only upgrades
+/// `None` to a concrete type and never overwrites a known one.
+///
+/// The detail is bounded the way the hook builders above bound theirs, because
+/// it arrives on argv from a producer rather than from the deck: a blank value
+/// is dropped rather than sent, the prompt goes through
+/// [`record_submitted_prompt`] exactly as a Claude or OpenCode prompt does, and
+/// the tool detail keeps only its first line, cut to the same 120 bytes as
+/// [`extract_tool_detail`]'s shell arms. The daemon scrubs both tool strings on
+/// ingest regardless.
+pub fn build_agent_event_cli(
+    pane_id: String,
+    agent_id: Option<String>,
+    event_type: EventType,
+    detail: AgentEventDetail,
+) -> AgentEvent {
+    let non_blank = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let tool_detail = non_blank(detail.tool_detail)
+        .map(|d| truncate(d.lines().next().unwrap_or(&d), 120))
+        .filter(|d| !d.trim().is_empty());
+    AgentEvent {
+        session_id: format!("{pane_id}-session"),
+        agent_type: AgentType::Pi,
+        event_type,
+        tool_name: non_blank(detail.tool_name).map(|n| truncate(&n, 80)),
+        tool_detail,
+        cwd: non_blank(detail.cwd),
+        timestamp: Utc::now(),
+        user_prompt: non_blank(detail.prompt).map(|p| record_submitted_prompt(&p)),
+        metadata: Default::default(),
+        pane_id: Some(pane_id),
+        agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    }
+}
+
 /// The total-operation budget for a `delegate`'s reply — the same 5s
 /// [`GET_SEED_REQUEST_TIMEOUT`] gives `get-seed`, and the value that comment
 /// already names as this path's bound.
@@ -1752,6 +1806,99 @@ mod tests {
     #[test]
     fn map_unknown_returns_none() {
         assert_eq!(map_event_type("SomethingElse"), None);
+    }
+
+    /// Issue #622: the `agent-event` CLI's detail lands on the fields every
+    /// other producer fills, bounded the same way.
+    #[test]
+    fn agent_event_cli_carries_the_card_detail() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-7".into()),
+            EventType::ToolStart,
+            AgentEventDetail {
+                cwd: Some("/work/repo".into()),
+                prompt: None,
+                tool_name: Some("bash".into()),
+                tool_detail: Some("touch a.txt\necho second line".into()),
+            },
+        );
+        assert_eq!(event.session_id, "pane-7-session");
+        assert_eq!(event.agent_type, AgentType::Pi);
+        assert_eq!(event.event_type, EventType::ToolStart);
+        assert_eq!(event.pane_id.as_deref(), Some("pane-7"));
+        assert_eq!(event.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(event.cwd.as_deref(), Some("/work/repo"));
+        assert_eq!(event.tool_name.as_deref(), Some("bash"));
+        assert_eq!(event.tool_detail.as_deref(), Some("touch a.txt"));
+        assert!(event.user_prompt.is_none());
+    }
+
+    #[test]
+    fn agent_event_cli_prompt_is_recorded_like_any_producer_prompt() {
+        let long = "p".repeat(crate::prompt_delivery::USER_PROMPT_MAX_LEN + 50);
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Thinking,
+            AgentEventDetail {
+                prompt: Some(long.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            event.user_prompt.as_deref(),
+            Some(record_submitted_prompt(&long).as_str())
+        );
+        assert!(event.user_prompt.unwrap().chars().count() < long.chars().count());
+    }
+
+    #[test]
+    fn agent_event_cli_drops_blank_detail_and_bounds_tool_text() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Idle,
+            AgentEventDetail {
+                cwd: Some("  ".into()),
+                prompt: Some("".into()),
+                tool_name: Some("\t".into()),
+                tool_detail: Some("\nsecond".into()),
+            },
+        );
+        assert!(event.cwd.is_none());
+        assert!(event.user_prompt.is_none());
+        assert!(event.tool_name.is_none());
+        assert!(event.tool_detail.is_none());
+
+        let long = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::ToolStart,
+            AgentEventDetail {
+                tool_name: Some("t".repeat(300)),
+                tool_detail: Some("d".repeat(300)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(long.tool_name, Some(truncate(&"t".repeat(300), 80)));
+        assert_eq!(long.tool_detail, Some(truncate(&"d".repeat(300), 120)));
+    }
+
+    /// A lifecycle report with no detail is the frame it has always been.
+    #[test]
+    fn agent_event_cli_without_detail_keeps_the_legacy_frame() {
+        let event = build_agent_event_cli(
+            "pane-7".into(),
+            None,
+            EventType::Thinking,
+            AgentEventDetail::default(),
+        );
+        assert!(event.cwd.is_none());
+        assert!(event.user_prompt.is_none());
+        assert!(event.tool_name.is_none());
+        assert!(event.tool_detail.is_none());
+        assert!(event.metadata.is_empty());
     }
 
     #[test]
