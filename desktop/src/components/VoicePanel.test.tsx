@@ -223,6 +223,9 @@ describe("VoicePanel", () => {
     // mode's phrases and everything said in it, and an answer to a choice.
     expect(disclosure).toHaveTextContent("“type on” and “type off” said on their own");
     expect(disclosure).toHaveTextContent("everything said while typing mode is on");
+    // PRD #1541: the prompt commands said on their own in an agent's pane are
+    // decided here too — outside typing mode they only ask for "typing on".
+    expect(disclosure).toHaveTextContent("in an agent’s pane, “interrupt”, “clear the prompt”, “scratch that” and the other prompt commands said on their own");
     expect(disclosure).toHaveTextContent("while a numbered choice is on offer, an answer to it");
     expect(disclosure).toHaveTextContent("Anything else said while a choice is on offer closes it and is sent as usual.");
     // PRD #1223, closing audit G2: the negations are about the app-observed

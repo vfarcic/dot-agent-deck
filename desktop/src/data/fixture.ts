@@ -1096,6 +1096,14 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    */
   readonly params?: readonly VoiceResolvedParamDto[];
   /**
+   * PRD #1541 — a typing-mode prompt command: dispatched only while typing
+   * mode is on, and never by the generic phrase match below. Outside the mode
+   * on the agent screen its phrases (less {@link FIXTURE_TYPING_STOP_PHRASES})
+   * are answered with {@link FIXTURE_TYPING_MODE_FIRST}, as `local_intercept`
+   * answers them.
+   */
+  readonly typingOnly?: true;
+  /**
    * Words this row is matched by as a PREFIX rather than by equality, with
    * everything after them becoming the row's `spoken_prefix` param.
    *
@@ -1245,6 +1253,38 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Sent.",
   },
   {
+    // PRD #1541 — the typing-mode prompt commands. The phrases are
+    // `voice::dictation::INTERRUPT_PHRASES` followed by `TYPING_STOP_PHRASES`
+    // (interrupt's bare "stop" forms, live only in typing mode),
+    // `CLEAR_PROMPT_PHRASES` and `SCRATCH_PHRASES`; `fixture.test.ts` compares
+    // each row with Rust's lists.
+    phrases: ["interrupt", "interrupt it", "interrupt that", "stop", "stop it", "stop that"],
+    action: "interrupt_agent",
+    invoke: "interruptAgent",
+    screens: ["agent"],
+    unavailableHint: "interrupting an agent works in its pane, in typing mode",
+    report: "Interrupted the agent.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["clear the prompt", "clear prompt", "clear it", "clear all", "clear everything", "delete everything"],
+    action: "clear_prompt",
+    invoke: "clearAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "clearing a prompt works in an agent's pane, in typing mode",
+    report: "Cleared the prompt.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["scratch that", "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that"],
+    action: "scratch_that",
+    invoke: "scratchLastDictation",
+    screens: ["agent"],
+    unavailableHint: "scratching dictated words works in an agent's pane, in typing mode",
+    report: "Scratched the last dictation.",
+    typingOnly: true,
+  },
+  {
     // PR #1451 round 3, change 5 — the New agent browser's Filter box.
     // Matched by OPENER, `commands.toml`'s `heard_as` for the row; the text
     // is then picked out of the utterance by {@link fixtureFilterText} and
@@ -1382,7 +1422,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      whole. The same rule here, over this module's own rows, in
      `dictation_intercept`'s order: the biggest stop first. */
   if (dictating) {
-    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt", "interrupt_agent", "clear_prompt", "scratch_that"]);
     /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
        what precedes it and asks the panel to send after it. */
     const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
@@ -1406,6 +1446,19 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      the same whole-utterance rule, ahead of the `type` opener — "type on"
      opens with `type` and would otherwise type the word "on". */
   const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  /* PRD #1541 — a typing-mode prompt command said with the mode OFF: on the
+     agent screen it runs nothing and says to say "typing on" first. On the
+     other screens Rust's model answers it, which the preview stands in for
+     with the row's own hint. A bare "stop" is neither: Rust hands it to the
+     model, and here it falls through like any other phrase. */
+  const typingOnly = reserved || fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES)
+    ? undefined
+    : FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.typingOnly && fixtureSaidWhole(utterance, candidate.phrases));
+  if (typingOnly) {
+    const hint = screen === "agent" ? FIXTURE_TYPING_MODE_FIRST : typingOnly.unavailableHint;
+    const sentence = screen === "agent" ? `${hint[0].toUpperCase()}${hint.slice(1)}.` : `Not here — ${hint}.`;
+    return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: typingOnly.action, hint, sentence } };
+  }
   if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
     const hint = "opening an agent works from the Daemons screen or the agent dashboard";
     if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
@@ -1431,7 +1484,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
     };
   }
   const command = reserved
-    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => !candidate.typingOnly && candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
@@ -1637,6 +1690,15 @@ function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolea
  * the whole utterance.
  */
 const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::dictation::TYPING_STOP_PHRASES` — interrupt's bare "stop" forms,
+ * which interrupt only in typing mode and are not answered locally outside it.
+ */
+const FIXTURE_TYPING_STOP_PHRASES: readonly string[] = ["stop", "stop it", "stop that"];
+
+/** `voice::outcome::TYPING_MODE_FIRST_HINT`, which `fixture.test.ts` compares. */
+const FIXTURE_TYPING_MODE_FIRST = "say “typing on” first — interrupting, clearing and scratching work in typing mode";
 
 /**
  * `voice::outcome::trailing_send`: the words before a separate final sentence

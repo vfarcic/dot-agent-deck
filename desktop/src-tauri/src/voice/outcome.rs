@@ -45,8 +45,9 @@ use serde::{Deserialize, Serialize};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
-    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    TRAILING_SEND_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
+    CLEAR_PROMPT_PHRASES, DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS,
+    INTERRUPT_PHRASES, SCRATCH_PHRASES, SUBMIT_PHRASES, TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES,
+    VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
@@ -86,6 +87,20 @@ const CLOSE_ROW: &str = "close";
 const DICTATION_ON_ROW: &str = "dictation_on";
 const DICTATION_OFF_ROW: &str = "dictation_off";
 const VOICE_OFF_ROW: &str = "voice_off";
+/// PRD #1541 — the typing-mode prompt commands: interrupt the open agent's
+/// turn, clear its prompt, scratch the last thing voice typed. Dispatched only
+/// by [`dictation_intercept`]; outside typing mode their phrases are answered
+/// with [`TYPING_MODE_FIRST_HINT`] ([`local_intercept`]), and a model pick of
+/// one is refused with it too ([`handle_utterance_with_dictation`]).
+const INTERRUPT_ROW: &str = "interrupt_agent";
+const CLEAR_PROMPT_ROW: &str = "clear_prompt";
+const SCRATCH_ROW: &str = "scratch_that";
+const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_ROW];
+/// What a typing-mode prompt command said OUTSIDE typing mode is answered with
+/// (PRD #1541 M1 decision 4): nothing runs, and the row says how to reach it.
+/// A fragment, like a row's `unavailable_hint`; the sentence capitalises it.
+pub const TYPING_MODE_FIRST_HINT: &str = "say “typing on” first — interrupting, clearing and \
+    scratching work in typing mode";
 /// The New agent dialog's Start — the one row a spoken command line keeps
 /// from grounding at all, wherever its start word is ([`heard_outside_command`]).
 const START_ROW: &str = "start_new_agent";
@@ -498,6 +513,26 @@ impl VoiceOutcome {
         }
     }
 
+    /// PRD #1541 — a typing-mode prompt command asked for outside typing mode:
+    /// [`VoiceOutcome::unavailable`]'s shape with [`TYPING_MODE_FIRST_HINT`]
+    /// in place of the row's own hint, and a sentence that is not "Not here",
+    /// because the screen is the right one and the mode is not.
+    fn typing_mode_first(transcript: Transcript, row: &CommandRow) -> Self {
+        let mut sentence = String::with_capacity(TYPING_MODE_FIRST_HINT.len() + 1);
+        let mut chars = TYPING_MODE_FIRST_HINT.chars();
+        if let Some(first) = chars.next() {
+            sentence.extend(first.to_uppercase());
+            sentence.push_str(chars.as_str());
+        }
+        sentence.push('.');
+        Self::Unavailable {
+            sentence,
+            action: row.id.clone(),
+            hint: TYPING_MODE_FIRST_HINT.to_string(),
+            transcript,
+        }
+    }
+
     fn labels_withheld(transcript: Transcript, row: &CommandRow) -> Self {
         Self::Unavailable {
             sentence: format!("Not here — {LABELS_WITHHELD_HINT}."),
@@ -862,6 +897,14 @@ pub async fn handle_utterance_with_dictation(
             });
         }
     };
+    // PRD #1541: the typing-mode prompt commands are dispatched only by
+    // `dictation_intercept`. Their grounding already keeps a model pick of one
+    // from getting here on the agent screen — every utterance it accepts was
+    // answered by `local_intercept` first — and this is the second wall, so a
+    // future grounding edit cannot quietly hand them to the model.
+    if TYPING_MODE_ROWS.contains(&row.id.as_str()) {
+        return finish(VoiceOutcome::typing_mode_first(transcript, row));
+    }
     if withheld && needs_labels(row) {
         return finish(VoiceOutcome::labels_withheld(transcript, row));
     }
@@ -2065,6 +2108,17 @@ fn local_intercept(
         }
     }
 
+    // PRD #1541: the typing-mode prompt commands, said with typing mode OFF on
+    // the agent screen, run nothing and say how to reach them. Only there —
+    // on another screen these words are the model's to answer, which renders
+    // the row's own hint — and never for a bare "stop" (`TYPING_STOP_PHRASES`
+    // is not consulted here), which keeps today's model answer (issue #1402).
+    if screen == Screen::Agent
+        && let Some(row) = typing_mode_row(table, transcript.text(), false)
+    {
+        return Some(VoiceOutcome::typing_mode_first(transcript.clone(), row));
+    }
+
     // Less an edge politeness word, as `heard_as_whole` grounding and the
     // dictation mode compare: "okay, send it please" is the same request as
     // "send it", and answering it here decides it without a model on every
@@ -2132,6 +2186,38 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
             .any(|phrase| spoken_words(phrase) == said)
 }
 
+/// The typing-mode prompt command (PRD #1541) whose phrase list the whole
+/// utterance is, less an edge politeness word — or `None`. `in_typing_mode`
+/// adds the bare "stop" forms ([`TYPING_STOP_PHRASES`]) to interrupt's list,
+/// which they belong to only while the mode is on. `None` too for a table
+/// without the row, which then falls through as it did before the rows existed.
+fn typing_mode_row<'t>(
+    table: &'t CommandTable,
+    text: &str,
+    in_typing_mode: bool,
+) -> Option<&'t CommandRow> {
+    let stops: &[&str] = if in_typing_mode {
+        &TYPING_STOP_PHRASES
+    } else {
+        &[]
+    };
+    [
+        (
+            INTERRUPT_ROW,
+            INTERRUPT_PHRASES
+                .iter()
+                .chain(stops)
+                .copied()
+                .collect::<Vec<_>>(),
+        ),
+        (CLEAR_PROMPT_ROW, CLEAR_PROMPT_PHRASES.to_vec()),
+        (SCRATCH_ROW, SCRATCH_PHRASES.to_vec()),
+    ]
+    .into_iter()
+    .find(|(_, phrases)| said_whole(text, phrases.iter().copied()))
+    .and_then(|(row_id, _)| table.row(row_id))
+}
+
 /// One utterance while the dictation mode is on (PRD #1260), decided with no
 /// backend call at all.
 ///
@@ -2141,12 +2227,16 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
 /// 2. [`DICTATION_OFF_PHRASES`] — end the mode;
 /// 3. a submit — [`SUBMIT_PHRASES`] or one of `submit_prompt`'s own
 ///    `heard_as_whole` entries ("go ahead");
-/// 4. a trailing send — the utterance ends with a separate sentence that is
+/// 4. a prompt command (PRD #1541) — [`INTERRUPT_PHRASES`] or
+///    [`TYPING_STOP_PHRASES`] interrupt the agent's turn,
+///    [`CLEAR_PROMPT_PHRASES`] clear its prompt, [`SCRATCH_PHRASES`] remove
+///    the last thing voice typed ([`typing_mode_row`]);
+/// 5. a trailing send — the utterance ends with a separate sentence that is
 ///    one of [`TRAILING_SEND_PHRASES`] ([`trailing_send`]): what precedes it
 ///    is typed and the dispatch asks for a send after it (`then_submit`);
-/// 5. anything else is typed, whole.
+/// 6. anything else is typed, whole.
 ///
-/// Each of the first three is a whole-utterance comparison, and the fourth a
+/// Each of the first four is a whole-utterance comparison, and the fifth a
 /// whole-SENTENCE one, so a phrase said inside a longer sentence is typed. The lists are disjoint (linkage-check
 /// rule 14), so the order decides nothing; it is #802's decided one — the
 /// bigger stop first — so a future overlap cannot leave a live microphone
@@ -2197,6 +2287,11 @@ fn dictation_intercept(
         if submits {
             return Some(dispatch(row, Vec::new()));
         }
+    }
+    // PRD #1541: interrupt, clear, scratch — with the bare "stop" forms
+    // interrupting here, and only here.
+    if let Some(row) = typing_mode_row(table, text, true) {
+        return Some(dispatch(row, Vec::new()));
     }
 
     let row = table.row(DICTATE_ROW)?;
@@ -8143,6 +8238,276 @@ mod tests {
                 assert_eq!(typed(&answer.outcome), text, "{said}");
             }
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    // -- PRD #1541: the typing-mode prompt commands --------------------------
+
+    /// Every phrase of each prompt-command list and the row it dispatches in
+    /// typing mode — the bare "stop" forms included, interrupting.
+    fn prompt_command_phrases() -> Vec<(&'static str, &'static str)> {
+        INTERRUPT_PHRASES
+            .iter()
+            .chain(TYPING_STOP_PHRASES.iter())
+            .map(|phrase| (*phrase, INTERRUPT_ROW))
+            .chain(
+                CLEAR_PROMPT_PHRASES
+                    .iter()
+                    .map(|phrase| (*phrase, CLEAR_PROMPT_ROW)),
+            )
+            .chain(SCRATCH_PHRASES.iter().map(|phrase| (*phrase, SCRATCH_ROW)))
+            .collect()
+    }
+
+    fn typing_target() -> VoiceDictationTarget {
+        VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        }
+    }
+
+    async fn in_typing_mode(said: &str) -> VoiceResult {
+        handle_utterance_with_dictation(
+            &NoCommandsResolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Some(&typing_target()),
+            Transcript::new(said),
+            LabelSharing::Shared,
+            true,
+        )
+        .await
+    }
+
+    /// Scenario: with typing mode on in an agent's pane, the user says each
+    /// interrupt, clear and scratch phrase alone — bare, with transcription
+    /// punctuation, and wrapped in an edge politeness word. Each dispatches its
+    /// own row with no params and nothing is typed or sent to the model.
+    #[tokio::test]
+    async fn voice_outcome_dictating_prompt_commands_dispatch_their_rows_without_resolving() {
+        for (phrase, row_id) in prompt_command_phrases() {
+            let capitalised = format!("{}{}.", phrase[..1].to_uppercase(), &phrase[1..]);
+            for said in [
+                phrase.to_string(),
+                capitalised,
+                format!("okay, {phrase}"),
+                format!("{phrase} please"),
+                format!("Okay, {phrase} now."),
+            ] {
+                let answer = in_typing_mode(&said).await;
+                let row = table().row(row_id).expect("a shipped row");
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, then_submit, .. }
+                        if action == row_id && *invoke == row.invoke && params.is_empty() && !then_submit),
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode on, a sentence that merely contains an
+    /// interrupt, clear or scratch word, or a phrase introduced by a dictation
+    /// opener ("type scratch that", "say stop"), is typed into the prompt whole
+    /// rather than run as a command.
+    #[tokio::test]
+    async fn voice_outcome_dictating_a_prompt_word_in_a_sentence_or_after_an_opener_is_typed() {
+        let mut typed_whole: Vec<String> = [
+            "we should work on the scratch feature",
+            "stop the build when tests fail",
+            "clear the cache please and then run it",
+            "interrupt the build if a test fails",
+            "delete that file and undo that change",
+            "please stop it from logging so much",
+            "scratch that idea and start over",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for (phrase, _) in prompt_command_phrases() {
+            for opener in DICTATION_OPENERS {
+                typed_whole.push(format!("{opener} {phrase}"));
+            }
+        }
+        for said in typed_whole {
+            let answer = in_typing_mode(&said).await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. } if action == DICTATE_ROW),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(typed(&answer.outcome), said, "{said}");
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, the user says an
+    /// interrupt, clear or scratch phrase (politely or not). Nothing runs, no
+    /// model is asked, and the row tells them to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_outside_typing_mode_say_typing_on_first() {
+        let outside: Vec<(&str, &str)> = prompt_command_phrases()
+            .into_iter()
+            .filter(|(phrase, _)| !TYPING_STOP_PHRASES.contains(phrase))
+            .collect();
+        assert_eq!(outside.len(), 16, "every phrase but the bare stops");
+        for (phrase, row_id) in outside {
+            for said in [phrase.to_string(), format!("okay, {phrase} please")] {
+                let answer = handle_utterance(
+                    &NoCommandsResolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(&said),
+                )
+                .await;
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::Unavailable {
+                        transcript: Transcript::new(&said),
+                        action: row_id.to_string(),
+                        hint: TYPING_MODE_FIRST_HINT.to_string(),
+                        sentence: "Say “typing on” first — interrupting, clearing and scratching \
+                                   work in typing mode."
+                            .to_string(),
+                    },
+                    "{said}"
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, a bare "stop",
+    /// "stop it" or "stop that" is not intercepted: it reaches the model as it
+    /// did before, whose `stop_agent` answer is refused as not available here.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_stop_outside_typing_mode_keeps_the_model_answer() {
+        for said in TYPING_STOP_PHRASES {
+            let resolver = CountingResolver::answering(IntentAnswer::new("stop_agent"));
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert_eq!(resolver.calls(), 1, "{said} was not asked of the model");
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                    if action == "stop_agent" && hint != TYPING_MODE_FIRST_HINT),
+                "{said}: {:?}",
+                answer.outcome
+            );
+        }
+    }
+
+    /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
+    /// or scratch phrase is not intercepted locally; it goes to the model,
+    /// and a pick of the row is refused with the row's own hint.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_on_other_screens_are_the_model_s_to_answer() {
+        for screen in [Screen::Deck, Screen::Overview] {
+            for (said, row_id) in [
+                ("interrupt", INTERRUPT_ROW),
+                ("clear the prompt", CLEAR_PROMPT_ROW),
+                ("scratch that", SCRATCH_ROW),
+            ] {
+                let resolver = CountingResolver::answering(IntentAnswer::new(row_id));
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await;
+                assert_eq!(resolver.calls(), 1, "{said} on {screen:?}");
+                let row = table().row(row_id).expect("a shipped row");
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::unavailable(Transcript::new(said), row),
+                    "{said} on {screen:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a table whose interrupt row grounds on a word the local list
+    /// does not hold, so the model can pick it in an agent's pane. The pick is
+    /// still not dispatched: the user is told to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_a_model_pick_of_a_typing_mode_row_is_never_dispatched() {
+        let source = "[[commands]]\n\
+                      id = \"interrupt_agent\"\n\
+                      invoke = \"interruptAgent\"\n\
+                      description = \"Interrupt or halt the open agent\"\n\
+                      screens = [\"agent\"]\n\
+                      unavailable_hint = \"open a pane first\"\n\
+                      report = \"Interrupted.\"\n\
+                      asks_to = \"interrupt the agent\"\n\
+                      try_saying = \"halt\"\n\
+                      heard_as = [\"halt\"]\n";
+        let parsed = CommandTable::parse(source).expect("a valid table");
+        let resolver = StubResolver::new().answering("halt", IntentAnswer::new(INTERRUPT_ROW));
+        let answer = handle_utterance(
+            &resolver,
+            &parsed,
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Transcript::new("halt"),
+        )
+        .await;
+        assert!(
+            matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                if action == INTERRUPT_ROW && hint == TYPING_MODE_FIRST_HINT),
+            "{:?}",
+            answer.outcome
+        );
+    }
+
+    /// The local paths answer exactly the rows' whole-utterance vocabularies
+    /// outside typing mode, so every utterance that could ground a model pick
+    /// of a prompt command on the agent screen is answered before the model.
+    #[test]
+    fn voice_outcome_prompt_command_grounding_is_the_local_list() {
+        for (row_id, phrases) in [
+            (INTERRUPT_ROW, &INTERRUPT_PHRASES[..]),
+            (CLEAR_PROMPT_ROW, &CLEAR_PROMPT_PHRASES[..]),
+            (SCRATCH_ROW, &SCRATCH_PHRASES[..]),
+        ] {
+            let row = table().row(row_id).expect("a shipped row");
+            assert_eq!(
+                row.grounding,
+                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
+                "{row_id}"
+            );
+            assert_eq!(row.screens, vec![Screen::Agent], "{row_id}");
+            assert!(row.params.is_empty(), "{row_id}");
+        }
+        // The bare stops ground nothing: a model pick of `interrupt_agent` for
+        // "stop" outside typing mode is refused rather than dispatched.
+        let interrupt = table().row(INTERRUPT_ROW).expect("a shipped row");
+        for said in TYPING_STOP_PHRASES {
+            assert!(!action_grounded(interrupt, said, None, None), "{said}");
         }
     }
 
