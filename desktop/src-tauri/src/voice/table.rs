@@ -2447,6 +2447,11 @@ mod tests {
                     "dictation on",
                     "start dictation",
                     "keep typing",
+                    "talking on",
+                    "start talking",
+                    "speaking on",
+                    "start speaking",
+                    "dictate on",
                 ],
             ),
             (
@@ -2459,6 +2464,11 @@ mod tests {
                     "dictation off",
                     "stop dictation",
                     "done typing",
+                    "talking off",
+                    "stop talking",
+                    "speaking off",
+                    "stop speaking",
+                    "dictate off",
                 ],
             ),
         ] {
