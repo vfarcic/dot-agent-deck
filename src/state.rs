@@ -10507,11 +10507,38 @@ impl AppState {
             .and_then(|s| s.pending_question.as_ref().map(|q| q.id.clone()))
     }
 
+    /// PRD #1542: the session on `pane_id` whose pending question is
+    /// `question_id` — its id, agent type and agent id — which is what the
+    /// daemon's own event about that question has to name.
+    pub fn pending_question_owner(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+    ) -> Option<(String, AgentType, Option<String>)> {
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && s.pending_question
+                        .as_ref()
+                        .is_some_and(|q| q.id == question_id)
+            })
+            .max_by_key(|s| s.last_activity)
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.agent_type.clone(),
+                    s.agent_id.clone(),
+                )
+            })
+    }
+
     /// PRD #1542: drop the question `question_id` wherever it is pending on
     /// `pane_id`, leaving the status alone — the next event decides it. The
-    /// daemon calls this when a held channel closes without an answer (Claude
-    /// Code kills its hook on a keyboard No or Esc [observed]). Returns whether
-    /// a question was dropped.
+    /// daemon's fallback when a held channel closes without an answer (Claude
+    /// Code kills its hook on a keyboard No or Esc [observed]) and its own
+    /// release event did not reach the card, and when an answer finds the
+    /// channel gone. Returns whether a question was dropped.
     pub fn clear_pending_question(&mut self, pane_id: &str, question_id: &str) -> bool {
         let mut cleared = false;
         for session in self.sessions.values_mut() {
@@ -15147,8 +15174,10 @@ impl AppState {
                 asserted
             }
             EventType::Unknown => {
-                // Forward-compat catch-all — informational at most, never
-                // produced by this build. No status change.
+                // Forward-compat catch-all — informational at most. Its one
+                // emitter in this build is the daemon's question release
+                // (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`), which relies on
+                // exactly this: no status change.
                 false
             }
             EventType::SessionEnd => unreachable!(),

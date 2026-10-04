@@ -1716,6 +1716,24 @@ where
         reply = rx => Some(reply.unwrap_or_else(|_| QuestionReply::released(&id, ReleaseReason::Cleared))),
         _ = gone => {
             if registry.question_holds().forget(&id) {
+                // Told to every attached client, not only applied here: a
+                // client still showing the question would offer an answer the
+                // daemon can only refuse. The event names the question and
+                // asserts no status (see `QUESTION_RELEASED_BY_DECK_METADATA_KEY`).
+                let owner = state.read().await.pending_question_owner(&pane_id, &id);
+                if let Some((session_id, agent_type, agent_id)) = owner {
+                    let event = deck_question_event(
+                        session_id,
+                        agent_type,
+                        Some(pane_id.clone()),
+                        agent_id,
+                        &id,
+                        crate::event::EventType::Unknown,
+                        crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY,
+                    );
+                    ingest_event(state, event_tx, registry, event).await;
+                }
+                // The fallback for an event the card refused.
                 let cleared = state.write().await.clear_pending_question(&pane_id, &id);
                 info!(
                     pane_id = %escape_id_for_log(&pane_id),
@@ -1726,6 +1744,49 @@ where
             }
             None
         }
+    }
+}
+
+/// PRD #1542: an event the daemon itself ingests about the question
+/// `question_id` — its answer (`Thinking`, marked
+/// [`crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY`]) or its release
+/// when the producer stopped waiting (`Unknown`, marked
+/// [`crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY`]). Both carry
+/// [`crate::event::QUESTION_RESOLVED_METADATA_KEY`], so applying the event
+/// drops the question in this daemon and in every attached client alike.
+pub(crate) fn deck_question_event(
+    session_id: String,
+    agent_type: crate::event::AgentType,
+    pane_id: Option<String>,
+    agent_id: Option<String>,
+    question_id: &str,
+    event_type: crate::event::EventType,
+    marker_key: &str,
+) -> AgentEvent {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        crate::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+        question_id.to_string(),
+    );
+    metadata.insert(
+        marker_key.to_string(),
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+    );
+    AgentEvent {
+        session_id,
+        agent_type,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id,
+        agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     }
 }
 
@@ -1803,6 +1864,9 @@ fn admit_producer_event(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY);
     if event
         .metadata
         .contains_key(crate::event::QUESTION_METADATA_KEY)
@@ -9538,6 +9602,121 @@ mod question_hold_tests {
         assert_eq!(reply.outcome, ReplyOutcome::Answered);
         assert_eq!(reply.question_id, "q-second");
         assert!(reply.answers_for("q-second").is_some());
+
+        handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: On the real hook loop, a producer holds a question and an
+    /// attached client mirrors the daemon's event stream. The producer's
+    /// connection closes with no answer (Claude Code killing its hook on a
+    /// keyboard No); the daemon tells every attached client, so the mirror drops
+    /// the question too and keeps Needs Input, and the frame it sent is an
+    /// `unknown` event an older client reads as a no-op.
+    #[spec("question/hold/004")]
+    #[tokio::test]
+    async fn question_hold_004_a_closed_hold_is_broadcast_without_moving_the_status() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let token = registry.hook_token_of(&agent).expect("a hook token");
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(PANE.to_string());
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move {
+                run_hook_loop(
+                    listener,
+                    state,
+                    event_tx,
+                    registry,
+                    Arc::new(Notify::new()),
+                    wtr,
+                )
+                .await
+            }
+        });
+
+        let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+            pane_id: PANE.to_string(),
+            token: Some(token.clone()),
+            event: question_event(&agent, "q-gone"),
+            hold: true,
+        });
+        let mut producer = UnixStream::connect(&sock).await.expect("connect");
+        let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+        producer.write_all(line.as_bytes()).await.unwrap();
+        producer.flush().await.unwrap();
+
+        // The attached client: an `AppState` fed only what the daemon fans out.
+        let mut mirror = crate::state::AppState::default();
+        mirror.register_pane(PANE.to_string());
+        let mut next_frame = async || loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("the daemon fans the frame out")
+                .expect("broadcast open");
+            if let BroadcastMsg::Event(event) = msg {
+                return event;
+            }
+        };
+        let raised = next_frame().await;
+        assert!(raised.question().is_some());
+        mirror.apply_event(raised);
+        assert_eq!(
+            mirror.pending_question_id_on_pane(PANE).as_deref(),
+            Some("q-gone")
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !registry.question_holds().is_held("q-gone") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hold never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(producer);
+        let released = next_frame().await;
+        assert_eq!(released.resolved_question_id(), Some("q-gone"));
+        assert!(released.is_daemon_synthetic());
+        let wire = serde_json::to_value(&released).unwrap();
+        assert_eq!(
+            wire["event_type"], "unknown",
+            "an older client must read the release as a no-op"
+        );
+        mirror.apply_event(released);
+        assert!(
+            mirror.pending_question_id_on_pane(PANE).is_none(),
+            "the attached client drops the question the daemon dropped"
+        );
+        assert_eq!(
+            mirror.sessions[SESSION].status,
+            crate::state::SessionStatus::WaitingForInput,
+            "the release says nothing about where the agent went"
+        );
+        wait_for(&state, "the daemon to drop the question", |s| {
+            s.pending_question_id_on_pane(PANE).is_none()
+        })
+        .await;
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::WaitingForInput
+        );
 
         handle.abort();
         registry.shutdown_all();

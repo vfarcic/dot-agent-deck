@@ -7048,6 +7048,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** Claude Code's own `SIGTERM` (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
+##### question/hold/004 — A closed hold is told to every attached client without moving the status.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop on a Unix socket with an attested pane token, plus an `AppState` fed only the daemon's broadcast).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** when a producer holding a question closes its connection without an answer, the daemon broadcasts an event carrying `question_resolved_id` and its own release marker; a client applying the broadcast drops the question and keeps Needs Input, as the daemon does; the frame's `event_type` is `unknown`, which an older client reads as a no-op.
+- **Does not assert:** the desktop's projection of the snapshot (`question/desktop/001`).
+- **Platform coverage:** mac+linux.
+
 ### Docs cross-reference skips
 
 Per Decision 27, documented user-facing behaviors that are deliberately not catalogued at M1:

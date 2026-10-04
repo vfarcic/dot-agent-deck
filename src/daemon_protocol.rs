@@ -5847,31 +5847,15 @@ pub(crate) async fn answer_question(
         channel = ?question.channel,
         "question answered by the deck"
     );
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert(
-        crate::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
-        question.id.clone(),
-    );
-    metadata.insert(
-        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
-        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
-    );
-    let event = crate::event::AgentEvent {
+    let event = crate::daemon::deck_question_event(
         session_id,
         agent_type,
-        event_type: crate::event::EventType::Thinking,
-        tool_name: None,
-        tool_detail: None,
-        cwd: None,
-        timestamp: chrono::Utc::now(),
-        user_prompt: None,
-        metadata,
         pane_id,
-        agent_id: Some(agent_id.to_string()),
-        agent_version: None,
-        schema_version: None,
-        live_target: None,
-    };
+        Some(agent_id.to_string()),
+        &question.id,
+        crate::event::EventType::Thinking,
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
+    );
     crate::daemon::ingest_event(state, event_tx, registry, event).await;
     Ok(())
 }

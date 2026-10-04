@@ -40,9 +40,12 @@ pub enum EventType {
     /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
     /// forward-compat catch-all for a future/unknown `event_type` string on
     /// the wire, so a build newer than THIS one can add further variants
-    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
-    /// produced by this build. Treated as a no-op wherever `EventType` is
-    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    /// without another `PROTOCOL_VERSION` bump. No producer sends it; the one
+    /// frame this build emits with it is the daemon's own question release
+    /// ([`QUESTION_RELEASED_BY_DECK_METADATA_KEY`]), chosen precisely because
+    /// every build reads it as a no-op. Treated as a no-op wherever `EventType`
+    /// is matched (never proof of agent activity, never changes
+    /// `SessionStatus`).
     #[serde(other)]
     Unknown,
 }
@@ -859,8 +862,18 @@ pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
 /// and [`AgentEvent::is_daemon_synthetic`] counts it.
 pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
 
-/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`] and
+/// [`QUESTION_RELEASED_BY_DECK_METADATA_KEY`] — only the key is read.
 pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
+
+/// PRD #1542: the daemon's marker on the event it ingests when a held
+/// question's producer stopped waiting without an answer (Claude Code kills its
+/// hook on a keyboard No or Esc [observed]). The event is an
+/// [`EventType::Unknown`] carrying [`QUESTION_RESOLVED_METADATA_KEY`], so a
+/// reader that knows the key drops the question and every reader leaves the
+/// status alone — an older client decodes `unknown` as the no-op it has always
+/// been. The daemon's alone, like [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+pub const QUESTION_RELEASED_BY_DECK_METADATA_KEY: &str = "question_released_by_deck";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -1239,6 +1252,9 @@ impl AgentEvent {
             || self
                 .metadata
                 .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+            || self
+                .metadata
+                .contains_key(QUESTION_RELEASED_BY_DECK_METADATA_KEY)
     }
 
     /// PRD #1542: the question this event raises, sanitized — `None` when it
@@ -2812,10 +2828,9 @@ mod tests {
         let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
         assert_eq!(ty, EventType::Unknown);
 
-        // Deserialize-only: `Unknown` is never produced by this build, so it
-        // has no "own" wire name to round-trip through — unlike
-        // `AgentType::None`, which legitimately serializes as `"none"`.
-        // Confirm the REAL variants this build DOES produce still round-trip
+        // No producer sends `Unknown`; the daemon's question release is its
+        // one emitter (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`), and that
+        // frame relies on it reading back as the same no-op. Confirm the REAL variants this build DOES produce still round-trip
         // cleanly, so the catch-all didn't disturb ordinary encode/decode.
         assert_eq!(
             serde_json::from_str::<EventType>(
