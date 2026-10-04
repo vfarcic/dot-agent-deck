@@ -3523,6 +3523,9 @@ pub struct AgentRecord {
     /// orchestration was started with — set only on the orchestration's START
     /// role, by the `ListAgents` handler from what the daemon recorded at the
     /// start ([`crate::state::AppState::attach_orchestrator_context_paths`]).
+    /// Issue #1445: once a TUI has re-armed that coordinator and reported it
+    /// ([`crate::daemon_protocol::AttachRequest::RecordOrchestratorContext`]),
+    /// the newest re-arm's file instead.
     /// A TUI hydrating the tab re-arms compaction and `/clear` from this file
     /// instead of the fixed-path mirror, which a later preparation in the same
     /// project may have overwritten.
