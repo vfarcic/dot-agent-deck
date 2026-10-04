@@ -1079,6 +1079,24 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // orchestrator instruction or script matching the old words stops matching.
     // It takes effect when the daemon starts on the new build.
     "505-unsolicited-work-done-label-reworded",
+    // Issue #1396, at 10 without moving it -- the #555 shape. A `StartAgent`
+    // whose `cwd` is not a directory used to start the agent in `$HOME`
+    // (portable-pty's silent fallback) while recording the requested path; a
+    // newer daemon refuses it with `START_ERR_CWD_NOT_A_DIRECTORY` before the PTY
+    // opens. Every other spawn path shares the refusal, so a respawn or
+    // `pane restart` into a deleted directory is refused too, and a pane a
+    // prepared start created is respawned only into the directory object that
+    // start verified. The request and the refusal channel are unchanged on the
+    // wire. What changed is which starts are refused.
+    "1396-start-refuses-non-directory-cwd",
+    // Issue #1396, at 10 without moving it -- the #580 shape, on the hook
+    // socket. `dispatch --orchestration <name>` (and a schedule's
+    // `shape = "orchestration:<name>"`) naming an orchestration the repo declares
+    // more than once, with roles each time, used to start the FIRST declaration;
+    // a newer daemon refuses it with `PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`, as
+    // `PrepareOrchestration` has since #1233. The `DispatchSignal` and its reply
+    // are unchanged on the wire. What changed is which dispatches are refused.
+    "1396-dispatch-refuses-ambiguous-orchestration",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1330,6 +1348,14 @@ pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 /// put the new-pane form back with its collision warning rather than reporting
 /// a generic pane-spawn failure; any other client just shows the sentence.
 pub const START_ERR_ORCHESTRATION_TITLE_IN_USE: &str = "orchestration-title-in-use";
+
+/// Issue #1396 item 2: the stable prefix of the [`AttachRequest::StartAgent`]
+/// refusal a start earns when its `cwd` is not a directory — it does not exist,
+/// or names a file. A daemon before #1396 started such an agent in `$HOME`
+/// instead (portable-pty's fallback) while recording the requested path, which
+/// is why this is declared as a contract break (`1396-start-refuses-non-directory-cwd`
+/// in [`CONTRACT_BREAKS`]): a request an older daemon served is now refused.
+pub const START_ERR_CWD_NOT_A_DIRECTORY: &str = "cwd-not-a-directory";
 
 /// PRD #819 audit fix: [`AttachRequest::PrepareOrchestration`] (in either
 /// spelling) is refused on this platform because the publish cannot deliver the owner-only guarantee it
@@ -4773,6 +4799,11 @@ async fn handle_connection(
                                  changed before the spawn"
                             );
                             crate::project_resolve::stale_preparation_refusal()
+                        }
+                        // Issue #1396 item 2: a plain start whose cwd is not a
+                        // directory, refused before the PTY was opened.
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(_) => {
+                            format!("{START_ERR_CWD_NOT_A_DIRECTORY}: {e}. Nothing was started.")
                         }
                         _ => e.to_string(),
                     };

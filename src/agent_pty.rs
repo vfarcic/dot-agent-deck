@@ -994,6 +994,13 @@ pub enum AgentPtyError {
     /// every other staleness finding gets.
     #[error("Prepared project directory changed before the spawn: {0}")]
     PreparedDirChanged(&'static str),
+    /// A spawn's working directory is not a directory — it does not exist, or
+    /// names something else (issue #1396 item 2). portable-pty would start the
+    /// child in `$HOME` instead (`USERPROFILE` on Windows) without a word, while
+    /// the registry recorded the path the caller asked for, so the spawn is
+    /// refused before the PTY is opened. The payload is the path as given.
+    #[error("working directory {0:?} is not a directory")]
+    CwdNotADirectory(String),
     /// Issue #544: a first write given a deadline by
     /// [`AgentPtyRegistry::write_and_submit_guarded_first_write_within`] ran
     /// out of it before writing a byte, doing something OTHER than waiting
@@ -1689,6 +1696,25 @@ fn spawn_with_dir(
     // Issue #747: through the shared helper, so this stays a mirror of
     // `resize` by construction rather than by two copies staying in step.
     let (rows, cols) = clamp_pty_dims(opts.rows, opts.cols);
+
+    // Issue #1396 item 2: a pathname cwd that is not a directory is refused,
+    // never handed to portable-pty, whose `as_command` silently replaces it
+    // with `$HOME` (`USERPROFILE` on Windows) — the child would then run in the
+    // home directory while the registry records the path the caller asked for.
+    // The same `is_dir()` test portable-pty applies, so this refuses exactly the
+    // cwds it would have replaced. A prepared start is refused for the same
+    // reason in `prepared_spawn_cwd`, against its verified directory instead.
+    //
+    // **This narrows the fallback without closing it**: a directory removed
+    // between this check and portable-pty's own still lands the child in
+    // `$HOME`, because portable-pty 0.8.1 decides the fallback inside
+    // `spawn_command` with no way for a caller to refuse it.
+    if verified_dir.is_none()
+        && let Some(dir) = opts.cwd
+        && !std::path::Path::new(dir).is_dir()
+    {
+        return Err(AgentPtyError::CwdNotADirectory(dir.to_string()));
+    }
 
     let pty_system = NativePtySystem::default();
 
@@ -6469,6 +6495,25 @@ struct RegistryInner {
     /// which is bounded by the panes a person or a schedule actually opens, and
     /// pruning it is exactly the operation that would re-open the window.
     hook_token_panes: HashSet<String>,
+    /// Issue #1396 item 3 — per pane id, the `(dev, ino)` of the project
+    /// directory a PREPARED start verified for it (issue #1233).
+    ///
+    /// A prepared start enters the directory object its checks verified, but
+    /// the record stores the pathname, and every later generation of the pane —
+    /// `pane restart`, a `clear = true` respawn, the issue-#606 re-create —
+    /// replays that pathname through a plain spawn. Before this, a directory
+    /// renamed away and replaced after the start was where the restarted role
+    /// ran. [`AgentPtyRegistry::spawn_agent`] now re-opens the pathname for a
+    /// pane named here and starts the child in it only when it is still the
+    /// recorded object, refusing otherwise ([`AgentPtyRegistry::reverify_prepared_pane`]).
+    ///
+    /// Pane-keyed rather than on the record, because the re-create leg runs
+    /// exactly when the pane has no record left. Never pruned, for
+    /// `hook_token_panes`' reason: it grows by one entry per prepared pane, and
+    /// forgetting one is what would hand its next generation back to the
+    /// pathname. Unix-only, like the prepared start that fills it.
+    #[cfg(unix)]
+    prepared_pane_dirs: HashMap<String, crate::prep_token::InodeIdentity>,
     /// Issue #320 — per pane id, the agent ids of every generation this
     /// registry has PUBLISHED on it.
     ///
@@ -6568,32 +6613,76 @@ struct RegistryInner {
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
 ///
 /// `Drop` releases it by taking the registry lock, which is correct for every
-/// path that is NOT already holding it. The success path *is* — `spawn_agent`
+/// path that is NOT already holding it. The post-spawn path *is* — `spawn_agent`
 /// holds `inner` from the post-spawn acquisition through `agents.insert` — so it
-/// calls [`Self::release_locked`] instead, which consumes the guard and disarms
-/// `Drop` (a second lock acquisition on a `std::sync::Mutex` would deadlock).
+/// calls [`Self::publish_locked`] or [`Self::abandon_locked`] instead, which
+/// consume the guard and disarm `Drop` (a second lock acquisition on a
+/// `std::sync::Mutex` would deadlock).
+///
+/// Issue #1396 item 3 (Qodo, PR #1557): it also carries the undo of a prepared
+/// start's pane binding ([`RegistryInner::prepared_pane_dirs`]), which is
+/// recorded under the same lock as the reservation, before the fork. A start
+/// that never publishes its agent restores the binding the pane had before (a
+/// re-prepared start replaces one) or removes it, and does so in the SAME lock
+/// hold that gives the pane up: undone any later, another start could reserve
+/// the pane, bind it and publish in between, and the undo would then overwrite
+/// that start's binding.
 struct SpawnReservation<'a> {
     registry: &'a AgentPtyRegistry,
     id: Option<String>,
+    /// The pane, and its binding before this start; `None` when this start
+    /// recorded no binding.
+    #[cfg(unix)]
+    prior_binding: Option<(String, Option<crate::prep_token::InodeIdentity>)>,
 }
 
 impl<'a> SpawnReservation<'a> {
-    /// Release the reservation while the caller already holds the registry lock.
-    fn release_locked(mut self, inner: &mut RegistryInner) {
+    /// The agent is published: give up the reservation and keep the binding,
+    /// while the caller holds the registry lock.
+    fn publish_locked(mut self, inner: &mut RegistryInner) {
+        #[cfg(unix)]
+        {
+            self.prior_binding = None;
+        }
+        self.give_up(inner);
+    }
+
+    /// The start was refused after the fork: give up the reservation and undo
+    /// the binding, while the caller holds the registry lock.
+    fn abandon_locked(mut self, inner: &mut RegistryInner) {
+        self.give_up(inner);
+    }
+
+    fn give_up(&mut self, inner: &mut RegistryInner) {
         if let Some(id) = self.id.take() {
             inner.pending_spawns.remove(&id);
+        }
+        #[cfg(unix)]
+        if let Some((pane, prior)) = self.prior_binding.take() {
+            match prior {
+                Some(identity) => {
+                    inner.prepared_pane_dirs.insert(pane, identity);
+                }
+                None => {
+                    inner.prepared_pane_dirs.remove(&pane);
+                }
+            }
         }
     }
 }
 
 impl Drop for SpawnReservation<'_> {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
+        #[cfg(unix)]
+        let armed = self.id.is_some() || self.prior_binding.is_some();
+        #[cfg(not(unix))]
+        let armed = self.id.is_some();
+        if armed {
             // A poisoned lock means some other thread panicked mid-mutation;
             // there is nothing useful to do here and panicking in `Drop` would
             // abort. The stale entry is bounded by one per panicking spawn.
             if let Ok(mut inner) = self.registry.inner.lock() {
-                inner.pending_spawns.remove(&id);
+                self.give_up(&mut inner);
             }
         }
     }
@@ -6841,6 +6930,8 @@ impl AgentPtyRegistry {
                 next_viewer_id: 1,
                 agents: HashMap::new(),
                 hook_token_panes: HashSet::new(),
+                #[cfg(unix)]
+                prepared_pane_dirs: HashMap::new(),
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
@@ -9668,6 +9759,62 @@ impl AgentPtyRegistry {
         self.spawn_agent_with_dir(opts, Some(dir))
     }
 
+    /// The verified directory a later generation of `pane` must start in, when
+    /// a prepared start created the pane (issue #1396 item 3): `cwd` opened
+    /// again as a [`crate::project_resolve::VerifiedProjectDir`] and accepted
+    /// only if it is still the object that start verified. `Ok(None)` for a pane
+    /// no prepared start created, which keeps its pathname spawn.
+    ///
+    /// Refused with [`AgentPtyError::CwdNotADirectory`] when `cwd` is not a
+    /// directory at all — deleted, or a file put at its path — which is the
+    /// refusal a plain pane gets for the same thing, through the same `is_dir()`
+    /// test: "prepare again" is no remedy for a project that is gone (agent
+    /// review, PR #1557). Refused with [`AgentPtyError::PreparedDirChanged`] when
+    /// `cwd` is still a directory but not the one the start verified: a symlink
+    /// (the open does not follow a final one), or a different directory. The
+    /// child is then started through the descriptor this returns, so a
+    /// replacement after this check is not entered either on Linux
+    /// ([`spawn_in`]).
+    #[cfg(unix)]
+    fn reverify_prepared_pane(
+        &self,
+        pane: &str,
+        cwd: Option<&str>,
+    ) -> Result<Option<crate::project_resolve::VerifiedProjectDir>, AgentPtyError> {
+        let Some(expected) = self
+            .inner
+            .lock()
+            .unwrap()
+            .prepared_pane_dirs
+            .get(pane)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let Some(cwd) = cwd else {
+            return Err(AgentPtyError::PreparedDirChanged(
+                "a prepared pane was respawned with no working directory",
+            ));
+        };
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err(AgentPtyError::CwdNotADirectory(cwd.to_string()));
+        }
+        let dir = crate::project_resolve::VerifiedProjectDir::open(std::path::Path::new(cwd))
+            .map_err(|_| {
+                AgentPtyError::PreparedDirChanged(
+                    "the prepared working directory could not be opened as the directory the \
+                     prepared start verified",
+                )
+            })?;
+        if dir.identity() != expected {
+            return Err(AgentPtyError::PreparedDirChanged(
+                "the prepared working directory was replaced after the pane's prepared start \
+                 verified it",
+            ));
+        }
+        Ok(Some(dir))
+    }
+
     fn spawn_agent_with_dir(
         self: &Arc<Self>,
         mut opts: SpawnOptions<'_>,
@@ -9718,6 +9865,17 @@ impl AgentPtyRegistry {
                     None
                 }
             });
+
+        // Issue #1396 item 3: a later generation of a pane a prepared start
+        // created starts in the directory object that start verified, or not
+        // at all — never by whatever its replayed pathname names by now.
+        #[cfg(unix)]
+        let reverified = match (dir, pane_id_env.as_deref()) {
+            (None, Some(pane)) => self.reverify_prepared_pane(pane, opts.cwd)?,
+            _ => None,
+        };
+        #[cfg(unix)]
+        let dir = dir.or(reverified.as_ref());
 
         // Point the child at THIS daemon's hook socket rather than letting it
         // re-resolve the endpoint from inherited environment at emit time.
@@ -9885,6 +10043,8 @@ impl AgentPtyRegistry {
         // happens before `spawn`, not after. The post-fork check below stays —
         // it is the one that is atomic with the `agents.insert`, and this one is
         // not a substitute for it.
+        #[cfg(unix)]
+        let mut prior_binding = None;
         let preallocated_id = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref candidate) = pane_id_env
@@ -9918,11 +10078,25 @@ impl AgentPtyRegistry {
             if let Some(ref pane) = pane_id_env {
                 inner.hook_token_panes.insert(pane.clone());
             }
+            // Issue #1396 item 3: bind the pane to the directory its prepared
+            // start verified, under the same lock and before the fork, for the
+            // reason the token requirement above is recorded here.
+            // Undone, with the reservation, if this start never publishes its
+            // agent ([`SpawnReservation`]).
+            #[cfg(unix)]
+            if let (Some(pane), Some(dir)) = (pane_id_env.as_ref(), dir) {
+                let prior = inner
+                    .prepared_pane_dirs
+                    .insert(pane.clone(), dir.identity());
+                prior_binding = Some((pane.clone(), prior));
+            }
             id
         };
         let reservation = SpawnReservation {
             registry: self,
             id: Some(preallocated_id.clone()),
+            #[cfg(unix)]
+            prior_binding,
         };
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -10002,11 +10176,11 @@ impl AgentPtyRegistry {
         let spawned_at = chrono::Utc::now();
         let mut inner = self.inner.lock().unwrap();
         // Issue #454: hand ownership over from the reservation to `agents`
-        // WITHOUT releasing the lock in between — every early return below has
-        // already given up on this spawn, and the success path inserts under
-        // this very acquisition. Released here rather than via `Drop` because
-        // `Drop` would try to take a lock this scope already holds.
-        reservation.release_locked(&mut inner);
+        // WITHOUT releasing the lock in between — each early return below gives
+        // the reservation up (and undoes a prepared binding) under this
+        // acquisition, and the success path publishes and inserts under it.
+        // Never via `Drop` here, because `Drop` would try to take a lock this
+        // scope already holds.
 
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
         // shutdown latch *inside* the inner lock, so the check + insert
@@ -10021,6 +10195,7 @@ impl AgentPtyRegistry {
         // the insert. On Err the `guard` Drop kills the child we just
         // spawned, so the rejection doesn't leak a PTY.
         if self.shutting_down.load(Ordering::SeqCst) {
+            reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
         }
 
@@ -10059,8 +10234,12 @@ impl AgentPtyRegistry {
                     && !a.exited.load(Ordering::SeqCst)
             })
         {
+            reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
         }
+        // Every refusal is behind us and the insert below cannot fail, so the
+        // pane keeps the binding this start recorded.
+        reservation.publish_locked(&mut inner);
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
         // box that no longer exists. Left behind it could only refuse this
@@ -11904,7 +12083,70 @@ impl AgentPtyRegistry {
         // entry is the place the new agent's identity (display_name,
         // tab_membership, etc.) lives, and `clear = true` on a
         // crashed agent should still produce a fresh worker.
-        let removed = {
+        // Issue #1396 items 2 and 3: decide where the replacement may start
+        // BEFORE the record is lifted out and its child terminated, so a
+        // refusal leaves the running agent in place rather than an empty pane.
+        //
+        // * A pane a prepared start created is respawned only into the directory
+        //   object that start verified. The descriptor opened for that check is
+        //   carried through the teardown below and is what the replacement
+        //   enters, so a swap of the pathname while the old child is being
+        //   terminated cannot land it elsewhere, nor refuse it after the old
+        //   agent is gone (Greptile / Qodo, PR #1557). A pathname that is no
+        //   longer a directory at all is refused here as `CwdNotADirectory`,
+        //   the refusal any other pane gets (agent review, PR #1557). What can
+        //   still refuse late is the pathname stopping being a directory in that
+        //   window — `spawn_in`'s own check, which reports it as
+        //   `PreparedDirChanged` — and on non-Linux Unix any swap, which is
+        //   #1396 item 1's residual.
+        // * Any other pane is refused when its recorded cwd is no longer a
+        //   directory, the check `spawn` would otherwise make only after the old
+        //   agent was gone.
+        //
+        // A pane with no record skips this, and step 1 reports `NotFound`.
+        //
+        // The check reads the occupant's cwd and releases the lock for the
+        // filesystem work, so the occupant can change before step 1 takes the
+        // lock again (a `StopAgent` and a new start on the same pane). Step 1
+        // therefore confirms it is removing the agent whose directory was
+        // checked, and checks again for the new occupant when it is not
+        // (Qodo, PR #1557): a refusal or a verified descriptor that belongs to
+        // the departed agent must not decide the current one's respawn. Bounded:
+        // a pane that keeps changing hands is reported as `NotFound`, which
+        // `respawn_or_recreate_agent_for_pane` answers by retrying the respawn.
+        const OCCUPANT_CHECKS: usize = 3;
+        let mut checks = 0;
+        #[allow(unused_variables)]
+        let (removed, verified_dir) = loop {
+            checks += 1;
+            let checked = self
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
+                .map(|(id, a)| (id.clone(), a.cwd.clone()));
+            #[cfg(unix)]
+            let verified_dir = match checked.as_ref() {
+                Some((_, cwd)) => self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?,
+                None => None,
+            };
+            // No prepared start exists off Unix, so there is never a directory
+            // to carry; the type keeps the loop's two arms the same shape.
+            #[cfg(not(unix))]
+            let verified_dir: Option<std::convert::Infallible> = None;
+            #[cfg(unix)]
+            let prepared = verified_dir.is_some();
+            #[cfg(not(unix))]
+            let prepared = false;
+            if !prepared
+                && let Some((_, Some(cwd))) = checked.as_ref()
+                && !std::path::Path::new(cwd).is_dir()
+            {
+                return Err(AgentPtyError::CwdNotADirectory(cwd.clone()));
+            }
+
             let mut inner = self.inner.lock().unwrap();
             // Issue #1114: a pane held for cleanup has no record this respawn
             // may replace, EVEN THOUGH it still has one. `spawn_agent` refuses a
@@ -11949,6 +12191,12 @@ impl AgentPtyRegistry {
                 .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
+            if checked.as_ref().map(|(id, _)| id) != Some(&agent_id) {
+                if checks < OCCUPANT_CHECKS {
+                    continue;
+                }
+                return Err(AgentPtyError::NotFound(pane_id_env.to_string()));
+            }
             let removed = inner
                 .agents
                 .remove(&agent_id)
@@ -11960,7 +12208,7 @@ impl AgentPtyRegistry {
             // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
             removed.pane_retired.store(true, Ordering::SeqCst);
-            removed
+            break (removed, verified_dir);
         };
 
         let RunningAgent {
@@ -12169,6 +12417,9 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type: respawn_agent_type,
         };
+        #[cfg(unix)]
+        let new_agent_id = self.spawn_agent_with_dir(opts, verified_dir.as_ref())?;
+        #[cfg(not(unix))]
         let new_agent_id = self.spawn_agent(opts)?;
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
         // card keeps the agent label the previous child taught us (`list_agents`
@@ -18872,6 +19123,287 @@ mod spawn_tests {
         };
         assert!(matches!(err, AgentPtyError::PreparedDirChanged(_)));
         assert!(registry.is_empty(), "a refused spawn must register nothing");
+    }
+
+    /// Issue #1396 item 2: the same refusal for a PLAIN start, whose cwd is a
+    /// pathname with no verified directory behind it. portable-pty's
+    /// `as_command` replaces a cwd that fails its `is_dir()` filter with `$HOME`
+    /// (`USERPROFILE` on Windows), so before this the child ran in the home
+    /// directory while the registry recorded the path the caller asked for.
+    /// `HOME` is pinned to a sandbox through `opts.env` — the value that
+    /// fallback reads — so a regression leaves its marker there.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_refuses_a_cwd_that_is_not_a_directory() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).expect("create the sandbox home");
+        let file = root.path().join("a-file");
+        std::fs::write(&file, b"not a directory").expect("write a file");
+        let missing = root.path().join("missing");
+        let home_env = home.to_str().expect("utf-8 tempdir").to_string();
+
+        for (what, cwd) in [("a regular file", &file), ("a missing path", &missing)] {
+            let cwd = cwd.to_str().expect("utf-8 tempdir");
+            let mut opts = marker_writer(cwd);
+            opts.env.push(("HOME".into(), home_env.clone()));
+            match spawn(opts) {
+                Ok(pty) => {
+                    let mut child = pty.child;
+                    let _ = child.wait();
+                    panic!(
+                        "{what}: the spawn was served (marker in $HOME: {})",
+                        home.join("marker").exists()
+                    );
+                }
+                Err(err) => assert!(
+                    matches!(err, AgentPtyError::CwdNotADirectory(_)),
+                    "{what}: expected CwdNotADirectory, got {err:?}"
+                ),
+            }
+
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let mut opts = marker_writer(cwd);
+            opts.env.push(("HOME".into(), home_env.clone()));
+            let Err(err) = registry.spawn_agent(opts) else {
+                panic!("{what}: spawn_agent must refuse the same cwd");
+            };
+            assert!(matches!(err, AgentPtyError::CwdNotADirectory(_)));
+            assert!(registry.is_empty(), "a refused spawn must register nothing");
+        }
+        assert!(
+            !home.join("marker").exists(),
+            "nothing may have run in $HOME"
+        );
+    }
+
+    /// Issue #1396 item 2, on a respawn (Greptile / Qodo, PR #1557): a pane whose
+    /// recorded cwd has been deleted is refused BEFORE the respawn lifts its
+    /// record out and terminates its child, so `pane restart` or a `clear = true`
+    /// delegate reports the refusal and leaves the running agent in place rather
+    /// than an empty pane. Control: with the directory back, the same respawn is
+    /// served.
+    ///
+    /// The same holds for a pane a prepared start created (agent review, PR
+    /// #1557): a deleted directory is the not-a-directory refusal there too, not
+    /// the stale-preparation one, which is kept for a directory that is still
+    /// there but is no longer the one the start verified. "Prepare again" would
+    /// not help a user whose project directory is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_respawn_into_a_deleted_cwd_is_refused_and_keeps_the_running_agent() {
+        for prepared in [false, true] {
+            let what = if prepared { "prepared" } else { "plain" };
+            let pane = format!("deleted-cwd-respawn-1396-{what}");
+            let root = tempfile::tempdir().expect("create tempdir");
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).expect("create the pane's dir");
+            let path = dir.to_str().expect("utf-8 tempdir").to_string();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let opts = SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&path),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.clone())],
+                ..SpawnOptions::default()
+            };
+            let id = if prepared {
+                let verified = crate::project_resolve::VerifiedProjectDir::open(&dir)
+                    .expect("open the project dir");
+                registry.spawn_agent_in(opts, &verified)
+            } else {
+                registry.spawn_agent(opts)
+            }
+            .expect("spawn the pane's agent");
+
+            std::fs::remove_dir(&dir).expect("delete the pane's dir");
+            match registry.respawn_agent_for_pane(&pane, "cat").await {
+                Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path, "{what}"),
+                other => panic!("{what}: expected CwdNotADirectory, got {other:?}"),
+            }
+            assert_eq!(
+                registry.pane_current_agent_id(&pane).as_deref(),
+                Some(id.as_str()),
+                "{what}: the refused respawn must leave the pane's record in place"
+            );
+            assert!(
+                registry.agent_is_live(&id),
+                "{what}: and its child running: a respawn that terminated it and then refused \
+                 would leave the pane empty"
+            );
+
+            // The re-create leg (no record left to replay) answers the same.
+            if prepared {
+                registry.close_agent(&id).expect("close the prepared pane");
+                let identity = PaneRecreateIdentity {
+                    cwd: Some(path.clone()),
+                    ..PaneRecreateIdentity::default()
+                };
+                match registry
+                    .respawn_or_recreate_agent_for_pane(&pane, "cat", &identity)
+                    .await
+                {
+                    Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path),
+                    other => panic!(
+                        "re-creating a prepared pane whose directory was deleted: expected \
+                         CwdNotADirectory, got {:?}",
+                        other.map(|r| r.agent_id)
+                    ),
+                }
+                assert!(
+                    registry.is_empty(),
+                    "a refused re-create must register nothing"
+                );
+            }
+
+            std::fs::create_dir(&dir).expect("restore the pane's dir");
+            if !prepared {
+                let replacement = registry
+                    .respawn_agent_for_pane(&pane, "cat")
+                    .await
+                    .expect("control: a directory cwd is respawned");
+                assert_ne!(replacement, id);
+            }
+            registry.shutdown_all();
+        }
+    }
+
+    /// Issue #1396 item 3 (Qodo, PR #1557): a prepared start that fails at the
+    /// spawn binds nothing. The pane-to-directory binding is recorded before the
+    /// fork, so without undoing it a start that never produced an agent would
+    /// leave the pane refusing a later plain start in another directory as a
+    /// stale preparation. Control: a prepared start that SUCCEEDS keeps its
+    /// binding, so the same plain start is then refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_prepared_start_does_not_bind_its_pane() {
+        const PANE: &str = "failed-prepared-1396";
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).expect("create another dir");
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+        let other_path = other.to_str().expect("utf-8 tempdir").to_string();
+        fn opts(cwd: &str) -> SpawnOptions<'_> {
+            let mut opts = marker_writer(cwd);
+            opts.command = Some("cat");
+            opts.env
+                .push((DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string()));
+            opts
+        }
+
+        // The verified directory stops being a directory before the spawn, so
+        // the prepared start is refused after the binding was recorded.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        std::fs::rename(&dir, dir.with_extension("old")).expect("move it away");
+        std::fs::write(&dir, b"not a directory").expect("put a file at the verified path");
+        let Err(err) = registry.spawn_agent_in(opts(&path), &verified) else {
+            panic!("a prepared cwd that is not a directory must be refused");
+        };
+        assert!(
+            matches!(err, AgentPtyError::PreparedDirChanged(_)),
+            "{err:?}"
+        );
+        drop(verified);
+        registry
+            .spawn_agent(opts(&other_path))
+            .expect("a pane whose prepared start failed must not be bound to that directory");
+        registry.shutdown_all();
+
+        // Control: a prepared start that succeeded keeps the pane bound.
+        std::fs::remove_file(&dir).expect("remove the file");
+        std::fs::create_dir(&dir).expect("recreate the project dir");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        let id = registry
+            .spawn_agent_in(opts(&path), &verified)
+            .expect("control: the prepared start is served");
+        drop(verified);
+        registry.close_agent(&id).expect("close the prepared pane");
+        match registry.spawn_agent(opts(&other_path)) {
+            Err(AgentPtyError::PreparedDirChanged(_)) => {}
+            other => panic!("control: a bound pane must refuse another directory; got {other:?}"),
+        }
+        registry.shutdown_all();
+    }
+
+    /// Issue #1396 item 3: a pane a prepared start created keeps its verified
+    /// directory across generations even when it has NO record left to replay —
+    /// the issue-#606 re-create leg of `respawn_or_recreate_agent_for_pane`,
+    /// which `pane restart` and a `clear = true` delegate both reach. That leg
+    /// spawns from the caller's pathname, so the binding has to live on the pane,
+    /// and the check has to run in `spawn_agent` rather than only before a
+    /// respawn lifts a record out. Control: the same re-create into the verified
+    /// directory, back at its path, is served and runs there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prepared_pane_is_not_re_created_in_a_replaced_directory() {
+        const PANE: &str = "prepared-recreate-1396";
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        let mut opts = marker_writer(&path);
+        opts.command = Some("cat");
+        opts.env
+            .push((DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string()));
+        let id = registry
+            .spawn_agent_in(opts, &verified)
+            .expect("the prepared start is served");
+        drop(verified);
+        registry.close_agent(&id).expect("close the prepared pane");
+
+        let (_, old) = verify_then_replace(&dir);
+        let identity = PaneRecreateIdentity {
+            cwd: Some(path.clone()),
+            env: vec![("SHELL".into(), "/bin/sh".into())],
+            ..PaneRecreateIdentity::default()
+        };
+        match registry
+            .respawn_or_recreate_agent_for_pane(PANE, "echo x > marker", &identity)
+            .await
+        {
+            Err(AgentPtyError::PreparedDirChanged(_)) => {}
+            other => panic!(
+                "re-creating a prepared pane in a replaced directory must be refused; got {:?}",
+                other.map(|r| r.agent_id)
+            ),
+        }
+        assert!(
+            registry.is_empty(),
+            "a refused re-create must register nothing"
+        );
+        assert!(
+            !dir.join("marker").exists(),
+            "nothing may run in the replacement"
+        );
+
+        std::fs::remove_dir(&dir).expect("remove the replacement");
+        std::fs::rename(&old, &dir).expect("restore the verified directory");
+        let respawned = registry
+            .respawn_or_recreate_agent_for_pane(PANE, "echo x > marker", &identity)
+            .await
+            .expect("control: the verified directory is served");
+        assert!(
+            respawned.recreated,
+            "control: the pane had no record to replace"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("marker").exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dir.join("marker").exists(),
+            "control: the re-created child ran in it"
+        );
+        registry.shutdown_all();
     }
 
     /// Issue #1385: every child is told the spawning deck's own absolute path in

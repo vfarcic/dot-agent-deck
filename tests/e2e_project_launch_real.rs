@@ -158,6 +158,12 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         // builder flag trusts BOTH the raw and the canonicalised form of the work
         // dir, which is the only spelling pair the daemon can produce here.
         .with_claude_trust_workdir()
+        // The daemon's own lifetime cap has to outlast the waits below, which
+        // `.config/nextest.toml` allows 660 s for; the harness default of 300 s
+        // would shut the deck down mid-wait on a slow agent and fail with a
+        // socket error instead of the phase that was slow. Below linkage-check
+        // rule 11's 900 s ceiling.
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "720")
         .launch_with_fixture("project-launch-real");
     deck.wait_for_string("No active agents");
 
@@ -327,8 +333,21 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     // ---- 6. THE claim. The coordinator was told only to read a file. If the
     // daemon's write is the one an agent actually reads, the fixture sentinel —
     // which is on disk and nowhere in the context — comes back in its pane.
+    //
+    // Matched on the coordinator's pane AS THE DECK RENDERS IT, with the raw
+    // scrollback as a second route. The raw route alone produced false reds
+    // (issue #1396, two of five runs on 2026-10-04): Claude Code redraws
+    // differentially, moving the cursor over characters already on screen
+    // instead of rewriting them, so stripping the escapes out of its scrollback
+    // drops those characters — the normalized dump read `conext_proof_9d4f2a.txt`
+    // while the deck's grid showed the agent's `ls -a` listing the sentinel
+    // intact. The grid is the deck's own vt100 render of the pane opened above,
+    // so it is the screen a user is looking at. The raw route stays for an agent
+    // whose listing has already scrolled off that screen
+    // (`TuiDeck::wait_for_grid_or_pane_text_within` owns both polls).
     const REPORT_WAIT: Duration = Duration::from_secs(240);
-    let reported = common::wait_for_pane_text_on(&socket, &agent_id, SENTINEL, REPORT_WAIT);
+    let reported =
+        deck.wait_for_grid_or_pane_text_within(&socket, &agent_id, SENTINEL, REPORT_WAIT);
     assert!(
         reported,
         "the coordinator never reported the fixture sentinel {SENTINEL:?} within {}s. It was \
