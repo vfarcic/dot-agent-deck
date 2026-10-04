@@ -699,16 +699,17 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 /// Two agreeing reads alone are NOT a settle (issue #818). The deck writes a
 /// frame through a buffered stdout, so a large frame reaches the PTY in several
 /// `write`s, and on a starved machine the deck can be descheduled between two
-/// of them for far longer than the 20ms `wait_until_grid` sleeps between polls.
-/// Both reads then see the same half-painted overlay and agree on it. CI caught
-/// exactly that twice, on runners at 100% CPU pressure: the baseline was read
-/// from an overlay painted only down to the row under `bravo`, its button and
+/// of them for far longer than the harness sleeps between polls. Both reads
+/// then see the same half-painted overlay and agree on it. CI caught exactly
+/// that twice, on runners at 100% CPU pressure: the baseline was read from an
+/// overlay painted only down to the row under `bravo`, its button and
 /// `Esc close` rows still missing, so four markers the full dialog covers were
 /// counted as visible and every later, fully painted read looked like a leak.
 /// The bottom border is the positive signal instead: ratatui emits a frame's
 /// changed cells in row-major order, so once that row is on screen every dialog
 /// row above it is too, and opening the dialog changes no side-pane marker
-/// below it.
+/// below it. The border check and the marker read run on one locked screen
+/// (`capture_screen_when`), so they cannot see two different frames.
 ///
 /// Deliberately settles on ANY marker value, including an empty set: a genuine
 /// wheel leak could scroll every marker out of view, and this must then return
@@ -717,35 +718,54 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 /// dialog painted, so the border condition does not hold it back.
 fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
     let last: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
-    deck.wait_until_grid(what, |grid| {
-        if !schedules_dialog_fully_painted(grid) {
+    deck.capture_screen_when(what, |screen| {
+        if !schedules_dialog_fully_painted(screen) {
             *last.borrow_mut() = None;
-            return false;
+            return None;
         }
-        let now = visible_side_scroll_markers(grid);
+        let now = visible_side_scroll_markers(&screen.contents());
         let mut prev = last.borrow_mut();
         let settled = prev.as_ref() == Some(&now);
-        *prev = Some(now);
-        settled
-    });
-    last.into_inner().unwrap_or_default()
+        *prev = Some(now.clone());
+        settled.then_some(now)
+    })
 }
 
-/// Whether the Schedules dialog is painted down to its bottom border: a row
-/// holding `└`, a run of `─` exactly as wide as the dialog's top border, and
-/// `┘`. The width comes from the top border, so the card borders behind the
-/// dialog (which carry text such as `Last:` in their bottom edge) cannot
-/// satisfy it.
-fn schedules_dialog_fully_painted(grid: &str) -> bool {
-    let Some(width) = grid.lines().find_map(|line| {
-        let top = &line[line.find("┌ Schedules")?..];
-        let end = top.find('┐')?;
-        Some(top[..end].chars().count() + 1)
-    }) else {
-        return false;
-    };
-    let bottom = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
-    grid.contains(&bottom)
+/// Whether the Schedules dialog is painted down to its bottom border.
+///
+/// Anchored to the dialog's own cells rather than searched for as text: find
+/// the top-left `┌` followed by the `Schedules` title and the `┐` closing that
+/// row, then require a later row with `└` and `┘` in exactly those two columns
+/// and `─` in every cell between them. A border elsewhere on screen, or one in
+/// other columns, cannot satisfy it. Cells are read through the vt100 API
+/// because the text grid drops a row's leading unwritten cells, so a column
+/// read off a grid line is not the screen column.
+fn schedules_dialog_fully_painted(screen: &vt100::Screen) -> bool {
+    const TITLE: &str = "Schedules";
+    let (rows, cols) = screen.size();
+    let cell = |row: u16, col: u16| screen.cell(row, col).map_or("", |c| c.contents());
+    for top in 0..rows {
+        for left in 0..cols {
+            let titled = cell(top, left) == "┌"
+                && usize::from(left) + 2 + TITLE.len() <= usize::from(cols)
+                && TITLE
+                    .chars()
+                    .zip(left + 2..cols)
+                    .all(|(ch, col)| cell(top, col).chars().eq([ch]));
+            if !titled {
+                continue;
+            }
+            let Some(right) = (left + 1..cols).find(|&col| cell(top, col) == "┐") else {
+                return false;
+            };
+            return (top + 1..rows).any(|row| {
+                cell(row, left) == "└"
+                    && cell(row, right) == "┘"
+                    && (left + 1..right).all(|col| cell(row, col) == "─")
+            });
+        }
+    }
+    false
 }
 
 /// Return the visible synthetic side-pane line markers from a rendered grid.
