@@ -341,3 +341,75 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         "the reconnected card must preserve Thinking rather than fall back to Idle; header={header:?}\nGrid:\n{grid}"
     );
 }
+
+/// Scenario: Start an ordinary pane through the real daemon `StartAgent` path and attach a real TUI whose event stream is set to break once, losing the event that triggers it, the way a lagged stream loses what it never forwarded. Drive the card to `Thinking` with the real `agent-event --type running` CLI — the one event the broken stream loses — and assert the same TUI, once it has reconnected, shows the card `Thinking` from the daemon's state rather than staying `Idle`.
+#[spec("session/live/019")]
+#[test]
+fn live_019_a_reconnected_event_stream_catches_the_card_up() {
+    const PANE_ID: &str = "pane-stream-gap";
+    const LABEL: &str = "stream-gap-19";
+
+    let daemon = spawn_daemon_serve(None, "0");
+    let response = daemon
+        .send_attach_request(&AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 600'".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE_ID.into())],
+            display_name: Some(LABEL.into()),
+            tab_membership: None,
+            agent_type: Some(AgentType::Pi),
+            seed: None,
+            authoring_kind: None,
+            remember_command: false,
+        })
+        .expect("StartAgent ordinary pane over the real daemon attach socket");
+    assert!(
+        response.error.is_none(),
+        "StartAgent should succeed, got error: {:?}",
+        response.error
+    );
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
+    let agent_id = records
+        .first()
+        .unwrap_or_else(|| panic!("ordinary StartAgent pane never registered: {records:?}"))
+        .id
+        .clone();
+
+    // The `e2e`-build seam in `main.rs` (`e2e_subscriber_breaks`): the first
+    // `Thinking` for this pane is dropped and the subscription torn down, once.
+    let tui = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_E2E_BREAK_STREAM_ON",
+            format!("{PANE_ID}/Thinking"),
+        )
+        .launch_with_fixture("minimal");
+    tui.wait_for_string(LABEL);
+
+    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tui.wait_until_grid(
+        "the card catches up to Thinking after the event stream reconnects",
+        |grid| {
+            grid.contains(LABEL)
+                && grid
+                    .lines()
+                    .any(|line| line.contains("Pi") && line.contains("Thinking"))
+        },
+    );
+}

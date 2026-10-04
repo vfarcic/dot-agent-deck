@@ -27,7 +27,7 @@ To avoid the Docker step, choose **OpenAI — needs an OpenAI API key** under **
 
 What the app did with each thing you said appears beside the Voice button and stays until the next one. The app keeps listening while it works out what you just said, so you can go on talking. You can pause in the middle of a command: when what you have said so far does not make a whole command, such as "set the command to be", the app waits about two seconds for the rest before saying it found nothing, and joins what you say next onto it. A command that is already complete runs without that wait. While it works out what you meant, the row shows the words it heard, for example *Heard “open settings”*; the answer then replaces them, and when the answer quotes your words itself (*Heard: “…” — no matching action.*) they are shown only once. When a command can be reversed, an **Undo** button is shown beside it for ten seconds. While voice is on, the text in that row at the bottom of the window is larger, so you can read it from where you sit, and a long message wraps onto more lines instead of being cut off; it returns to its usual size when you turn voice off.
 
-Sounds that are not speech, such as typing on the keyboard, a cough or noise in the room, are ignored: nothing is typed or run for them, and what is shown beside the Voice button stays as it was.
+Sounds that are not speech, such as typing on the keyboard, a breath, a cough, a knock on the desk, a notification sound or other noise in the room, are ignored: nothing is typed or run for them, and what is shown beside the Voice button stays as it was. Speech from somewhere else is still speech, though: another person talking, or a television or video playing near the microphone, is heard as if you had said it.
 
 What you can do by voice, by screen:
 
@@ -114,7 +114,7 @@ A list is not offered while a confirmation is open, or when more than nine thing
 
 ## Typing mode
 
-When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing"). From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
+When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on", "start talking", "speaking on", "start speaking", "dictate on"). Say it on its own: "I was talking on the phone" does not start typing mode. From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
 
 While typing mode is on:
 
@@ -124,12 +124,12 @@ While typing mode is on:
 - Nothing is sent to the agent until you say "send it" (or "send", "submit", "enter", "press enter", "go ahead", "finished", "end") on its own, or press `Enter` yourself. After a send, typing mode stays on, so you can dictate the next prompt the same way.
 - You can also end what you say with "send it", "send", "submit" or "press enter" as a separate last sentence, for example "What's the weather over there? Send it." Everything before it is typed and then sent; the last sentence itself is not typed. The other send phrases ("enter", "go ahead", "finished", "end") send only when said on their own, so "Fix the tests. Go ahead." is typed in full and not sent.
 - If you stop talking for four seconds with words typed but not yet sent, “send it” to send is highlighted as a reminder. It never sends anything itself; the highlight goes away when you speak again, send, or stop typing.
-- Only a handful of things you can say still act as commands, and only when you say them on their own (or, for the four send phrases above, as a separate last sentence): "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing"), the send phrases above, and "voice off" (or "mute", "mic off", "stop listening", "stop voice"). Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
+- Only a handful of things you can say still act as commands, and only when you say them on their own (or, for the four send phrases above, as a separate last sentence): "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate off"), the send phrases above, and "voice off" (or "mute", "mic off", "stop listening", "stop voice"). Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
 - If you speak for 30 seconds without a pause, what you said is still typed, and the app tells you it reached the limit.
 
 Typing mode ends, and **nothing is sent** when it does, if you:
 
-- say "type off", or say "voice off", which also turns voice off;
+- say "type off" (or one of the other ways to stop listed above), which leaves voice on, or say "voice off", which also turns voice off. "Stop talking" ends typing mode and leaves voice on; to turn the microphone off, say "voice off" or "stop listening";
 - press **Stop typing** (you can also reach it with `Tab`), which leaves voice on, or press the Voice button, which turns voice off;
 - close the pane (for example with `Escape`), switch the pane to another tab such as **Diff** or **Checks**, open another screen, open another agent, or switch daemons;
 - or a confirmation opens, for example to stop an agent.
@@ -193,6 +193,7 @@ What went wrong is shown beside the Voice button.
 | A name is refused with "is on page 2: say “next page”" | The item is on another page of a list shown in pages. | Turn to that page and say it again, or narrow a directory list with "filter …". |
 | "type off" was typed into the prompt instead of stopping typing mode | The app misheard it. | Nothing was sent: press **Stop typing** and delete the words. |
 | A command you paused in the middle of was answered in two halves | You paused for longer than the app waits for the rest, which is a few seconds. | Say the whole command again, with a shorter pause. |
+| Words you did not say were typed into the prompt in typing mode | Speech from somewhere else, such as another person or a video playing, was heard as yours. | Nothing was sent: delete the words. Turn typing mode off while others are talking near the microphone. If it happened in a quiet room, report the text you saw. |
 | You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |
 | Answers are cut off or not understood with a reasoning model | **Max tokens** is too low for its reasoning. | Raise **Max tokens**. |
 | "no microphone was found on this machine", or "the microphone would not open (…)" | No input device, or the app may not use it. | Connect a microphone and check it is the system's input device; on macOS, allow the app under System Settings → Privacy & Security → Microphone. Then press **Voice** again. |

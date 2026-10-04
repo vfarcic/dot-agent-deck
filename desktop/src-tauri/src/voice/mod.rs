@@ -47,6 +47,7 @@ pub mod dictation;
 mod filter;
 pub mod hold;
 pub mod http;
+pub mod human_voice;
 pub mod numbers;
 pub mod openai;
 pub mod outcome;

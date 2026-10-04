@@ -440,7 +440,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 ### One task per worker at a time
 
-A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a card can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy.
+A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a worker's card (TUI) or row (desktop) can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy, until a different agent takes over its pane: a task the exited agent had received does not make the new agent busy.
 
 When the earlier task is not coming back:
 
@@ -513,7 +513,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts | What the orchestrator is told: its `prompt_template`, the available workers, and how to delegate. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |

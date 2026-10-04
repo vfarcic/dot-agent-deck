@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use std::any::Any;
 
 use crate::agent_pty::{self, DOT_AGENT_DECK_PANE_ID, PTY_RESIZE_DIM_MAX, TabMembership};
-use crate::daemon_client::{AttachConnection, DaemonClient, StartAgentOptions, generate_client_id};
+use crate::daemon_client::{
+    AttachConnection, DaemonClient, GatedQuery, StartAgentOptions, generate_client_id,
+};
 use crate::event::AgentType;
 use crate::focus_report::FocusReporter;
 use crate::hyperlink::{HyperlinkMap, Osc8Filter, Osc8Segment};
@@ -4262,6 +4264,40 @@ impl PaneController for EmbeddedPaneController {
                     .await
             })
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
+    }
+
+    fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let context_path = context_path.to_path_buf();
+        self.runtime.spawn(async move {
+            match client
+                .record_orchestrator_context(&pane_id, &context_path)
+                .await
+            {
+                Ok(GatedQuery::Answered(())) => {}
+                Ok(GatedQuery::Unsupported) => tracing::debug!(
+                    pane_id,
+                    "the daemon does not record re-arm publications; it keeps the context file \
+                     it recorded at the start"
+                ),
+                // The daemon logs its own refusals, at the level each deserves:
+                // most are routine (an orchestration opened with `Ctrl+n` has no
+                // recorded file to follow).
+                Err(e @ crate::daemon_client::ClientError::Server(_)) => tracing::debug!(
+                    pane_id,
+                    path = %context_path.display(),
+                    error = %e,
+                    "the daemon did not record the orchestrator's re-armed context file"
+                ),
+                Err(e) => tracing::warn!(
+                    pane_id,
+                    path = %context_path.display(),
+                    error = %e,
+                    "could not report the orchestrator's re-armed context file to the daemon"
+                ),
+            }
+        });
     }
 
     /// Issue #1383: the same RPC as

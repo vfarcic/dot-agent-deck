@@ -211,14 +211,27 @@ enum Commands {
         /// The delivery id from the task file, e.g. `d-7f3a9c21`.
         delivery_id: String,
     },
-    /// Report an agent lifecycle state so the pane's card status updates
-    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
-    /// extension) to drive status with NO hook installed: it rides the
-    /// existing raw-`AgentEvent` socket path.
+    /// Report an agent lifecycle state, a submitted prompt or a tool call so
+    /// the pane's card updates (PRD #201 M1.2, issue #622). Used by an agent's
+    /// extension (e.g. the bundled Pi extension) to drive its card with NO
+    /// hook installed: it rides the existing raw-`AgentEvent` socket path.
     AgentEvent {
-        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        /// One of `running`, `waiting`, `finished` (lifecycle), `prompt`,
+        /// `tool-start`, `tool-end` (card detail).
         #[arg(long = "type")]
         r#type: String,
+        /// The agent's working directory, shown as the card's `Dir:`.
+        #[arg(long, allow_hyphen_values = true)]
+        cwd: Option<String>,
+        /// The prompt being submitted (with `--type prompt`).
+        #[arg(long, allow_hyphen_values = true)]
+        prompt: Option<String>,
+        /// The tool starting or finishing (with `--type tool-start|tool-end`).
+        #[arg(long = "tool-name", allow_hyphen_values = true)]
+        tool_name: Option<String>,
+        /// A short description of the tool call, e.g. its command or path.
+        #[arg(long = "tool-detail", allow_hyphen_values = true)]
+        tool_detail: Option<String>,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
     /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
@@ -1462,7 +1475,13 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::AgentEvent { r#type }) => {
+        Some(Commands::AgentEvent {
+            r#type,
+            cwd,
+            prompt,
+            tool_name,
+            tool_detail,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -1479,8 +1498,9 @@ fn main() -> ExitCode {
                 Some(et) => et,
                 None => {
                     eprintln!(
-                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
-                        r#type
+                        "Error: unknown agent-event --type {:?}. Expected one of: {}.",
+                        r#type,
+                        dot_agent_deck::event::AGENT_EVENT_TYPES.join(", ")
                     );
                     return ExitCode::FAILURE;
                 }
@@ -1489,28 +1509,18 @@ fn main() -> ExitCode {
             // a bare AgentEvent with no `message_type` envelope, keyed on a
             // stable session id derived from the pane so repeated events update
             // the same card. The daemon's `run_hook_loop` falls back to
-            // `AgentEvent` and `apply_event` drives the status.
-            let event = dot_agent_deck::event::AgentEvent {
-                session_id: format!("{pane_id}-session"),
-                // TODO(companion PRD): derive agent type from the pane instead
-                // of hard-coding Pi. Safe today because the daemon's
-                // `apply_event` only UPGRADES `None` → a concrete type (never
-                // downgrades), so a hard-coded `Pi` from the `agent-event`
-                // subcommand can't clobber an already-known type.
-                agent_type: dot_agent_deck::event::AgentType::Pi,
-                event_type,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: chrono::Utc::now(),
-                user_prompt: None,
-                metadata: Default::default(),
-                pane_id: Some(pane_id),
+            // `AgentEvent` and `apply_event` drives the card.
+            let event = dot_agent_deck::hook::build_agent_event_cli(
+                pane_id,
                 agent_id,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            };
+                event_type,
+                dot_agent_deck::hook::AgentEventDetail {
+                    cwd,
+                    prompt,
+                    tool_name,
+                    tool_detail,
+                },
+            );
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,
                 Err(e) => {
@@ -2449,109 +2459,30 @@ async fn run_tui_session() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// PRD #76 M2.17 (hook events) / M2.19 (delegate signals): open a
-/// long-lived `SubscribeEvents` connection against the daemon and
-/// route each [`BroadcastMsg::Event`] into the TUI's `AppState` via
-/// `apply_event`.
-///
-/// PRD #93 round-5: the delegate / work-done variants used to ride this
-/// channel too — the daemon couldn't dispatch them locally and the TUI
-/// re-ran the role-validation guards. The daemon now owns dispatch end
-/// to end (writes the prompt directly into the target pane's PTY), so
-/// only hook events flow through here.
-///
-/// Reconnects with a small backoff on transport errors so a daemon
-/// restart or a `KIND_STREAM_END "lagged"` tear-down recovers
-/// automatically.
+/// PRD #76 M2.17: spawn the TUI's event subscriber — see
+/// [`dot_agent_deck::event_subscriber`].
 fn spawn_event_subscriber(
     attach_path: std::path::PathBuf,
     state: dot_agent_deck::state::SharedState,
 ) {
-    use dot_agent_deck::event::BroadcastMsg;
+    use dot_agent_deck::event_subscriber::{SubscriberConfig, run};
 
-    tokio::spawn(async move {
-        // Backoff parameters tuned for "daemon briefly unavailable" rather
-        // than long outages: a fresh-daemon ready window is sub-second, so
-        // a 500ms initial delay catches most transient cases, and we cap
-        // at 5s so a stuck daemon doesn't burn CPU on reconnect attempts.
-        let mut delay = std::time::Duration::from_millis(500);
-        let max_delay = std::time::Duration::from_secs(5);
-        let client = DaemonClient::new(attach_path);
-        loop {
-            match client.subscribe_events().await {
-                Ok(mut sub) => {
-                    // Reset backoff on a successful subscribe.
-                    delay = std::time::Duration::from_millis(500);
-                    loop {
-                        match sub.next_event().await {
-                            Ok(Some(BroadcastMsg::Event(event))) => {
-                                #[cfg(feature = "e2e")]
-                                if e2e_subscriber_drops(&event) {
-                                    continue;
-                                }
-                                state.write().await.apply_event(event);
-                            }
-                            // PRD #120: a daemon-spawned orchestration (issue
-                            // dispatch). Queue it for the render loop, which owns
-                            // the TabManager + pane controller and builds the
-                            // live tab. The subscriber task can't touch those.
-                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
-                                state.write().await.queue_orchestration_surface(surface);
-                            }
-                            // Issue #717: a close left a dispatched worktree on
-                            // disk. Queue it for the render loop for the same
-                            // reason as the surface above — the status line is
-                            // `UiState`, which this task cannot touch.
-                            Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
-                                state.write().await.queue_worktree_kept(kept);
-                            }
-                            // PRD #741 M8 (issue #801 item 3): a `kind` tag this
-                            // build does not know, from a newer daemon. Ignored
-                            // rather than escalated — there is no payload to act
-                            // on, and the TUI's own state is rebuilt from
-                            // `list_agents` at hydration and reconciled by the
-                            // ordinary event flow, so a message it cannot read
-                            // costs it nothing it can name.
-                            //
-                            // What the variant buys is the line above this one:
-                            // before it, such a frame failed its whole decode
-                            // and arrived at the `Err` arm below, which breaks
-                            // the loop and reconnects. A daemon pushing the new
-                            // variant regularly therefore took the TUI's event
-                            // stream down every time it did.
-                            Ok(Some(BroadcastMsg::Unknown)) => {
-                                tracing::debug!(
-                                    "subscribe_events: ignoring a broadcast kind this build does                                      not know"
-                                );
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "subscribe_events: stream error, reconnecting"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "subscribe_events: subscribe failed, retrying"
-                    );
-                }
-            }
-            tokio::time::sleep(delay).await;
-            delay = std::cmp::min(delay * 2, max_delay);
-        }
-    });
+    let config = SubscriberConfig {
+        #[cfg(feature = "e2e")]
+        drop_event: Some(e2e_subscriber_drops),
+        #[cfg(feature = "e2e")]
+        break_on_event: Some(e2e_subscriber_breaks),
+        ..SubscriberConfig::default()
+    };
+    tokio::spawn(run(DaemonClient::new(attach_path), state, config));
 }
 
 /// Issue #621 e2e seam: make this subscriber miss a conversation's events, the
-/// way it does when they arrive while it is reconnecting — it resubscribes
-/// without replaying what it missed, so the daemon knows the conversation and
-/// the TUI never learns it. A reconnect cannot be timed against an agent's boot
+/// way it did when they arrived while it was reconnecting — it resubscribed
+/// without replaying what it missed, so the daemon knew the conversation and
+/// the TUI never learned it. (Since issue #1520 a reconnect re-reads the
+/// daemon's state, so this seam now models a gap the subscriber does not see,
+/// which the daemon's `stale` refusal still covers.) A reconnect cannot be timed against an agent's boot
 /// from a PTY test, so the test names a session-id prefix in
 /// `DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS` instead, and `prompt/pane-input/044`
 /// asserts the prompt is still delivered.
@@ -2569,6 +2500,29 @@ fn spawn_event_subscriber(
 fn e2e_subscriber_drops(event: &dot_agent_deck::event::AgentEvent) -> bool {
     std::env::var("DOT_AGENT_DECK_E2E_DROP_SESSION_EVENTS")
         .is_ok_and(|prefix| !prefix.is_empty() && event.session_id.starts_with(&prefix))
+}
+
+/// Issue #1520 e2e seam: tear this subscriber's stream down ONCE, losing the
+/// event that triggered it, the way a `KIND_STREAM_END "lagged"` loses whatever
+/// the daemon never forwarded — so a PTY test can make the deck reconnect at a
+/// moment it chooses, which neither a real lag (1024 unread broadcasts) nor a
+/// daemon restart (which takes the agents with it) gives it.
+/// `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON` names `<pane id>/<EventType>`, the
+/// event type spelled as its `Debug` name (`Thinking`); `session/live/019`
+/// uses it. Compiled only into the `e2e` build, like the seam above.
+#[cfg(feature = "e2e")]
+fn e2e_subscriber_breaks(event: &dot_agent_deck::event::AgentEvent) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let Ok(target) = std::env::var("DOT_AGENT_DECK_E2E_BREAK_STREAM_ON") else {
+        return false;
+    };
+    let Some((pane, kind)) = target.split_once('/') else {
+        return false;
+    };
+    event.pane_id.as_deref() == Some(pane)
+        && format!("{:?}", event.event_type) == kind
+        && !FIRED.swap(true, Ordering::SeqCst)
 }
 
 /// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an

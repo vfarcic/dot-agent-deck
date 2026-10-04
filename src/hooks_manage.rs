@@ -386,8 +386,10 @@ fn lock_settings() -> MutexGuard<'static, ()> {
 /// The copy aside goes through
 /// [`agent_hook_config::backup_malformed`](crate::agent_hook_config::backup_malformed)
 /// rather than a bare `std::fs::write`, which followed a symlink planted at that
-/// predictable `.bak` name (#731); the message names the backup only when there
-/// is one.
+/// predictable `.bak` name (#731). It never replaces a `settings.json.bak` that
+/// is already there — most plausibly the user's own copy from before the edit
+/// that broke the file (#537) — and the message names a backup only when it
+/// holds these bytes.
 ///
 /// Issue #522: this used to be the install path's reader only, with a
 /// `read_settings_lenient` twin still serving [`uninstall`] and
@@ -407,7 +409,7 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
                     format!(
                         "{} is not valid JSON (left unchanged, original {}): {parse_err}",
                         path.display(),
-                        crate::agent_hook_config::preserved_phrase(backup.as_deref())
+                        crate::agent_hook_config::preserved_phrase(&backup)
                     ),
                 ))
             }
@@ -1295,8 +1297,9 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A malformed `settings.json` is preserved at `settings.json.bak` — and the
-    /// copy must never be made THROUGH a symlink planted at that path.
+    /// A malformed `settings.json` is copied to `settings.json.bak` — but never
+    /// THROUGH a symlink planted at that path, and since #537 never over one
+    /// either.
     ///
     /// The backup destination is fully predictable, and `std::fs::write` follows
     /// a symlink, so a writer able to add an entry to `~/.claude` could point
@@ -1330,16 +1333,15 @@ mod tests {
             "the backup was written through the planted symlink and overwrote the victim"
         );
         assert!(
-            !std::fs::symlink_metadata(&backup)
+            std::fs::symlink_metadata(&backup)
                 .expect("stat backup")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "something already at the backup name is left as it was (#537)"
         );
-        assert_eq!(
-            std::fs::read_to_string(&backup).expect("read backup"),
-            malformed,
-            "the user's bytes must still be preserved beside the original"
+        assert!(
+            !err.to_string().contains("preserved at"),
+            "the planted link must not be claimed as the backup: {err}"
         );
         assert_eq!(
             std::fs::read_to_string(&settings).expect("read settings"),
@@ -1348,28 +1350,28 @@ mod tests {
         );
     }
 
-    /// When the copy aside cannot be made, the error must not claim a backup.
+    /// When the copy aside is not made, the error must not claim a backup.
     ///
-    /// A directory at the `.bak` name is the portable way to make the publish's
-    /// `rename` fail (`EISDIR`); before #731 the message named `<path>.bak`
-    /// unconditionally, because the write's result was discarded.
+    /// A directory at the `.bak` name is the portable way to occupy it; before
+    /// #731 the message named `<path>.bak` unconditionally, because the write's
+    /// result was discarded.
     #[test]
     fn a_backup_that_cannot_be_written_is_not_claimed_in_the_error() {
         let dir = crate::test_temp::tempdir().expect("settings tempdir");
         let settings = dir.path().join("settings.json");
         std::fs::write(&settings, "{ nope").expect("seed settings.json");
-        // Occupied by something a file cannot be renamed onto.
+        // Occupied by something no copy can be made over.
         std::fs::create_dir(dir.path().join("settings.json.bak")).expect("occupy the backup name");
 
         let err = load_settings_or_refuse(&settings).expect_err("malformed settings are refused");
         let message = err.to_string();
 
         assert!(
-            !message.contains("settings.json.bak"),
+            !message.contains("preserved at"),
             "the error named a backup that was never written: {message}"
         );
         assert!(
-            message.contains("not preserved"),
+            message.contains("not copied") || message.contains("not preserved"),
             "the error must say the copy aside did not happen: {message}"
         );
         assert!(
@@ -1684,6 +1686,40 @@ mod tests {
         let removed = uninstall_impl(&mut settings);
         assert!(removed.hook_types.contains(&STOP_FAILURE_HOOK));
         assert!(settings["hooks"].get(STOP_FAILURE_HOOK).is_none());
+    }
+
+    /// Issue #537 item 4.6: what an install reports. `hooks install` prints
+    /// `installed` and `skipped` to the user, and `auto_install` skips the write
+    /// when nothing was installed, so a first install must report every hook
+    /// type as installed and a repeat of it every type as already there.
+    ///
+    /// The binary is a real executable: a pin naming a file that is not there
+    /// is dead, and an install rightly rewrites a dead pin every time.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_reports_what_it_wrote_and_a_repeat_reports_it_already_there() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_temp::tempdir().expect("binary tempdir");
+        let binary_path = dir.path().join(DEFAULT_BINARY_NAME);
+        crate::test_isolation::write_script(&binary_path, "#!/bin/sh\nexit 0\n")
+            .expect("write binary");
+        std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod binary");
+        let binary = binary_path.to_str().expect("utf-8 tempdir");
+        let mut settings = serde_json::json!({});
+
+        let first = install_impl(&mut settings, binary, false);
+        assert_eq!(first.installed, hook_types(false));
+        assert!(first.skipped.is_empty(), "{:?}", first.skipped);
+
+        let second = install_impl(&mut settings, binary, false);
+        assert!(
+            second.installed.is_empty(),
+            "a repeat install reported types as newly installed: {:?}",
+            second.installed
+        );
+        assert_eq!(second.skipped, hook_types(false));
+        assert_eq!(second.repaired, 0);
     }
 
     /// Write `body` as an executable stand-in `claude` in `dir`.
