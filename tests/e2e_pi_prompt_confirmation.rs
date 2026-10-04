@@ -406,6 +406,9 @@ async fn chain_smoke_pi_003_inner() {
         },
         POINTER_REPORT_WAIT,
     );
+    // Observed after the pointer's write, which is where the re-delivery's clock
+    // starts: a report of that pointer cannot precede the write.
+    let reported_at = std::time::Instant::now();
     let Some(pointer) = pointer else {
         panic!(
             "the pi worker never reported the delegate's pointer as a declared prompt within \
@@ -447,11 +450,20 @@ async fn chain_smoke_pi_003_inner() {
         worker_pane()
     );
 
-    // 3. Confirmed once, typed once: the report arrived while the first
-    //    re-delivery was still pending, so it must have stopped it. Watch until
-    //    past the moment that re-delivery was due; a second report of the same
-    //    delivery id would be pi submitting the pointer again.
-    let past_first_redelivery = (delegated_at + FIRST_REDELIVERY + Duration::from_secs(10))
+    // 3. Confirmed once, typed once. The write came after `delegated_at`, so a
+    //    report observed less than FIRST_REDELIVERY after it arrived while the
+    //    first re-delivery was still pending, and must have stopped it. Then
+    //    watch until 10 s past the latest moment that re-delivery could be due —
+    //    counted from the report, which is after the write — for a second report
+    //    of the same delivery id.
+    assert!(
+        reported_at.duration_since(delegated_at) < FIRST_REDELIVERY,
+        "precondition: the pointer report came {:?} after the delegate, not before the first \
+         re-delivery was due ({FIRST_REDELIVERY:?}), so this run cannot tell whether the report \
+         stopped it",
+        reported_at.duration_since(delegated_at)
+    );
+    let past_first_redelivery = (reported_at + FIRST_REDELIVERY + Duration::from_secs(10))
         .saturating_duration_since(std::time::Instant::now());
     let second = sub.try_wait_for(
         |e| {
