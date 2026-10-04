@@ -36,6 +36,7 @@ import {
   VOICE_CAP_DISCARDED,
   VOICE_JOIN_WINDOW_MS,
   VOICE_STATUS_POLL_MS,
+  VOICE_SUBMIT_SETTLE_MS,
   VOICE_UNAVAILABLE,
   VOICE_UNDO_WINDOW_MS,
 } from "./VoiceControlPanel";
@@ -702,11 +703,58 @@ describe("voice control panel", () => {
       expect(write.mock.calls).toEqual([[target, keys.deleteChar.bytes.repeat(10)]]);
     });
 
-    /** Scenario: clear a prompt entirely dictated since its last reset, then press Undo after clearing finishes. Claude's paced clear writes finish before the button re-types precisely the cleared voice writes in order. */
-    it.each(["codex", "claude_code"] as const)("offers clear Undo for a wholly dictated prompt and restores its exact text (%s)", async (agentType) => {
+    /// Scenario: scratch two voice writes that together exceed the literal limit when they landed just before or exactly at the settle boundary, and a pair within the limit. Only the too-close, oversized pair is refused with an explanation and no deletion bytes.
+    it.each([
+      { name: "the 800-character floor", agentType: "codex" as const, servedLimit: 1000 },
+      { name: "a lower deck limit", agentType: "claude_code" as const, servedLimit: 10 },
+      { name: "no deck limit", agentType: "claude_code" as const, servedLimit: undefined },
+    ].flatMap((limit) => [
+      { ...limit, timing: "within settle and over limit", gap: VOICE_SUBMIT_SETTLE_MS - 1, over: true, refused: true },
+      { ...limit, timing: "at settle and over limit", gap: VOICE_SUBMIT_SETTLE_MS, over: true, refused: false },
+      { ...limit, timing: "within settle and at limit", gap: VOICE_SUBMIT_SETTLE_MS - 1, over: false, refused: false },
+    ]))("guards scratch against paste collapse: $timing ($name)", async ({ agentType, servedLimit, gap, over, refused }) => {
+      const keys = structuredClone(FIXTURE_PROMPT_KEYS[agentType]!);
+      keys.deleteChar.maxLiteralWriteChars = servedLimit;
+      const limit = Math.min(800, servedLimit ?? 800);
+      const lastLength = Math.floor(limit / 2);
+      const first = `${"a".repeat(limit - lastLength + Number(over) - 1)} `;
+      const last = `${"b".repeat(lastLength - 1)} `;
+      const { say, write, target } = await startPrompt(agentType, { promptKeys: keys });
+      await say(first.trimEnd());
+      const firstLandedAt = Date.now();
+      await act(async () => { await vi.advanceTimersByTimeAsync(gap - VOICE_STATUS_POLL_MS); });
+      await say(last.trimEnd());
+      expect(Date.now() - firstLandedAt).toBe(gap);
+      expect(write.mock.calls).toEqual([[target, first], [target, last]]);
+      write.mockClear();
+      await say("scratch that");
+      if (refused) {
+        expect(write).not.toHaveBeenCalled();
+        expect(report()).toHaveTextContent(/cannot|can't/i);
+        expect(report()).toHaveTextContent(/safely|safe|collapsed|paste|together/i);
+      } else {
+        expect(write.mock.calls).toEqual([[target, keys.deleteChar.bytes.repeat(last.length)]]);
+        expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
+      }
+    });
+
+    /// Scenario: clear an earlier prompt to establish an empty prompt, then dictate and clear two parts whose combined text exceeds the paste limit. Undo restores each original write one settle apart, and scratch removes exactly the second part including its trailing space.
+    it.each(["codex", "claude_code"] as const)("restores clear Undo as separate paced writes then scratches only the last write (%s)", async (agentType) => {
       const { say, write, target } = await startPrompt(agentType);
-      await say("first part");
-      await say("second part");
+      await say("earlier cleared prompt");
+      await say("clear the prompt");
+      if (agentType === "claude_code") {
+        const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+        const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
+        expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs!); });
+      }
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+      const first = `${"a".repeat(400)} `;
+      const second = `${"b".repeat(399)} `;
+      await say(first.trimEnd());
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      await say(second.trimEnd());
       write.mockClear();
       await say("clear the prompt");
       if (agentType === "claude_code") {
@@ -725,12 +773,43 @@ describe("voice control panel", () => {
       write.mockClear();
       fireEvent.click(undo);
       await flush();
-      expect(write.mock.calls).toEqual([[target, "first part second part "]]);
+      expect(write.mock.calls).toEqual([[target, first]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS - 1); });
+      expect(write.mock.calls).toEqual([[target, first]]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(write.mock.calls).toEqual([[target, first], [target, second]]);
+      expect(report()).toHaveTextContent("Restored Planner's prompt.");
+      write.mockClear();
+      await say("scratch that");
+      expect(write.mock.calls).toEqual([[target, FIXTURE_PROMPT_KEYS[agentType]!.deleteChar.bytes.repeat(second.length)]]);
+      expect(report()).toHaveTextContent(/Removed .*from Planner's prompt\./);
     });
 
-    /** Scenario: type by hand between voice writes and clear the prompt. No Undo is offered and the outcome row explains that the text cannot be restored. */
+    /// Scenario: open a pane whose existing draft is unknown, dictate a voice part, and clear the prompt. Clearing succeeds, but no Undo is offered and the row explains that the whole draft cannot be restored.
+    it.each(["codex", "claude_code"] as const)("does not offer clear Undo when the pane's prompt was never seen empty (%s)", async (agentType) => {
+      const { say, write, target } = await startPrompt(agentType);
+      await say("voice part");
+      expect(write).toHaveBeenLastCalledWith(target, "voice part ");
+      write.mockClear();
+      await say("clear the prompt");
+      if (agentType === "claude_code") {
+        const keys = FIXTURE_PROMPT_KEYS.claude_code!.clear;
+        const pauseBetweenWritesMs = (keys as typeof keys & { pauseBetweenWritesMs?: number }).pauseBetweenWritesMs;
+        expect(pauseBetweenWritesMs, "Claude's fixture must provide the pause between clear writes").toBeGreaterThan(0);
+        await act(async () => { await vi.advanceTimersByTimeAsync(pauseBetweenWritesMs!); });
+      }
+      const keys = FIXTURE_PROMPT_KEYS[agentType]!.clear;
+      const chunk = keys.bytes.repeat(agentType === "claude_code" ? keys.maxPressesPerWrite! : 16);
+      expect(write.mock.calls).toEqual(agentType === "claude_code" ? [[target, chunk], [target, chunk]] : [[target, chunk]]);
+      expect(report()).toHaveTextContent("Cleared Planner's prompt.");
+      expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+      expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
+    });
+
+    /// Scenario: send with keyboard Enter to establish an empty prompt, then type by hand between voice writes and clear. No Undo is offered and the outcome row explains that the text cannot be restored.
     it("does not offer clear Undo after keyboard input in the same pane", async () => {
       const { say, keyboard } = await startPrompt();
+      await keyboard("\r");
       await say("voice part");
       await keyboard("hand typed part");
       await say("another voice part");
@@ -740,9 +819,10 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
     });
 
-    /** Scenario: clear a prompt after interrupt has ended knowledge of its voice contents. The row admits it cannot be undone and shows no Undo button. */
+    /// Scenario: send with keyboard Enter, dictate, and interrupt before clearing the prompt. The interrupt ends knowledge of the voice contents, so the row admits clearing cannot be undone and shows no Undo button.
     it("does not offer clear Undo for voice text predating interrupt", async () => {
-      const { say } = await startPrompt();
+      const { say, keyboard } = await startPrompt();
+      await keyboard("\r");
       await say("voice part");
       await say("interrupt");
       await say("clear the prompt");
@@ -750,9 +830,10 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent(/cannot be undone|can't be undone|cannot undo|can't undo/i);
     });
 
-    /** Scenario: clear a wholly dictated prompt and let its ten-second Undo window elapse. The restoration control disappears without typing anything. */
+    /// Scenario: clear first to establish an empty prompt, then dictate and clear again. Letting the ten-second Undo window elapse removes the restoration control without typing anything.
     it("expires clear Undo after its existing ten-second window", async () => {
       const { say, write } = await startPrompt();
+      await say("clear the prompt");
       await say("voice part");
       await say("clear the prompt");
       expect(screen.getByRole("button", { name: "Undo" })).toBeVisible();
@@ -762,9 +843,10 @@ describe("voice control panel", () => {
       expect(write).not.toHaveBeenCalled();
     });
 
-    /** Scenario: clear voice text and close the pane before using Undo. The stale restoration writes nothing and reports that the pane changed. */
+    /// Scenario: send with keyboard Enter to establish an empty prompt, then dictate and clear voice text. Closing the pane before using Undo prevents the stale restoration and reports that the pane changed.
     it("refuses clear Undo after the cleared pane closes", async () => {
-      const { say, write } = await startPrompt();
+      const { say, write, keyboard } = await startPrompt();
+      await keyboard("\r");
       await say("voice part");
       await say("clear the prompt");
       const undo = screen.getByRole("button", { name: "Undo" });

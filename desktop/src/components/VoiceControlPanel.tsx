@@ -568,17 +568,29 @@ const PROMPT_EMPTIED = {
 } as const;
 
 /**
+ * PRD #1541 — one voice write into a prompt: its text, when it was handed to
+ * the terminal, and when that settled (`undefined` while it is in flight).
+ * The two times are what "scratch that" reads to tell whether the agent may
+ * have read this write and the one before it in one go ({@link scratchCollapse}).
+ */
+type PromptWrite = { text: string; madeAt: number; landedAt?: number };
+
+/**
  * PRD #1541 — what this app knows about one agent's prompt: the voice writes
  * made into it since it was last sent, cleared or interrupted (what "scratch
  * that" removes, last first), and whether those writes are the WHOLE prompt —
  * nothing typed by hand, nothing left over from before an interrupt — which
  * is the only case in which a clear can be undone by typing them again.
  *
+ * `whole` holds only once this app has seen the prompt emptied — sent (by
+ * voice or a plain keyboard Enter) or cleared. A pane first seen may already
+ * hold a draft nobody dictated, so its record starts not whole.
+ *
  * Kept per agent and per incarnation (`spawnedAtMs`): a replaced agent starts
  * a record of its own.
  */
 type PromptRecord = {
-  writes: string[];
+  writes: PromptWrite[];
   whole: boolean;
   why: string;
   spawnedAtMs?: number;
@@ -620,6 +632,22 @@ function scratchRefusal(write: string, limit: number): string | undefined {
     return `Cannot scratch that — ${quoted(write)} has characters that cannot be removed safely one key at a time.`;
   }
   return undefined;
+}
+
+/**
+ * PRD #1541 — why "scratch that" will not remove `last` because the agent may
+ * have read it and `before` as one input, or `undefined` when it would not.
+ * An agent that reads more than about 800 characters in one go can fold them
+ * into a single pasted block (Claude Code's `[Pasted text]`), which one delete
+ * per character would not take back exactly. Two writes are read apart once
+ * `last` went out at least {@link VOICE_SUBMIT_SETTLE_MS} after `before`
+ * landed; closer than that, they are refused when together they exceed `limit`.
+ */
+function scratchCollapse(before: PromptWrite | undefined, last: PromptWrite, limit: number): string | undefined {
+  if (before === undefined) return undefined;
+  const apart = before.landedAt !== undefined && last.madeAt - before.landedAt >= VOICE_SUBMIT_SETTLE_MS;
+  if (apart || before.text.length + last.text.length <= limit) return undefined;
+  return `Cannot scratch that — ${quoted(last.text)} followed the words before it so closely that the agent may have read the two together as one paste, so it cannot safely tell what to remove.`;
 }
 
 /**
@@ -1390,7 +1418,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       was.spawnedAtMs ??= spawnedAtMs;
       return was;
     }
-    const fresh: PromptRecord = { writes: [], whole: true, why: was ? PROMPT_EMPTIED.replaced : PROMPT_EMPTIED.fresh, spawnedAtMs };
+    const fresh: PromptRecord = { writes: [], whole: false, why: was ? PROMPT_EMPTIED.replaced : PROMPT_EMPTIED.fresh, spawnedAtMs };
     prompts.current.set(key, fresh);
     return fresh;
   }, []);
@@ -2862,11 +2890,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         record.writes = [];
         record.whole = false;
         record.why = PROMPT_EMPTIED.sent;
-      } else {
-        record.writes.push(typed);
       }
+      const write: PromptWrite = { text: typed, madeAt: Date.now() };
+      if (!sends) record.writes.push(write);
       try {
         await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
+        write.landedAt = Date.now();
       } catch (cause) {
         resetPrompt(aim, false, PROMPT_EMPTIED.failed);
         throw cause;
@@ -3091,6 +3120,12 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * user's own click, but still only into the pane and agent it was cleared
    * from, and only once the clear's own writes have all gone out (it waits on
    * the same line).
+   *
+   * Each cleared write goes back as a write of its own, in order and
+   * {@link VOICE_SUBMIT_SETTLE_MS} after the one before landed, each held to
+   * the declaration before it goes out: one write of the whole prompt could be
+   * read as a paste, and "scratch that" afterwards removes the last of them as
+   * it would have before the clear.
    */
   const restorePrompt = useCallback((aim: AgentAddress, declared: VoiceContext, writes: readonly string[], label: string) => {
     const lost = contextLost(declared, current(), { pane: aim });
@@ -3099,11 +3134,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       return;
     }
     const restore = onPane(aim, "command", async () => {
-      const moved = contextLost(declared, current(), { pane: aim });
-      if (moved) throw new PaneMoved(moved.why);
-      await sendTerminalInput(aim, writes.join(""));
-      const record = promptFor(aim, incarnationOf(aim));
-      if (record.whole) record.writes.push(...writes);
+      let landedAt: number | undefined;
+      for (const text of writes) {
+        if (landedAt !== undefined) await sleep(Math.max(0, landedAt + VOICE_SUBMIT_SETTLE_MS - Date.now()));
+        const moved = contextLost(declared, current(), { pane: aim });
+        if (moved) throw new PaneMoved(moved.why);
+        const record = promptFor(aim, incarnationOf(aim));
+        const write: PromptWrite = { text, madeAt: Date.now() };
+        if (record.whole) record.writes.push(write);
+        await sendTerminalInput(aim, text);
+        landedAt = Date.now();
+        write.landedAt = landedAt;
+      }
     });
     trackWrite(restore);
     void restore.then(
@@ -3130,7 +3172,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const { bytes, presses, maxPressesPerWrite, pauseBetweenWritesMs } = run.keys.clear;
     const total = VOICE_CLEAR_PRESSES[presses];
     const perWrite = maxPressesPerWrite ?? total;
-    const restorable = run.record.whole ? [...run.record.writes] : undefined;
+    const restorable = run.record.whole ? run.record.writes.map((write) => write.text) : undefined;
     run.record.writes = [];
     run.record.whole = false;
     run.record.why = PROMPT_EMPTIED.cleared;
@@ -3158,19 +3200,22 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * PRD #1541 — remove the last words voice typed into the open agent's
    * prompt, one delete per character, trailing space included. Refuses rather
    * than guesses: nothing on record (see {@link PromptRecord} for what empties
-   * it), or a write a delete per character might not remove exactly
-   * ({@link scratchRefusal}). A second "scratch that" removes the write before.
+   * it), a write a delete per character might not remove exactly
+   * ({@link scratchRefusal}), or one the agent may have read together with
+   * the write before it ({@link scratchCollapse}). A second "scratch that"
+   * removes the write before.
    */
   const scratchLastDictation = useCallback((target: VoiceDispatchTarget) => {
     const run = promptCommand(target, "scratch");
     if (!run) return;
-    const last = run.record.writes.at(-1);
-    if (last === undefined) {
+    const lastWrite = run.record.writes.at(-1);
+    if (lastWrite === undefined) {
       reportRefused(`Nothing to scratch — ${run.record.why}.`);
       return;
     }
+    const last = lastWrite.text;
     const limit = Math.min(VOICE_SCRATCH_MAX_CHARS, run.keys.deleteChar.maxLiteralWriteChars ?? VOICE_SCRATCH_MAX_CHARS);
-    const refusal = scratchRefusal(last, limit);
+    const refusal = scratchRefusal(last, limit) ?? scratchCollapse(run.record.writes.at(-2), lastWrite, limit);
     if (refusal) {
       reportRefused(refusal);
       return;
