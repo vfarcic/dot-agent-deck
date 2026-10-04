@@ -2281,6 +2281,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the Codex and Devin installers, which `daemon serve` already ran (`hooks/install/004`–`006` cover their writers); the desktop app's own spawn of the sidecar (`daemon_bridge::resolve_daemon_executable`, which needs a display and WebKitGTK); where macOS's `current_exe()` actually points for an installed or translocated bundle, which is unverified (#1157).
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/010 — A refused `hooks install` exits non-zero and leaves a user's own `settings.json.bak` alone (issue #537).
+- **Layer:** as `hooks/install/007` (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`).
+- **Agent:** none (the freshly built binary at a scratch path, with a stub install seeded at `$HOME/.local/bin/dot-agent-deck` so binary resolution succeeds and the run reaches the settings file).
+- **Asserts:** with `~/.claude/settings.json` made invalid by a trailing comma and a valid `settings.json.bak` beside it — the copy a user makes before hand-editing — the command exits non-zero, says the file is not valid JSON, leaves both files byte-for-byte as they were, and does not claim a backup (`preserved at`). Before #537 the refusal replaced that `.bak` with the malformed bytes and the message named it as the deck's backup.
+- **Does not assert:** the Codex and Devin installers, which share the backup helper (`agent_hook_config::backup_malformed`, unit-covered there); the `.bak` the deck writes when the name is free (`hook_rule_identification_017`); the startup install's logged form of the same refusal.
+- **Platform coverage:** mac+linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
