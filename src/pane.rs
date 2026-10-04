@@ -374,6 +374,11 @@ pub struct AgentSpawnOptions<'a> {
     /// into the PTY. Set only for a Pi start-role (orchestrator) pane; `None`
     /// for every other pane, which keeps the unchanged PTY-injection path.
     pub seed: Option<String>,
+    /// Issue #1540: this start was submitted from the New agent form, so the
+    /// deck may remember its command as the form's next pre-fill. `false` for
+    /// every other start — orchestration roles, restores and anything else —
+    /// so none of them ever becomes the deck's last command.
+    pub remember_command: bool,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -388,6 +393,7 @@ impl Default for AgentSpawnOptions<'_> {
             cols: 80,
             agent_type: None,
             seed: None,
+            remember_command: false,
         }
     }
 }

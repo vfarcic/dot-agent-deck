@@ -59,6 +59,8 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
+// Issue #1540: the deck's last New-agent-form command, owned by the daemon.
+pub mod last_command;
 pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;

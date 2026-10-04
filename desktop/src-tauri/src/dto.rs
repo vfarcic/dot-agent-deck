@@ -1277,7 +1277,9 @@ pub enum DesktopNewAgentOptions {
         experimental: bool,
         /// The authoring kinds the deck can compose a seed for.
         authoring_kinds: Vec<String>,
-        /// The command this app last started a plain agent with on this deck.
+        /// This deck's last New agent form command, plain or authoring: the
+        /// deck's own value when it keeps one (issue #1540), shared with the
+        /// TUI's form, and otherwise the one this app last started there.
         #[serde(skip_serializing_if = "Option::is_none")]
         last_command: Option<String>,
     },

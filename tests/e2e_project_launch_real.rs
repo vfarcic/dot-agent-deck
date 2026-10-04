@@ -266,6 +266,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
             // guarded PTY delivery below.
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .expect("StartAgent over the attach socket");

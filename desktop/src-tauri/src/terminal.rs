@@ -284,6 +284,14 @@ pub(crate) struct DesktopState {
     /// `default_command` — the TUI's `last_command`, kept **per deck** because
     /// one deck's command means nothing on another.
     ///
+    /// # Only for a deck that does not keep it itself (issue #1540)
+    ///
+    /// A current deck keeps its last command on the deck host, shared with the
+    /// TUI's form and persisted across restarts, and this map is neither read
+    /// nor written for it. It is the fallback for a deck whose daemon predates
+    /// that ([`dot_agent_deck::daemon_client::LastCommandKeeper::Client`]),
+    /// which is exactly the behaviour every deck had before.
+    ///
     /// # In memory, and deliberately not in `desktop.toml`
     ///
     /// A command line is free text, and it is exactly where a user puts a
