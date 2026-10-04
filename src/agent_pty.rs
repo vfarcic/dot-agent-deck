@@ -6607,6 +6607,52 @@ struct RegistryInner {
     exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
 }
 
+/// Issue #1396 item 3 (Qodo, PR #1557): undoes a prepared start's pane binding
+/// ([`RegistryInner::prepared_pane_dirs`]) unless the start published an agent.
+///
+/// The binding is recorded under the lock that reserves the pane, before the
+/// fork, so every failure after that point — the spawn itself, the shutdown
+/// latch, the duplicate check — would otherwise leave the pane bound to a
+/// directory no agent ever ran in, and a later plain start there in another
+/// directory would be refused as a stale preparation. `Drop` restores whatever
+/// binding the pane had before (a re-prepared start replaces one), or removes
+/// it. It takes the registry lock, so it must be declared BEFORE any guard of
+/// that lock in the same scope: locals drop in reverse order, so the lock guard
+/// is released first. The success path calls [`Self::commit`] instead.
+#[cfg(unix)]
+struct PreparedBindingUndo<'a> {
+    registry: &'a AgentPtyRegistry,
+    /// The pane, and the binding it had before this start; `None` when this
+    /// start recorded no binding, or once committed.
+    prior: Option<(String, Option<crate::prep_token::InodeIdentity>)>,
+}
+
+#[cfg(unix)]
+impl PreparedBindingUndo<'_> {
+    /// Keep the binding: the start published its agent.
+    fn commit(mut self) {
+        self.prior = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PreparedBindingUndo<'_> {
+    fn drop(&mut self) {
+        if let Some((pane, prior)) = self.prior.take()
+            && let Ok(mut inner) = self.registry.inner.lock()
+        {
+            match prior {
+                Some(identity) => {
+                    inner.prepared_pane_dirs.insert(pane, identity);
+                }
+                None => {
+                    inner.prepared_pane_dirs.remove(&pane);
+                }
+            }
+        }
+    }
+}
+
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
 ///
 /// `Drop` releases it by taking the registry lock, which is correct for every
@@ -9996,6 +10042,8 @@ impl AgentPtyRegistry {
         // happens before `spawn`, not after. The post-fork check below stays —
         // it is the one that is atomic with the `agents.insert`, and this one is
         // not a substitute for it.
+        #[cfg(unix)]
+        let mut prepared_binding = None;
         let preallocated_id = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref candidate) = pane_id_env
@@ -10032,13 +10080,23 @@ impl AgentPtyRegistry {
             // Issue #1396 item 3: bind the pane to the directory its prepared
             // start verified, under the same lock and before the fork, for the
             // reason the token requirement above is recorded here.
+            // Undone if this start never publishes its agent
+            // ([`PreparedBindingUndo`]).
             #[cfg(unix)]
             if let (Some(pane), Some(dir)) = (pane_id_env.as_ref(), dir) {
-                inner
+                let prior = inner
                     .prepared_pane_dirs
                     .insert(pane.clone(), dir.identity());
+                prepared_binding = Some((pane.clone(), prior));
             }
             id
+        };
+        // Declared before the post-spawn `inner` guard below, so that guard is
+        // released before this one's `Drop` takes the lock.
+        #[cfg(unix)]
+        let prepared_binding = PreparedBindingUndo {
+            registry: self,
+            prior: prepared_binding,
         };
         let reservation = SpawnReservation {
             registry: self,
@@ -10181,6 +10239,10 @@ impl AgentPtyRegistry {
         {
             return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
         }
+        // Every refusal is behind us and the insert below cannot fail, so the
+        // pane keeps the binding this start recorded.
+        #[cfg(unix)]
+        prepared_binding.commit();
         // Issue #424 H3: this agent is the pane's new occupant, so whatever the
         // previous one's guarded sends recorded about that input box describes a
         // box that no longer exists. Left behind it could only refuse this
@@ -19206,6 +19268,69 @@ mod spawn_tests {
             }
             registry.shutdown_all();
         }
+    }
+
+    /// Issue #1396 item 3 (Qodo, PR #1557): a prepared start that fails at the
+    /// spawn binds nothing. The pane-to-directory binding is recorded before the
+    /// fork, so without undoing it a start that never produced an agent would
+    /// leave the pane refusing a later plain start in another directory as a
+    /// stale preparation. Control: a prepared start that SUCCEEDS keeps its
+    /// binding, so the same plain start is then refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_prepared_start_does_not_bind_its_pane() {
+        const PANE: &str = "failed-prepared-1396";
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).expect("create the project dir");
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).expect("create another dir");
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+        let other_path = other.to_str().expect("utf-8 tempdir").to_string();
+        fn opts(cwd: &str) -> SpawnOptions<'_> {
+            let mut opts = marker_writer(cwd);
+            opts.command = Some("cat");
+            opts.env
+                .push((DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string()));
+            opts
+        }
+
+        // The verified directory stops being a directory before the spawn, so
+        // the prepared start is refused after the binding was recorded.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        std::fs::rename(&dir, dir.with_extension("old")).expect("move it away");
+        std::fs::write(&dir, b"not a directory").expect("put a file at the verified path");
+        let Err(err) = registry.spawn_agent_in(opts(&path), &verified) else {
+            panic!("a prepared cwd that is not a directory must be refused");
+        };
+        assert!(
+            matches!(err, AgentPtyError::PreparedDirChanged(_)),
+            "{err:?}"
+        );
+        drop(verified);
+        registry
+            .spawn_agent(opts(&other_path))
+            .expect("a pane whose prepared start failed must not be bound to that directory");
+        registry.shutdown_all();
+
+        // Control: a prepared start that succeeded keeps the pane bound.
+        std::fs::remove_file(&dir).expect("remove the file");
+        std::fs::create_dir(&dir).expect("recreate the project dir");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let verified =
+            crate::project_resolve::VerifiedProjectDir::open(&dir).expect("open the project dir");
+        let id = registry
+            .spawn_agent_in(opts(&path), &verified)
+            .expect("control: the prepared start is served");
+        drop(verified);
+        registry.close_agent(&id).expect("close the prepared pane");
+        match registry.spawn_agent(opts(&other_path)) {
+            Err(AgentPtyError::PreparedDirChanged(_)) => {}
+            other => panic!("control: a bound pane must refuse another directory; got {other:?}"),
+        }
+        registry.shutdown_all();
     }
 
     /// Issue #1396 item 3: a pane a prepared start created keeps its verified
