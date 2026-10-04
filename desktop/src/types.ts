@@ -377,8 +377,10 @@ export type AuthoringKind = "schedule" | "schedule-issues" | "dispatcher";
  *
  * `deck` is the deck's own answer. `unsupported` is a deck older than the PRD:
  * nothing in it comes from the deck, and `desktopAgents` is the registry
- * compiled into THIS app, which the form labels as such. `lastCommand` is the
- * command this app last started a plain agent with on that deck, either way.
+ * compiled into THIS app, which the form labels as such. `lastCommand` is that
+ * deck's last New agent command, either way: the deck's own, shared with the
+ * TUI, when the deck keeps one (issue #1540), else the one this app last
+ * started there.
  */
 export type NewAgentOptions =
   | {

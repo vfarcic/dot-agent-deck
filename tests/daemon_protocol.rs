@@ -191,6 +191,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -214,6 +215,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             agent_type: Some(AgentType::Codex),
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -237,6 +239,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -439,6 +442,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -503,6 +507,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -590,6 +595,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -702,6 +708,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -732,6 +739,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -1011,6 +1019,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 authoring_kind: None,
+                remember_command: false,
             },
         )
         .await;
@@ -4488,6 +4497,7 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;

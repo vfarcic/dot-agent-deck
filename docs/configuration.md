@@ -12,7 +12,7 @@ This page is the reference for the files and environment variables that configur
 | `schedules.toml` | scheduled tasks, see [Schedules](scheduled-tasks.md) | the daemon and `dot-agent-deck schedule` | `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`, else `~/.config/dot-agent-deck/schedules.toml` | `DOT_AGENT_DECK_SCHEDULES` |
 | `remotes.toml` | registered remote hosts, see [Remote Environments](remote-environments.md) | `dot-agent-deck remote`/`connect` and the desktop app | `~/.config/dot-agent-deck/remotes.toml` | `DOT_AGENT_DECK_REMOTES` |
 | `desktop.toml` | the desktop app's own settings ([reference](#desktoptoml-reference)) | the desktop app | `~/.config/dot-agent-deck/desktop.toml` | `DOT_AGENT_DECK_DESKTOP_CONFIG` |
-| `session.toml` | the TUI's saved session (panes to restore, last command used) | the TUI | `~/.config/dot-agent-deck/session.toml` | `DOT_AGENT_DECK_SESSION` |
+| `session.toml` | the TUI's saved session (panes to restore, and its copy of the last command used) | the TUI | `~/.config/dot-agent-deck/session.toml` | `DOT_AGENT_DECK_SESSION` |
 | `config-gen-state.json`, `star-prompt-state.json` | small TUI state files | the TUI | beside `config.toml` | `DOT_AGENT_DECK_CONFIG_GEN_STATE`, `DOT_AGENT_DECK_STAR_PROMPT` |
 
 `~/.config/dot-agent-deck/` is used on macOS and Linux whatever `XDG_CONFIG_HOME` says; of the files above, only `schedules.toml` consults `XDG_CONFIG_HOME`. On Windows the directory is `%APPDATA%\dot-agent-deck`. Every override variable takes the full path of the file, not a directory.
@@ -30,10 +30,12 @@ dot-agent-deck config get default_command     # prints: claude
 
 What it affects:
 
-- **TUI, `Ctrl+n` New Agent form:** the **Command** field is pre-filled with `default_command`. When `default_command` is empty, it is pre-filled with the last command you started from that form (kept in `session.toml`, so it survives restarts); with neither, it starts blank. A blank command starts your shell. The field is only pre-filled, never run until you submit.
+- **TUI, `Ctrl+n` New Agent form:** the **Command** field is pre-filled with `default_command`. When `default_command` is empty, it is pre-filled with the deck's last command (below); with neither, it starts blank. A blank command starts your shell. The field is only pre-filled, never run until you submit.
 - **TUI, the schedule, `schedule: issues` and dispatcher modes:** a blank **Command** becomes `default_command`, or `claude` when that is empty, because these modes need an agent rather than a shell. The Schedules manager's **Add** and **Edit** pre-fill **Command** the same way.
-- **Desktop app, New agent:** the **Command** field is pre-filled with the chosen daemon's `default_command`, else the command this app last started a plain agent with on that daemon during the current app session (it is not saved across app restarts), else blank. A blank command starts the daemon's default shell for a plain agent; for the schedule and dispatcher modes a blank command becomes `default_command`, or `claude` when that is empty.
+- **Desktop app, New agent:** the **Command** field is pre-filled with the chosen daemon's `default_command`, else that deck's last command (below), else blank. A blank command starts the daemon's default shell for a plain agent; for the schedule and dispatcher modes a blank command becomes `default_command`, or `claude` when that is empty.
 - **Daemon:** a scheduled issue-dispatch task with no `command`, and a single-agent `dot-agent-deck dispatch`, start `default_command`, or Claude Code when it is empty. The daemon reads the file each time, so no restart is needed.
+
+The **last command** is the most recent command started from a New Agent form on that deck, from the TUI or the desktop app. The deck remembers it on its own host, so it survives restarting the TUI, the app or the daemon, and both clients offer the same one. Each deck remembers its own last command. When the TUI attaches to a deck that has none yet, it hands that deck the command the TUI last started, from whichever deck that was, so a deck can start out offering a command first used on another. A deck from a release before this one does not remember it: there the TUI offers the last command it started (kept in `session.toml`) and the desktop app the last command it started on that deck since the app was opened.
 
 Check it worked: open the New Agent form (`Ctrl+n` in the TUI, **New agent** in the desktop app) and look at the **Command** field. The TUI reads `config.toml` when it starts, so restart the TUI after changing it; the desktop app picks up the change the next time it opens New agent.
 

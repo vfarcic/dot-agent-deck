@@ -1270,6 +1270,37 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// Issue #1540 — who keeps a deck's last New-agent-form command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastCommandKeeper {
+    /// The daemon advertises [`crate::daemon_protocol::CAP_LAST_COMMAND`]: it
+    /// records form starts itself and answers the value on
+    /// [`crate::new_agent_options::NewAgentOptions::last_command`].
+    Daemon,
+    /// The daemon predates it, so nothing was recorded there and the caller
+    /// keeps its own copy, as before the daemon owned one.
+    Client,
+}
+
+impl LastCommandKeeper {
+    fn from_capabilities(capabilities: &DaemonCapabilities) -> Self {
+        if capabilities.supports(crate::daemon_protocol::CAP_LAST_COMMAND) {
+            Self::Daemon
+        } else {
+            Self::Client
+        }
+    }
+}
+
+/// Issue #1540 — what [`DaemonClient::start_form_agent`] and
+/// [`DaemonClient::start_form_authoring_agent`] answer: the new agent's id, and
+/// who keeps the deck's last command now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormStart {
+    pub agent_id: String,
+    pub last_command: LastCommandKeeper,
+}
+
 /// PRD #1105 — a fresh client identity for [`DaemonClient::with_client_id`]:
 /// `c-` followed by 32 lowercase hex digits.
 ///
@@ -1579,7 +1610,119 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
-        self.send_start_agent(opts, None).await
+        self.send_start_agent(opts, None, false).await
+    }
+
+    /// Issue #1540 — [`Self::start_agent`] for a start submitted from a **New
+    /// agent form** (the TUI's `Ctrl+n`, the desktop's New agent dialog). Use
+    /// it for exactly those starts and nothing else: an orchestration role, a
+    /// scheduled run or `dispatch` must call [`Self::start_agent`], so they
+    /// never become the deck's last command.
+    ///
+    /// Against a daemon that advertises
+    /// [`crate::daemon_protocol::CAP_LAST_COMMAND`] the start carries
+    /// `remember_command`, and the daemon records `opts.command` as the deck's
+    /// last command once it has accepted the start — a refused start records
+    /// nothing, and neither does a `None` (default-shell) or blank command.
+    /// Against one that does not, the marker is withheld and the start is an
+    /// ordinary one. Either way [`FormStart::last_command`] says who keeps the
+    /// value, so a caller keeps its own copy exactly when the deck does not.
+    ///
+    /// Decided from the cached capability set ([`Self::capabilities`]). The
+    /// residual — a cache outliving a daemon replaced by an older build —
+    /// starts the agent normally and drops the marker, so that one start is not
+    /// recorded anywhere a [`LastCommandKeeper::Daemon`] caller looks; nothing
+    /// wrong is started, which is why this does not re-handshake the way
+    /// [`Self::start_authoring_agent`] must.
+    ///
+    /// The two clients come out of that residual differently. The desktop keeps
+    /// no copy of its own for a deck it believes keeps the value, and the older
+    /// daemon answers no `last_command`, so its New agent dialog offers no last
+    /// command for that deck until it reconnects and re-reads the capabilities.
+    /// The TUI writes its `session.toml` copy on every accepted form start
+    /// whoever keeps the value, so it offers that one instead.
+    pub async fn start_form_agent(
+        &self,
+        opts: StartAgentOptions,
+    ) -> Result<FormStart, ClientError> {
+        let keeper = LastCommandKeeper::from_capabilities(&self.capabilities().await?);
+        let agent_id = self
+            .send_start_agent(opts, None, keeper == LastCommandKeeper::Daemon)
+            .await?;
+        Ok(FormStart {
+            agent_id,
+            last_command: keeper,
+        })
+    }
+
+    /// Issue #1540 — [`Self::start_authoring_agent`] for a New agent form
+    /// start: the same authoring start, gated the same way on a fresh
+    /// handshake, which also decides the last-command marker exactly as
+    /// [`Self::start_form_agent`] does.
+    pub async fn start_form_authoring_agent(
+        &self,
+        opts: StartAgentOptions,
+        kind: crate::authoring_seeds::AuthoringKind,
+    ) -> Result<GatedQuery<FormStart>, ClientError> {
+        let capabilities = self.fresh_capabilities().await?;
+        if !capabilities.supports(crate::daemon_protocol::CAP_AUTHORING_KIND) {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let keeper = LastCommandKeeper::from_capabilities(&capabilities);
+        let agent_id = self
+            .send_start_agent(opts, Some(kind), keeper == LastCommandKeeper::Daemon)
+            .await?;
+        Ok(GatedQuery::Answered(FormStart {
+            agent_id,
+            last_command: keeper,
+        }))
+    }
+
+    /// Issue #1540 — who keeps this deck's last command: the daemon, when it
+    /// advertises [`crate::daemon_protocol::CAP_LAST_COMMAND`], otherwise the
+    /// caller. A form reads it to decide where its pre-fill comes from — the
+    /// daemon's [`crate::new_agent_options::NewAgentOptions::last_command`], or
+    /// its own copy — without sending anything but the cached `Hello`.
+    pub async fn last_command_keeper(&self) -> Result<LastCommandKeeper, ClientError> {
+        Ok(LastCommandKeeper::from_capabilities(
+            &self.capabilities().await?,
+        ))
+    }
+
+    /// Issue #1540 — offer `command` as this deck's last command **only if it
+    /// has none yet**: how a client hands over a value it kept before the
+    /// daemon owned one (the TUI's `session.toml`) without overwriting a newer
+    /// command another client recorded. A blank or over-long command is not
+    /// taken, and the answer is the same.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_LAST_COMMAND`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything, so the caller keeps
+    /// its own copy.
+    pub async fn seed_last_command(&self, command: &str) -> Result<GatedQuery<()>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_LAST_COMMAND)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SeedLastCommand {
+                command: command.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "seed-last-command failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
     }
 
     /// PRD #1223 M7 — start an AUTHORING agent: the daemon composes `kind`'s
@@ -1632,17 +1775,19 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        self.send_start_agent(opts, Some(kind))
+        self.send_start_agent(opts, Some(kind), false)
             .await
             .map(GatedQuery::Answered)
     }
 
-    /// The one `start-agent` sender. `authoring_kind` is `Some` only from
-    /// [`Self::start_authoring_agent`], after its capability check.
+    /// The one `start-agent` sender. `authoring_kind` is `Some` only from the
+    /// authoring starts, after their capability check, and `remember_command`
+    /// is `true` only from the form starts, after theirs.
     async fn send_start_agent(
         &self,
         opts: StartAgentOptions,
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        remember_command: bool,
     ) -> Result<String, ClientError> {
         let (mut rd, mut wr) = self.connect().await?;
         let req = AttachRequest::StartAgent {
@@ -1656,6 +1801,7 @@ impl DaemonClient {
             agent_type: opts.agent_type,
             seed: opts.seed,
             authoring_kind,
+            remember_command,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
         if !resp.ok {
@@ -4520,6 +4666,173 @@ mod tests {
             0,
             "advertised {advertised:?}: withholding means no start reaches the socket, even \
              from a handle whose cached set still names `authoring-kind`"
+        );
+
+        drop(client);
+        server.await.unwrap();
+        drop(dir);
+    }
+
+    /// Issue #1540 — the last-command marker and the seed verb are withheld
+    /// from the two older daemons a client will meet: one advertising nothing
+    /// (pre-PRD #819), and one advertising everything up to M7 but not
+    /// `last-command`. A form start still starts the agent — as an ordinary
+    /// start, with no `remember_command` key on the wire — and says the CLIENT
+    /// keeps the value; the seed is answered `Unsupported` without being sent.
+    /// Against a daemon that advertises it, the form starts carry the marker,
+    /// a plain start never does, and the seed is sent.
+    #[cfg(unix)]
+    #[test]
+    fn last_command_is_withheld_by_a_daemon_that_does_not_advertise_it() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build older-daemon runtime");
+        runtime.block_on(async {
+            let older: &'static [&'static str] = &[
+                CAP_LIST_PROJECTS,
+                CAP_RESOLVE_PROJECT,
+                CAP_PREPARE_WORKFLOW,
+                crate::daemon_protocol::CAP_START_PREPARED_AGENT,
+                crate::daemon_protocol::CAP_STOP_DAEMON,
+                crate::daemon_protocol::CAP_FOCUS_GAINED,
+                crate::daemon_protocol::CAP_LIST_DIRECTORIES,
+                crate::daemon_protocol::CAP_NEW_AGENT_OPTIONS,
+                crate::daemon_protocol::CAP_AUTHORING_KIND,
+            ];
+            last_command_gate_inner(None, LastCommandKeeper::Client).await;
+            last_command_gate_inner(Some(older), LastCommandKeeper::Client).await;
+            last_command_gate_inner(
+                Some(crate::daemon_protocol::DAEMON_CAPABILITIES),
+                LastCommandKeeper::Daemon,
+            )
+            .await;
+        });
+    }
+
+    #[cfg(unix)]
+    async fn last_command_gate_inner(
+        advertised: Option<&'static [&'static str]>,
+        expected: LastCommandKeeper,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scripted-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind scripted daemon");
+            (dir, path, listener)
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read scripted-daemon request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode scripted-daemon request");
+                let op = request
+                    .get("op")
+                    .and_then(|op| op.as_str())
+                    .map(str::to_string);
+                let response = match op.as_deref() {
+                    Some("hello") => AttachResponse {
+                        capabilities: advertised
+                            .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                        ..AttachResponse::hello(PROTOCOL_VERSION)
+                    },
+                    Some("start-agent") => AttachResponse::with_id("agent-1540".into()),
+                    _ => AttachResponse::ok(),
+                };
+                if op.as_deref() != Some("hello") {
+                    server_requests.lock().unwrap().push(request);
+                }
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write scripted-daemon response");
+            }
+        });
+        let client = DaemonClient::new(path);
+        let opts = || StartAgentOptions {
+            command: Some("claude".into()),
+            cwd: Some("/tmp".into()),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                "form-pane".into(),
+            )],
+            ..StartAgentOptions::default()
+        };
+        let daemon_keeps = expected == LastCommandKeeper::Daemon;
+
+        assert_eq!(client.last_command_keeper().await.unwrap(), expected);
+        let form = client.start_form_agent(opts()).await.expect("form start");
+        assert_eq!(
+            form,
+            FormStart {
+                agent_id: "agent-1540".into(),
+                last_command: expected,
+            },
+            "advertised {advertised:?}"
+        );
+        let GatedQuery::Answered(authoring) = client
+            .start_form_authoring_agent(opts(), crate::authoring_seeds::AuthoringKind::Schedule)
+            .await
+            .expect("authoring form start")
+        else {
+            // Only the capability-less daemon lacks `authoring-kind`.
+            assert!(advertised.is_none(), "advertised {advertised:?}");
+            client.start_agent(opts()).await.expect("plain start");
+            let seeded = client.seed_last_command("claude").await.unwrap();
+            assert_eq!(seeded, GatedQuery::Unsupported);
+            let sent = requests.lock().unwrap().clone();
+            assert_eq!(sent.len(), 2, "two starts, and the seed withheld: {sent:?}");
+            for request in &sent {
+                assert!(request.get("remember_command").is_none(), "{request}");
+            }
+            drop(client);
+            server.await.unwrap();
+            drop(dir);
+            return;
+        };
+        assert_eq!(authoring.last_command, expected);
+        client.start_agent(opts()).await.expect("plain start");
+        let seeded = client.seed_last_command("claude").await.unwrap();
+        assert_eq!(
+            seeded,
+            if daemon_keeps {
+                GatedQuery::Answered(())
+            } else {
+                GatedQuery::Unsupported
+            },
+            "advertised {advertised:?}"
+        );
+
+        let sent = requests.lock().unwrap().clone();
+        let ops: Vec<_> = sent
+            .iter()
+            .map(|r| r["op"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let mut expected_ops = vec!["start-agent"; 3];
+        if daemon_keeps {
+            expected_ops.push("seed-last-command");
+        }
+        assert_eq!(ops, expected_ops, "advertised {advertised:?}");
+        let markers: Vec<_> = sent[..3]
+            .iter()
+            .map(|r| r.get("remember_command").and_then(|v| v.as_bool()))
+            .collect();
+        let marker = daemon_keeps.then_some(true);
+        assert_eq!(
+            markers,
+            vec![marker, marker, None],
+            "advertised {advertised:?}: the form starts carry the marker only when it is \
+             advertised, and a plain start never does"
         );
 
         drop(client);

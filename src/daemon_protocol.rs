@@ -774,6 +774,24 @@ pub const CAP_AUTHORING_KIND: &str = "authoring-kind";
 /// platforms is not one it can honour there.
 pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 
+/// Capability string for the deck's shared last command (issue #1540): the
+/// [`crate::new_agent_options::NewAgentOptions::last_command`] answer field,
+/// [`AttachRequest::StartAgent`]'s `remember_command` marker, and the
+/// [`AttachRequest::SeedLastCommand`] verb — one feature, so one string.
+///
+/// Names a FEATURE rather than a single verb's `op`, because two of its three
+/// parts are fields: an older daemon drops `remember_command` silently and
+/// omits `last_command`, so neither can be detected from the reply, and a
+/// client that wants to know whether this deck keeps the last command — and so
+/// whether to keep its own copy — has only this to ask. Held by
+/// [`crate::daemon_client::DaemonClient::start_form_agent`],
+/// [`crate::daemon_client::DaemonClient::start_form_authoring_agent`] and
+/// [`crate::daemon_client::DaemonClient::seed_last_command`], so no call site
+/// checks it itself. Advertised on every platform: none of the three arms is
+/// `#[cfg]`-gated, and the store is an owner-only file under the state
+/// directory on every platform this builds for.
+pub const CAP_LAST_COMMAND: &str = "last-command";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -843,7 +861,8 @@ fn invalid_client_id_message() -> String {
 /// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
 /// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
 /// same reason: none of their dispatch arms is `#[cfg]`-gated — and so is issue
-/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first.
+/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first, and issue
+/// #1540's [`CAP_LAST_COMMAND`].
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
 /// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb — and so is
 /// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
@@ -865,6 +884,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
+    CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
 ];
 #[cfg(not(unix))]
@@ -877,6 +897,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
 ];
 
@@ -1579,6 +1600,31 @@ pub enum AttachRequest {
         /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        /// Issue #1540: this start was submitted from a **New agent form** (the
+        /// TUI's `Ctrl+n`, the desktop's New agent dialog), plain or authoring,
+        /// so once the daemon has ACCEPTED it — the spawn succeeded — `command`
+        /// becomes the deck's last command
+        /// ([`crate::last_command::LastCommandStore::remember`]). A start that is
+        /// refused records nothing, and so does one with no `command` (the
+        /// default shell) or a command [`crate::last_command::is_recordable`]
+        /// rejects.
+        ///
+        /// **Ignored, not refused, on an orchestration role start** — one
+        /// presenting a preparation token (`start-prepared-agent`) or carrying a
+        /// [`TabMembership::Orchestration`] — so a role start can never
+        /// overwrite the value whatever a client sends. Scheduled runs and
+        /// `dispatch` do not come through this verb with it set: neither is a
+        /// form, and the one production sender of `true` is
+        /// [`crate::daemon_client::DaemonClient`]'s form-start methods.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`].** An
+        /// older daemon drops the key and starts the agent unchanged, so sending
+        /// it would be harmless; it is gated anyway so the capability is the one
+        /// thing a client reads to know whether this deck keeps the value. No
+        /// `PROTOCOL_VERSION` bump: an additive optional field, omitted when
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remember_command: bool,
     },
     StopAgent {
         id: String,
@@ -2178,6 +2224,20 @@ pub enum AttachRequest {
     /// **Withheld unless the daemon advertises [`CAP_NEW_AGENT_OPTIONS`]**, on
     /// the same no-bump basis as [`Self::ListDirectories`].
     NewAgentOptions {},
+    /// Issue #1540: offer `command` as the deck's last command **only if the
+    /// daemon has none yet** ([`crate::last_command::LastCommandStore::remember_if_empty`]) —
+    /// how a client hands over a value it kept before the daemon owned one
+    /// (the TUI's `session.toml`) without overwriting a newer command another
+    /// client already recorded. Answers `ok` whether or not the value was
+    /// taken; a blank or over-long `command` is simply not taken.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`]**, on the
+    /// same no-bump basis as [`Self::FocusGained`]: an older daemon has no such
+    /// variant and refuses it with the generic `malformed request: …`, changing
+    /// nothing.
+    SeedLastCommand {
+        command: String,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -3942,6 +4002,9 @@ async fn handle_connection(
                     // PRD #1223 M7: an orchestration role is not an authoring
                     // agent, and `start-prepared-agent` has no such field.
                     authoring_kind: None,
+                    // Issue #1540: a role start is not a form start, so it
+                    // never records the deck's last command.
+                    remember_command: false,
                 },
                 Some(prep_token),
                 use_configured_command,
@@ -4093,6 +4156,7 @@ async fn handle_connection(
             agent_type,
             seed,
             authoring_kind,
+            remember_command,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -4362,6 +4426,16 @@ async fn handle_connection(
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
+            // Issue #1540: whether an accepted start becomes the deck's last
+            // command. Decided here, from the request as it stands, because
+            // `tab_membership` moves into the spawn. A role start — a prepared
+            // one, or one carrying an orchestration membership — never records,
+            // whatever the marker says (see `StartAgent::remember_command`).
+            let last_command_to_record: Option<String> = (remember_command
+                && prepared_token.is_none()
+                && !matches!(tab_membership, Some(TabMembership::Orchestration { .. })))
+            .then(|| command.clone())
+            .flatten();
 
             // PRD #1223 M7: an authoring start's seed is composed — and its
             // preconditions checked — before anything spawns, so a refusal
@@ -4667,6 +4741,15 @@ async fn handle_connection(
                             &record,
                             command.as_deref(),
                         );
+                    }
+                    // Issue #1540: the start is accepted, so a form start's
+                    // command becomes the deck's last command — in memory
+                    // before the reply, so a form that reopens on the reply
+                    // already sees it, and on disk after, on a detached task,
+                    // so the reply never waits for the state directory. A
+                    // failed write is logged and does not fail the start.
+                    if let Some(command) = last_command_to_record {
+                        record_last_command(&state, &command).await;
                     }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
@@ -5635,7 +5718,14 @@ async fn handle_connection(
             )
             .await
             {
-                Ok(options) => {
+                Ok(mut options) => {
+                    // Issue #1540: the deck's last command, from the daemon's
+                    // in-memory snapshot — `get` takes no lock a writer holds
+                    // across disk I/O, so it is read here rather than inside
+                    // the blocking query. The store is bound first so the
+                    // `AppState` guard is released before it is read.
+                    let store = state.read().await.last_command_store();
+                    options.last_command = store.and_then(|store| store.get());
                     let mut resp = AttachResponse::ok();
                     resp.new_agent_options = Some(options);
                     resp
@@ -5652,8 +5742,53 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        // Issue #1540: set the deck's last command only if it has none. `ok`
+        // whether or not it was taken — the caller has nothing to do either way.
+        AttachRequest::SeedLastCommand { command } => {
+            // Bound in its own statement so the `AppState` read guard is
+            // dropped before the store is used. The value is taken in memory
+            // and written on a detached task, so the answer never waits for
+            // the disk — the same shape as a form start's record.
+            let store = state.read().await.last_command_store();
+            if let Some(store) = store
+                && store.remember_if_empty(&command) == crate::last_command::StoreOutcome::Set
+            {
+                persist_last_command(store, "seed-last-command");
+            }
+            write_resp(&mut stream, &AttachResponse::ok()).await?
+        }
     }
     Ok(())
+}
+
+/// Issue #1540: make `command` the deck's last command in memory — no I/O, so
+/// the caller may reply straight after — and write it to disk on a detached
+/// blocking task ([`persist_last_command`]). A daemon with no store installed —
+/// a test harness — records nothing. Never fails the caller: the start it
+/// follows has already been accepted.
+async fn record_last_command(state: &SharedState, command: &str) {
+    // `let … else` drops the `AppState` read guard at the end of this
+    // statement.
+    let Some(store) = state.read().await.last_command_store() else {
+        return;
+    };
+    if store.remember(command) == crate::last_command::StoreOutcome::Set {
+        persist_last_command(store, "start-agent");
+    }
+}
+
+/// Issue #1540: write the store's current value to disk on a detached blocking
+/// task, so no reply waits for the state directory. The store writes whatever
+/// value is newest when the task runs and skips one already on disk, so tasks
+/// finishing out of order cannot leave an older command on disk. A failure is
+/// logged under `verb` with the store's error, which names a path and never the
+/// command.
+fn persist_last_command(store: Arc<crate::last_command::LastCommandStore>, verb: &'static str) {
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(error) = store.persist() {
+            warn!(verb, %error, "could not persist the last command");
+        }
+    }));
 }
 
 /// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
@@ -8131,6 +8266,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -8167,6 +8303,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -8208,6 +8345,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -8249,6 +8387,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -9614,6 +9753,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind,
+            remember_command: false,
         };
         let plain = serde_json::to_value(start(None)).unwrap();
         assert!(
@@ -10004,5 +10144,222 @@ mod tests {
         );
         let neither: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(neither.into_prepared_orchestration(), None);
+    }
+
+    /// Issue #1540: the daemon records the deck's last command from a New
+    /// agent form start once it has accepted it, answers it on the options
+    /// query, and records nothing for any other start — a plain (non-form)
+    /// start, a form-marked orchestration role start, or a refused form start.
+    /// A seed only fills an empty store.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_accepted_form_start_records_the_last_command() {
+        use crate::daemon_client::{
+            DaemonClient, GatedQuery, LastCommandKeeper, StartAgentOptions,
+        };
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        // The options query reads through the shared new-agent pool; see the
+        // guard's doc for why tests that use it serialise.
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join("state").join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock.clone());
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let last_command = || async {
+            match client.new_agent_options().await.expect("options query") {
+                GatedQuery::Answered(options) => options.last_command,
+                GatedQuery::Unsupported => panic!("this build advertises the options query"),
+            }
+        };
+        let start = |command: &str, pane: &str| StartAgentOptions {
+            command: Some(command.to_string()),
+            cwd: Some(cwd.clone()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..StartAgentOptions::default()
+        };
+
+        assert_eq!(last_command().await, None, "a fresh deck has none");
+        assert_eq!(
+            client.last_command_keeper().await.unwrap(),
+            LastCommandKeeper::Daemon
+        );
+
+        // A non-form start — what `dispatch` and the CLI send — records nothing.
+        client
+            .start_agent(start("cat", "plain-1540"))
+            .await
+            .expect("plain start");
+        assert_eq!(last_command().await, None, "a non-form start never records");
+
+        // A form start records once accepted, and the next options query has it.
+        let form = client
+            .start_form_agent(start("cat -u", "form-1540"))
+            .await
+            .expect("form start");
+        assert_eq!(form.last_command, LastCommandKeeper::Daemon);
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+        // The disk write runs after the reply, on a detached task, so wait for
+        // it — bounded, since it is a small local file.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("cat -u") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recorded command never reached disk, so it would not survive a \
+                 daemon restart"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A form-marked ORCHESTRATION role start is ignored, whatever the marker.
+        let role = StartAgentOptions {
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-1540".into(),
+                role_index: 0,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: Some(cwd.clone()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            ..start("cat -v", "role-1540")
+        };
+        client
+            .start_form_agent(role)
+            .await
+            .expect("role start is accepted");
+        assert_eq!(
+            last_command().await.as_deref(),
+            Some("cat -u"),
+            "an orchestration role start never overwrites the last command"
+        );
+
+        // A REFUSED form start (an authoring start naming no directory) records
+        // nothing.
+        let refused = client
+            .start_form_authoring_agent(
+                StartAgentOptions {
+                    cwd: None,
+                    ..start("cat -e", "refused-1540")
+                },
+                crate::authoring_seeds::AuthoringKind::Schedule,
+            )
+            .await;
+        assert!(refused.is_err(), "precondition: the start is refused");
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        // A seed does not overwrite a recorded value.
+        assert_eq!(
+            client.seed_last_command("from-session-toml").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        server.abort();
+        for record in registry.agent_records() {
+            let _ = registry.close_agent(&record.id);
+        }
+    }
+
+    /// Issue #1540: a seed fills an empty store, through the real dispatch.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_fills_an_empty_deck_through_the_dispatch() {
+        use crate::daemon_client::{DaemonClient, GatedQuery};
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+        let server = {
+            let sock = sock.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock);
+        assert_eq!(
+            client.seed_last_command("   ").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(
+            LastCommandStore::load(store_path.clone()).get(),
+            None,
+            "blank is not taken"
+        );
+        client.seed_last_command("claude").await.unwrap();
+        let GatedQuery::Answered(options) = client.new_agent_options().await.unwrap() else {
+            panic!("this build advertises the options query");
+        };
+        assert_eq!(options.last_command.as_deref(), Some("claude"));
+        // Persisted after the answer, on a detached task: wait for it, bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("claude") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seeded command never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
     }
 }

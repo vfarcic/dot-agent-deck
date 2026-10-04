@@ -1629,6 +1629,7 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
             agent_type: AgentType::from_command(Some("sleep 600")),
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         })
         .expect("start legacy-mode agent over attach socket");
     assert!(
