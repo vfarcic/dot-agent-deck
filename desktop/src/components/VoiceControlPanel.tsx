@@ -1403,8 +1403,25 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** Seconds left before the answer is sent, or `undefined` while no countdown runs. */
   const [answerIn, setAnswerIn] = useState<number>();
   const answerTimer = useRef<number | undefined>(undefined);
-  /** The lease whose cancel failed to reach Rust, so its outcome says the cancel could not stop it (audit A8). */
+  /** The lease whose cancel failed to reach Rust before its outcome arrived, so the outcome says the cancel could not stop it (audit A8). */
   const cancelFailedLease = useRef<string | undefined>(undefined);
+  /** The outcome last written to the row for a lease whose cancel has not failed yet — amended if it fails later (audit R5). */
+  const reportedOutcome = useRef<{ lease: string; sentence: string } | undefined>(undefined);
+  /**
+   * A cancel that never reached Rust, reported whichever arrives first
+   * (audit R5): before the answer's outcome, the outcome carries it when it
+   * comes; after, the row that outcome wrote is amended — if it still shows it.
+   */
+  const reportCancelFailed = useCallback((lease: string) => {
+    const reported = reportedOutcome.current;
+    if (reported?.lease !== lease) {
+      cancelFailedLease.current = lease;
+      return;
+    }
+    reportedOutcome.current = undefined;
+    const amended = `${reported.sentence} ${QUESTION_CANCEL_FAILED}`;
+    setProblem((shown) => (shown === reported.sentence ? amended : shown));
+  }, []);
   /** Bumped by every stop of the countdown, so a tick or a send that outlived it acts on nothing. */
   const answerEpoch = useRef(0);
   const stopAnswerCountdown = useCallback(() => {
@@ -1427,7 +1444,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (held?.sending) {
       if (!held.cancelling) {
         const lease = held.lease;
-        if (lease) void cancelVoiceAnswer?.(lease).catch(() => { cancelFailedLease.current = lease; });
+        if (lease) void cancelVoiceAnswer?.(lease).catch(() => reportCancelFailed(lease));
         setQuestionForm({ ...held, cancelling: true });
       }
       return;
@@ -1437,7 +1454,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setResult(undefined);
       setProblem(why);
     }
-  }, [cancelVoiceAnswer, setQuestionForm, stopAnswerCountdown]);
+  }, [cancelVoiceAnswer, reportCancelFailed, setQuestionForm, stopAnswerCountdown]);
   /**
    * PRD #1542 (audit A3) — the microphone heard speech while the answer was
    * counting down: the countdown stops NOW, before anything is transcribed or
@@ -1489,7 +1506,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     if (cancelFailedLease.current === lease) {
       cancelFailedLease.current = undefined;
+      reportedOutcome.current = undefined;
       sentence = `${sentence} ${QUESTION_CANCEL_FAILED}`;
+    } else {
+      reportedOutcome.current = { lease, sentence };
     }
     if (questionFormRef.current?.lease === lease) setQuestionForm(undefined);
     setResult(undefined);
@@ -1540,6 +1560,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     host already hands down, so this subscribes rather than polls.
   */
   const paneQuestionId = pane?.question?.id;
+  /* Audit R5: the same id at another revision is another question. */
+  const paneQuestionRevision = pane?.question?.revision;
   const paneQuestionDeck = pane?.deckId;
   const paneQuestionAgent = pane?.agentId;
   const paneQuestionSpawned = pane?.spawnedAtMs;
@@ -1547,7 +1569,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   useEffect(() => {
     const lost = answerLost();
     if (lost) dropQuestion(questionLostSentence(lost));
-  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionSpawned, selectedDeckId]);
+  }, [answerLost, confirmationOpen, dropQuestion, paneQuestionAgent, paneQuestionDeck, paneQuestionHidden, paneQuestionId, paneQuestionRevision, paneQuestionSpawned, selectedDeckId]);
 
   /**
    * PRD #1542 — an utterance said while the agent on screen waits on a

@@ -219,6 +219,43 @@ describe("answering an agent's question by voice", () => {
     view.unmount();
   });
 
+  /**
+   * Scenario (question/desktop/006, audit R5): the question keeps its id but
+   * the deck registers it again — a new revision — while nothing else about
+   * the pane changes. A countdown is called off at once with nothing sent, and
+   * an answer already on its way has its lease cancelled at once.
+   */
+  it("question/desktop/006: the same question id at a new revision calls the answer off at once", async () => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    const first = pane({ ...PERMISSION, revision: 7 });
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={first} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    await speak(voice, "yes");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("sending in 5 s");
+    await waitOut(2_000);
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane({ ...PERMISSION, revision: 8 })} selectedDeckId="local" />);
+    await flush();
+    expect(screen.queryByTestId("voice-question")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_MOVED_ON);
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    const lease = sendVoiceAnswer.mock.calls[0][3];
+    view.rerender(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane({ ...PERMISSION, revision: 9 })} selectedDeckId="local" />);
+    await flush();
+    expect(cancelVoiceAnswer).toHaveBeenCalledWith(lease);
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("cancelling…");
+    deliver?.({ kind: "cancelled", sentence: "Answer cancelled" });
+    await flush();
+    view.unmount();
+  });
+
   it("question/desktop/006: each refusal's sentence is what the row says", async () => {
     const refusals: AnswerOutcomeDto[] = [
       { kind: "refused", code: "no_pending_question", sentence: "No question is waiting in this agent." },
@@ -500,6 +537,36 @@ describe("answering an agent's question by voice", () => {
     await flush();
     expect(cancelVoiceAnswer).toHaveBeenCalledTimes(1);
     deliver?.({ kind: "answered", sentence: "Allowed: touch x" });
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`Allowed: touch x ${QUESTION_CANCEL_FAILED}`);
+    view.unmount();
+  });
+
+  /**
+   * Scenario (question/desktop/011, audit R5): the same failed cancel, but
+   * this time the answer's outcome arrives first and the cancel's failure
+   * only afterwards. The row first says what became of the answer, then is
+   * amended to say the cancel could not stop it.
+   */
+  it("question/desktop/011: a cancel that fails after the outcome arrived still amends the row", async () => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    let failCancel: ((cause: Error) => void) | undefined;
+    const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    cancelVoiceAnswer.mockImplementationOnce(() => new Promise((_, reject) => { failCancel = reject; }));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+    expect(cancelVoiceAnswer).toHaveBeenCalledTimes(1);
+    deliver?.({ kind: "answered", sentence: "Allowed: touch x" });
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Allowed: touch x");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(QUESTION_CANCEL_FAILED);
+    failCancel?.(new Error("ipc down"));
     await flush();
     expect(screen.getByTestId("voice-report")).toHaveTextContent(`Allowed: touch x ${QUESTION_CANCEL_FAILED}`);
     view.unmount();
