@@ -684,6 +684,15 @@ pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 /// the same bounded context-file read the TUI's re-arm uses on every platform.
 pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
 
+/// Capability string for [`AttachRequest::SubscribeEventsWithSnapshot`] (issue
+/// #1555).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`] holds
+/// the check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated.
+pub const CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT: &str = "subscribe-events-with-snapshot";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -849,7 +858,8 @@ fn invalid_client_id_message() -> String {
 /// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
 /// [`CAP_PREPARE_ORCHESTRATION`]. Issue #1445's
 /// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
-/// not `#[cfg]`-gated.
+/// not `#[cfg]`-gated, and neither is issue #1555's
+/// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`].
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -866,6 +876,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -878,6 +889,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1719,33 @@ pub enum AttachRequest {
     /// `AppState` mirrors the daemon's view of live agent activity (agent
     /// type, tool counts, prompts, last-activity timestamps).
     SubscribeEvents,
+    /// Issue #1555: [`Self::SubscribeEvents`], answered with the daemon's agents
+    /// as of the instant the subscription opened — the OK `RESP` carries the
+    /// same [`AttachResponse::agent_records`] a [`Self::ListAgents`] reply does,
+    /// and the `KIND_EVENT` frames that follow it are the broadcasts made after
+    /// that instant.
+    ///
+    /// What a resubscribing client needs, and what `SubscribeEvents` followed by
+    /// `ListAgents` cannot give it: between those two requests the daemon keeps
+    /// broadcasting, so an event sent in that window is queued on the new
+    /// subscription AND already reflected in the listing, and the client
+    /// replays it over the snapshot (a conversation that rolled over comes back
+    /// for a moment and its closure is counted twice). Here the daemon opens the
+    /// subscription and builds the listing under one read of its `AppState`
+    /// lock, and the hook-event ingest path broadcasts and applies each event
+    /// under that lock's write guard, so such an event is on exactly one side:
+    /// in the listing and not on the stream, or the other way round. That
+    /// holds for a broadcast made under the same guard as the state change it
+    /// reports, which is how every hook event the daemon receives, a
+    /// conversation's start and end included, reaches both; see
+    /// `handle_subscribe_events_with_snapshot`.
+    ///
+    /// **Withheld unless the daemon advertises
+    /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`]**, by
+    /// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`],
+    /// which a client falls back from to `SubscribeEvents` plus `ListAgents`.
+    /// An older daemon refuses the unknown variant and opens nothing.
+    SubscribeEventsWithSnapshot,
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
@@ -3424,8 +3463,8 @@ async fn compute_write_and_submit_reply(
                         // this from looping.
                         //
                         // Issue #621: and it now recovers when the caller's event
-                        // stream DROPPED the generation too. `spawn_event_subscriber`
-                        // (`main.rs`) resubscribes after a lagged or errored
+                        // stream DROPPED the generation too. The TUI's event
+                        // subscriber resubscribed after a lagged or errored
                         // stream WITHOUT replaying what it missed, so a
                         // `SessionStart` dropped in that window was never applied
                         // to the client `AppState`: every retry went out unnamed,
@@ -3442,12 +3481,18 @@ async fn compute_write_and_submit_reply(
                         // are about to enter and claims nothing retroactively.
                         // A delivery that already wrote into a pane with no
                         // generation and then missed the start still cannot
-                        // bind from a refusal, and is still abandoned at the
-                        // deadline: from a point-in-time answer it cannot tell
-                        // the conversation it wrote into from a successor whose
-                        // predecessor ended unseen. Resynchronizing client state
-                        // after a reconnect would close that too, and is the
-                        // more general remedy the issue names.
+                        // bind from a refusal: from a point-in-time answer it
+                        // cannot tell the conversation it wrote into from a
+                        // successor whose predecessor ended unseen. Since issue
+                        // #1520 the TUI's subscriber (`crate::event_subscriber`)
+                        // records the gap that dropped the start and
+                        // resynchronizes its state when it reconnects, and such a
+                        // delivery stops when its next retry falls due after the
+                        // gap (`crate::ui`'s `delivery_outlived_event_gap`) rather
+                        // than being retried until the deadline; a retry that
+                        // falls due while the stream is still down waits, bounded
+                        // by that deadline. Stopping writes nothing more, so
+                        // nothing here needs to change for it.
                         //
                         // Issue #608 audit, finding 5(b): this arm refuses on the
                         // SESSION evidence alone, with no `has_live_attach`
@@ -5238,6 +5283,9 @@ async fn handle_connection(
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
         }
+        AttachRequest::SubscribeEventsWithSnapshot => {
+            handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
+        }
         AttachRequest::Hello {
             client_version: _,
             client_build_version,
@@ -5906,7 +5954,9 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// so a wedged client can't pin this task forever. A lagged receiver
 /// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
-/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// TUI's reconnect path resynchronizes from a snapshot of the daemon's agents
+/// to recover — [`AttachRequest::SubscribeEventsWithSnapshot`] where the daemon
+/// offers it (issue #1555), `ListAgents` otherwise.
 /// Client disconnect is detected by racing a one-byte read against
 /// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
 /// the client goes away between messages — otherwise the
@@ -5925,9 +5975,54 @@ async fn handle_subscribe_events(
     stream: IpcStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
-    let mut rx = event_tx.subscribe();
+    let rx = event_tx.subscribe();
+    forward_event_stream(stream, rx, &AttachResponse::ok()).await
+}
+
+/// Issue #1555: [`AttachRequest::SubscribeEventsWithSnapshot`]. The receiver is
+/// opened and the listing's live state is read under ONE read guard of the
+/// daemon's `AppState`, so no broadcast made under that state's write guard can
+/// fall between them. `crate::daemon::ingest_event` broadcasts and applies every
+/// hook event under its write guard, and the daemon's delivery notices are
+/// broadcast and applied under one too, so each such event is either already in
+/// the listing (sent before the receiver existed, so not on this stream) or on
+/// this stream (sent after the listing was read, so not in it) — never both.
+///
+/// The registry's records are read before the guard is taken, the order every
+/// path that holds both locks uses. That only decides which agents the listing
+/// names; an agent registered after that read is missing from the listing and
+/// its later events arrive on the stream, as they would for any new agent.
+///
+/// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
+/// built by the same calls.
+async fn handle_subscribe_events_with_snapshot(
+    stream: IpcStream,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+) -> io::Result<()> {
+    let mut records = registry.agent_records();
+    let rx = {
+        let guard = state.read().await;
+        let rx = event_tx.subscribe();
+        guard.attach_live_sessions(&mut records);
+        guard.attach_orchestrator_context_paths(&mut records);
+        rx
+    };
+    crate::agent_pty::attach_cli_names(&mut records);
+    forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
+}
+
+/// The forwarding loop both subscribe handlers share: confirm with `resp`, then
+/// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
+/// ends. See [`handle_subscribe_events`].
+async fn forward_event_stream(
+    stream: IpcStream,
+    mut rx: broadcast::Receiver<BroadcastMsg>,
+    resp: &AttachResponse,
+) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
-    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    write_resp(&mut wr, resp).await?;
 
     loop {
         tokio::select! {
@@ -6911,6 +7006,146 @@ mod tests {
     /// injected into the spawned pane. Never a `SessionStart` — which is the
     /// whole reason admission decided issue #454.
     #[cfg(unix)]
+    /// Issue #1555: a `SubscribeEventsWithSnapshot` reply never carries an event
+    /// on its stream that its snapshot already includes, even when the
+    /// conversation rolls over while the request is in flight.
+    ///
+    /// The test holds the daemon's `AppState` write guard while the request is
+    /// sent, and under that guard broadcasts and applies a rollover — `gen-a`
+    /// ends and `gen-b` starts — exactly as `crate::daemon::ingest_event` does.
+    /// Whichever side of the guard the handler lands on, the rollover must be in
+    /// the snapshot or on the stream, not both. Here it lands after (the guard
+    /// is held until the rollover is done), so the snapshot must name `gen-b`
+    /// and the stream's first event must be the next one ingested. A handler
+    /// that opened its receiver before taking the guard would get the rollover
+    /// on the stream as well, which is the replay the TUI cannot tell apart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordered_subscription_never_carries_an_event_its_snapshot_includes() {
+        use crate::daemon_client::{DaemonClient, GatedQuery, StartAgentOptions};
+        use crate::event::EventType;
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "ordered-pane-1555";
+        let client = DaemonClient::new(sock.clone());
+        let agent_id = client
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a pane through the attach socket");
+        let event = |session: &str, event_type: EventType| crate::event::AgentEvent {
+            session_id: session.to_string(),
+            event_type,
+            agent_type: crate::event::AgentType::ClaudeCode,
+            ..thinking_event_454(pane_id, &agent_id)
+        };
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-a", EventType::SessionStart),
+        )
+        .await;
+
+        let mut guard = state.write().await;
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.subscribe_events_with_snapshot().await }
+        });
+        // Long enough for the request to reach the handler, which then waits on
+        // the guard this test holds. Only a handler that wrongly opens its
+        // receiver first depends on it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for ev in [
+            event("gen-a", EventType::SessionEnd),
+            event("gen-b", EventType::SessionStart),
+        ] {
+            let _ = event_tx.send(BroadcastMsg::Event(ev.clone()));
+            guard.apply_event(ev);
+        }
+        drop(guard);
+
+        let GatedQuery::Answered((mut sub, records)) = request
+            .await
+            .expect("the request task")
+            .expect("the ordered subscription opens")
+        else {
+            panic!("this build advertises the ordered subscription");
+        };
+        let generation = records
+            .iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|r| r.live.as_ref())
+            .and_then(|live| live.hook_generation.as_ref())
+            .map(|generation| generation.session_id.clone());
+        assert_eq!(
+            generation.as_deref(),
+            Some("gen-b"),
+            "the snapshot was read after the rollover, so it must name gen-b"
+        );
+
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-b", EventType::Thinking),
+        )
+        .await;
+        let first = tokio::time::timeout(Duration::from_secs(5), sub.next_event())
+            .await
+            .expect("the stream delivers the next event")
+            .expect("the stream reads")
+            .expect("the stream is open");
+        let BroadcastMsg::Event(first) = first else {
+            panic!("expected an event, got {first:?}");
+        };
+        assert_eq!(
+            (first.session_id.as_str(), first.event_type),
+            ("gen-b", EventType::Thinking),
+            "the stream must start after the snapshot: the rollover it includes must not \
+             follow it"
+        );
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
     fn thinking_event_454(pane_id: &str, agent_id: &str) -> crate::event::AgentEvent {
         crate::event::AgentEvent {
             session_id: format!("{pane_id}-session"),
@@ -9563,6 +9798,17 @@ mod tests {
         let resp: AttachResponse = serde_json::from_str(json).unwrap();
         assert!(resp.ok);
         assert!(resp.server_version.is_none());
+    }
+
+    /// Issue #1555 — the ordered subscription is advertised on every platform,
+    /// under its variant's `op`, per PRD #819's convention.
+    #[test]
+    fn the_ordered_subscription_is_advertised_under_its_op_name() {
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT));
+        assert_eq!(
+            serde_json::to_value(AttachRequest::SubscribeEventsWithSnapshot).unwrap()["op"],
+            CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT
+        );
     }
 
     /// PRD #1223 — both new-agent queries are advertised on every platform, and

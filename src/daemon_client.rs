@@ -2603,6 +2603,61 @@ impl DaemonClient {
         Ok(EventSubscription { rd, _wr: wr })
     }
 
+    /// Issue #1555: open an event subscription together with the daemon's agents
+    /// as of the instant it opened
+    /// ([`AttachRequest::SubscribeEventsWithSnapshot`]), so no event on the
+    /// returned stream is already reflected in the returned records.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`]**,
+    /// answering [`GatedQuery::Unsupported`] without opening anything; the
+    /// caller then falls back to [`Self::subscribe_events`] plus
+    /// [`Self::list_agents`]. The capability is read from a fresh `Hello`, not
+    /// the cache: the caller is reconnecting, which is exactly when the daemon
+    /// behind this socket may have been replaced by another build. A daemon
+    /// replaced between that `Hello` and the request refuses the unknown variant,
+    /// which comes back as [`ClientError::Server`] and opens nothing.
+    ///
+    /// The records are sanitised exactly as [`Self::list_agents`]'s are.
+    pub async fn subscribe_events_with_snapshot(
+        &self,
+    ) -> Result<GatedQuery<(EventSubscription, Vec<AgentRecord>)>, ClientError> {
+        if !self
+            .fresh_capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::SubscribeEventsWithSnapshot,
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "subscribe-events-with-snapshot failed".into()),
+            ));
+        }
+        let Some(mut records) = resp.agent_records else {
+            return Err(ClientError::Malformed(
+                "subscribe-events-with-snapshot reply carried no agent records".into(),
+            ));
+        };
+        for rec in &mut records {
+            sanitize_record_tab_membership(rec);
+        }
+        // The write half stays alive with the subscription, for the reason
+        // `subscribe_events` gives.
+        Ok(GatedQuery::Answered((
+            EventSubscription { rd, _wr: wr },
+            records,
+        )))
+    }
+
     /// PRD #92 F1: send a `KIND_SHUTDOWN` header-only frame and wait
     /// for the daemon's explicit `KIND_SHUTDOWN_ACK` reply. Used by
     /// the **Stop** option in the Ctrl+C dialog.
