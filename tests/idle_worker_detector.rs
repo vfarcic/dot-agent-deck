@@ -2778,6 +2778,20 @@ fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_wa
             "control: a worker whose pointer landed before its notice fired was not reported \
              once the orchestrator's draft was sent; snapshot = {snapshot:?}"
         );
+        // The notice quotes the worker's screen as it stood when the notice
+        // fired, so a quote without the held pointer proves the notice fired
+        // before the pointer landed — the race this test exists for — rather
+        // than after it, which a starved machine could otherwise turn into a
+        // pass that exercised nothing (Greptile, #1548).
+        let held_needle = idle_role_needle(HELD);
+        assert!(
+            snapshot
+                .split(['\r', '\n'])
+                .filter(|line| line.contains(WAITING_NEEDLE) && line.contains(&held_needle))
+                .all(|line| !line.contains("worker-task-held-pointer-worker.md")),
+            "precondition: the held worker's notice fired after its pointer had landed, so this \
+             run did not exercise the race; snapshot = {snapshot:?}"
+        );
         assert_eq!(
             waiting_notices_for(&snapshot, HELD),
             1,

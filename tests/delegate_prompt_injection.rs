@@ -5074,26 +5074,29 @@ fn idle_worker_029_waiting_silence_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Silence);
 }
 
-/// Scenario: A worker is delegated to and its pointer lands. The orchestrator
-/// then delegates to it again with `--supersede` while the test holds the
-/// newer dispatch on the worker pane's dispatch lock. The first delegation's
-/// no-event window runs out meanwhile, and its "went quiet" report waits on an
-/// unsent draft in the orchestrator's pane. The test releases the lock and the
-/// newer pointer lands; when the orchestrator's draft is sent, the stale report
-/// about the first delegation must not arrive, and the newer delegation's own
-/// report still must.
+/// Scenario: A worker's first pointer lands, and the orchestrator delegates to
+/// it again with `--supersede` while the test holds that newer dispatch on the
+/// worker pane's dispatch lock, so the first delegation's "went quiet" report
+/// fires and waits on an unsent draft in the orchestrator's pane. The test then
+/// releases the lock, the newer pointer lands, and the orchestrator's draft is
+/// sent. The stale report about the first delegation must not arrive, while the
+/// newer delegation's own report still must.
 #[spec("scheduler/idle-worker/031")]
 #[test]
 #[cfg(unix)]
 fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_lands() {
-    const WINDOW: Duration = Duration::from_millis(2000);
+    // Scaled for a contended machine (issue #1526 was met on starved CI
+    // runners): the setup must fit inside the first window, and the waits
+    // below are measured in windows.
+    let window = common::load_scaled(Duration::from_millis(2000));
+    let window_ms = window.as_millis().to_string();
     const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (DELEGATE_READINESS_BUFFER_ENV, "0"),
         (SESSION_START_WAIT_ENV, "2000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
-        (DELEGATE_NO_EVENT_WINDOW_ENV, "2000"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, window_ms.as_str()),
         (DRAFT_DEFER_CAP_ENV, "60000"),
     ]);
     tokio::runtime::Builder::new_multi_thread()
@@ -5137,14 +5140,14 @@ fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_l
                 String::from_utf8_lossy(&typed)
             );
             assert!(
-                first_delivered.elapsed() < WINDOW,
+                first_delivered.elapsed() < window,
                 "precondition: the setup outlasted the first delegation's window, so its report \
                  may have fired before the newer delegate was armed"
             );
 
             // Past the first window: its report has fired and waits on the
             // orchestrator's draft.
-            tokio::time::sleep(WINDOW + Duration::from_millis(1000)).await;
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1000))).await;
             let waiting = harness.orchestrator_snapshot();
             assert!(
                 !String::from_utf8_lossy(&waiting).contains(SILENCE_NEEDLE),
@@ -5191,7 +5194,7 @@ fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_l
             let reported = wait_for_silence_notice(
                 &harness.registry,
                 &harness.orchestrator_agent_id,
-                WINDOW + Duration::from_secs(5),
+                window + common::load_scaled(Duration::from_secs(5)),
             )
             .await;
             assert!(
@@ -5202,7 +5205,7 @@ fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_l
             // Every chance for a second report to land before counting: the
             // newer delegation's own report fires a whole window after its
             // pointer, so whichever arrived first, the other is due within one.
-            tokio::time::sleep(WINDOW + Duration::from_millis(1500)).await;
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1500))).await;
             let after = harness.orchestrator_snapshot();
             let text = String::from_utf8_lossy(&after);
             assert_eq!(
