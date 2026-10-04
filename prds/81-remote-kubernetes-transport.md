@@ -40,7 +40,7 @@ These are the product decisions this PRD is built on. Everything else is open.
 
 The 2026-10-04 discussion raised these as candidates. They are recorded so M1 can weigh them against the current code, not as conclusions:
 
-- **Per-unit decks as Kubernetes Jobs**, with the daemon exiting when its unit is done (it already has an idle shutdown), `ttlSecondsAfterFinished` for cleanup without the laptop, `activeDeadlineSeconds` for runaways, and a `ResourceQuota` on the namespace.
+- **Per-unit decks as Kubernetes Jobs**, with `ttlSecondsAfterFinished` for cleanup without the laptop, `activeDeadlineSeconds` for runaways, and a `ResourceQuota` on the namespace. This only works if the daemon actually exits when its unit is done, and today it would not: the daemon's idle shutdown requires no live agents, while a unit that reports `work-done --done` keeps its agents running, so the Job would never finish and TTL cleanup would never start. How a unit's completion tears down its agents and ends the deck is an open question below, not something the existing idle shutdown provides.
 - **Discovery through the Kubernetes API** using the user's kubeconfig: decks carry labels (and annotations for creator, unit, repository, parent deck), and the desktop lists and watches them, so the cluster itself is the registry and Kubernetes RBAC bounds what a user sees.
 - **Connections through the API server** (`port-forward` or `exec`), opened by the desktop, carrying the existing attach protocol.
 - **Shipped access scaffolding:** a namespace-scoped Role for the user's credentials and a `NetworkPolicy` isolating decks from each other.
@@ -52,6 +52,7 @@ The 2026-10-04 discussion raised these as candidates. They are recorded so M1 ca
 - What, in the current code, already supports this (SSH remotes, the remote registry and its reserved `kubernetes` type, the desktop's multi-deck connections, daemon idle shutdown, dispatch, capability tokens and hook provenance), and what is missing?
 - How agents in a pod authenticate to their providers and to the repository (API keys or tokens as secrets) — the question #634 is discovering — and what that means for a credential stored in a cluster.
 - How a per-unit deck gets the repository and returns its result (clone, push a branch, open a PR), and how build caches are shared so each unit does not pay a cold build.
+- How a per-unit deck ends when its work is done: what tears down its agents on completion (a single agent and an orchestration team alike), so the daemon exits and the cluster can clean up without the laptop. The existing idle shutdown does not cover this, because it requires no live agents.
 - How the desktop presents many short-lived decks without overwhelming the deck list.
 - What the user-facing messages that currently point at this PRD (`src/connect.rs`: "kubernetes remotes are not yet supported (planned in PRD #81)") should say as the work lands.
 - CLAUDE.md rules 12 and 18: which daemon or protocol changes this needs, and how an older daemon and a newer desktop interoperate.
