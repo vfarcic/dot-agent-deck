@@ -12033,31 +12033,49 @@ impl AgentPtyRegistry {
         //   agent was gone.
         //
         // A pane with no record skips this, and step 1 reports `NotFound`.
-        let recorded_cwd = self
-            .inner
-            .lock()
-            .unwrap()
-            .agents
-            .values()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
-            .map(|a| a.cwd.clone());
-        #[cfg(unix)]
-        let verified_dir = match recorded_cwd.as_ref() {
-            Some(cwd) => self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?,
-            None => None,
-        };
-        #[cfg(unix)]
-        let prepared = verified_dir.is_some();
-        #[cfg(not(unix))]
-        let prepared = false;
-        if !prepared
-            && let Some(Some(cwd)) = recorded_cwd.as_ref()
-            && !std::path::Path::new(cwd).is_dir()
-        {
-            return Err(AgentPtyError::CwdNotADirectory(cwd.clone()));
-        }
+        //
+        // The check reads the occupant's cwd and releases the lock for the
+        // filesystem work, so the occupant can change before step 1 takes the
+        // lock again (a `StopAgent` and a new start on the same pane). Step 1
+        // therefore confirms it is removing the agent whose directory was
+        // checked, and checks again for the new occupant when it is not
+        // (Qodo, PR #1557): a refusal or a verified descriptor that belongs to
+        // the departed agent must not decide the current one's respawn. Bounded:
+        // a pane that keeps changing hands is reported as `NotFound`, which
+        // `respawn_or_recreate_agent_for_pane` answers by retrying the respawn.
+        const OCCUPANT_CHECKS: usize = 3;
+        let mut checks = 0;
+        #[allow(unused_variables)]
+        let (removed, verified_dir) = loop {
+            checks += 1;
+            let checked = self
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
+                .map(|(id, a)| (id.clone(), a.cwd.clone()));
+            #[cfg(unix)]
+            let verified_dir = match checked.as_ref() {
+                Some((_, cwd)) => self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?,
+                None => None,
+            };
+            // No prepared start exists off Unix, so there is never a directory
+            // to carry; the type keeps the loop's two arms the same shape.
+            #[cfg(not(unix))]
+            let verified_dir: Option<std::convert::Infallible> = None;
+            #[cfg(unix)]
+            let prepared = verified_dir.is_some();
+            #[cfg(not(unix))]
+            let prepared = false;
+            if !prepared
+                && let Some((_, Some(cwd))) = checked.as_ref()
+                && !std::path::Path::new(cwd).is_dir()
+            {
+                return Err(AgentPtyError::CwdNotADirectory(cwd.clone()));
+            }
 
-        let removed = {
             let mut inner = self.inner.lock().unwrap();
             // Issue #1114: a pane held for cleanup has no record this respawn
             // may replace, EVEN THOUGH it still has one. `spawn_agent` refuses a
@@ -12102,6 +12120,12 @@ impl AgentPtyRegistry {
                 .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
                 .map(|(id, _)| id.clone())
                 .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
+            if checked.as_ref().map(|(id, _)| id) != Some(&agent_id) {
+                if checks < OCCUPANT_CHECKS {
+                    continue;
+                }
+                return Err(AgentPtyError::NotFound(pane_id_env.to_string()));
+            }
             let removed = inner
                 .agents
                 .remove(&agent_id)
@@ -12113,7 +12137,7 @@ impl AgentPtyRegistry {
             // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
             removed.pane_retired.store(true, Ordering::SeqCst);
-            removed
+            break (removed, verified_dir);
         };
 
         let RunningAgent {
