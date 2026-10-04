@@ -352,7 +352,8 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
     const PANE_ID: &str = "pane-stream-gap";
     const LABEL: &str = "stream-gap-19";
 
-    let daemon = spawn_daemon_serve(None, "0");
+    let daemon =
+        spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_HOOK_PROVENANCE", "warn")]);
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
             command: Some("sh -c 'sleep 600'".into()),
