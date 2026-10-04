@@ -1631,6 +1631,49 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the seed path's hold (`ui::tests::a_seed_that_may_have_written_is_held_through_an_event_stream_outage`, and `prompt/pane-input/047`); a request still unanswered at the deadline, whose `not delivered (timed out)` wording predates #1520; the real subscriber (`session/live/018`, `session/live/019`).
 - **Platform coverage:** mac+linux.
 
+#### prompt/voice-keys
+
+The per-agent prompt keys the deck serves for voice control of the open agent's prompt (PRD #1541): interrupt the turn, clear the prompt, delete characters. Each test reads the keys from the daemon's own `ListAgents` answer (`AgentRecord::prompt_keys`) and writes them as raw `KIND_STREAM_IN` frames on an attach stream to the agent — the desktop's terminal-write path — rather than as keystrokes through the TUI. File: `tests/e2e_prompt_keys_live.rs` (lane 2).
+
+Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; with a ChatGPT-subscription login set `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` and `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the defaults are refused by that login, and the preflights say so).
+
+Measured while writing these, against Claude Code 2.1.289 through this path, and worth knowing for whoever sends the clear key: **separate writes are not separate reads.** Two writes of 32 `Ctrl+U` sent back to back left Claude's prompt untouched, exactly as one write of 64 does (Claude ignores a read holding 64 or more); two 250 ms apart did too on a box at load 174; two 1 s apart cleared it; a single write of 32 always did. `DEL` × 100 in one write was exact, and on 2026-10-04 so were single writes of 400 and 800 `DEL`s against Claude Code 2.1.289, Codex 0.160.0 and OpenCode 1.18.34. The paste-collapse threshold applies to what the agent reads, not to one write: an 8-character write followed at once by an 800-character one was read by Claude as one 808-character paste and collapsed, so 003 writes its long dictation only once the prompt before it is on screen. An `Enter` written in the same burst as the text before it is taken as part of a paste and inserts a newline, so the tests let typed text settle before `Enter`.
+
+##### prompt/voice-keys/001 — The served interrupt key ends a REAL interactive Claude turn mid-task, keeps the agent running, and the agent answers the next prompt. [reel]
+- **Layer:** L2 PTY-attached (the real binary in the vt100 `TuiDeck` harness; records a cast), lane 2.
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, onboarding and project trust seeded, `--allowedTools Bash Read`; no `-p`.
+- **Asserts:** the daemon serves `prompt_keys` for the Claude pane and no interrupt step contains `0x03`; a directive long-list prompt written on the attach stream puts Claude visibly to work (`esc to interrupt`); writing the served interrupt steps (honouring each `pause_after_ms`) makes Claude show `Interrupted` with no working indicator, which stays away for 3 s; the agent record is still present and not `crashed`; and a follow-up prompt asking for the uniquely named fixture file `voicekeys_interrupt_sentinel_4e7b.txt` is answered with that name on screen.
+- **Does not assert:** the panel's repeat guard or its working-status check (`voiceActions` / `VoiceControlPanel` unit tests); the draft typed mid-turn surviving the interrupt; the exact wording Claude renders beyond `Interrupted`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/002 — The served clear key, pressed as the desktop presses it, empties a REAL interactive Claude prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Claude Code on Haiku, set up as in `prompt/voice-keys/001`. Nothing is submitted, so no tokens are spent on a turn.
+- **Asserts:** a draft written on the attach stream appears in Claude's input row; the served clear key is `per_wrapped_row`, so it is pressed 64 times in writes of at most the served `max_presses_per_write` (two writes of 32, the served `pause_between_writes_ms` — 1 s — apart; see the section note on why the gap); the input row then holds none of the draft, a word written after it is the input row's whole text, and the agent is still registered and not `crashed`.
+- **Does not assert:** Undo of a clear (panel unit tests); a multi-line draft typed with Shift+Enter.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/003 — The served delete key, once per character, removes exactly the last characters of a REAL interactive Claude prompt, a 500-character dictation included.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Claude Code on Haiku, set up as in `prompt/voice-keys/001`. Nothing is submitted.
+- **Asserts:** a kept word and a dictated tail (trailing space included, as voice writes it) appear in Claude's input row; one write of the served delete key repeated once per tail character, followed by a next word, leaves the input row reading the kept word, its space and the next word contiguously — so exactly the tail went, no more and no less; a 500-character dictation written after that settles without collapsing into a `[Pasted text]` placeholder, and one write of 500 deletes followed by a final word leaves the input row reading the earlier text and the final word contiguously; the agent is still registered and not `crashed`.
+- **Does not assert:** the scratch-that stack or its refusals (panel unit tests); paste collapse above 800 characters.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/004 — A REAL interactive Codex honours the served delete, clear and interrupt keys, and answers the next prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Codex on `common::codex_test_model()`, `--sandbox workspace-write --ask-for-approval never`, credentials imported.
+- **Asserts:** in one session, on the whole pane rather than a framed input row: one write of the served delete key per character of a dictated tail, then a next word, leaves the kept word, its space and the next word contiguous; the served clear key (`per_line`, 16 presses in one write) leaves nothing of the prompt; a long numbered-list prompt visibly streams, the served interrupt key stops the list growing (stable for 4 s, short of 600) with the agent still registered and not `crashed`; a follow-up prompt asking for `voicekeys_parity_sentinel_codex_3c8a.txt` is answered with that name on screen.
+- **Does not assert:** Codex's own interrupt wording; the idle-Esc hazard (the panel's guard, unit-tested).
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/005 — A REAL interactive OpenCode honours the served delete, clear and two-step interrupt keys, and answers the next prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive OpenCode on `common::opencode_test_model()`, credentials imported.
+- **Asserts:** as `prompt/voice-keys/004`, with the sentinel `voicekeys_parity_sentinel_opencode_7f15.txt`, plus that the served interrupt is two steps (Esc, the served pause, Esc) — written in order with that pause.
+- **Does not assert:** OpenCode's own interrupt wording.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

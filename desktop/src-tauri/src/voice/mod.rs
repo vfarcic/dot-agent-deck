@@ -594,6 +594,7 @@ pub mod test_support {
             cols: 80,
             agent_type: agent_type.to_string(),
             cli_name: None,
+            prompt_keys: None,
             status: "running".to_string(),
             active_tool: None,
             tool_count: 0,

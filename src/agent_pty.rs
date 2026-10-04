@@ -3532,6 +3532,25 @@ pub struct AgentRecord {
     /// `last_activity_ms` and `spawned_at_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_name: Option<String>,
+    /// PRD #1541: the keys that interrupt this agent's turn and edit its
+    /// prompt, resolved from the **daemon's** copy of
+    /// [`crate::agent_registry`] for the identity this record reports — so a
+    /// deck answers for the agent versions on its own host, the way
+    /// [`Self::cli_name`] answers which binary it forked (issue #856, rule 18).
+    ///
+    /// Stamped at the wire boundary by [`attach_prompt_keys`], after the
+    /// `ListAgents` live join, for the reason [`Self::cli_name`] gives.
+    ///
+    /// **`None` is a refusal, never a licence to guess.** It means this daemon
+    /// has no measured keys for the agent — Devin, [`AgentType::None`] (which
+    /// also absorbs a type from a NEWER daemon), a record with no reported type
+    /// — or the daemon predates the field. A client refuses the command with a
+    /// reason rather than falling back to a table of its own.
+    ///
+    /// Additive optional, so no `PROTOCOL_VERSION` bump — same basis as
+    /// `cli_name`, `spawned_at_ms` and `live`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_keys: Option<crate::agent_registry::PromptKeys>,
     /// Issue #868: `Some(true)` when the agent's process exited on its own
     /// rather than via a deliberate `close_agent`/`respawn_agent_for_pane`
     /// teardown. The name says "crashed", but the flag fires on ANY natural
@@ -3600,6 +3619,20 @@ pub fn attach_cli_names(records: &mut [AgentRecord]) {
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).default_command)
             .map(str::to_string);
+    }
+}
+
+/// PRD #1541: stamp each record with the prompt keys the DAEMON's agent
+/// registry measured for the identity that record reports.
+///
+/// The sibling of [`attach_cli_names`], run beside it at the wire boundary and
+/// for the same reasons: after the live join, unconditional, and `None` when
+/// this daemon's registry has no keys for the reported type.
+pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
+    for record in records {
+        record.prompt_keys = record
+            .reported_agent_type()
+            .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
     }
 }
 
@@ -13851,6 +13884,7 @@ impl AgentPtyRegistry {
             // reports. This path (`agent_record_any`) is a CLEANUP lookup and
             // reaches no client at all.
             cli_name: None,
+            prompt_keys: None,
             crashed: agent.crashed,
             orchestrator_context_path: None,
         })
@@ -14227,6 +14261,7 @@ impl AgentPtyRegistry {
                 // boundary, after the `ListAgents` handler's live join. See
                 // `AgentRecord::cli_name`.
                 cli_name: None,
+                prompt_keys: None,
                 crashed: agent.crashed,
                 // Issue #1395: the registry does not know it; the `ListAgents`
                 // handler stamps it from `AppState`. See
@@ -19867,6 +19902,7 @@ mod spawn_tests {
             }),
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         }
@@ -19938,6 +19974,32 @@ mod spawn_tests {
         assert_eq!(records[0].cli_name, None);
     }
 
+    /// PRD #1541: each record gets the prompt keys THIS daemon's registry holds
+    /// for the identity it reports — the live session's type ahead of the
+    /// spawn-time one, as for `cli_name` — and none for Devin, `None`, or no
+    /// type at all. Unconditional, so a stale value never shows through.
+    #[test]
+    fn attach_prompt_keys_follows_the_reported_identity() {
+        let keys_of =
+            |agent_type: AgentType| crate::agent_registry::spec(&agent_type).prompt_keys.clone();
+        let mut records = [
+            typed_record(Some(AgentType::Codex), Some(Some(AgentType::OpenCode))),
+            typed_record(Some(AgentType::ClaudeCode), Some(None)),
+            typed_record(Some(AgentType::Devin), None),
+            typed_record(Some(AgentType::None), None),
+            typed_record(None, None),
+        ];
+        records[2].prompt_keys = keys_of(AgentType::Pi);
+        attach_prompt_keys(&mut records);
+        assert_eq!(records[0].prompt_keys, keys_of(AgentType::OpenCode));
+        assert!(records[0].prompt_keys.is_some());
+        assert_eq!(records[1].prompt_keys, keys_of(AgentType::ClaudeCode));
+        assert!(records[1].prompt_keys.is_some());
+        assert_eq!(records[2].prompt_keys, None, "Devin is unmeasured");
+        assert_eq!(records[3].prompt_keys, None);
+        assert_eq!(records[4].prompt_keys, None);
+    }
+
     #[test]
     fn agent_record_round_trips_explicit_rows_cols() {
         let rec = AgentRecord {
@@ -19952,6 +20014,7 @@ mod spawn_tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -21076,6 +21139,7 @@ mod spawn_tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
