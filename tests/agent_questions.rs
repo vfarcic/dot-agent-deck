@@ -278,24 +278,32 @@ async fn question_state_005_a_newer_question_supersedes_and_releases_the_older()
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
     let registry = Arc::new(AgentPtyRegistry::new());
 
-    let older = registry.question_holds().hold(PANE, "agent-1", "q-old").rx;
-    dot_agent_deck::daemon::ingest_event(
+    // Registered and published through the daemon's own path, which stamps
+    // each question with its own registration's generation (audit R1).
+    let older = dot_agent_deck::daemon::register_and_publish_held(
         &state,
         &event_tx,
         &registry,
+        PANE,
+        "agent-1",
         asking(EventType::PermissionRequest, &question("q-old", None)),
     )
-    .await;
+    .await
+    .expect("the older question is pending")
+    .rx;
     assert!(registry.question_holds().is_held(PANE, "q-old"));
 
-    let newer = registry.question_holds().hold(PANE, "agent-1", "q-new").rx;
-    dot_agent_deck::daemon::ingest_event(
+    let newer = dot_agent_deck::daemon::register_and_publish_held(
         &state,
         &event_tx,
         &registry,
+        PANE,
+        "agent-1",
         asking(EventType::PermissionRequest, &question("q-new", None)),
     )
-    .await;
+    .await
+    .expect("the newer question is pending")
+    .rx;
     assert_eq!(pending(&*state.read().await).as_deref(), Some("q-new"));
     let released = older.await.expect("the older hold is answered");
     assert_eq!(released.outcome, ReplyOutcome::Released);

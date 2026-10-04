@@ -5809,22 +5809,30 @@ pub(crate) async fn answer_question(
 /// rather than starting work (review S3); the agent's own next event then
 /// says where it went.
 ///
-/// **Bound to one revision of the question (audit A4).** The answer is
+/// **Bound to one revision of the question (audit A4, R1–R3).** The answer is
 /// validated against the pending question's daemon-minted revision
 /// ([`crate::question::PendingQuestion::revision`]) and delivered only to that
-/// revision: a held reply goes only to the hold whose generation it is, every
-/// key is written only while it is still the pending revision, and the deck's
-/// own clearing event and every clear on a failure name it too. A same-id
-/// replacement that registers between validation and delivery is refused as
-/// stale, never answered with a choice made for the question it replaced.
+/// revision, revalidated at each commit point under the pane's question
+/// lifecycle ([`crate::agent_pty::QuestionAnswers::lock_lifecycle`]), which
+/// every event ingested for the pane also holds: a held reply goes only to the
+/// hold whose generation it is, and nothing can register, replace or clear the
+/// question between its revalidation, the reply and the deck's clearing event;
+/// each key is queued on the PTY only while its revision is still pending, so
+/// an event that replaces or clears the question is ordered either before the
+/// check (and the key is refused) or after the key (and the next key's check
+/// sees it). The deck's own clearing event and every clear on a failure name
+/// the revision too. A same-id replacement that registers between validation
+/// and delivery is refused as stale, never answered with a choice made for the
+/// question it replaced.
 ///
-/// **One answer per agent at a time, and once per question.** The agent's
-/// [`crate::agent_pty::QuestionAnswers::slot`] is held from the first read of
-/// the pending question to the last write, so a second client's answer waits
-/// and then finds the question gone; the pane's answered ledger
-/// ([`crate::agent_pty::QuestionAnswers::mark_answered`]) refuses a question
-/// the deck emitted an answer for as stale even if its clearing event was not
-/// applied, or the producer raised it again under the same id.
+/// **One answer per agent at a time, and not the same question twice in a
+/// row.** The agent's [`crate::agent_pty::QuestionAnswers::slot`] is held from
+/// the first read of the pending question to the last write, so a second
+/// client's answer waits and then finds the question gone; the pane's
+/// last-answered id ([`crate::agent_pty::QuestionAnswers::mark_answered`])
+/// refuses the question the deck last emitted an answer for there as stale even
+/// if its clearing event was not applied, or the producer raised it again under
+/// the same id. It is one id per pane, not a history.
 ///
 /// **The keys channel refuses a pane a human has typed into since the
 /// question arrived** ([`AnswerRefusal::KeyboardStarted`]): the daemon owns the
@@ -5889,8 +5897,31 @@ pub(crate) async fn answer_question_at(
         .question_answers()
         .barrier("answer_question:validated")
         .await;
+    // The pane's question lifecycle, when this path already holds it — the
+    // held reply keeps it from its revalidation to the deck's clearing event.
+    let mut lifecycle = None;
     match question.channel {
         AnswerChannel::Held => {
+            // Audit R1–R3: revalidated at the commit point, under the pane's
+            // question lifecycle, which every registration, publication,
+            // reconciliation and cleanup on the pane also holds — so nothing
+            // can replace, clear or re-register the question between this
+            // check, the reply and the clearing event below.
+            let held = registry.question_answers().lock_lifecycle(pane).await;
+            let current = state
+                .read()
+                .await
+                .pending_question_for(agent_id, pane_id.as_deref())
+                .map(|(_, q)| q);
+            if current
+                .as_ref()
+                .is_none_or(|q| q.id != question.id || q.revision != revision)
+                || registry.question_answers().is_answered(pane, &question.id)
+            {
+                return Err(AnswerRefusal::Stale {
+                    current_id: current.map(|q| q.id),
+                });
+            }
             let delivered = pane_id.as_deref().is_some_and(|pane| {
                 registry.question_holds().answer(
                     pane,
@@ -5915,6 +5946,11 @@ pub(crate) async fn answer_question_at(
             registry
                 .question_answers()
                 .mark_answered(pane, &question.id);
+            registry
+                .question_answers()
+                .barrier("answer_question:delivered")
+                .await;
+            lifecycle = Some(held);
         }
         AnswerChannel::Keys => {
             let keys = crate::question::answer_keys(&agent_type, &question, &resolved)?;
@@ -5941,7 +5977,7 @@ pub(crate) async fn answer_question_at(
                             .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
                 };
                 match registry
-                    .write_answer_keys(agent_id, key.as_bytes(), still_ours)
+                    .write_answer_keys(agent_id, pane, key.as_bytes(), still_ours)
                     .await
                 {
                     Ok(at) => {
@@ -5988,6 +6024,7 @@ pub(crate) async fn answer_question_at(
                             // Part of the answer is in the agent's prompt: the
                             // stored question no longer describes what is on
                             // screen, so it is the keyboard's from here (S2).
+                            let _lifecycle = registry.question_answers().lock_lifecycle(pane).await;
                             state.write().await.mark_pending_question_keyboard_only(
                                 pane,
                                 &question.id,
@@ -6034,12 +6071,21 @@ pub(crate) async fn answer_question_at(
         crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
     );
     // Clears this revision only: a same-id registration that replaced it
-    // after the answer went is left pending (audit A5).
+    // after the answer went is left pending (audit A5). A held answer is still
+    // inside the lifecycle it was delivered under, so nothing registered in
+    // between; the keys path takes it here, after its last key.
     let replaced = |s: &crate::state::AppState| {
         s.pending_question_for(agent_id, pane_id.as_deref())
             .is_some_and(|(_, q)| q.id == question.id && q.revision != revision)
     };
-    crate::daemon::ingest_event_unless(state, event_tx, registry, event, replaced).await;
+    let lifecycle = match lifecycle {
+        Some(held) => held,
+        None => registry.question_answers().lock_lifecycle(pane).await,
+    };
+    crate::daemon::ingest_event_in_lifecycle(
+        state, event_tx, registry, &lifecycle, event, None, replaced,
+    )
+    .await;
     Ok(())
 }
 
@@ -10157,6 +10203,29 @@ mod question_answer_tests {
             self.state.write().await.apply_event(event);
         }
 
+        /// A producer holding `question` on [`PANE`] for this agent: its hold
+        /// registered and its event published through the daemon's own path
+        /// ([`crate::daemon::register_and_publish_held`]). The receiver its
+        /// reply arrives on.
+        async fn hold_ingested(
+            &self,
+            question: &PendingQuestion,
+        ) -> tokio::sync::oneshot::Receiver<crate::question::QuestionReply> {
+            let mut event = self.event(EventType::PermissionRequest);
+            event.set_question(question);
+            crate::daemon::register_and_publish_held(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                PANE,
+                &self.agent_id,
+                event,
+            )
+            .await
+            .expect("the held question is pending")
+            .rx
+        }
+
         /// [`Self::ask`] through the daemon's own ingest, which is what
         /// records when the question arrived (audit A4).
         async fn ask_ingested(&self, question: &PendingQuestion) {
@@ -10382,12 +10451,7 @@ mod question_answer_tests {
     async fn question_answer_002_a_held_answer_reaches_its_holder() {
         let fx = Fixture::start(AgentType::ClaudeCode).await;
         let mut events = fx.event_tx.subscribe();
-        let held = fx
-            .registry
-            .question_holds()
-            .hold(PANE, &fx.agent_id, "q-bash")
-            .rx;
-        fx.ask_ingested(&claude_bash()).await;
+        let held = fx.hold_ingested(&claude_bash()).await;
         assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
         fx.answer("q-bash", &[(0, &[2], None)], true)
             .await
@@ -10623,12 +10687,7 @@ mod question_answer_tests {
         );
 
         let fx = Fixture::start(AgentType::ClaudeCode).await;
-        let mut held = fx
-            .registry
-            .question_holds()
-            .hold(PANE, &fx.agent_id, "q-bash")
-            .rx;
-        fx.ask_ingested(&claude_bash()).await;
+        let mut held = fx.hold_ingested(&claude_bash()).await;
         let a = fx.answer_task("q-bash", vec![one(0, 1)], false);
         let b = fx.answer_task("q-bash", vec![one(0, 1)], false);
         let (a, b) = (a.await.unwrap(), b.await.unwrap());
@@ -10689,12 +10748,7 @@ mod question_answer_tests {
         // Held: a same-id hold replaces the first between validation and
         // delivery.
         let fx = Fixture::start(AgentType::ClaudeCode).await;
-        let mut first = fx
-            .registry
-            .question_holds()
-            .hold(PANE, &fx.agent_id, "q-bash")
-            .rx;
-        fx.ask_ingested(&claude_bash()).await;
+        let mut first = fx.hold_ingested(&claude_bash()).await;
         let first_revision = fx.pending_question().await.unwrap().revision;
         assert!(first_revision.is_some(), "the daemon stamps a revision");
         fx.ask_ingested(&claude_bash()).await;
@@ -10709,12 +10763,7 @@ mod question_answer_tests {
             .arm_barrier("answer_question:validated");
         let answering = fx.answer_task("q-bash", vec![one(0, 1)], false);
         reached.await.unwrap();
-        let mut second = fx
-            .registry
-            .question_holds()
-            .hold(PANE, &fx.agent_id, "q-bash")
-            .rx;
-        fx.ask_ingested(&claude_bash()).await;
+        let mut second = fx.hold_ingested(&claude_bash()).await;
         let second_revision = fx.pending_question().await.unwrap().revision;
         assert_ne!(second_revision, first_revision);
         resume.send(()).unwrap();
@@ -10830,6 +10879,79 @@ mod question_answer_tests {
         );
     }
 
+    /// Scenario: The deck is typing a Codex form's answer and has just checked
+    /// that the form is still the pending question when an event replacing the
+    /// form arrives — the same id with other questions — or one that clears it.
+    /// That event waits until the deck's digit is queued for the terminal, so
+    /// the digit lands on the form it was checked against; the replacement or
+    /// clear then applies, and the deck's next digit is refused and never typed.
+    #[spec("question/answer/012")]
+    #[tokio::test]
+    async fn question_answer_012_no_question_change_lands_between_a_key_s_check_and_its_write() {
+        for clear in [false, true] {
+            let fx = Fixture::start(AgentType::Codex).await;
+            let form = codex_form("call_r2");
+            fx.ask_ingested(&form).await;
+            let checked = fx.pending_question().await.unwrap().revision;
+            let (reached, resume) = fx
+                .registry
+                .question_answers()
+                .arm_barrier("answer_keys:revalidated");
+            let answering = fx.answer_task("call_r2", vec![one(0, 2), one(1, 1)], false);
+            reached.await.expect("the first key was revalidated");
+            let change = if clear {
+                fx.event(EventType::Idle)
+            } else {
+                let mut replaced = form.clone();
+                replaced.questions[0].prompt = "Which shade?".into();
+                let mut event = fx.event(EventType::PermissionRequest);
+                event.set_question(&replaced);
+                event
+            };
+            let changing = tokio::spawn({
+                let registry = fx.registry.clone();
+                let state = fx.state.clone();
+                let event_tx = fx.event_tx.clone();
+                async move { crate::daemon::ingest_event(&state, &event_tx, &registry, change).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !changing.is_finished(),
+                "the change was applied between the key's check and its write"
+            );
+            assert_eq!(
+                fx.pending_question().await.unwrap().revision,
+                checked,
+                "nothing changed the question while the key was being committed"
+            );
+            resume.send(()).unwrap();
+            changing.await.unwrap();
+            let refused = answering.await.unwrap();
+            assert!(
+                matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
+                "{refused:?}"
+            );
+            assert!(fx.screen_shows("2").await, "the checked key was typed");
+            assert!(
+                !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+                "no key reached the changed prompt"
+            );
+            let now = fx.pending_question().await;
+            if clear {
+                assert_eq!(now, None);
+            } else {
+                let now = now.expect("the replacement is pending");
+                assert_ne!(now.revision, checked);
+                assert_eq!(now.questions[0].prompt, "Which shade?");
+                assert_ne!(
+                    now.channel,
+                    AnswerChannel::Unsupported,
+                    "the replacement is not the half-typed form"
+                );
+            }
+        }
+    }
+
     /// Scenario: The user answers a permission prompt with "no" by voice. The
     /// question clears, but the card does not flash Thinking: the deck's own
     /// event about the answer asserts no status, and the agent's next event
@@ -10839,12 +10961,7 @@ mod question_answer_tests {
     async fn question_answer_009_a_deny_does_not_show_thinking() {
         let fx = Fixture::start(AgentType::ClaudeCode).await;
         let mut events = fx.event_tx.subscribe();
-        let held = fx
-            .registry
-            .question_holds()
-            .hold(PANE, &fx.agent_id, "q-bash")
-            .rx;
-        fx.ask_ingested(&claude_bash()).await;
+        let held = fx.hold_ingested(&claude_bash()).await;
         fx.answer("q-bash", &[(0, &[3], None)], false)
             .await
             .expect("denied");
