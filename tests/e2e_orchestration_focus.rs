@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the lock-governed focus contract — the
 //! real-binary proof that focus follows the command-entry lock.

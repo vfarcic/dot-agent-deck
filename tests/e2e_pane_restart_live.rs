@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Upstream PR #918 review fix round: PTY-attached L2 coverage for `pane
 //! restart <role>` — the coverage gap every existing `pane/restart/*` entry

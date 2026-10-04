@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! PTY-attached, REAL-binary proof of the hook-socket provenance gate (issue
 //! #1077), under the DEFAULT policy.

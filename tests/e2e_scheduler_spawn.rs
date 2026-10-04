@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 spawn-primitive tests for the daemon-hosted scheduler (PRD #127 Phase 2A,
 //! M2.1 + M2.3). A scheduled fire (cron tick or run-now) must call the spawn

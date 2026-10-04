@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the "No agent on reconnect" fix (PRD-less
 //! bugfix). Drives the real `dot-agent-deck` daemon binary over its hook and

@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 

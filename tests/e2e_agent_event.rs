@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 headless / UNATTENDED status-reporting tests for a Pi pane (PRD #201
 //! M2.2, test-plan row 10).

@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Attached-TUI regressions for automatic daemon writes into a pane where a
 //! person is still drafting input. The fixture uses live `cat` PTYs so the

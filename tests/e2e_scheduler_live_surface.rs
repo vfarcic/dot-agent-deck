@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 live-surfacing tests for the daemon-hosted scheduler (PRD #127 finding
 //! #2): a scheduled fire must surface its card to an ALREADY-ATTACHED TUI —

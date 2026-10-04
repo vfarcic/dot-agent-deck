@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 end-to-end coverage for the orchestrator remit re-assertion feature: an
 //! orchestration's start role has its remit delivered exactly once, as a seed
