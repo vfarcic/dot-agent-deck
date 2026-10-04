@@ -27,8 +27,8 @@
 //! the daemon-serve precedents (`e2e_scheduler_*.rs`) are the model.
 //!
 //! GREEN-ON-WRITE: every seam this exercises already landed — the `agent-event`
-//! subcommand (M1.2), `AgentType::Pi` (M1.1), the daemon's unconditional
-//! raw-`AgentEvent` re-broadcast, `apply_event`'s status derivation, and the
+//! subcommand (M1.2), `AgentType::Pi` (M1.1), the daemon's attested
+//! `AgentEvent` re-broadcast, `apply_event`'s status derivation, and the
 //! fact that Claude-Code hook install (`hooks_manage::auto_install`) runs ONLY
 //! at TUI/dashboard startup and is machine-global — never per-pane and never in
 //! the `daemon serve` path. So spawning/handling a Pi pane installs no hook and
@@ -40,7 +40,8 @@ use std::time::Duration;
 
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{AgentType, EventType};
-use dot_agent_deck::state::{AppState, SessionStatus};
+use dot_agent_deck::state::{AppState, SessionState, SessionStatus};
+use dot_agent_deck::ui::{CardDensityKind, render_card_to_buffer};
 use spec::spec;
 
 /// The pane the (synthetic) Pi extension reports under — the value the TUI
@@ -53,19 +54,46 @@ const PI_PANE: &str = "pi-headless-pane";
 /// state typed into it. It inherits everything the daemon injects at spawn —
 /// pane id, agent id, hook socket and the pane's hook capability token — and
 /// adds nothing of its own. `PI_EXT_BIN` is the binary under test.
-const PI_STAND_IN: &str =
-    "sh -c 'while IFS= read -r s; do \"$PI_EXT_BIN\" agent-event --type \"$s\"; done'";
+const PI_STAND_IN: &str = "sh -c 'while IFS= read -r s; do
+    case \"$s\" in
+        prompt) \"$PI_EXT_BIN\" agent-event --type prompt --cwd /work/pi-detail --prompt \"list pi-detail-sentinel\" ;;
+        tool-start) \"$PI_EXT_BIN\" agent-event --type tool-start --cwd /work/pi-detail --tool-name bash --tool-detail \"ls pi-detail-sentinel\" ;;
+        tool-end) \"$PI_EXT_BIN\" agent-event --type tool-end --cwd /work/pi-detail --tool-name bash ;;
+        *) \"$PI_EXT_BIN\" agent-event --type \"$s\" ;;
+    esac
+done'";
 
-/// Scenario: Start the real `daemon serve` headlessly (no TUI client), seed a
-/// sentinel `~/.claude/settings.json` in its HOME, and have the daemon spawn a
-/// Pi stand-in pane that runs the real `dot-agent-deck agent-event` CLI from
-/// inside the pane, as the bundled extension does. Type `running`, `waiting`
-/// and `finished` into the pane while an unattended `SubscribeEvents` consumer
-/// watches the daemon's broadcast, and assert each is re-broadcast as a proven
-/// `AgentEvent` carrying the Pi identity and the pane's ids, that feeding those
-/// through `AppState::apply_event` (exactly as the TUI subscriber does) drives
-/// the badge Thinking → WaitingForInput → Idle, and that the whole flow
-/// installs NO Claude hook and leaves `~/.claude/settings.json` unchanged.
+/// Render the received session through the same card widget as the dashboard.
+fn rendered_card(session: &SessionState, now: chrono::DateTime<chrono::Utc>) -> String {
+    let density = CardDensityKind::Normal;
+    let buffer = render_card_to_buffer(
+        session,
+        None,
+        Some(1),
+        density,
+        0,
+        now,
+        false,
+        100,
+        density.rendered_height(),
+    );
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// Scenario: Start the real daemon headlessly with its default enforce policy
+/// and a Pi stand-in pane that runs `agent-event` with the pane's inherited token.
+/// Report lifecycle states plus a prompt and tool call with their directory,
+/// then render the received card to confirm its status and details; send the
+/// same detail event types from outside without a token and confirm they never
+/// reach the subscriber or change the card.
+/// The flow leaves a seeded Claude settings file unchanged and installs no hook.
 #[spec("status/agent-event/003")]
 #[test]
 fn agent_event_003_headless_pi_status_no_hook_no_settings_mutation() {
@@ -91,8 +119,8 @@ fn agent_event_003_headless_pi_status_no_hook_no_settings_mutation() {
     // The Pi pane is the daemon's own spawn, as every pane a TUI or the desktop
     // registers is: the daemon mints its hook capability token at spawn, and
     // the CLI inside the pane presents it with every report. A report sent from
-    // OUTSIDE the pane carries none, so the daemon would mark it as an outside
-    // agent's (issue #318), and a client that registered the pane refuses that.
+    // OUTSIDE the pane carries none, so the default enforce policy refuses
+    // that report when it claims this daemon-managed pane (issue #318).
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let response = daemon
         .send_attach_request(&AttachRequest::StartAgent {
@@ -180,6 +208,117 @@ fn agent_event_003_headless_pi_status_no_hook_no_settings_mutation() {
         assert_eq!(
             status, want_status,
             "after agent-event --type {state}, the unattended Pi card badge must read {want_status:?}"
+        );
+    }
+
+    // Detail-bearing types use the same inherited token as lifecycle reports.
+    // The tool-start and prompt are both observed on the rendered card, rather
+    // than merely inspecting the frame or the client's routing bookkeeping.
+    for (kind, want_event, want_status, detail) in [
+        (
+            "prompt",
+            EventType::Thinking,
+            SessionStatus::Thinking,
+            "list pi-detail-sentinel",
+        ),
+        (
+            "tool-start",
+            EventType::ToolStart,
+            SessionStatus::Working,
+            "ls pi-detail-sentinel",
+        ),
+        (
+            "tool-end",
+            EventType::ToolEnd,
+            SessionStatus::Working,
+            "Tools: 1",
+        ),
+    ] {
+        assert!(daemon.send_pane_input(&pi_agent_id, &format!("{kind}\r")));
+        let ev = sub.wait_for(
+            |e| {
+                e.pane_id.as_deref() == Some(PI_PANE)
+                    && e.event_type == want_event
+                    && e.cwd.as_deref() == Some("/work/pi-detail")
+            },
+            Duration::from_secs(10),
+        );
+        assert!(!ev.is_unproven(), "in-pane {kind} must be attested");
+        assert_eq!(ev.agent_type, AgentType::Pi);
+        assert_eq!(ev.agent_id.as_deref(), Some(pi_agent_id.as_str()));
+        badge.apply_event(ev);
+        let card = badge.sessions.get(&session_id).expect("Pi card");
+        assert_eq!(card.status, want_status);
+        let now = chrono::Utc::now();
+        let before = rendered_card(card, now);
+        assert!(
+            before
+                .lines()
+                .any(|line| line.contains("Dir:") && line.contains("pi-detail")),
+            "card directory basename:\n{before}"
+        );
+        assert!(before.contains(detail), "card {kind} detail:\n{before}");
+        assert!(
+            before.contains("list pi-detail-sentinel"),
+            "card keeps the submitted prompt:\n{before}"
+        );
+        if kind == "tool-start" {
+            assert!(before.contains("bash"), "card active tool name:\n{before}");
+        }
+
+        // Reuse the real CLI, pane id and agent id OUTSIDE the pane, explicitly
+        // removing this test worker's own ambient capability. The distinctive
+        // forged detail distinguishes this report from the earlier proven one.
+        let forged = std::process::Command::new(bin)
+            .args(["agent-event", "--type", kind, "--cwd", "/outside-forged"])
+            .args(if kind == "prompt" {
+                vec!["--prompt", "FORGED-PI-PROMPT"]
+            } else {
+                vec![
+                    "--tool-name",
+                    "FORGED-PI-TOOL",
+                    "--tool-detail",
+                    "FORGED-PI-DETAIL",
+                ]
+            })
+            .env("HOME", &daemon.home)
+            .env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket)
+            .env("DOT_AGENT_DECK_PANE_ID", PI_PANE)
+            .env("DOT_AGENT_DECK_AGENT_ID", &pi_agent_id)
+            .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
+            .output()
+            .expect("run outside agent-event without a token");
+        assert!(
+            forged.status.success(),
+            "outside {kind} CLI failed: {}",
+            String::from_utf8_lossy(&forged.stderr)
+        );
+        let outside = sub.try_wait_for(
+            |e| {
+                e.pane_id.as_deref() == Some(PI_PANE)
+                    && e.event_type == want_event
+                    && e.cwd.as_deref() == Some("/outside-forged")
+            },
+            Duration::from_millis(500),
+        );
+        // Enforce rejects a tokenless report claiming a managed pane before
+        // fan-out, so the card subscriber must receive no such frame.
+        if let Some(outside) = outside {
+            badge.apply_event(outside);
+            let after = rendered_card(badge.sessions.get(&session_id).expect("Pi card"), now);
+            panic!(
+                "outside {kind} reached the card subscriber; card before:\n{before}\ncard after:\n{after}"
+            );
+        }
+        assert_eq!(
+            rendered_card(badge.sessions.get(&session_id).expect("Pi card"), now),
+            before,
+            "an outside {kind} without the pane's token must not change its card"
+        );
+        assert_eq!(
+            badge.sessions.len(),
+            1,
+            "no duplicate outside card for the pane"
         );
     }
 
