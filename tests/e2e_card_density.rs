@@ -75,11 +75,13 @@ fn density_009_real_binary_draws_every_card_at_minimal() {
         send_session_start(&deck, id, &format!("pane-min-{i:02}"), "/tmp/density-dir");
     }
 
-    deck.wait_until_grid("every card drawn at the Minimal height", |grid| {
-        card_heights(grid) == vec![3; CARDS] && ids.iter().all(|id| grid.contains(id.as_str()))
+    // One capture under the parser lock, so the frame the assertions below read
+    // is the frame that was judged ready — a redraw cannot land in between.
+    let grid = deck.capture_screen_when("every card drawn at the Minimal height", |screen| {
+        let grid = screen.contents();
+        (card_heights(&grid) == vec![3; CARDS] && ids.iter().all(|id| grid.contains(id.as_str())))
+            .then_some(grid)
     });
-
-    let grid = deck.snapshot_grid();
     for id in &ids {
         assert!(
             grid.contains(id.as_str()),
