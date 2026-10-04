@@ -1288,3 +1288,142 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
             );
         });
 }
+
+/// The orchestrator and worker of [`fixture`], with the worker started the way
+/// a prepared launch starts it: through `spawn_agent_in`, in the project
+/// directory opened and identified as a `VerifiedProjectDir` (issue #1233).
+/// `project` is a subdirectory of the returned tempdir, so a test can rename it
+/// away and put a replacement at its path.
+async fn prepared_fixture(
+    worker_restart_command: &str,
+) -> (
+    common::InProcDaemon,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+) {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let root = common::race_safe_tempdir();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).expect("create the project dir");
+    std::fs::write(
+        project.join(".dot-agent-deck.toml"),
+        config(worker_restart_command),
+    )
+    .expect("write orchestration config");
+    let cwd = project.to_string_lossy().into_owned();
+
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd),
+            display_name: Some("orchestrator"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+            tab_membership: Some(membership(0, "orchestrator", true, &cwd)),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn orchestrator stand-in");
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&project)
+        .expect("verify the project dir");
+    let worker_agent_id = daemon
+        .registry
+        .spawn_agent_in(
+            SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&cwd),
+                display_name: Some(WORKER_ROLE),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                tab_membership: Some(membership(1, WORKER_ROLE, false, &cwd)),
+                ..SpawnOptions::default()
+            },
+            &verified,
+        )
+        .expect("spawn the prepared worker stand-in");
+    drop(verified);
+
+    {
+        let mut state = daemon.state.write().await;
+        let identity = OrchestrationIdentity::Instance {
+            id: ORCHESTRATION_ID.to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
+        state.register_orchestration_role(
+            ORCH_PANE,
+            "orchestrator",
+            true,
+            identity.clone(),
+            Some(&cwd),
+        );
+        state.register_orchestration_role(WORKER_PANE, WORKER_ROLE, false, identity, Some(&cwd));
+    }
+    (daemon, root, project, worker_agent_id)
+}
+
+/// Scenario: a worker role is started as a prepared launch, in the project
+/// directory the daemon verified. The project directory is then renamed away
+/// and a different directory, with a config of its own, is put at the same
+/// path. `pane restart --force` of that role must be refused and leave the
+/// running worker alone, rather than starting the role's command in the
+/// replacement tree; once the verified directory is back at its path, the same
+/// restart succeeds and runs there (issue #1396 item 3).
+#[tokio::test(flavor = "multi_thread")]
+#[spec("pane/restart/016")]
+async fn pane_restart_016_a_prepared_role_is_not_restarted_in_a_replaced_directory() {
+    const MARKER: &str = "restarted-here";
+    let (daemon, root, project, worker_agent_id) =
+        prepared_fixture(&format!("touch {MARKER} && exec cat")).await;
+    let fx = Fixture {
+        daemon,
+        _dir: root,
+        worker_agent_id,
+    };
+
+    // Rename-and-replace: the verified object moves to `<project>.old`, and a
+    // directory with its own config (the same role, so the restart resolves a
+    // command) takes the pathname.
+    let moved = project.with_extension("old");
+    std::fs::rename(&project, &moved).expect("move the verified directory away");
+    std::fs::create_dir(&project).expect("put a replacement at the verified path");
+    std::fs::copy(
+        moved.join(".dot-agent-deck.toml"),
+        project.join(".dot-agent-deck.toml"),
+    )
+    .expect("give the replacement a config");
+
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    // A restart that was (wrongly) served starts its command asynchronously;
+    // give it the time a `touch` needs before looking for the marker.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !project.join(MARKER).exists(),
+        "the prepared role was restarted in the REPLACEMENT directory; response = {response:?}"
+    );
+    assert!(
+        !response.restarted && response.error.is_some(),
+        "a restart whose verified directory was replaced must be refused; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
+    );
+
+    // Control: put the verified directory back. The pathname names the object
+    // the start verified again, so the same restart is served and runs there.
+    std::fs::remove_dir_all(&project).expect("remove the replacement");
+    std::fs::rename(&moved, &project).expect("restore the verified directory");
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    assert!(
+        response.restarted && response.error.is_none(),
+        "control: a restart in the verified directory must succeed; response = {response:?}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !project.join(MARKER).exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        project.join(MARKER).exists(),
+        "control: the restarted worker must have run in the verified directory"
+    );
+}

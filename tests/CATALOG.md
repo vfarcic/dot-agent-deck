@@ -5270,6 +5270,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the CLI/socket encoding of the reply, or a real agent's editor behavior.
 - **Platform coverage:** mac+linux (unix-only).
 
+##### pane/restart/016 — `pane restart` of a role a prepared launch started does not start it in a directory put at the project's path afterwards (issue #1396 item 3).
+- **Layer:** L1/fast (in-process real restart handler; the worker is started through `AgentPtyRegistry::spawn_agent_in` with a `VerifiedProjectDir`, the way the daemon's `start-prepared-agent` arm starts it; no socket or LLM).
+- **Agent:** none (`cat` stand-ins; the role's configured restart command is `touch restarted-here && exec cat`, so where a restart ran is a file on disk).
+- **Asserts:** after the verified project directory is renamed away and a different directory with its own copy of the config is put at its path, `pane restart --force` of the worker is refused with an error, leaves the original worker in the pane, and leaves no marker in the replacement; once the verified directory is back at its path, the same restart succeeds and its marker lands there (the control).
+- **Does not assert:** the re-create leg, where the pane has no record left (`a_prepared_pane_is_not_re_created_in_a_replaced_directory` in `src/agent_pty.rs` covers it and is what pins the spawn-time check rather than the pre-check); a replacement made after the check, which on Linux the held descriptor makes harmless and elsewhere is the #1396 item 1 residual; the CLI/socket layer.
+- **Platform coverage:** mac+linux (unix-only).
+
 #### pane/spawn
 
 ##### pane/spawn/001 — Spawning a configured-but-unspawned role succeeds and it becomes reachable (issue #868).

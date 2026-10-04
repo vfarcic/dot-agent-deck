@@ -389,31 +389,41 @@ pub fn decide_target_with_override(
                     dir.display()
                 )
             })?;
-            let orch = cfg
-                .orchestrations
-                .iter()
-                // Skip roleless entries: two entries can resolve to the SAME name
-                // (e.g. an unnamed `roles = []` plus a real one), and without this
-                // filter `find` could return the empty one and refuse a target the
-                // listing legitimately offered.
-                .filter(|o| !o.roles.is_empty())
-                .find(|o| resolve_orchestration_name(&o.name, dir) == *want)
-                .ok_or_else(|| {
+            // Roleless entries are skipped: two entries can resolve to the SAME
+            // name (e.g. an unnamed `roles = []` plus a real one), and matching
+            // the empty one would refuse a target the listing legitimately
+            // offered. Issue #1396 item 4: two ROLE-BEARING entries under one
+            // name are refused as ambiguous rather than resolved to the first —
+            // the rule `PrepareOrchestration` follows since #1233, through the
+            // same lookup, so a dispatch and a desktop launch of one config
+            // cannot answer the same name differently.
+            let orch = match crate::project_resolve::find_orchestration(cfg, want, dir) {
+                Ok(orch) => orch,
+                Err(crate::project_resolve::OrchestrationLookup::Ambiguous(count)) => {
+                    return Err(format!(
+                        "{}: {count} orchestrations with roles are named '{want}' in {}; \
+                         rename one to dispatch it",
+                        crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION,
+                        dir.display()
+                    ));
+                }
+                Err(crate::project_resolve::OrchestrationLookup::Missing) => {
                     let available: Vec<String> = cfg
                         .orchestrations
                         .iter()
                         .filter(|o| !o.roles.is_empty())
                         .map(|o| resolve_orchestration_name(&o.name, dir))
                         .collect();
-                    if available.is_empty() {
+                    return Err(if available.is_empty() {
                         format!("no orchestration named '{want}', and none are defined")
                     } else {
                         format!(
                             "no orchestration named '{want}'; available: {}",
                             available.join(", ")
                         )
-                    }
-                })?;
+                    });
+                }
+            };
             if orch.roles.is_empty() {
                 return Err(format!("orchestration '{want}' defines no roles"));
             }
@@ -7294,6 +7304,52 @@ mod tests {
             .is_err(),
             "a config with modes but no orchestrations → error"
         );
+    }
+
+    /// Issue #1396 item 4: two ROLE-BEARING declarations under the requested
+    /// name are refused as ambiguous rather than resolved to the first, as
+    /// `crate::project_resolve::find_orchestration` refuses them for
+    /// `PrepareOrchestration`. The control is a roleless namesake beside one
+    /// role-bearing entry, which is not ambiguous: it cannot launch anything,
+    /// so the role-bearing one is still the only target with that name.
+    #[test]
+    fn shape_override_refuses_a_name_two_role_bearing_orchestrations_share() {
+        let dir = Path::new("/tmp/x");
+        let ambiguous = parse_config(
+            "[[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        let err = decide_target_with_override(
+            Some(&ambiguous),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("dup".into()))),
+        )
+        .expect_err("a name two role-bearing orchestrations share must not resolve to the first");
+        assert!(
+            err.starts_with(crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION),
+            "the refusal must carry the ambiguous-orchestration code: {err}"
+        );
+
+        let roleless_namesake = parse_config(
+            "[[orchestrations]]\nname = \"dup\"\nroles = []\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        match decide_target_with_override(
+            Some(&roleless_namesake),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("dup".into()))),
+        ) {
+            Ok(SpawnTarget::Orchestration { name, roles, .. }) => {
+                assert_eq!(name, "dup");
+                assert_eq!(roles[0].role_name, "lead");
+            }
+            other => panic!("control: a roleless namesake is not ambiguous, got {other:?}"),
+        }
     }
 
     /// A roleless `[[orchestrations]]` is skipped by `decide_target`, so naming it

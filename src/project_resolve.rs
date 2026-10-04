@@ -1540,8 +1540,9 @@ pub enum OrchestrationLookup {
 /// resolves against one config and prepares against an edited one, reached the
 /// first match. This is the check at the one step that publishes.
 ///
-/// `crate::spawn::decide_target`, which `dispatch --orchestration` uses, still
-/// takes the first match; that is follow-up #1396.
+/// `crate::spawn::decide_target_with_override`, which `dispatch --orchestration`
+/// and a schedule's `shape = "orchestration:<name>"` use, resolves a named
+/// orchestration through this same lookup since issue #1396.
 pub fn find_orchestration<'a>(
     config: &'a ProjectConfig,
     name: &str,
