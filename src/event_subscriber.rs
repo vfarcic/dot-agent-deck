@@ -202,10 +202,11 @@ async fn resubscribe(
 
 /// Why [`subscribe_with_snapshot`] could not hand back a stream and a snapshot.
 enum ResyncFailure {
-    /// The plain subscription of the fallback could not be opened.
+    /// No subscription could be opened: the daemon could not be reached for
+    /// the ordered request, or the fallback's plain subscribe failed.
     Subscribe(crate::daemon_client::ClientError),
-    /// The snapshot could not be read: the ordered request failed, or the
-    /// fallback's `ListAgents` did.
+    /// The snapshot could not be read: a reachable daemon refused or garbled
+    /// the ordered request, or the fallback's `ListAgents` failed.
     Snapshot(crate::daemon_client::ClientError),
     /// Either of those took longer than [`RESYNC_LIST_TIMEOUT`].
     TimedOut,
@@ -223,7 +224,7 @@ async fn subscribe_with_snapshot(
     ),
     ResyncFailure,
 > {
-    use crate::daemon_client::GatedQuery;
+    use crate::daemon_client::{ClientError, GatedQuery};
     match tokio::time::timeout(RESYNC_LIST_TIMEOUT, client.subscribe_events_with_snapshot()).await {
         Ok(Ok(GatedQuery::Answered(answer))) => Ok(answer),
         Ok(Ok(GatedQuery::Unsupported)) => {
@@ -236,6 +237,13 @@ async fn subscribe_with_snapshot(
                 Ok(Err(e)) => Err(ResyncFailure::Snapshot(e)),
                 Err(_) => Err(ResyncFailure::TimedOut),
             }
+        }
+        // Qodo on #1577: a daemon that cannot be reached — down, or restarting —
+        // fails the request's `Hello` or connect, and that is a failed
+        // subscribe, as it was before the ordered request existed: logged
+        // quietly, with no further gap recorded on every backoff.
+        Ok(Err(e @ (ClientError::Io(_) | ClientError::SocketMissing(_)))) => {
+            Err(ResyncFailure::Subscribe(e))
         }
         Ok(Err(e)) => Err(ResyncFailure::Snapshot(e)),
         Err(_) => Err(ResyncFailure::TimedOut),
@@ -757,6 +765,61 @@ mod tests {
             "control: without an ordered snapshot the queued events replay over it and the \
              closures are counted again, which is what makes the case above meaningful; \
              saw {seen:?}"
+        );
+    }
+
+    /// Qodo on #1577: a daemon that is down while the subscriber retries fails
+    /// every attempt at the connect, before any snapshot is asked for. That is
+    /// a failed subscribe, not a failed snapshot: the stream's break recorded
+    /// the gap once, and the retries record no more of them.
+    #[tokio::test]
+    async fn retries_against_a_daemon_that_is_down_record_no_further_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("attach.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the scripted daemon");
+        let server = tokio::spawn(async move {
+            // One subscription, ended as `lagged`; then the daemon goes away.
+            let (stream, _) = listener.accept().await.expect("the subscriber connects");
+            let (mut rd, mut wr) = stream.into_split();
+            let _ = read_frame(&mut rd).await;
+            let ok = serde_json::to_vec(&AttachResponse::ok()).unwrap();
+            write_frame(&mut wr, KIND_RESP, &ok).await.unwrap();
+            write_frame(&mut wr, KIND_STREAM_END, b"lagged")
+                .await
+                .unwrap();
+        });
+
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let config = SubscriberConfig {
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(20),
+            drop_event: None,
+            break_on_event: None,
+        };
+        let subscriber = tokio::spawn(run(
+            DaemonClient::new(socket.clone()),
+            Arc::clone(&state),
+            config,
+        ));
+        server
+            .await
+            .expect("the scripted daemon served its one stream");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while state.read().await.event_stream_gaps() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stream's end was never recorded as a gap"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_file(&socket).expect("the daemon's socket goes with it");
+        // A dozen or more retries at this backoff.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let gaps = state.read().await.event_stream_gaps();
+        subscriber.abort();
+        assert_eq!(
+            gaps, 1,
+            "retries that cannot reach the daemon must not each record another gap"
         );
     }
 

@@ -5988,10 +5988,16 @@ async fn handle_subscribe_events(
 /// the listing (sent before the receiver existed, so not on this stream) or on
 /// this stream (sent after the listing was read, so not in it) — never both.
 ///
-/// The registry's records are read before the guard is taken, the order every
-/// path that holds both locks uses. That only decides which agents the listing
-/// names; an agent registered after that read is missing from the listing and
-/// its later events arrive on the stream, as they would for any new agent.
+/// The registry's records are read under the same guard, AFTER the receiver is
+/// open (Greptile and Qodo on #1577). A spawn registers its agent before it
+/// broadcasts the agent's card, and a stop removes the agent before it
+/// broadcasts the pane's end, so an agent whose broadcast came before the
+/// receiver is already in, or already gone from, the records, and one whose
+/// broadcast came after it is on the stream. Reading the records first left a
+/// window in which an agent registered between the two reads was in neither.
+/// Taking the registry's lock inside the `AppState` guard is the nesting
+/// `AppState::apply_event`'s ownership check already takes under the write
+/// guard on every event, so it adds no new lock order.
 ///
 /// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
 /// built by the same calls.
@@ -6001,13 +6007,13 @@ async fn handle_subscribe_events_with_snapshot(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
 ) -> io::Result<()> {
-    let mut records = registry.agent_records();
-    let rx = {
+    let (rx, mut records) = {
         let guard = state.read().await;
         let rx = event_tx.subscribe();
+        let mut records = registry.agent_records();
         guard.attach_live_sessions(&mut records);
         guard.attach_orchestrator_context_paths(&mut records);
-        rx
+        (rx, records)
     };
     crate::agent_pty::attach_cli_names(&mut records);
     forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
@@ -6999,30 +7005,35 @@ mod tests {
         server.abort();
     }
 
-    /// The payload the real `dot-agent-deck agent-event --type running` CLI puts
-    /// on the hook socket (`Commands::AgentEvent` in `main.rs`): a bare
-    /// `AgentEvent`, `EventType::Thinking`, a pane-derived session id, and the
-    /// `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` pair the daemon
-    /// injected into the spawned pane. Never a `SessionStart` — which is the
-    /// whole reason admission decided issue #454.
-    #[cfg(unix)]
     /// Issue #1555: a `SubscribeEventsWithSnapshot` reply never carries an event
     /// on its stream that its snapshot already includes, even when the
     /// conversation rolls over while the request is in flight.
     ///
-    /// The test holds the daemon's `AppState` write guard while the request is
-    /// sent, and under that guard broadcasts and applies a rollover — `gen-a`
-    /// ends and `gen-b` starts — exactly as `crate::daemon::ingest_event` does.
-    /// Whichever side of the guard the handler lands on, the rollover must be in
-    /// the snapshot or on the stream, not both. Here it lands after (the guard
-    /// is held until the rollover is done), so the snapshot must name `gen-b`
-    /// and the stream's first event must be the next one ingested. A handler
-    /// that opened its receiver before taking the guard would get the rollover
-    /// on the stream as well, which is the replay the TUI cannot tell apart.
+    /// The test sends the request itself, raw, while holding the daemon's
+    /// `AppState` write guard, and under that guard broadcasts and applies a
+    /// rollover — `gen-a` ends and `gen-b` starts — exactly as
+    /// `crate::daemon::ingest_event` does. Whichever side of the guard the
+    /// handler lands on, the rollover must be in the snapshot or on the stream,
+    /// not both. Here it lands after (the guard is held until the rollover is
+    /// done), so the snapshot must name `gen-b` and the stream's first event
+    /// must be the next one ingested. A handler that opened its receiver before
+    /// taking the guard would get the rollover on the stream as well, which is
+    /// the replay the TUI cannot tell apart.
+    ///
+    /// Greptile on #1577: such a handler must have opened its receiver before
+    /// the rollover is sent, or this would pass it. So the request goes out raw,
+    /// with no `Hello` round trip in front of it, and the rollover waits until a
+    /// new receiver appears or a second passes. A correct handler never opens one
+    /// while the guard is held, so for it the wait is the whole second; a wrong
+    /// one is a single buffered frame away from opening it.
+    ///
+    /// The same window carries an agent started while the request is in flight,
+    /// whose announcement is broadcast before the receiver opens: it must be in
+    /// the snapshot, since the stream cannot carry it.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_ordered_subscription_never_carries_an_event_its_snapshot_includes() {
-        use crate::daemon_client::{DaemonClient, GatedQuery, StartAgentOptions};
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
         use crate::event::EventType;
 
         let dir = tempfile::tempdir().expect("tempdir for the attach socket");
@@ -7059,8 +7070,7 @@ mod tests {
         }
 
         let pane_id = "ordered-pane-1555";
-        let client = DaemonClient::new(sock.clone());
-        let agent_id = client
+        let agent_id = DaemonClient::new(sock.clone())
             .start_agent(StartAgentOptions {
                 command: Some("cat".to_string()),
                 cwd: Some(dir.path().to_string_lossy().into_owned()),
@@ -7083,15 +7093,20 @@ mod tests {
         )
         .await;
 
+        let (mut rd, mut wr) = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect for the ordered subscription")
+            .into_split();
         let mut guard = state.write().await;
-        let request = tokio::spawn({
-            let client = client.clone();
-            async move { client.subscribe_events_with_snapshot().await }
-        });
-        // Long enough for the request to reach the handler, which then waits on
-        // the guard this test holds. Only a handler that wrongly opens its
-        // receiver first depends on it.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let receivers = event_tx.receiver_count();
+        let request = serde_json::to_vec(&AttachRequest::SubscribeEventsWithSnapshot).unwrap();
+        write_frame(&mut wr, KIND_REQ, &request)
+            .await
+            .expect("send the request");
+        let opened_by = tokio::time::Instant::now() + Duration::from_secs(1);
+        while event_tx.receiver_count() == receivers && tokio::time::Instant::now() < opened_by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         for ev in [
             event("gen-a", EventType::SessionEnd),
             event("gen-b", EventType::SessionStart),
@@ -7099,15 +7114,45 @@ mod tests {
             let _ = event_tx.send(BroadcastMsg::Event(ev.clone()));
             guard.apply_event(ev);
         }
+        // Greptile and Qodo on #1577: an agent started while the request is in
+        // flight, registered and then announced the way a spawn does it. Its
+        // announcement goes out before the receiver exists, so the snapshot
+        // must carry it; a handler that read the registry before taking the
+        // guard would have it in neither.
+        let late_pane = "ordered-pane-1555-late";
+        let late_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(dir.path().to_str().expect("a UTF-8 tempdir")),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), late_pane.to_string())],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the late pane");
+        let _ = event_tx.send(BroadcastMsg::Event(thinking_event_454(
+            late_pane,
+            &late_agent,
+        )));
         drop(guard);
 
-        let GatedQuery::Answered((mut sub, records)) = request
-            .await
-            .expect("the request task")
-            .expect("the ordered subscription opens")
-        else {
-            panic!("this build advertises the ordered subscription");
-        };
+        async fn read(rd: &mut tokio::net::unix::OwnedReadHalf) -> (u8, Vec<u8>) {
+            tokio::time::timeout(Duration::from_secs(5), read_frame(rd))
+                .await
+                .expect("the daemon answers within 5 s")
+                .expect("the frame reads")
+                .expect("the stream is open")
+        }
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).expect("a response");
+        assert!(resp.ok, "the ordered subscription opens: {:?}", resp.error);
+        let records = resp.agent_records.expect("the reply carries the snapshot");
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == late_agent && r.pane_id_env.as_deref() == Some(late_pane)),
+            "an agent announced before the receiver opened must be in the snapshot, or the \
+             client learns of it nowhere"
+        );
         let generation = records
             .iter()
             .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
@@ -7127,11 +7172,9 @@ mod tests {
             event("gen-b", EventType::Thinking),
         )
         .await;
-        let first = tokio::time::timeout(Duration::from_secs(5), sub.next_event())
-            .await
-            .expect("the stream delivers the next event")
-            .expect("the stream reads")
-            .expect("the stream is open");
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_EVENT);
+        let first: BroadcastMsg = serde_json::from_slice(&payload).expect("a broadcast");
         let BroadcastMsg::Event(first) = first else {
             panic!("expected an event, got {first:?}");
         };
@@ -7146,6 +7189,13 @@ mod tests {
         server.abort();
     }
 
+    /// The payload the real `dot-agent-deck agent-event --type running` CLI puts
+    /// on the hook socket (`Commands::AgentEvent` in `main.rs`): a bare
+    /// `AgentEvent`, `EventType::Thinking`, a pane-derived session id, and the
+    /// `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` pair the daemon
+    /// injected into the spawned pane. Never a `SessionStart` — which is the
+    /// whole reason admission decided issue #454.
+    #[cfg(unix)]
     fn thinking_event_454(pane_id: &str, agent_id: &str) -> crate::event::AgentEvent {
         crate::event::AgentEvent {
             session_id: format!("{pane_id}-session"),
