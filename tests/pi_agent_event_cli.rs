@@ -162,6 +162,30 @@ fn a_lifecycle_only_report_is_unchanged() {
     assert!(event.tool_detail.is_none());
 }
 
+/// Scenario: Report a prompt and a tool call whose text starts with a dash
+/// (`--help me`, `-rf build`), in both the `--flag=value` form the extension
+/// sends and the separate-argument form. Each is delivered as text rather than
+/// refused as an unknown flag.
+#[test]
+fn a_detail_starting_with_a_dash_is_text_not_a_flag() {
+    let event = agent_event(&["--type", "prompt", "--prompt=--help me"]);
+    assert_eq!(event.user_prompt.as_deref(), Some("--help me"));
+    let event = agent_event(&["--type", "prompt", "--prompt", "- item one"]);
+    assert_eq!(event.user_prompt.as_deref(), Some("- item one"));
+    let event = agent_event(&[
+        "--type",
+        "tool-start",
+        "--tool-name",
+        "bash",
+        "--tool-detail",
+        "-rf build",
+        "--cwd",
+        "-odd-dir",
+    ]);
+    assert_eq!(event.tool_detail.as_deref(), Some("-rf build"));
+    assert_eq!(event.cwd.as_deref(), Some("-odd-dir"));
+}
+
 /// Scenario: Run `agent-event --type tool_start` (a misspelling). The CLI
 /// exits non-zero and its error lists every type it accepts.
 #[test]

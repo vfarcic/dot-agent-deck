@@ -30,6 +30,7 @@ import {
 	buildWorkDoneArgv,
 	execFailureMessage,
 	isAgentState,
+	isUnsupportedFlagFailure,
 	legacyAgentEventArgv,
 	piEventReport,
 	resolveDeckBin,
@@ -129,11 +130,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// down) must never break the agent loop, so failures are swallowed here —
 	// unlike the tools above, which surface errors to the LLM.
 	//
-	// `legacyCli` is set once a CLI has refused the detail flags but accepted
-	// the bare lifecycle argv — an older deck (see `legacyAgentEventArgv`). From
-	// then on only lifecycle reports are sent, bare, so status keeps working and
-	// no report is spent on a flag that CLI cannot read. A failure that the bare
-	// retry shares (no daemon, no pane env) leaves it unset.
+	// `legacyCli` is set once a CLI has refused the detail flags as unknown
+	// (`isUnsupportedFlagFailure`) and accepted the bare lifecycle argv — an
+	// older deck (see `legacyAgentEventArgv`). From then on only lifecycle
+	// reports are sent, bare, so status keeps working and no report is spent on
+	// a flag that CLI cannot read. Any other failure (no daemon, a transient
+	// socket error) still gets the bare retry for that one report but leaves
+	// the session's detail reporting on.
 	let legacyCli = false;
 	const report = async (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
 		const decided = piEventReport(eventName, event, ctx.cwd);
@@ -149,12 +152,12 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		}
 		try {
 			await runDeck(pi, buildAgentEventArgv(decided.type, decided.detail), ctx.signal);
-		} catch {
+		} catch (err) {
 			// Best-effort. Retry a lifecycle report the way an older CLI reads it.
 			if (fallback) {
 				try {
 					await runDeck(pi, fallback, ctx.signal);
-					legacyCli = true;
+					legacyCli = err instanceof Error && isUnsupportedFlagFailure(err.message);
 				} catch {
 					// Intentionally ignored — card reporting is best-effort.
 				}

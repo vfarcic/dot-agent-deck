@@ -28,6 +28,7 @@ import {
 	DECK_EXE_ENV,
 	execFailureMessage,
 	isAgentState,
+	isUnsupportedFlagFailure,
 	legacyAgentEventArgv,
 	MAX_PROMPT_CHARS,
 	piEventReport,
@@ -137,16 +138,30 @@ describe("row 8: agent-event argv", () => {
 				toolName: "bash",
 				toolDetail: "touch x.txt",
 			}),
-			["agent-event", "--type", "tool-start", "--cwd", "/work/repo", "--tool-name", "bash", "--tool-detail", "touch x.txt"],
+			["agent-event", "--type", "tool-start", "--cwd=/work/repo", "--tool-name=bash", "--tool-detail=touch x.txt"],
 		);
 		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "fix it" }), [
 			"agent-event",
 			"--type",
 			"prompt",
-			"--cwd",
-			"/w",
-			"--prompt",
-			"fix it",
+			"--cwd=/w",
+			"--prompt=fix it",
+		]);
+	});
+
+	test("a value starting with a dash stays inside its own flag", () => {
+		assert.deepEqual(buildAgentEventArgv("prompt", { prompt: "--help me" }), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--prompt=--help me",
+		]);
+		assert.deepEqual(buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "-rf build" }), [
+			"agent-event",
+			"--type",
+			"tool-start",
+			"--tool-name=bash",
+			"--tool-detail=-rf build",
 		]);
 	});
 
@@ -446,5 +461,20 @@ describe("issue #622: falling back for a CLI older than the extension", () => {
 		assert.equal(legacyAgentEventArgv({ type: "prompt", detail: { prompt: "p" } }), null);
 		assert.equal(legacyAgentEventArgv({ type: "tool-start", detail: { toolName: "bash" } }), null);
 		assert.equal(legacyAgentEventArgv({ type: "tool-end", detail: {} }), null);
+	});
+
+	test("only an unknown-flag refusal marks the CLI as older", () => {
+		// The released CLI's own stderr, as execFailureMessage carries it.
+		assert.ok(
+			isUnsupportedFlagFailure(
+				"`dot-agent-deck agent-event --type running --cwd=/w` failed with exit code 2: error: unexpected argument '--cwd' found",
+			),
+		);
+		assert.ok(
+			!isUnsupportedFlagFailure(
+				"`dot-agent-deck agent-event --type running --cwd=/w` failed with exit code 1: Failed to send agent-event to daemon socket.",
+			),
+		);
+		assert.ok(!isUnsupportedFlagFailure("Failed to run `dot-agent-deck agent-event`: spawn ENOENT"));
 	});
 });

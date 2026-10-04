@@ -142,7 +142,7 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
  * @example buildAgentEventArgv("running")
  *   → ["agent-event", "--type", "running"]
  * @example buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "ls" })
- *   → ["agent-event", "--type", "tool-start", "--tool-name", "bash", "--tool-detail", "ls"]
+ *   → ["agent-event", "--type", "tool-start", "--tool-name=bash", "--tool-detail=ls"]
  */
 export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {}): string[] {
 	if (!isAgentEventType(type)) {
@@ -157,9 +157,13 @@ export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {})
 		["--tool-name", detail.toolName],
 		["--tool-detail", detail.toolDetail],
 	];
+	// `--flag=value` as ONE argv element: these values are free text (a prompt
+	// like `--help me`, a command like `-rf x`), and as a separate element the
+	// CLI's parser would read a leading dash as another flag and refuse the
+	// whole report.
 	for (const [flag, value] of flags) {
 		if (typeof value === "string" && value.trim().length > 0) {
-			argv.push(flag, value);
+			argv.push(`${flag}=${value}`);
 		}
 	}
 	return argv;
@@ -398,6 +402,17 @@ export function legacyAgentEventArgv(report: AgentEventReport): string[] | null 
 	}
 	const bare = buildAgentEventArgv(report.type);
 	return buildAgentEventArgv(report.type, report.detail).length > bare.length ? bare : null;
+}
+
+/**
+ * Whether a failed report's error says the CLI does not know one of the flags
+ * — clap's `unexpected argument` — i.e. the CLI is older than this extension.
+ * Only that may switch the session to lifecycle-only reporting: a transient
+ * failure (daemon restarting, socket busy) must not cost the card its detail
+ * for the rest of the session.
+ */
+export function isUnsupportedFlagFailure(message: string): boolean {
+	return message.includes("unexpected argument");
 }
 
 /** Minimal shape of a `dot-agent-deck` CLI exec result (subset of Pi's ExecResult). */

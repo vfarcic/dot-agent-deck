@@ -221,16 +221,16 @@ enum Commands {
         #[arg(long = "type")]
         r#type: String,
         /// The agent's working directory, shown as the card's `Dir:`.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         cwd: Option<String>,
         /// The prompt being submitted (with `--type prompt`).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         prompt: Option<String>,
         /// The tool starting or finishing (with `--type tool-start|tool-end`).
-        #[arg(long = "tool-name")]
+        #[arg(long = "tool-name", allow_hyphen_values = true)]
         tool_name: Option<String>,
         /// A short description of the tool call, e.g. its command or path.
-        #[arg(long = "tool-detail")]
+        #[arg(long = "tool-detail", allow_hyphen_values = true)]
         tool_detail: Option<String>,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
