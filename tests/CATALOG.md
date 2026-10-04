@@ -7069,6 +7069,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the `ListAgents` wire round trip.
 - **Platform coverage:** mac+linux.
 
+##### question/state/007 — A resync after an event-stream gap restores a question raised during the gap and drops one answered during it.
+- **Layer:** L1/fast unit (`tests/agent_questions.rs`, `AppState::resync_after_event_gap` against an `attach_live_sessions` reply).
+- **Agent:** none.
+- **Asserts:** a question (with its revision) raised on the daemon while the client was not listening reaches the client's card through the resync, and the card reads Needs Input; a question resolved on the daemon during a later gap is gone from the card after the next resync.
+- **Does not assert:** the subscriber's reconnect loop itself (`event_subscriber`'s own tests, issue #1520); the desktop, which reads `ListAgents` snapshots directly.
+- **Platform coverage:** mac+linux.
+
 #### question/answer
 
 ##### question/answer/001 — Every refusal of an answer, each with its own reason.

@@ -355,3 +355,56 @@ fn question_state_006_the_snapshot_carries_it_and_hydration_restores_it() {
         .collect();
     assert_eq!(restored, vec![&q]);
 }
+
+/// Scenario: A client's event stream drops and resubscribes (issue #1520).
+/// A question raised while it was not listening — revision and all — reaches
+/// its card through the resync, the card reads Needs Input, and a question
+/// answered while it was away is gone from the card after the next resync.
+#[spec("question/state/007")]
+#[test]
+fn question_state_007_a_resync_after_an_event_gap_carries_the_question() {
+    let records_from = |daemon: &AppState| {
+        let mut records: Vec<dot_agent_deck::agent_pty::AgentRecord> = vec![
+            serde_json::from_value(serde_json::json!({ "id": AGENT, "pane_id_env": PANE }))
+                .unwrap(),
+        ];
+        daemon.attach_live_sessions(&mut records);
+        records
+    };
+
+    let mut client = fresh();
+    let mut daemon = client.clone();
+    let mut q = question("q-a", Some(("Bash", None)));
+    q.revision = Some(3);
+    daemon.apply_event(asking(EventType::PermissionRequest, &q));
+    assert_eq!(pending(&client), None, "the client missed the question");
+
+    client.resync_after_event_gap(&records_from(&daemon));
+    assert_eq!(
+        client.sessions[SESSION].pending_question.as_ref(),
+        Some(&q),
+        "the resync must restore the question raised during the gap, revision included"
+    );
+    assert_eq!(
+        client.sessions[SESSION].status,
+        SessionStatus::WaitingForInput
+    );
+
+    // The question is answered while the client is away again.
+    let mut resolved = event(EventType::ToolEnd);
+    resolved.tool_name = Some("Bash".to_string());
+    resolved.metadata.insert(
+        QUESTION_RESOLVED_METADATA_KEY.to_string(),
+        "q-a".to_string(),
+    );
+    daemon.apply_event(resolved);
+    assert_eq!(pending(&daemon), None);
+    assert_eq!(pending(&client).as_deref(), Some("q-a"));
+
+    client.resync_after_event_gap(&records_from(&daemon));
+    assert_eq!(
+        pending(&client),
+        None,
+        "the resync must drop a question answered during the gap"
+    );
+}
