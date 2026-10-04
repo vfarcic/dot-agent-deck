@@ -891,6 +891,20 @@ fn sandbox_name(branch: &str, direction: Direction, epoch: u64) -> String {
     format!("{label}-{digest:08x}{rev}-{epoch}")
 }
 
+/// [`sandbox_name`] at `epoch`, or at the first later second whose name is not
+/// already taken under `runs_root`. Two runs of one branch, or of two branches
+/// the label and digest make alike, can reach this in the same second, and
+/// [`Sandbox::create`] refuses an existing entry — after the build, losing it
+/// (Greptile, PR #1570). The name keeps its length, so the preflight's socket
+/// check still holds for it. A race between this look and the `mkdir` is still
+/// refused by [`Sandbox::create`]; this only stops the common case costing a run.
+fn free_sandbox_name(runs_root: &Path, branch: &str, direction: Direction, epoch: u64) -> String {
+    (epoch..)
+        .map(|e| sandbox_name(branch, direction, e))
+        .find(|name| std::fs::symlink_metadata(runs_root.join(name)).is_err())
+        .expect("an unbounded range of seconds has a free one")
+}
+
 /// Every Unix socket path a run in `<runs_root>/<name>` may bind or probe must
 /// fit `sun_path`. Run in the preflight, against the canonical runs root
 /// [`Sandbox::create`] will use, so a runs root too long for the sandbox's
@@ -1698,7 +1712,7 @@ fn run_one(
     ev.head_sha = head_sha;
 
     let slug = branch_slug(&opts.branch);
-    let sb_name = sandbox_name(&opts.branch, direction, epoch_secs());
+    let sb_name = free_sandbox_name(&runs_root, &opts.branch, direction, epoch_secs());
     let sb = Sandbox::create(&runs_root, &sb_name)?;
     let runs_root = std::fs::canonicalize(&runs_root).map_err(|e| format!("{e}"))?;
     ev.sandbox_root = sb.root.clone();
@@ -2482,6 +2496,33 @@ mod tests {
         )
         .expect_err("a runs root this long cannot hold the sandbox's sockets");
         assert!(err.contains("--runs-root"), "{err}");
+    }
+
+    /// Greptile on PR #1570: a sandbox name already taken under the runs root
+    /// — the same branch and direction in the same second — moves to the next
+    /// free second instead of failing [`Sandbox::create`] after the build.
+    #[test]
+    fn a_taken_sandbox_name_moves_to_the_next_free_second() {
+        let root = std::env::temp_dir().join(format!("xver-free-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let branch = "agent/dispatch-issue-1540-shared-last-command";
+        let first = sandbox_name(branch, Direction::Forward, 100);
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Forward, 100),
+            first
+        );
+        std::fs::create_dir(root.join(&first)).unwrap();
+        std::fs::create_dir(root.join(sandbox_name(branch, Direction::Forward, 101))).unwrap();
+        let got = free_sandbox_name(&root, branch, Direction::Forward, 100);
+        assert_eq!(got, sandbox_name(branch, Direction::Forward, 102));
+        assert_eq!(got.len(), first.len(), "the length the preflight checked");
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Reverse, 100),
+            sandbox_name(branch, Direction::Reverse, 100),
+            "the other direction's name is its own"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Issue #1562's other two branch-derived names: the evidence file and an
