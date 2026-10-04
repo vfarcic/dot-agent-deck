@@ -1550,23 +1550,59 @@ pub async fn ingest_event(
 /// can slip between the verdict and the apply. Returns whether the event was
 /// ingested.
 ///
-/// An event naming a pane is ingested holding that pane's question lifecycle
-/// (PRD #1542, audit R1–R3 — [`crate::agent_pty::QuestionAnswers::lock_lifecycle`]):
-/// any event can raise, replace or clear the pane's question, so none may land
-/// between a question transition's check and its commit. A caller that
-/// already holds the lifecycle uses [`ingest_event_in_lifecycle`] instead.
-pub(crate) async fn ingest_event_unless(
+/// An event is ingested holding the question lifecycle of the pane it lands
+/// on (PRD #1542, audit R1–R3 —
+/// [`crate::agent_pty::QuestionAnswers::lock_lifecycle`]): any event can
+/// raise, replace or clear the pane's question, so none may land between a
+/// question transition's check and its commit. That is the pane the event
+/// names, or — for one that names none — the pane of the session it resolves
+/// to (audit T2): a pane-less event is applied to its session by id and can
+/// clear a pane-backed session's question just as well. The resolution is read
+/// before the lifecycle is taken, so it is checked again under the `AppState`
+/// lock that applies the event, and the lifecycle retaken if a concurrent
+/// event moved the session in between. A pane-less event whose session has no
+/// pane takes no lifecycle. A caller that already holds the lifecycle uses
+/// [`ingest_event_in_lifecycle`] instead.
+pub(crate) async fn ingest_event_unless<F>(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    event: AgentEvent,
-    stale: impl FnOnce(&crate::state::AppState) -> bool,
-) -> bool {
-    let _lifecycle = match event.pane_id.as_deref() {
-        Some(pane_id) => Some(registry.question_answers().lock_lifecycle(pane_id).await),
-        None => None,
-    };
-    ingest_event_core(state, event_tx, registry, event, None, stale).await
+    mut event: AgentEvent,
+    mut stale: F,
+) -> bool
+where
+    F: FnOnce(&crate::state::AppState) -> bool,
+{
+    loop {
+        let pane = match event.pane_id.clone() {
+            Some(pane_id) => Some(pane_id),
+            None => state.read().await.session_pane(&event.session_id),
+        };
+        let lifecycle = match pane.as_deref() {
+            Some(pane_id) => Some(registry.question_answers().lock_lifecycle(pane_id).await),
+            None => None,
+        };
+        if event.pane_id.is_none() {
+            registry
+                .question_answers()
+                .barrier("ingest:paneless_resolved")
+                .await;
+        }
+        match ingest_event_core(
+            state,
+            event_tx,
+            registry,
+            lifecycle.as_ref().map(|held| held.pane_id()),
+            event,
+            None,
+            stale,
+        )
+        .await
+        {
+            Ok(ingested) => return ingested,
+            Err((again, unused)) => (event, stale) = (again, unused),
+        }
+    }
 }
 
 /// [`ingest_event_unless`] for a caller that already holds `lifecycle`, the
@@ -1587,22 +1623,40 @@ pub(crate) async fn ingest_event_in_lifecycle(
         event
             .pane_id
             .as_deref()
-            .is_none_or(|pane_id| pane_id == lifecycle.pane_id()),
+            .is_some_and(|pane_id| pane_id == lifecycle.pane_id()),
         "an event is ingested under its own pane's question lifecycle"
     );
-    ingest_event_core(state, event_tx, registry, event, registration, stale).await
+    // Every caller's event names the lifecycle's pane, so it resolves to it.
+    ingest_event_core(
+        state,
+        event_tx,
+        registry,
+        Some(lifecycle.pane_id()),
+        event,
+        registration,
+        stale,
+    )
+    .await
+    .unwrap_or(false)
 }
 
-/// The body of [`ingest_event_unless`]; its caller holds the event's pane's
-/// question lifecycle, if it names one.
-async fn ingest_event_core(
+/// The body of [`ingest_event_unless`]; its caller holds the question
+/// lifecycle of `held`, the pane it resolved the event to (`None`: none). Under
+/// the `AppState` write lock, before anything else, the event is resolved again
+/// — the pane it names, else its session's — and handed back unapplied, with
+/// `stale` unasked, when that is not `held` (audit T2).
+async fn ingest_event_core<F>(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
+    held: Option<&str>,
     mut event: AgentEvent,
     registration: Option<u64>,
-    stale: impl FnOnce(&crate::state::AppState) -> bool,
-) -> bool {
+    stale: F,
+) -> Result<bool, (AgentEvent, F)>
+where
+    F: FnOnce(&crate::state::AppState) -> bool,
+{
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
     // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
     // takes the registry's own mutex, and every other path in the daemon that
@@ -1614,8 +1668,17 @@ async fn ingest_event_core(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
+    // Audit T2: the pane whose question this event can change, which is the
+    // one whose lifecycle must be held.
+    let question_pane = match event.pane_id.clone() {
+        Some(pane_id) => Some(pane_id),
+        None => state.session_pane(&event.session_id),
+    };
+    if question_pane.as_deref() != held {
+        return Err((event, stale));
+    }
     if stale(&state) {
-        return false;
+        return Ok(false);
     }
     // PRD #1542 (audit R1): an event publishing a hold is ingested only while
     // that registration is still the one held for its pane and question id.
@@ -1634,7 +1697,7 @@ async fn ingest_event_core(
                 "question: a held question's registration was superseded before it was \
                  published; its event is not applied"
             );
-            return false;
+            return Ok(false);
         }
     }
     // Issue #714: keep the registry's per-agent quota-block latch in step with
@@ -1690,9 +1753,14 @@ async fn ingest_event_core(
     // PRD #1542 (audit A4): the question's revision is the daemon's, stamped
     // here under the state lock that applies it, before the fan-out — so every
     // client's copy and the snapshot carry the same one.
-    stamp_question_revision(&state, registry, &mut event, registration);
+    stamp_question_revision(
+        &state,
+        registry,
+        question_pane.as_deref(),
+        &mut event,
+        registration,
+    );
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
-    let question_pane = event.pane_id.clone();
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
@@ -1706,16 +1774,8 @@ async fn ingest_event_core(
     // every hold this sees is already published (audit R3): the one kept is
     // the pending question's own registration, by id AND generation.
     if let Some(pane_id) = question_pane.as_deref() {
-        let pending = state.pending_question_on_pane(pane_id);
+        let pending = note_pending_question(&state, registry, pane_id);
         let keep = pending.as_ref().map(|q| (q.id.clone(), q.revision));
-        // Audit A4/N1: which registration is pending, and the human-input
-        // sequence when it arrived, for the keys channel's "did a human type
-        // into the pane since?".
-        registry.question_answers().note_pending(
-            pane_id,
-            pending.as_ref().map(|q| (q.id.as_str(), q.revision)),
-            registry.human_input_counter(),
-        );
         let reason = if keep.is_some() {
             crate::question::ReleaseReason::Superseded
         } else {
@@ -1731,7 +1791,28 @@ async fn ingest_event_core(
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
-    true
+    Ok(true)
+}
+
+/// PRD #1542 (audit A4/N1/T1): record which question is pending on `pane_id`
+/// now, as `state` has it — which registration, and the human-input sequence
+/// when it arrived, for the keys channel's "did a human type into the pane
+/// since?", and what a queued answer key is checked against on the PTY thread
+/// ([`crate::agent_pty::AnswerGate`]). Called after every change to the pane's
+/// pending question, under the pane's question lifecycle and the `AppState`
+/// write lock that made it. Returns the pending question.
+pub(crate) fn note_pending_question(
+    state: &crate::state::AppState,
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+) -> Option<crate::question::PendingQuestion> {
+    let pending = state.pending_question_on_pane(pane_id);
+    registry.question_answers().note_pending(
+        pane_id,
+        pending.as_ref().map(|q| (q.id.as_str(), q.revision)),
+        registry.human_input_counter(),
+    );
+    pending
 }
 
 /// PRD #1542 (audit A4): stamp the question `event` raises with the daemon's
@@ -1749,17 +1830,21 @@ async fn ingest_event_core(
 ///   form answerable again.
 /// - Anything else is new content and gets a fresh revision; a hold on the old
 ///   one is then released by the reconciliation that follows the apply.
+///
+/// `pane_id` is the pane the question lands on: the one the event names, or
+/// its session's when it names none (audit T2).
 fn stamp_question_revision(
     state: &crate::state::AppState,
     registry: &AgentPtyRegistry,
+    pane_id: Option<&str>,
     event: &mut AgentEvent,
     registration: Option<u64>,
 ) {
-    let (Some(pane_id), Some(mut question)) = (event.pane_id.clone(), event.question()) else {
+    let (Some(pane_id), Some(mut question)) = (pane_id, event.question()) else {
         return;
     };
     let current = state
-        .pending_question_on_pane(&pane_id)
+        .pending_question_on_pane(pane_id)
         .filter(|current| current.id == question.id && current.same_content(&question));
     question.revision = match (registration, &current) {
         (Some(generation), _) => Some(generation),
@@ -2047,10 +2132,12 @@ async fn drop_held_question(
             .await;
     }
     // The fallback for an event the card refused.
-    let cleared = state
-        .write()
-        .await
-        .clear_pending_question_revision(pane_id, id, revision);
+    let cleared = {
+        let mut guard = state.write().await;
+        let cleared = guard.clear_pending_question_revision(pane_id, id, revision);
+        note_pending_question(&guard, registry, pane_id);
+        cleared
+    };
     info!(
         pane_id = %escape_id_for_log(pane_id),
         question_id = %id,

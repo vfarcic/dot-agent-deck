@@ -4369,26 +4369,34 @@ impl PaneWriter {
     /// so no keystroke can fall between the write and the value. A later human
     /// keystroke on the pane has a higher sequence number than the one
     /// returned.
+    ///
+    /// Audit T1: the PTY thread writes the keys only if `gate` still holds when
+    /// it comes to them — [`AnswerWrite::Superseded`], with nothing written,
+    /// otherwise.
     pub(crate) async fn write_answer(
         &self,
         bytes: &[u8],
+        gate: AnswerGate,
         queued: impl FnOnce(),
-    ) -> std::io::Result<u64> {
+    ) -> std::io::Result<AnswerWrite> {
         match self
             .pty
-            .run_queued(
-                PtyOp::WriteAll(bytes.to_vec(), ByteSource::Answer, true),
-                queued,
-            )
+            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued)
             .await
         {
+            PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerSuperseded>()) =>
+            {
+                return Ok(AnswerWrite::Superseded);
+            }
             PtyJobOutcome::Done(done) => done.result?,
             PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
             PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => {
                 unreachable!("an unbounded job is neither withdrawn nor stalled")
             }
         }
-        Ok(self.state.lock().unwrap().input_seq)
+        Ok(AnswerWrite::Written(self.state.lock().unwrap().input_seq))
     }
 
     /// Issue #525: the PTY thread's progress, readable without this writer's
@@ -4461,6 +4469,10 @@ enum PtyOp {
     /// one round trip to this thread instead of two matters on a starved
     /// machine, where each costs a scheduling delay.
     WriteAll(Vec<u8>, ByteSource, bool),
+    /// PRD #1542 (audit T1): a voice answer's keys — a flushed
+    /// [`Self::WriteAll`] as [`ByteSource::Answer`], written only if its
+    /// [`AnswerGate`] still holds when the thread comes to it.
+    Answer(Vec<u8>, AnswerGate),
     Flush,
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
@@ -4683,6 +4695,22 @@ impl PtyWriterThread {
                             }
                             done
                         }
+                        PtyOp::Answer(buf, mut gate) => {
+                            if gate.still_pending() {
+                                let mut done =
+                                    write_all_recorded(inner.as_mut(), &buf, |accepted| {
+                                        recorder.record(ByteSource::Answer, accepted)
+                                    });
+                                done.flushed = Some(inner.flush());
+                                done
+                            } else {
+                                PtyJobDone {
+                                    accepted: 0,
+                                    result: Err(std::io::Error::other(AnswerSuperseded)),
+                                    flushed: None,
+                                }
+                            }
+                        }
                         PtyOp::Flush => PtyJobDone {
                             accepted: 0,
                             result: inner.flush(),
@@ -4748,10 +4776,12 @@ impl PtyWriterThread {
     /// the thread's queue — before its outcome is awaited. Jobs are written in
     /// the order they are queued, so a caller that holds a lock only until
     /// `queued` runs has fixed where its bytes land relative to every later
-    /// job without holding that lock across the write itself (PRD #1542, the
-    /// question lifecycle — see [`QuestionAnswers::lock_lifecycle`]). A job
-    /// still queued when the caller is dropped is withdrawn, as [`Self::run`]'s
-    /// is, and so never written.
+    /// JOB without holding that lock across the write itself. That orders
+    /// nothing else: whatever the lock serialises can happen after `queued`
+    /// and before the thread reaches the job, which is why a voice answer's
+    /// key re-checks its question on the thread ([`AnswerGate`], PRD #1542
+    /// audit T1). A job still queued when the caller is dropped is withdrawn,
+    /// as [`Self::run`]'s is, and so never written.
     async fn run_queued(&self, op: PtyOp, queued: impl FnOnce()) -> PtyJobOutcome {
         let (tx, rx) = oneshot::channel();
         let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
@@ -5386,9 +5416,10 @@ impl HeldQuestions {
 ///
 /// # The question lifecycle (audit R1–R3)
 ///
-/// Every transition of a pane's question is made holding that pane's
-/// lifecycle lock, and re-checks the registration it acts on at the point it
-/// commits:
+/// Every change the daemon makes to a pane's question — in its state, its
+/// holds, or by delivering an answer — is made holding that pane's lifecycle
+/// lock, over the span each item below names, and re-checks the registration
+/// it acts on at the point it commits:
 ///
 /// - **registration and publication** — a held question's hold is registered
 ///   and its event ingested under one acquisition, so no other transition ever
@@ -5399,9 +5430,19 @@ impl HeldQuestions {
 ///   of which can raise, replace or clear the question, and the reconciliation
 ///   of holds it ends with;
 /// - **cleanup** of a hold whose producer went or whose deadline passed;
+/// - **the keyboard-only mark** on a question the deck typed part of an
+///   answer into;
 /// - **delivery** of an answer: a held reply from its revalidation to the
 ///   deck's clearing event, and each key from its revalidation until the write
-///   is queued on the pane's PTY thread, which writes in queue order.
+///   is queued on the pane's PTY thread. The lifecycle is not held across the
+///   write itself, so the thread checks the key's question again before
+///   writing it ([`AnswerGate`], audit T1) — against the record
+///   [`Self::note_pending`] keeps, updated wherever the daemon changes which
+///   question is pending on the pane.
+///
+/// Every transition above that the daemon ingests as an event takes the
+/// lifecycle of the pane the event lands on: the pane it names, or, for an
+/// event that names none, the pane of the session it resolves to (audit T2).
 ///
 /// **Lock order**, and every path keeps it: the agent's answer
 /// [`Self::slot`] → the pane's writer → the pane's question lifecycle → the
@@ -5413,7 +5454,8 @@ impl HeldQuestions {
 pub struct QuestionAnswers {
     slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     lifecycles: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    raised: Mutex<HashMap<String, RaisedQuestion>>,
+    /// Shared with every [`AnswerGate`], which reads it on a PTY thread.
+    raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
     answered: Mutex<HashMap<String, String>>,
     #[cfg(test)]
     barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
@@ -5431,6 +5473,73 @@ struct RaisedQuestion {
     revision: Option<u64>,
     input_seq: u64,
 }
+
+/// PRD #1542 (audit T1): what a voice answer's key is written under — the
+/// question pending on its pane must still be the one, at the revision, the
+/// key was checked against. Carried by the key's PTY job and checked by the
+/// pane's PTY thread immediately before it writes the key, against the record
+/// [`QuestionAnswers::note_pending`] keeps, which is updated under the pane's
+/// lifecycle wherever the daemon changes which question is pending there. A question replaced or cleared
+/// while the key waited in the queue drops it unwritten.
+///
+/// What it cannot stop is a change that lands after the check: once the
+/// thread has found the question unchanged it writes the key, and a
+/// replacement ingested in that instant, or one the agent draws with no event
+/// at all, receives it.
+pub(crate) struct AnswerGate {
+    raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
+    pane_id: String,
+    question_id: String,
+    revision: Option<u64>,
+    /// Test seam: the PTY thread stops here before its check — see
+    /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
+    #[cfg(test)]
+    pause: Option<QuestionBarrier>,
+}
+
+impl AnswerGate {
+    /// Whether the question the key was checked against is still the one
+    /// pending on its pane. Called on the PTY thread.
+    fn still_pending(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some((reached, resume)) = self.pause.take() {
+            let _ = reached.send(());
+            let _ = resume.blocking_recv();
+        }
+        self.raised
+            .lock()
+            .unwrap()
+            .get(&self.pane_id)
+            .is_some_and(|seen| seen.id == self.question_id && seen.revision == self.revision)
+    }
+}
+
+/// How [`PaneWriter::write_answer`] ended when the PTY thread did not fail.
+pub(crate) enum AnswerWrite {
+    /// The keys are written; the human-input sequence number they were
+    /// committed at.
+    Written(u64),
+    /// The question changed while the keys were queued: nothing was written
+    /// (audit T1).
+    Superseded,
+}
+
+/// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
+/// held — told apart from a failed write by its type.
+#[derive(Debug)]
+struct AnswerSuperseded;
+
+impl std::fmt::Display for AnswerSuperseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the question changed before the key was written")
+    }
+}
+
+impl std::error::Error for AnswerSuperseded {}
+
+/// Test seam: the barrier name an [`AnswerGate`] stops the PTY thread at.
+#[cfg(test)]
+pub(crate) const ANSWER_KEY_ON_PTY_THREAD: &str = "answer_key:on_pty_thread";
 
 /// Slots kept before idle ones are pruned: one per agent that was ever
 /// answered, so this only matters to a very long-lived daemon. The same bound
@@ -5490,6 +5599,11 @@ impl QuestionAnswers {
     /// human-input sequence stood at `input_seq`. The record is kept from the
     /// first time a revision is seen, so a later event repeating the same
     /// question does not move it.
+    ///
+    /// It is also what a queued answer key is checked against on the PTY
+    /// thread ([`AnswerGate`], audit T1), so every path that changes a pane's
+    /// pending question calls this after it, under the pane's question
+    /// lifecycle and the `AppState` lock that applied the change.
     pub fn note_pending(
         &self,
         pane_id: &str,
@@ -5566,6 +5680,28 @@ impl QuestionAnswers {
             .unwrap()
             .insert(name, (reached_tx, resume_rx));
         (reached_rx, resume_tx)
+    }
+
+    /// The [`AnswerGate`] a key answering `question_id` at `revision` on
+    /// `pane_id` is written under.
+    pub(crate) fn answer_gate(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> AnswerGate {
+        AnswerGate {
+            raised: Arc::clone(&self.raised),
+            pane_id: pane_id.to_string(),
+            question_id: question_id.to_string(),
+            revision,
+            #[cfg(test)]
+            pause: self
+                .barriers
+                .lock()
+                .unwrap()
+                .remove(ANSWER_KEY_ON_PTY_THREAD),
+        }
     }
 
     /// A point a test can stop the question paths at ([`Self::arm_barrier`]);
@@ -7467,12 +7603,23 @@ impl AgentPtyRegistry {
     /// ([`QuestionAnswers::lock_lifecycle`]) is taken after the writer and held
     /// from `revalidate` until the write is queued on the PTY thread, so no
     /// event that replaces or clears the question can be ingested between the
-    /// check and the key: one ingested after it is ordered after the key, and
-    /// the next key's check sees it.
+    /// check and the queueing.
+    ///
+    /// **Checked again on the PTY thread (audit T1).** Queued is not written:
+    /// the lifecycle is released at the queueing — holding it across a PTY
+    /// write would hold every event for the pane behind an agent that is not
+    /// reading — and the thread may reach the key later. So the key carries
+    /// `question_id` at `revision` ([`AnswerGate`]), and the thread writes it
+    /// only if that is still the question pending on the pane when it comes to
+    /// it; a replacement or clear ingested in between drops it unwritten. One
+    /// ingested after that check is not stopped: the key is already going to
+    /// the PTY, and the next key's check sees the change.
     pub async fn write_answer_keys<Fut>(
         &self,
         agent_id: &str,
         pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
         keys: &[u8],
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<u64, &'static str>
@@ -7493,10 +7640,17 @@ impl AgentPtyRegistry {
         self.question_answers
             .barrier("answer_keys:revalidated")
             .await;
-        writer
-            .write_answer(keys, move || drop(lifecycle))
+        let gate = self
+            .question_answers
+            .answer_gate(pane_id, question_id, revision);
+        match writer
+            .write_answer(keys, gate, move || drop(lifecycle))
             .await
-            .map_err(|_| "writing to the agent's terminal failed")
+        {
+            Ok(AnswerWrite::Written(at)) => Ok(at),
+            Ok(AnswerWrite::Superseded) => Err("the question changed before the keys were typed"),
+            Err(_) => Err("writing to the agent's terminal failed"),
+        }
     }
 
     /// Issue #1383: the delegate deliveries a retry loop is watching, one per

@@ -7081,11 +7081,32 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** a real Codex form (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
-##### question/answer/012 — No question change lands between a key's check and its write.
+##### question/answer/012 — No question change lands between a key's check and its queueing.
 - **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after a key's revalidation and before it is queued on the PTY).
 - **Agent:** none (`/bin/cat` stand-in for Codex).
-- **Asserts:** an event replacing the form under its id, or one clearing it, waits while the deck's first digit is between its check and its write (audit R2); the digit is typed, then the change applies; the second digit is refused and never typed; a replacement stays pending at its own revision and is not marked keyboard-only.
-- **Does not assert:** a real Codex form (`question/live/*`).
+- **Asserts:** an event replacing the form under its id, or one clearing it, waits while the deck's first digit is between its check and its queueing on the PTY thread (audit R2); once it is queued, the change applies and the digit is either typed — and the answer then fails at the second digit — or dropped unwritten and the answer refused stale (audit T1), whichever the PTY thread reaches first; the second digit is never typed; a replacement stays pending at its own revision and is not marked keyboard-only.
+- **Does not assert:** which of the two orders a run takes (`question/answer/013` pins the dropped one); a real Codex form (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/013 — A queued key is dropped when its question changes first.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier on the pane's PTY thread after the first key is queued and before the thread checks it).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** with the PTY thread stalled on the queued first digit, an event replacing the form under its id, or one clearing it, is ingested without waiting (audit T1); on release the digit is not typed and the answer is refused stale, naming the replacement or nothing; with no change the same stall ends with both digits typed.
+- **Does not assert:** a change that lands after the PTY thread's check, which the key is not protected from (the accepted residual in `docs/develop/agent-questions.md`); a real Codex form (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/014 — An event naming no pane waits for its session's pane.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, the registry's ownership oracle installed and the pane outside the managed set, as on an ordinary daemon pane; a barrier after a key's revalidation).
+- **Agent:** none (`/bin/cat` stand-ins for Codex and Claude Code).
+- **Asserts:** a bare `Idle` naming the session but no pane, ingested through `ingest_event`, waits while the deck's first digit is between its check and its queueing (audit T2); after it the question is cleared, the digit was typed before the clear or dropped, and the second digit is never typed; the pane's record of its pending question is reconciled; the same event releases a held question's producer.
+- **Does not assert:** the hook socket's framing (the event enters at `ingest_event`, which the hook loop calls); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### question/answer/015 — An event naming no pane follows its session onto a pane.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, a barrier after a pane-less event resolves its session's pane).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** a pane-less `Idle` that resolved its session to no pane, and whose session then moves onto a pane during that pane's question transition, is applied only after the transition releases the pane's lifecycle (audit T2's re-check under the state lock).
+- **Does not assert:** a session leaving a pane, which no event can do while the pane's lifecycle is held.
 - **Platform coverage:** mac+linux.
 
 #### question/desktop

@@ -5819,8 +5819,11 @@ pub(crate) async fn answer_question(
 /// question between its revalidation, the reply and the deck's clearing event;
 /// each key is queued on the PTY only while its revision is still pending, so
 /// an event that replaces or clears the question is ordered either before the
-/// check (and the key is refused) or after the key (and the next key's check
-/// sees it). The deck's own clearing event and every clear on a failure name
+/// check (and the key is refused) or after the queueing — and then the PTY
+/// thread, which checks the revision again immediately before writing the key
+/// ([`crate::agent_pty::AnswerGate`]), drops the key if the change was applied
+/// first; a change applied after that check is not stopped, and the next key's
+/// check sees it. The deck's own clearing event and every clear on a failure name
 /// the revision too. A same-id replacement that registers between validation
 /// and delivery is refused as stale, never answered with a choice made for the
 /// question it replaced.
@@ -5936,7 +5939,9 @@ pub(crate) async fn answer_question_at(
                 // registration that replaced this revision holds it now, which
                 // this answer was never checked against.
                 let mut guard = state.write().await;
-                if guard.clear_pending_question_revision(pane, &question.id, revision) {
+                let cleared = guard.clear_pending_question_revision(pane, &question.id, revision);
+                crate::daemon::note_pending_question(&guard, registry, pane);
+                if cleared {
                     return Err(AnswerRefusal::ChannelGone);
                 }
                 return Err(AnswerRefusal::Stale {
@@ -5977,7 +5982,14 @@ pub(crate) async fn answer_question_at(
                             .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
                 };
                 match registry
-                    .write_answer_keys(agent_id, pane, key.as_bytes(), still_ours)
+                    .write_answer_keys(
+                        agent_id,
+                        pane,
+                        &question.id,
+                        revision,
+                        key.as_bytes(),
+                        still_ours,
+                    )
                     .await
                 {
                     Ok(at) => {
@@ -5991,23 +6003,28 @@ pub(crate) async fn answer_question_at(
                             .mark_answered(pane, &question.id);
                     }
                     Err(detail) => {
-                        let replaced = if typed == 0 {
-                            state
+                        // Audit T1: with nothing typed, a question that is no
+                        // longer this revision — registered again under its
+                        // id, replaced, or cleared, before the key's check or
+                        // while the key waited for the PTY — makes the answer
+                        // stale rather than a failed write.
+                        let moved_on = if typed == 0 {
+                            let current = state
                                 .read()
                                 .await
                                 .pending_question_for(agent_id, pane_id.as_deref())
-                                .filter(|(_, q)| q.id == question.id && q.revision != revision)
+                                .map(|(_, q)| q);
+                            (!current
+                                .as_ref()
+                                .is_some_and(|q| q.id == question.id && q.revision == revision))
+                            .then(|| current.map(|q| q.id))
                         } else {
                             None
                         };
                         let refusal = if typed_since(baseline) {
                             AnswerRefusal::KeyboardStarted
-                        } else if let Some((_, current)) = replaced {
-                            // Nothing typed, and the question was registered
-                            // again under its id since it was validated.
-                            AnswerRefusal::Stale {
-                                current_id: Some(current.id),
-                            }
+                        } else if let Some(current_id) = moved_on {
+                            AnswerRefusal::Stale { current_id }
                         } else if typed > 0 {
                             AnswerRefusal::WriteFailed {
                                 detail: format!(
@@ -10154,6 +10171,18 @@ mod question_answer_tests {
         /// A `cat` in a PTY standing in for `agent_type`, with a session the
         /// state attributes to it.
         async fn start(agent_type: AgentType) -> Self {
+            Self::start_with(agent_type, true).await
+        }
+
+        /// [`Self::start`] as a daemon runs an ordinary dashboard pane: the
+        /// registry's ownership oracle installed, as `run_daemon_with` does,
+        /// and the pane NOT in the state's managed set — so an event naming no
+        /// pane is admitted (audit T2).
+        async fn start_unmanaged(agent_type: AgentType) -> Self {
+            Self::start_with(agent_type, false).await
+        }
+
+        async fn start_with(agent_type: AgentType, managed: bool) -> Self {
             let registry = Arc::new(AgentPtyRegistry::new());
             let agent_id = registry
                 .spawn_agent(SpawnOptions {
@@ -10164,7 +10193,15 @@ mod question_answer_tests {
                 .expect("spawn the stand-in agent");
             let state: SharedState =
                 Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-            state.write().await.register_pane(PANE.to_string());
+            if managed {
+                state.write().await.register_pane(PANE.to_string());
+            } else {
+                let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+                state
+                    .write()
+                    .await
+                    .set_agent_ownership(Arc::downgrade(&ownership));
+            }
             let (event_tx, _rx) = broadcast::channel(64);
             let fx = Self {
                 registry,
@@ -10232,6 +10269,25 @@ mod question_answer_tests {
             let mut event = self.event(EventType::PermissionRequest);
             event.set_question(question);
             crate::daemon::ingest_event(&self.state, &self.event_tx, &self.registry, event).await;
+        }
+
+        /// Ingest `event` through the daemon's own path on a task of its own,
+        /// as a second hook connection would.
+        fn ingest_task(&self, event: AgentEvent) -> tokio::task::JoinHandle<()> {
+            let registry = self.registry.clone();
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                crate::daemon::ingest_event(&state, &event_tx, &registry, event).await
+            })
+        }
+
+        /// An event that names neither a pane nor an agent — only the session.
+        fn paneless(&self, event_type: EventType) -> AgentEvent {
+            let mut event = self.event(event_type);
+            event.pane_id = None;
+            event.agent_id = None;
+            event
         }
 
         async fn pending_question(&self) -> Option<PendingQuestion> {
@@ -10882,12 +10938,14 @@ mod question_answer_tests {
     /// Scenario: The deck is typing a Codex form's answer and has just checked
     /// that the form is still the pending question when an event replacing the
     /// form arrives — the same id with other questions — or one that clears it.
-    /// That event waits until the deck's digit is queued for the terminal, so
-    /// the digit lands on the form it was checked against; the replacement or
-    /// clear then applies, and the deck's next digit is refused and never typed.
+    /// That event waits until the deck's digit is queued for the terminal. The
+    /// digit is then either typed into the form it was checked against, or —
+    /// when the change is applied before the terminal takes it — not typed at
+    /// all and the answer refused as stale; either way the deck's next digit is
+    /// never typed into the changed prompt.
     #[spec("question/answer/012")]
     #[tokio::test]
-    async fn question_answer_012_no_question_change_lands_between_a_key_s_check_and_its_write() {
+    async fn question_answer_012_no_question_change_lands_between_a_key_s_check_and_its_queueing() {
         for clear in [false, true] {
             let fx = Fixture::start(AgentType::Codex).await;
             let form = codex_form("call_r2");
@@ -10908,16 +10966,11 @@ mod question_answer_tests {
                 event.set_question(&replaced);
                 event
             };
-            let changing = tokio::spawn({
-                let registry = fx.registry.clone();
-                let state = fx.state.clone();
-                let event_tx = fx.event_tx.clone();
-                async move { crate::daemon::ingest_event(&state, &event_tx, &registry, change).await }
-            });
+            let changing = fx.ingest_task(change);
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(
                 !changing.is_finished(),
-                "the change was applied between the key's check and its write"
+                "the change was applied between the key's check and its queueing"
             );
             assert_eq!(
                 fx.pending_question().await.unwrap().revision,
@@ -10927,11 +10980,20 @@ mod question_answer_tests {
             resume.send(()).unwrap();
             changing.await.unwrap();
             let refused = answering.await.unwrap();
-            assert!(
-                matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
-                "{refused:?}"
-            );
-            assert!(fx.screen_shows("2").await, "the checked key was typed");
+            if fx
+                .screen_shows_within("2", Duration::from_millis(500))
+                .await
+            {
+                assert!(
+                    matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
+                    "the checked key was typed, the next refused: {refused:?}"
+                );
+            } else {
+                assert!(
+                    matches!(refused, Err(AnswerRefusal::Stale { .. })),
+                    "the checked key was dropped unwritten: {refused:?}"
+                );
+            }
             assert!(
                 !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
                 "no key reached the changed prompt"
@@ -10950,6 +11012,216 @@ mod question_answer_tests {
                 );
             }
         }
+    }
+
+    /// Scenario: The deck has checked a Codex form and queued its first digit
+    /// for the terminal, but the terminal has not taken it yet. An event
+    /// replacing the form — the same id with other questions — or one clearing
+    /// it is applied in that gap. The digit is then dropped instead of typed,
+    /// the answer is refused as stale, and nothing reaches the pane; with no
+    /// change in the gap the same queued digit is typed as usual.
+    #[spec("question/answer/013")]
+    #[tokio::test]
+    async fn question_answer_013_a_queued_key_is_dropped_when_its_question_changes_first() {
+        for change in ["none", "replace", "clear"] {
+            let fx = Fixture::start(AgentType::Codex).await;
+            let form = codex_form("call_t1");
+            fx.ask_ingested(&form).await;
+            let checked = fx.pending_question().await.unwrap().revision;
+            let (reached, resume) = fx
+                .registry
+                .question_answers()
+                .arm_barrier(crate::agent_pty::ANSWER_KEY_ON_PTY_THREAD);
+            let answering = fx.answer_task("call_t1", vec![one(0, 2), one(1, 1)], false);
+            reached
+                .await
+                .expect("the PTY thread reached the queued key");
+            let event = match change {
+                "none" => None,
+                "clear" => Some(fx.event(EventType::Idle)),
+                _ => {
+                    let mut replaced = form.clone();
+                    replaced.questions[0].prompt = "Which shade?".into();
+                    let mut event = fx.event(EventType::PermissionRequest);
+                    event.set_question(&replaced);
+                    Some(event)
+                }
+            };
+            if let Some(event) = event {
+                // Not held behind the queued key: the lifecycle was released
+                // when it was queued.
+                tokio::time::timeout(Duration::from_secs(5), fx.ingest_task(event))
+                    .await
+                    .expect("the change is ingested while the key waits on the PTY thread")
+                    .unwrap();
+            }
+            resume.send(()).unwrap();
+            let outcome = answering.await.unwrap();
+            match change {
+                "none" => {
+                    assert_eq!(outcome, Ok(()), "{change}");
+                    assert!(fx.screen_shows("21").await, "both keys were typed");
+                }
+                "clear" => {
+                    assert_eq!(outcome, Err(AnswerRefusal::Stale { current_id: None }));
+                    assert_eq!(fx.pending_question().await, None);
+                }
+                _ => {
+                    assert_eq!(
+                        outcome,
+                        Err(AnswerRefusal::Stale {
+                            current_id: Some("call_t1".into())
+                        })
+                    );
+                    let now = fx.pending_question().await.expect("the replacement");
+                    assert_ne!(now.revision, checked);
+                    assert_ne!(now.channel, AnswerChannel::Unsupported);
+                }
+            }
+            if change != "none" {
+                assert!(
+                    !fx.screen_shows_within("2", Duration::from_millis(500))
+                        .await,
+                    "{change}: the queued key was not typed into the changed prompt"
+                );
+            }
+        }
+    }
+
+    /// Scenario: On an ordinary daemon pane, the deck has checked a Codex form
+    /// and is about to queue its first digit when an Idle event arrives that
+    /// names the agent's session but no pane. That event clears the pane's
+    /// question, so it waits for the deck's digit to be queued exactly as an
+    /// event naming the pane would; the digit is then either typed before the
+    /// clear or dropped, never typed after it, and the next digit is never
+    /// typed. The same event also lets a held question's producer go.
+    #[spec("question/answer/014")]
+    #[tokio::test]
+    async fn question_answer_014_an_event_naming_no_pane_waits_for_its_session_s_pane() {
+        let fx = Fixture::start_unmanaged(AgentType::Codex).await;
+        fx.ask_ingested(&codex_form("call_t2")).await;
+        let checked = fx.pending_question().await.unwrap().revision;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_keys:revalidated");
+        let answering = fx.answer_task("call_t2", vec![one(0, 2), one(1, 1)], false);
+        reached.await.expect("the first key was revalidated");
+        let clearing = fx.ingest_task(fx.paneless(EventType::Idle));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !clearing.is_finished(),
+            "the pane-less clear was applied between the key's check and its queueing"
+        );
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            checked,
+            "nothing changed the question while the key was being committed"
+        );
+        resume.send(()).unwrap();
+        clearing.await.unwrap();
+        let refused = answering.await.unwrap();
+        if fx
+            .screen_shows_within("2", Duration::from_millis(500))
+            .await
+        {
+            assert!(
+                matches!(refused, Err(AnswerRefusal::WriteFailed { .. })),
+                "the checked key was typed before the clear: {refused:?}"
+            );
+        } else {
+            assert_eq!(refused, Err(AnswerRefusal::Stale { current_id: None }));
+        }
+        assert!(
+            !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+            "no key was typed after the clear"
+        );
+        assert_eq!(
+            fx.pending_question().await,
+            None,
+            "the pane-less event reached the pane's session"
+        );
+        assert_eq!(
+            fx.registry
+                .question_answers()
+                .raised_input_seq(PANE, "call_t2", checked),
+            None,
+            "the pane's record of its pending question was reconciled"
+        );
+
+        // A held question's producer is let go by the same pane-less clear.
+        let fx = Fixture::start_unmanaged(AgentType::ClaudeCode).await;
+        let held = fx.hold_ingested(&claude_bash()).await;
+        fx.ingest_task(fx.paneless(EventType::Idle)).await.unwrap();
+        assert_eq!(fx.pending().await, None);
+        let released = held.await.expect("the holder is answered");
+        assert_eq!(released.outcome, ReplyOutcome::Released);
+        assert!(!fx.registry.question_holds().is_held(PANE, "q-bash"));
+    }
+
+    /// Scenario: An Idle event names a session but no pane, and when it arrives
+    /// that session has no pane yet. Before it is applied, the session's agent
+    /// starts the session on a pane while that pane's question transition is
+    /// in progress. The Idle is then applied only after that
+    /// transition ends, as an event naming the pane would be.
+    #[spec("question/answer/015")]
+    #[tokio::test]
+    async fn question_answer_015_an_event_naming_no_pane_follows_its_session_onto_a_pane() {
+        const LATE: &str = "question-answer-late-session";
+        let fx = Fixture::start_unmanaged(AgentType::Codex).await;
+        // Setup: the pane's own session would adopt the late one's frame.
+        fx.state.write().await.sessions.remove(SESSION);
+        let mut start = fx.paneless(EventType::SessionStart);
+        start.session_id = LATE.into();
+        fx.ingest_task(start).await.unwrap();
+        assert_eq!(fx.state.read().await.session_pane(LATE), None);
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("ingest:paneless_resolved");
+        let mut idle = fx.paneless(EventType::Idle);
+        idle.session_id = LATE.into();
+        let idling = fx.ingest_task(idle);
+        reached
+            .await
+            .expect("the Idle resolved its session to no pane");
+        // A question transition on the pane, during which the session moves
+        // onto it.
+        let lifecycle = fx.registry.question_answers().lock_lifecycle(PANE).await;
+        let mut moving = fx.event(EventType::SessionStart);
+        moving.session_id = LATE.into();
+        assert!(
+            crate::daemon::ingest_event_in_lifecycle(
+                &fx.state,
+                &fx.event_tx,
+                &fx.registry,
+                &lifecycle,
+                moving,
+                None,
+                |_| false,
+            )
+            .await
+        );
+        assert_eq!(
+            fx.state.read().await.session_pane(LATE).as_deref(),
+            Some(PANE),
+            "the session moved onto the pane"
+        );
+        resume.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !idling.is_finished(),
+            "the Idle was applied to the pane's session during its question transition"
+        );
+        drop(lifecycle);
+        tokio::time::timeout(Duration::from_secs(5), idling)
+            .await
+            .expect("the Idle is applied once the transition ends")
+            .unwrap();
+        assert_eq!(
+            fx.state.read().await.sessions[LATE].status,
+            SessionStatus::Idle
+        );
     }
 
     /// Scenario: The user answers a permission prompt with "no" by voice. The

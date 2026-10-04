@@ -10474,6 +10474,15 @@ impl AppState {
             })
     }
 
+    /// PRD #1542 (audit T2): the pane of the session `session_id`, if it has
+    /// one — where an event that names no pane lands, since such an event is
+    /// applied to its session by id and the session keeps its pane.
+    pub fn session_pane(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.pane_id.clone())
+    }
+
     /// PRD #1542: the question pending for `(agent_id, pane_id)` — on the same
     /// session [`Self::live_session_for`] picks — with that session's id.
     pub fn pending_question_for(
