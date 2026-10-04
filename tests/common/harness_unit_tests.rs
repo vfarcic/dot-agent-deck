@@ -4805,16 +4805,21 @@ fn the_opencode_probe_failure_says_how_to_find_a_reachable_model() {
 
     // Listing alone is not enough: `opencode models openai` (1.18.34) lists
     // ids that a ChatGPT login then refuses, so the message must also give
-    // the probe itself, runnable as written against a candidate id.
+    // the probe itself. Its placeholder is a bare word: an `<id>` pasted into
+    // a shell is an input redirection, not an argument.
     assert!(
         message.contains("opencode models"),
         "the message must say how to list candidate models:\n{message}"
     );
     assert!(
         message.contains(&format!(
-            "opencode run --model <id> \"{OPENCODE_PROBE_PROMPT}\""
+            "opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\""
         )),
         "the message must give the probe command to try a candidate:\n{message}"
+    );
+    assert!(
+        message.contains("MODEL_ID replaced by an id from that listing"),
+        "the message must say what to put in place of the placeholder:\n{message}"
     );
     assert!(
         message.contains(OPENCODE_TEST_MODEL_ENV),

@@ -5494,10 +5494,11 @@ const OPENCODE_PROBE_ANSWER: &str = "4444";
 ///
 /// FINITE, which the sibling [`check_codex_available`] probe is not. An
 /// unbounded probe that wedges spends the test's entire nextest kill window
-/// (3 x 60 s by default here, and neither of the two callers has an override),
-/// after which the process is SIGKILLed — producing no skip, no failure message
-/// and no diagnostics whatever. 60 s leaves two thirds of that window for the
-/// scenario the probe is only the gate for.
+/// (3 x 60 s by default here; some callers widen theirs in
+/// `.config/nextest.toml`), after which the process is SIGKILLed — producing
+/// no skip, no failure message and no diagnostics whatever. 60 s leaves two
+/// thirds of the default window for the scenario the probe is only the gate
+/// for.
 const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
@@ -5579,8 +5580,9 @@ pub(crate) fn opencode_probe_failure_message(
          ChatGPT-subscription `opencode auth login`, `openrouter` for an OpenRouter key). \
          A login can still reject a listed id (ChatGPT logins answer \"not supported when \
          using Codex with a ChatGPT account\"), so try each candidate with this check's own \
-         probe and keep one that answers {OPENCODE_PROBE_ANSWER}: \
-         `opencode run --model <id> \"{OPENCODE_PROBE_PROMPT}\"`.\nProbe output:\n{probe_output}"
+         probe, with MODEL_ID replaced by an id from that listing, and keep one that \
+         answers {OPENCODE_PROBE_ANSWER}: \
+         `opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\"`.\nProbe output:\n{probe_output}"
     )
 }
 
