@@ -2471,11 +2471,24 @@ impl Drop for TuiDeck {
             // PRD #77 Decision 30 / M4: regenerate the paired `.md`
             // for this test so a `DOT_AGENT_DECK_RECORD=1` run keeps
             // the doc next to the freshly-written cast in sync with
-            // the test source. Cheap (~3 files to parse today);
-            // best-effort — a generator error is surfaced to stderr
-            // but does NOT poison the test result, because rule 7
-            // already catches drift in CI.
-            regenerate_paired_doc(&self.test_name);
+            // the test source. Best-effort — a generator error is
+            // surfaced to stderr but does NOT poison the test result,
+            // because rule 7 already catches drift in CI.
+            //
+            // Issue #1566: NOT on the panic path. The generator
+            // syn-parses every `#[spec]`-bearing source file in a debug
+            // build, measured at 8–24s on a loaded 16-core box
+            // (2026-10-04) against 0.4s for the dump above, and on CI's
+            // starved 4-CPU runners it kept a test that panicked 5s in
+            // alive past nextest's 180s timeout, so the run reported a
+            // timeout instead of the panic. Nothing that reads a failure
+            // needs the doc: CI uploads no recordings, the demo-reel
+            // adapter refuses a recording whose provenance is not
+            // `passed`, and `cargo xtask docs --tests` rebuilds it on
+            // demand. `harness/teardown/001` pins this.
+            if !panicking {
+                regenerate_paired_doc(&self.test_name);
+            }
         }
     }
 }
