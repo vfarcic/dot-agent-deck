@@ -571,3 +571,15 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 [[profile.default.overrides]]
 filter = 'test(delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# PRD #1542: real question tests have bounded agent startup, prompt submission,
+# permission paint, answer delivery and completion waits; /004 and /005 run
+# two sequential turns. Preserve their assertion diagnostics on a loaded host.
+[[profile.default.overrides]]
+filter = 'test(/^question_live_00[1-5]_/)'
+slow-timeout = { period = "60s", terminate-after = 12 }
+
+# Offline Pi still boots Node and loads the two extensions before its dialog.
+[[profile.default.overrides]]
+filter = 'test(question_live_006_pi_extension_select_without_model)'
+slow-timeout = { period = "60s", terminate-after = 6 }

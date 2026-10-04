@@ -6854,7 +6854,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ### Agent questions (PRD #1542)
 
-The question an agent is waiting on — a permission prompt, a menu, a form — as the daemon knows it (`pending_question` on the session's snapshot), and the `answer-question` verb that answers it through the agent's own channel. The lane-2 `question/live/*` tests that run real agents are added separately.
+The question an agent is waiting on — a permission prompt, a menu, a form — as the daemon knows it (`pending_question` on the session's snapshot), and the `answer-question` verb that answers it through the agent's own channel. `question/live/001`–`005` run real agents in lane 2; `006` exercises an offline Pi extension dialog in lane 1.
 
 #### question/model
 
@@ -7065,6 +7065,48 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Asserts:** when a producer holding a question closes its connection without an answer, the daemon broadcasts an event carrying `question_resolved_id` and its own release marker; a client applying the broadcast drops the question and keeps Needs Input, as the daemon does; the frame's `event_type` is `unknown`, which an older client reads as a no-op.
 - **Does not assert:** the desktop's projection of the snapshot (`question/desktop/001`).
 - **Platform coverage:** mac+linux.
+
+##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
+- **Asserts:** Needs Input and a pending held Permission question; permission labels match the visible menu; no sentinel before approval; one client-library `AnswerQuestion` creates the unique sentinel and the agent finishes Idle.
+- **Does not assert:** desktop voice recognition or the always-allow confirmation.
+- **Platform coverage:** mac+linux.
+
+##### question/live/002 — One client answer fills a real Claude form, including multiple choices.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Haiku Claude Code.
+- **Asserts:** the whole two-question form, multi-select sizes, appended free-text and keyboard-only options, one held reply selecting Green/Small/Large, the reported choices, and Idle with no pending question.
+- **Does not assert:** free-text dictation or keyboard form navigation.
+- **Platform coverage:** mac+linux.
+
+##### question/live/003 — Keyboard denial clears a held Claude question and rejects a late answer.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Haiku Claude Code.
+- **Asserts:** keyboard `3` denies the visible permission, the snapshot clears, a late client answer is refused `NoPendingQuestion`, and the sentinel stays absent.
+- **Does not assert:** a keyboard allow or another client's simultaneous answer.
+- **Platform coverage:** mac+linux.
+
+##### question/live/004 — Codex approval and two-question Plan form accept the daemon's keys.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Codex, cheap `common::codex_test_model()` (default gpt-5.1-codex-mini), read-only sandbox and on-request approvals.
+- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large.
+- **Does not assert:** always-allow persistence or free-text notes.
+- **Platform coverage:** mac+linux.
+
+##### question/live/005 — OpenCode replies through its plugin for permissions and whole forms.
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive OpenCode, cheap `common::opencode_test_model()` (default Haiku); a subscription host can override `DOT_AGENT_DECK_OPENCODE_TEST_MODEL` with `openai/gpt-5.6-luna`, while compatible API credentials can use a mini model.
+- **Asserts:** permission options and held channel, a unique sentinel after approval, a two-question form with multiple sizes and appended free-text, one plugin reply and reported Green/Small/Large choices.
+- **Does not assert:** plugin HTTP stale-reply errors or desktop voice.
+- **Platform coverage:** mac+linux.
+
+##### question/live/006 — Pi answers another extension's selector without a model or credential.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_pi_questions.rs`), offline and credential-free.
+- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call, not reel-eligible.
+- **Asserts:** the select dialog's real labels and pending question, a client answer resolves Blue to the asking extension, the dialog closes and Pi visibly reports the selected value.
+- **Does not assert:** a live model, confirm/input dialogs or Pi's undocumented API stability beyond this installed version.
+- **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
 
 ### Docs cross-reference skips
 
