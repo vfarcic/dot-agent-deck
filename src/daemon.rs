@@ -1620,16 +1620,113 @@ async fn ingest_event_unless(
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    let question_pane = event.pane_id.clone();
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
     // it like `daemon_owns_pane` above.
     state.apply_event_watching_waiting(event, registry);
+    // PRD #1542: a held question that is no longer the pane's pending one —
+    // this event answered, cleared or replaced it — lets its producer go, so
+    // the producer prints no decision and the agent's own prompt is the one
+    // that counts. Under the state lock, so the verdict and the apply cannot
+    // be split by another event.
+    if let Some(pane_id) = question_pane.as_deref() {
+        let keep = state.pending_question_id_on_pane(pane_id);
+        let reason = if keep.is_some() {
+            crate::question::ReleaseReason::Superseded
+        } else {
+            crate::question::ReleaseReason::Cleared
+        };
+        registry
+            .question_holds()
+            .release_pane_except(pane_id, keep.as_deref(), reason);
+    }
     drop(state);
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
     true
+}
+
+/// PRD #1542: apply a producer's [`crate::event::QuestionSignal`] and, for a
+/// held question, wait for its answer.
+///
+/// The hold is registered BEFORE the event is applied, so the reconciliation
+/// in [`ingest_event`] sees it: an event racing this one that clears the
+/// question releases the hold rather than leaving it to wait for nothing.
+/// After the apply the question must be the pane's pending one, or it was not
+/// accepted (it did not survive sanitizing, or the event was refused) and the
+/// producer is released at once.
+///
+/// Returns the reply line to write, or `None` when the producer's connection
+/// closed while it waited — the producer is gone, so the question goes too
+/// (Claude Code kills its hook when the keyboard answers No or Esc
+/// [observed]); the status is left for the next event to decide.
+async fn handle_question_signal<R>(
+    signal: crate::event::QuestionSignal,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    reader: &mut R,
+) -> Option<crate::question::QuestionReply>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use crate::question::{QuestionReply, ReleaseReason};
+    let crate::event::QuestionSignal {
+        pane_id,
+        mut event,
+        hold,
+        ..
+    } = signal;
+    // The pane the provenance gate attested, not whatever the event claims.
+    event.pane_id = Some(pane_id.clone());
+    admit_producer_event(&mut event);
+    let question_id = event.question().map(|q| q.id);
+    info!(
+        pane_id = %escape_id_for_log(&pane_id),
+        question_id = ?question_id,
+        hold,
+        event_type = ?event.event_type,
+        "Received question"
+    );
+    let holding = match (&question_id, hold) {
+        (Some(id), true) => Some((id.clone(), registry.question_holds().hold(&pane_id, id))),
+        _ => None,
+    };
+    registry.set_agent_type(&pane_id, &event.agent_type);
+    ingest_event(state, event_tx, registry, event).await;
+    let Some((id, rx)) = holding else {
+        return Some(QuestionReply::released(
+            question_id.as_deref().unwrap_or(""),
+            ReleaseReason::NotHeld,
+        ));
+    };
+    let pending = state.read().await.pending_question_id_on_pane(&pane_id);
+    if pending.as_deref() != Some(id.as_str()) {
+        registry.question_holds().forget(&id);
+        return Some(QuestionReply::released(&id, ReleaseReason::NotHeld));
+    }
+    // Any read outcome means the producer is gone or misbehaving: a holding
+    // producer sends nothing more on this connection.
+    let gone =
+        crate::bounded_read::read_capped_line(reader, crate::bounded_read::MAX_HOOK_LINE_BYTES);
+    tokio::select! {
+        reply = rx => Some(reply.unwrap_or_else(|_| QuestionReply::released(&id, ReleaseReason::Cleared))),
+        _ = gone => {
+            if registry.question_holds().forget(&id) {
+                let cleared = state.write().await.clear_pending_question(&pane_id, &id);
+                info!(
+                    pane_id = %escape_id_for_log(&pane_id),
+                    question_id = %id,
+                    cleared,
+                    "question: the producer stopped waiting before an answer; the question is cleared"
+                );
+            }
+            None
+        }
+    }
 }
 
 /// Issue #714: the one notice to the orchestrator of a worker whose block
@@ -1700,6 +1797,23 @@ fn admit_producer_event(event: &mut AgentEvent) {
     };
     event.metadata.remove(QUOTA_BLOCKED_SOURCE_METADATA_KEY);
     event.metadata.remove(QUOTA_BLOCKED_LIFTED_METADATA_KEY);
+    // PRD #1542: the deck's own answered marker never comes from a producer,
+    // and a question is rewritten sanitized — or dropped — so every reader of
+    // the fan-out sees the question the snapshot will hold.
+    event
+        .metadata
+        .remove(crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY);
+    if event
+        .metadata
+        .contains_key(crate::event::QUESTION_METADATA_KEY)
+    {
+        match event.question() {
+            Some(question) => event.set_question(&question),
+            None => {
+                event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+            }
+        }
+    }
     if event.event_type == crate::event::EventType::QuotaBlocked {
         normalize_quota_blocked_metadata(
             &mut event.metadata,
@@ -3222,6 +3336,9 @@ async fn run_hook_loop_with_idle_timeout(
                 // reason before notifying, so naming one here (this used to say
                 // "on idle shutdown") mislabels the other three.
                 info!("Daemon hook loop exiting on shutdown signal");
+                pty_registry
+                    .question_holds()
+                    .release_all(crate::question::ReleaseReason::Shutdown);
                 return Ok(());
             }
             accept_res = accept_hook_connection(&listener, &conn_limit, &mut at_cap) => match accept_res {
@@ -3809,6 +3926,31 @@ async fn run_hook_loop_with_idle_timeout(
                                     let resp =
                                         crate::event::GetSeedResponse { seed };
                                     if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::Question(signal) => {
+                                    // PRD #1542: one line back, always — the
+                                    // answer, or a release — and for a held
+                                    // question not until one of them happens.
+                                    // A connection that closes first (the
+                                    // agent killed its hook, the keyboard
+                                    // answered) takes the question with it.
+                                    let Some(reply) = handle_question_signal(
+                                        signal,
+                                        &state,
+                                        &event_tx,
+                                        &pty_registry,
+                                        &mut reader,
+                                    )
+                                    .await
+                                    else {
+                                        break;
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&reply) {
                                         let line = format!("{json}\n");
                                         let _ =
                                             write_half.write_all(line.as_bytes()).await;
@@ -9208,5 +9350,196 @@ mod legacy_alias_tests {
         let p = paths();
         let bound = bind_legacy_aliases(None, None, Some(&p.locks)).await;
         assert!(bound.hook.is_none() && bound.attach.is_none() && bound.aliases.is_empty());
+    }
+}
+
+/// PRD #1542: a producer holding a question on the real hook loop.
+#[cfg(all(test, unix))]
+mod question_hold_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::question::{QuestionAnswer, QuestionReply, ReplyOutcome};
+    use spec::spec;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    const PANE: &str = "pane-held-question";
+    const SESSION: &str = "held-question-session";
+
+    fn question_event(agent_id: &str, id: &str) -> AgentEvent {
+        let mut event = AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::PermissionRequest,
+            tool_name: Some("Bash".to_string()),
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        let question = crate::question::claude_permission_request(
+            id.to_string(),
+            "Bash",
+            None,
+            Some("touch x".into()),
+            None,
+            1,
+            None,
+        )
+        .question;
+        event.set_question(&question);
+        event
+    }
+
+    async fn wait_for(
+        state: &SharedState,
+        what: &str,
+        test: impl Fn(&crate::state::AppState) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !test(&*state.read().await) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Scenario: On the real hook loop, a producer holds a question. When its
+    /// connection closes with no answer — Claude Code killing its hook on a
+    /// keyboard No — the daemon drops the question and leaves the card on Needs
+    /// Input for the next event to decide. A second producer holds the next
+    /// question, the deck answers it, and the answer arrives on that producer's
+    /// connection as one `answered` line.
+    #[spec("question/hold/003")]
+    #[tokio::test]
+    async fn question_hold_003_a_closed_hold_clears_and_an_open_one_hears_the_answer() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let token = registry.hook_token_of(&agent).expect("a hook token");
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(PANE.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move {
+                run_hook_loop(
+                    listener,
+                    state,
+                    event_tx,
+                    registry,
+                    Arc::new(Notify::new()),
+                    wtr,
+                )
+                .await
+            }
+        });
+        let hold = |id: &str| {
+            let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+                pane_id: PANE.to_string(),
+                token: Some(token.clone()),
+                event: question_event(&agent, id),
+                hold: true,
+            });
+            let sock = sock.clone();
+            async move {
+                let mut stream = UnixStream::connect(&sock).await.expect("connect");
+                let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+                stream.write_all(line.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                stream
+            }
+        };
+        let pending = |id: &'static str| {
+            move |s: &crate::state::AppState| {
+                s.pending_question_id_on_pane(PANE).as_deref() == Some(id)
+            }
+        };
+
+        let first = hold("q-first").await;
+        wait_for(
+            &state,
+            "the first question to be pending",
+            pending("q-first"),
+        )
+        .await;
+        assert!(registry.question_holds().is_held("q-first"));
+        drop(first);
+        wait_for(&state, "the closed hold to clear its question", |s| {
+            s.pending_question_id_on_pane(PANE).is_none()
+        })
+        .await;
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::WaitingForInput,
+            "a closed hold says nothing about where the agent went"
+        );
+        assert!(!registry.question_holds().is_held("q-first"));
+
+        let second = hold("q-second").await;
+        wait_for(
+            &state,
+            "the second question to be pending",
+            pending("q-second"),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !registry.question_holds().is_held("q-second") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the hold never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        crate::daemon_protocol::answer_question(
+            &registry,
+            &state,
+            &event_tx,
+            &agent,
+            "q-second",
+            &[QuestionAnswer {
+                question_index: 0,
+                option_indices: vec![1],
+                text: None,
+            }],
+            false,
+        )
+        .await
+        .expect("the deck answers the held question");
+        let mut reader = tokio::io::BufReader::new(second);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("the answer arrives")
+            .unwrap();
+        let reply: QuestionReply = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+        assert_eq!(reply.question_id, "q-second");
+        assert!(reply.answers_for("q-second").is_some());
+
+        handle.abort();
+        registry.shutdown_all();
     }
 }

@@ -835,6 +835,33 @@ pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
 /// #1364, [`crate::state::SubagentWait`]), which a plain `Idle` would end too.
 pub const SUBAGENT_ID_METADATA_KEY: &str = "subagent_id";
 
+/// PRD #1542: the question an event raises, as a JSON-encoded
+/// [`crate::question::PendingQuestion`] riding the free-form `metadata` map.
+///
+/// A metadata key rather than a new [`AgentEvent`] field, deliberately: the
+/// map is already on every producer's wire and every reader's decode, so the
+/// question moves no wire at all — an older daemon or TUI ignores an unknown
+/// key — and the dozens of places that build an `AgentEvent` stay as they are.
+/// Every reader decodes it through [`AgentEvent::question`], which sanitizes
+/// it ([`crate::question::PendingQuestion::sanitized`]); the daemon also
+/// rewrites it sanitized, or drops it, on arrival.
+pub const QUESTION_METADATA_KEY: &str = "pending_question";
+
+/// PRD #1542: the id of a question the AGENT reports answered — OpenCode's
+/// `permission.replied` / `question.replied` / `question.rejected` name their
+/// request id here. An event carrying it clears that question if it is the
+/// pending one. It can only take a question away, never raise one, so a forged
+/// value costs nothing a plain `Idle` would not.
+pub const QUESTION_RESOLVED_METADATA_KEY: &str = "question_resolved_id";
+
+/// PRD #1542: the daemon's marker on the event it ingests after answering a
+/// question itself. The daemon's alone: stripped from every producer frame,
+/// and [`AgentEvent::is_daemon_synthetic`] counts it.
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_KEY: &str = "question_answered_by_deck";
+
+/// The value of [`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`].
+pub const QUESTION_ANSWERED_BY_DECK_METADATA_VALUE: &str = "1";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -1209,6 +1236,35 @@ impl AgentEvent {
                 .contains_key(crate::quota_block::QUOTA_BLOCKED_LIFTED_METADATA_KEY)
             || self.is_card_surface_session_start()
             || self.is_daemon_pane_closed()
+            || self
+                .metadata
+                .contains_key(QUESTION_ANSWERED_BY_DECK_METADATA_KEY)
+    }
+
+    /// PRD #1542: the question this event raises, sanitized — `None` when it
+    /// carries none, or one that does not decode or does not survive
+    /// [`crate::question::PendingQuestion::sanitized`].
+    pub fn question(&self) -> Option<crate::question::PendingQuestion> {
+        let raw = self.metadata.get(QUESTION_METADATA_KEY)?;
+        serde_json::from_str::<crate::question::PendingQuestion>(raw)
+            .ok()?
+            .sanitized()
+    }
+
+    /// PRD #1542: put `question` on this event.
+    pub fn set_question(&mut self, question: &crate::question::PendingQuestion) {
+        if let Ok(json) = serde_json::to_string(question) {
+            self.metadata
+                .insert(QUESTION_METADATA_KEY.to_string(), json);
+        }
+    }
+
+    /// PRD #1542: the question id this event reports the agent answered, if
+    /// any ([`QUESTION_RESOLVED_METADATA_KEY`]).
+    pub fn resolved_question_id(&self) -> Option<&str> {
+        self.metadata
+            .get(QUESTION_RESOLVED_METADATA_KEY)
+            .map(String::as_str)
     }
 }
 
@@ -1292,6 +1348,21 @@ pub enum DaemonMessage {
     /// reports as harmless.
     #[serde(rename = "ack")]
     Ack(AckSignal),
+    /// PRD #1542: a producer reports a question and, with `hold`, keeps this
+    /// connection open for the daemon's answer — the Claude Code
+    /// `PermissionRequest` hook, and the `await-answer` child the OpenCode
+    /// plugin and the Pi extension start. The daemon applies the event exactly
+    /// as a bare one and, for a held question it accepted, writes one
+    /// [`crate::question::QuestionReply`] line when the question is answered
+    /// or let go; otherwise it answers a `released` reply at once.
+    ///
+    /// Additive on the unversioned hook socket, so it does NOT move the attach
+    /// `PROTOCOL_VERSION`. An older daemon decodes it as neither a
+    /// `DaemonMessage` nor an [`AgentEvent`], logs it as malformed and answers
+    /// nothing; the producer then exits with no decision and the agent shows
+    /// its own prompt, as it did before.
+    #[serde(rename = "question")]
+    Question(QuestionSignal),
 }
 
 impl DaemonMessage {
@@ -1311,6 +1382,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => &s.pane_id,
             DaemonMessage::SpawnRole(s) => &s.pane_id,
             DaemonMessage::Ack(s) => &s.pane_id,
+            DaemonMessage::Question(s) => &s.pane_id,
         }
     }
 
@@ -1326,6 +1398,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(s) => s.token.as_deref(),
             DaemonMessage::SpawnRole(s) => s.token.as_deref(),
             DaemonMessage::Ack(s) => s.token.as_deref(),
+            DaemonMessage::Question(s) => s.token.as_deref(),
         }
     }
 
@@ -1341,6 +1414,7 @@ impl DaemonMessage {
             DaemonMessage::RestartRole(_) => "restart_role",
             DaemonMessage::SpawnRole(_) => "spawn_role",
             DaemonMessage::Ack(_) => "ack",
+            DaemonMessage::Question(_) => "question",
         }
     }
 
@@ -1391,6 +1465,15 @@ impl DaemonMessage {
             DaemonMessage::WorkDone(_) | DaemonMessage::Dispatch(_) | DaemonMessage::Ack(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
             }
+            // A refused question is released as `refused`: the producer prints
+            // no decision, the agent's own prompt stays on screen, and the
+            // producer re-sends the event as a plain one so it is not lost.
+            DaemonMessage::Question(s) => {
+                serde_json::to_string(&crate::question::QuestionReply::released(
+                    &s.question_id().unwrap_or_default(),
+                    crate::question::ReleaseReason::Refused,
+                ))
+            }
         };
         json.ok()
     }
@@ -1427,7 +1510,8 @@ impl DaemonMessage {
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::ListTargets(_)
             | DaemonMessage::GetSeed(_)
-            | DaemonMessage::Ack(_) => None,
+            | DaemonMessage::Ack(_)
+            | DaemonMessage::Question(_) => None,
         }
     }
 }
@@ -2488,6 +2572,28 @@ pub struct AckSignal {
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
+/// PRD #1542: [`DaemonMessage::Question`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionSignal {
+    pub pane_id: String,
+    /// The hook capability token (issue #1077), as on every verb.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The event to apply. It carries the question
+    /// ([`QUESTION_METADATA_KEY`]).
+    pub event: AgentEvent,
+    /// Keep this connection open for the answer.
+    #[serde(default)]
+    pub hold: bool,
+}
+
+impl QuestionSignal {
+    /// The id of the question the event carries, as the producer sent it.
+    pub fn question_id(&self) -> Option<String> {
+        self.event.question().map(|q| q.id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDoneSignal {
     pub pane_id: String,

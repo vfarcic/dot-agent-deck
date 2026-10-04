@@ -392,6 +392,7 @@ fn make_session(
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        pending_question: None,
     }
 }
 
@@ -2996,6 +2997,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         last_activity_ms: None,
         blocked: None,
         hook_generation: None,
+        pending_question: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3144,6 +3146,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_activity_ms: None,
                         blocked: None,
                         hook_generation: None,
+                        pending_question: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3280,6 +3283,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        pending_question: None,
     };
     let (buffer, _) =
         render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
@@ -3396,6 +3400,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         orchestration_orphaned: false,
         subagent_wait: None,
         prompt_reports_unavailable: false,
+        pending_question: None,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

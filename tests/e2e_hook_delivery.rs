@@ -87,6 +87,17 @@ fn claude_hook_via_cli(deck: &TuiDeck, pane_id: &str, payload: &serde_json::Valu
         .expect("hook stdin")
         .write_all(payload.to_string().as_bytes())
         .expect("write hook payload");
+    // PRD #1542: a `PermissionRequest` is HELD — the hook waits on the deck
+    // for an answer until the question is answered or cleared, as it does
+    // under Claude Code, which runs it beside its own dialog. Waiting for it
+    // here would deadlock the scenario's next step, which is what clears it;
+    // reap it on a thread instead.
+    if payload["hook_event_name"] == "PermissionRequest" {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return;
+    }
     let output = child.wait_with_output().expect("wait for hook CLI");
     assert!(
         output.status.success(),

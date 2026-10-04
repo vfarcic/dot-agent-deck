@@ -256,3 +256,223 @@ export function spawnFailureMessage(argv: string[], err: unknown, bin: string = 
 			: ` (does \`${bin}\` still exist?)`;
 	return `Failed to run \`${cmd}\`${hint}: ${reason}`;
 }
+
+// ---------------------------------------------------------------------------
+// PRD #1542: answering another extension's dialog from the deck
+// ---------------------------------------------------------------------------
+
+/**
+ * A dialog another Pi extension raised, as `dot-agent-deck await-answer --agent
+ * pi --question <json>` takes it (the Rust `question::PiDialog`). MUST stay in
+ * sync with that struct.
+ */
+export interface PiDialog {
+	id: string;
+	kind: "select" | "confirm" | "input";
+	title: string;
+	message?: string;
+	options?: string[];
+	placeholder?: string;
+}
+
+/** The argv that holds `dialog` with the deck until it answers. */
+export function buildAwaitAnswerArgv(dialog: PiDialog): string[] {
+	return ["await-answer", "--agent", "pi", "--question", JSON.stringify(dialog)];
+}
+
+/**
+ * The deck's answer from `await-answer`'s stdout: `{ value }` on its one line,
+ * or `undefined` — print-nothing, an unparseable line, or a value of the wrong
+ * type for the dialog — which means "leave the dialog to the keyboard".
+ */
+export function parseAwaitAnswer(
+	kind: PiDialog["kind"],
+	stdout: string | undefined | null,
+): { value: string | boolean } | undefined {
+	const line = (stdout ?? "").split("\n").find((l) => l.trim().length > 0);
+	if (!line) {
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object" || !("value" in parsed)) {
+		return undefined;
+	}
+	const value = (parsed as { value: unknown }).value;
+	if (kind === "confirm" ? typeof value === "boolean" : typeof value === "string") {
+		return { value: value as string | boolean };
+	}
+	return undefined;
+}
+
+/** What the wrapper needs from Pi: run the deck CLI, mint an id. */
+export interface QuestionDeps {
+	exec(argv: string[], signal: AbortSignal): Promise<{ code: number; stdout: string }>;
+	mintId(): string;
+}
+
+/** The part of Pi's shared `ctx.ui` object the wrapper replaces. */
+export interface DialogUi {
+	select?: (title: string, options: string[], opts?: DialogOptions) => Promise<unknown>;
+	confirm?: (title: string, message?: string, opts?: DialogOptions) => Promise<unknown>;
+	input?: (title: string, placeholder?: string, opts?: DialogOptions) => Promise<unknown>;
+}
+
+/** Pi's `ExtensionUIDialogOptions`, as far as the wrapper reads it. */
+export interface DialogOptions {
+	signal?: AbortSignal;
+	[key: string]: unknown;
+}
+
+const WRAPPED = "__dotAgentDeckQuestionWrapper";
+
+/**
+ * Race the original dialog against the deck's answer. Whichever settles first
+ * wins: a deck answer aborts the dialog through the signal Pi documents for
+ * dismissing it programmatically, and a keyboard answer aborts the
+ * `await-answer` child, whose closed connection tells the deck the question is
+ * gone. A caller's own signal still dismisses the dialog.
+ */
+function raceDialog(
+	open: (signal: AbortSignal) => Promise<unknown>,
+	dialog: PiDialog,
+	deps: QuestionDeps,
+	callerSignal: AbortSignal | undefined,
+): Promise<unknown> {
+	const dialogAbort = new AbortController();
+	const execAbort = new AbortController();
+	if (callerSignal) {
+		if (callerSignal.aborted) {
+			dialogAbort.abort();
+		} else {
+			callerSignal.addEventListener("abort", () => dialogAbort.abort(), { once: true });
+		}
+	}
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let keyboard: Promise<unknown>;
+		try {
+			keyboard = open(dialogAbort.signal);
+		} catch (err) {
+			reject(err);
+			return;
+		}
+		keyboard.then(
+			(value) => {
+				if (!settled) {
+					settled = true;
+					execAbort.abort();
+					resolve(value);
+				}
+			},
+			(err) => {
+				if (!settled) {
+					settled = true;
+					execAbort.abort();
+					reject(err);
+				}
+			},
+		);
+		let deck: Promise<{ code: number; stdout: string }>;
+		try {
+			deck = deps.exec(buildAwaitAnswerArgv(dialog), execAbort.signal);
+		} catch {
+			return;
+		}
+		deck.then(
+			(outcome) => {
+				if (settled) {
+					return;
+				}
+				const answer = parseAwaitAnswer(dialog.kind, outcome?.stdout);
+				if (!answer) {
+					return;
+				}
+				settled = true;
+				dialogAbort.abort();
+				resolve(answer.value);
+			},
+			() => {
+				// No deck, or the child was stopped: the keyboard answers.
+			},
+		);
+	});
+}
+
+/**
+ * PRD #1542: replace `select`, `confirm` and `input` on Pi's shared `ctx.ui`
+ * with wrappers that let the deck answer them. This rests on behaviour Pi does
+ * NOT document — the object is shared by every extension and its methods are
+ * writable [observed on 0.87.1] — so every step is guarded: anything missing or
+ * read-only leaves that method alone, and the function never throws. Returns
+ * how many methods it wrapped. Idempotent: a method already wrapped is left as
+ * it is, so re-applying on every `session_start` (Pi rebuilds the object when
+ * it rebinds its UI) is safe.
+ */
+export function installQuestionWrappers(ui: unknown, deps: QuestionDeps): number {
+	if (!ui || typeof ui !== "object") {
+		return 0;
+	}
+	const target = ui as DialogUi & Record<string, unknown>;
+	let wrapped = 0;
+	const replace = (name: "select" | "confirm" | "input", wrapper: (...args: never[]) => Promise<unknown>) => {
+		try {
+			const original = target[name];
+			if (typeof original !== "function" || (original as unknown as Record<string, unknown>)[WRAPPED]) {
+				return;
+			}
+			Object.defineProperty(wrapper, WRAPPED, { value: true });
+			target[name] = wrapper as never;
+			if (target[name] === wrapper) {
+				wrapped += 1;
+			}
+		} catch {
+			// Read-only or otherwise unwritable: leave Pi's own method alone.
+		}
+	};
+	const select = target.select;
+	if (typeof select === "function") {
+		replace("select", ((title: string, options: string[], opts?: DialogOptions) =>
+			raceDialog(
+				(signal) => select.call(ui, title, options, { ...opts, signal }),
+				{ id: deps.mintId(), kind: "select", title: String(title ?? ""), options: (options ?? []).map(String) },
+				deps,
+				opts?.signal,
+			)) as never);
+	}
+	const confirm = target.confirm;
+	if (typeof confirm === "function") {
+		replace("confirm", ((title: string, message?: string, opts?: DialogOptions) =>
+			raceDialog(
+				(signal) => confirm.call(ui, title, message, { ...opts, signal }),
+				{
+					id: deps.mintId(),
+					kind: "confirm",
+					title: String(title ?? ""),
+					...(typeof message === "string" ? { message } : {}),
+				},
+				deps,
+				opts?.signal,
+			)) as never);
+	}
+	const input = target.input;
+	if (typeof input === "function") {
+		replace("input", ((title: string, placeholder?: string, opts?: DialogOptions) =>
+			raceDialog(
+				(signal) => input.call(ui, title, placeholder, { ...opts, signal }),
+				{
+					id: deps.mintId(),
+					kind: "input",
+					title: String(title ?? ""),
+					...(typeof placeholder === "string" ? { placeholder } : {}),
+				},
+				deps,
+				opts?.signal,
+			)) as never);
+	}
+	return wrapped;
+}

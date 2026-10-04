@@ -5045,6 +5045,112 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
+/// PRD #1542: the hook-socket connections producers hold open for a
+/// question's answer, keyed by question id.
+///
+/// A producer — the Claude Code `PermissionRequest` hook, the OpenCode
+/// plugin's and Pi extension's `await-answer` child — sends
+/// `DaemonMessage::Question` with `hold` and waits on its connection. The hook
+/// loop registers it here ([`Self::hold`]) and then waits on the receiver and
+/// on the connection at once. The daemon's `AnswerQuestion` handler sends the
+/// answer ([`Self::answer`]); every path that makes a question stop being the
+/// pending one releases its hold ([`Self::release_pane_except`]), and a
+/// producer that dies closes the connection, which the hook loop reports by
+/// dropping the hold ([`Self::forget`]).
+#[derive(Default)]
+pub struct HeldQuestions {
+    holds: Mutex<HashMap<String, HeldQuestion>>,
+}
+
+struct HeldQuestion {
+    pane_id: String,
+    tx: tokio::sync::oneshot::Sender<crate::question::QuestionReply>,
+}
+
+impl HeldQuestions {
+    /// Register a hold for `question_id` on `pane_id`. A hold already
+    /// registered under the same id is released as superseded: one question id
+    /// is one connection.
+    pub fn hold(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::question::QuestionReply> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let previous = self.holds.lock().unwrap().insert(
+            question_id.to_string(),
+            HeldQuestion {
+                pane_id: pane_id.to_string(),
+                tx,
+            },
+        );
+        if let Some(previous) = previous {
+            let _ = previous.tx.send(crate::question::QuestionReply::released(
+                question_id,
+                crate::question::ReleaseReason::Superseded,
+            ));
+        }
+        rx
+    }
+
+    /// Whether `question_id` is held.
+    pub fn is_held(&self, question_id: &str) -> bool {
+        self.holds.lock().unwrap().contains_key(question_id)
+    }
+
+    /// Send the answer down `question_id`'s connection. `false` when nothing
+    /// holds it, or the holder has already gone.
+    pub fn answer(&self, question_id: &str, reply: crate::question::QuestionReply) -> bool {
+        let held = self.holds.lock().unwrap().remove(question_id);
+        held.is_some_and(|held| held.tx.send(reply).is_ok())
+    }
+
+    /// Release every hold on `pane_id` except `keep` — the question pending
+    /// there now, if any. Returns how many were released.
+    pub fn release_pane_except(
+        &self,
+        pane_id: &str,
+        keep: Option<&str>,
+        reason: crate::question::ReleaseReason,
+    ) -> usize {
+        let released: Vec<(String, HeldQuestion)> = {
+            let mut holds = self.holds.lock().unwrap();
+            let ids: Vec<String> = holds
+                .iter()
+                .filter(|(id, held)| held.pane_id == pane_id && Some(id.as_str()) != keep)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| holds.remove(&id).map(|held| (id, held)))
+                .collect()
+        };
+        let count = released.len();
+        for (id, held) in released {
+            let _ = held
+                .tx
+                .send(crate::question::QuestionReply::released(&id, reason));
+        }
+        count
+    }
+
+    /// Release every hold — the daemon is shutting down.
+    pub fn release_all(&self, reason: crate::question::ReleaseReason) {
+        let all: Vec<(String, HeldQuestion)> = self.holds.lock().unwrap().drain().collect();
+        for (id, held) in all {
+            let _ = held
+                .tx
+                .send(crate::question::QuestionReply::released(&id, reason));
+        }
+    }
+
+    /// Drop `question_id`'s hold without answering: its connection closed.
+    /// Returns whether it was still held — `false` after an answer or a release
+    /// already took it.
+    pub fn forget(&self, question_id: &str) -> bool {
+        self.holds.lock().unwrap().remove(question_id).is_some()
+    }
+}
+
 /// In-process registry of agent PTYs owned by the daemon. M1.1 only exposed
 /// the in-process API; M1.2 wires it to the streaming attach protocol via
 /// [`AgentBus`] and [`AttachHandle`].
@@ -5081,6 +5187,9 @@ pub struct AgentPtyRegistry {
     /// [`AgentPtyRegistry::pane_dispatch_order_lock`]. Never pruned, for the
     /// same reason `dispatch_mutexes` is not.
     dispatch_order_mutexes: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// PRD #1542: the hook-socket connections a producer holds open for a
+    /// question's answer, by question id — see [`HeldQuestions`].
+    question_holds: HeldQuestions,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -6838,6 +6947,7 @@ impl AgentPtyRegistry {
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
+            question_holds: HeldQuestions::default(),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -6859,6 +6969,45 @@ impl AgentPtyRegistry {
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
         }
+    }
+
+    /// PRD #1542: the held question channels — see [`HeldQuestions`].
+    pub fn question_holds(&self) -> &HeldQuestions {
+        &self.question_holds
+    }
+
+    /// PRD #1542: type `keys` into `agent_id`'s PTY to answer a question, with
+    /// no Enter after them, under that agent's writer — the keys channel.
+    ///
+    /// `revalidate` is asked with the writer held, immediately before the
+    /// write, and a `false` writes nothing: the daemon passes "is the question
+    /// still the pending one", so keys aimed at a question the keyboard already
+    /// answered are never typed into whatever replaced it. Written as the
+    /// user's own keystrokes ([`PaneWriter::write_user`]) — they ARE the user's
+    /// answer, given by voice.
+    pub async fn write_answer_keys<Fut>(
+        &self,
+        agent_id: &str,
+        keys: &[u8],
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<(), &'static str>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        let target = self
+            .writer_target_for_agent(agent_id)
+            .ok_or("the agent is not running")?;
+        let writer = target.writer.lock().await;
+        if target.exited.load(Ordering::SeqCst) {
+            return Err("the agent exited");
+        }
+        if !revalidate().await {
+            return Err("the question changed before the keys were typed");
+        }
+        writer
+            .write_user(keys)
+            .await
+            .map_err(|_| "writing to the agent's terminal failed")
     }
 
     /// Issue #1383: the delegate deliveries a retry loop is watching, one per
@@ -19228,6 +19377,7 @@ mod spawn_tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pending_question: None,
             }),
             spawned_at_ms: None,
             cli_name: None,

@@ -1,0 +1,49 @@
+{
+  "session_id": "2e44853a-f020-4f10-bdcf-4fc672c162eb",
+  "prompt_id": "1e9576ff-d463-471c-87ea-530bd9777d4a",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Which colour?",
+        "header": "Colour",
+        "options": [
+          {
+            "label": "Red",
+            "description": "A warm colour"
+          },
+          {
+            "label": "Green",
+            "description": "A natural colour"
+          },
+          {
+            "label": "Blue",
+            "description": "A calm colour"
+          }
+        ],
+        "multiSelect": false
+      },
+      {
+        "question": "Which sizes?",
+        "header": "Sizes",
+        "options": [
+          {
+            "label": "Small",
+            "description": "The small size"
+          },
+          {
+            "label": "Medium",
+            "description": "The medium size"
+          },
+          {
+            "label": "Large",
+            "description": "The large size"
+          }
+        ],
+        "multiSelect": true
+      }
+    ]
+  }
+}

@@ -28,6 +28,7 @@ import {
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
 	execFailureMessage,
+	installQuestionWrappers,
 	piEventToAgentState,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
@@ -167,7 +168,28 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		pi.sendUserMessage(seed, { deliverAs: SEED_DELIVER_AS });
 	};
 
+	// --- PRD #1542: answer other extensions' dialogs from the deck --------
+	// Pi's `ctx.ui` is one object shared by every extension and is rebuilt when
+	// Pi rebinds its UI, so the wrappers are (re)applied on every
+	// session_start. Only inside a deck pane, where `await-answer` has a daemon
+	// to talk to. Best-effort and guarded: a Pi whose `ctx.ui` is not what
+	// 0.87.1 had leaves its dialogs to the keyboard, never crashes.
+	const wrapDialogs = (ctx: ExtensionContext): void => {
+		if (!process.env.DOT_AGENT_DECK_PANE_ID) {
+			return;
+		}
+		try {
+			installQuestionWrappers((ctx as unknown as { ui?: unknown }).ui, {
+				exec: (argv, signal) => pi.exec(deckBin, argv, { signal }),
+				mintId: () => `q-${globalThis.crypto.randomUUID().replace(/-/g, "")}`,
+			});
+		} catch {
+			// Unsupported on this Pi: the keyboard answers.
+		}
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
+		wrapDialogs(ctx);
 		// Report status first (Idle — a Pi pane awaiting its first prompt is
 		// idle, matching every other backend's session-start), then deliver the
 		// native seed, which triggers a turn (→ agent_start → Thinking) — the

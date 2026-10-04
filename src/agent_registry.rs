@@ -221,7 +221,275 @@ pub struct AgentSpec {
     /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
     /// synthesizes events from stdout), or the neutral placeholder.
     pub startup_auto_install: Option<fn()>,
+    /// PRD #1542: the options this agent draws on screen but never reports in
+    /// a payload — its permission and plan menus, and the free-text entries it
+    /// appends to a multiple-choice list — with the keys that pick each where
+    /// the deck answers by keys. Read by the producers that build a
+    /// [`crate::question::PendingQuestion`] and by the daemon's keys channel
+    /// ([`crate::question::answer_keys`]). `None` for an agent with no such
+    /// menus (Pi, whose dialogs report their own options) and the placeholder.
+    pub questions: Option<&'static QuestionTables>,
 }
+
+/// PRD #1542: one agent's per-version option tables (decision 3). The deck
+/// never reads the screen, so every option an agent draws without reporting it
+/// comes from here, keyed on the versions it was verified on; the lane-2
+/// `question/live/*` tests are what pin them.
+#[derive(Debug)]
+pub struct QuestionTables {
+    /// The oldest version these tables are known to describe. A version below
+    /// it lists the table's options keyboard-only and refuses the keys channel.
+    /// An unknown version (no producer reports one today) is treated as covered:
+    /// the lane-2 tests are the guard.
+    pub verified_from: (u64, u64, u64),
+    /// The newest version the tables were verified on, for the docs and for
+    /// whoever next measures them.
+    pub verified_on: (u64, u64, u64),
+    pub menus: &'static [MenuTable],
+}
+
+impl QuestionTables {
+    /// The options of `kind`, empty when the agent has no such menu.
+    pub fn menu(&self, kind: MenuKind) -> &'static [TableOption] {
+        self.menus
+            .iter()
+            .find(|m| m.menu == kind)
+            .map(|m| m.options)
+            .unwrap_or(&[])
+    }
+
+    /// Whether `version` is one these tables describe; `None` (not reported)
+    /// is.
+    pub fn covers(&self, version: Option<(u64, u64, u64)>) -> bool {
+        version.is_none_or(|v| v >= self.verified_from)
+    }
+}
+
+/// Which on-screen menu a [`MenuTable`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// A tool-permission prompt.
+    Permission,
+    /// The options an agent appends after a multiple-choice question's own.
+    ChoiceAppended,
+    /// Claude Code's plan approval.
+    Plan,
+}
+
+#[derive(Debug)]
+pub struct MenuTable {
+    pub menu: MenuKind,
+    /// In on-screen order.
+    pub options: &'static [TableOption],
+}
+
+/// When a table option is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableWhen {
+    Always,
+    /// Claude Code's "always" option beside an `addDirectories` suggestion.
+    SuggestionAddDirectories,
+    /// Claude Code's "always" option beside a `setMode` suggestion.
+    SuggestionSetMode,
+    /// Claude Code's "always" option beside any other suggestion.
+    SuggestionOther,
+}
+
+#[derive(Debug)]
+pub struct TableOption {
+    /// The on-screen label. `{dir}`, `{rule}`, `{detail}` and `{patterns}` are
+    /// filled from the payload.
+    pub label: &'static str,
+    pub role: crate::question::OptionRole,
+    /// What the keys channel types to pick this option, with no Enter after it.
+    /// `None` where the agent is answered another way, or where the keys are
+    /// unknown.
+    pub keys: Option<&'static str>,
+    /// The deck shows this option but cannot pick it.
+    pub keyboard_only: bool,
+    /// For an "always" option: what it covers, for the confirmation.
+    pub scope: Option<&'static str>,
+    pub when: TableWhen,
+}
+
+const fn table_option(
+    label: &'static str,
+    role: crate::question::OptionRole,
+    keys: Option<&'static str>,
+) -> TableOption {
+    TableOption {
+        label,
+        role,
+        keys,
+        keyboard_only: false,
+        scope: None,
+        when: TableWhen::Always,
+    }
+}
+
+const fn keyboard_only(mut option: TableOption) -> TableOption {
+    option.keyboard_only = true;
+    option
+}
+
+const fn scoped(mut option: TableOption, scope: &'static str) -> TableOption {
+    option.scope = Some(scope);
+    option
+}
+
+const fn when(mut option: TableOption, when: TableWhen) -> TableOption {
+    option.when = when;
+    option
+}
+
+use crate::question::OptionRole::{AllowAlways, AllowOnce, Choice, Deny, FreeText};
+
+/// Claude Code, verified on 2.1.289 (PRD #1542 M1 and follow-up b). The
+/// `PermissionRequest` hook it rests on is installed from 2.1.136
+/// ([`crate::hooks_manage::PERMISSION_REQUEST_MIN_CLAUDE_VERSION`]). Permission
+/// and choice answers go through the held hook, so they name no keys; plan
+/// approval is answered by keys because a hook decision does not dismiss it.
+pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (2, 1, 136),
+    verified_on: (2, 1, 289),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Yes", AllowOnce, None),
+                when(
+                    scoped(
+                        table_option(
+                            "Yes, and always allow access to {dir} from this project",
+                            AllowAlways,
+                            None,
+                        ),
+                        "access to {dir} from this project",
+                    ),
+                    TableWhen::SuggestionAddDirectories,
+                ),
+                when(
+                    scoped(
+                        table_option(
+                            "Yes, and switch to accept edits for this session",
+                            AllowAlways,
+                            None,
+                        ),
+                        "file edits for the rest of this session (accept-edits mode)",
+                    ),
+                    TableWhen::SuggestionSetMode,
+                ),
+                // Label and index unverified: M1 saw only the two suggestion
+                // kinds above.
+                when(
+                    scoped(
+                        table_option("Yes, and don't ask again", AllowAlways, None),
+                        "{rule}",
+                    ),
+                    TableWhen::SuggestionOther,
+                ),
+                table_option("No", Deny, None),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            options: &[
+                table_option("Type something.", FreeText, None),
+                keyboard_only(table_option("Chat about this", Choice, None)),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::Plan,
+            options: &[
+                // `1` is inferred from `2` [observed].
+                scoped(
+                    table_option("Yes, auto-accept edits", AllowAlways, Some("1")),
+                    "file edits for the rest of this session (auto-accept)",
+                ),
+                table_option("Yes, manually approve edits", AllowOnce, Some("2")),
+                keyboard_only(table_option("Tell Claude what to change", FreeText, None)),
+            ],
+        },
+    ],
+};
+
+/// Codex, verified on 0.160.0 (PRD #1542 M1 and follow-up c). Answered by
+/// keys: each acts without Enter.
+pub static CODEX_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (0, 160, 0),
+    verified_on: (0, 160, 0),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Yes, proceed", AllowOnce, Some("1")),
+                scoped(
+                    table_option(
+                        "Yes, and don't ask again for commands that start with the prefix shown",
+                        AllowAlways,
+                        Some("p"),
+                    ),
+                    "commands that start with the prefix Codex shows for `{detail}`",
+                ),
+                table_option("No, and tell Codex what to do differently", Deny, Some("3")),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            // Its notes are typed after Tab, which is not measured.
+            options: &[keyboard_only(table_option(
+                "None of the above",
+                FreeText,
+                None,
+            ))],
+        },
+    ],
+};
+
+/// OpenCode, verified on 1.18.34 (PRD #1542 M1 and follow-up d). Answered
+/// through the plugin's reply API, so no keys.
+pub static OPEN_CODE_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (1, 18, 34),
+    verified_on: (1, 18, 34),
+    menus: &[
+        MenuTable {
+            menu: MenuKind::Permission,
+            options: &[
+                table_option("Allow once", AllowOnce, None),
+                scoped(
+                    table_option("Allow always", AllowAlways, None),
+                    "requests matching {patterns}",
+                ),
+                table_option("Reject", Deny, None),
+            ],
+        },
+        MenuTable {
+            menu: MenuKind::ChoiceAppended,
+            options: &[table_option("Type your own answer", FreeText, None)],
+        },
+    ],
+};
+
+/// Devin 3000.11.3, from its documentation only: no logged-in Devin has run
+/// it, so every entry here — the labels, their order and both keys — is
+/// UNVERIFIED. Only Allow once and Deny are answerable.
+pub static DEVIN_QUESTIONS: QuestionTables = QuestionTables {
+    verified_from: (3000, 11, 3),
+    verified_on: (3000, 11, 3),
+    menus: &[MenuTable {
+        menu: MenuKind::Permission,
+        options: &[
+            table_option("Allow once", AllowOnce, Some("\r")),
+            keyboard_only(table_option("Allow for session", AllowAlways, None)),
+            keyboard_only(table_option("Allow for project", AllowAlways, None)),
+            keyboard_only(table_option("Allow for project (local)", AllowAlways, None)),
+            keyboard_only(table_option("Allow globally", AllowAlways, None)),
+            keyboard_only(table_option("Edit command", FreeText, None)),
+            keyboard_only(table_option("Describe change to command", FreeText, None)),
+            table_option("Deny", Deny, Some("\x1b")),
+        ],
+    }],
+};
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
 // module's signature to the spec's handler shape. Keeping them here (as the
@@ -393,6 +661,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(claude_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::hooks_manage::auto_install),
+    questions: Some(&CLAUDE_CODE_QUESTIONS),
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -414,6 +683,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     hook_uninstall: Some(opencode_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::opencode_manage::auto_install),
+    questions: Some(&OPEN_CODE_QUESTIONS),
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -432,6 +702,7 @@ pub static PI: AgentSpec = AgentSpec {
     materialize: Some(pi_materialize),
     // Pi materializes its extension at SPAWN time, not startup.
     startup_auto_install: None,
+    questions: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -465,6 +736,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // basename isn't `codex` (`devbox run codex-big`), which the spawn-command
     // seam can't detect and which therefore got NO integration before.
     startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
+    questions: Some(&CODEX_QUESTIONS),
 };
 
 /// Devin CLI — native-hooks strategy. The second agent to reuse
@@ -509,6 +781,7 @@ pub static DEVIN: AgentSpec = AgentSpec {
     hook_uninstall: Some(devin_uninstall),
     materialize: None,
     startup_auto_install: Some(crate::devin_hooks_manage::auto_install),
+    questions: Some(&DEVIN_QUESTIONS),
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -530,6 +803,7 @@ pub static NONE: AgentSpec = AgentSpec {
     hook_uninstall: None,
     materialize: None,
     startup_auto_install: None,
+    questions: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral

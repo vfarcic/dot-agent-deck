@@ -122,6 +122,11 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "PostCompact",
     "SubagentStart",
     "SubagentStop",
+    // PRD #1542: fires when a turn is interrupted — after a keyboard "No" on
+    // Codex's approval prompt [observed on 0.160.0] — so the deck can clear
+    // the question that prompt raised. Adding it changes the installed hook
+    // set, which Codex asks the user to review and trust again once.
+    "Interrupt",
 ];
 
 /// Resolve the active Codex home the way Codex itself does: `$CODEX_HOME` when
@@ -2164,6 +2169,32 @@ pub fn auto_install_and_trust_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// Scenario: Installing the deck's Codex hooks into a fresh Codex home
+    /// writes a command rule for `Interrupt` — the event Codex fires after a
+    /// keyboard "No" on its approval prompt — alongside the existing set, and
+    /// a payload naming it reads as Idle, which clears the prompt's question.
+    #[spec("codex/hooks/013")]
+    #[test]
+    fn codex_hooks_013_interrupt_is_installed() {
+        assert!(CODEX_HOOK_EVENTS.contains(&"Interrupt"));
+        let dir = tempfile::tempdir().expect("codex home tempdir");
+        install_to(dir.path(), "/abs/dot-agent-deck").expect("install hooks.json");
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("hooks.json")).expect("read hooks.json"),
+        )
+        .expect("parse hooks.json");
+        let interrupt = root["hooks"]["Interrupt"]
+            .as_array()
+            .expect("an Interrupt rule");
+        assert!(
+            interrupt.iter().any(|rule| rule["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.ends_with(HOOK_COMMAND_SUFFIX))),
+            "{interrupt:?}"
+        );
+    }
 
     /// Codex's hook commands are quoted for the HOST's shell — the half of #734
     /// that is a real behaviour change, and the half no test on a POSIX box can

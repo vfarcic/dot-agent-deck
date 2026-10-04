@@ -1,0 +1,48 @@
+{
+  "id": "que_1043ff915001MjL9vryfDO6HZX",
+  "sessionID": "ses_efbc02f39ffeP3cw5BFH7xv6VM",
+  "questions": [
+    {
+      "question": "Which colour?",
+      "header": "Colour",
+      "options": [
+        {
+          "label": "Red",
+          "description": ""
+        },
+        {
+          "label": "Green",
+          "description": ""
+        },
+        {
+          "label": "Blue",
+          "description": ""
+        }
+      ],
+      "multiple": false
+    },
+    {
+      "question": "Which sizes?",
+      "header": "Sizes",
+      "options": [
+        {
+          "label": "Small",
+          "description": ""
+        },
+        {
+          "label": "Medium",
+          "description": ""
+        },
+        {
+          "label": "Large",
+          "description": ""
+        }
+      ],
+      "multiple": true
+    }
+  ],
+  "tool": {
+    "messageID": "msg_1043fd154001O6LCIYGf7XDLWx",
+    "callID": "call_hlpKyqBYovDWSfiRwh1krMPS"
+  }
+}

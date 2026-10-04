@@ -660,6 +660,15 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::AnswerQuestion`] (PRD #1542).
+///
+/// Same convention as [`CAP_FOCUS_GAINED`]: the string is the variant's `op`,
+/// and a client sends `answer-question` only to a daemon whose `Hello` reply
+/// names it — [`crate::daemon_client::DaemonClient::answer_question_while`]
+/// holds the check. Advertised on every platform: the dispatch arm is not
+/// `#[cfg]`-gated.
+pub const CAP_ANSWER_QUESTION: &str = "answer-question";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -839,6 +848,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
+    CAP_ANSWER_QUESTION,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -850,6 +860,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_ANSWER_QUESTION,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1992,6 +2003,35 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
+    /// PRD #1542: answer the question `agent_id` is waiting on
+    /// ([`crate::state::SessionSnapshot::pending_question`]).
+    ///
+    /// The daemon refuses unless `question_id` names the question pending NOW,
+    /// validates the whole answer against it
+    /// ([`crate::question::PendingQuestion::validate`]), and answers through
+    /// the agent's own channel: the held hook, plugin or extension decision, or
+    /// the keys the agent's option table names. A refusal says why on
+    /// [`AttachResponse::answer_refusal`].
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_ANSWER_QUESTION`]** —
+    /// [`crate::daemon_client::DaemonClient::answer_question_while`] holds that
+    /// check, so no call site repeats it. An older daemon has no such variant
+    /// and answers the generic `malformed request: …` refusal, changing
+    /// nothing. Its own short-lived connection: one request, one response,
+    /// close.
+    AnswerQuestion {
+        agent_id: String,
+        question_id: String,
+        /// One per question of the form, in any order, each question exactly
+        /// once.
+        answers: Vec<crate::question::QuestionAnswer>,
+        /// The client asserts it showed the "always" confirmation naming the
+        /// option's scope. The daemon cannot verify it; it refuses an "always"
+        /// option without it, so a client that skipped the dialog has to claim
+        /// otherwise explicitly rather than by omission.
+        #[serde(default)]
+        confirmed_always: bool,
+    },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
     /// Ctrl+C dialog reaches the deck via the header-only [`KIND_SHUTDOWN`]
@@ -2597,6 +2637,12 @@ pub struct AttachResponse {
     /// [`Self::directories`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_agent_options: Option<crate::new_agent_options::NewAgentOptions>,
+    /// PRD #1542: why an [`AttachRequest::AnswerQuestion`] was refused, so a
+    /// client never branches on `error` text. `None` on success and on every
+    /// other response. Additive + optional, and the request it answers is
+    /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_refusal: Option<crate::question::AnswerRefusal>,
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -4882,6 +4928,33 @@ async fn handle_connection(
                 .await?
             }
         }
+        AttachRequest::AnswerQuestion {
+            agent_id,
+            question_id,
+            answers,
+            confirmed_always,
+        } => {
+            let resp = match answer_question(
+                &registry,
+                &state,
+                &event_tx,
+                &agent_id,
+                &question_id,
+                &answers,
+                confirmed_always,
+            )
+            .await
+            {
+                Ok(()) => AttachResponse::ok(),
+                Err(refusal) => AttachResponse {
+                    ok: false,
+                    error: Some(refusal.to_string()),
+                    answer_refusal: Some(refusal),
+                    ..Default::default()
+                },
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::WriteAndSubmit { pane_id, text } => {
             // PRD #20 M3: deliver input honestly. A dashboard-visible session is
             // not necessarily a live, writable target (a wrapped Codex session
@@ -5678,6 +5751,128 @@ fn validate_task(task: &str) -> Result<(), String> {
             "{PROJECT_ERR_TASK_REJECTED}: task must contain no NUL"
         ));
     }
+    Ok(())
+}
+
+/// The pause between two keys of a form answered by keys. Codex draws the
+/// next question after each digit; the pending question is re-checked before
+/// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
+const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
+
+/// PRD #1542: [`AttachRequest::AnswerQuestion`]'s handler.
+///
+/// Refusal order: the agent, a pending question, the id, then the answer
+/// itself ([`crate::question::PendingQuestion::validate`]), then the channel.
+/// On success the daemon ingests an event of its own — `Thinking`, carrying
+/// [`crate::event::QUESTION_RESOLVED_METADATA_KEY`] and its answered marker —
+/// so the question clears and the card moves on in this daemon and in every
+/// attached client alike.
+pub(crate) async fn answer_question(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    use crate::question::{AnswerChannel, AnswerRefusal, QuestionReply};
+    let record = registry
+        .agent_records()
+        .into_iter()
+        .find(|r| r.id == agent_id)
+        .ok_or(AnswerRefusal::AgentNotFound)?;
+    let pane_id = record.pane_id_env.clone();
+    let (session_id, agent_type, question) = {
+        let guard = state.read().await;
+        let (session_id, question) = guard
+            .pending_question_for(agent_id, pane_id.as_deref())
+            .ok_or(AnswerRefusal::NoPendingQuestion)?;
+        let agent_type = guard
+            .sessions
+            .get(&session_id)
+            .map(|s| s.agent_type.clone())
+            .unwrap_or(crate::event::AgentType::None);
+        (session_id, agent_type, question)
+    };
+    if question.id != question_id {
+        return Err(AnswerRefusal::Stale {
+            current_id: Some(question.id),
+        });
+    }
+    let resolved = question.validate(answers, confirmed_always)?;
+    match question.channel {
+        AnswerChannel::Held => {
+            if !registry.question_holds().answer(
+                &question.id,
+                QuestionReply::answered(&question.id, resolved),
+            ) {
+                if let Some(pane_id) = pane_id.as_deref() {
+                    state
+                        .write()
+                        .await
+                        .clear_pending_question(pane_id, &question.id);
+                }
+                return Err(AnswerRefusal::ChannelGone);
+            }
+        }
+        AnswerChannel::Keys => {
+            let keys = crate::question::answer_keys(&agent_type, &question, &resolved)?;
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(ANSWER_KEY_GAP).await;
+                }
+                let still_pending = || async {
+                    state
+                        .read()
+                        .await
+                        .pending_question_for(agent_id, pane_id.as_deref())
+                        .is_some_and(|(_, q)| q.id == question.id)
+                };
+                registry
+                    .write_answer_keys(agent_id, key.as_bytes(), still_pending)
+                    .await
+                    .map_err(|detail| AnswerRefusal::WriteFailed {
+                        detail: detail.to_string(),
+                    })?;
+            }
+        }
+        AnswerChannel::Unsupported | AnswerChannel::Unknown => {
+            return Err(AnswerRefusal::Unsupported);
+        }
+    }
+    info!(
+        agent_id = %agent_id,
+        question_id = %question.id,
+        channel = ?question.channel,
+        "question answered by the deck"
+    );
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        crate::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+        question.id.clone(),
+    );
+    metadata.insert(
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY.to_string(),
+        crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_VALUE.to_string(),
+    );
+    let event = crate::event::AgentEvent {
+        session_id,
+        agent_type,
+        event_type: crate::event::EventType::Thinking,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id,
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+    };
+    crate::daemon::ingest_event(state, event_tx, registry, event).await;
     Ok(())
 }
 
@@ -8164,6 +8359,7 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pending_question: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -8202,6 +8398,7 @@ mod tests {
                 last_activity_ms: None,
                 blocked: None,
                 hook_generation: None,
+                pending_question: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -8279,6 +8476,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            pending_question: None,
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -9713,5 +9911,381 @@ mod tests {
         );
         let neither: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(neither.into_prepared_orchestration(), None);
+    }
+}
+
+/// PRD #1542: [`answer_question`] against a real registry and state — every
+/// refusal, the held channel and the keys channel.
+#[cfg(all(test, unix))]
+mod question_answer_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::question::{
+        AnswerChannel, AnswerRefusal, OptionRole, PendingQuestion, QuestionAnswer, ReplyOutcome,
+    };
+    use crate::state::SessionStatus;
+    use spec::spec;
+
+    const PANE: &str = "pane-question-answer";
+    const SESSION: &str = "question-answer-session";
+
+    struct Fixture {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        agent_id: String,
+    }
+
+    impl Fixture {
+        /// A `cat` in a PTY standing in for `agent_type`, with a session the
+        /// state attributes to it.
+        async fn start(agent_type: AgentType) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn the stand-in agent");
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            state.write().await.register_pane(PANE.to_string());
+            let (event_tx, _rx) = broadcast::channel(64);
+            let fx = Self {
+                registry,
+                state,
+                event_tx,
+                agent_id,
+            };
+            let mut start = fx.event(EventType::SessionStart);
+            start.agent_type = agent_type;
+            fx.state.write().await.apply_event(start);
+            fx
+        }
+
+        fn event(&self, event_type: EventType) -> AgentEvent {
+            AgentEvent {
+                session_id: SESSION.to_string(),
+                agent_type: AgentType::None,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(PANE.to_string()),
+                agent_id: Some(self.agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        async fn ask(&self, question: &PendingQuestion) {
+            let mut event = self.event(EventType::PermissionRequest);
+            event.set_question(question);
+            self.state.write().await.apply_event(event);
+        }
+
+        async fn answer(
+            &self,
+            question_id: &str,
+            answers: &[(u32, &[u32], Option<&str>)],
+            confirmed_always: bool,
+        ) -> Result<(), AnswerRefusal> {
+            self.answer_as(
+                &self.agent_id.clone(),
+                question_id,
+                answers,
+                confirmed_always,
+            )
+            .await
+        }
+
+        async fn answer_as(
+            &self,
+            agent_id: &str,
+            question_id: &str,
+            answers: &[(u32, &[u32], Option<&str>)],
+            confirmed_always: bool,
+        ) -> Result<(), AnswerRefusal> {
+            let answers: Vec<QuestionAnswer> = answers
+                .iter()
+                .map(|(qi, oi, text)| QuestionAnswer {
+                    question_index: *qi,
+                    option_indices: oi.to_vec(),
+                    text: text.map(str::to_string),
+                })
+                .collect();
+            answer_question(
+                &self.registry,
+                &self.state,
+                &self.event_tx,
+                agent_id,
+                question_id,
+                &answers,
+                confirmed_always,
+            )
+            .await
+        }
+
+        async fn pending(&self) -> Option<String> {
+            self.state
+                .read()
+                .await
+                .pending_question_for(&self.agent_id, Some(PANE))
+                .map(|(_, q)| q.id)
+        }
+
+        async fn status(&self) -> SessionStatus {
+            self.state.read().await.sessions[SESSION].status.clone()
+        }
+
+        /// What the stand-in agent's terminal shows: `cat` in a PTY echoes
+        /// every key typed into it.
+        async fn screen_shows(&self, needle: &str) -> bool {
+            self.screen_shows_within(needle, Duration::from_secs(5))
+                .await
+        }
+
+        async fn screen_shows_within(&self, needle: &str, budget: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + budget;
+            loop {
+                if let Ok(bytes) = self.registry.snapshot(&self.agent_id)
+                    && String::from_utf8_lossy(&bytes).contains(needle)
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+        }
+    }
+
+    fn claude_bash() -> PendingQuestion {
+        crate::question::claude_permission_request(
+            "q-bash".into(),
+            "Bash",
+            None,
+            Some("touch x".into()),
+            Some(&serde_json::json!([{"type": "setMode", "mode": "acceptEdits"}])),
+            1,
+            None,
+        )
+        .question
+    }
+
+    /// Scenario: Each way an answer can be refused is refused with its own
+    /// reason and changes nothing it should not: an agent the daemon does not
+    /// run, an agent with no question, a stale question id, an answer that does
+    /// not fit the question, a keyboard-only option, an unconfirmed
+    /// always-allow, a question the deck cannot answer, and a held question
+    /// whose producer is no longer holding — which also drops the question.
+    #[spec("question/answer/001")]
+    #[tokio::test]
+    async fn question_answer_001_every_refusal() {
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        assert_eq!(
+            fx.answer_as("no-such-agent", "q-bash", &[(0, &[1], None)], false)
+                .await,
+            Err(AnswerRefusal::AgentNotFound)
+        );
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::NoPendingQuestion)
+        );
+        fx.ask(&claude_bash()).await;
+        assert_eq!(
+            fx.answer("q-older", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
+        );
+        for wrong in [
+            &[(0, &[9][..], None)][..],
+            &[(1, &[1][..], None)][..],
+            &[][..],
+            &[(0, &[1, 3][..], None)][..],
+            &[(0, &[1][..], Some("text"))][..],
+        ] {
+            assert!(
+                matches!(
+                    fx.answer("q-bash", wrong, false).await,
+                    Err(AnswerRefusal::InvalidAnswer { .. })
+                ),
+                "{wrong:?}"
+            );
+        }
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[2], None)], false).await,
+            Err(AnswerRefusal::AlwaysNotConfirmed)
+        );
+        assert_eq!(
+            fx.pending().await.as_deref(),
+            Some("q-bash"),
+            "refusals change nothing"
+        );
+        assert_eq!(
+            fx.answer("q-bash", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::ChannelGone),
+            "nothing holds the question"
+        );
+        assert_eq!(
+            fx.pending().await,
+            None,
+            "a question nobody holds is dropped"
+        );
+
+        let mut keyboard_only = claude_bash();
+        keyboard_only.id = "q-ko".into();
+        keyboard_only.questions[0].options[0].keyboard_only = true;
+        fx.ask(&keyboard_only).await;
+        assert_eq!(
+            fx.answer("q-ko", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::KeyboardOnly)
+        );
+
+        let mut unsupported = claude_bash();
+        unsupported.id = "q-un".into();
+        unsupported.channel = AnswerChannel::Unsupported;
+        fx.ask(&unsupported).await;
+        assert_eq!(
+            fx.answer("q-un", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::Unsupported)
+        );
+    }
+
+    /// Scenario: A held question answered with valid indices reaches the
+    /// producer holding it as an `answered` reply naming the deck's labels and
+    /// roles; the question clears and the card moves on to Thinking, in the
+    /// daemon and in what it broadcasts.
+    #[spec("question/answer/002")]
+    #[tokio::test]
+    async fn question_answer_002_a_held_answer_reaches_its_holder() {
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut events = fx.event_tx.subscribe();
+        fx.ask(&claude_bash()).await;
+        assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
+        let held = fx.registry.question_holds().hold(PANE, "q-bash");
+        fx.answer("q-bash", &[(0, &[2], None)], true)
+            .await
+            .expect("answered");
+        let reply = held.await.expect("the holder hears the answer");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+        assert_eq!(reply.question_id, "q-bash");
+        assert_eq!(reply.answers[0].option_indices, vec![2]);
+        assert_eq!(reply.answers[0].roles, vec![OptionRole::AllowAlways]);
+        assert_eq!(
+            reply.answers[0].labels,
+            vec!["Yes, and switch to accept edits for this session"]
+        );
+        assert_eq!(fx.pending().await, None);
+        assert_eq!(fx.status().await, SessionStatus::Thinking);
+        let Ok(BroadcastMsg::Event(broadcast)) = events.recv().await else {
+            panic!("the deck's answered event is broadcast");
+        };
+        assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
+        assert!(broadcast.is_daemon_synthetic());
+    }
+
+    /// Scenario: A Codex command approval answered by voice types the table's
+    /// key — `p` for "don't ask again" — into the agent's terminal with no
+    /// Enter. A two-question Codex form types one digit per question in
+    /// question order. When the question changes between two keys, the second
+    /// is never typed and the answer fails.
+    #[spec("question/answer/003")]
+    #[tokio::test]
+    async fn question_answer_003_keys_are_typed_in_order_and_revalidated() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        let approval = crate::question::codex_permission_request(
+            "q-approve".into(),
+            "Bash",
+            Some("touch x".into()),
+            1,
+            None,
+        );
+        fx.ask(&approval).await;
+        fx.answer("q-approve", &[(0, &[2], None)], true)
+            .await
+            .expect("answered by keys");
+        assert!(fx.screen_shows("p").await, "the key reached the agent");
+        assert_eq!(fx.pending().await, None);
+
+        let form_input = serde_json::json!({"questions": [
+            {"id": "colour", "question": "Which colour?", "options": [{"label": "Red"}, {"label": "Green"}]},
+            {"id": "size", "question": "Which size?", "options": [{"label": "Small"}, {"label": "Large"}, {"label": "Huge"}]}
+        ]});
+        let form = crate::question::codex_request_user_input(
+            Some("call_form1"),
+            Some(&form_input),
+            1,
+            None,
+        )
+        .unwrap();
+        fx.ask(&form).await;
+        fx.answer("call_form1", &[(1, &[3], None), (0, &[2], None)], false)
+            .await
+            .expect("answered by keys");
+        assert!(
+            fx.screen_shows("p23").await,
+            "one digit per question, in order"
+        );
+
+        let mut second = form.clone();
+        second.id = "call_form2".into();
+        fx.ask(&second).await;
+        let answering = {
+            let registry = fx.registry.clone();
+            let state = fx.state.clone();
+            let event_tx = fx.event_tx.clone();
+            let agent_id = fx.agent_id.clone();
+            tokio::spawn(async move {
+                answer_question(
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &agent_id,
+                    "call_form2",
+                    &[
+                        QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![1],
+                            text: None,
+                        },
+                        QuestionAnswer {
+                            question_index: 1,
+                            option_indices: vec![1],
+                            text: None,
+                        },
+                    ],
+                    false,
+                )
+                .await
+            })
+        };
+        assert!(fx.screen_shows("p231").await, "the first key went in");
+        fx.state
+            .write()
+            .await
+            .clear_pending_question(PANE, "call_form2");
+        assert!(matches!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::WriteFailed { .. })
+        ));
+        assert!(
+            !fx.screen_shows_within("p2311", ANSWER_KEY_GAP * 2).await,
+            "the second key must not reach a question that changed"
+        );
     }
 }

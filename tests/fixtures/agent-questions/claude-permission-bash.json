@@ -1,0 +1,25 @@
+{
+  "session_id": "60a980a9-04b6-417a-aed4-ae5a31b5fa9b",
+  "prompt_id": "ca67f0db-58cf-49ca-80f5-635992626f0e",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "touch created_m1.txt",
+    "description": "Create created_m1.txt"
+  },
+  "permission_suggestions": [
+    {
+      "type": "addDirectories",
+      "directories": [
+        "/work/proj"
+      ],
+      "destination": "session"
+    },
+    {
+      "type": "setMode",
+      "mode": "acceptEdits",
+      "destination": "session"
+    }
+  ]
+}
