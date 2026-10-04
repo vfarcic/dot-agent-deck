@@ -17,6 +17,10 @@ fn claude() -> TuiDeck {
     TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            QUESTION_DAEMON_MAX_LIFETIME_SECS,
+        )
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .with_continue_session("question-haiku", "claude --model claude-haiku-4-5-20251001 --permission-mode default --tools Bash,AskUserQuestion")
@@ -178,6 +182,10 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            QUESTION_DAEMON_MAX_LIFETIME_SECS,
+        )
         .with_imported_codex_credentials()
         .with_continue_session("question-codex", command)
         .launch_with_fixture("minimal");
@@ -286,6 +294,10 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            QUESTION_DAEMON_MAX_LIFETIME_SECS,
+        )
         .with_env("OPENCODE_CONFIG", settings.to_string_lossy())
         .with_imported_opencode_credentials()
         .with_continue_session("question-opencode", command)

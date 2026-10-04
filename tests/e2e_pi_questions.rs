@@ -44,6 +44,10 @@ fn question_live_006_pi_extension_select_without_model() {
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
         .with_env("PATH", path())
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            QUESTION_DAEMON_MAX_LIFETIME_SECS,
+        )
         .with_env("QUESTION_RESULT_FILE", result.to_string_lossy())
         .without_agent_credentials()
         .with_continue_session("question-pi", command)

@@ -129,6 +129,49 @@ describe("question/detect/008 — Pi ctx.ui wrapper", () => {
 		assert.equal(await pending, "A");
 	});
 
+	test("a caller's cancel stops the deck's wait even when the dialog ignores its signal", async () => {
+		const calls: { signal?: AbortSignal }[] = [];
+		// Never settles: a dialog that does not honour its signal.
+		const stuck = (_title: unknown, _message: unknown, opts?: { signal?: AbortSignal }) => {
+			calls.push({ signal: opts?.signal });
+			return new Promise(() => {});
+		};
+		const ui: Record<string, unknown> = { confirm: stuck };
+		const deck = fakeDeck();
+		installQuestionWrappers(ui, deck.deps);
+		const caller = new AbortController();
+		const pending = (ui.confirm as (t: string, m: string, o: { signal: AbortSignal }) => Promise<unknown>)(
+			"Allow rm?",
+			"Run rm -rf build?",
+			{ signal: caller.signal },
+		);
+		await tick();
+		assert.equal(deck.runs.length, 1, "await-answer is started");
+		caller.abort();
+		assert.equal(await pending, false, "settled as a dismissed confirm");
+		assert.equal(calls[0].signal?.aborted, true, "the dialog was told to dismiss");
+		assert.equal(deck.runs[0].signal.aborted, true, "the deck's wait was stopped");
+		deck.runs[0].reply('{"value":true}');
+		await tick();
+		assert.equal(await pending, false, "a later deck answer does not win");
+	});
+
+	test("an already-cancelled caller starts neither the dialog nor the deck's wait", async () => {
+		const select = fakeDialog();
+		const ui: Record<string, unknown> = { select: select.method };
+		const deck = fakeDeck();
+		installQuestionWrappers(ui, deck.deps);
+		const pending = (ui.select as (t: string, o: string[], x: { signal: AbortSignal }) => Promise<unknown>)(
+			"Pick",
+			["A", "B"],
+			{ signal: AbortSignal.abort() },
+		);
+		assert.equal(await pending, undefined, "settled as a dismissed select");
+		await tick();
+		assert.equal(select.calls.length, 0, "the dialog is not shown");
+		assert.equal(deck.runs.length, 0, "await-answer is not started");
+	});
+
 	test("wrapping twice leaves one wrapper", () => {
 		const select = fakeDialog();
 		const ui: Record<string, unknown> = { select: select.method };

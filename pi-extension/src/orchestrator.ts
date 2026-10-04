@@ -554,7 +554,11 @@ const WRAPPED = "__dotAgentDeckQuestionWrapper";
  * wins: a deck answer aborts the dialog through the signal Pi documents for
  * dismissing it programmatically, and a keyboard answer aborts the
  * `await-answer` child, whose closed connection tells the deck the question is
- * gone. A caller's own signal still dismisses the dialog.
+ * gone. A caller's own signal cancels both at once and settles the race as Pi
+ * settles a dismissed dialog — `false` for `confirm`, `undefined` otherwise —
+ * so no later deck answer can win it, whether or not the original dialog
+ * settles on its signal. A signal already aborted settles it before either is
+ * started, as Pi resolves such a dialog without showing it.
  */
 function raceDialog(
 	open: (signal: AbortSignal) => Promise<unknown>,
@@ -564,37 +568,48 @@ function raceDialog(
 ): Promise<unknown> {
 	const dialogAbort = new AbortController();
 	const execAbort = new AbortController();
-	if (callerSignal) {
-		if (callerSignal.aborted) {
-			dialogAbort.abort();
-		} else {
-			callerSignal.addEventListener("abort", () => dialogAbort.abort(), { once: true });
-		}
-	}
 	return new Promise((resolve, reject) => {
 		let settled = false;
+		const settle = (finish: () => void) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			callerSignal?.removeEventListener("abort", cancel);
+			finish();
+		};
+		const cancel = () =>
+			settle(() => {
+				dialogAbort.abort();
+				execAbort.abort();
+				resolve(dialog.kind === "confirm" ? false : undefined);
+			});
+		if (callerSignal?.aborted) {
+			cancel();
+			return;
+		}
+		callerSignal?.addEventListener("abort", cancel, { once: true });
 		let keyboard: Promise<unknown>;
 		try {
 			keyboard = open(dialogAbort.signal);
 		} catch (err) {
-			reject(err);
+			settle(() => {
+				execAbort.abort();
+				reject(err);
+			});
 			return;
 		}
 		keyboard.then(
-			(value) => {
-				if (!settled) {
-					settled = true;
+			(value) =>
+				settle(() => {
 					execAbort.abort();
 					resolve(value);
-				}
-			},
-			(err) => {
-				if (!settled) {
-					settled = true;
+				}),
+			(err) =>
+				settle(() => {
 					execAbort.abort();
 					reject(err);
-				}
-			},
+				}),
 		);
 		let deck: Promise<{ code: number; stdout: string }>;
 		try {
@@ -611,9 +626,10 @@ function raceDialog(
 				if (!answer) {
 					return;
 				}
-				settled = true;
-				dialogAbort.abort();
-				resolve(answer.value);
+				settle(() => {
+					dialogAbort.abort();
+					resolve(answer.value);
+				});
 			},
 			() => {
 				// No deck, or the child was stopped: the keyboard answers.

@@ -575,6 +575,10 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # PRD #1542: real question tests have bounded agent startup, prompt submission,
 # permission paint, answer delivery and completion waits; /004 and /005 run
 # two sequential turns. Preserve their assertion diagnostics on a loaded host.
+# Their daemon's self-exit cap, `QUESTION_DAEMON_MAX_LIFETIME_SECS` in
+# `tests/common/questions.rs` (780 s), sits above this 720 s window and the
+# 360 s one below, so the daemon cannot leave before the test is killed; raise
+# either window past it and the cap has to move too.
 [[profile.default.overrides]]
 filter = 'test(/^question_live_00[1-5]_/)'
 slow-timeout = { period = "60s", terminate-after = 12 }

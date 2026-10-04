@@ -9,6 +9,20 @@ use std::time::Duration;
 
 pub const TURN: Duration = Duration::from_secs(120);
 
+/// The daemon's self-exit cap for every question PTY test, pinned over the
+/// harness's 300 s because the waits these tests chain are not bounded by it:
+/// `question/live/004` and `/005` each run two real turns, and every step
+/// waits up to [`TURN`]. What actually bounds a run is nextest's kill window —
+/// 720 s for `question_live_001`–`005` and 360 s for `question_live_006`
+/// (`.config/nextest.toml`) — so the cap sits above the longer of the two:
+/// the daemon is younger than the test, and cannot exit before nextest has
+/// killed the test, so a slow run fails on its own assertion rather than on a
+/// daemon that left mid-wait. 780 s also leaves the kill's grace period and
+/// stays under `MAX_PINNED_ORPHAN_CAP_SECS` (900 s, linkage-check rule 11), so
+/// a leaked daemon is still reaped. Raise the nextest budget past 780 s and
+/// this has to move with it.
+pub const QUESTION_DAEMON_MAX_LIFETIME_SECS: &str = "780";
+
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

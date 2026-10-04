@@ -10630,15 +10630,27 @@ impl AppState {
             })
     }
 
-    /// PRD #1542: the id of the question pending on any session of `pane_id`,
-    /// newest first — what the daemon's held channels for that pane are
-    /// reconciled against.
-    pub fn pending_question_id_on_pane(&self, pane_id: &str) -> Option<String> {
+    /// PRD #1542 (Qodo #1561): the session `pane_id` is in now — its newest
+    /// card, ties broken on the (unique) `session_id` as
+    /// [`Self::live_session_for`] breaks them. The pane's pending question is
+    /// this session's or none: a predecessor's question does not outlive the
+    /// session that superseded it, even while its card is still in the map.
+    fn pane_current_session(&self, pane_id: &str) -> Option<&SessionState> {
         self.sessions
             .values()
-            .filter(|s| s.pane_id.as_deref() == Some(pane_id) && s.pending_question.is_some())
-            .max_by_key(|s| s.last_activity)
-            .and_then(|s| s.pending_question.as_ref().map(|q| q.id.clone()))
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+    }
+
+    /// PRD #1542: the id of the question pending on `pane_id`'s current
+    /// session ([`Self::pane_current_session`]) — what the daemon's held
+    /// channels for that pane are reconciled against.
+    pub fn pending_question_id_on_pane(&self, pane_id: &str) -> Option<String> {
+        self.pending_question_on_pane(pane_id).map(|q| q.id)
     }
 
     /// PRD #1542 (audit A4): the question pending on `pane_id` — the one
@@ -10647,10 +10659,7 @@ impl AppState {
         &self,
         pane_id: &str,
     ) -> Option<crate::question::PendingQuestion> {
-        self.sessions
-            .values()
-            .filter(|s| s.pane_id.as_deref() == Some(pane_id) && s.pending_question.is_some())
-            .max_by_key(|s| s.last_activity)
+        self.pane_current_session(pane_id)
             .and_then(|s| s.pending_question.clone())
     }
 

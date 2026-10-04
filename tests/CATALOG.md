@@ -7335,6 +7335,13 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a late event from the current session with an older timestamp, which is applied as before.
 - **Platform coverage:** mac+linux.
 
+##### question/hold/018 — A session switch releases the predecessor's hold.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop and the daemon's own ingest).
+- **Agent:** none (`/bin/sh` stand-in agent; the successor is the placeholder card a respawn mints).
+- **Asserts:** with a held question on the pane's old session and a newer session without one beside it, the next event on the pane — a late frame from the old session — releases the old producer, and the old question is neither the pane's pending question nor answerable.
+- **Does not assert:** how the successor card came to sit beside the old one without retiring it.
+- **Platform coverage:** mac+linux.
+
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.

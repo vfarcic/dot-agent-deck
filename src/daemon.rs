@@ -11288,4 +11288,57 @@ mod question_hold_tests {
             "an unconfirmed answer may have been taken, so it is not offered again"
         );
     }
+
+    /// Scenario: A producer holds a question on a pane, and the pane then moves
+    /// to a new session that has no question — the card a respawned agent gets.
+    /// The next event on the pane, here a late frame from the session it left,
+    /// lets the old question's producer go, and the old question is no longer
+    /// the pane's pending one.
+    #[spec("question/hold/018")]
+    #[tokio::test]
+    async fn question_hold_018_a_session_switch_releases_the_predecessors_hold() {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-switch").await;
+        let producer = deck.hold(&a, "q-old").await;
+        deck.until_held(&a, "q-old").await;
+        let asked_at = {
+            let state = deck.state.read().await;
+            state.sessions[&format!("{}-session", a.pane)].last_activity
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // The session switch: the pane's new session, newer and without a
+        // question, beside the old one's card.
+        deck.state.write().await.insert_placeholder_session(
+            a.pane.clone(),
+            None,
+            Some(AgentType::ClaudeCode),
+            Some("successor-agent".into()),
+        );
+
+        let mut late = deck.question_on(&a, "q-old", "touch x");
+        late.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        late.event_type = EventType::ToolStart;
+        late.timestamp = asked_at - chrono::Duration::seconds(1);
+        ingest_event(&deck.state, &deck.event_tx, &deck.registry, late).await;
+
+        let reply = reply_on(producer)
+            .await
+            .expect("the old question's producer is let go");
+        assert_eq!(reply.outcome, ReplyOutcome::Released);
+        assert!(!deck.registry.question_holds().is_held(&a.pane, "q-old"));
+        assert_eq!(
+            deck.pending(&a).await,
+            None,
+            "the old question is not pending"
+        );
+        assert_eq!(
+            deck.state.read().await.pending_question_id_on_pane(&a.pane),
+            None
+        );
+        assert_eq!(
+            deck.answer(&a, "q-old").await,
+            Err(crate::question::AnswerRefusal::ChannelGone),
+            "the old question is not answered"
+        );
+    }
 }
