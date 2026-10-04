@@ -12650,6 +12650,22 @@ pub async fn handle_restart_role_with_state(
             _ => None,
         };
         let Some((role_index, role_config)) = role_config_indexed else {
+            // Issue #1396 item 2 (agent review, PR #1557): a directory that has
+            // been deleted has no config to read either, and "could not resolve
+            // the role" sends the user to the wrong file. Name the cause, in the
+            // words the respawn's own check would have used.
+            if let Some(c) = cwd.as_deref()
+                && !std::path::Path::new(c).is_dir()
+            {
+                return RestartRoleResponse {
+                    error: Some(format!(
+                        "failed to restart role `{}`: {}. Nothing was restarted.",
+                        signal.role,
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(c.to_string())
+                    )),
+                    ..Default::default()
+                };
+            }
             return RestartRoleResponse {
                 error: Some(format!(
                     "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \

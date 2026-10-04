@@ -5238,5 +5238,53 @@ async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
         "control: the agent must have run in the requested directory"
     );
     assert!(!home.join("marker").exists());
+
+    // A pane a prepared start created, re-created by a plain `start-agent`
+    // after its project directory was deleted (agent review, PR #1557): the same
+    // not-a-directory refusal, not the stale-preparation one. "Prepare again" is
+    // the remedy for a directory that was REPLACED; for one that is gone it
+    // would only send the user round the loop.
+    const PANE: &str = "prepared-deleted-1396";
+    let prepared = sandbox.path().join("prepared");
+    std::fs::create_dir(&prepared).unwrap();
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&prepared).unwrap();
+    let prepared_id = server
+        .registry
+        .spawn_agent_in(
+            dot_agent_deck::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(prepared.to_str().unwrap()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+                ..Default::default()
+            },
+            &verified,
+        )
+        .unwrap();
+    drop(verified);
+    server.registry.close_agent(&prepared_id).unwrap();
+    std::fs::remove_dir(&prepared).unwrap();
+
+    let mut request = start(&prepared);
+    if let AttachRequest::StartAgent { env, .. } = &mut request {
+        env.push(("DOT_AGENT_DECK_PANE_ID".into(), PANE.into()));
+    }
+    let spawned_before = server.registry.agent_records().len();
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &request).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        !resp.ok && resp.id.is_none(),
+        "a prepared pane whose directory was deleted must be refused; response = {resp:?}"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(&format!(
+            "{}:",
+            dot_agent_deck::daemon_protocol::START_ERR_CWD_NOT_A_DIRECTORY
+        )),
+        "a deleted prepared directory gets the not-a-directory refusal, not a stale-preparation \
+         one: {error:?}"
+    );
+    assert_eq!(server.registry.agent_records().len(), spawned_before);
     server.registry.shutdown_all();
 }

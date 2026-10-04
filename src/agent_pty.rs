@@ -9718,11 +9718,16 @@ impl AgentPtyRegistry {
     /// only if it is still the object that start verified. `Ok(None)` for a pane
     /// no prepared start created, which keeps its pathname spawn.
     ///
-    /// Refused with [`AgentPtyError::PreparedDirChanged`] when `cwd` is missing,
-    /// is no longer a directory (or is a symlink — the open does not follow a
-    /// final one), or names a different directory. The child is then started
-    /// through the descriptor this returns, so a replacement after this check
-    /// is not entered either on Linux ([`spawn_in`]).
+    /// Refused with [`AgentPtyError::CwdNotADirectory`] when `cwd` is not a
+    /// directory at all — deleted, or a file put at its path — which is the
+    /// refusal a plain pane gets for the same thing, through the same `is_dir()`
+    /// test: "prepare again" is no remedy for a project that is gone (agent
+    /// review, PR #1557). Refused with [`AgentPtyError::PreparedDirChanged`] when
+    /// `cwd` is still a directory but not the one the start verified: a symlink
+    /// (the open does not follow a final one), or a different directory. The
+    /// child is then started through the descriptor this returns, so a
+    /// replacement after this check is not entered either on Linux
+    /// ([`spawn_in`]).
     #[cfg(unix)]
     fn reverify_prepared_pane(
         &self,
@@ -9744,10 +9749,14 @@ impl AgentPtyRegistry {
                 "a prepared pane was respawned with no working directory",
             ));
         };
+        if !std::path::Path::new(cwd).is_dir() {
+            return Err(AgentPtyError::CwdNotADirectory(cwd.to_string()));
+        }
         let dir = crate::project_resolve::VerifiedProjectDir::open(std::path::Path::new(cwd))
             .map_err(|_| {
                 AgentPtyError::PreparedDirChanged(
-                    "the prepared working directory is no longer a directory",
+                    "the prepared working directory could not be opened as the directory the \
+                     prepared start verified",
                 )
             })?;
         if dir.identity() != expected {
@@ -12024,10 +12033,13 @@ impl AgentPtyRegistry {
         //   carried through the teardown below and is what the replacement
         //   enters, so a swap of the pathname while the old child is being
         //   terminated cannot land it elsewhere, nor refuse it after the old
-        //   agent is gone (Greptile / Qodo, PR #1557). What can still refuse
-        //   late is the pathname stopping being a directory at all in that
-        //   window — `spawn_in`'s own check — and on non-Linux Unix any swap,
-        //   which is #1396 item 1's residual.
+        //   agent is gone (Greptile / Qodo, PR #1557). A pathname that is no
+        //   longer a directory at all is refused here as `CwdNotADirectory`,
+        //   the refusal any other pane gets (agent review, PR #1557). What can
+        //   still refuse late is the pathname stopping being a directory in that
+        //   window — `spawn_in`'s own check, which reports it as
+        //   `PreparedDirChanged` — and on non-Linux Unix any swap, which is
+        //   #1396 item 1's residual.
         // * Any other pane is refused when its recorded cwd is no longer a
         //   directory, the check `spawn` would otherwise make only after the old
         //   agent was gone.
@@ -19112,47 +19124,88 @@ mod spawn_tests {
     /// delegate reports the refusal and leaves the running agent in place rather
     /// than an empty pane. Control: with the directory back, the same respawn is
     /// served.
+    ///
+    /// The same holds for a pane a prepared start created (agent review, PR
+    /// #1557): a deleted directory is the not-a-directory refusal there too, not
+    /// the stale-preparation one, which is kept for a directory that is still
+    /// there but is no longer the one the start verified. "Prepare again" would
+    /// not help a user whose project directory is gone.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_respawn_into_a_deleted_cwd_is_refused_and_keeps_the_running_agent() {
-        const PANE: &str = "deleted-cwd-respawn-1396";
-        let root = tempfile::tempdir().expect("create tempdir");
-        let dir = root.path().join("d");
-        std::fs::create_dir(&dir).expect("create the pane's dir");
-        let path = dir.to_str().expect("utf-8 tempdir").to_string();
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
-            .spawn_agent(SpawnOptions {
+        for prepared in [false, true] {
+            let what = if prepared { "prepared" } else { "plain" };
+            let pane = format!("deleted-cwd-respawn-1396-{what}");
+            let root = tempfile::tempdir().expect("create tempdir");
+            let dir = root.path().join("d");
+            std::fs::create_dir(&dir).expect("create the pane's dir");
+            let path = dir.to_str().expect("utf-8 tempdir").to_string();
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let opts = SpawnOptions {
                 command: Some("cat"),
                 cwd: Some(&path),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.clone())],
                 ..SpawnOptions::default()
-            })
+            };
+            let id = if prepared {
+                let verified = crate::project_resolve::VerifiedProjectDir::open(&dir)
+                    .expect("open the project dir");
+                registry.spawn_agent_in(opts, &verified)
+            } else {
+                registry.spawn_agent(opts)
+            }
             .expect("spawn the pane's agent");
 
-        std::fs::remove_dir(&dir).expect("delete the pane's dir");
-        match registry.respawn_agent_for_pane(PANE, "cat").await {
-            Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path),
-            other => panic!("expected CwdNotADirectory, got {other:?}"),
-        }
-        assert_eq!(
-            registry.pane_current_agent_id(PANE).as_deref(),
-            Some(id.as_str()),
-            "the refused respawn must leave the pane's record in place"
-        );
-        assert!(
-            registry.agent_is_live(&id),
-            "and its child running: a respawn that terminated it and then refused would leave \
-             the pane empty"
-        );
+            std::fs::remove_dir(&dir).expect("delete the pane's dir");
+            match registry.respawn_agent_for_pane(&pane, "cat").await {
+                Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path, "{what}"),
+                other => panic!("{what}: expected CwdNotADirectory, got {other:?}"),
+            }
+            assert_eq!(
+                registry.pane_current_agent_id(&pane).as_deref(),
+                Some(id.as_str()),
+                "{what}: the refused respawn must leave the pane's record in place"
+            );
+            assert!(
+                registry.agent_is_live(&id),
+                "{what}: and its child running: a respawn that terminated it and then refused \
+                 would leave the pane empty"
+            );
 
-        std::fs::create_dir(&dir).expect("restore the pane's dir");
-        let replacement = registry
-            .respawn_agent_for_pane(PANE, "cat")
-            .await
-            .expect("control: a directory cwd is respawned");
-        assert_ne!(replacement, id);
-        registry.shutdown_all();
+            // The re-create leg (no record left to replay) answers the same.
+            if prepared {
+                registry.close_agent(&id).expect("close the prepared pane");
+                let identity = PaneRecreateIdentity {
+                    cwd: Some(path.clone()),
+                    ..PaneRecreateIdentity::default()
+                };
+                match registry
+                    .respawn_or_recreate_agent_for_pane(&pane, "cat", &identity)
+                    .await
+                {
+                    Err(AgentPtyError::CwdNotADirectory(cwd)) => assert_eq!(cwd, path),
+                    other => panic!(
+                        "re-creating a prepared pane whose directory was deleted: expected \
+                         CwdNotADirectory, got {:?}",
+                        other.map(|r| r.agent_id)
+                    ),
+                }
+                assert!(
+                    registry.is_empty(),
+                    "a refused re-create must register nothing"
+                );
+            }
+
+            std::fs::create_dir(&dir).expect("restore the pane's dir");
+            if !prepared {
+                let replacement = registry
+                    .respawn_agent_for_pane(&pane, "cat")
+                    .await
+                    .expect("control: a directory cwd is respawned");
+                assert_ne!(replacement, id);
+            }
+            registry.shutdown_all();
+        }
     }
 
     /// Issue #1396 item 3: a pane a prepared start created keeps its verified

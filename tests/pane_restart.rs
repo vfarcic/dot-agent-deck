@@ -1360,13 +1360,12 @@ async fn prepared_fixture(
     (daemon, root, project, worker_agent_id)
 }
 
-/// Scenario: a worker role is started as a prepared launch, in the project
-/// directory the daemon verified. The project directory is then renamed away
-/// and a different directory, with a config of its own, is put at the same
-/// path. `pane restart --force` of that role must be refused and leave the
-/// running worker alone, rather than starting the role's command in the
-/// replacement tree; once the verified directory is back at its path, the same
-/// restart succeeds and runs there (issue #1396 item 3).
+/// Scenario: a worker role is started as a prepared launch in a verified
+/// project directory, which is then moved away, and `pane restart --force` of
+/// that role is refused as "not a directory" with the worker left running. A
+/// different directory with its own config is then put at the same path, and
+/// the restart is refused again rather than run there; once the verified
+/// directory is back, the same restart succeeds and runs in it (issue #1396).
 #[tokio::test(flavor = "multi_thread")]
 #[spec("pane/restart/016")]
 async fn pane_restart_016_a_prepared_role_is_not_restarted_in_a_replaced_directory() {
@@ -1379,11 +1378,32 @@ async fn pane_restart_016_a_prepared_role_is_not_restarted_in_a_replaced_directo
         worker_agent_id,
     };
 
-    // Rename-and-replace: the verified object moves to `<project>.old`, and a
-    // directory with its own config (the same role, so the restart resolves a
-    // command) takes the pathname.
+    // Deleted: the verified directory is moved away and nothing takes its
+    // path. The restart is refused as a directory that is not there, not as a
+    // stale preparation — "prepare again" is no remedy for a project that is
+    // gone (agent review, PR #1557) — and the running worker is left alone.
     let moved = project.with_extension("old");
     std::fs::rename(&project, &moved).expect("move the verified directory away");
+    let response = restart_role(&fx, ORCH_PANE, WORKER_ROLE, true).await;
+    let error = response.error.clone().unwrap_or_default();
+    assert!(
+        !response.restarted && error.contains("is not a directory"),
+        "a restart whose verified directory was deleted must be refused as not a directory; \
+         response = {response:?}"
+    );
+    assert!(
+        !error.contains("Prepared project directory changed"),
+        "a deleted directory is not a stale preparation; response = {response:?}"
+    );
+    assert_eq!(
+        fx.daemon.registry.pane_current_agent_id(WORKER_PANE),
+        Some(fx.worker_agent_id.clone()),
+        "a refused restart must leave the running worker in place"
+    );
+
+    // Rename-and-replace: the verified object sits at `<project>.old`, and a
+    // directory with its own config (the same role, so the restart resolves a
+    // command) takes the pathname.
     std::fs::create_dir(&project).expect("put a replacement at the verified path");
     std::fs::copy(
         moved.join(".dot-agent-deck.toml"),
