@@ -40,6 +40,8 @@ use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType};
 
 mod common;
 
+use common::TuiDeck;
+
 use spec::spec;
 
 /// Cheapest tier in pi's Anthropic catalog — the model every pi lane-2 test
@@ -105,16 +107,9 @@ fn log_line_time(log: &str, needle: &str) -> Option<chrono::DateTime<chrono::Fix
 
 const SCHEDULED_SENTINEL: &str = "pi_confirm_sentinel_3a7f.txt";
 const SCHEDULED_SENTINEL_CONTENT: &str = "PI_CONFIRM_SENTINEL_OK";
+const SCHEDULE_NAME: &str = "pi-typed-prompt";
 
-/// Scenario: Start a real `daemon serve` headlessly with its log written to a
-/// file, and register a schedule whose command is an interactive real `pi`
-/// (no prompt on its command line) and whose `prompt` tells it to create the
-/// sentinel `pi_confirm_sentinel_3a7f.txt`. The daemon installs the bundled
-/// extension into its HOME as it boots. Fire the schedule with `RunNow`: the
-/// daemon spawns pi and types the prompt into its pane. Pi's extension reports
-/// the submitted prompt, declaring that it reports every prompt; the daemon log
-/// records the delivery as confirmed by that report rather than as a write it
-/// cannot confirm, and pi creates the sentinel.
+/// Scenario: Launch the deck with a schedule whose command is an interactive real `pi` and whose prompt tells it to create `pi_confirm_sentinel_3a7f.txt`, then fire it with Run now. The deck types the prompt into the new Pi pane, and its card shows the prompt on its `Prmt:` row. Pi's own report of that prompt confirms the delivery in the deck log, never `cannot be confirmed`, and pi creates the sentinel.
 #[spec("scheduler/pi/002")]
 #[test]
 fn scheduler_pi_002_typed_in_prompt_is_confirmed_by_pi_own_report() {
@@ -124,66 +119,77 @@ fn scheduler_pi_002_typed_in_prompt_is_confirmed_by_pi_own_report() {
     let work = scratch.path().join("pi-work");
     std::fs::create_dir_all(&work).expect("create pi working_dir");
     let log = scratch.path().join("deck.log");
+    let schedules = scratch.path().join("schedules.toml");
 
+    // An interactive pi with NO prompt on its command line, so the schedule's
+    // prompt goes through the deck's typed-in delivery, not pi's argv.
     let directive = format!(
         "Use your bash tool to create a file named {SCHEDULED_SENTINEL} in the current \
          directory whose entire contents are {SCHEDULED_SENTINEL_CONTENT}. Do nothing else."
     );
-    let toml = format!(
-        "[[scheduled_tasks]]\n\
-         name = \"pi-typed-prompt\"\n\
-         cron = \"0 0 1 1 *\"\n\
-         working_dir = \"{}\"\n\
-         command = \"pi --provider anthropic --model {PI_MODEL} --approve\"\n\
-         prompt = \"{directive}\"\n\
-         enabled = true\n\n",
-        work.to_string_lossy()
-    );
+    std::fs::write(
+        &schedules,
+        format!(
+            "[[scheduled_tasks]]\n\
+             name = \"{SCHEDULE_NAME}\"\n\
+             cron = \"0 0 1 1 *\"\n\
+             working_dir = \"{}\"\n\
+             command = \"pi --provider anthropic --model {PI_MODEL} --approve\"\n\
+             prompt = \"{directive}\"\n\
+             enabled = true\n\n",
+            work.to_string_lossy()
+        ),
+    )
+    .expect("write schedules.toml");
 
-    let anthropic_key =
-        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
-    let path_env = path_with_binary_dir();
-    let log_env = log.to_string_lossy().into_owned();
-    let daemon = common::spawn_daemon_serve_with_env(
-        Some(&toml),
-        "0",
-        &[
-            ("ANTHROPIC_API_KEY", anthropic_key.as_str()),
-            ("PATH", path_env.as_str()),
-            ("DOT_AGENT_DECK_LOG", log_env.as_str()),
-        ],
-    );
-    let sub = daemon.subscribe_events();
-    daemon
-        .run_now("pi-typed-prompt")
-        .expect("run-now pi-typed-prompt");
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        // pi authenticates with this (never printed); the deck's daemon and the
+        // pi child inherit it.
+        .with_env(
+            "ANTHROPIC_API_KEY",
+            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
+        )
+        // The built binary's dir, so the extension's `dot-agent-deck
+        // agent-event` resolves; the daemon-startup auto-materialize finds `pi`
+        // on this PATH and installs the bundled extension into the per-test HOME.
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("DOT_AGENT_DECK_SCHEDULES", schedules.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_LOG", log.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
 
-    // 1. Pi's own report of the typed-in prompt, carrying the declaration.
-    let reported = sub.try_wait_for(
-        |e| declared_prompt_report(e, SCHEDULED_SENTINEL),
-        Duration::from_secs(120),
-    );
+    common::attach_request_on(
+        deck.attach_socket_path(),
+        &dot_agent_deck::daemon_protocol::AttachRequest::RunNow {
+            name: SCHEDULE_NAME.to_string(),
+        },
+    )
+    .unwrap_or_else(|e| panic!("RunNow {SCHEDULE_NAME} over the attach socket failed: {e}"));
+
+    // 1. What the user sees: the Pi pane's card carries the prompt the deck
+    //    typed in, which only Pi's own report puts there.
     assert!(
-        reported.is_some(),
-        "no declared Pi prompt report naming {SCHEDULED_SENTINEL:?} arrived within 120s — \
-         either the typed-in prompt was never submitted, or the extension did not report it \
-         with `--reports-prompts`. Observed events: {:#?}",
-        sub.snapshot()
+        deck.wait_for_grid_string_within("Prmt:", Duration::from_secs(120)),
+        "the scheduled Pi pane's card never showed the typed-in prompt (`Prmt:`) within 120s.\n\
+         Final grid:\n{}",
+        deck.snapshot_grid()
     );
 
-    // 2. The daemon's delivery CONFIRMED the write from that report.
+    // 2. The delivery was CONFIRMED by that report.
     let confirmed = "prompt delivery confirmed by the agent's submitted prompt";
     let confirmation = common::wait_for_file_containing(&log, confirmed, Duration::from_secs(60));
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         confirmation.is_ok(),
-        "the daemon never recorded the scheduled prompt as confirmed: {confirmation:?}\n\
-         === deck.log (delivery lines) ===\n{}",
+        "the deck never recorded the scheduled prompt as confirmed: {confirmation:?}\n\
+         === deck.log (delivery lines) ===\n{}\nFinal grid:\n{}",
         log_text
             .lines()
             .filter(|line| line.contains("prompt"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        deck.snapshot_grid()
     );
     assert!(
         !log_text.contains("delivery cannot be confirmed by this agent"),
@@ -213,7 +219,9 @@ fn scheduler_pi_002_typed_in_prompt_is_confirmed_by_pi_own_report() {
     );
     assert!(
         created.is_ok(),
-        "pi confirmed the prompt but never created {SCHEDULED_SENTINEL:?}: {created:?}"
+        "pi confirmed the prompt but never created {SCHEDULED_SENTINEL:?}: {created:?}\n\
+         Final grid:\n{}",
+        deck.snapshot_grid()
     );
 }
 
@@ -226,22 +234,30 @@ const WORKER_PANE: &str = "pi-confirm-worker-pane";
 const WORKER_ROLE: &str = "coder";
 const DELEGATE_SENTINEL: &str = "pi_delegate_sentinel_6b1c.txt";
 const DELEGATE_SENTINEL_CONTENT: &str = "PI_DELEGATE_SENTINEL_OK";
+/// When the deck's first in-place re-delivery of the pointer is due, pinned so
+/// the test knows: a report arriving before it stops the re-delivery, and the
+/// exactly-once check runs only after it would have fired.
+const FIRST_REDELIVERY: Duration = Duration::from_secs(60);
+/// How long the pointer report may take. Under [`FIRST_REDELIVERY`], so a report
+/// that counts arrived while the re-delivery was still pending.
+const POINTER_REPORT_WAIT: Duration = Duration::from_secs(50);
 
-/// Scenario: Bring up an in-process daemon and spawn a real `pi` worker pane
-/// whose HOME carries the bundled extension, with no role config — so its role
-/// is not `clear = true` and a delegate is typed into the running pane instead
-/// of respawning it. Wait for the worker's session-start report, which declares
-/// that it reports every prompt. Register a synthetic orchestrator pane and
-/// delegate to the `coder` role a task to create the sentinel
-/// `pi_delegate_sentinel_6b1c.txt`. The daemon types the task pointer into the
-/// worker; pi reports that pointer as its submitted prompt, declaring prompt
-/// reports. The worker creates the sentinel and signals work-done, and across
-/// the whole run the pointer's delivery id is reported exactly once — the
-/// report confirmed it, so the deck never typed it in again.
+/// Scenario: Spawn a real `pi` worker with no role config, so a delegate is typed into its running pane, and wait for its session-start report declaring that it reports every prompt. Delegate to it a task to create `pi_delegate_sentinel_6b1c.txt`; pi reports the typed-in pointer as its own declared prompt, creates the sentinel and signals work-done. Past the moment the deck's first re-delivery would have fired, the pointer has still been submitted exactly once.
 #[spec("chain-smoke/pi/003")]
 #[test]
 fn chain_smoke_pi_003_typed_in_delegate_is_confirmed_by_pi_worker_report() {
     skip_unless!(check_pi_available());
+    // SAFETY: a stated residual, not a proof (issue #1516), as in
+    // `chain-smoke/pi/002`. Set before the tokio runtime (and so any daemon
+    // worker thread) is created below, and never written again; the threads
+    // that exist here are this test's and libtest's runner thread, which waits
+    // for it. nextest runs each test in its own process, so this never leaks.
+    unsafe {
+        std::env::set_var(
+            dot_agent_deck::delegate_retry::DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS,
+            FIRST_REDELIVERY.as_millis().to_string(),
+        );
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -362,6 +378,7 @@ async fn chain_smoke_pi_003_inner() {
          completion. Never describe signalling as a next step, offer to do it later, or wait for \
          confirmation."
     );
+    let delegated_at = std::time::Instant::now();
     daemon
         .state
         .read()
@@ -387,12 +404,12 @@ async fn chain_smoke_pi_003_inner() {
             e.pane_id.as_deref() == Some(WORKER_PANE)
                 && declared_prompt_report(e, &format!("worker-task-{WORKER_ROLE}.md"))
         },
-        Duration::from_secs(120),
+        POINTER_REPORT_WAIT,
     );
     let Some(pointer) = pointer else {
         panic!(
             "the pi worker never reported the delegate's pointer as a declared prompt within \
-             120s.\n=== pi worker pane ===\n{}\n=== end ===\nObserved events: {:#?}",
+             {POINTER_REPORT_WAIT:?}.\n=== pi worker pane ===\n{}\n=== end ===\nObserved events: {:#?}",
             worker_pane(),
             sub.snapshot()
         );
@@ -430,21 +447,26 @@ async fn chain_smoke_pi_003_inner() {
         worker_pane()
     );
 
-    // 3. Confirmed once, typed once: by the time the work is done the pointer's
-    //    delivery id has been reported exactly once.
-    let reports = sub
-        .snapshot()
-        .into_iter()
-        .filter(|e| e.pane_id.as_deref() == Some(WORKER_PANE))
-        .filter(|e| {
-            e.user_prompt
-                .as_deref()
-                .is_some_and(|p| p.contains(&delivery_id))
-        })
-        .count();
-    assert_eq!(
-        reports, 1,
-        "the delegate pointer {delivery_id} was submitted {reports} times — the worker's own \
-         report should have confirmed it the first time"
+    // 3. Confirmed once, typed once: the report arrived while the first
+    //    re-delivery was still pending, so it must have stopped it. Watch until
+    //    past the moment that re-delivery was due; a second report of the same
+    //    delivery id would be pi submitting the pointer again.
+    let past_first_redelivery = (delegated_at + FIRST_REDELIVERY + Duration::from_secs(10))
+        .saturating_duration_since(std::time::Instant::now());
+    let second = sub.try_wait_for(
+        |e| {
+            e.pane_id.as_deref() == Some(WORKER_PANE)
+                && e.timestamp != pointer.timestamp
+                && e.user_prompt
+                    .as_deref()
+                    .is_some_and(|p| p.contains(&delivery_id))
+        },
+        past_first_redelivery,
+    );
+    assert!(
+        second.is_none(),
+        "the delegate pointer {delivery_id} was submitted a second time ({second:?}) — the \
+         worker's own report should have confirmed it the first time and stopped the \
+         re-delivery due {FIRST_REDELIVERY:?} after the delegate"
     );
 }
