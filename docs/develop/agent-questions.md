@@ -1,6 +1,6 @@
 # Agent questions: knowing and answering what an agent is waiting on
 
-PRD #1542 gives the daemon a model of the question each agent is waiting on — a permission prompt, a multiple-choice menu, a form of several questions — and a request to answer it through the agent's own channel. The desktop's voice panel is its first client (user docs: [`docs/desktop/voice.md`](../desktop/voice.md#answering-an-agents-question)); #1497, which will speak a prompt aloud, is meant to read the same model. This page is the mechanism and its risks. The PRD (`prds/1542-voice-answer-agent-questions.md`) has the measurements every table below rests on, tagged by how each fact was established.
+PRD #1542 gives the daemon a model of the question each agent is waiting on — a permission prompt, a multiple-choice menu, a form of several questions — and a request to answer it through the agent's own channel. The desktop's voice panel is its first client (user docs: [`docs/desktop/voice.md`](../desktop/voice.md#answering-an-agents-question)); #1497, which will speak a prompt aloud, is meant to read the same model. This page is the mechanism and its risks. The PRD (`prds/done/1542-voice-answer-agent-questions.md`) has the measurements every table below rests on, tagged by how each fact was established.
 
 ## The model: `pending_question`
 
