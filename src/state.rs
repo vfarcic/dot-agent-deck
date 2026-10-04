@@ -5312,6 +5312,11 @@ fn arm_delegate_silence_watch(
         // ran and the cancellation had not been observed yet — suppress.
         // PR #1398 finding #18: captured before the take — see the idle watch.
         let resolution = registry.delegation_resolution_epoch(&worker_pane_id);
+        // Qodo, PR #1502: and the pane's pointer deliveries, also before the
+        // take — a watch displaced by a newer delegate whose pointer is still
+        // being written can fire and take its own record, and that pointer
+        // landing while this report waits answers the question it asks.
+        let delivery = registry.pointer_delivery_epoch(&worker_pane_id);
         if !registry.cancel_silence_watch_if(&worker_pane_id, seq) {
             tracing::debug!(
                 pane_id = %worker_pane_id,
@@ -5412,6 +5417,14 @@ fn arm_delegate_silence_watch(
                         resolution,
                         "silent-worker watch",
                     ) {
+                        return false;
+                    }
+                    if revalidate_registry.pointer_delivery_epoch(&revalidate_worker) != delivery {
+                        tracing::info!(
+                            worker_pane_id = %revalidate_worker,
+                            "a newer task pointer reached the worker while the silent-worker \
+                             report waited to be written; not sent"
+                        );
                         return false;
                     }
                     orchestration_still_matches(
