@@ -255,6 +255,7 @@ fn send_question_unheld_at(
             token: crate::hook_provenance::token_from_env(),
             event: event.clone(),
             hold: false,
+            ack: false,
         });
         if let Ok(json) = serde_json::to_string(&signal)
             && let (SocketReply::Line(line), _) =
@@ -335,11 +336,19 @@ fn hold_question(
 /// event it carried was not applied — send it again as a plain event, without
 /// the question, so the card still reads Needs Input, exactly as it would have
 /// before the deck could answer questions.
-fn send_plain_if_refused(mut event: AgentEvent, reply: Option<&crate::question::QuestionReply>) {
+fn send_plain_if_refused(event: AgentEvent, reply: Option<&crate::question::QuestionReply>) {
+    send_plain_if_refused_at(&client_socket_path(), event, reply);
+}
+
+fn send_plain_if_refused_at(
+    path: &std::path::Path,
+    mut event: AgentEvent,
+    reply: Option<&crate::question::QuestionReply>,
+) {
     if reply.is_some_and(crate::question::QuestionReply::refused) {
         event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
         if let Ok(json) = serde_json::to_string(&event) {
-            let _ = send_to_socket(&json);
+            let _ = send_to_socket_at(path, &json);
         }
     }
 }
@@ -354,6 +363,7 @@ fn hold_question_at(
         token: crate::hook_provenance::token_from_env(),
         event: event.clone(),
         hold: true,
+        ack: false,
     });
     let json = serde_json::to_string(&signal).ok()?;
     let SocketReply::Line(line) = request_held_at(path, &json, deadline) else {
@@ -370,7 +380,22 @@ fn hold_question_at(
 /// ([`crate::question::opencode_reply`], [`crate::question::pi_value`]).
 /// Prints nothing — the producer then leaves the agent's own prompt alone — on
 /// every other outcome, and always exits 0.
-pub fn handle_await_answer(agent: &str, question_arg: Option<&str>) -> ExitCode {
+///
+/// With `ack` (the OpenCode plugin) the question is the FIRST line of stdin,
+/// and the answer is acknowledged: see [`opencode_await_answer_acked_at`].
+pub fn handle_await_answer(agent: &str, question_arg: Option<&str>, ack: bool) -> ExitCode {
+    if ack && agent == "opencode" && question_arg.is_none() {
+        let mut first = String::new();
+        if std::io::stdin().read_line(&mut first).is_ok() && !first.trim().is_empty() {
+            opencode_await_answer_acked_at(
+                &client_socket_path(),
+                first.trim(),
+                &mut std::io::stdout(),
+                || read_stdin_line_within(AWAIT_ANSWER_ACK_WAIT),
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
     let raw = match question_arg {
         Some(arg) => arg.to_string(),
         None => match read_stdin() {
@@ -435,6 +460,110 @@ fn opencode_await_answer(raw: &str) -> Option<Value> {
     let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
     send_plain_if_refused(event, reply.as_ref());
     crate::question::opencode_reply(&question, &properties, &reply?)
+}
+
+/// PRD #1542: how long an acknowledging `await-answer` child waits for the
+/// OpenCode plugin to say what OpenCode's reply API made of the answer —
+/// shorter than the daemon's [`crate::daemon::HELD_REPLY_ACK_WAIT`], so the
+/// daemon hears the plugin's report rather than timing out first.
+pub const AWAIT_ANSWER_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// One line of stdin, if one arrives within `wait`. The read runs on a thread
+/// of its own, left behind when the wait ends: the process exits right after.
+fn read_stdin_line_within(wait: std::time::Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = std::io::stdin().read_line(&mut line);
+        let _ = tx.send(read.ok().filter(|n| *n > 0).map(|_| line));
+    });
+    rx.recv_timeout(wait).ok().flatten()
+}
+
+/// [`hold_question_at`] for a producer that acknowledges: the held message
+/// carries `ack`, and the connection is handed back with the reply so the
+/// acknowledgement can follow on it.
+fn hold_question_acked_at(
+    path: &std::path::Path,
+    event: &AgentEvent,
+    deadline: std::time::Duration,
+) -> Option<(
+    crate::question::QuestionReply,
+    crate::platform::ipc::IpcClient,
+)> {
+    let signal = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+        pane_id: event.pane_id.clone()?,
+        token: crate::hook_provenance::token_from_env(),
+        event: event.clone(),
+        hold: true,
+        ack: true,
+    });
+    let json = serde_json::to_string(&signal).ok()?;
+    let until = std::time::Instant::now() + deadline;
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, deadline).ok()?;
+    stream.set_timeouts(deadline).ok()?;
+    if !matches!(
+        write_request_line(&mut stream, format!("{json}\n").as_bytes()),
+        RequestWrite::Written
+    ) {
+        return None;
+    }
+    let line = read_reply_line(&mut stream, Some(until)).ok()?;
+    Some((serde_json::from_str(&line).ok()?, stream))
+}
+
+/// PRD #1542: the OpenCode plugin's `await-answer --ack`. Holds the question
+/// like [`opencode_await_answer`] and prints the reply OpenCode should get;
+/// then reads ONE line — `ack_line`, the plugin's
+/// [`crate::question::ReplyAck`] for what OpenCode's reply API said — and
+/// passes it to the daemon on the held connection, which reports the deck's
+/// answer only once it has it. An answer that cannot be turned into OpenCode's
+/// reply is acknowledged as not taken, and nothing is printed. A missing or
+/// unreadable acknowledgement is passed on as nothing, which the daemon
+/// reports as unconfirmed.
+fn opencode_await_answer_acked_at(
+    path: &std::path::Path,
+    raw: &str,
+    out: &mut dyn std::io::Write,
+    ack_line: impl FnOnce() -> Option<String>,
+) {
+    if let Some((event, question, properties)) = opencode_question_event(raw) {
+        opencode_hold_acked_at(path, event, &question, &properties, out, ack_line);
+    }
+}
+
+/// [`opencode_await_answer_acked_at`] once the question is built.
+fn opencode_hold_acked_at(
+    path: &std::path::Path,
+    event: AgentEvent,
+    question: &crate::question::PendingQuestion,
+    properties: &Value,
+    out: &mut dyn std::io::Write,
+    ack_line: impl FnOnce() -> Option<String>,
+) {
+    let held = hold_question_acked_at(path, &event, AWAIT_ANSWER_DEADLINE);
+    send_plain_if_refused_at(path, event, held.as_ref().map(|(reply, _)| reply));
+    let Some((reply, mut stream)) = held else {
+        return;
+    };
+    if reply.answers_for(&question.id).is_none() {
+        return;
+    }
+    let ack = match crate::question::opencode_reply(question, properties, &reply) {
+        Some(line) => {
+            let printed = writeln!(out, "{line}").and_then(|()| out.flush()).is_ok();
+            printed.then(ack_line).flatten().and_then(|line| {
+                serde_json::from_str::<crate::question::ReplyAck>(line.trim()).ok()
+            })
+        }
+        None => Some(crate::question::ReplyAck {
+            delivered: false,
+            detail: Some("the answer could not be turned into OpenCode's reply".to_string()),
+        }),
+    };
+    if let Some(json) = ack.and_then(|ack| serde_json::to_string(&ack).ok()) {
+        let _ = write_request_line(&mut stream, format!("{json}\n").as_bytes());
+    }
 }
 
 fn pi_await_answer(raw: &str) -> Option<Value> {
@@ -1028,13 +1157,21 @@ fn hook_question(
             )
             .question,
         ),
-        (AgentType::Codex, "PermissionRequest") => Some(crate::question::codex_permission_request(
-            id(),
-            tool_name?,
-            tool_detail,
-            now,
-            None,
-        )),
+        (AgentType::Codex, "PermissionRequest") => {
+            // The whole command, for the "don't ask again" confirmation:
+            // `tool_detail` is its first line, cut at 120 bytes.
+            let command = tool_input
+                .and_then(|input| input.get("command"))
+                .and_then(codex_shell_command);
+            Some(crate::question::codex_permission_request(
+                id(),
+                tool_name?,
+                tool_detail,
+                command.as_deref(),
+                now,
+                None,
+            ))
+        }
         (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
             crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
         }
@@ -4855,6 +4992,72 @@ mod question_tests {
             true,
         )
         .unwrap()
+    }
+
+    /// Scenario: The OpenCode plugin's `await-answer --ack` child holds a
+    /// permission with a stand-in daemon, asking to acknowledge. The daemon
+    /// answers Allow once; the child prints OpenCode's `once` reply for the
+    /// plugin, reads the plugin's report that OpenCode refused it, and passes
+    /// that report on to the daemon on the same connection. A report that
+    /// never comes, or does not parse, is passed on as nothing.
+    #[cfg(unix)]
+    #[spec("question/hold/016")]
+    #[test]
+    fn question_hold_016_the_opencode_child_passes_on_what_opencode_made_of_the_reply() {
+        use std::io::BufRead as _;
+        let raw = serde_json::json!({
+            "session_id": "ses_1",
+            "event": "permission.asked",
+            "properties": fixture("opencode-permission-asked.json"),
+        });
+        let run = |ack: Option<&str>| -> (Value, Option<String>, String) {
+            let (mut event, q, props) = opencode_question_event(&raw.to_string()).unwrap();
+            event.pane_id = Some("pane-oc".into());
+            let reply = QuestionReply::answered(&q.id, resolved(&q, &[(0, &[1], None)]));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let reply_line = serde_json::to_string(&reply).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut held = String::new();
+                reader.read_line(&mut held).unwrap();
+                writeln!(reader.get_mut(), "{reply_line}").unwrap();
+                let mut acked = String::new();
+                let n = reader.read_line(&mut acked).unwrap();
+                (
+                    serde_json::from_str::<Value>(&held).unwrap(),
+                    (n > 0).then(|| acked.trim().to_string()),
+                )
+            });
+            let mut out = Vec::new();
+            let ack = ack.map(str::to_string);
+            opencode_hold_acked_at(&path, event, &q, &props, &mut out, || ack);
+            let (held, acked) = server.join().unwrap();
+            (held, acked, String::from_utf8(out).unwrap())
+        };
+
+        let (held, acked, printed) = run(Some(
+            r#"{"delivered":false,"detail":"OpenCode answered 500"}"#,
+        ));
+        assert_eq!(held["hold"], true);
+        assert_eq!(held["ack"], true, "the child asks to acknowledge");
+        let printed: Value = serde_json::from_str(printed.trim()).unwrap();
+        assert_eq!(printed["body"]["reply"], "once");
+        assert_eq!(
+            serde_json::from_str::<crate::question::ReplyAck>(&acked.unwrap()).unwrap(),
+            crate::question::ReplyAck {
+                delivered: false,
+                detail: Some("OpenCode answered 500".into()),
+            }
+        );
+
+        for silent in [None, Some("not json")] {
+            let (_, acked, printed) = run(silent);
+            assert!(!printed.is_empty(), "the reply is still printed");
+            assert_eq!(acked, None, "{silent:?}: nothing passed on");
+        }
     }
 
     /// Scenario: A held Claude Code permission hook sends its question to a

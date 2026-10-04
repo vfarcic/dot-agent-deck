@@ -6993,7 +6993,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/007 — The OpenCode plugin holds a question through `await-answer` and replies through OpenCode.
 - **Layer:** L1/fast real-Node integration (`src/opencode_manage.rs`: the generated plugin loaded by Node with its binary pinned to a recorder and a stand-in OpenCode client, captured OpenCode 1.18.34 events).
 - **Agent:** none (stand-in client and recorder).
-- **Asserts:** `question.asked` starts `await-answer --agent opencode` with the event's properties and the plugin posts the printed answer to `/question/{requestID}/reply`; a `permission.asked` still waiting when OpenCode reports `permission.replied` gets its child stopped and nothing posted; `permission.replied` and `question.rejected` are forwarded with their request id, which the hook CLI turns into a resolved-question marker. Skips where `node` is missing.
+- **Asserts:** `question.asked` starts `await-answer --agent opencode --ack` with the event's properties as its first stdin line and the plugin posts the printed answer to `/question/{requestID}/reply`; a `permission.asked` still waiting when OpenCode reports `permission.replied` gets its child stopped and nothing posted; `permission.replied` and `question.rejected` are forwarded with their request id, which the hook CLI turns into a resolved-question marker; each child that printed an answer is told what OpenCode made of it, and a reply OpenCode refuses (an error response, which the SDK reports rather than throws) is reported `{"delivered": false, "detail": "OpenCode answered 500"}` and the question raised again, whose second reply is reported delivered. Skips where `node` is missing.
 - **Does not assert:** a real OpenCode dismissing its dialog on that post (`question/live/*`); the Rust side's question building and reply mapping, which the hook CLI's own unit test covers.
 - **Platform coverage:** mac+linux.
 
@@ -7197,7 +7197,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **question/desktop/008** — vitest `question/desktop/008: a bare yes does not confirm always allow`: with the always-allow confirmation open, "yes", "sure", "ok" and "yes please" leave it open and say to say "confirm", and no countdown starts; "always allow" said again confirms it.
 - **question/desktop/009** — vitest `question/desktop/009: speaking stops the answer countdown before the words are worked out` (audit A3): speech a second before the countdown ends stops it at once, with transcription and resolution stalled far past the end; a resolver error and a refusal leave it stopped; only a fresh complete answer re-arms it.
 - **question/desktop/010** — vitest `question/desktop/010: an answer needs the agent's terminal on screen` (audit A7): over a hidden terminal "yes" is an ordinary command and no question is resolved; hiding the terminal mid-countdown calls it off with nothing sent; `questionLost` reports `hidden`.
-- **question/desktop/011** — `question_desktop_011_a_cancelled_lease_writes_no_frame` (`voice/lease.rs`) and vitest `question/desktop/011: …` (audit A8): a lease cancelled while the send is stalled writes no frame; a cancel arriving before its send kills it; one after the write is reported too late; the panel keeps the form with its Cancel while sending, cancels the lease on a pane change, and always reports the outcome; a cancel that fails to reach the app is reported with the outcome rather than swallowed, whether its failure arrives before the outcome or after it (audit R5: the row the outcome wrote is then amended).
+- **question/desktop/011** — `question_desktop_011_a_cancelled_lease_writes_no_frame` (`voice/lease.rs`) and vitest `question/desktop/011: …` (audit A8): a lease cancelled while the send is stalled writes no frame; a cancel arriving before its send kills it; one after the write is reported too late; a send that times out or breaks after the request was let through is reported `unconfirmed` ("may have been sent — check the agent"), never "nothing was sent", while one that fails before is the plain error; the panel keeps the form with its Cancel while sending, cancels the lease on a pane change, and always reports the outcome; a cancel that fails to reach the app is reported with the outcome rather than swallowed, whether its failure arrives before the outcome or after it (audit R5: the row the outcome wrote is then amended).
 - **question/desktop/012** — vitest `question/desktop/012: …` (audit A1, accepted residual): an Allow once the model ties to words that do not mean it ("what time is it", "no don't run that") is shown in the countdown as exactly what would be sent; Cancel, or speaking, stops it, and nothing is sent.
 
 #### question/hold
@@ -7291,6 +7291,27 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Agent:** none (`/bin/sh` stand-in).
 - **Asserts:** the same id asked again right after the deck's held answer reached its producer is not registered until the deck's clearing event is applied (audit R3); it then stays held and pending at its own revision.
 - **Does not assert:** answering the re-asked question — the pane's last-answered id refuses the same id by design (`question/answer/007`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/014 — OpenCode's and Codex's always options are shown whole or keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`, through the event's own sanitizing).
+- **Agent:** none (synthetic payloads in OpenCode's, Codex's and Devin's shapes).
+- **Asserts:** an OpenCode `always` list whose sentence would pass the snapshot's 300-byte cap, a pattern sanitizing would alter (a bidi character), one that reads ambiguously (a comma) or an empty list has no scope, reaches the card as a keyboard-only "Allow always", is refused `keyboard_only` by validation, and a forged reply maps to no `always`; a Codex command too long, spanning lines, carrying a bidi character or missing does the same for `p`, and `answer_keys` refuses it; a short pattern list shows every pattern and replies `always`, a short command is named whole and types `p`; Devin's "allow for …" options are keyboard-only with no scope.
+- **Does not assert:** the desktop's confirmation rendering (`question/desktop/*`), or what prefix Codex itself grants.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/015 — An answer the agent does not take is reported and answerable again.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop with a short acknowledgement wait).
+- **Agent:** none (`/bin/sh` stand-in; a raw socket producer acknowledging as the OpenCode plugin's child does).
+- **Asserts:** a producer that asks to acknowledge reports the agent refused the answer: the deck's answer is refused `write_failed`, naming the sanitized reason and that the agent is asking again; the same id raised again is answerable and, reported taken, answered once; a producer that reports nothing within the wait leaves the answer `unconfirmed`, and the question is not offered again.
+- **Does not assert:** the plugin's own report or re-raise (`question/detect/007`), or the child's bridge (`question/hold/016`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/016 — The OpenCode child passes on what OpenCode made of the reply.
+- **Layer:** L1/fast unit (`src/hook.rs`, a one-shot stand-in daemon on a Unix socket that reads the held message, answers, and reads the acknowledgement).
+- **Agent:** none (captured OpenCode 1.18.34 `permission.asked`).
+- **Asserts:** `await-answer --ack`'s hold carries `ack`; the child prints OpenCode's `once` reply, then passes the plugin's report — OpenCode refused it, and why — to the daemon on the same connection; a report that never comes or does not parse is passed on as nothing.
+- **Does not assert:** the daemon's handling of the report (`question/hold/015`).
 - **Platform coverage:** mac+linux.
 
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]

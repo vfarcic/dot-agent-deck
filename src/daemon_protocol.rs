@@ -5908,6 +5908,8 @@ pub(crate) async fn answer_question_at(
     // The pane's question lifecycle, when this path already holds it — the
     // held reply keeps it from its revalidation to the deck's clearing event.
     let mut lifecycle = None;
+    // Where a held answer's handler reports what became of it.
+    let mut delivery = None;
     match question.channel {
         AnswerChannel::Held => {
             // Audit R1–R3: revalidated at the commit point, under the pane's
@@ -5930,7 +5932,7 @@ pub(crate) async fn answer_question_at(
                     current_id: current.map(|q| q.id),
                 });
             }
-            let delivered = pane_id.as_deref().is_some_and(|pane| {
+            let handed = pane_id.as_deref().and_then(|pane| {
                 registry.question_holds().answer(
                     pane,
                     agent_id,
@@ -5939,7 +5941,7 @@ pub(crate) async fn answer_question_at(
                     QuestionReply::answered(&question.id, resolved),
                 )
             });
-            if !delivered {
+            let Some(handed) = handed else {
                 // Either the holder went — the question goes with it — or a
                 // registration that replaced this revision holds it now, which
                 // this answer was never checked against.
@@ -5952,7 +5954,7 @@ pub(crate) async fn answer_question_at(
                 return Err(AnswerRefusal::Stale {
                     current_id: guard.pending_question_id_on_pane(pane),
                 });
-            }
+            };
             registry
                 .question_answers()
                 .mark_answered(pane, &question.id);
@@ -5961,6 +5963,7 @@ pub(crate) async fn answer_question_at(
                 .barrier("answer_question:delivered")
                 .await;
             lifecycle = Some(held);
+            delivery = Some(handed);
         }
         AnswerChannel::Keys => {
             let keys = crate::question::answer_keys(&agent_type, &question, &resolved)?;
@@ -6108,6 +6111,49 @@ pub(crate) async fn answer_question_at(
         state, event_tx, registry, &lifecycle, event, None, replaced,
     )
     .await;
+    drop(lifecycle);
+    // A held answer is reported only once its handler has written it — and,
+    // for a producer that acknowledges (OpenCode's plugin), once the agent has
+    // taken it. Awaited OUTSIDE the lifecycle: the agent's own events for the
+    // pane (OpenCode's `permission.replied`, forwarded while the plugin is
+    // still finishing its reply) must not wait behind it. The handler bounds
+    // the acknowledgement by `HELD_REPLY_ACK_WAIT`; this bound is only the
+    // backstop for a handler that never reports at all.
+    if let Some(delivery) = delivery {
+        use crate::agent_pty::ReplyDelivery;
+        let outcome = tokio::time::timeout(
+            crate::daemon::HELD_REPLY_ACK_WAIT + Duration::from_secs(1),
+            delivery,
+        )
+        .await;
+        match outcome {
+            Ok(Ok(ReplyDelivery::Delivered)) => {}
+            Ok(Ok(ReplyDelivery::NotAccepted(detail))) => {
+                // The agent never took it and is still asking: the producer
+                // raises it again, and the deck must be able to answer it.
+                registry
+                    .question_answers()
+                    .unmark_answered(pane, &question.id);
+                warn!(
+                    agent_id = %agent_id,
+                    question_id = %question.id,
+                    %detail,
+                    "question: the agent did not take the deck's answer"
+                );
+                return Err(AnswerRefusal::WriteFailed {
+                    detail: format!("the agent did not take it ({detail}) and is asking again"),
+                });
+            }
+            Ok(Ok(ReplyDelivery::Unconfirmed)) | Ok(Err(_)) | Err(_) => {
+                warn!(
+                    agent_id = %agent_id,
+                    question_id = %question.id,
+                    "question: the agent did not confirm it took the deck's answer"
+                );
+                return Err(AnswerRefusal::Unconfirmed);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -10255,7 +10301,7 @@ mod question_answer_tests {
         ) -> tokio::sync::oneshot::Receiver<crate::question::QuestionReply> {
             let mut event = self.event(EventType::PermissionRequest);
             event.set_question(question);
-            crate::daemon::register_and_publish_held(
+            let held = crate::daemon::register_and_publish_held(
                 &self.state,
                 &self.event_tx,
                 &self.registry,
@@ -10265,7 +10311,19 @@ mod question_answer_tests {
             )
             .await
             .expect("the held question is pending")
-            .rx
+            .rx;
+            // Stands in for the hook loop's handler: a producer that does not
+            // acknowledge, so an answer handed to it is delivered.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok(held) = held.await {
+                    if let Some(delivery) = held.delivery {
+                        let _ = delivery.send(crate::agent_pty::ReplyDelivery::Delivered);
+                    }
+                    let _ = tx.send(held.reply);
+                }
+            });
+            rx
         }
 
         /// [`Self::ask`] through the daemon's own ingest, which is what
@@ -10554,6 +10612,7 @@ mod question_answer_tests {
             "q-approve".into(),
             "Bash",
             Some("touch x".into()),
+            Some("touch x"),
             1,
             None,
         );
@@ -10682,6 +10741,7 @@ mod question_answer_tests {
             "q-kb-approve".into(),
             "Bash",
             Some("touch x".into()),
+            Some("touch x"),
             1,
             None,
         );
@@ -10722,6 +10782,7 @@ mod question_answer_tests {
             "q-race".into(),
             "Bash",
             Some("touch x".into()),
+            Some("touch x"),
             1,
             None,
         );
@@ -10878,6 +10939,7 @@ mod question_answer_tests {
             "q-swap".into(),
             "Bash",
             Some("touch x".into()),
+            Some("touch x"),
             1,
             None,
         );

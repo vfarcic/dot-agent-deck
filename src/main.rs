@@ -254,6 +254,11 @@ enum Commands {
         /// The question, for a producer that cannot write stdin (Pi).
         #[arg(long)]
         question: Option<String>,
+        /// After printing the answer, read one line from stdin — whether the
+        /// agent took it — and pass it to the deck (the OpenCode plugin). The
+        /// question is then the first line of stdin rather than all of it.
+        #[arg(long)]
+        ack: bool,
     },
     /// Print the user documentation for this version, embedded in the binary
     /// (no network, no daemon). With no topic, list the topics; with a topic
@@ -1565,9 +1570,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(Commands::AwaitAnswer { agent, question }) => {
-            dot_agent_deck::hook::handle_await_answer(&agent, question.as_deref())
-        }
+        Some(Commands::AwaitAnswer {
+            agent,
+            question,
+            ack,
+        }) => dot_agent_deck::hook::handle_await_answer(&agent, question.as_deref(), ack),
         Some(Commands::GetSeed) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,

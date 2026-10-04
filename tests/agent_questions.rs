@@ -306,15 +306,15 @@ async fn question_state_005_a_newer_question_supersedes_and_releases_the_older()
     .rx;
     assert_eq!(pending(&*state.read().await).as_deref(), Some("q-new"));
     let released = older.await.expect("the older hold is answered");
-    assert_eq!(released.outcome, ReplyOutcome::Released);
-    assert_eq!(released.reason, Some(ReleaseReason::Superseded));
-    assert_eq!(released.question_id, "q-old");
+    assert_eq!(released.reply.outcome, ReplyOutcome::Released);
+    assert_eq!(released.reply.reason, Some(ReleaseReason::Superseded));
+    assert_eq!(released.reply.question_id, "q-old");
     assert!(registry.question_holds().is_held(PANE, "q-new"));
 
     dot_agent_deck::daemon::ingest_event(&state, &event_tx, &registry, event(EventType::Idle))
         .await;
     let released = newer.await.expect("the newer hold is answered");
-    assert_eq!(released.reason, Some(ReleaseReason::Cleared));
+    assert_eq!(released.reply.reason, Some(ReleaseReason::Cleared));
     assert!(!registry.question_holds().is_held(PANE, "q-new"));
 }
 

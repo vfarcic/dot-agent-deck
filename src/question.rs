@@ -255,6 +255,10 @@ pub enum AnswerRefusal {
     /// already moved on — a form partly answered by keyboard, or a prompt
     /// already dismissed. The user finishes it by keyboard.
     KeyboardStarted,
+    /// The answer reached a producer that reports whether the agent took it
+    /// (OpenCode's plugin), and no report came back in time: the agent may or
+    /// may not have it. The user checks the agent before answering again.
+    Unconfirmed,
     #[serde(other)]
     Unknown,
 }
@@ -275,6 +279,10 @@ impl std::fmt::Display for AnswerRefusal {
                 f,
                 "the agent's terminal was typed into after it asked; finish the answer by keyboard"
             ),
+            Self::Unconfirmed => write!(
+                f,
+                "the agent did not confirm it took the answer; it may have — check the agent"
+            ),
             Self::Unknown => write!(f, "refused"),
         }
     }
@@ -289,6 +297,37 @@ pub struct QuestionReply {
     pub answers: Vec<ResolvedAnswer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ReleaseReason>,
+}
+
+/// PRD #1542: what a producer that asked to acknowledge (`QuestionSignal::ack`)
+/// writes back after an answered [`QuestionReply`] — one JSON line saying
+/// whether the agent accepted the answer it was handed (OpenCode's reply API
+/// taking the POST), and if not, why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyAck {
+    pub delivered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The longest acknowledgement detail the daemon passes on, in bytes.
+pub const MAX_ACK_DETAIL_BYTES: usize = 200;
+
+impl ReplyAck {
+    /// The detail as the daemon passes it on: capped, stripped of control and
+    /// bidi characters, and never empty.
+    pub fn detail_for_client(&self) -> String {
+        let detail = clean(
+            self.detail.as_deref().unwrap_or_default(),
+            MAX_ACK_DETAIL_BYTES,
+            false,
+        );
+        if detail.is_empty() {
+            "no reason given".to_string()
+        } else {
+            detail
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,11 +801,36 @@ fn claude_mode(mode: &str) -> Option<(&'static str, &'static str)> {
 /// non-empty, already trimmed, nothing [`PendingQuestion::sanitized`] would
 /// strip (control or bidi characters), and no `,` — the separator the scope
 /// joins its targets with, so a target containing one would read as two.
-fn claude_scope_part_is_exact(text: &str) -> bool {
+fn scope_part_is_exact(text: &str) -> bool {
     !text.is_empty()
         && text.trim() == text
         && !text.contains(',')
         && crate::untrusted_text::strip_control_and_bidi(text, false) == text
+}
+
+/// PRD #1542 (audit A2): whether an "always" scope reaches the card exactly as
+/// written — within [`MAX_DESCRIPTION_BYTES`] and unchanged by
+/// [`PendingQuestion::sanitized`] — so the confirmation shows all of it.
+fn scope_shown_whole(scope: &str) -> bool {
+    scope.len() <= MAX_DESCRIPTION_BYTES && clean(scope, MAX_DESCRIPTION_BYTES, false) == scope
+}
+
+/// PRD #1542 (audit A2): give each "always" option the scope its producer
+/// wrote from what the answer will grant, or — when there is none that can be
+/// shown whole — make it keyboard-only with nothing to confirm.
+fn settle_always_scope(options: &mut [QuestionOption], scope: Option<String>) {
+    for option in options
+        .iter_mut()
+        .filter(|o| o.role == OptionRole::AllowAlways)
+    {
+        match &scope {
+            Some(scope) => option.scope = Some(scope.clone()),
+            None => {
+                option.keyboard_only = true;
+                option.scope = None;
+            }
+        }
+    }
 }
 
 /// PRD #1542 (audit A2): what one Claude Code permission update grants, in
@@ -776,14 +840,13 @@ fn claude_scope_part_is_exact(text: &str) -> bool {
 /// faithfully (an unknown type, mode or destination, a rule that is not an
 /// allow, an empty list) or cannot show COMPLETELY: a target the snapshot's
 /// sanitizing would alter or that reads ambiguously
-/// ([`claude_scope_part_is_exact`]), or a whole sentence longer than
+/// ([`scope_part_is_exact`]), or a whole sentence longer than
 /// [`MAX_DESCRIPTION_BYTES`], which the snapshot would cut. The option is then
 /// keyboard-only, and [`claude_decision`] refuses to send it — so no grant
 /// ever reaches past what the confirmation displayed.
 pub fn claude_update_scope(update: &Value) -> Option<String> {
     let scope = claude_update_scope_words(update)?;
-    (scope.len() <= MAX_DESCRIPTION_BYTES && clean(&scope, MAX_DESCRIPTION_BYTES, false) == scope)
-        .then_some(scope)
+    scope_shown_whole(&scope).then_some(scope)
 }
 
 fn claude_update_scope_words(update: &Value) -> Option<String> {
@@ -793,7 +856,7 @@ fn claude_update_scope_words(update: &Value) -> Option<String> {
             .get(key)?
             .as_array()?
             .iter()
-            .map(|item| item.as_str().filter(|s| claude_scope_part_is_exact(s)))
+            .map(|item| item.as_str().filter(|s| scope_part_is_exact(s)))
             .collect::<Option<_>>()?;
         (!items.is_empty()).then_some(items)
     };
@@ -815,10 +878,9 @@ fn claude_update_scope_words(update: &Value) -> Option<String> {
                 .as_array()?
                 .iter()
                 .map(|rule| {
-                    let tool =
-                        str_field(rule, "toolName").filter(|t| claude_scope_part_is_exact(t))?;
+                    let tool = str_field(rule, "toolName").filter(|t| scope_part_is_exact(t))?;
                     Some(match str_field(rule, "ruleContent") {
-                        Some(content) if claude_scope_part_is_exact(content) => {
+                        Some(content) if scope_part_is_exact(content) => {
                             format!("{tool}({content})")
                         }
                         Some(_) => return None,
@@ -978,16 +1040,10 @@ pub fn claude_permission_request(
             );
             // The confirmation names exactly what the decision will send, or
             // the option cannot be sent at all (audit A2).
-            let scope = suggestion_value.as_ref().and_then(claude_update_scope);
-            for option in options
-                .iter_mut()
-                .filter(|o| o.role == OptionRole::AllowAlways)
-            {
-                match &scope {
-                    Some(scope) => option.scope = Some(scope.clone()),
-                    None => option.keyboard_only = true,
-                }
-            }
+            settle_always_scope(
+                &mut options,
+                suggestion_value.as_ref().and_then(claude_update_scope),
+            );
             BuiltQuestion {
                 question: PendingQuestion {
                     id,
@@ -1110,23 +1166,29 @@ pub fn claude_decision(
 /// answered by keys from Codex's command-approval table. Never held: a running
 /// `PermissionRequest` hook hides Codex's prompt from a keyboard user
 /// [observed on 0.160.0].
+///
+/// `command` is the whole command the call runs, not `tool_detail`'s first
+/// line or cut: the "don't ask again" option's confirmation names it
+/// ([`codex_prefix_scope`]), and that option is keyboard-only when there is
+/// none or it cannot be shown whole (audit A2).
 pub fn codex_permission_request(
     id: String,
     tool_name: &str,
     tool_detail: Option<String>,
+    command: Option<&str>,
     raised_at_ms: i64,
     version: Option<(u64, u64, u64)>,
 ) -> PendingQuestion {
     let tables = agent_tables(&AgentType::Codex);
-    let detail = tool_detail.clone().unwrap_or_default();
-    let options = table_options(
+    let mut options = table_options(
         tables,
         MenuKind::Permission,
         version,
         1,
         &|_| true,
-        &|template: &str| template.replace("{detail}", &detail),
+        &|s: &str| s.to_string(),
     );
+    settle_always_scope(&mut options, command.and_then(codex_prefix_scope));
     PendingQuestion {
         id,
         kind: QuestionKind::Permission,
@@ -1146,6 +1208,25 @@ pub fn codex_permission_request(
         subagent_id: None,
         revision: None,
     }
+}
+
+/// PRD #1542 (audit A2, Codex): the confirmation for Codex's "don't ask again
+/// for commands that start with the prefix shown", from the table's scope
+/// template filled with the WHOLE command — the prefix Codex grants is cut
+/// from it. `None` when the command is empty or untrimmed, or the sentence
+/// cannot be shown whole ([`scope_shown_whole`]: too long, or a line break,
+/// control or bidi character the snapshot would strip).
+pub fn codex_prefix_scope(command: &str) -> Option<String> {
+    if command.is_empty() || command.trim() != command {
+        return None;
+    }
+    let template = agent_tables(&AgentType::Codex)?
+        .menu(MenuKind::Permission)
+        .iter()
+        .find(|o| o.role == OptionRole::AllowAlways)?
+        .scope?;
+    let scope = template.replace("{detail}", command);
+    scope_shown_whole(&scope).then_some(scope)
 }
 
 /// PRD #1542: Codex's `request_user_input` tool, from its `PreToolUse` →
@@ -1274,16 +1355,16 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         .and_then(|m| str_field(m, "command"))
         .map(str::to_string)
         .or_else(|| Some(patterns("patterns")).filter(|p| !p.is_empty()));
-    let always = patterns("always");
     let tables = agent_tables(&AgentType::OpenCode);
-    let options = table_options(
+    let mut options = table_options(
         tables,
         MenuKind::Permission,
         None,
         1,
         &|_| true,
-        &|template: &str| template.replace("{patterns}", &always),
+        &|s: &str| s.to_string(),
     );
+    settle_always_scope(&mut options, opencode_always_scope(props));
     Some(PendingQuestion {
         id,
         kind: QuestionKind::Permission,
@@ -1303,6 +1384,33 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         subagent_id: None,
         revision: None,
     })
+}
+
+/// PRD #1542 (audit A2, OpenCode): what OpenCode's "Allow always" grants —
+/// EVERY pattern in `permission.asked`'s `always`, which the `always` reply
+/// approves together — as the confirmation's sentence, from the table's scope
+/// template with the patterns joined by `, `. `None` when the list is empty, a
+/// pattern is not exact ([`scope_part_is_exact`]), or the sentence cannot be
+/// shown whole ([`scope_shown_whole`]); the option is then keyboard-only and
+/// [`opencode_reply`] refuses to send `always`, so no grant reaches a pattern
+/// the confirmation did not show.
+pub fn opencode_always_scope(props: &Value) -> Option<String> {
+    let patterns: Vec<&str> = props
+        .get("always")?
+        .as_array()?
+        .iter()
+        .map(|p| p.as_str().filter(|p| scope_part_is_exact(p)))
+        .collect::<Option<_>>()?;
+    if patterns.is_empty() {
+        return None;
+    }
+    let template = agent_tables(&AgentType::OpenCode)?
+        .menu(MenuKind::Permission)
+        .iter()
+        .find(|o| o.role == OptionRole::AllowAlways)?
+        .scope?;
+    let scope = template.replace("{patterns}", &patterns.join(", "));
+    scope_shown_whole(&scope).then_some(scope)
 }
 
 /// PRD #1542: OpenCode's `question.asked` properties → a held
@@ -1354,7 +1462,8 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
 /// What the OpenCode plugin does with an answer: POST `body` to
 /// `/permission/{request_id}/reply` or `/question/{request_id}/reply`.
 ///
-/// Permission: allow-once → `once`, always → `always`, deny → `reject`. A form:
+/// Permission: allow-once → `once`, always → `always` (nothing when
+/// [`opencode_always_scope`] cannot show its scope whole), deny → `reject`. A form:
 /// `answers` = one array of labels per question, in question order, labels
 /// taken from the payload by index; a free-text answer is the text as the
 /// array's one element [unverified — the lane-2 test pins it].
@@ -1368,7 +1477,11 @@ pub fn opencode_reply(
         QuestionKind::Permission => {
             let reply = match answers.first()?.roles.first()? {
                 OptionRole::AllowOnce => "once",
-                OptionRole::AllowAlways => "always",
+                // Only a scope the confirmation showed whole (audit A2).
+                OptionRole::AllowAlways => {
+                    opencode_always_scope(props)?;
+                    "always"
+                }
                 OptionRole::Deny => "reject",
                 _ => return None,
             };
@@ -1562,6 +1675,9 @@ pub fn answer_keys(
                 .first()
                 .and_then(|q| q.options.iter().find(|o| o.index == index))
                 .ok_or(AnswerRefusal::Unsupported)?;
+            if !option.answerable() {
+                return Err(AnswerRefusal::KeyboardOnly);
+            }
             // Each answerable role appears once in a keyed menu (the table
             // tests pin it), so the chosen option's role names its entry.
             let keys = tables
@@ -2088,6 +2204,159 @@ mod tests {
                 .unwrap(),
         );
         assert!(claude_decision(&question, None, Some(&short), &reply).is_some());
+    }
+
+    /// Scenario: OpenCode asks to "Allow always" a list of patterns too long, or
+    /// too odd, to show whole, and Codex offers "don't ask again" for a command
+    /// too long or spanning lines. Each reaches the card through the event's
+    /// own sanitizing as a keyboard-only option with nothing to confirm, a
+    /// forged reply sends no `always` and types no `p`, and Devin's "allow
+    /// for …" options stay keyboard-only; short ones show every pattern, and
+    /// the whole command, and are sent.
+    #[spec("question/hold/014")]
+    #[test]
+    fn question_hold_014_opencode_and_codex_always_scopes_shown_whole_or_keyboard_only() {
+        let through_event = |built: PendingQuestion, agent: &str| -> PendingQuestion {
+            let mut event: crate::event::AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "s-scope",
+                "agent_type": agent,
+                "event_type": "permission_request",
+                "timestamp": "2026-10-04T10:00:00Z",
+            }))
+            .unwrap();
+            event.set_question(&built);
+            event.question().expect("the question survives sanitizing")
+        };
+        let always_of = |question: &PendingQuestion| -> QuestionOption {
+            question.questions[0]
+                .options
+                .iter()
+                .find(|o| o.role == OptionRole::AllowAlways)
+                .expect("an always option")
+                .clone()
+        };
+        let forged = |always: &QuestionOption| ResolvedAnswer {
+            question_index: 0,
+            option_indices: vec![always.index],
+            labels: vec![always.label.clone()],
+            roles: vec![OptionRole::AllowAlways],
+            text: None,
+        };
+        let props = |always: Value| {
+            serde_json::json!({
+                "id": "per_scope",
+                "permission": "bash",
+                "patterns": ["make all"],
+                "metadata": {"command": "make all"},
+                "always": always,
+            })
+        };
+
+        // OpenCode: the reply's `always` grants every pattern in the list.
+        let many: Vec<String> = (0..20)
+            .map(|i| format!("make a-rather-long-target-name-{i} *"))
+            .collect();
+        for (name, always) in [
+            ("many patterns", serde_json::json!(many)),
+            ("a bidi character", serde_json::json!(["rm \u{202e}* *"])),
+            ("a comma", serde_json::json!(["git status *, rm *"])),
+            ("no pattern", serde_json::json!([])),
+        ] {
+            let props = props(always);
+            assert_eq!(opencode_always_scope(&props), None, "{name}");
+            let question =
+                through_event(opencode_permission_asked(&props, 1).unwrap(), "open_code");
+            let always = always_of(&question);
+            assert!(
+                always.keyboard_only && always.scope.is_none() && !always.answerable(),
+                "{name}: keyboard-only, nothing to confirm: {always:?}"
+            );
+            assert_eq!(
+                question.validate(&[answer(0, &[always.index], None)], true),
+                Err(AnswerRefusal::KeyboardOnly),
+                "{name}: no client can send it"
+            );
+            let reply = QuestionReply::answered(&question.id, vec![forged(&always)]);
+            assert_eq!(
+                opencode_reply(&question, &props, &reply),
+                None,
+                "{name}: no `always` grants a pattern the confirmation did not show"
+            );
+        }
+        let props = props(serde_json::json!(["git status *", "git diff *"]));
+        let question = through_event(opencode_permission_asked(&props, 1).unwrap(), "open_code");
+        let always = always_of(&question);
+        assert_eq!(
+            always.scope.as_deref(),
+            Some("requests matching git status *, git diff *"),
+            "every pattern, unchanged by sanitizing"
+        );
+        let reply = QuestionReply::answered(
+            &question.id,
+            question
+                .validate(&[answer(0, &[always.index], None)], true)
+                .unwrap(),
+        );
+        assert_eq!(
+            opencode_reply(&question, &props, &reply).unwrap()["body"]["reply"],
+            "always"
+        );
+
+        // Codex: the prefix `p` grants is cut from the whole command.
+        let long = format!("cargo build {}", "--features e2e ".repeat(30).trim_end());
+        for (name, command) in [
+            ("a long command", Some(long.as_str())),
+            ("two lines", Some("touch a\nrm -rf b")),
+            ("a bidi character", Some("touch \u{202e}a")),
+            ("no command", None),
+        ] {
+            let question = through_event(
+                codex_permission_request("q-codex".into(), "Bash", None, command, 1, None),
+                "codex",
+            );
+            let always = always_of(&question);
+            assert!(
+                always.keyboard_only && always.scope.is_none() && !always.answerable(),
+                "{name}: keyboard-only, nothing to confirm: {always:?}"
+            );
+            assert_eq!(
+                question.validate(&[answer(0, &[always.index], None)], true),
+                Err(AnswerRefusal::KeyboardOnly),
+                "{name}: no client can send it"
+            );
+            assert_eq!(
+                answer_keys(&AgentType::Codex, &question, &[forged(&always)]),
+                Err(AnswerRefusal::KeyboardOnly),
+                "{name}: no `p` is typed for a command the confirmation did not show"
+            );
+        }
+        let question = through_event(
+            codex_permission_request("q-codex".into(), "Bash", None, Some("touch x"), 1, None),
+            "codex",
+        );
+        let always = always_of(&question);
+        assert!(always.scope.as_deref().unwrap().contains("`touch x`"));
+        let resolved = question
+            .validate(&[answer(0, &[always.index], None)], true)
+            .unwrap();
+        assert_eq!(
+            answer_keys(&AgentType::Codex, &question, &resolved),
+            Ok(vec!["p".to_string()])
+        );
+
+        // Devin: its "allow for …" options are keyboard-only by table.
+        let devin = devin_permission_request("q-devin".into(), "exec", None, 1, None);
+        let alwayses: Vec<_> = devin.questions[0]
+            .options
+            .iter()
+            .filter(|o| o.role == OptionRole::AllowAlways)
+            .collect();
+        assert!(!alwayses.is_empty());
+        assert!(
+            alwayses
+                .iter()
+                .all(|o| o.keyboard_only && o.scope.is_none())
+        );
     }
 
     /// Scenario: Every shape an answer can be wrong in is refused with the

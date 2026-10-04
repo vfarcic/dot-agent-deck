@@ -130,11 +130,18 @@ pub enum Leased {
     TooLate(AnswerReport),
     /// The lease held throughout.
     Sent(AnswerReport),
+    /// The send failed — it timed out, or the connection broke — AFTER the
+    /// gate let the request through, so it may have been written and acted
+    /// on: the outcome is unknown, never "nothing was sent". Carries the
+    /// failure, for the log.
+    Unconfirmed(String),
 }
 
 /// Run `send` under `lease`. `send` gets the lease's `still_wanted` gate to
 /// pass to `DaemonClient::answer_question_while`; a `Superseded` report while
-/// the lease is dead is the gate having held the frame back.
+/// the lease is dead is the gate having held the frame back. A failure before
+/// the gate let the request through is returned as the error it is — nothing
+/// was sent; one after is [`Leased::Unconfirmed`].
 pub async fn send_leased<F>(
     lease: &AnswerLease,
     send: impl FnOnce(Box<dyn Fn() -> bool + Send + Sync>) -> F,
@@ -145,7 +152,23 @@ where
     if !lease.is_live() {
         return Ok(Leased::Cancelled);
     }
-    let report = send(Box::new(lease.still_wanted())).await?;
+    let passed = Arc::new(AtomicBool::new(false));
+    let gate = {
+        let still_wanted = lease.still_wanted();
+        let passed = Arc::clone(&passed);
+        move || {
+            let wanted = still_wanted();
+            if wanted {
+                passed.store(true, Ordering::SeqCst);
+            }
+            wanted
+        }
+    };
+    let report = match send(Box::new(gate)).await {
+        Ok(report) => report,
+        Err(failure) if passed.load(Ordering::SeqCst) => return Ok(Leased::Unconfirmed(failure)),
+        Err(failure) => return Err(failure),
+    };
     Ok(match report {
         AnswerReport::Superseded | AnswerReport::Withheld if !lease.is_live() => Leased::Cancelled,
         AnswerReport::Answered | AnswerReport::Refused(_) if !lease.is_live() => {
@@ -165,7 +188,9 @@ mod tests {
     /// before the frame finds the lease dead and nothing is written. A cancel
     /// that reaches Rust before its send does still kills it, and a cancel that
     /// lands after the frame was written is reported as too late, not as
-    /// nothing sent.
+    /// nothing sent. A send that times out after the gate let the frame
+    /// through is reported unconfirmed — it may have been sent — and one that
+    /// fails before the gate is the plain error.
     #[tokio::test]
     async fn question_desktop_011_a_cancelled_lease_writes_no_frame() {
         let leases = AnswerLeases::default();
@@ -223,6 +248,28 @@ mod tests {
         let held = leases.begin("lease-4");
         let outcome = send_leased(&held, |_| async { Ok(AnswerReport::Answered) }).await;
         assert_eq!(outcome, Ok(Leased::Sent(AnswerReport::Answered)));
+
+        // A send that fails after the gate let the request through may have
+        // been acted on: unconfirmed, not an error saying nothing went. One
+        // that fails before the gate is the plain error.
+        let timed_out = leases.begin("lease-5");
+        let outcome = send_leased(&timed_out, |still_wanted| async move {
+            assert!(still_wanted());
+            Err("the deck did not answer in time".to_string())
+        })
+        .await;
+        assert_eq!(
+            outcome,
+            Ok(Leased::Unconfirmed(
+                "the deck did not answer in time".to_string()
+            ))
+        );
+        let unreached = leases.begin("lease-6");
+        let outcome = send_leased(&unreached, |_| async {
+            Err("the deck did not answer in time".to_string())
+        })
+        .await;
+        assert_eq!(outcome, Err("the deck did not answer in time".to_string()));
 
         assert!(is_valid_lease("a1-b2"));
         assert!(!is_valid_lease(""));

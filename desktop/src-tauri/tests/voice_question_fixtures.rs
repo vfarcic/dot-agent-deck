@@ -290,6 +290,7 @@ fn build(planted: Planted) -> PendingQuestion {
                 payload["tool_input"]["command"]
                     .as_str()
                     .map(str::to_string),
+                payload["tool_input"]["command"].as_str(),
                 1,
                 None,
             )

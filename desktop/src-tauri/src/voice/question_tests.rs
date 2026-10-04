@@ -518,6 +518,34 @@ fn question_desktop_every_refusal_has_its_sentence() {
     }
     assert!(sentences.contains("No question is waiting in this agent."));
     assert!(sentences.contains("Couldn't send the answer: pane closed."));
+    // The agent did not confirm it took the answer: unknown, never "nothing
+    // was sent" — and the same when the deck's report never came back after
+    // the request was written.
+    let unconfirmed = report_outcome(
+        "tester",
+        &question,
+        &[],
+        &AnswerReport::Refused(AnswerRefusal::Unconfirmed),
+    );
+    assert_eq!(unconfirmed.kind, "unconfirmed");
+    assert_eq!(unconfirmed.code, Some("unconfirmed"));
+    let timed_out = leased_outcome(
+        "tester",
+        &question,
+        &[],
+        crate::voice::lease::Leased::Unconfirmed("the deck did not answer in time".into()),
+    );
+    assert_eq!(timed_out.kind, "unconfirmed");
+    for outcome in [&unconfirmed, &timed_out] {
+        assert!(
+            outcome.sentence.contains("may have been sent"),
+            "{outcome:?}"
+        );
+        assert!(
+            !outcome.sentence.contains("nothing was sent"),
+            "{outcome:?}"
+        );
+    }
     assert_eq!(
         report_outcome("tester", &question, &[], &AnswerReport::Withheld).kind,
         "withheld"

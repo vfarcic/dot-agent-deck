@@ -5221,14 +5221,43 @@ pub struct HeldQuestions {
 struct HeldQuestion {
     agent_id: String,
     generation: u64,
-    tx: tokio::sync::oneshot::Sender<crate::question::QuestionReply>,
+    tx: tokio::sync::oneshot::Sender<HeldReply>,
+}
+
+/// What a held connection's handler is handed: the reply to write, and — for
+/// an answer — where to report what became of it ([`ReplyDelivery`]).
+pub struct HeldReply {
+    pub reply: crate::question::QuestionReply,
+    pub delivery: Option<tokio::sync::oneshot::Sender<ReplyDelivery>>,
+}
+
+impl HeldReply {
+    fn released(question_id: &str, reason: crate::question::ReleaseReason) -> Self {
+        Self {
+            reply: crate::question::QuestionReply::released(question_id, reason),
+            delivery: None,
+        }
+    }
+}
+
+/// PRD #1542: what became of a held answer once the handler wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyDelivery {
+    /// Written to a producer that does not acknowledge (it acts on the line
+    /// itself), or acknowledged as taken by the agent.
+    Delivered,
+    /// The producer reported that the agent did not take it, and why.
+    NotAccepted(String),
+    /// The producer asked to acknowledge and did not, in time — or the line
+    /// could not be written. The agent may or may not have the answer.
+    Unconfirmed,
 }
 
 /// One registration in [`HeldQuestions`]: the receiver the answer arrives on,
 /// and the generation [`HeldQuestions::forget`] must name.
 pub struct QuestionHold {
     pub generation: u64,
-    pub rx: tokio::sync::oneshot::Receiver<crate::question::QuestionReply>,
+    pub rx: tokio::sync::oneshot::Receiver<HeldReply>,
 }
 
 impl HeldQuestions {
@@ -5248,7 +5277,7 @@ impl HeldQuestions {
             },
         );
         if let Some(previous) = previous {
-            let _ = previous.tx.send(crate::question::QuestionReply::released(
+            let _ = previous.tx.send(HeldReply::released(
                 question_id,
                 crate::question::ReleaseReason::Superseded,
             ));
@@ -5295,7 +5324,8 @@ impl HeldQuestions {
     /// registration's generation — the revision the answer was validated
     /// against (audit A4). `false` when nothing holds it, it belongs to another
     /// agent or another registration (either of which is left alone), or the
-    /// holder has already gone.
+    /// holder has already gone; otherwise the receiver the handler reports
+    /// the answer's [`ReplyDelivery`] on, once it has written it.
     pub fn answer(
         &self,
         pane_id: &str,
@@ -5303,7 +5333,7 @@ impl HeldQuestions {
         question_id: &str,
         revision: Option<u64>,
         reply: crate::question::QuestionReply,
-    ) -> bool {
+    ) -> Option<tokio::sync::oneshot::Receiver<ReplyDelivery>> {
         let held = {
             let mut holds = self.holds.lock().unwrap();
             let key = (pane_id.to_string(), question_id.to_string());
@@ -5314,7 +5344,15 @@ impl HeldQuestions {
                 _ => None,
             }
         };
-        held.is_some_and(|held| held.tx.send(reply).is_ok())
+        let (delivery, delivered) = tokio::sync::oneshot::channel();
+        held?
+            .tx
+            .send(HeldReply {
+                reply,
+                delivery: Some(delivery),
+            })
+            .ok()?;
+        Some(delivered)
     }
 
     /// Release every hold on `pane_id` except `keep` — the question pending
@@ -5349,9 +5387,7 @@ impl HeldQuestions {
         };
         let count = released.len();
         for (id, held) in released {
-            let _ = held
-                .tx
-                .send(crate::question::QuestionReply::released(&id, reason));
+            let _ = held.tx.send(HeldReply::released(&id, reason));
         }
         count
     }
@@ -5361,9 +5397,7 @@ impl HeldQuestions {
         let all: Vec<((String, String), HeldQuestion)> =
             self.holds.lock().unwrap().drain().collect();
         for ((_, id), held) in all {
-            let _ = held
-                .tx
-                .send(crate::question::QuestionReply::released(&id, reason));
+            let _ = held.tx.send(HeldReply::released(&id, reason));
         }
     }
 
@@ -5667,6 +5701,16 @@ impl QuestionAnswers {
             .lock()
             .unwrap()
             .insert(pane_id.to_string(), question_id.to_string());
+    }
+
+    /// Forget that the deck answered `question_id` on `pane_id`, when it is
+    /// still the last one it did — the agent reported that it did not take
+    /// the answer, so the same question raised again must be answerable.
+    pub fn unmark_answered(&self, pane_id: &str, question_id: &str) {
+        let mut answered = self.answered.lock().unwrap();
+        if answered.get(pane_id).is_some_and(|id| id == question_id) {
+            answered.remove(pane_id);
+        }
     }
 
     /// Test seam: make the next [`Self::barrier`] named `name` report that it

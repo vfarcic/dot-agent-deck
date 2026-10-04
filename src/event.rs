@@ -2621,6 +2621,13 @@ pub struct QuestionSignal {
     /// Keep this connection open for the answer.
     #[serde(default)]
     pub hold: bool,
+    /// PRD #1542: after an answered reply this producer writes one
+    /// [`crate::question::ReplyAck`] line saying whether the agent took the
+    /// answer, and the daemon reports the answer only once it has. Only the
+    /// OpenCode plugin's `await-answer` child sets it: it hands the answer to
+    /// OpenCode's reply API, which can refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
 }
 
 impl QuestionSignal {

@@ -76,6 +76,11 @@ Nothing is sent, and the row says why, when:
 - the agent's questions cannot be answered by voice at all: *… 's questions have to be answered by keyboard.*
 - the daemon is older than the app and cannot answer questions: *This deck cannot answer questions by voice — update the deck to use it. Nothing was sent.*
 
+Two outcomes are not "nothing was sent":
+
+- the answer reached OpenCode but OpenCode did not take it: *Couldn't send the answer: the agent did not take it (…) and is asking again.* The question shows again; answer it again, by voice or in the pane.
+- the answer may have reached the agent, but the deck could not confirm it in time: *The answer may have been sent, but … did not confirm it — check … before answering again.* Look at the pane before you answer again, so that you do not answer twice.
+
 ### Which questions each agent can answer by voice
 
 | Agent | By voice | By keyboard only |
@@ -234,6 +239,7 @@ What went wrong is shown beside the Voice button.
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
 | "yes" to an agent showing **Needs Input** finds no matching action | The deck does not know that question: the agent or its version is not covered, or its hooks are missing. | Check [which questions each agent can answer](#which-questions-each-agent-can-answer-by-voice), and answer in the pane. |
 | An answer to a question is refused with "has to be answered by keyboard" | That option, or that agent's questions, cannot be answered by voice. | Answer in the pane. |
+| An answer says it "may have been sent" | The deck could not confirm in time that the agent got it. | Check the pane; answer there only if the agent is still asking. |
 | A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
 | "Select daemon 13" chooses nothing and says no daemon shows 13 | The number belongs to another list, such as the directories. | Say that list's name with the number, for example "directory 13". |
 | A name is refused with "is on page 2: say “next page”" | The item is on another page of a list shown in pages. | Turn to that page and say it again, or narrow a directory list with "filter …". |

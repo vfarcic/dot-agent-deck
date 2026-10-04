@@ -1882,6 +1882,14 @@ pub const QUESTION_HOLD_DEADLINE: Duration = Duration::from_secs(3600 + 120);
 /// prompt is answered by keyboard.
 pub const MAX_HELD_QUESTIONS: usize = 64;
 
+/// PRD #1542: how long the daemon waits, after writing an answer to a producer
+/// that acknowledges (`QuestionSignal::ack` — OpenCode's plugin), for its
+/// report of whether the agent took it. The plugin posts to OpenCode's local
+/// reply API, which answers in milliseconds; past this the deck's answer is
+/// reported unconfirmed. Kept well inside the desktop's own 15 s wait for the
+/// answer's report.
+pub const HELD_REPLY_ACK_WAIT: Duration = Duration::from_secs(5);
+
 /// The most bytes read from a holding producer's connection while it waits.
 /// A holding producer sends nothing more, so any byte at all means it is gone
 /// or misbehaving; the small cap keeps a held connection from costing a
@@ -1896,6 +1904,7 @@ struct HookLoopLimits {
     max_connections: usize,
     hold_deadline: Duration,
     max_holds: usize,
+    ack_wait: Duration,
 }
 
 impl HookLoopLimits {
@@ -1905,6 +1914,7 @@ impl HookLoopLimits {
             max_connections: MAX_CONCURRENT_HOOK_CONNECTIONS,
             hold_deadline: QUESTION_HOLD_DEADLINE,
             max_holds: MAX_HELD_QUESTIONS,
+            ack_wait: HELD_REPLY_ACK_WAIT,
         }
     }
 }
@@ -1940,10 +1950,11 @@ struct QuestionConnection<'a, R> {
 /// and waits under [`MAX_HELD_QUESTIONS`] and the hold deadline instead (audit
 /// A6).
 ///
-/// Returns the reply line to write, or `None` when the producer's connection
-/// closed while it waited — the producer is gone, so the question goes too
-/// (Claude Code kills its hook when the keyboard answers No or Esc
-/// [observed]); the status is left for the next event to decide.
+/// Returns the reply line to write — with, for an answer, where to report
+/// what became of it ([`crate::agent_pty::ReplyDelivery`]) — or `None` when
+/// the producer's connection closed while it waited: the producer is gone, so
+/// the question goes too (Claude Code kills its hook when the keyboard answers
+/// No or Esc [observed]); the status is left for the next event to decide.
 async fn handle_question_signal<R>(
     signal: crate::event::QuestionSignal,
     attested_agent: Option<String>,
@@ -1951,11 +1962,15 @@ async fn handle_question_signal<R>(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
     conn: QuestionConnection<'_, R>,
-) -> Option<crate::question::QuestionReply>
+) -> Option<crate::agent_pty::HeldReply>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     use crate::question::{QuestionReply, ReleaseReason};
+    let reply = |reply: QuestionReply| crate::agent_pty::HeldReply {
+        reply,
+        delivery: None,
+    };
     let crate::event::QuestionSignal {
         pane_id,
         mut event,
@@ -2003,15 +2018,15 @@ where
     registry.set_agent_type(&pane_id, &event.agent_type);
     let Some((id, agent_id, _budget)) = holding else {
         ingest_event(state, event_tx, registry, event).await;
-        return Some(QuestionReply::released(
+        return Some(reply(QuestionReply::released(
             question_id.as_deref().unwrap_or(""),
             ReleaseReason::NotHeld,
-        ));
+        )));
     };
     let Some(hold) =
         register_and_publish_held(state, event_tx, registry, &pane_id, &agent_id, event).await
     else {
-        return Some(QuestionReply::released(&id, ReleaseReason::NotHeld));
+        return Some(reply(QuestionReply::released(&id, ReleaseReason::NotHeld)));
     };
     // Held: the hook-pool slot goes back, so this wait never queues another
     // producer's hook (audit A6). `_budget` bounds it instead.
@@ -2020,16 +2035,69 @@ where
     // producer sends nothing more on this connection.
     let gone = crate::bounded_read::read_capped_line(conn.reader, HELD_CONNECTION_READ_CAP);
     tokio::select! {
-        reply = hold.rx => Some(reply.unwrap_or_else(|_| QuestionReply::released(&id, ReleaseReason::Cleared))),
+        held = hold.rx => Some(held.unwrap_or_else(|_| reply(QuestionReply::released(&id, ReleaseReason::Cleared)))),
         _ = gone => {
             drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the producer stopped waiting before an answer").await;
             None
         }
         _ = tokio::time::sleep(conn.hold_deadline) => {
             drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the daemon's hold deadline passed").await;
-            Some(QuestionReply::released(&id, ReleaseReason::Cleared))
+            Some(reply(QuestionReply::released(&id, ReleaseReason::Cleared)))
         }
     }
+}
+
+/// PRD #1542: write a held connection's one reply line and, for an answer,
+/// report what became of it to the deck's `AnswerQuestion` handler waiting on
+/// `delivery`. A producer that asked to acknowledge (`ack`, the OpenCode
+/// plugin's child) then writes one [`crate::question::ReplyAck`] line, read
+/// within `ack_wait`; any other producer acts on the line itself, so a written
+/// line is a delivered answer, as it always was.
+async fn write_held_reply<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    held: crate::agent_pty::HeldReply,
+    ack: bool,
+    ack_wait: Duration,
+) where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use crate::agent_pty::ReplyDelivery;
+    let Ok(json) = serde_json::to_string(&held.reply) else {
+        return;
+    };
+    let written = async {
+        writer.write_all(format!("{json}\n").as_bytes()).await?;
+        writer.flush().await
+    }
+    .await
+    .is_ok();
+    let Some(delivery) = held.delivery else {
+        return;
+    };
+    let outcome = if !ack {
+        ReplyDelivery::Delivered
+    } else if !written {
+        ReplyDelivery::Unconfirmed
+    } else {
+        match tokio::time::timeout(
+            ack_wait,
+            crate::bounded_read::read_capped_line(reader, HELD_CONNECTION_READ_CAP),
+        )
+        .await
+        {
+            Ok(Ok(Some(line))) => {
+                match serde_json::from_str::<crate::question::ReplyAck>(line.trim()) {
+                    Ok(ack) if ack.delivered => ReplyDelivery::Delivered,
+                    Ok(ack) => ReplyDelivery::NotAccepted(ack.detail_for_client()),
+                    Err(_) => ReplyDelivery::Unconfirmed,
+                }
+            }
+            _ => ReplyDelivery::Unconfirmed,
+        }
+    };
+    let _ = delivery.send(outcome);
 }
 
 /// PRD #1542 (audit R1/R3): register a hold for the question `event` raises on
@@ -4470,7 +4538,8 @@ async fn run_hook_loop_with_limits(
                                     // handler, so a socket kept open past the
                                     // reply would otherwise read and dispatch
                                     // more lines outside both bounds.
-                                    let Some(reply) = handle_question_signal(
+                                    let ack = signal.ack;
+                                    let Some(held) = handle_question_signal(
                                         signal,
                                         attested_agent.clone(),
                                         &state,
@@ -4487,12 +4556,14 @@ async fn run_hook_loop_with_limits(
                                     else {
                                         break;
                                     };
-                                    if let Ok(json) = serde_json::to_string(&reply) {
-                                        let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
-                                    }
+                                    write_held_reply(
+                                        &mut reader,
+                                        &mut write_half,
+                                        held,
+                                        ack,
+                                        limits.ack_wait,
+                                    )
+                                    .await;
                                     break;
                                 }
                                 DaemonMessage::ListTargets(req) => {
@@ -10005,6 +10076,7 @@ mod question_hold_tests {
                 token: Some(token.clone()),
                 event: question_event(&agent, id),
                 hold: true,
+                ack: false,
             });
             let sock = sock.clone();
             async move {
@@ -10135,6 +10207,7 @@ mod question_hold_tests {
             token: Some(token.clone()),
             event: question_event(&agent, "q-gone"),
             hold: true,
+            ack: false,
         });
         let mut producer = UnixStream::connect(&sock).await.expect("connect");
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -10282,6 +10355,22 @@ mod question_hold_tests {
         /// [`Self::hold`], for a Bash permission whose command is `detail` —
         /// the question's content.
         async fn hold_with(&self, agent: &Agent, question_id: &str, detail: &str) -> UnixStream {
+            self.hold_signal(agent, question_id, detail, false).await
+        }
+
+        /// A producer that acknowledges (`ack`, as the OpenCode plugin's
+        /// child does) holding `question_id` for `agent`.
+        async fn hold_acking(&self, agent: &Agent, question_id: &str) -> UnixStream {
+            self.hold_signal(agent, question_id, "touch x", true).await
+        }
+
+        async fn hold_signal(
+            &self,
+            agent: &Agent,
+            question_id: &str,
+            detail: &str,
+            ack: bool,
+        ) -> UnixStream {
             let mut event = self.question_on(agent, question_id, detail);
             let question = event.question().unwrap();
             event.set_question(&question);
@@ -10290,6 +10379,7 @@ mod question_hold_tests {
                 token: Some(agent.token.clone()),
                 event,
                 hold: true,
+                ack,
             });
             let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
             let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
@@ -10450,15 +10540,18 @@ mod question_hold_tests {
         let mut on_b = deck.hold(&b, "q-same").await;
         deck.until_held(&b, "q-same").await;
         assert!(
-            !deck.registry.question_holds().answer(
-                &b.pane,
-                &a.id,
-                "q-same",
-                deck.registry
-                    .question_holds()
-                    .generation_of(&b.pane, "q-same"),
-                QuestionReply::answered("q-same", Vec::new())
-            ),
+            deck.registry
+                .question_holds()
+                .answer(
+                    &b.pane,
+                    &a.id,
+                    "q-same",
+                    deck.registry
+                        .question_holds()
+                        .generation_of(&b.pane, "q-same"),
+                    QuestionReply::answered("q-same", Vec::new())
+                )
+                .is_none(),
             "a hold is answered only for the agent that registered it"
         );
         assert!(deck.registry.question_holds().is_held(&b.pane, "q-same"));
@@ -10982,6 +11075,7 @@ mod question_hold_tests {
                     token,
                     event,
                     hold: false,
+                    ack: false,
                 },
             ))
             .unwrap()
@@ -11097,5 +11191,93 @@ mod question_hold_tests {
             }
         };
         assert!(released.is_daemon_synthetic());
+    }
+
+    /// Scenario: A producer that reports whether the agent took the answer —
+    /// the OpenCode plugin's child — holds a question. The deck answers; the
+    /// producer hears it and reports that OpenCode refused the reply, so the
+    /// deck's answer is refused as not sent, saying why, and the same question
+    /// raised again can be answered again, this time reported taken. A
+    /// producer that reports nothing in time leaves the answer unconfirmed.
+    #[spec("question/hold/015")]
+    #[tokio::test]
+    async fn question_hold_015_an_answer_the_agent_does_not_take_is_reported_and_answerable_again()
+    {
+        let deck = Deck::start(HookLoopLimits {
+            ack_wait: Duration::from_millis(300),
+            ..limits()
+        })
+        .await;
+        let a = deck.agent("pane-ack").await;
+        let acknowledge = |producer: UnixStream, ack: Option<&'static str>| async move {
+            let mut reader = tokio::io::BufReader::new(producer);
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .expect("the answer arrives")
+                .unwrap();
+            let reply: QuestionReply = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(reply.outcome, ReplyOutcome::Answered);
+            if let Some(ack) = ack {
+                let mut producer = reader.into_inner();
+                producer
+                    .write_all(format!("{ack}\n").as_bytes())
+                    .await
+                    .unwrap();
+                producer.flush().await.unwrap();
+                producer
+            } else {
+                reader.into_inner()
+            }
+        };
+
+        // OpenCode refuses the reply: the deck says so, and why.
+        let producer = deck.hold_acking(&a, "per_ack").await;
+        deck.until_held(&a, "per_ack").await;
+        let (answered, _producer) = tokio::join!(
+            deck.answer(&a, "per_ack"),
+            acknowledge(
+                producer,
+                Some(r#"{"delivered":false,"detail":"OpenCode answered 500\u202e"}"#)
+            )
+        );
+        match answered {
+            Err(crate::question::AnswerRefusal::WriteFailed { detail }) => {
+                assert!(detail.contains("OpenCode answered 500"), "{detail}");
+                assert!(detail.contains("asking again"), "{detail}");
+                assert!(
+                    !detail.contains('\u{202e}'),
+                    "the detail is sanitized: {detail:?}"
+                );
+            }
+            other => panic!("not reported as not sent: {other:?}"),
+        }
+
+        // The plugin raises it again under the same id: answerable, and taken.
+        let producer = deck.hold_acking(&a, "per_ack").await;
+        deck.until_held(&a, "per_ack").await;
+        let (answered, _producer) = tokio::join!(
+            deck.answer(&a, "per_ack"),
+            acknowledge(producer, Some(r#"{"delivered":true}"#))
+        );
+        assert_eq!(answered, Ok(()), "the re-raised question is answered");
+        assert_eq!(
+            deck.answer(&a, "per_ack").await,
+            Err(crate::question::AnswerRefusal::NoPendingQuestion),
+            "and, once taken, not answered twice"
+        );
+
+        // No report in time: unconfirmed, never "answered".
+        let producer = deck.hold_acking(&a, "per_silent").await;
+        deck.until_held(&a, "per_silent").await;
+        let (answered, _producer) =
+            tokio::join!(deck.answer(&a, "per_silent"), acknowledge(producer, None));
+        assert_eq!(answered, Err(crate::question::AnswerRefusal::Unconfirmed));
+        assert!(
+            deck.registry
+                .question_answers()
+                .is_answered(&a.pane, "per_silent"),
+            "an unconfirmed answer may have been taken, so it is not offered again"
+        );
     }
 }

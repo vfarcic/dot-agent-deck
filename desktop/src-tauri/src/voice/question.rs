@@ -814,8 +814,10 @@ pub fn answers_of(form: &[Selection]) -> Vec<QuestionAnswer> {
 #[serde(rename_all = "camelCase")]
 pub struct AnswerOutcome {
     /// `answered`, `refused`, `withheld`, `superseded`, `cancelled` (the
-    /// panel's lease was cancelled before the request was written) or
-    /// `too_late` (it was cancelled after).
+    /// panel's lease was cancelled before the request was written),
+    /// `too_late` (it was cancelled after) or `unconfirmed` (the request was
+    /// written but what became of it is unknown: no report came back in time,
+    /// or the agent did not confirm it took the answer).
     pub kind: &'static str,
     /// The refusal's code (`no_pending_question`, `stale`, …) for a refusal.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -851,7 +853,24 @@ pub fn report_outcome(
             code: None,
             sentence: QUESTION_MOVED_ON.to_string(),
         },
+        AnswerReport::Refused(AnswerRefusal::Unconfirmed) => {
+            unconfirmed_outcome(agent, Some("unconfirmed"))
+        }
         AnswerReport::Refused(refusal) => refusal_outcome(agent, question, refusal),
+    }
+}
+
+/// The outcome when the answer may have reached the agent but nothing says it
+/// did: the deck's report did not come back in time after the request was
+/// written, or the agent did not confirm it took the answer. Never "nothing
+/// was sent" — answering again could answer twice.
+pub fn unconfirmed_outcome(agent: &str, code: Option<&'static str>) -> AnswerOutcome {
+    AnswerOutcome {
+        kind: "unconfirmed",
+        code,
+        sentence: format!(
+            "The answer may have been sent, but {agent} did not confirm it — check {agent} before answering again."
+        ),
     }
 }
 
@@ -880,6 +899,7 @@ pub fn leased_outcome(
             }
         }
         Leased::Sent(report) => report_outcome(agent, question, form, &report),
+        Leased::Unconfirmed(_) => unconfirmed_outcome(agent, None),
     }
 }
 
@@ -923,6 +943,8 @@ pub fn refusal_outcome(
                 "{agent}'s prompt was typed into after it asked, so the deck won't type the answer there — finish it by keyboard."
             ),
         ),
+        // Reported by `report_outcome` as `unconfirmed`, not as a refusal.
+        AnswerRefusal::Unconfirmed => return unconfirmed_outcome(agent, Some("unconfirmed")),
         AnswerRefusal::Unknown => (
             "unknown",
             "The deck refused that answer — nothing was sent.".to_string(),

@@ -73,8 +73,8 @@ export type QuestionResultDto = { verdict: QuestionVerdictDto; resolveMs: number
 
 /** What sending a form came to (`voice::question::AnswerOutcome`). */
 export type AnswerOutcomeDto = {
-  /** `cancelled`: the panel's lease was cancelled before the answer went; `too_late`: after. */
-  kind: "answered" | "refused" | "withheld" | "superseded" | "cancelled" | "too_late";
+  /** `cancelled`: the panel's lease was cancelled before the answer went; `too_late`: after; `unconfirmed`: the request went but nothing says what became of it — it may have been sent. */
+  kind: "answered" | "refused" | "withheld" | "superseded" | "cancelled" | "too_late" | "unconfirmed";
   /** The daemon's refusal code, for a refusal. */
   code?: string;
   sentence: string;
