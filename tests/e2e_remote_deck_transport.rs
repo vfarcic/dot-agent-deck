@@ -796,16 +796,27 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
     );
     drop(connection);
     // `process_running` treats a zombie as exited, so this observes the ssh
-    // child exiting; on its own it does not tell an unreaped child from a
-    // reaped one.
+    // child exiting and nothing more; the reap is checked separately below.
     common::wait_until(TEARDOWN_TIMEOUT, || {
         !common::process_running(ssh_pid as i32)
     });
     assert!(
         !common::process_running(ssh_pid as i32),
-        "`EndpointConnection`'s Drop must kill and reap the ssh child (pid \
-         {ssh_pid}); an app that leaks one per reconnect is the orphan this \
-         transport was built to avoid"
+        "`EndpointConnection`'s Drop must kill the ssh child (pid {ssh_pid}); \
+         an app that leaks one per reconnect is the orphan this transport was \
+         built to avoid"
+    );
+    // The ssh child is this test process's own child, and Drop reaps it before
+    // returning. A zombie still accepts `kill(pid, 0)`, so only `ESRCH` shows
+    // the reap happened rather than just the exit.
+    // SAFETY: kill(pid, 0) only probes existence/permission.
+    let probe = unsafe { libc::kill(ssh_pid as libc::pid_t, 0) };
+    let reaped = probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    assert!(
+        reaped,
+        "`EndpointConnection`'s Drop must also reap the ssh child (pid \
+         {ssh_pid}): it exited but is still a zombie, which every reconnect \
+         would leave behind"
     );
     assert!(
         !forwarded.exists(),
