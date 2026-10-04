@@ -4,13 +4,13 @@ This page describes how changes reach `main`, who may approve them, and — beca
 
 ## The model
 
-`main` is protected by a repository ruleset named `main-protected`. Every change lands through a pull request with at least one approving review. A maintainer's own pull request is reviewed by another maintainer. The repository owner retains ownership and can override anything, either by holding the `admin` bypass or by disabling the ruleset outright.
+`main` is protected by a repository ruleset named `main-protected`. A change written by hand must reach `main` through a pull request with at least one approving review from an actor other than its author. That actor is normally the agent reviewer, `dot-agent-deck-reviewer[bot]` (see [The automated reviewer](#the-automated-reviewer)), and can be the other maintainer. Two automated lanes reach `main` with no approval: three CI workflows push to it directly under the admin bypass (next paragraph), and Renovate merges its automerge groups under a `pull_request`-mode bypass (see [Renovate and automerge](#renovate-and-automerge)). The repository owner retains ownership and can override anything, either by holding the `admin` bypass or by disabling the ruleset outright.
 
 Two properties of that arrangement are worth stating plainly rather than discovering later.
 
 **The admin bypass is what keeps releases alive, and it also softens the rule for the owner.** CI pushes to `main` directly — three commits per release since issue #1089, two before it — so *something* has to be allowed past the gate. Granting the bypass to the `admin` repository role covers CI's PAT and, unavoidably, covers the owner's own hands at the same time. Enforcement against the owner is therefore a matter of habit, not of mechanism. The stricter arrangement — no admin bypass, with a GitHub App token as the sole bypass actor — is available and is described under [Making the gate bind the owner too](#making-the-gate-bind-the-owner-too).
 
-**A gate needs two maintainers before it means anything.** Nobody can approve their own pull request. With a single collaborator, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below is sequenced around that fact.
+**A gate needs a second approving actor before it means anything.** Nobody can approve their own pull request. With a single collaborator and no other reviewer, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below was sequenced around that fact by onboarding a second maintainer first (step 3); the agent reviewer, added later by #966, is now what casts the routine approval.
 
 ## Who counts as a maintainer
 
