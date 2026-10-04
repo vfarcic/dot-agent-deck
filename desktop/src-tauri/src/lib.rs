@@ -3686,6 +3686,11 @@ const VOICE_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 /// daemon that does not advertise `answer-question`. Every outcome, the
 /// daemon's refusals included, comes back as a sentence for the outcome row.
 ///
+/// **Bound to the question's revision** (`revision`, audit A4): the one the
+/// webview read, which must still be the snapshot's, and which the daemon is
+/// told so it refuses the answer if the question was registered again under
+/// the same id before the request lands.
+///
 /// **Sent under the panel's lease** (`lease`, audit A8): the panel cancels it
 /// ([`desktop_voice_answer_cancel`]) the moment the answer stops being wanted,
 /// and the lease is `answer_question_while`'s `still_wanted` gate, checked
@@ -3704,6 +3709,7 @@ async fn desktop_voice_answer_question(
     form: Vec<voice::question::Selection>,
     confirmed_always: bool,
     lease: String,
+    revision: Option<u64>,
 ) -> Result<voice::question::AnswerOutcome, String> {
     ensure_main_webview(&webview)?;
     validate_voice_question_form(&deck_id, &agent_id, &question_id, &form)?;
@@ -3724,6 +3730,12 @@ async fn desktop_voice_answer_question(
     {
         return Ok(refused);
     }
+    // Audit A4: the registration the webview resolved the answer against must
+    // still be the pending one, and the daemon is told which one it is.
+    if revision.is_some() && revision != question.revision {
+        return Ok(voice::question::stale_outcome());
+    }
+    let revision = question.revision;
     let answers = voice::question::answers_of(&form);
     let leased = voice::lease::send_leased(&lease, |still_wanted| async {
         if !still_wanted() {
@@ -3732,10 +3744,11 @@ async fn desktop_voice_answer_question(
         let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
         let daemon = state.daemon.trusted(scope.endpoint()).await?;
         daemon.require_compatible()?;
-        let sent = daemon.client.answer_question_while(
+        let sent = daemon.client.answer_question_at_while(
             still_wanted,
             &agent_id,
             &question_id,
+            revision,
             answers,
             confirmed_always,
         );

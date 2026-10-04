@@ -88,7 +88,7 @@ import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNe
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
-import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
+import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { desktopFeaturesOf, type DeckRuntimeState } from "../types";
 
@@ -1403,6 +1403,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /** Seconds left before the answer is sent, or `undefined` while no countdown runs. */
   const [answerIn, setAnswerIn] = useState<number>();
   const answerTimer = useRef<number | undefined>(undefined);
+  /** The lease whose cancel failed to reach Rust, so its outcome says the cancel could not stop it (audit A8). */
+  const cancelFailedLease = useRef<string | undefined>(undefined);
   /** Bumped by every stop of the countdown, so a tick or a send that outlived it acts on nothing. */
   const answerEpoch = useRef(0);
   const stopAnswerCountdown = useCallback(() => {
@@ -1424,7 +1426,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const held = questionFormRef.current;
     if (held?.sending) {
       if (!held.cancelling) {
-        if (held.lease) void cancelVoiceAnswer?.(held.lease).catch(() => undefined);
+        const lease = held.lease;
+        if (lease) void cancelVoiceAnswer?.(lease).catch(() => { cancelFailedLease.current = lease; });
         setQuestionForm({ ...held, cancelling: true });
       }
       return;
@@ -1438,7 +1441,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   /**
    * PRD #1542 (audit A3) — the microphone heard speech while the answer was
    * counting down: the countdown stops NOW, before anything is transcribed or
-   * resolved, so "cancel" said a second before the end is never too late. The
+   * resolved — so speech stops it once it is detected, before transcription,
+   * rather than after the words are worked out. The
    * form stays as a draft; only a fresh, complete, validated answer arms it
    * again (`answerQuestion`), so a failed transcription or a refused verdict
    * leaves it disarmed.
@@ -1454,7 +1458,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const held = questionFormRef.current;
     if (!held) return undefined;
     return questionLost(
-      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, spawnedAtMs: held.spawnedAtMs, deck: held.deck },
+      { deckId: held.target.deckId, agentId: held.target.agentId, questionId: held.target.questionId, revision: held.target.revision, spawnedAtMs: held.spawnedAtMs, deck: held.deck },
       { pane: paneRef.current, confirmation: confirmationRef.current, deck: selectedDeckRef.current },
     );
   }, []);
@@ -1482,6 +1486,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       sentence = (await sendVoiceAnswer(held.target, held.form, held.confirmedAlways, lease)).sentence;
     } catch (cause) {
       sentence = sentenceOf(cause);
+    }
+    if (cancelFailedLease.current === lease) {
+      cancelFailedLease.current = undefined;
+      sentence = `${sentence} ${QUESTION_CANCEL_FAILED}`;
     }
     if (questionFormRef.current?.lease === lease) setQuestionForm(undefined);
     setResult(undefined);
@@ -1565,7 +1573,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       dropQuestion(QUESTION_ANSWER_CANCELLED);
       return true;
     }
-    if (held && (held.target.questionId !== question.id || held.target.deckId !== shown.deckId || held.target.agentId !== shown.agentId)) {
+    if (held && (held.target.questionId !== question.id || held.target.revision !== question.revision || held.target.deckId !== shown.deckId || held.target.agentId !== shown.agentId)) {
       dropQuestion();
       held = undefined;
     }
@@ -1585,7 +1593,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       setProblem(QUESTION_SAY_CONFIRM);
       return true;
     }
-    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.label, questionId: question.id };
+    const target: VoiceQuestionTarget = { deckId: shown.deckId, agentId: shown.agentId, agent: shown.label, questionId: question.id, revision: question.revision };
     const spawnedAtMs = shown.spawnedAtMs;
     const deck = selectedDeckRef.current;
     setPhase("resolving");
@@ -1594,7 +1602,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const verdict = answered.verdict;
     if (verdict.kind === "not_answer") return false;
     const now = paneRef.current;
-    if (!now || now.deckId !== target.deckId || now.agentId !== target.agentId || now.question?.id !== target.questionId) {
+    if (!now || now.deckId !== target.deckId || now.agentId !== target.agentId || now.question?.id !== target.questionId || now.question.revision !== target.revision) {
       dropQuestion(QUESTION_MOVED_ON);
       return true;
     }

@@ -10507,13 +10507,29 @@ impl AppState {
             .and_then(|s| s.pending_question.as_ref().map(|q| q.id.clone()))
     }
 
+    /// PRD #1542 (audit A4): the question pending on `pane_id` — the one
+    /// [`Self::pending_question_id_on_pane`] names — whole, revision included.
+    pub fn pending_question_on_pane(
+        &self,
+        pane_id: &str,
+    ) -> Option<crate::question::PendingQuestion> {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id) && s.pending_question.is_some())
+            .max_by_key(|s| s.last_activity)
+            .and_then(|s| s.pending_question.clone())
+    }
+
     /// PRD #1542: the session on `pane_id` whose pending question is
-    /// `question_id` — its id, agent type and agent id — which is what the
-    /// daemon's own event about that question has to name.
+    /// `question_id` at `revision` — its id, agent type and agent id — which is
+    /// what the daemon's own event about that question has to name. A
+    /// registration under the same id with another revision is not it (audit
+    /// A5).
     pub fn pending_question_owner(
         &self,
         pane_id: &str,
         question_id: &str,
+        revision: Option<u64>,
     ) -> Option<(String, AgentType, Option<String>)> {
         self.sessions
             .values()
@@ -10521,7 +10537,7 @@ impl AppState {
                 s.pane_id.as_deref() == Some(pane_id)
                     && s.pending_question
                         .as_ref()
-                        .is_some_and(|q| q.id == question_id)
+                        .is_some_and(|q| q.id == question_id && q.revision == revision)
             })
             .max_by_key(|s| s.last_activity)
             .map(|s| {
@@ -10540,13 +10556,35 @@ impl AppState {
     /// release event did not reach the card, and when an answer finds the
     /// channel gone. Returns whether a question was dropped.
     pub fn clear_pending_question(&mut self, pane_id: &str, question_id: &str) -> bool {
+        self.clear_pending_question_where(pane_id, question_id, |_| true)
+    }
+
+    /// PRD #1542 (audit A5): [`Self::clear_pending_question`], only where the
+    /// pending question is still `revision` — a registration that replaced it
+    /// under the same id is left alone. What every daemon path that clears a
+    /// question it validated, held or released uses.
+    pub fn clear_pending_question_revision(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> bool {
+        self.clear_pending_question_where(pane_id, question_id, |q| q.revision == revision)
+    }
+
+    fn clear_pending_question_where(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        also: impl Fn(&crate::question::PendingQuestion) -> bool,
+    ) -> bool {
         let mut cleared = false;
         for session in self.sessions.values_mut() {
             if session.pane_id.as_deref() == Some(pane_id)
                 && session
                     .pending_question
                     .as_ref()
-                    .is_some_and(|q| q.id == question_id)
+                    .is_some_and(|q| q.id == question_id && also(q))
             {
                 session.pending_question = None;
                 cleared = true;
@@ -10564,6 +10602,7 @@ impl AppState {
         &mut self,
         pane_id: &str,
         question_id: &str,
+        revision: Option<u64>,
     ) -> bool {
         let mut marked = false;
         for session in self.sessions.values_mut() {
@@ -10571,7 +10610,7 @@ impl AppState {
                 && let Some(question) = session
                     .pending_question
                     .as_mut()
-                    .filter(|q| q.id == question_id)
+                    .filter(|q| q.id == question_id && q.revision == revision)
             {
                 question.channel = crate::question::AnswerChannel::Unsupported;
                 marked = true;

@@ -41,6 +41,8 @@ export type PendingQuestionDto = {
   tool?: { name: string; detail?: string };
   /** Whether the deck can answer this question at all. */
   answerable: boolean;
+  /** The daemon's revision of this question (audit A4): which registration of it an answer is bound to. */
+  revision?: number;
 };
 
 /** One question's answer as the form holds it. */
@@ -78,11 +80,13 @@ export type AnswerOutcomeDto = {
   sentence: string;
 };
 
-/** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id it saw. */
-export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string };
+/** Which question an utterance or a send is about: the agent by its composite identity, the name its pane shows, and the question id — and revision, audit A4 — it saw. */
+export type VoiceQuestionTarget = { deckId: string; agentId: string; agent: string; questionId: string; revision?: number };
 
 /** The countdown was running for a question that is no longer the one waiting. */
 export const QUESTION_MOVED_ON = "That question was answered or changed before I could send it — nothing was sent.";
+/** Said after an answer's outcome when the cancel asked for while it was on its way never reached the app (audit A8). */
+export const QUESTION_CANCEL_FAILED = "The cancel did not reach the app, so it could not stop the answer.";
 /** The user called the countdown off. */
 export const QUESTION_ANSWER_CANCELLED = "Answer cancelled — nothing was sent.";
 /** The "always allow" confirmation was declined or closed. */
@@ -115,7 +119,7 @@ export type QuestionLost = { code: "question" | "pane" | "replaced" | "hidden" |
  * the selected deck changed (`deck`).
  */
 export function questionLost(
-  aim: { deckId: string; agentId: string; questionId: string; spawnedAtMs?: number; deck?: string },
+  aim: { deckId: string; agentId: string; questionId: string; revision?: number; spawnedAtMs?: number; deck?: string },
   now: { pane?: QuestionPane; confirmation: boolean; deck?: string },
 ): QuestionLost | undefined {
   const pane = now.pane;
@@ -123,6 +127,7 @@ export function questionLost(
   if (aim.spawnedAtMs !== undefined && pane.spawnedAtMs !== undefined && aim.spawnedAtMs !== pane.spawnedAtMs) return { code: "replaced", why: "the agent in the pane was replaced" };
   if (pane.terminalHidden) return { code: "hidden", why: "its terminal is not shown" };
   if (pane.question?.id !== aim.questionId) return { code: "question", why: "the question changed" };
+  if (aim.revision !== undefined && pane.question.revision !== aim.revision) return { code: "question", why: "the question changed" };
   if (now.confirmation) return { code: "confirmation", why: "a confirmation is open" };
   if (now.deck !== aim.deck) return { code: "deck", why: "the deck changed" };
   return undefined;

@@ -523,6 +523,12 @@ pub struct DesktopPendingQuestion {
     /// Whether the deck can answer this question at all: its channel is one
     /// the deck can use and at least one option is answerable.
     pub answerable: bool,
+    /// The daemon's revision of the question (audit A4): which registration
+    /// of it an answer is bound to. The webview echoes it with the answer, so
+    /// a question replaced under the same id since it was read is refused
+    /// rather than answered with a choice made for the old one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 /// The tool a [`DesktopPendingQuestion`] asks about.
@@ -655,6 +661,7 @@ pub(crate) fn map_pending_question(
                 .filter(|detail| !detail.is_empty()),
         }),
         answerable,
+        revision: question.revision,
     }
 }
 

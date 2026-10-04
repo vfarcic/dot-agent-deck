@@ -12,6 +12,8 @@ import { fixtureDesktopFeatures, type VoiceResultDto, type VoiceStatusDto, type 
 import type { DeckRuntimeState } from "../types";
 import {
   QUESTION_ALWAYS_DECLINED,
+  QUESTION_ANSWER_CANCELLED,
+  QUESTION_CANCEL_FAILED,
   QUESTION_COUNTDOWN_STOPPED,
   QUESTION_MOVED_ON,
   QUESTION_SAY_CONFIRM,
@@ -256,6 +258,10 @@ describe("answering an agent's question by voice", () => {
     expect(questionLost(aim, { ...now, pane: { ...pane(), spawnedAtMs: 2 } })?.code).toBe("replaced");
     expect(questionLost(aim, { ...now, confirmation: true })?.code).toBe("confirmation");
     expect(questionLost(aim, { ...now, deck: "remote" })?.code).toBe("deck");
+    /* The same id registered again is another question (audit A4). */
+    const revised = { ...aim, revision: 7 };
+    expect(questionLost(revised, { ...now, pane: pane({ ...PERMISSION, revision: 7 }) })).toBeUndefined();
+    expect(questionLost(revised, { ...now, pane: pane({ ...PERMISSION, revision: 8 }) })?.code).toBe("question");
   });
 
   /**
@@ -437,6 +443,65 @@ describe("answering an agent's question by voice", () => {
     await flush();
     expect(screen.queryByTestId("voice-question")).toBeNull();
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Too late to cancel — Allowed: touch x");
+    view.unmount();
+  });
+
+  /**
+   * Scenario (question/desktop/012, audit A1 — an accepted residual): the
+   * model picks "Allow once" for words that do not mean it, quoting them
+   * exactly — "what time is it", and the "run that" inside "no don't run
+   * that". The app cannot tell, so the answer is armed; what the countdown
+   * shows is exactly what would be sent, and pressing Cancel, or speaking
+   * ("cancel"), stops it with nothing sent.
+   */
+  it("question/desktop/012: an approval the model ties to words that do not mean it is shown before it is sent, and cancelling sends nothing", async () => {
+    const voice = microphone();
+    const { rt, sendVoiceAnswer, resolveVoiceQuestion } = runtime(voice, () => ({ kind: "answered", sentence: "Allowed: touch x" }));
+    resolveVoiceQuestion.mockImplementation(async (_target: VoiceQuestionTarget, utterance: string) =>
+      utterance === "what time is it" || utterance === "no don't run that"
+        ? questionAnswers("yes")
+        : questionAnswers(utterance));
+    render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+
+    await speak(voice, "what time is it");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s.");
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(QUESTION_ANSWER_CANCELLED);
+    await waitOut(VOICE_DICTATION_SEND_MS + 1_000);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+
+    await speak(voice, "no don't run that");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent("Allow once — touch x — sending in 5 s.");
+    await speak(voice, "cancel");
+    expect(screen.getByTestId("voice-question")).toHaveTextContent(`Allow once — touch x${QUESTION_COUNTDOWN_STOPPED}`);
+    await waitOut(VOICE_DICTATION_SEND_MS + 1_000);
+    expect(sendVoiceAnswer).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario (question/desktop/011, audit A8): the answer is on its way and
+   * the user presses Cancel, but the cancel itself never reaches the app. The
+   * answer goes through, and the row says so — and says the cancel could not
+   * stop it — rather than reading as if nothing had been asked.
+   */
+  it("question/desktop/011: a cancel that fails to reach the app is reported with the outcome", async () => {
+    const voice = microphone();
+    let deliver: ((outcome: AnswerOutcomeDto) => void) | undefined;
+    const { rt, sendVoiceAnswer, cancelVoiceAnswer } = runtime(voice, () => new Promise<AnswerOutcomeDto>((resolve) => { deliver = resolve; }));
+    cancelVoiceAnswer.mockRejectedValueOnce(new Error("ipc down"));
+    const view = render(<VoiceControlPanel runtime={rt} screen="agent" onDispatch={() => undefined} pane={pane()} selectedDeckId="local" />);
+    await turnOnVoice();
+    await speak(voice, "yes");
+    await waitOut(VOICE_DICTATION_SEND_MS);
+    expect(sendVoiceAnswer).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("voice-question-cancel"));
+    await flush();
+    expect(cancelVoiceAnswer).toHaveBeenCalledTimes(1);
+    deliver?.({ kind: "answered", sentence: "Allowed: touch x" });
+    await flush();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(`Allowed: touch x ${QUESTION_CANCEL_FAILED}`);
     view.unmount();
   });
 });

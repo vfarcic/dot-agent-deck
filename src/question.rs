@@ -76,6 +76,19 @@ pub struct PendingQuestion {
     /// ([`crate::event::SUBAGENT_ID_METADATA_KEY`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_id: Option<String>,
+    /// PRD #1542 (audit A4): the daemon's revision of this question — which
+    /// registration of it on its pane an answer is bound to. Minted by the
+    /// daemon when it ingests the question (a held question's is its hold's
+    /// generation) and never taken from a producer, so a question replaced
+    /// under the same id, by another registration or with other content,
+    /// carries another revision. A repeat of the pending question with the same
+    /// id and content keeps it. A client echoes it on `AnswerQuestion`; the
+    /// daemon refuses an answer whose revision is not the pending one, and its
+    /// own delivery — the held reply and every typed key — is checked against
+    /// it. `None` on a producer's copy, and on the TUI's own state before the
+    /// daemon's stamped frame arrives. Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 /// The tool a permission or plan prompt asks about.
@@ -436,7 +449,22 @@ impl PendingQuestion {
             tool,
             channel: self.channel,
             subagent_id: clean_opt(self.subagent_id, MAX_LABEL_BYTES),
+            revision: self.revision,
         })
+    }
+
+    /// PRD #1542 (audit A4): whether `other` is this same question raised
+    /// again — every field equal except when it was raised, how the deck would
+    /// answer it, and its revision, none of which a repeat of one prompt
+    /// changes.
+    pub fn same_content(&self, other: &Self) -> bool {
+        let bare = |q: &Self| Self {
+            raised_at_ms: 0,
+            channel: AnswerChannel::Unknown,
+            revision: None,
+            ..q.clone()
+        };
+        bare(self) == bare(other)
     }
 
     /// Whether any option of this question can be answered by the deck at all.
@@ -730,20 +758,42 @@ fn claude_mode(mode: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// Whether `text` can be shown in a confirmation exactly as it is granted:
+/// non-empty, already trimmed, nothing [`PendingQuestion::sanitized`] would
+/// strip (control or bidi characters), and no `,` — the separator the scope
+/// joins its targets with, so a target containing one would read as two.
+fn claude_scope_part_is_exact(text: &str) -> bool {
+    !text.is_empty()
+        && text.trim() == text
+        && !text.contains(',')
+        && crate::untrusted_text::strip_control_and_bidi(text, false) == text
+}
+
 /// PRD #1542 (audit A2): what one Claude Code permission update grants, in
 /// words, for the "always allow" confirmation — written from the update's own
 /// `type`, `mode`, `destination`, `directories` and `rules`, never from a
 /// table. `None` when the update is anything this build cannot describe
 /// faithfully (an unknown type, mode or destination, a rule that is not an
-/// allow, an empty list): the option is then keyboard-only.
+/// allow, an empty list) or cannot show COMPLETELY: a target the snapshot's
+/// sanitizing would alter or that reads ambiguously
+/// ([`claude_scope_part_is_exact`]), or a whole sentence longer than
+/// [`MAX_DESCRIPTION_BYTES`], which the snapshot would cut. The option is then
+/// keyboard-only, and [`claude_decision`] refuses to send it — so no grant
+/// ever reaches past what the confirmation displayed.
 pub fn claude_update_scope(update: &Value) -> Option<String> {
+    let scope = claude_update_scope_words(update)?;
+    (scope.len() <= MAX_DESCRIPTION_BYTES && clean(&scope, MAX_DESCRIPTION_BYTES, false) == scope)
+        .then_some(scope)
+}
+
+fn claude_update_scope_words(update: &Value) -> Option<String> {
     let destination = claude_destination(update)?;
     let list = |key: &str| -> Option<Vec<&str>> {
         let items: Vec<&str> = update
             .get(key)?
             .as_array()?
             .iter()
-            .map(Value::as_str)
+            .map(|item| item.as_str().filter(|s| claude_scope_part_is_exact(s)))
             .collect::<Option<_>>()?;
         (!items.is_empty()).then_some(items)
     };
@@ -765,9 +815,13 @@ pub fn claude_update_scope(update: &Value) -> Option<String> {
                 .as_array()?
                 .iter()
                 .map(|rule| {
-                    let tool = str_field(rule, "toolName").filter(|t| !t.is_empty())?;
+                    let tool =
+                        str_field(rule, "toolName").filter(|t| claude_scope_part_is_exact(t))?;
                     Some(match str_field(rule, "ruleContent") {
-                        Some(content) => format!("{tool}({content})"),
+                        Some(content) if claude_scope_part_is_exact(content) => {
+                            format!("{tool}({content})")
+                        }
+                        Some(_) => return None,
                         None => tool.to_string(),
                     })
                 })
@@ -876,6 +930,7 @@ pub fn claude_permission_request(
                     }),
                     channel: AnswerChannel::Held,
                     subagent_id: None,
+                    revision: None,
                 },
                 hold: true,
             }
@@ -900,6 +955,7 @@ pub fn claude_permission_request(
                     }),
                     channel: channel_for(tables, version, AnswerChannel::Keys),
                     subagent_id: None,
+                    revision: None,
                 },
                 hold: false,
             }
@@ -950,6 +1006,7 @@ pub fn claude_permission_request(
                     }),
                     channel: AnswerChannel::Held,
                     subagent_id: None,
+                    revision: None,
                 },
                 hold: true,
             }
@@ -1087,6 +1144,7 @@ pub fn codex_permission_request(
         }),
         channel: channel_for(tables, version, AnswerChannel::Keys),
         subagent_id: None,
+        revision: None,
     }
 }
 
@@ -1140,6 +1198,7 @@ pub fn codex_request_user_input(
         }),
         channel: channel_for(tables, version, AnswerChannel::Keys),
         subagent_id: None,
+        revision: None,
     })
 }
 
@@ -1184,6 +1243,7 @@ pub fn devin_permission_request(
         }),
         channel: channel_for(tables, version, AnswerChannel::Keys),
         subagent_id: None,
+        revision: None,
     }
 }
 
@@ -1241,6 +1301,7 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         }),
         channel: AnswerChannel::Held,
         subagent_id: None,
+        revision: None,
     })
 }
 
@@ -1286,6 +1347,7 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
         tool: None,
         channel: AnswerChannel::Held,
         subagent_id: None,
+        revision: None,
     })
 }
 
@@ -1437,6 +1499,7 @@ pub fn pi_dialog(dialog: &PiDialog, raised_at_ms: i64) -> Option<PendingQuestion
         tool: None,
         channel: AnswerChannel::Held,
         subagent_id: None,
+        revision: None,
     })
 }
 
@@ -1567,6 +1630,7 @@ mod tests {
             }),
             channel,
             subagent_id: None,
+            revision: None,
         }
     }
 
@@ -1603,6 +1667,7 @@ mod tests {
             tool: None,
             channel: AnswerChannel::Held,
             subagent_id: None,
+            revision: None,
         }
     }
 
@@ -1892,6 +1957,139 @@ mod tests {
         assert_eq!(claude_decision(&question, None, Some(&odd), &forged), None);
     }
 
+    /// Scenario: Claude Code suggests "always allow" for an update too long, or
+    /// too odd, to show whole — many directories whose broadest one sits past
+    /// what the card can show, many rules, a path with a hidden bidi character
+    /// or one containing the comma the deck joins targets with. Each reaches the
+    /// card through the event's own sanitizing as a keyboard-only option with
+    /// nothing to confirm, and a reply claiming it sends no decision, so no
+    /// grant reaches a target the confirmation did not show.
+    #[spec("question/hold/010")]
+    #[test]
+    fn question_hold_010_an_always_allow_too_long_to_show_whole_is_keyboard_only() {
+        let through_event = |suggestions: &Value| -> (PendingQuestion, QuestionOption) {
+            let built = claude_permission_request(
+                "q-long".into(),
+                "Bash",
+                None,
+                Some("ls".into()),
+                Some(suggestions),
+                1,
+                None,
+            )
+            .question;
+            let mut event: crate::event::AgentEvent = serde_json::from_value(serde_json::json!({
+                "session_id": "s-long",
+                "agent_type": "claude_code",
+                "event_type": "waiting_for_input",
+                "timestamp": "2026-10-04T10:00:00Z",
+            }))
+            .unwrap();
+            event.set_question(&built);
+            let shown = event.question().expect("the question survives sanitizing");
+            let always = shown.questions[0]
+                .options
+                .iter()
+                .find(|o| o.role == OptionRole::AllowAlways)
+                .expect("an always option")
+                .clone();
+            (shown, always)
+        };
+        let forged = |question: &PendingQuestion, always: &QuestionOption| {
+            QuestionReply::answered(
+                &question.id,
+                vec![ResolvedAnswer {
+                    question_index: 0,
+                    option_indices: vec![always.index],
+                    labels: vec![always.label.clone()],
+                    roles: vec![OptionRole::AllowAlways],
+                    text: None,
+                }],
+            )
+        };
+
+        // The broadest directory and the destination fall past the cap.
+        let mut directories: Vec<String> = (0..6)
+            .map(|i| format!("/work/a-rather-long-project-directory-name-{i}/src"))
+            .collect();
+        directories.push("/".to_string());
+        let wide = serde_json::json!([{
+            "type": "addDirectories",
+            "directories": directories,
+            "destination": "userSettings",
+        }]);
+        let rules: Vec<Value> = (0..12)
+            .map(|i| serde_json::json!({"toolName": "Bash", "ruleContent": format!("make target-{i}:*")}))
+            .collect();
+        let many_rules = serde_json::json!([{
+            "type": "addRules", "behavior": "allow", "rules": rules, "destination": "projectSettings",
+        }]);
+        let bidi = serde_json::json!([{
+            "type": "addDirectories",
+            "directories": ["/work/proj\u{202e}cod/"],
+            "destination": "session",
+        }]);
+        let comma = serde_json::json!([{
+            "type": "addDirectories",
+            "directories": ["/work/a, /"],
+            "destination": "session",
+        }]);
+        for (name, suggestions) in [
+            ("many directories", &wide),
+            ("many rules", &many_rules),
+            ("a bidi character", &bidi),
+            ("a comma", &comma),
+        ] {
+            let update = claude_always_update(Some(suggestions)).unwrap();
+            assert_eq!(
+                claude_update_scope(&update),
+                None,
+                "{name}: no scope the snapshot cannot show whole"
+            );
+            let (question, always) = through_event(suggestions);
+            assert!(
+                always.keyboard_only && always.scope.is_none() && !always.answerable(),
+                "{name}: keyboard-only, nothing to confirm: {always:?}"
+            );
+            assert_eq!(
+                question.validate(&[answer(0, &[always.index], None)], true),
+                Err(AnswerRefusal::KeyboardOnly),
+                "{name}: no client can send it"
+            );
+            assert_eq!(
+                claude_decision(
+                    &question,
+                    None,
+                    Some(suggestions),
+                    &forged(&question, &always)
+                ),
+                None,
+                "{name}: no decision grants a target the confirmation did not show"
+            );
+        }
+
+        // Short enough to show whole: the scope the card shows after
+        // sanitizing is byte-for-byte the one the decision is checked against.
+        let short = serde_json::json!([{
+            "type": "addDirectories",
+            "directories": ["/work/proj", "/work/lib"],
+            "destination": "localSettings",
+        }]);
+        let (question, always) = through_event(&short);
+        let shown = always.scope.clone().expect("a scope to confirm");
+        assert_eq!(
+            Some(shown),
+            claude_update_scope(&claude_always_update(Some(&short)).unwrap())
+        );
+        let reply = QuestionReply::answered(
+            &question.id,
+            question
+                .validate(&[answer(0, &[always.index], None)], true)
+                .unwrap(),
+        );
+        assert!(claude_decision(&question, None, Some(&short), &reply).is_some());
+    }
+
     /// Scenario: Every shape an answer can be wrong in is refused with the
     /// reason a client shows — a missing or doubled question, an option that is
     /// not there, two options on a single-select question, text where no
@@ -1973,14 +2171,17 @@ mod tests {
             question_id: "q-1".into(),
             answers: vec![answer(0, &[1], None)],
             confirmed_always: true,
+            revision: Some(41),
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["op"], "answer-question");
+        assert_eq!(json["revision"], 41);
         let back: crate::daemon_protocol::AttachRequest = serde_json::from_value(json).unwrap();
         assert!(matches!(
             back,
             crate::daemon_protocol::AttachRequest::AnswerQuestion {
                 confirmed_always: true,
+                revision: Some(41),
                 ..
             }
         ));
@@ -1993,9 +2194,25 @@ mod tests {
             without_confirmation,
             crate::daemon_protocol::AttachRequest::AnswerQuestion {
                 confirmed_always: false,
+                revision: None,
                 ..
             }
         ));
+        // An older client's request omits the revision, and a request without
+        // one writes no `revision` key.
+        let unrevised = crate::daemon_protocol::AttachRequest::AnswerQuestion {
+            agent_id: "7".into(),
+            question_id: "q-1".into(),
+            answers: Vec::new(),
+            confirmed_always: false,
+            revision: None,
+        };
+        assert!(
+            serde_json::to_value(&unrevised)
+                .unwrap()
+                .get("revision")
+                .is_none()
+        );
         for refusal in [
             AnswerRefusal::AgentNotFound,
             AnswerRefusal::NoPendingQuestion,

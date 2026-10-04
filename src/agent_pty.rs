@@ -3875,6 +3875,16 @@ struct PaneInputState {
     /// maps here drop a pane's entry when the pane is closed for good
     /// ([`Self::forget_closed_pane`]), not when it changes hands.
     user_input_at: HashMap<String, Instant>,
+    /// PRD #1542 (audit N1): a sequence number for HUMAN input, ordering it
+    /// against a question's arrival and the deck's own answer keys without a
+    /// clock. [`Self::input_seq`] is the counter, global and monotonic, and
+    /// moves only on a human keystroke; [`Self::human_input_seq`] holds, per
+    /// pane, the counter value of that pane's last one. A voice answer's keys
+    /// ([`ByteSource::Answer`]) stamp `user_input_at` as before but never move
+    /// it, so "has a human typed since X" is `human_input_seq > X`, read under
+    /// the same lock that records the keystroke.
+    input_seq: u64,
+    human_input_seq: HashMap<String, u64>,
     /// Issue #424 F1: what THIS daemon's guarded sends put into each pane.
     automatic: HashMap<String, AutomaticWrite>,
     /// Issue #424 S1: where each pane's user-input stream is, so that neither a
@@ -3890,13 +3900,32 @@ fn is_sentinel_pane_id(pane_id_env: &str) -> bool {
 }
 
 impl PaneInputState {
-    /// Record that a USER keystroke reached `pane_id_env`.
+    /// Record that a USER keystroke reached `pane_id_env` — a human's, so it
+    /// also moves the human-input sequence (PRD #1542, audit N1).
     fn note_user_input(&mut self, pane_id_env: &str) {
         if is_sentinel_pane_id(pane_id_env) {
             return;
         }
+        self.stamp_user_input(pane_id_env);
+        self.input_seq += 1;
+        self.human_input_seq
+            .insert(pane_id_env.to_string(), self.input_seq);
+    }
+
+    /// Stamp the user-input clock alone — for a voice answer's keys, which are
+    /// the user's answer but not a human at the keyboard.
+    fn stamp_user_input(&mut self, pane_id_env: &str) {
         self.user_input_at
             .insert(pane_id_env.to_string(), Instant::now());
+    }
+
+    /// PRD #1542 (audit N1): the counter value of `pane_id_env`'s last human
+    /// keystroke, `0` when it has had none.
+    fn human_input_seq(&self, pane_id_env: &str) -> u64 {
+        self.human_input_seq
+            .get(pane_id_env)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Record the user's actual bytes — the stamp above, plus the one thing the
@@ -3919,10 +3948,20 @@ impl PaneInputState {
     /// newline keys; reading any of them as a submission drained the records of
     /// a box that still held both our payload and the user's draft.
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
+        self.note_user_bytes_as(pane_id_env, bytes, true);
+    }
+
+    /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
+    /// answer's, which leave the human-input sequence alone (PRD #1542).
+    fn note_user_bytes_as(&mut self, pane_id_env: &str, bytes: &[u8], human: bool) {
         if is_sentinel_pane_id(pane_id_env) || bytes.is_empty() {
             return;
         }
-        self.note_user_input(pane_id_env);
+        if human {
+            self.note_user_input(pane_id_env);
+        } else {
+            self.stamp_user_input(pane_id_env);
+        }
         let submitted = self
             .input
             .entry(pane_id_env.to_string())
@@ -4015,6 +4054,7 @@ impl PaneInputState {
     /// box itself is gone.
     fn forget_closed_pane(&mut self, pane_id_env: &str) {
         self.user_input_at.remove(pane_id_env);
+        self.human_input_seq.remove(pane_id_env);
         self.automatic.remove(pane_id_env);
         self.input.remove(pane_id_env);
     }
@@ -4322,6 +4362,31 @@ impl PaneWriter {
         Ok(())
     }
 
+    /// PRD #1542 (audit N1): write a voice answer's keys, like
+    /// [`Self::write_user`] but as [`ByteSource::Answer`], and return the
+    /// human-input counter as it stood once the PTY took them — read while the
+    /// caller still holds this writer, which every human keystroke also needs,
+    /// so no keystroke can fall between the write and the value. A later human
+    /// keystroke on the pane has a higher sequence number than the one
+    /// returned.
+    pub(crate) async fn write_answer(&self, bytes: &[u8]) -> std::io::Result<u64> {
+        match self
+            .pty
+            .run(
+                PtyOp::WriteAll(bytes.to_vec(), ByteSource::Answer, true),
+                None,
+            )
+            .await
+        {
+            PtyJobOutcome::Done(done) => done.result?,
+            PtyJobOutcome::Gone => return Err(PtyWriterThread::gone()),
+            PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => {
+                unreachable!("an unbounded job is neither withdrawn nor stalled")
+            }
+        }
+        Ok(self.state.lock().unwrap().input_seq)
+    }
+
     /// Issue #525: the PTY thread's progress, readable without this writer's
     /// lock — see [`RunningAgent::pty_progress`].
     pub(crate) fn pty_progress(&self) -> Arc<PtyInFlight> {
@@ -4344,6 +4409,10 @@ impl PaneWriter {
 enum ByteSource {
     Deck,
     User,
+    /// PRD #1542: a voice answer's keys — recorded as the user's input (they
+    /// are the user's answer) without moving the human-input sequence (audit
+    /// N1), so the deck's own keys are never mistaken for a human's.
+    Answer,
 }
 
 /// Issue #525: what [`PtyWriterThread`] records into [`PaneInputState`] for the
@@ -4372,6 +4441,7 @@ impl InputRecorder {
         match source {
             ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
+            ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
     }
 }
@@ -5066,6 +5136,15 @@ type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>
 /// [`Self::forget`] removes a hold only when the generation matches — so a
 /// superseded handler whose connection closes late cannot drop the hold that
 /// replaced it.
+///
+/// **The generation is the question's revision (audit A4).** The daemon stamps
+/// a held question with its hold's generation when it ingests it, and mints
+/// every other question's revision from the same counter
+/// ([`Self::mint_revision`]), so one number names one registration on a pane.
+/// [`Self::answer`] delivers only to the registration whose generation is the
+/// revision the answer was validated against: a same-id replacement that
+/// registered in between has another one, and the answer is refused rather
+/// than handed to a question it was not checked against.
 #[derive(Default)]
 pub struct HeldQuestions {
     holds: Mutex<HashMap<(String, String), HeldQuestion>>,
@@ -5110,6 +5189,22 @@ impl HeldQuestions {
         QuestionHold { generation, rx }
     }
 
+    /// A fresh question revision, from the counter hold generations come from
+    /// — for a question nothing holds (audit A4).
+    pub fn mint_revision(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The generation of the hold registered for `question_id` on `pane_id`,
+    /// if one is.
+    pub fn generation_of(&self, pane_id: &str, question_id: &str) -> Option<u64> {
+        self.holds
+            .lock()
+            .unwrap()
+            .get(&(pane_id.to_string(), question_id.to_string()))
+            .map(|held| held.generation)
+    }
+
     /// Whether `question_id` is held on `pane_id`.
     pub fn is_held(&self, pane_id: &str, question_id: &str) -> bool {
         self.holds
@@ -5129,21 +5224,26 @@ impl HeldQuestions {
     }
 
     /// Send the answer down the connection holding `question_id` on `pane_id`,
-    /// when `agent_id` is the agent that registered it. `false` when nothing
-    /// holds it, it belongs to another agent (which leaves that hold alone), or
-    /// the holder has already gone.
+    /// when `agent_id` is the agent that registered it and `revision` is that
+    /// registration's generation — the revision the answer was validated
+    /// against (audit A4). `false` when nothing holds it, it belongs to another
+    /// agent or another registration (either of which is left alone), or the
+    /// holder has already gone.
     pub fn answer(
         &self,
         pane_id: &str,
         agent_id: &str,
         question_id: &str,
+        revision: Option<u64>,
         reply: crate::question::QuestionReply,
     ) -> bool {
         let held = {
             let mut holds = self.holds.lock().unwrap();
             let key = (pane_id.to_string(), question_id.to_string());
             match holds.get(&key) {
-                Some(held) if held.agent_id == agent_id => holds.remove(&key),
+                Some(held) if held.agent_id == agent_id && Some(held.generation) == revision => {
+                    holds.remove(&key)
+                }
                 _ => None,
             }
         };
@@ -5209,24 +5309,46 @@ impl HeldQuestions {
     }
 }
 
-/// PRD #1542 (audit A4): what the daemon's `AnswerQuestion` handler keeps per
-/// agent so two answers can never both reach the agent.
+/// PRD #1542 (audit A4): what the daemon's `AnswerQuestion` handler keeps so
+/// two answers can never both reach the agent.
 ///
 /// - **One answer at a time per agent.** [`Self::slot`] is a lock the handler
 ///   holds from its first read of the pending question to its last write, so a
 ///   second client's answer waits and then re-reads a question the first one
-///   has already cleared.
-/// - **Answered once.** The slot remembers the id of the last question the
-///   deck emitted an answer for, so a question the deck answered is refused even
-///   if the event that clears it was not applied.
+///   has already cleared. A slot holds nothing else, so pruning an idle one
+///   loses nothing.
+/// - **Answered once.** [`Self::mark_answered`] remembers, per pane, the id of
+///   the last question the deck emitted an answer for, so a question the deck
+///   answered is refused even if the event that clears it was not applied, or
+///   if the producer raises it again under the same id. Kept per pane and never
+///   pruned while the daemon runs — one id per pane ever seen, the same bound
+///   the registry's per-pane dispatch locks accept.
 /// - **When the question arrived.** [`Self::note_pending`] records, per pane,
-///   the instant the daemon first saw the pending question, so the keys channel
-///   can tell whether the user typed into the pane after it — keys typed into a
-///   prompt the keyboard has already moved on would land somewhere else.
+///   the pending question's id and revision and the human-input sequence
+///   number at the moment the daemon first saw that revision (audit N1), so the
+///   keys channel can tell whether a human typed into the pane after it — keys
+///   typed into a prompt the keyboard has already moved on would land
+///   somewhere else.
 #[derive(Default)]
 pub struct QuestionAnswers {
-    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<String>>>>>,
-    raised: Mutex<HashMap<String, (String, Instant)>>,
+    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    raised: Mutex<HashMap<String, RaisedQuestion>>,
+    answered: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
+}
+
+/// See [`QuestionAnswers::arm_barrier`]: the "reached" sender and the
+/// "resume" receiver of one armed barrier.
+#[cfg(test)]
+type QuestionBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// The question pending on a pane, as [`QuestionAnswers::note_pending`] saw it
+/// arrive.
+struct RaisedQuestion {
+    id: String,
+    revision: Option<u64>,
+    input_seq: u64,
 }
 
 /// Slots kept before idle ones are pruned: one per agent that was ever
@@ -5234,44 +5356,112 @@ pub struct QuestionAnswers {
 const QUESTION_ANSWER_SLOTS_PRUNE_AT: usize = 256;
 
 impl QuestionAnswers {
-    /// `agent_id`'s answer lock; its value is the id of the last question the
-    /// deck emitted an answer for.
-    pub fn slot(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<Option<String>>> {
+    /// `agent_id`'s answer lock.
+    pub fn slot(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut slots = self.slots.lock().unwrap();
         if slots.len() >= QUESTION_ANSWER_SLOTS_PRUNE_AT {
-            // An idle slot (nobody holds or waits on it) only remembers an
-            // answered id, whose question its own answer already cleared.
+            // An idle slot (nobody holds or waits on it) carries no state.
             slots.retain(|_, slot| Arc::strong_count(slot) > 1);
         }
         Arc::clone(slots.entry(agent_id.to_string()).or_default())
     }
 
-    /// Record that `question_id` is the question pending on `pane_id` now
-    /// (`None`: nothing is). The instant is kept from the first time an id is
-    /// seen, so a later event repeating the same question does not move it.
-    pub fn note_pending(&self, pane_id: &str, question_id: Option<&str>) {
+    /// Record that `pending` — a question id and its revision — is the question
+    /// pending on `pane_id` now (`None`: nothing is), first seen when the
+    /// human-input sequence stood at `input_seq`. The record is kept from the
+    /// first time a revision is seen, so a later event repeating the same
+    /// question does not move it.
+    pub fn note_pending(
+        &self,
+        pane_id: &str,
+        pending: Option<(&str, Option<u64>)>,
+        input_seq: u64,
+    ) {
         let mut raised = self.raised.lock().unwrap();
-        match question_id {
+        match pending {
             None => {
                 raised.remove(pane_id);
             }
-            Some(id) => {
-                if raised.get(pane_id).is_none_or(|(seen, _)| seen != id) {
-                    raised.insert(pane_id.to_string(), (id.to_string(), Instant::now()));
+            Some((id, revision)) => {
+                if raised
+                    .get(pane_id)
+                    .is_none_or(|seen| seen.id != id || seen.revision != revision)
+                {
+                    raised.insert(
+                        pane_id.to_string(),
+                        RaisedQuestion {
+                            id: id.to_string(),
+                            revision,
+                            input_seq,
+                        },
+                    );
                 }
             }
         }
     }
 
-    /// When the daemon first saw `question_id` pending on `pane_id`, or `None`
-    /// when it has no record of that question there.
-    pub fn raised_at(&self, pane_id: &str, question_id: &str) -> Option<Instant> {
+    /// The human-input sequence number when the daemon first saw `question_id`
+    /// at `revision` pending on `pane_id`, or `None` when it has no record of
+    /// that registration there.
+    pub fn raised_input_seq(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> Option<u64> {
         self.raised
             .lock()
             .unwrap()
             .get(pane_id)
-            .filter(|(id, _)| id == question_id)
-            .map(|(_, at)| *at)
+            .filter(|seen| seen.id == question_id && seen.revision == revision)
+            .map(|seen| seen.input_seq)
+    }
+
+    /// Whether the deck already emitted an answer for `question_id` on
+    /// `pane_id`.
+    pub fn is_answered(&self, pane_id: &str, question_id: &str) -> bool {
+        self.answered
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .is_some_and(|id| id == question_id)
+    }
+
+    /// Record that the deck emitted (part of) an answer for `question_id` on
+    /// `pane_id`.
+    pub fn mark_answered(&self, pane_id: &str, question_id: &str) {
+        self.answered
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), question_id.to_string());
+    }
+
+    /// Test seam: make the next [`Self::barrier`] named `name` report that it
+    /// was reached and then wait until the test resumes it.
+    #[cfg(test)]
+    pub fn arm_barrier(&self, name: &'static str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        self.barriers
+            .lock()
+            .unwrap()
+            .insert(name, (reached_tx, resume_rx));
+        (reached_rx, resume_tx)
+    }
+
+    /// A point a test can stop the question paths at ([`Self::arm_barrier`]);
+    /// nothing in a production build.
+    pub(crate) async fn barrier(&self, name: &'static str) {
+        #[cfg(test)]
+        {
+            let armed = self.barriers.lock().unwrap().remove(name);
+            if let Some((reached, resume)) = armed {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+        }
+        #[cfg(not(test))]
+        let _ = name;
     }
 }
 
@@ -7109,26 +7299,37 @@ impl AgentPtyRegistry {
         &self.question_answers
     }
 
-    /// PRD #1542 (audit A4): whether a user keystroke reached `pane_id` after
-    /// the daemon first saw `question_id` pending there, and after
-    /// `deck_typed_at` — when the deck's own last answer key went in, since
-    /// those are written as user keystrokes ([`Self::write_answer_keys`]) and
-    /// move the same clock. With no record of when the question arrived, any
-    /// keystroke ever counts — the safe reading for a channel that types into
-    /// the pane; every question the daemon ingests has one.
+    /// PRD #1542 (audit A4/N1): whether a HUMAN keystroke reached `pane_id`
+    /// after the daemon first saw `question_id` at `revision` pending there, and
+    /// after `committed` — the human-input sequence number the deck's own last
+    /// answer key was written at ([`Self::write_answer_keys`]). Sequence
+    /// numbers, not clocks: the deck's keys never move the sequence, and the
+    /// value they return was read under the writer every human keystroke also
+    /// needs, so no keystroke can be mistaken for the deck's. With no record of
+    /// when the question arrived, any human keystroke ever counts — the safe
+    /// reading for a channel that types into the pane; every question the
+    /// daemon ingests has one.
     pub fn user_typed_since_question(
         &self,
         pane_id: &str,
         question_id: &str,
-        deck_typed_at: Option<Instant>,
+        revision: Option<u64>,
+        committed: Option<u64>,
     ) -> bool {
-        let Some(typed) = self.last_user_input_at(pane_id) else {
-            return false;
-        };
-        let Some(raised) = self.question_answers.raised_at(pane_id, question_id) else {
-            return true;
-        };
-        typed >= raised && deck_typed_at.is_none_or(|deck| typed > deck)
+        let human = self.pane_input.lock().unwrap().human_input_seq(pane_id);
+        let baseline = committed
+            .or_else(|| {
+                self.question_answers
+                    .raised_input_seq(pane_id, question_id, revision)
+            })
+            .unwrap_or_default();
+        human > baseline
+    }
+
+    /// PRD #1542 (audit N1): the human-input counter now — what a question
+    /// arriving now is compared against.
+    pub fn human_input_counter(&self) -> u64 {
+        self.pane_input.lock().unwrap().input_seq
     }
 
     /// PRD #1542: type `keys` into `agent_id`'s PTY to answer a question, with
@@ -7136,16 +7337,18 @@ impl AgentPtyRegistry {
     ///
     /// `revalidate` is asked with the writer held, immediately before the
     /// write, and a `false` writes nothing: the daemon passes "is the question
-    /// still the pending one", so keys aimed at a question the keyboard already
-    /// answered are never typed into whatever replaced it. Written as the
-    /// user's own keystrokes ([`PaneWriter::write_user`]) — they ARE the user's
-    /// answer, given by voice.
+    /// still the pending revision, and has no human typed since", so keys aimed
+    /// at a question the keyboard already answered are never typed into
+    /// whatever replaced it. Written as the user's answer
+    /// ([`PaneWriter::write_answer`]) — it IS the user's answer, given by voice
+    /// — without moving the human-input sequence, and returns the sequence
+    /// number it was committed at, for the next key's check (audit N1).
     pub async fn write_answer_keys<Fut>(
         &self,
         agent_id: &str,
         keys: &[u8],
         revalidate: impl FnOnce() -> Fut,
-    ) -> Result<(), &'static str>
+    ) -> Result<u64, &'static str>
     where
         Fut: std::future::Future<Output = bool>,
     {
@@ -7160,7 +7363,7 @@ impl AgentPtyRegistry {
             return Err("the question changed before the keys were typed");
         }
         writer
-            .write_user(keys)
+            .write_answer(keys)
             .await
             .map_err(|_| "writing to the agent's terminal failed")
     }

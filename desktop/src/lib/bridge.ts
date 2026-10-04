@@ -4468,7 +4468,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async sendVoiceAnswer(target: VoiceQuestionTarget, form: QuestionSelectionDto[], confirmedAlways: boolean, lease: string): Promise<AnswerOutcomeDto> {
     const invoke = await this.getInvoke();
-    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease });
+    return invoke<AnswerOutcomeDto>("desktop_voice_answer_question", { deckId: target.deckId, agentId: target.agentId, agent: target.agent, questionId: target.questionId, form, confirmedAlways, lease, revision: target.revision ?? null });
   }
 
   async cancelVoiceAnswer(lease: string): Promise<void> {

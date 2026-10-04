@@ -2403,6 +2403,31 @@ impl DaemonClient {
         answers: Vec<crate::question::QuestionAnswer>,
         confirmed_always: bool,
     ) -> Result<AnswerReport, ClientError> {
+        self.answer_question_at_while(
+            still_wanted,
+            agent_id,
+            question_id,
+            None,
+            answers,
+            confirmed_always,
+        )
+        .await
+    }
+
+    /// [`Self::answer_question_while`], naming the question's `revision` as
+    /// the snapshot carried it ([`crate::question::PendingQuestion::revision`],
+    /// audit A4): the daemon refuses the answer as stale unless that revision
+    /// is still the pending one. `None` sends no revision, as an older client
+    /// does.
+    pub async fn answer_question_at_while(
+        &self,
+        still_wanted: impl Fn() -> bool,
+        agent_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        answers: Vec<crate::question::QuestionAnswer>,
+        confirmed_always: bool,
+    ) -> Result<AnswerReport, ClientError> {
         if !self
             .capabilities()
             .await?
@@ -2422,6 +2447,7 @@ impl DaemonClient {
                 question_id: question_id.to_string(),
                 answers,
                 confirmed_always,
+                revision,
             },
         )
         .await?;

@@ -2031,6 +2031,16 @@ pub enum AttachRequest {
         /// otherwise explicitly rather than by omission.
         #[serde(default)]
         confirmed_always: bool,
+        /// PRD #1542 (audit A4): the question's revision as the client saw it
+        /// ([`crate::question::PendingQuestion::revision`] on the snapshot).
+        /// When given, the daemon refuses the answer as stale unless it is the
+        /// revision pending now, so a question replaced under the same id since
+        /// the client read it is never answered with a choice made for the old
+        /// one. Additive optional: a client that omits it gets the id check
+        /// alone at the request, and the daemon still binds its own delivery to
+        /// the revision it validated against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
     },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
@@ -4933,13 +4943,15 @@ async fn handle_connection(
             question_id,
             answers,
             confirmed_always,
+            revision,
         } => {
-            let resp = match answer_question(
+            let resp = match answer_question_at(
                 &registry,
                 &state,
                 &event_tx,
                 &agent_id,
                 &question_id,
+                revision,
                 &answers,
                 confirmed_always,
             )
@@ -5759,10 +5771,36 @@ fn validate_task(task: &str) -> Result<(), String> {
 /// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
 const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
 
+/// PRD #1542: [`AttachRequest::AnswerQuestion`]'s handler, for a request that
+/// names no revision — [`answer_question_at`] with `None`.
+#[cfg(test)]
+pub(crate) async fn answer_question(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    answer_question_at(
+        registry,
+        state,
+        event_tx,
+        agent_id,
+        question_id,
+        None,
+        answers,
+        confirmed_always,
+    )
+    .await
+}
+
 /// PRD #1542: [`AttachRequest::AnswerQuestion`]'s handler.
 ///
-/// Refusal order: the agent, a pending question, the id, then the answer
-/// itself ([`crate::question::PendingQuestion::validate`]), then the channel.
+/// Refusal order: the agent, a pending question, the id and the revision the
+/// client named, then the answer itself
+/// ([`crate::question::PendingQuestion::validate`]), then the channel.
 /// On success the daemon ingests an event of its own carrying
 /// [`crate::event::QUESTION_RESOLVED_METADATA_KEY`] and its answered marker, so
 /// the question clears and the card moves on in this daemon and in every
@@ -5771,26 +5809,40 @@ const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
 /// rather than starting work (review S3); the agent's own next event then
 /// says where it went.
 ///
-/// **One answer per agent at a time, and once per question (audit A4).** The
-/// agent's [`crate::agent_pty::QuestionAnswers::slot`] is held from the first
-/// read of the pending question to the last write, so a second client's answer
-/// waits and then finds the question gone; the slot also remembers the last
-/// question the deck emitted an answer for, which is refused as stale even if
-/// its clearing event was not applied.
+/// **Bound to one revision of the question (audit A4).** The answer is
+/// validated against the pending question's daemon-minted revision
+/// ([`crate::question::PendingQuestion::revision`]) and delivered only to that
+/// revision: a held reply goes only to the hold whose generation it is, every
+/// key is written only while it is still the pending revision, and the deck's
+/// own clearing event and every clear on a failure name it too. A same-id
+/// replacement that registers between validation and delivery is refused as
+/// stale, never answered with a choice made for the question it replaced.
 ///
-/// **The keys channel refuses a pane the user has typed into since the
+/// **One answer per agent at a time, and once per question.** The agent's
+/// [`crate::agent_pty::QuestionAnswers::slot`] is held from the first read of
+/// the pending question to the last write, so a second client's answer waits
+/// and then finds the question gone; the pane's answered ledger
+/// ([`crate::agent_pty::QuestionAnswers::mark_answered`]) refuses a question
+/// the deck emitted an answer for as stale even if its clearing event was not
+/// applied, or the producer raised it again under the same id.
+///
+/// **The keys channel refuses a pane a human has typed into since the
 /// question arrived** ([`AnswerRefusal::KeyboardStarted`]): the daemon owns the
 /// PTY's input, but not the agent's dialog position, so keys aimed at a form
 /// the keyboard has half-answered, or at a prompt it already dismissed, would
-/// land on the wrong question or in the composer. The check is repeated under
-/// the writer before every key. When a write fails after some keys went in,
-/// the question is left pending but marked keyboard-only.
-pub(crate) async fn answer_question(
+/// land on the wrong question or in the composer. The check compares
+/// human-input sequence numbers (audit N1) and is repeated under the writer
+/// before every key, against the sequence number the deck's previous key was
+/// committed at. When a write fails after some keys went in, the question is
+/// left pending but marked keyboard-only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_question_at(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     agent_id: &str,
     question_id: &str,
+    requested_revision: Option<u64>,
     answers: &[crate::question::QuestionAnswer],
     confirmed_always: bool,
 ) -> Result<(), crate::question::AnswerRefusal> {
@@ -5801,8 +5853,9 @@ pub(crate) async fn answer_question(
         .find(|r| r.id == agent_id)
         .ok_or(AnswerRefusal::AgentNotFound)?;
     let pane_id = record.pane_id_env.clone();
+    let pane = pane_id.as_deref().unwrap_or_default();
     let slot = registry.question_answers().slot(agent_id);
-    let mut last_answered = slot.lock().await;
+    let _answering = slot.lock().await;
     let (session_id, agent_type, question) = {
         let guard = state.read().await;
         let (session_id, question) = guard
@@ -5815,19 +5868,27 @@ pub(crate) async fn answer_question(
             .unwrap_or(crate::event::AgentType::None);
         (session_id, agent_type, question)
     };
-    if question.id != question_id {
+    if question.id != question_id
+        || requested_revision.is_some_and(|wanted| Some(wanted) != question.revision)
+    {
         return Err(AnswerRefusal::Stale {
             current_id: Some(question.id),
         });
     }
-    if last_answered.as_deref() == Some(question.id.as_str()) {
-        // The deck already answered this one; its clear has not landed.
+    if registry.question_answers().is_answered(pane, &question.id) {
+        // The deck already answered this one; its clear has not landed, or
+        // the producer raised it again.
         return Err(AnswerRefusal::Stale { current_id: None });
     }
+    let revision = question.revision;
     let resolved = question.validate(answers, confirmed_always)?;
     let denied = resolved
         .iter()
         .any(|answer| answer.roles.contains(&OptionRole::Deny));
+    registry
+        .question_answers()
+        .barrier("answer_question:validated")
+        .await;
     match question.channel {
         AnswerChannel::Held => {
             let delivered = pane_id.as_deref().is_some_and(|pane| {
@@ -5835,88 +5896,116 @@ pub(crate) async fn answer_question(
                     pane,
                     agent_id,
                     &question.id,
+                    revision,
                     QuestionReply::answered(&question.id, resolved),
                 )
             });
             if !delivered {
-                if let Some(pane_id) = pane_id.as_deref() {
-                    state
-                        .write()
-                        .await
-                        .clear_pending_question(pane_id, &question.id);
+                // Either the holder went — the question goes with it — or a
+                // registration that replaced this revision holds it now, which
+                // this answer was never checked against.
+                let mut guard = state.write().await;
+                if guard.clear_pending_question_revision(pane, &question.id, revision) {
+                    return Err(AnswerRefusal::ChannelGone);
                 }
-                return Err(AnswerRefusal::ChannelGone);
+                return Err(AnswerRefusal::Stale {
+                    current_id: guard.pending_question_id_on_pane(pane),
+                });
             }
-            *last_answered = Some(question.id.clone());
+            registry
+                .question_answers()
+                .mark_answered(pane, &question.id);
         }
         AnswerChannel::Keys => {
             let keys = crate::question::answer_keys(&agent_type, &question, &resolved)?;
-            let pane = pane_id.as_deref().unwrap_or_default();
-            // When the deck's own last key went in: those are written as user
-            // keystrokes and move the clock `typed_since` reads.
-            let deck_typed_at = std::sync::Mutex::new(None);
-            let typed_since = || {
-                registry.user_typed_since_question(
-                    pane,
-                    &question.id,
-                    *deck_typed_at.lock().unwrap(),
-                )
+            // The human-input sequence number the deck's own last key was
+            // committed at (audit N1); `None` until one is.
+            let mut committed: Option<u64> = None;
+            let typed_since = |committed: Option<u64>| {
+                registry.user_typed_since_question(pane, &question.id, revision, committed)
             };
-            if typed_since() {
+            if typed_since(None) {
                 return Err(AnswerRefusal::KeyboardStarted);
             }
             for (typed, key) in keys.iter().enumerate() {
                 if typed > 0 {
                     tokio::time::sleep(ANSWER_KEY_GAP).await;
                 }
+                let baseline = committed;
                 let still_ours = || async {
-                    !typed_since()
+                    !typed_since(baseline)
                         && state
                             .read()
                             .await
                             .pending_question_for(agent_id, pane_id.as_deref())
-                            .is_some_and(|(_, q)| q.id == question.id)
+                            .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
                 };
-                if let Err(detail) = registry
+                match registry
                     .write_answer_keys(agent_id, key.as_bytes(), still_ours)
                     .await
                 {
-                    let refusal = if typed_since() {
-                        AnswerRefusal::KeyboardStarted
-                    } else if typed > 0 {
-                        AnswerRefusal::WriteFailed {
-                            detail: format!(
-                                "{detail} after {typed} of {} keys; finish it by keyboard",
-                                keys.len()
-                            ),
-                        }
-                    } else {
-                        AnswerRefusal::WriteFailed {
-                            detail: detail.to_string(),
-                        }
-                    };
-                    if typed > 0 {
-                        // Part of the answer is in the agent's prompt: the
-                        // stored question no longer describes what is on
-                        // screen, so it is the keyboard's from here (S2).
-                        state
-                            .write()
-                            .await
-                            .mark_pending_question_keyboard_only(pane, &question.id);
-                        warn!(
-                            agent_id = %agent_id,
-                            question_id = %question.id,
-                            typed,
-                            of = keys.len(),
-                            %refusal,
-                            "question: the deck typed part of an answer and stopped; \
-                             the question is now keyboard-only"
-                        );
+                    Ok(at) => {
+                        registry
+                            .question_answers()
+                            .barrier("answer_question:key_written")
+                            .await;
+                        committed = Some(at);
+                        registry
+                            .question_answers()
+                            .mark_answered(pane, &question.id);
                     }
-                    return Err(refusal);
+                    Err(detail) => {
+                        let replaced = if typed == 0 {
+                            state
+                                .read()
+                                .await
+                                .pending_question_for(agent_id, pane_id.as_deref())
+                                .filter(|(_, q)| q.id == question.id && q.revision != revision)
+                        } else {
+                            None
+                        };
+                        let refusal = if typed_since(baseline) {
+                            AnswerRefusal::KeyboardStarted
+                        } else if let Some((_, current)) = replaced {
+                            // Nothing typed, and the question was registered
+                            // again under its id since it was validated.
+                            AnswerRefusal::Stale {
+                                current_id: Some(current.id),
+                            }
+                        } else if typed > 0 {
+                            AnswerRefusal::WriteFailed {
+                                detail: format!(
+                                    "{detail} after {typed} of {} keys; finish it by keyboard",
+                                    keys.len()
+                                ),
+                            }
+                        } else {
+                            AnswerRefusal::WriteFailed {
+                                detail: detail.to_string(),
+                            }
+                        };
+                        if typed > 0 {
+                            // Part of the answer is in the agent's prompt: the
+                            // stored question no longer describes what is on
+                            // screen, so it is the keyboard's from here (S2).
+                            state.write().await.mark_pending_question_keyboard_only(
+                                pane,
+                                &question.id,
+                                revision,
+                            );
+                            warn!(
+                                agent_id = %agent_id,
+                                question_id = %question.id,
+                                typed,
+                                of = keys.len(),
+                                %refusal,
+                                "question: the deck typed part of an answer and stopped; \
+                                 the question is now keyboard-only"
+                            );
+                        }
+                        return Err(refusal);
+                    }
                 }
-                *deck_typed_at.lock().unwrap() = Some(std::time::Instant::now());
-                *last_answered = Some(question.id.clone());
             }
         }
         AnswerChannel::Unsupported | AnswerChannel::Unknown => {
@@ -5926,6 +6015,7 @@ pub(crate) async fn answer_question(
     info!(
         agent_id = %agent_id,
         question_id = %question.id,
+        revision = ?revision,
         channel = ?question.channel,
         denied,
         "question answered by the deck"
@@ -5933,7 +6023,7 @@ pub(crate) async fn answer_question(
     let event = crate::daemon::deck_question_event(
         session_id,
         agent_type,
-        pane_id,
+        pane_id.clone(),
         Some(agent_id.to_string()),
         &question.id,
         if denied {
@@ -5943,7 +6033,13 @@ pub(crate) async fn answer_question(
         },
         crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY,
     );
-    crate::daemon::ingest_event(state, event_tx, registry, event).await;
+    // Clears this revision only: a same-id registration that replaced it
+    // after the answer went is left pending (audit A5).
+    let replaced = |s: &crate::state::AppState| {
+        s.pending_question_for(agent_id, pane_id.as_deref())
+            .is_some_and(|(_, q)| q.id == question.id && q.revision != revision)
+    };
+    crate::daemon::ingest_event_unless(state, event_tx, registry, event, replaced).await;
     Ok(())
 }
 
@@ -10286,13 +10382,13 @@ mod question_answer_tests {
     async fn question_answer_002_a_held_answer_reaches_its_holder() {
         let fx = Fixture::start(AgentType::ClaudeCode).await;
         let mut events = fx.event_tx.subscribe();
-        fx.ask(&claude_bash()).await;
-        assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
         let held = fx
             .registry
             .question_holds()
             .hold(PANE, &fx.agent_id, "q-bash")
             .rx;
+        fx.ask_ingested(&claude_bash()).await;
+        assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
         fx.answer("q-bash", &[(0, &[2], None)], true)
             .await
             .expect("answered");
@@ -10307,8 +10403,14 @@ mod question_answer_tests {
         );
         assert_eq!(fx.pending().await, None);
         assert_eq!(fx.status().await, SessionStatus::Thinking);
-        let Ok(BroadcastMsg::Event(broadcast)) = events.recv().await else {
-            panic!("the deck's answered event is broadcast");
+        let broadcast = loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.resolved_question_id().is_some() => {
+                    break event;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the deck's answered event is broadcast"),
+            }
         };
         assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
         assert!(broadcast.is_daemon_synthetic());
@@ -10521,12 +10623,12 @@ mod question_answer_tests {
         );
 
         let fx = Fixture::start(AgentType::ClaudeCode).await;
-        fx.ask(&claude_bash()).await;
         let mut held = fx
             .registry
             .question_holds()
             .hold(PANE, &fx.agent_id, "q-bash")
             .rx;
+        fx.ask_ingested(&claude_bash()).await;
         let a = fx.answer_task("q-bash", vec![one(0, 1)], false);
         let b = fx.answer_task("q-bash", vec![one(0, 1)], false);
         let (a, b) = (a.await.unwrap(), b.await.unwrap());
@@ -10573,6 +10675,161 @@ mod question_answer_tests {
         );
     }
 
+    /// Scenario: An agent's question is answered and, after the daemon has
+    /// checked the answer but before it is delivered, the same question id is
+    /// registered again — a new hold for a held question, new content for one
+    /// answered by keys. The answer is refused as stale and reaches nothing: the
+    /// replacement stays pending and held, and its own answer later reaches it.
+    /// An answer naming a revision that is no longer pending is refused before
+    /// anything is checked, and a repeat of the pending question keeps its
+    /// revision.
+    #[spec("question/answer/010")]
+    #[tokio::test]
+    async fn question_answer_010_an_answer_is_bound_to_the_revision_it_was_checked_against() {
+        // Held: a same-id hold replaces the first between validation and
+        // delivery.
+        let fx = Fixture::start(AgentType::ClaudeCode).await;
+        let mut first = fx
+            .registry
+            .question_holds()
+            .hold(PANE, &fx.agent_id, "q-bash")
+            .rx;
+        fx.ask_ingested(&claude_bash()).await;
+        let first_revision = fx.pending_question().await.unwrap().revision;
+        assert!(first_revision.is_some(), "the daemon stamps a revision");
+        fx.ask_ingested(&claude_bash()).await;
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            first_revision,
+            "a repeat of the pending question keeps its revision"
+        );
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let answering = fx.answer_task("q-bash", vec![one(0, 1)], false);
+        reached.await.unwrap();
+        let mut second = fx
+            .registry
+            .question_holds()
+            .hold(PANE, &fx.agent_id, "q-bash")
+            .rx;
+        fx.ask_ingested(&claude_bash()).await;
+        let second_revision = fx.pending_question().await.unwrap().revision;
+        assert_ne!(second_revision, first_revision);
+        resume.send(()).unwrap();
+        assert!(
+            matches!(answering.await.unwrap(), Err(AnswerRefusal::Stale { .. })),
+            "the answer was checked against the replaced registration"
+        );
+        let superseded = (&mut first).await.expect("the first holder is let go");
+        assert_eq!(superseded.outcome, ReplyOutcome::Released);
+        assert!(fx.registry.question_holds().is_held(PANE, "q-bash"));
+        assert_eq!(
+            fx.pending_question().await.unwrap().revision,
+            second_revision,
+            "the replacement is still pending"
+        );
+        // A client that read the old revision is refused at the request.
+        assert_eq!(
+            answer_question_at(
+                &fx.registry,
+                &fx.state,
+                &fx.event_tx,
+                &fx.agent_id,
+                "q-bash",
+                first_revision,
+                &[one(0, 1)],
+                false,
+            )
+            .await,
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-bash".into())
+            })
+        );
+        answer_question_at(
+            &fx.registry,
+            &fx.state,
+            &fx.event_tx,
+            &fx.agent_id,
+            "q-bash",
+            second_revision,
+            &[one(0, 1)],
+            false,
+        )
+        .await
+        .expect("the replacement's own answer");
+        let reply = (&mut second).await.expect("the replacement hears it");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+
+        // Keys: the same id raised again with other content.
+        let fx = Fixture::start(AgentType::Codex).await;
+        let approval = crate::question::codex_permission_request(
+            "q-swap".into(),
+            "Bash",
+            Some("touch x".into()),
+            1,
+            None,
+        );
+        fx.ask_ingested(&approval).await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:validated");
+        let answering = fx.answer_task("q-swap", vec![one(0, 1)], false);
+        reached.await.unwrap();
+        let mut swapped = approval.clone();
+        swapped.tool.as_mut().unwrap().detail = Some("rm -rf build".into());
+        fx.ask_ingested(&swapped).await;
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale {
+                current_id: Some("q-swap".into())
+            })
+        );
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "no key reached the replaced prompt"
+        );
+        assert_eq!(fx.pending().await.as_deref(), Some("q-swap"));
+    }
+
+    /// Scenario: The deck is typing a Codex form's answer when, the instant the
+    /// first digit is written and before the deck goes on, the user presses a
+    /// key in the pane. The next digit is refused with "finish it by keyboard"
+    /// and never typed: the deck's own digit is told apart from the user's key
+    /// by an input sequence number recorded with the write, not by a clock read
+    /// afterwards.
+    #[spec("question/answer/011")]
+    #[tokio::test]
+    async fn question_answer_011_a_keystroke_right_after_the_deck_s_key_is_not_mistaken_for_it() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_form("call_seq")).await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier("answer_question:key_written");
+        let answering = fx.answer_task("call_seq", vec![one(0, 2), one(1, 1)], false);
+        reached.await.unwrap();
+        assert!(fx.screen_shows("2").await, "the first key went in");
+        fx.registry.note_user_input(PANE);
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::KeyboardStarted)
+        );
+        assert!(
+            !fx.screen_shows_within("21", ANSWER_KEY_GAP * 2).await,
+            "the second key was not typed"
+        );
+        assert_eq!(
+            fx.pending_question().await.unwrap().channel,
+            AnswerChannel::Unsupported
+        );
+    }
+
     /// Scenario: The user answers a permission prompt with "no" by voice. The
     /// question clears, but the card does not flash Thinking: the deck's own
     /// event about the answer asserts no status, and the agent's next event
@@ -10582,20 +10839,26 @@ mod question_answer_tests {
     async fn question_answer_009_a_deny_does_not_show_thinking() {
         let fx = Fixture::start(AgentType::ClaudeCode).await;
         let mut events = fx.event_tx.subscribe();
-        fx.ask(&claude_bash()).await;
         let held = fx
             .registry
             .question_holds()
             .hold(PANE, &fx.agent_id, "q-bash")
             .rx;
+        fx.ask_ingested(&claude_bash()).await;
         fx.answer("q-bash", &[(0, &[3], None)], false)
             .await
             .expect("denied");
         assert_eq!(held.await.unwrap().answers[0].roles, vec![OptionRole::Deny]);
         assert_eq!(fx.pending().await, None);
         assert_eq!(fx.status().await, SessionStatus::WaitingForInput);
-        let Ok(BroadcastMsg::Event(broadcast)) = events.recv().await else {
-            panic!("the deck's answered event is broadcast");
+        let broadcast = loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event)) if event.resolved_question_id().is_some() => {
+                    break event;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the deck's answered event is broadcast"),
+            }
         };
         assert_eq!(broadcast.event_type, EventType::Unknown);
         assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));

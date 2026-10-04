@@ -46,6 +46,7 @@ fn permission(channel: AnswerChannel) -> PendingQuestion {
         }),
         channel,
         subagent_id: None,
+        revision: None,
     }
 }
 
@@ -92,6 +93,7 @@ fn form_question() -> PendingQuestion {
         }),
         channel: AnswerChannel::Held,
         subagent_id: None,
+        revision: None,
     }
 }
 
@@ -641,6 +643,36 @@ async fn question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_sa
     }
     let verdict = say(&resolver, &question, &[], "sure, do it").await;
     assert_eq!(form_of(&verdict), [pick(0, &[1])]);
+
+    // The accepted residual (audit A1): grounding proves the cited words were
+    // said, not that they mean the option. An approval quoting the user's own
+    // unrelated words, or the "run that" of a refusal, passes the check and is
+    // armed — complete, and summarised as exactly what would be sent, which is
+    // what the countdown shows; the countdown, speech and Cancel are what stop
+    // it (vitest `question/desktop/012`).
+    let resolver = StubResolver::new()
+        .answering_question(
+            "what time is it",
+            ModelAnswer::answer(0, &[1]).citing("what time is it"),
+        )
+        .answering_question(
+            "no don't run that",
+            ModelAnswer::answer(0, &[1]).citing("run that"),
+        );
+    for said in ["what time is it", "no don't run that"] {
+        match say(&resolver, &question, &[], said).await {
+            QuestionVerdict::Answered {
+                form,
+                complete: true,
+                summary,
+                ..
+            } => {
+                assert_eq!(form, [pick(0, &[1])], "{said}");
+                assert!(summary.contains("Allow once"), "{said}: {summary}");
+            }
+            other => panic!("{said}: the residual is armed, not refused: {other:?}"),
+        }
+    }
 
     // Free text: only the user's own words, as the transcript has them.
     let form = map_pending_question(&form_question());

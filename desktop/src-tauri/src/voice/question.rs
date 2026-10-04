@@ -34,8 +34,13 @@
 //! refuses the whole answer unless each one is a run of words of the
 //! transcript itself; a free-text answer must be such a run too, and is
 //! replaced by the transcript's own words. This is no phrase list — the model
-//! still decides what the words mean — but a model that answers an unrelated
-//! utterance, or quotes words the user never said, cannot arm a send.
+//! still decides what the words mean — and it proves only that the cited words
+//! were said, not that they mean the option chosen: a model that quotes words
+//! the user never said, or cites nothing, cannot arm a send, but one that
+//! selects an option while quoting real words that do not mean it — "what time
+//! is it" for Allow once, the "run that" of "no, don't run that" — passes. That
+//! residual is accepted (PRD #1542, audit A1); the countdown shows exactly what
+//! would be sent, and speech or Cancel stops it.
 //!
 //! # Every text field of the question is untrusted
 //!
@@ -927,6 +932,15 @@ pub fn refusal_outcome(
         kind: "refused",
         code: Some(code),
         sentence,
+    }
+}
+
+/// The outcome for an answer whose question changed before it was sent.
+pub fn stale_outcome() -> AnswerOutcome {
+    AnswerOutcome {
+        kind: "refused",
+        code: Some("stale"),
+        sentence: QUESTION_MOVED_ON.to_string(),
     }
 }
 

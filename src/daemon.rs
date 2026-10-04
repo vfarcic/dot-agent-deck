@@ -1541,19 +1541,20 @@ pub async fn ingest_event(
     registry: &Arc<AgentPtyRegistry>,
     event: AgentEvent,
 ) {
-    ingest_event_unless(state, event_tx, registry, event, || false).await;
+    ingest_event_unless(state, event_tx, registry, event, |_| false).await;
 }
 
 /// [`ingest_event`], except that `stale` is asked once the `AppState` write
-/// lock is held, and a `true` drops the event before it is broadcast or
-/// applied. Asked under that lock so nothing the lock orders can slip between
-/// the verdict and the apply. Returns whether the event was ingested.
-async fn ingest_event_unless(
+/// lock is held, with the state it guards, and a `true` drops the event before
+/// it is broadcast or applied. Asked under that lock so nothing the lock orders
+/// can slip between the verdict and the apply. Returns whether the event was
+/// ingested.
+pub(crate) async fn ingest_event_unless(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
     mut event: AgentEvent,
-    stale: impl FnOnce() -> bool,
+    stale: impl FnOnce(&crate::state::AppState) -> bool,
 ) -> bool {
     // Issue #770: half of the orphan verdict, asked of the registry BEFORE the
     // `AppState` write lock is taken. Sequencing, not style: `has_live_pane`
@@ -1566,7 +1567,7 @@ async fn ingest_event_unless(
         .as_deref()
         .is_some_and(|pane_id| registry.has_live_pane(pane_id));
     let mut state = state.write().await;
-    if stale() {
+    if stale(&state) {
         return false;
     }
     // Issue #714: keep the registry's per-agent quota-block latch in step with
@@ -1619,6 +1620,10 @@ async fn ingest_event_unless(
     event
         .metadata
         .remove(crate::event::DAEMON_PANE_CLOSED_METADATA_KEY);
+    // PRD #1542 (audit A4): the question's revision is the daemon's, stamped
+    // here under the state lock that applies it, before the fan-out — so every
+    // client's copy and the snapshot carry the same one.
+    stamp_question_revision(&state, registry, &mut event);
     let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
     let question_pane = event.pane_id.clone();
     // Issue #447: `apply_event` plus the orchestrator-facing consumer of a
@@ -1632,12 +1637,16 @@ async fn ingest_event_unless(
     // that counts. Under the state lock, so the verdict and the apply cannot
     // be split by another event.
     if let Some(pane_id) = question_pane.as_deref() {
-        let keep = state.pending_question_id_on_pane(pane_id);
-        // Audit A4: when the question arrived, for the keys channel's "did the
-        // user type into the pane since?".
-        registry
-            .question_answers()
-            .note_pending(pane_id, keep.as_deref());
+        let pending = state.pending_question_on_pane(pane_id);
+        let keep = pending.as_ref().map(|q| q.id.clone());
+        // Audit A4/N1: which registration is pending, and the human-input
+        // sequence when it arrived, for the keys channel's "did a human type
+        // into the pane since?".
+        registry.question_answers().note_pending(
+            pane_id,
+            pending.as_ref().map(|q| (q.id.as_str(), q.revision)),
+            registry.human_input_counter(),
+        );
         let reason = if keep.is_some() {
             crate::question::ReleaseReason::Superseded
         } else {
@@ -1652,6 +1661,45 @@ async fn ingest_event_unless(
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);
     }
     true
+}
+
+/// PRD #1542 (audit A4): stamp the question `event` raises with the daemon's
+/// revision for it, overwriting whatever a producer put there.
+///
+/// - A question something holds on its pane takes its hold's generation — the
+///   registration the held reply will be checked against.
+/// - Otherwise a repeat of the question already pending on the pane, with the
+///   same id and content ([`crate::question::PendingQuestion::same_content`]),
+///   keeps that revision — and keeps a keyboard-only channel the daemon set on
+///   it after typing part of an answer, so a repeat cannot make a half-typed
+///   form answerable again.
+/// - Anything else is a new registration and gets a fresh revision.
+fn stamp_question_revision(
+    state: &crate::state::AppState,
+    registry: &AgentPtyRegistry,
+    event: &mut AgentEvent,
+) {
+    let (Some(pane_id), Some(mut question)) = (event.pane_id.clone(), event.question()) else {
+        return;
+    };
+    let current = state
+        .pending_question_on_pane(&pane_id)
+        .filter(|current| current.id == question.id && current.same_content(&question));
+    let held = registry
+        .question_holds()
+        .generation_of(&pane_id, &question.id);
+    question.revision = match (held, &current) {
+        (Some(generation), _) => Some(generation),
+        (None, Some(current)) if current.revision.is_some() => current.revision,
+        _ => Some(registry.question_holds().mint_revision()),
+    };
+    if let Some(current) = current
+        && current.revision == question.revision
+        && current.channel == crate::question::AnswerChannel::Unsupported
+    {
+        question.channel = crate::question::AnswerChannel::Unsupported;
+    }
+    event.set_question(&question);
 }
 
 /// PRD #1542 (audit A6): how long the daemon holds a question for its producer
@@ -1800,8 +1848,12 @@ where
             ReleaseReason::NotHeld,
         ));
     };
-    let pending = state.read().await.pending_question_id_on_pane(&pane_id);
-    if pending.as_deref() != Some(id.as_str()) {
+    let pending = state
+        .read()
+        .await
+        .pending_question_on_pane(&pane_id)
+        .map(|q| (q.id, q.revision));
+    if pending != Some((id.clone(), Some(hold.generation))) {
         registry
             .question_holds()
             .forget(&pane_id, &id, hold.generation);
@@ -1832,6 +1884,13 @@ where
 /// client, not only applied here: a client still showing the question would
 /// offer an answer the daemon can only refuse. The event names the question
 /// and asserts no status (see `QUESTION_RELEASED_BY_DECK_METADATA_KEY`).
+///
+/// **Revision-checked at the point of mutation (audit A5).** The generation is
+/// the held question's revision, and a same-id replacement can register while
+/// this awaits — after its `forget` already succeeded. So the release event is
+/// applied only if, under the state write lock that applies it, the pane's
+/// pending question is still this revision, and the fallback clear names the
+/// revision too: a replacement's question and its hold are never touched.
 async fn drop_held_question(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -1844,7 +1903,15 @@ async fn drop_held_question(
     if !registry.question_holds().forget(pane_id, id, generation) {
         return;
     }
-    let owner = state.read().await.pending_question_owner(pane_id, id);
+    registry
+        .question_answers()
+        .barrier("drop_held_question:forgotten")
+        .await;
+    let revision = Some(generation);
+    let owner = state
+        .read()
+        .await
+        .pending_question_owner(pane_id, id, revision);
     if let Some((session_id, agent_type, agent_id)) = owner {
         let event = deck_question_event(
             session_id,
@@ -1855,10 +1922,17 @@ async fn drop_held_question(
             crate::event::EventType::Unknown,
             crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY,
         );
-        ingest_event(state, event_tx, registry, event).await;
+        let replaced = |s: &crate::state::AppState| {
+            s.pending_question_on_pane(pane_id)
+                .is_none_or(|q| q.id != id || q.revision != revision)
+        };
+        ingest_event_unless(state, event_tx, registry, event, replaced).await;
     }
     // The fallback for an event the card refused.
-    let cleared = state.write().await.clear_pending_question(pane_id, id);
+    let cleared = state
+        .write()
+        .await
+        .clear_pending_question_revision(pane_id, id, revision);
     info!(
         pane_id = %escape_id_for_log(pane_id),
         question_id = %id,
@@ -2210,7 +2284,7 @@ async fn report_codex_rollout_failure(
     let turn_id = failure.turn_id.clone();
     let outcome = failure.outcome.clone();
     let event = codex_rollout_failure_event(failure);
-    let superseded = || {
+    let superseded = |_: &crate::state::AppState| {
         registry
             .codex_rollout_arms()
             .supersedes(&agent_id, &turn_id)
@@ -4182,6 +4256,15 @@ async fn run_hook_loop_with_limits(
                                     // A connection that closes first (the
                                     // agent killed its hook, the keyboard
                                     // answered) takes the question with it.
+                                    //
+                                    // Audit A6/N2: and then the connection
+                                    // ENDS. A question connection carries one
+                                    // request, as every producer sends it; a
+                                    // held one has given its hook-pool slot
+                                    // back and its hold budget goes with the
+                                    // handler, so a socket kept open past the
+                                    // reply would otherwise read and dispatch
+                                    // more lines outside both bounds.
                                     let Some(reply) = handle_question_signal(
                                         signal,
                                         attested_agent.clone(),
@@ -4205,6 +4288,7 @@ async fn run_hook_loop_with_limits(
                                             write_half.write_all(line.as_bytes()).await;
                                         let _ = write_half.flush().await;
                                     }
+                                    break;
                                 }
                                 DaemonMessage::ListTargets(req) => {
                                     // PRD #220: the shape menu, computed HERE so it
@@ -10063,6 +10147,31 @@ mod question_hold_tests {
         }
     }
 
+    /// The producer's one reply line, and whether the daemon then closed the
+    /// connection: a producer that keeps its end open and writes another line
+    /// is read no further (audit A6/N2).
+    async fn reply_then_closed(stream: UnixStream, more: &AgentEvent) -> (QuestionReply, bool) {
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("a reply")
+            .expect("a reply");
+        assert!(n > 0, "a reply line");
+        let reply = serde_json::from_str(line.trim()).unwrap();
+        // The producer misbehaves: it keeps the socket and sends more.
+        let _ = reader
+            .get_mut()
+            .write_all(format!("{}\n", serde_json::to_string(more).unwrap()).as_bytes())
+            .await;
+        let mut rest = String::new();
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut rest)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        (reply, closed)
+    }
+
     async fn no_reply_within(stream: &mut UnixStream, budget: Duration) -> bool {
         let mut byte = [0u8; 1];
         use tokio::io::AsyncReadExt;
@@ -10091,6 +10200,9 @@ mod question_hold_tests {
                 &b.pane,
                 &a.id,
                 "q-same",
+                deck.registry
+                    .question_holds()
+                    .generation_of(&b.pane, "q-same"),
                 QuestionReply::answered("q-same", Vec::new())
             ),
             "a hold is answered only for the agent that registered it"
@@ -10168,11 +10280,58 @@ mod question_hold_tests {
         assert_eq!(reply.outcome, ReplyOutcome::Answered);
     }
 
+    /// Scenario: A producer holding a question goes away, and the daemon starts
+    /// dropping its question. Right after it lets go of that producer's hold —
+    /// before it clears the question — a new producer registers the same
+    /// question id on the same pane. The old cleanup then finishes without
+    /// touching the replacement: the replacement stays held and pending, and
+    /// the deck's answer reaches it.
+    #[spec("question/hold/011")]
+    #[tokio::test]
+    async fn question_hold_011_a_late_cleanup_cannot_clear_a_same_id_replacement() {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-a5-late").await;
+        let first = deck.hold(&a, "q-late").await;
+        deck.until_held(&a, "q-late").await;
+        let (reached, resume) = deck
+            .registry
+            .question_answers()
+            .arm_barrier("drop_held_question:forgotten");
+        drop(first);
+        reached.await.expect("the old cleanup let go of its hold");
+        let second = deck.hold(&a, "q-late").await;
+        deck.until_held(&a, "q-late").await;
+        let replacement = deck
+            .state
+            .read()
+            .await
+            .pending_question_on_pane(&a.pane)
+            .expect("the replacement is pending");
+        resume.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(deck.registry.question_holds().is_held(&a.pane, "q-late"));
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_on_pane(&a.pane)
+                .map(|q| (q.id, q.revision)),
+            Some(("q-late".to_string(), replacement.revision)),
+            "the replacement's question survives the old cleanup"
+        );
+        deck.answer(&a, "q-late").await.expect("answered");
+        let reply = reply_on(second).await.expect("the replacement hears it");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+    }
+
     /// Scenario: With the hook connection pool cut to two, three agents each
     /// hold a question open. A completion hook for the first agent's tool still
     /// gets in, clears that question and lets its producer go — held questions
     /// give their pool slot back. With the hold budget cut to one, a question
     /// past it still turns the card Needs Input but is not held or offered.
+    /// Every question connection ends with its reply — cleared, not held,
+    /// superseded or released at the deadline — so a producer that keeps its
+    /// socket open and sends more has it read by nothing, however many do.
     #[spec("question/hold/008")]
     #[tokio::test]
     async fn question_hold_008_held_questions_never_starve_the_hook_pool() {
@@ -10212,11 +10371,17 @@ mod question_hold_tests {
         )
         .await;
         let first = producers.remove(0);
-        let released = reply_on(first).await.expect("the first producer is let go");
+        // A line the first producer sends after its reply, if it were read,
+        // would raise a question on its pane again.
+        let mut sneaked = question_event(&agents[0].id, "q-sneaked");
+        sneaked.pane_id = Some(agents[0].pane.clone());
+        sneaked.session_id = format!("{}-session", agents[0].pane);
+        let (released, closed) = reply_then_closed(first, &sneaked).await;
         assert_eq!(
             released.reason,
             Some(crate::question::ReleaseReason::Cleared)
         );
+        assert!(closed, "the connection ends with its reply");
         assert_eq!(deck.registry.question_holds().len(), 2);
 
         // The hold budget.
@@ -10230,26 +10395,88 @@ mod question_hold_tests {
         let _held = deck.hold(&one, "q-budget-1").await;
         deck.until_held(&one, "q-budget-1").await;
         let over = deck.hold(&two, "q-budget-2").await;
-        let reply = reply_on(over).await.expect("released at once");
+        let mut sneaked = question_event(&two.id, "q-budget-sneaked");
+        sneaked.pane_id = Some(two.pane.clone());
+        sneaked.session_id = format!("{}-session", two.pane);
+        let (reply, closed) = reply_then_closed(over, &sneaked).await;
         assert_eq!(reply.reason, Some(crate::question::ReleaseReason::NotHeld));
+        assert!(closed, "a question refused a hold ends its connection too");
         assert!(
             !deck
                 .registry
                 .question_holds()
                 .is_held(&two.pane, "q-budget-2")
         );
-        let state = deck.state.read().await;
-        assert_eq!(state.pending_question_id_on_pane(&two.pane), None);
-        assert_eq!(
-            state.sessions["pane-a8-b2-session"].status,
-            crate::state::SessionStatus::WaitingForInput
-        );
+        {
+            let state = deck.state.read().await;
+            assert_eq!(state.pending_question_id_on_pane(&two.pane), None);
+            assert_eq!(
+                state.sessions["pane-a8-b2-session"].status,
+                crate::state::SessionStatus::WaitingForInput
+            );
+        }
+
+        // Past both bounds: more producers than the pool holds connections and
+        // the budget holds questions, each released — superseded, or at the
+        // hold deadline — and each keeping its socket open afterwards. Every
+        // one is closed with its reply, so none can go on sending lines that
+        // nothing accounts for, and the pool still serves a fresh hook.
+        let deck = Deck::start(HookLoopLimits {
+            max_connections: 2,
+            max_holds: 2,
+            hold_deadline: Duration::from_millis(300),
+            ..limits()
+        })
+        .await;
+        let mut kept_open = Vec::new();
+        for round in 0..3 {
+            let agent = deck.agent(&format!("pane-a8-c{round}")).await;
+            let superseded = deck.hold(&agent, "q-churn").await;
+            deck.until_held(&agent, "q-churn").await;
+            let replacement = deck.hold(&agent, "q-churn").await;
+            let mut sneaked = question_event(&agent.id, "q-churn-sneaked");
+            sneaked.pane_id = Some(agent.pane.clone());
+            sneaked.session_id = format!("{}-session", agent.pane);
+            let (reply, closed) = reply_then_closed(superseded, &sneaked).await;
+            assert_eq!(
+                reply.reason,
+                Some(crate::question::ReleaseReason::Superseded)
+            );
+            assert!(closed, "round {round}: a superseded hold's connection ends");
+            let (reply, closed) = reply_then_closed(replacement, &sneaked).await;
+            assert_eq!(
+                reply.reason,
+                Some(crate::question::ReleaseReason::Cleared),
+                "round {round}: released at the deadline"
+            );
+            assert!(
+                closed,
+                "round {round}: a deadline release ends its connection"
+            );
+            kept_open.push(agent);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let state = deck.state.read().await;
+            for agent in &kept_open {
+                assert_eq!(
+                    state.pending_question_id_on_pane(&agent.pane),
+                    None,
+                    "nothing sent after a reply was read"
+                );
+            }
+        }
+        assert!(deck.registry.question_holds().is_empty());
+        let fresh = deck.agent("pane-a8-fresh").await;
+        let producer = deck.hold(&fresh, "q-fresh").await;
+        deck.until_held(&fresh, "q-fresh").await;
+        drop(producer);
     }
 
     /// Scenario: A process sends the hook socket a bare event carrying a
     /// question, and another carrying an "answered" marker. The card takes the
-    /// status, but neither raises nor clears a question: those come only through
-    /// the provenance gate. The same question sent as an unheld `question`
+    /// status, but the question metadata neither raises nor clears a question:
+    /// that comes only through the provenance gate. The same question sent as an unheld `question`
     /// message with the pane's token is pending at once, and an attested
     /// "answered" marker clears it; one for a pane the deck never issued a token
     /// to has its question removed.
