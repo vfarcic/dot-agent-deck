@@ -7331,7 +7331,11 @@ impl AgentPtyRegistry {
     /// worker cannot both pass it. Expired commissions
     /// ([`DELEGATION_COMMISSION_TTL`]) are dropped first, which is what keeps a
     /// commission nobody will ever answer from refusing that worker for ever
-    /// (issue #590). The ledger is the signal rather than the worker's status:
+    /// (issue #590), and so are commissions bound to an agent other than the
+    /// pane's current occupant — a worker that exited on its own, whose pane a
+    /// successor now holds (issue #1531; see
+    /// [`Self::retire_commissions_of_a_previous_occupant`]). The ledger is the
+    /// signal rather than the worker's status:
     /// status is hook-reported, and a hook event is not proof of anything.
     ///
     /// With `supersede`, arming does not REPLACE a previous entry — it
@@ -7376,6 +7380,49 @@ impl AgentPtyRegistry {
         supersede: bool,
         now: Instant,
     ) -> CommissionArm {
+        // Issue #1531: read before the tracker lock, which is never held
+        // together with the registry's own (the same order as crediting).
+        let occupant = self.pane_current_agent_id(worker_pane_id);
+        let arm = self.arm_delegation_commission_for_occupant(
+            worker_pane_id,
+            orchestrator_pane_id,
+            orchestrator_agent_id,
+            supersede,
+            now,
+            occupant.as_deref(),
+        );
+        // Qodo (#1551): the pane can change hands between that read and the
+        // lock, and a refusal decided for the agent that just left would turn
+        // away its successor. A refusal records nothing, so it is decided once
+        // more, against the agent holding the pane now, when that has changed.
+        if matches!(arm, CommissionArm::Busy { .. }) {
+            let current = self.pane_current_agent_id(worker_pane_id);
+            if current != occupant {
+                return self.arm_delegation_commission_for_occupant(
+                    worker_pane_id,
+                    orchestrator_pane_id,
+                    orchestrator_agent_id,
+                    supersede,
+                    now,
+                    current.as_deref(),
+                );
+            }
+        }
+        arm
+    }
+
+    /// [`Self::arm_delegation_commission_at`] for a known pane occupant,
+    /// `occupant` — the pane's current live agent, read by the caller without
+    /// the tracker lock held.
+    fn arm_delegation_commission_for_occupant(
+        self: &Arc<Self>,
+        worker_pane_id: &str,
+        orchestrator_pane_id: &str,
+        orchestrator_agent_id: Option<&str>,
+        supersede: bool,
+        now: Instant,
+        occupant: Option<&str>,
+    ) -> CommissionArm {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
             || tracker.closing_panes.contains(orchestrator_pane_id)
@@ -7383,6 +7430,22 @@ impl AgentPtyRegistry {
             return CommissionArm::Closing;
         }
         Self::expire_commissions(&mut tracker, worker_pane_id, now);
+        // Issue #1531: a commission made to an agent that no longer holds the
+        // pane can never be answered, so it does not make the pane's current
+        // occupant busy — the same retirement #507 applies when crediting.
+        // Without it a live successor in the pane of a worker that exited on
+        // its own was refused as busy until `--supersede` or its own first
+        // `work-done`.
+        let retired =
+            Self::retire_commissions_of_a_previous_occupant(&mut tracker, worker_pane_id, occupant);
+        if retired > 0 {
+            tracing::info!(
+                pane_id = %worker_pane_id,
+                retired,
+                "delegate: retired delegation commissions made to an agent that no longer holds \
+                 this pane, so they do not make its current occupant busy"
+            );
+        }
         let entry = tracker
             .commissions
             .entry(worker_pane_id.to_string())
@@ -7792,7 +7855,8 @@ impl AgentPtyRegistry {
     /// pane id is then free for another agent. Without this, that agent's first
     /// `work-done` spent the predecessor's commission: reported to the
     /// orchestrator as the delegated work coming back, and filed over the
-    /// role's `work-done-<role>.md`.
+    /// role's `work-done-<role>.md`. Issue #1531: arming a delegate runs it too,
+    /// against the same occupant, so the busy refusal does not count them either.
     ///
     /// Decided per commission, from the agent its own task pointer went to
     /// ([`ArmedCommission::worker_agent_id`]). Kept: a commission bound to the
