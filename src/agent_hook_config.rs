@@ -175,55 +175,12 @@ fn build_command_for(
 /// publish lands is still the destination's own, applied by `fchmod`, which no
 /// umask filters.
 pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    publish(dir, dest, bytes, PublishMode::Destination)
-}
-
-/// Which mode a [`publish`] lands.
-///
-/// Named rather than implied because the answer genuinely differs between the
-/// two things this module writes, and the wrong one is a confidentiality bug in
-/// either direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PublishMode {
-    /// The destination's OWN current mode, or owner-only when it is new — the
-    /// rule #360 and #382 exist to hold, so an install never widens a config the
-    /// user kept private and never narrows one they deliberately opened.
-    ///
-    /// The stat behind this FOLLOWS a symlink, which is correct here: a config
-    /// legitimately symlinked into a dotfiles checkout should be published at
-    /// the mode of the file that actually holds it. What makes that safe is the
-    /// caller — `hooks_manage::write_settings` refuses a symlinked destination
-    /// outright, and the other adapters write a path the agent owns.
-    Destination,
-    /// Owner-only, whatever is at the destination.
-    ///
-    /// For a file whose name is the deck's own scratch convention, where there
-    /// is no user intent at the destination to preserve and a pre-existing entry
-    /// is far more likely to be a plant than a preference. Greptile's P1 on PR
-    /// #855: [`backup_malformed`] used [`PublishMode::Destination`], so a
-    /// symlink planted at `<name>.bak` pointing at a world-readable file got to
-    /// CHOOSE the mode a copy of the user's config was published with — the
-    /// `rename` correctly refused to follow the link for the write, and then the
-    /// mode was taken from what it pointed at anyway.
-    OwnerOnly,
-}
-
-/// [`write_atomic`] with the landed mode spelled by the caller.
-fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Result<()> {
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
 
     let (mut file, tmp) = create_temp(dir, name)?;
-
-    // Windows has no mode bits to set, so the policy is read by nobody there and
-    // `-D warnings` fails on the unused parameter. `build-windows` is the only
-    // gate that compiles this arm, and it caught exactly that on PR #855 — the
-    // divergence CLAUDE.md rule 2 warns about, since the four-flag clippy run a
-    // contributor makes locally never builds this configuration.
-    #[cfg(not(unix))]
-    let _ = mode;
 
     // Everything after the create is fallible with a temp file already on disk,
     // so it runs in one closure and shares a single cleanup path. The previous
@@ -233,15 +190,12 @@ fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Resu
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            // Set explicitly in BOTH arms rather than leaning on
-            // `create_temp_excl`'s `mode(0o600)`, which an unusual umask can
-            // narrow further; `fchmod` is filtered by no umask.
-            let landed = match mode {
-                PublishMode::Destination => std::fs::metadata(dest)
-                    .map(|meta| meta.permissions().mode() & 0o777)
-                    .unwrap_or(0o600),
-                PublishMode::OwnerOnly => 0o600,
-            };
+            // Set explicitly rather than leaning on `create_temp_excl`'s
+            // `mode(0o600)`, which an unusual umask can narrow further; `fchmod`
+            // is filtered by no umask.
+            let landed = std::fs::metadata(dest)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
             file.set_permissions(std::fs::Permissions::from_mode(landed))?;
         }
         file.write_all(bytes)?;
@@ -256,49 +210,74 @@ fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Resu
     Ok(())
 }
 
+/// What [`backup_malformed`] did with the bytes it was handed, so
+/// [`preserved_phrase`] can say exactly that and nothing more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Backup {
+    /// The bytes are at this path: copied there now, or already there byte for
+    /// byte — the same config refused again, as `hooks_manage::auto_install`
+    /// does on every launch while it stays malformed.
+    Preserved(PathBuf),
+    /// Something else already holds the backup name and was left as it was.
+    Occupied(PathBuf),
+    /// No copy was made.
+    Failed,
+}
+
 /// Preserve `bytes` — the content of a config file that would not parse — beside
-/// the original as `<file name>.bak`, and report where they went.
+/// the original as `<file name>.bak`, **unless that name is already taken**, and
+/// report what happened.
 ///
 /// Best-effort by contract: every caller is on its way to returning an
 /// `InvalidData` error with the user's file left untouched, so a failed copy must
-/// not replace that error with its own. The return is a path rather than a `()`
-/// so [`preserved_phrase`] can turn it into the clause the caller's message
-/// shows, and no message names a backup that was never made — the
-/// `let _ = std::fs::write(…)` this replaces could not express that difference.
+/// not replace that error with its own. That is also why the copy is close to
+/// redundant — the original bytes are still on disk at the original path — and
+/// why nothing here may cost the user a file to make it.
+///
+/// # An existing `<name>.bak` is never replaced (#537)
+///
+/// A config is malformed because somebody is hand-editing it, and copying it to
+/// `<name>.bak` first is what a careful hand-editor does. This used to publish
+/// over whatever held the name, so the first refusal destroyed the one copy of
+/// the user's config that still parsed, to protect an original that was never
+/// at risk. The name is now taken only when it is free:
+///
+/// - free → the bytes land there, [`Backup::Preserved`];
+/// - holding exactly these bytes, as a regular file → the earlier refusal's own
+///   copy, [`Backup::Preserved`] without a write;
+/// - holding anything else — a different file, a directory, a symlink →
+///   [`Backup::Occupied`], left exactly as found.
+///
+/// Repeat refusals therefore never accumulate files (the reason #855 chose to
+/// replace rather than draw a fresh name each time): a config that stays
+/// malformed reuses its backup, and one that changes keeps the first copy and
+/// says so.
 ///
 /// # The copy is never written THROUGH a symlink (#731)
 ///
-/// All three adapters spelled this as `std::fs::write` at this same, fully
-/// predictable path. That opens with `O_TRUNC` and **follows a symlink**, so a
+/// All three adapters once spelled this as `std::fs::write` at this same, fully
+/// predictable path, which opens with `O_TRUNC` and **follows a symlink**: a
 /// writer able to add an entry to the agent's config directory — `~/.claude`,
 /// `~/.codex`, `~/.config/devin` — could plant `<name>.bak` pointing at any file
-/// it could write and have the deck truncate that file and fill it with the
-/// malformed config's bytes. It is [`write_atomic`]'s own defect one door along:
-/// the config directory's other name the deck writes without creating it first.
-///
-/// Publishing through [`write_atomic`] closes it, because `rename(2)` does not
-/// follow a symlink at its destination either — it replaces the link itself, so
-/// the planted target is never opened. Replacing rather than refusing is the
-/// right branch *here*, unlike `hooks_manage::refuse_symlinked_destination`
-/// which guards the real config file: a `.bak` is the deck's own scratch name
-/// that nobody stows in a dotfiles checkout, and refusing would discard the very
-/// bytes this exists to keep.
+/// it could write and have the deck fill it with the malformed config's bytes.
+/// [`create_temp_excl`]'s `O_CREAT|O_EXCL` (`CREATE_NEW` on Windows) closes it:
+/// POSIX requires it to fail with `EEXIST` when the path names a symlink,
+/// dangling or not, so a planted link is never opened and is reported as
+/// [`Backup::Occupied`]. A symlink is never counted as an earlier copy either —
+/// the comparison reads only a regular file.
 ///
 /// # Permissions
 ///
-/// The backup lands **owner-only, always** ([`PublishMode::OwnerOnly`]) — not at
-/// the destination's own mode, which is what every other write here uses. It is
-/// a byte-for-byte copy of a config that may hold an org id or an auth
-/// reference, so 0600 is the right answer on its merits; `std::fs::write` left
-/// it at `0666 & !umask`, typically 0644, beside a Devin config that ships 0600
-/// (#360, #382).
+/// The backup lands **owner-only, always** — not at the destination's mode. It
+/// is a byte-for-byte copy of a config that may hold an org id or an auth
+/// reference, so 0600 is the right answer on its merits (#360, #382), and since
+/// nothing that already holds the name is ever opened for writing, a planted
+/// link cannot choose the mode either (Greptile's P1 on PR #855).
 ///
-/// Taking the destination's mode here would ALSO hand the mode back to a
-/// planted symlink, which is Greptile's P1 on PR #855 and the reason this arm
-/// exists: `rename` does not follow the link for the write, but the stat that
-/// chose the mode did, so a link pointing at a world-readable file published the
-/// user's config bytes 0666. Not following a symlink and then adopting its
-/// target's permissions is worse than either half sounds.
+/// The write is not atomic: a crash part-way leaves a short `<name>.bak`, which
+/// a later refusal then reports as [`Backup::Occupied`] while the original is
+/// still intact. That is the cost of a create that cannot replace, and it is the
+/// cheap side — the alternative is a publish that can.
 ///
 /// # The name
 ///
@@ -308,29 +287,71 @@ fn publish(dir: &Path, dest: &Path, bytes: &[u8], mode: PublishMode) -> io::Resu
 /// `settings.json`, `hooks.json` and `config.json` each reach
 /// `<that name>.bak` either way, and a different one only for a destination not
 /// named `*.json`, where appending is what keeps the original name legible.
-pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Option<PathBuf> {
-    let mut name = dest.file_name()?.to_os_string();
-    name.push(".bak");
-    // `dest`'s OWN directory, which is what keeps the publish's `rename` on one
-    // filesystem — the same requirement `write_atomic` states for `dir`.
-    let dir = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
+pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
+    let Some(file_name) = dest.file_name() else {
+        return Backup::Failed;
     };
-    let backup = dir.join(name);
-    publish(dir, &backup, bytes, PublishMode::OwnerOnly)
-        .ok()
-        .map(|()| backup)
+    let mut name = file_name.to_os_string();
+    name.push(".bak");
+    let backup = dest.with_file_name(name);
+
+    let mut file = match create_temp_excl(&backup) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return if holds_exactly(&backup, bytes) {
+                Backup::Preserved(backup)
+            } else {
+                Backup::Occupied(backup)
+            };
+        }
+        Err(_) => return Backup::Failed,
+    };
+    let written = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Explicit for the same reason as in `write_atomic`: an unusual umask
+            // can narrow `create_temp_excl`'s 0600, and `fchmod` is filtered by
+            // none.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    match written {
+        Ok(()) => Backup::Preserved(backup),
+        Err(_) => {
+            // This call created the file a moment ago, so removing a partial
+            // copy takes nothing that was the user's.
+            let _ = std::fs::remove_file(&backup);
+            Backup::Failed
+        }
+    }
 }
 
-/// Spell where [`backup_malformed`]'s bytes went, for the caller's error message.
+/// Whether `path` is a regular file holding exactly `bytes` — read without
+/// following a symlink at `path` itself, so a planted link is never taken for
+/// an earlier backup.
+fn holds_exactly(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == bytes.len() as u64)
+        && std::fs::read(path).is_ok_and(|existing| existing == bytes)
+}
+
+/// Spell what [`backup_malformed`] did, for the caller's error message.
 ///
 /// One phrasing shared by all three adapters, so the sentence a user reads names
-/// a file that exists.
-pub(crate) fn preserved_phrase(backup: Option<&Path>) -> String {
+/// a file that holds what it says, and never claims a file the deck did not
+/// write as its backup.
+pub(crate) fn preserved_phrase(backup: &Backup) -> String {
     match backup {
-        Some(path) => format!("preserved at {}", path.display()),
-        None => "not preserved: the copy aside failed".to_string(),
+        Backup::Preserved(path) => format!("preserved at {}", path.display()),
+        Backup::Occupied(path) => format!(
+            "not copied: {} already exists and was left as it was",
+            path.display()
+        ),
+        Backup::Failed => "not preserved: the copy aside failed".to_string(),
     }
 }
 
@@ -1166,7 +1187,8 @@ mod tests {
     /// `std::fs::write` all three adapters used follows a symlink — so a writer
     /// able to add an entry to the agent's config directory could point that
     /// name at any file it could write and have the deck fill it with the
-    /// malformed config's bytes. The publish must replace the link instead.
+    /// malformed config's bytes. The link must be neither followed nor, since
+    /// #537, replaced: it is something already at the backup name.
     #[cfg(unix)]
     #[test]
     fn backup_malformed_does_not_follow_a_symlink_planted_at_the_backup_path() {
@@ -1178,47 +1200,116 @@ mod tests {
         let planted = dir.path().join("config.json.bak");
         std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
 
-        let backup = backup_malformed(&dest, b"{ not json").expect("the bytes must be preserved");
+        let outcome = backup_malformed(&dest, b"{ not json");
 
         assert_eq!(
             std::fs::read(&victim).expect("read victim"),
             b"victim bytes",
             "the copy followed the planted symlink and overwrote the victim"
         );
-        assert_eq!(backup, planted, "the backup keeps its conventional name");
+        assert_eq!(outcome, Backup::Occupied(planted.clone()));
         assert!(
-            !std::fs::symlink_metadata(&backup)
-                .expect("stat backup")
+            std::fs::symlink_metadata(&planted)
+                .expect("stat planted link")
                 .file_type()
                 .is_symlink(),
-            "the backup must be a real file, not the planted symlink"
+            "the planted link must be left as it was found"
         );
-        assert_eq!(std::fs::read(&backup).expect("read backup"), b"{ not json");
     }
 
-    /// The plain path, and the control for the test above: with nothing planted
-    /// the bytes land at `<name>.bak`, a later copy replaces that same file
-    /// rather than accumulating beside it, and no temp is left behind.
-    ///
-    /// Replacing matters more than it looks: `hooks_manage::auto_install` runs on
-    /// every deck start, so a config that stays malformed reaches this on every
-    /// launch. A collision-safe *new* name each time — the issue's other
-    /// sanctioned shape — would grow one file per launch in the user's config
-    /// directory.
+    /// The comparison that recognises an earlier copy must not follow a planted
+    /// link either: a link to a file that happens to hold the same bytes is
+    /// still not a backup the deck made, and must not be named as one.
+    #[cfg(unix)]
     #[test]
-    fn backup_malformed_replaces_a_previous_backup_without_accumulating() {
+    fn a_planted_symlink_to_identical_bytes_is_not_taken_for_a_backup() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("config.json");
+        let lookalike = dir.path().join("lookalike");
+        std::fs::write(&lookalike, b"{ not json").expect("seed lookalike");
+        let planted = dir.path().join("config.json.bak");
+        std::os::unix::fs::symlink(&lookalike, &planted).expect("plant symlink");
+
+        assert_eq!(
+            backup_malformed(&dest, b"{ not json"),
+            Backup::Occupied(planted)
+        );
+    }
+
+    /// Issue #537 item 1: a `<name>.bak` that is already there is somebody's
+    /// file, and the copy aside must not replace it.
+    ///
+    /// The realistic owner is the user: a config becomes malformed because
+    /// somebody is hand-editing it, and copying it to `settings.json.bak` first
+    /// is what a careful hand-editor does. A refusal that then replaced that
+    /// file destroyed the one copy of their config that still parsed, while the
+    /// original it was protecting was never at risk — every caller leaves it
+    /// untouched. The message must not claim the occupant as the deck's backup
+    /// either.
+    #[test]
+    fn backup_malformed_never_replaces_a_file_already_at_the_backup_name() {
         let dir = crate::test_temp::tempdir().expect("backup tempdir");
         let dest = dir.path().join("settings.json");
+        std::fs::write(&dest, b"{ \"model\": \"opus\",, }").expect("seed destination");
+        let users_own = dir.path().join("settings.json.bak");
+        std::fs::write(&users_own, b"{ \"model\": \"opus\" }").expect("seed the user's backup");
+
+        let outcome = backup_malformed(&dest, b"{ \"model\": \"opus\",, }");
+
+        assert_eq!(
+            std::fs::read(&users_own).expect("read the user's backup"),
+            b"{ \"model\": \"opus\" }",
+            "the copy aside replaced a backup the user made themselves"
+        );
+        assert_eq!(outcome, Backup::Occupied(users_own.clone()));
+        let phrase = preserved_phrase(&outcome);
+        assert!(
+            !phrase.starts_with("preserved at"),
+            "the message claimed the user's own file as the deck's backup: {phrase}"
+        );
+    }
+
+    /// A copy that cannot be made at all is reported as such, not as preserved.
+    #[test]
+    fn backup_malformed_reports_a_copy_it_could_not_make() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("missing-dir").join("settings.json");
+        assert_eq!(backup_malformed(&dest, b"{ not json"), Backup::Failed);
+    }
+
+    /// The plain path, and the control for the test above: with nothing at the
+    /// name the bytes land at `<name>.bak`; the same bytes refused again are
+    /// recognised as already preserved; different bytes leave the first copy
+    /// alone and say so. Nothing accumulates and no temp is left behind.
+    ///
+    /// Not accumulating matters more than it looks: `hooks_manage::auto_install`
+    /// runs on every deck start, so a config that stays malformed reaches this
+    /// on every launch. A collision-safe *new* name each time would grow one
+    /// file per launch in the user's config directory.
+    #[test]
+    fn backup_malformed_reuses_its_own_backup_and_never_accumulates() {
+        let dir = crate::test_temp::tempdir().expect("backup tempdir");
+        let dest = dir.path().join("settings.json");
+        let bak = dir.path().join("settings.json.bak");
         std::fs::write(&dest, b"first malformed").expect("seed destination");
 
-        let first = backup_malformed(&dest, b"first malformed").expect("first backup");
-        assert_eq!(first, dir.path().join("settings.json.bak"));
-
-        let second = backup_malformed(&dest, b"second malformed").expect("second backup");
-        assert_eq!(second, first, "the backup name is stable across copies");
         assert_eq!(
-            std::fs::read(&second).expect("read backup"),
-            b"second malformed"
+            backup_malformed(&dest, b"first malformed"),
+            Backup::Preserved(bak.clone())
+        );
+        assert_eq!(
+            backup_malformed(&dest, b"first malformed"),
+            Backup::Preserved(bak.clone()),
+            "the same bytes refused again are already preserved"
+        );
+        assert_eq!(
+            backup_malformed(&dest, b"second malformed"),
+            Backup::Occupied(bak.clone()),
+            "different bytes must not replace the first copy"
+        );
+        assert_eq!(
+            std::fs::read(&bak).expect("read backup"),
+            b"first malformed"
         );
 
         let mut names: Vec<_> = std::fs::read_dir(dir.path())
@@ -1244,7 +1335,8 @@ mod tests {
     /// which DOES follow — so a link pointing at a world-readable file published
     /// the user's config bytes 0666. Not following a symlink for the write and
     /// then taking the symlink target's permissions for it is worse than either
-    /// half sounds.
+    /// half sounds. Since #537 nothing is written at a name a link already
+    /// holds, so neither the bytes nor a mode reach what it points at.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_backup_path_cannot_choose_the_backups_mode() {
@@ -1261,16 +1353,19 @@ mod tests {
         std::os::unix::fs::symlink(&victim, dir.path().join("config.json.bak"))
             .expect("plant symlink");
 
-        let backup = backup_malformed(&dest, b"{ not json").expect("backup");
-
         assert_eq!(
-            std::fs::metadata(&backup)
-                .expect("stat backup")
+            backup_malformed(&dest, b"{ not json"),
+            Backup::Occupied(dir.path().join("config.json.bak")),
+            "nothing may be published at a name a link already holds"
+        );
+        assert_eq!(
+            std::fs::metadata(&victim)
+                .expect("stat victim")
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600,
-            "the planted link's target supplied the published backup's mode"
+            0o666,
+            "the victim's mode must be left as it was"
         );
         assert_eq!(
             std::fs::read(&victim).expect("read victim"),
@@ -1290,7 +1385,9 @@ mod tests {
 
         let dir = crate::test_temp::tempdir().expect("backup tempdir");
         let dest = dir.path().join("config.json");
-        let backup = backup_malformed(&dest, b"{ not json").expect("backup");
+        let Backup::Preserved(backup) = backup_malformed(&dest, b"{ not json") else {
+            panic!("a free backup name must take the copy");
+        };
 
         assert_eq!(
             std::fs::metadata(&backup)
@@ -1389,6 +1486,36 @@ mod tests {
             command_executable("/abs/dot-agent-deckhook --agent codex", CODEX),
             None,
             "the space before the suffix is required — no substring match"
+        );
+    }
+
+    /// Issue #537 item 4.2: both quoting forms are undone on every platform, and
+    /// so is the escape inside each. A path holding the quote character is where
+    /// the escape matters — the POSIX writer spells `'` as `'\''`, the `cmd.exe`
+    /// writer spells `"` as `\"` — and no fixture elsewhere carries one, so
+    /// deleting either `replace` passed every other test.
+    #[test]
+    fn unquote_if_needed_undoes_both_quoting_forms_and_their_escapes() {
+        assert_eq!(
+            unquote_if_needed("'/opt/My Deck/dot-agent-deck'"),
+            "/opt/My Deck/dot-agent-deck"
+        );
+        assert_eq!(
+            unquote_if_needed("\"/opt/My Deck/dot-agent-deck\""),
+            "/opt/My Deck/dot-agent-deck"
+        );
+        assert_eq!(
+            unquote_if_needed(r"'/opt/Bob'\''s Deck/dot-agent-deck'"),
+            "/opt/Bob's Deck/dot-agent-deck"
+        );
+        assert_eq!(
+            unquote_if_needed(r#""/opt/The \"Deck\"/dot-agent-deck""#),
+            r#"/opt/The "Deck"/dot-agent-deck"#
+        );
+        assert_eq!(
+            unquote_if_needed("/opt/deck/dot-agent-deck"),
+            "/opt/deck/dot-agent-deck",
+            "an unquoted token is returned as it is"
         );
     }
 
@@ -1655,18 +1782,26 @@ mod tests {
     }
 
     /// The message a user reads must not name a file that was never written.
-    /// The `let _ = std::fs::write(…)` this replaced always claimed one.
+    /// The `let _ = std::fs::write(…)` this replaced always claimed one, and
+    /// until #537 a backup name already in use was claimed as well.
     #[test]
     fn preserved_phrase_names_a_backup_only_when_there_is_one() {
+        let path = PathBuf::from("/agent/config/hooks.json.bak");
         assert_eq!(
-            preserved_phrase(Some(Path::new("/agent/config/hooks.json.bak"))),
+            preserved_phrase(&Backup::Preserved(path.clone())),
             "preserved at /agent/config/hooks.json.bak"
         );
-        let none = preserved_phrase(None);
+        let occupied = preserved_phrase(&Backup::Occupied(path));
         assert!(
-            !none.contains(".bak"),
-            "a failed copy must not name a backup path: {none}"
+            !occupied.contains("preserved at"),
+            "a name someone else holds must not be claimed as the backup: {occupied}"
         );
-        assert!(none.contains("not preserved"), "{none}");
+        assert!(occupied.contains("already exists"), "{occupied}");
+        let failed = preserved_phrase(&Backup::Failed);
+        assert!(
+            !failed.contains(".bak"),
+            "a failed copy must not name a backup path: {failed}"
+        );
+        assert!(failed.contains("not preserved"), "{failed}");
     }
 }
