@@ -11172,10 +11172,14 @@ pub fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
     cond()
 }
 
-/// Whether `pid` is still a live (non-exited) process. A reaped pid is gone; a
-/// reparented-then-exited pid may briefly be a zombie — treat state `Z` as
-/// exited so the check isn't fooled by an unreaped zombie under a sub-reaper.
-/// Uses `/proc` on Linux and falls back to a `kill(pid, 0)` probe elsewhere.
+/// Whether `pid` is still a live (non-exited) process. A reaped pid is gone,
+/// and so is a zombie: an exited pid nobody has reaped yet — under a
+/// sub-reaper, or the caller's own child before it calls `Child::wait` — reads
+/// as exited, so a test may poll its own child with this. Linux reads the
+/// state from `/proc`, macOS from `proc_pidinfo` (issue #1565: a bare
+/// `kill(pid, 0)` succeeds on a zombie, which is how #397's wrapper read as
+/// alive 15 s after it exited). Other Unixes still fall back to that
+/// zombie-blind `kill(pid, 0)` probe; the test suite runs on neither.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn process_running(pid: i32) -> bool {
@@ -11191,12 +11195,46 @@ pub fn process_running(pid: i32) -> bool {
             if Path::new("/proc").is_dir() {
                 false // Linux: no /proc entry → the pid is gone.
             } else {
-                // SAFETY: kill(pid, 0) only probes existence/permission.
-                unsafe { libc::kill(pid, 0) == 0 }
+                process_running_without_proc(pid)
             }
         }
         Err(_) => true,
     }
+}
+
+/// [`process_running`] where there is no `/proc`. On macOS `proc_pidinfo`
+/// reports the BSD process status, so a zombie (`SZOMB`) reads as exited.
+/// Passing `1` as its `arg` asks xnu to look zombies up as well; if it does
+/// not find one, `ESRCH` is the answer for a zombie and a reaped pid alike.
+#[cfg(target_os = "macos")]
+fn process_running_without_proc(pid: i32) -> bool {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: a zeroed `proc_bsdinfo` is a valid out-buffer of `size` bytes.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if filled == size {
+        return info.pbi_status != libc::SZOMB;
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    // Any other refusal says nothing about the pid's state; keep the old probe.
+    // SAFETY: kill(pid, 0) only probes existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_running_without_proc(pid: i32) -> bool {
+    // SAFETY: kill(pid, 0) only probes existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 // ---------------------------------------------------------------------------
