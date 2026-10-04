@@ -38912,14 +38912,10 @@ mod tests {
         assert_eq!(writes.lock().unwrap().len(), 1, "and it is never rewritten");
     }
 
-    /// Issue #1520 (Qodo on #1553): the orchestrator path's twin of
-    /// [`a_seed_that_may_have_written_is_held_through_an_event_stream_outage`]. A
-    /// role prompt written before the stream went down is held when its retry
-    /// falls due — no second write, the role not finalized — and, if the outage
-    /// outlasts the deadline, abandoned saying it went unconfirmed rather than
-    /// undelivered.
+    /// Scenario: An orchestration's start role is ready and the deck writes its role prompt; then the deck's event stream goes down. When the prompt's retry falls due the deck must wait rather than type it again, and when the outage outlasts the delivery deadline the status line must say the prompt went unconfirmed after losing contact with the agent's events, not that it was not delivered.
+    #[spec("prompt/pane-input/048")]
     #[test]
-    fn an_orchestrator_prompt_is_held_through_an_event_stream_outage() {
+    fn pane_input_048_an_orchestrator_prompt_is_held_through_an_event_stream_outage() {
         const PANE_ID: &str = "outage-orchestrator-pane";
         const AGENT_ID: &str = "outage-orchestrator-agent";
         const PROMPT: &str = "Read the orchestrator seed and begin";
