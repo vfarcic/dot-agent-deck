@@ -2463,6 +2463,57 @@ impl DaemonClient {
         }
     }
 
+    /// Issue #1445 — tell the daemon the orchestrator in `pane_id` was re-armed
+    /// from `context_path`, so the context file it records for that
+    /// orchestration follows the re-arm
+    /// ([`crate::daemon_protocol::AttachRequest::RecordOrchestratorContext`]).
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_RECORD_ORCHESTRATOR_CONTEXT`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: an older daemon
+    /// keeps the file it recorded at the start, which is its behaviour from
+    /// before the verb existed. The capability comes from
+    /// [`Self::capabilities`], one `Hello` per endpoint until that cache is
+    /// invalidated; the residual — a cache outliving a daemon replaced by an
+    /// older build — fails closed, as that daemon refuses the unknown variant
+    /// and records nothing.
+    ///
+    /// A daemon refusal (the report did not check out) is
+    /// [`ClientError::Server`]. Nothing the caller holds depends on the answer.
+    pub async fn record_orchestrator_context(
+        &self,
+        pane_id: &str,
+        context_path: &std::path::Path,
+    ) -> Result<GatedQuery<()>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_RECORD_ORCHESTRATOR_CONTEXT)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let context_path = context_path
+            .to_str()
+            .ok_or_else(|| ClientError::Malformed("the context path is not valid UTF-8".into()))?;
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::RecordOrchestratorContext {
+                pane_id: pane_id.to_string(),
+                context_path: context_path.to_string(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "record-orchestrator-context failed".into()),
+            ));
+        }
+        Ok(GatedQuery::Answered(()))
+    }
+
     /// PRD #1223 M1 — list one directory's immediate subdirectories on the
     /// daemon's filesystem, widened or narrowed by `options` (issue #1240).
     /// **Read-only.**
