@@ -999,6 +999,9 @@ pub async fn spawn(
                         identity.clone(),
                         Some(req.working_dir.as_str()),
                     );
+                    if let Some(tx) = event_tx {
+                        state.announce_unproven_evictions(tx);
+                    }
                     // Issue #1395: the orchestrator's own context file, for its
                     // `ListAgents` record and for removal when this ends.
                     if idx == orch_idx

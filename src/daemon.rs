@@ -1772,9 +1772,9 @@ async fn ingest_event_unless(
     // reaches attached clients too, in order and under the same lock, so a
     // client that attached later than the daemon started — and so holds a
     // different set of outside cards — drops exactly the card the daemon did.
-    for eviction in state.take_unproven_evictions() {
-        let _ = event_tx.send(BroadcastMsg::Event(eviction));
-    }
+    // It also drains announcements a registration queued without
+    // broadcasting them (`AppState::register_pane`).
+    state.announce_unproven_evictions(event_tx);
     drop(state);
     if let Some((pane_id, agent_id, epoch)) = reported_block {
         notify_orchestrator_of_quota_block(registry, &pane_id, &agent_id, epoch);

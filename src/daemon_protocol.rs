@@ -4742,6 +4742,9 @@ async fn handle_connection(
                             identity.clone(),
                             cwd_for_state.as_deref(),
                         );
+                        // Issue #697: outside cards the registration dropped
+                        // leave every attached client's view too.
+                        state.announce_unproven_evictions(&event_tx);
                         // Issue #555: the registered pane holds the title from
                         // here on, so this start's in-flight claim ends — under
                         // the same guard, so there is no instant in which

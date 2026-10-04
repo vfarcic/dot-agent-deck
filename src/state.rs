@@ -38,11 +38,65 @@ const MAX_RECENT_EVENTS: usize = 50;
 pub const MAX_UNPROVEN_SESSIONS: usize = 256;
 
 /// Issue #697: an unproven session's event journal — the
-/// [`MAX_RECENT_EVENTS`] counterpart. Smaller because each retained event can be
-/// as large as a hook line, so a full set of [`MAX_UNPROVEN_SESSIONS`] journals
-/// at the managed size could hold close to a gigabyte; at this size the worst
-/// case is about an eighth of that.
+/// [`MAX_RECENT_EVENTS`] counterpart. Smaller because a card that reports often
+/// should not crowd the others out of [`MAX_UNPROVEN_JOURNAL_BYTES`]. A count
+/// alone does not bound the memory: a retained event is the whole event, and a
+/// hook line may be up to [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] (8 MiB),
+/// so a full set of [`MAX_UNPROVEN_SESSIONS`] journals at this size could
+/// otherwise hold 16 GiB. The byte budget is what bounds them.
 const MAX_UNPROVEN_RECENT_EVENTS: usize = 8;
+
+/// Qodo, PR #1559: the most bytes the journals of every unproven session
+/// together retain, as [`retained_event_bytes`] counts them. Past it, the
+/// journals of the least recently active outside cards give up their oldest
+/// events, down to each card's newest, and then the payload of that newest
+/// event ([`strip_event_payload`]), until the total fits. Neither touches a
+/// card's status, pane, agent or key, which live on the card rather than in
+/// its journal, nor its live target, which every journal event carries forward.
+/// Large enough to hold one event from the longest hook line whole, so the card
+/// of the event being applied keeps it unless every other journal is already
+/// down to a stripped event.
+const MAX_UNPROVEN_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes one event retained in a journal holds, approximately: its own
+/// size, its strings, and each metadata entry with a fixed allowance for the
+/// entry's slot and allocations. An estimate, but one that grows with every
+/// byte a producer controls, which is what [`MAX_UNPROVEN_JOURNAL_BYTES`] needs.
+fn retained_event_bytes(event: &AgentEvent) -> usize {
+    const METADATA_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<String>() + 16;
+    let strings: usize = [
+        Some(&event.session_id),
+        event.tool_name.as_ref(),
+        event.tool_detail.as_ref(),
+        event.cwd.as_ref(),
+        event.user_prompt.as_ref(),
+        event.pane_id.as_ref(),
+        event.agent_id.as_ref(),
+        event.agent_version.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum();
+    let metadata: usize = event
+        .metadata
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + METADATA_ENTRY_OVERHEAD)
+        .sum();
+    std::mem::size_of::<AgentEvent>() + strings + metadata
+}
+
+/// Drop what a retained event reports beyond its identity — see
+/// [`MAX_UNPROVEN_JOURNAL_BYTES`]. Keeps the key, pane, agent, type, kind,
+/// timestamp and live target.
+fn strip_event_payload(event: &mut AgentEvent) {
+    event.tool_name = None;
+    event.tool_detail = None;
+    event.cwd = None;
+    event.user_prompt = None;
+    event.agent_version = None;
+    event.metadata = HashMap::new();
+}
 
 /// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id —
 /// the whole bound on what a wait tracks, at a few kilobytes per session for
@@ -64,6 +118,10 @@ struct UnprovenSession {
     /// The pane the session sits on, so evicting it can clear what this state
     /// keeps per pane once nothing is left there.
     pane_id: Option<String>,
+    /// What the card's journal retains, by [`retained_event_bytes`], kept up
+    /// to date as the journal changes. `None` until first counted: a card can
+    /// reach this accounting with a journal already on it.
+    journal_bytes: Option<usize>,
 }
 /// The session key a pane's PLACEHOLDER card is filed under — the one
 /// [`AppState::insert_placeholder_session`] mints.
@@ -1565,10 +1623,16 @@ pub struct AppState {
     unproven_seq: u64,
     /// Issue #697: the daemon's evictions, as the `SessionEnd` announcements an
     /// attached client applies, waiting for `crate::daemon::ingest_event` to
-    /// broadcast them after the event that caused them. Filled only when an
+    /// broadcast them after the event that caused them — or, for the outside
+    /// cards a registration removed ([`Self::register_pane`]), for the spawn
+    /// path that registered the pane ([`Self::announce_unproven_evictions`]). Filled only when an
     /// ownership oracle is installed (the daemon), so a TUI or the desktop fold
     /// never accumulates it; bounded by [`MAX_UNPROVEN_SESSIONS`] regardless.
     pending_unproven_evictions: Vec<AgentEvent>,
+    /// Qodo, PR #1559: a test's override of [`MAX_UNPROVEN_JOURNAL_BYTES`], so
+    /// a regression can exercise the budget without allocating it. `None`
+    /// everywhere outside tests.
+    unproven_journal_budget: Option<usize>,
     /// Whether the event [`Self::apply_event_unsettled`] last admitted was
     /// admitted as UNPROVEN — read by the daemon's waiting-for-input watch,
     /// which keeps history only for the deck's own agents (audit finding 4).
@@ -8621,6 +8685,7 @@ async fn dispatch_one_owned(
                             identity,
                             cwd.as_deref(),
                         );
+                        state.announce_unproven_evictions(&event_tx);
                     }
                 }
                 // Issue #962: the replacement holds the title from here on (a
@@ -10747,6 +10812,12 @@ impl AppState {
     /// as a second, stale card beside the pane's real one. What this state
     /// kept per pane for them is cleared with them when nothing else is left on
     /// the pane, so the deck's agent starts on a clean pane.
+    ///
+    /// On the daemon each card removed this way is announced like an eviction
+    /// (Qodo, PR #1559): an attached client that does not register the pane
+    /// itself would otherwise keep showing it. The caller broadcasts the queue
+    /// ([`Self::announce_unproven_evictions`]); one that does not leaves it for
+    /// the next ingested event to drain.
     pub fn register_pane(&mut self, pane_id: String) {
         let outside: Vec<String> = self
             .unproven_sessions
@@ -10756,7 +10827,10 @@ impl AppState {
             .collect();
         for id in &outside {
             self.unproven_sessions.remove(id);
-            self.sessions.remove(id);
+            if let Some(session) = self.sessions.remove(id) {
+                let pane = session.pane_id.clone();
+                self.queue_unproven_eviction(id, session, pane);
+            }
         }
         if !outside.is_empty()
             && !self.managed_pane_ids.contains(&pane_id)
@@ -10835,10 +10909,65 @@ impl AppState {
         ]
     }
 
+    /// Qodo, PR #1559: lower [`MAX_UNPROVEN_JOURNAL_BYTES`] for this state.
+    #[cfg(test)]
+    pub(crate) fn set_unproven_journal_budget(&mut self, bytes: usize) {
+        self.unproven_journal_budget = Some(bytes);
+    }
+
     /// Issue #697: take the daemon's queued eviction announcements, oldest
     /// first. See [`Self::pending_unproven_evictions`].
     pub fn take_unproven_evictions(&mut self) -> Vec<AgentEvent> {
         std::mem::take(&mut self.pending_unproven_evictions)
+    }
+
+    /// Issue #697: broadcast the daemon's queued eviction announcements to
+    /// attached clients, oldest first. For a daemon path that removes outside
+    /// cards outside an ingested event — a spawn registering its pane
+    /// ([`Self::register_pane`]) — so a client that does not register that pane
+    /// itself still drops the card. A no-op outside the daemon, whose queue
+    /// stays empty.
+    pub(crate) fn announce_unproven_evictions(
+        &mut self,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+    ) {
+        for eviction in self.take_unproven_evictions() {
+            let _ = event_tx.send(BroadcastMsg::Event(eviction));
+        }
+    }
+
+    /// Issue #697: queue the announcement that the outside card `id`, whose
+    /// session was `session` on `pane`, is gone — on the daemon only (an
+    /// ownership oracle is installed), where an attached client holding the
+    /// same card applies it ([`Self::apply_unproven_eviction`]).
+    fn queue_unproven_eviction(&mut self, id: &str, session: SessionState, pane: Option<String>) {
+        if self.agent_ownership.is_none() {
+            return;
+        }
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        if self.pending_unproven_evictions.len() >= MAX_UNPROVEN_SESSIONS {
+            self.pending_unproven_evictions.remove(0);
+        }
+        self.pending_unproven_evictions.push(AgentEvent {
+            session_id: id.to_string(),
+            agent_type: session.agent_type,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: pane,
+            agent_id: session.agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
     }
 
     /// Issue #697: record activity on the unproven session `session_id`, about
@@ -10862,6 +10991,7 @@ impl AppState {
             UnprovenSession {
                 seq,
                 pane_id: pane_id.map(str::to_string),
+                journal_bytes: None,
             },
         );
     }
@@ -10890,33 +11020,8 @@ impl AppState {
         let card_pane = removed
             .as_ref()
             .map_or(entry.pane_id.clone(), |session| session.pane_id.clone());
-        if self.agent_ownership.is_some()
-            && let Some(session) = removed
-        {
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
-                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
-            );
-            if self.pending_unproven_evictions.len() >= MAX_UNPROVEN_SESSIONS {
-                self.pending_unproven_evictions.remove(0);
-            }
-            self.pending_unproven_evictions.push(AgentEvent {
-                session_id: id.clone(),
-                agent_type: session.agent_type,
-                event_type: EventType::SessionEnd,
-                tool_name: None,
-                tool_detail: None,
-                cwd: None,
-                timestamp: Utc::now(),
-                user_prompt: None,
-                metadata,
-                pane_id: card_pane.clone(),
-                agent_id: session.agent_id,
-                agent_version: None,
-                schema_version: None,
-                live_target: None,
-            });
+        if let Some(session) = removed {
+            self.queue_unproven_eviction(&id, session, card_pane.clone());
         }
         tracing::debug!(
             session_id = %crate::config_validation::escape_id_for_log(&id),
@@ -10968,6 +11073,63 @@ impl AppState {
         for pane in gone_panes {
             if keep_pane != Some(pane.as_str()) {
                 self.forget_unbacked_pane(&pane);
+            }
+        }
+    }
+
+    /// Qodo, PR #1559: bring the unproven journals within
+    /// [`MAX_UNPROVEN_JOURNAL_BYTES`], least recently active card first. See
+    /// the constant for what goes and what every card keeps.
+    fn enforce_unproven_journal_budget(&mut self) {
+        let budget = self
+            .unproven_journal_budget
+            .unwrap_or(MAX_UNPROVEN_JOURNAL_BYTES);
+        let mut total = 0usize;
+        let mut order = Vec::with_capacity(self.unproven_sessions.len());
+        for (id, entry) in &mut self.unproven_sessions {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let bytes = *entry.journal_bytes.get_or_insert_with(|| {
+                session.recent_events.iter().map(retained_event_bytes).sum()
+            });
+            total += bytes;
+            order.push((entry.seq, id.clone()));
+        }
+        if total <= budget {
+            return;
+        }
+        order.sort_unstable();
+        // First the older events, down to each card's newest; then the payload
+        // of that newest event.
+        for strip in [false, true] {
+            for (_, id) in &order {
+                if total <= budget {
+                    return;
+                }
+                let (Some(session), Some(entry)) = (
+                    self.sessions.get_mut(id),
+                    self.unproven_sessions.get_mut(id),
+                ) else {
+                    continue;
+                };
+                let before = entry.journal_bytes.unwrap_or_default();
+                let mut freed = 0;
+                if strip {
+                    if let Some(event) = session.recent_events.back_mut() {
+                        let full = retained_event_bytes(event);
+                        strip_event_payload(event);
+                        freed = full.saturating_sub(retained_event_bytes(event));
+                    }
+                } else {
+                    while total.saturating_sub(freed) > budget && session.recent_events.len() > 1 {
+                        if let Some(old) = session.recent_events.pop_front() {
+                            freed += retained_event_bytes(&old);
+                        }
+                    }
+                }
+                entry.journal_bytes = Some(before.saturating_sub(freed));
+                total = total.saturating_sub(freed);
             }
         }
     }
@@ -13741,6 +13903,7 @@ pub async fn handle_restart_role_with_state(
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
                 let title = resolved.title.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let mut state = state.write().await;
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
@@ -13760,6 +13923,7 @@ pub async fn handle_restart_role_with_state(
                         identity,
                         cwd.as_deref(),
                     );
+                    state.announce_unproven_evictions(&event_tx);
                 });
             }
             RestartRoleResponse {
@@ -14016,6 +14180,7 @@ pub async fn handle_spawn_role_with_state(
             resolved.identity,
             resolved.cwd.as_deref(),
         );
+        state_guard.announce_unproven_evictions(event_tx);
     }
 
     // Best-effort, like `surface_spawned_orchestration`'s own
@@ -14576,6 +14741,9 @@ impl AppState {
         // Issue #697: whatever the event removed, the unproven bookkeeping
         // follows it — see [`Self::settle_unproven`].
         self.settle_unproven(None);
+        if self.applied_unproven {
+            self.enforce_unproven_journal_budget();
+        }
         applied
     }
 
@@ -16014,9 +16182,30 @@ impl AppState {
                 .find_map(|e| e.live_target);
         }
 
+        // Qodo, PR #1559: an outside card's journal is counted against
+        // `MAX_UNPROVEN_JOURNAL_BYTES` as it changes.
+        let mut journal_entry = if unproven {
+            self.unproven_sessions.get_mut(&event.session_id)
+        } else {
+            None
+        };
+        let pushed = journal_entry
+            .as_ref()
+            .and_then(|entry| entry.journal_bytes)
+            .map(|_| retained_event_bytes(&event));
         session.recent_events.push_back(event);
+        let mut popped = 0;
         while session.recent_events.len() > journal_cap {
-            session.recent_events.pop_front();
+            if let Some(old) = session.recent_events.pop_front()
+                && pushed.is_some()
+            {
+                popped += retained_event_bytes(&old);
+            }
+        }
+        if let (Some(entry), Some(pushed)) = (journal_entry.as_mut(), pushed) {
+            entry.journal_bytes = entry
+                .journal_bytes
+                .map(|bytes| (bytes + pushed).saturating_sub(popped));
         }
 
         // The `session` borrow is done, so the pane-level provenance captured
@@ -26865,6 +27054,140 @@ while True:
         assert_eq!(
             hook_provenance_audit_unaccounted_cards(&client),
             Vec::<String>::new()
+        );
+    }
+
+    /// Scenario: The daemon and an attached client both hold an outside card
+    /// on pane P, and the client also holds one of its own cards on pane Q and
+    /// an outside card on pane R. The daemon then spawns an agent on P and
+    /// registers it. The client, which never registers P itself, must drop its
+    /// outside card on P from the daemon's announcement and keep the other two.
+    #[test]
+    fn hook_provenance_daemon_register_pane_announces_the_outside_cards_it_drops() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        client.register_pane("pane-q".to_string());
+        let mut own = agent_event_cli_payload("pane-q", "agent-q");
+        own.session_id = "own-card".to_string();
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own);
+        for (session, pane) in [("outside-p", "pane-p"), ("outside-r", "pane-r")] {
+            let event = hook_provenance_audit_outside_start(session, pane);
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+        }
+        assert!(daemon.take_unproven_evictions().is_empty(), "precondition");
+        assert!(client.sessions.contains_key("outside-p"), "precondition");
+
+        daemon.register_pane("pane-p".to_string());
+        assert!(!daemon.sessions.contains_key("outside-p"));
+        for announcement in daemon.take_unproven_evictions() {
+            client.apply_event(announcement);
+        }
+
+        assert!(
+            !client.sessions.contains_key("outside-p"),
+            "the client must drop the outside card the daemon dropped"
+        );
+        assert!(client.sessions.contains_key("outside-r"));
+        assert!(client.sessions.contains_key("own-card"));
+        assert_eq!(client.unproven_session_count(), 1);
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The bytes [`hook_provenance_journal_budget_keeps_every_card`] counts
+    /// for one retained event: its strings and its metadata.
+    fn hook_provenance_journal_payload_bytes(event: &AgentEvent) -> usize {
+        [
+            Some(&event.session_id),
+            event.tool_name.as_ref(),
+            event.tool_detail.as_ref(),
+            event.cwd.as_ref(),
+            event.user_prompt.as_ref(),
+            event.pane_id.as_ref(),
+            event.agent_id.as_ref(),
+            event.agent_version.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum::<usize>()
+            + event
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+    }
+
+    /// Scenario: Thirty-two outside agents each send eight reports carrying a
+    /// large tool detail, far more than this state's lowered budget for
+    /// outside-card journals. Every card must stay, with the status, pane and
+    /// agent its last report gave it; the journals must fit the budget; and
+    /// the most recently active card must keep its newest report whole.
+    #[test]
+    fn hook_provenance_journal_budget_keeps_every_card() {
+        const CARDS: usize = 32;
+        const DETAIL: usize = 2048;
+        const BUDGET: usize = 64 * 1024;
+        let mut bounded = AppState::default();
+        bounded.set_unproven_journal_budget(BUDGET);
+        let mut reference = AppState::default();
+        for card in 0..CARDS {
+            let session = format!("outside-{card}");
+            let pane = format!("outside-pane-{card}");
+            for round in 0..MAX_UNPROVEN_RECENT_EVENTS {
+                let mut event = hook_provenance_audit_outside_start(&session, &pane);
+                event.agent_id = Some(format!("agent-{card}"));
+                if round > 0 {
+                    event.event_type = if round % 2 == 0 {
+                        EventType::Thinking
+                    } else {
+                        EventType::ToolStart
+                    };
+                    event.tool_name = Some("Bash".to_string());
+                }
+                event.tool_detail = Some(format!("{card}-{round}-{}", "x".repeat(DETAIL)));
+                bounded.apply_event(event.clone());
+                reference.apply_event(event);
+            }
+        }
+
+        assert_eq!(bounded.unproven_session_count(), CARDS);
+        let retained: usize = bounded
+            .sessions
+            .values()
+            .flat_map(|session| session.recent_events.iter())
+            .map(hook_provenance_journal_payload_bytes)
+            .sum();
+        assert!(
+            retained <= BUDGET,
+            "outside journals retain {retained} payload bytes against a {BUDGET}-byte budget"
+        );
+        for (id, expected) in &reference.sessions {
+            let card = bounded
+                .sessions
+                .get(id)
+                .unwrap_or_else(|| panic!("card {id} must survive the budget"));
+            assert_eq!(card.status, expected.status, "{id}");
+            assert_eq!(card.pane_id, expected.pane_id, "{id}");
+            assert_eq!(card.agent_id, expected.agent_id, "{id}");
+            assert_eq!(card.agent_type, expected.agent_type, "{id}");
+        }
+        let last = format!("outside-{}", CARDS - 1);
+        assert_eq!(
+            bounded.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            reference.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            "the most recently active card keeps its newest report whole"
         );
     }
 }
