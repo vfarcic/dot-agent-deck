@@ -1010,8 +1010,17 @@ pub async fn handle_audio(transcriber: &dyn Transcriber, audio: &Pcm16) -> Voice
     let checked = audio.clone();
     let verdict = match tokio::task::spawn_blocking(move || ineligible(&checked)).await {
         Ok(verdict) => verdict,
-        Err(_) => {
-            let detail = "the audio check did not finish".to_string();
+        Err(error) => {
+            // Logged the way this crate logs a blocking task that did not
+            // complete (`lib.rs`'s settings save). A `JoinError` carries the
+            // task's panic message and never the audio, which this module
+            // does not log at any level.
+            eprintln!("desktop voice: the audio check did not complete: {error}");
+            let detail = if error.is_panic() {
+                "the audio check failed unexpectedly".to_string()
+            } else {
+                "the audio check was cancelled".to_string()
+            };
             return VoiceTranscription {
                 outcome: TranscriptionOutcome::Failed {
                     sentence: format!("Could not turn that into text ({detail})."),
