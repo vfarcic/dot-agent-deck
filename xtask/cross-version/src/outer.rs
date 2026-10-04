@@ -269,9 +269,11 @@ struct Opts {
 
     /// The branch-specific stimulus a reverse run carries after the four tells.
     ///
-    /// `auto` (the default) selects it from the branch's `dispatch-issue-<n>`
-    /// path component, and refuses the run when it cannot tie the branch to
-    /// exactly one probe — it never falls back. `generic` asks for no stimulus
+    /// `auto` (the default) selects it from the issue number in the branch's
+    /// `dispatch-issue-<n>` or `dispatch-issue-<n>-<slug>` path component, and
+    /// refuses the run when it cannot tie the branch to exactly one probe — a
+    /// coupled unit's `dispatch-issue-<a>-<b>` names two issues and is refused
+    /// — it never falls back. `generic` asks for no stimulus
     /// on purpose: the four tells plus a `role-set` tell, in any endpoint mode,
     /// which is how the #1179 negative control runs (`--branch main --direction
     /// reverse --probe generic --endpoint-mode resolved
@@ -398,8 +400,8 @@ fn select_probe(
             Ok((
                 p,
                 format!(
-                    "selected by `--probe auto` from the branch's `dispatch-issue-{issue}` \
-                     component"
+                    "selected by `--probe auto` from issue #{issue} in the branch's \
+                     `dispatch-issue-<n>` component"
                 ),
             ))
         }
@@ -419,10 +421,11 @@ fn evidence_path(explicit: Option<&Path>, root: &Path, slug: &str, d: Direction)
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    let name = match d {
-        Direction::Forward => format!("{slug}.md"),
-        Direction::Reverse => format!("{slug}-reverse.md"),
+    let suffix = match d {
+        Direction::Forward => ".md",
+        Direction::Reverse => "-reverse.md",
     };
+    let name = format!("{}{suffix}", fit_component(slug, NAME_MAX - suffix.len()));
     root.join(".dot-agent-deck")
         .join("xver-evidence")
         .join(name)
@@ -770,16 +773,20 @@ impl Domain {
     /// repository and branch together: a readable slug of the branch, plus a
     /// digest of both, since the slug alone collides (`feature/x` and
     /// `feature-x`) and a branch of another `--repo` is another trust domain.
+    ///
+    /// The slug is cut short when the whole name would not fit `NAME_MAX`
+    /// (issue #1562's maximal dispatch branch does not); the digest after it is
+    /// what keeps two such branches apart.
     fn dir(self, base: &Path, repo: &str, branch: &str) -> PathBuf {
         match self {
             Domain::Mainline => base.to_path_buf(),
             Domain::OptedIn => {
+                let digest = format!("-{:016x}", fnv1a64(format!("{repo}\0{branch}").as_bytes()));
+                let used = base.file_name().map_or(0, |n| n.len()) + "-opted-in-".len();
+                let mut slug = branch_slug(branch);
+                slug.truncate(NAME_MAX.saturating_sub(used + digest.len()));
                 let mut s = base.as_os_str().to_owned();
-                s.push(format!(
-                    "-opted-in-{}-{:016x}",
-                    branch_slug(branch),
-                    fnv1a64(format!("{repo}\0{branch}").as_bytes())
-                ));
+                s.push(format!("-opted-in-{slug}{digest}"));
                 PathBuf::from(s)
             }
         }
@@ -844,6 +851,91 @@ fn prepare_domain_dir(dir: &Path, label: &str) -> Result<(), String> {
     }
     std::fs::write(&marker, format!("{label}\n"))
         .map_err(|e| format!("write {}: {e}", marker.display()))
+}
+
+/// `--runs-root` when it is not given.
+fn default_runs_root(repo_parent: &Path) -> PathBuf {
+    repo_parent.join("dot-agent-deck-xver-runs")
+}
+
+/// How much of the branch a sandbox name keeps, as a label for whoever lists
+/// the runs root. See [`sandbox_name`].
+const SANDBOX_LABEL_MAX: usize = 16;
+
+/// The per-run sandbox directory's name under the runs root:
+/// `<label>-<digest>[-rev]-<epoch>`, at most 40 bytes whatever the branch is
+/// called (issue #1562).
+///
+/// The sandbox's sockets live directly under it (`$S/attach.sock`), and a Unix
+/// socket path has 108 bytes including the NUL. The name used to be the whole
+/// branch slug, so a dispatched unit's `agent/dispatch-issue-<n>-<slug>`
+/// overflowed that under the default runs root, after the build had finished.
+/// The label is the branch's last path component with a leading `dispatch-`
+/// dropped, cut to [`SANDBOX_LABEL_MAX`] bytes (`issue-1540-share`); the digest
+/// is of the whole branch, so two branches the cut makes alike still get
+/// different names. [`check_sandbox_socket_paths`] refuses, before the build,
+/// a runs root too long for even this.
+fn sandbox_name(branch: &str, direction: Direction, epoch: u64) -> String {
+    let last = branch.rsplit('/').find(|c| !c.is_empty()).unwrap_or("");
+    let last = last.strip_prefix("dispatch-").unwrap_or(last);
+    let mut label = branch_slug(last);
+    label.truncate(SANDBOX_LABEL_MAX);
+    if label.is_empty() {
+        label.push_str("branch");
+    }
+    let digest = fnv1a64(branch.as_bytes()) & 0xffff_ffff;
+    let rev = match direction {
+        Direction::Forward => "",
+        Direction::Reverse => "-rev",
+    };
+    format!("{label}-{digest:08x}{rev}-{epoch}")
+}
+
+/// [`sandbox_name`] at `epoch`, or at the first later second whose name is not
+/// already taken under `runs_root`. Two runs of one branch, or of two branches
+/// the label and digest make alike, can reach this in the same second, and
+/// [`Sandbox::create`] refuses an existing entry — after the build, losing it
+/// (Greptile, PR #1570). The name keeps its length, so the preflight's socket
+/// check still holds for it. A race between this look and the `mkdir` is still
+/// refused by [`Sandbox::create`]; this only stops the common case costing a run.
+fn free_sandbox_name(runs_root: &Path, branch: &str, direction: Direction, epoch: u64) -> String {
+    (epoch..)
+        .map(|e| sandbox_name(branch, direction, e))
+        .find(|name| std::fs::symlink_metadata(runs_root.join(name)).is_err())
+        .expect("an unbounded range of seconds has a free one")
+}
+
+/// Every Unix socket path a run in `<runs_root>/<name>` may bind or probe must
+/// fit `sun_path`. Run in the preflight, against the canonical runs root
+/// [`Sandbox::create`] will use, so a runs root too long for the sandbox's
+/// sockets is refused before anything is downloaded or built (issue #1562).
+fn check_sandbox_socket_paths(
+    runs_root: &Path,
+    name: &str,
+    mode: EndpointMode,
+    keep_xdg: bool,
+    uid: u32,
+) -> Result<(), String> {
+    let sb = Sandbox::at(runs_root.join(name));
+    for m in &EndpointMatrix::candidates(&sb, mode, keep_xdg, uid) {
+        sandbox::check_socket_path_lengths(m)?;
+    }
+    Ok(())
+}
+
+/// The longest file name Linux filesystems take, in bytes.
+const NAME_MAX: usize = 255;
+
+/// `slug` as it is when it is at most `max` bytes; otherwise its first bytes
+/// and a digest of the whole, `max` bytes in all, so two long slugs that share
+/// a prefix stay apart. `slug` is ASCII ([`branch_slug`]).
+fn fit_component(slug: &str, max: usize) -> String {
+    if slug.len() <= max {
+        return slug.to_string();
+    }
+    let digest = format!("-{:016x}", fnv1a64(slug.as_bytes()));
+    let keep = max.saturating_sub(digest.len());
+    format!("{}{digest}", &slug[..keep])
 }
 
 /// The branch name with everything but ASCII alphanumerics replaced by `-`.
@@ -1465,7 +1557,7 @@ fn run_one(
     let runs_root = opts
         .runs_root
         .clone()
-        .unwrap_or_else(|| parent.join("dot-agent-deck-xver-runs"));
+        .unwrap_or_else(|| default_runs_root(&parent));
     let releases = opts
         .releases_dir
         .clone()
@@ -1530,6 +1622,17 @@ fn run_one(
         "runs root: {}",
         sandbox::require_disk_backed("runs root", &runs_root, opts.min_free_gib)?
     ));
+    // The name is minted again once the build is done, so two runs of one
+    // branch queued on the build lock still get a sandbox each; the length it
+    // is checked at here is the same.
+    check_sandbox_socket_paths(
+        &std::fs::canonicalize(&runs_root)
+            .map_err(|e| format!("canonicalize runs root {}: {e}", runs_root.display()))?,
+        &sandbox_name(&opts.branch, direction, epoch_secs()),
+        mode,
+        spec.keep_xdg_runtime_dir,
+        uid,
+    )?;
     ev.preflight.push(format!(
         "cargo target dir: {}",
         sandbox::require_disk_backed("cargo target dir", &target_dir, opts.min_free_gib)?
@@ -1609,10 +1712,7 @@ fn run_one(
     ev.head_sha = head_sha;
 
     let slug = branch_slug(&opts.branch);
-    let sb_name = match direction {
-        Direction::Forward => format!("{slug}-{}", epoch_secs()),
-        Direction::Reverse => format!("{slug}-rev-{}", epoch_secs()),
-    };
+    let sb_name = free_sandbox_name(&runs_root, &opts.branch, direction, epoch_secs());
     let sb = Sandbox::create(&runs_root, &sb_name)?;
     let runs_root = std::fs::canonicalize(&runs_root).map_err(|e| format!("{e}"))?;
     ev.sandbox_root = sb.root.clone();
@@ -2239,7 +2339,8 @@ mod tests {
             ),
             Ok((
                 Probe::TeardownInventory,
-                "selected by `--probe auto` from the branch's `dispatch-issue-1109` component"
+                "selected by `--probe auto` from issue #1109 in the branch's \
+                 `dispatch-issue-<n>` component"
                     .to_string()
             ))
         );
@@ -2254,13 +2355,58 @@ mod tests {
         );
     }
 
+    /// Issue #1563: the dispatch verb names a unit `issue-<n>-<slug>` as often
+    /// as `issue-<n>`, so `auto` reads the issue out of both — and a coupled
+    /// unit's `issue-<a>-<b>` is refused as naming two issues, never resolved
+    /// to either one.
+    #[test]
+    fn auto_reads_the_issue_out_of_a_slugged_dispatch_branch_and_refuses_a_coupled_one() {
+        for branch in [
+            "agent/dispatch-issue-1109-teardown-disclosure",
+            "agent/dispatch-issue-1109-v2",
+        ] {
+            assert_eq!(
+                select_probe(ProbeArg::Auto, branch, Direction::Reverse),
+                Ok((
+                    Probe::TeardownInventory,
+                    "selected by `--probe auto` from issue #1109 in the branch's \
+                     `dispatch-issue-<n>` component"
+                        .to_string()
+                )),
+                "{branch}"
+            );
+        }
+        let err = select_probe(
+            ProbeArg::Auto,
+            "agent/dispatch-issue-1109-1121",
+            Direction::Reverse,
+        )
+        .expect_err("a coupled unit names two issues");
+        assert!(
+            err.contains("more than one issue") && err.contains("#1109, #1121"),
+            "says which issues it could not choose between: {err}"
+        );
+        assert!(err.contains("--probe generic"), "{err}");
+        let err = select_probe(
+            ProbeArg::Auto,
+            "agent/dispatch-issue-1540-shared-last-command",
+            Direction::Reverse,
+        )
+        .expect_err("no probe was written for #1540");
+        assert!(
+            err.contains("found issue #1540") && err.contains("no probe"),
+            "the slug is read past, and the refusal is about the issue: {err}"
+        );
+    }
+
     #[test]
     fn auto_refuses_a_reverse_run_it_cannot_tie_to_one_probe() {
         for branch in [
             "some/other-branch",
-            "agent/dispatch-issue-1181-v2",
             "agent/dispatch-issue-1109-1121",
+            "agent/dispatch-issue-1562-1563",
             "agent/dispatch-issue-1",
+            "agent/dispatch-issue-1-some-slug",
         ] {
             let err = select_probe(ProbeArg::Auto, branch, Direction::Reverse)
                 .expect_err("no silent fallback to generic");
@@ -2278,6 +2424,147 @@ mod tests {
         let err = select_probe(ProbeArg::LogEscaping, "x", Direction::Forward)
             .expect_err("a forward run carries no probe");
         assert!(err.contains("reverse direction only"), "{err}");
+    }
+
+    /// Issue #1562: the longest branch the dispatch verb can create. Its
+    /// worktree is the sibling directory `<repo>-dispatch-<name>`, one path
+    /// component, so `<name>` is bounded only by `NAME_MAX` (255 bytes) less
+    /// `dot-agent-deck-dispatch-`.
+    fn maximal_dispatch_branch() -> String {
+        let name_max = 255 - "dot-agent-deck-dispatch-".len();
+        let mut name = "issue-1540-shared-last-command".to_string();
+        while name.len() < name_max {
+            name.push_str("-x");
+        }
+        name.truncate(name_max);
+        format!("agent/dispatch-{name}")
+    }
+
+    /// Issue #1562: with the default `--runs-root`, the sandbox's socket paths
+    /// fit `sun_path` whatever the branch is called. Three dispatched units each
+    /// lost a full build to a long `agent/dispatch-issue-<n>-<slug>` overflowing
+    /// it. `/home/vfarcic/code` is the repository parent those runs had.
+    #[test]
+    fn the_default_runs_root_fits_sun_path_for_any_dispatch_branch_name() {
+        let runs_root = default_runs_root(Path::new("/home/vfarcic/code"));
+        for branch in [
+            "agent/dispatch-issue-1540-shared-last-command".to_string(),
+            maximal_dispatch_branch(),
+        ] {
+            for direction in [Direction::Forward, Direction::Reverse] {
+                let name = sandbox_name(&branch, direction, 9_999_999_999);
+                for mode in [EndpointMode::SandboxSockets, EndpointMode::Resolved] {
+                    for keep_xdg in [true, false] {
+                        assert_eq!(
+                            check_sandbox_socket_paths(&runs_root, &name, mode, keep_xdg, 1000),
+                            Ok(()),
+                            "{branch} ({direction:?}, {mode:?}, keep_xdg {keep_xdg})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The control for the test above: the bound is the sandbox NAME's, and a
+    /// runs root too long for even that is still refused — by the check the
+    /// preflight runs before anything is downloaded or built — naming the
+    /// option to pass.
+    #[test]
+    fn the_sandbox_name_is_bounded_and_a_runs_root_too_long_for_it_is_refused() {
+        let long = maximal_dispatch_branch();
+        let a = sandbox_name(&long, Direction::Reverse, 9_999_999_999);
+        assert!(a.len() <= 40, "{a} is {} bytes", a.len());
+        assert!(a.starts_with("issue-1540-share-"), "readable label: {a}");
+        assert_ne!(
+            a,
+            sandbox_name(&format!("{long}y"), Direction::Reverse, 9_999_999_999),
+            "branches alike in their first bytes get different sandboxes"
+        );
+        assert_ne!(
+            sandbox_name("main", Direction::Forward, 1),
+            sandbox_name("main", Direction::Reverse, 1)
+        );
+        assert!(sandbox_name("weird/", Direction::Forward, 1).starts_with("weird-"));
+        let too_long = PathBuf::from(format!("/{}", "r".repeat(80)));
+        let err = check_sandbox_socket_paths(
+            &too_long,
+            &sandbox_name("main", Direction::Forward, 1),
+            EndpointMode::SandboxSockets,
+            true,
+            1000,
+        )
+        .expect_err("a runs root this long cannot hold the sandbox's sockets");
+        assert!(err.contains("--runs-root"), "{err}");
+    }
+
+    /// Greptile on PR #1570: a sandbox name already taken under the runs root
+    /// — the same branch and direction in the same second — moves to the next
+    /// free second instead of failing [`Sandbox::create`] after the build.
+    #[test]
+    fn a_taken_sandbox_name_moves_to_the_next_free_second() {
+        let root = std::env::temp_dir().join(format!("xver-free-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let branch = "agent/dispatch-issue-1540-shared-last-command";
+        let first = sandbox_name(branch, Direction::Forward, 100);
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Forward, 100),
+            first
+        );
+        std::fs::create_dir(root.join(&first)).unwrap();
+        std::fs::create_dir(root.join(sandbox_name(branch, Direction::Forward, 101))).unwrap();
+        let got = free_sandbox_name(&root, branch, Direction::Forward, 100);
+        assert_eq!(got, sandbox_name(branch, Direction::Forward, 102));
+        assert_eq!(got.len(), first.len(), "the length the preflight checked");
+        assert_eq!(
+            free_sandbox_name(&root, branch, Direction::Reverse, 100),
+            sandbox_name(branch, Direction::Reverse, 100),
+            "the other direction's name is its own"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Issue #1562's other two branch-derived names: the evidence file and an
+    /// opted-in target dir are each ONE path component, so a maximal dispatch
+    /// branch overflowed `NAME_MAX` with both — the evidence file only once the
+    /// whole run was over. A name that fits is left exactly as it was.
+    #[test]
+    fn branch_derived_file_names_fit_name_max_for_any_dispatch_branch_name() {
+        let branch = maximal_dispatch_branch();
+        let root = Path::new("/repo");
+        for d in [Direction::Forward, Direction::Reverse] {
+            let path = evidence_path(None, root, &branch_slug(&branch), d);
+            let name = path.file_name().expect("a file name").len();
+            assert!(name <= 255, "{d:?}: evidence file name is {name} bytes");
+            assert_eq!(
+                path.parent(),
+                Some(Path::new("/repo/.dot-agent-deck/xver-evidence"))
+            );
+        }
+        assert_ne!(
+            evidence_path(None, root, &branch_slug(&branch), Direction::Forward),
+            evidence_path(
+                None,
+                root,
+                &branch_slug(&format!("{branch}y")),
+                Direction::Forward
+            ),
+            "two long branches that share a prefix keep separate evidence files"
+        );
+        let base = Path::new("/home/vfarcic/code/dot-agent-deck-xver-target");
+        let dir = Domain::OptedIn.dir(base, "vfarcic/dot-agent-deck", &branch);
+        let name = dir.file_name().expect("a dir name").len();
+        assert!(name <= 255, "opted-in target dir name is {name} bytes");
+        assert_eq!(dir.parent(), base.parent());
+        assert_eq!(
+            Domain::OptedIn.dir(base, "o/r", "feature/x"),
+            PathBuf::from(format!(
+                "/home/vfarcic/code/dot-agent-deck-xver-target-opted-in-feature-x-{:016x}",
+                fnv1a64(b"o/r\0feature/x")
+            )),
+            "a short branch's target dir is named exactly as before"
+        );
     }
 
     #[test]
