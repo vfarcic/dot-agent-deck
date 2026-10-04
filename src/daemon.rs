@@ -1654,10 +1654,14 @@ async fn ingest_event_unless(
     // ask the registry under it, and no registry path waits on this lock while
     // holding the registry's mutex (`spawn_agent` releases it before any
     // caller takes the state lock to register a role).
+    //
+    // Issue #318: a reserved spawn counts as the daemon's too. Its token
+    // resolves from the reservation, so its first report can arrive before the
+    // record is published or the role registered, and must not be badged.
     let daemon_owns_pane = event
         .pane_id
         .as_deref()
-        .is_some_and(|pane_id| registry.has_live_pane(pane_id));
+        .is_some_and(|pane_id| registry.has_live_or_reserved_pane(pane_id));
     // Issue #714: keep the registry's per-agent quota-block latch in step with
     // the card. A `QuotaBlocked` latches a fresh epoch for the pane's live
     // owner — the key the orchestrator notice below is claimed and re-checked
@@ -10627,6 +10631,61 @@ mod hook_provenance_audit_tests {
         assert_eq!(card.status, SessionStatus::Idle);
         assert!(!card.orchestration_orphaned, "the live card was badged");
         assert_eq!(client.sessions.len(), 1);
+    }
+
+    /// Scenario: The deck has reserved a spawn on a role-shaped pane but not
+    /// yet published its record or registered its role, and the new agent's
+    /// first report arrives — once attested to the reservation's token, once
+    /// unproven. Neither may reach a client stamped as coming from an orphaned
+    /// role pane, nor as naming a pane with no live agent. The same reports for
+    /// a role-shaped pane nobody reserved are still stamped.
+    #[tokio::test]
+    async fn hook_provenance_audit_reserved_role_pane_is_not_stamped_orphaned() {
+        const RESERVED: &str = "sched-audit-reserved-1-r0";
+        const ORPHAN: &str = "sched-audit-orphan-1-r0";
+        for pane in [RESERVED, ORPHAN] {
+            assert!(
+                crate::spawn::is_orchestration_role_pane_id(pane),
+                "precondition: {pane} is role-shaped"
+            );
+        }
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (reserved_id, _token) = registry.reserve_spawn_for_test(Some(RESERVED));
+        assert!(
+            !registry.has_live_pane(RESERVED),
+            "precondition: the reservation is not published"
+        );
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        for (pane, expect_stamped) in [(RESERVED, false), (ORPHAN, true)] {
+            for (unproven, attested) in [(false, Some(reserved_id.as_str())), (true, None)] {
+                let attested = attested.filter(|_| pane == RESERVED);
+                ingest_event_unless(
+                    &state,
+                    &event_tx,
+                    &registry,
+                    event_of(line("reserved-card", Some(pane), None, "thinking", None)),
+                    unproven,
+                    attested,
+                    || false,
+                )
+                .await;
+                let Ok(BroadcastMsg::Event(event)) = events.try_recv() else {
+                    panic!("{pane} unproven={unproven}: the report was broadcast");
+                };
+                assert_eq!(
+                    event.is_orchestration_orphaned(),
+                    expect_stamped,
+                    "{pane} unproven={unproven}: orphan stamp"
+                );
+                assert_eq!(
+                    event.is_daemon_no_live_agent(),
+                    expect_stamped && unproven,
+                    "{pane} unproven={unproven}: no-live-agent stamp"
+                );
+            }
+        }
+        registry.shutdown_all();
     }
 
     /// Scenario: A client stayed attached across a daemon restart and still

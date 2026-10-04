@@ -14678,6 +14678,31 @@ impl AgentPtyRegistry {
         })
     }
 
+    /// [`Self::has_live_pane`], or a spawn on `pane_id_env` that is reserved in
+    /// [`RegistryInner::pending_spawns`] but not yet published — both asked
+    /// under one acquisition, so a spawn publishing in between cannot fall
+    /// between the two answers.
+    ///
+    /// Issue #318: for the daemon's orphan and no-live-agent stamps. An
+    /// in-flight spawn's token resolves from its reservation, so its first
+    /// report can be admitted before the record exists or its role is
+    /// registered; asked of [`Self::has_live_pane`] alone, that report was
+    /// stamped as coming from an orphaned role pane, a badge a client never
+    /// takes back.
+    pub fn has_live_or_reserved_pane(&self, pane_id_env: &str) -> bool {
+        if pane_id_env.is_empty() {
+            return false;
+        }
+        let inner = self.inner.lock().unwrap();
+        inner
+            .pending_spawns
+            .values()
+            .any(|reserved| reserved.as_deref() == Some(pane_id_env))
+            || inner.agents.values().any(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })
+    }
+
     /// Issue #318 (round-2 audit finding 4): [`Self::set_agent_type`] for a
     /// hook event, written onto the record of the GENERATION that sent it
     /// rather than onto whichever record a pane scan meets first.
