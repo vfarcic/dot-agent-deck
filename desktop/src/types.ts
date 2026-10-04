@@ -1250,7 +1250,7 @@ export interface DeckRuntimeState {
    * heading — the ids collide across decks by construction.
    */
   terminalInputResults?: Record<string, SendResult>;
-  sendTerminalInput: (target: AgentTarget, data: string) => Promise<void>;
+  sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**
    * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by

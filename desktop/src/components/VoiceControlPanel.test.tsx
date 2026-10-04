@@ -12,6 +12,13 @@ import {
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
 
+const { terminalInvoke } = vi.hoisted(() => ({ terminalInvoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: terminalInvoke,
+  Channel: class { onmessage?: (value: unknown) => void; },
+}));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined) }));
+
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId, label, onInput }: { agentId: string; label: string; onInput: (data: string) => void }) => (
     <div data-testid={`terminal-${agentId}`} role="group" aria-label={`${label} terminal`}>
@@ -411,7 +418,7 @@ describe("voice control panel", () => {
       await flush();
       expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
       const write = vi.mocked(deck.sendTerminalInput);
-      const target = { deckId: snapshot.connection.deckId, agentId: "planner" };
+      const target = { deckId: snapshot.connection.deckId!, agentId: "planner" };
       const say = async (said: string) => {
         const before = voice.voiceStop.mock.calls.length;
         steps.push({ outcome: heard(said) });
@@ -596,6 +603,53 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent(/not working|stopped interrupting|turn.*ended/i);
     });
 
+    /// Scenario: a keyboard write holds the real Tauri bridge queue while the panel requests interrupt or clear. Idle or Stop typing before the keyboard write settles cancels the control at transport dispatch, so no stale Escape or clear bytes reach invoke.
+    it.each([
+      { said: "interrupt", change: "idle", bytes: "\x1b" },
+      { said: "interrupt", change: "Stop typing", bytes: "\x1b" },
+      { said: "clear the prompt", change: "Stop typing", bytes: "\x15".repeat(32) },
+    ])("cancels real bridge queued $said after $change", async ({ said, change, bytes }) => {
+      const { say, write, target, keyboard, updatePlanner } = await startPrompt();
+      let release!: () => void;
+      terminalInvoke.mockReset();
+      terminalInvoke.mockImplementation((command: string, args?: { data?: number[] }) => {
+        if (command === "desktop_bootstrap") return Promise.resolve({
+          connection: { status: "connected", deckId: target.deckId, deckKind: "local", socketPath: "/tmp/deck.sock", clientProtocolVersion: 6, serverProtocolVersion: 6, clientBuildVersion: "test", daemonBuildVersion: "test", runningAgentCount: 1 },
+          agents: [{ id: "planner", paneId: "pane-planner", displayName: "Planner", rows: 32, cols: 120, agentType: "codex", status: "working", toolCount: 0, tab: { kind: "orchestration", name: "test", roleIndex: 0, roleName: "planner", isStartRole: false, displayTitle: "test" } }],
+          protocolVersion: 6, source: "daemon",
+        });
+        if (command === "desktop_terminal_attach") return Promise.resolve({ sessionId: "voice-session", agentId: "planner", generation: 1, reused: false });
+        if (command === "desktop_terminal_write" && args?.data?.[0] === 107) return new Promise<void>((resolve) => { release = resolve; });
+        return Promise.resolve({ ok: true });
+      });
+      const { TauriDeckBridge } = await import("../lib/bridge");
+      const bridge = new TauriDeckBridge();
+      await bridge.subscribe(vi.fn(), vi.fn());
+      await bridge.connect();
+      await bridge.setShownTerminals([target]);
+      // A spy wraps the REAL input queue; it never substitutes a fake writer.
+      write.mockImplementation(bridge.sendTerminalInput.bind(bridge));
+      try {
+        await keyboard("k");
+        expect(release, "keyboard input must hold the real bridge queue").toBeTypeOf("function");
+        await say(said);
+        expect(write.mock.calls.some(([, data]) => data === bytes), "control must enter the bridge queue before cancellation").toBe(true);
+        expect(terminalInvoke.mock.calls.filter(([command]) => command === "desktop_terminal_write")).toHaveLength(1);
+        if (change === "idle") updatePlanner({ turn: "idle" });
+        else fireEvent.click(screen.getByRole("button", { name: /stop typing/i }));
+        await flush();
+        await act(async () => { release(); });
+        await flush();
+        await Promise.all(write.mock.results.map((entry) => Promise.resolve(entry.value).catch(() => undefined)));
+        await flush();
+        const delivered = terminalInvoke.mock.calls.filter(([command]) => command === "desktop_terminal_write").map(([, args]) => args.data);
+        expect(delivered, "stale control must never reach Tauri invoke after idle or Stop typing").toEqual([[107]]);
+      } finally {
+        release?.();
+        await bridge.dispose();
+      }
+    });
+
     /// Scenario: OpenCode stops working during the pause after the first Escape. The second Escape is cancelled and the outcome row says the interrupt stopped.
     it("stops OpenCode interrupt when the turn ends between steps", async () => {
       const { say, write, target, updatePlanner } = await startPrompt("open_code");
@@ -645,6 +699,48 @@ describe("voice control panel", () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
       await say("interrupt");
       expect(write).toHaveBeenCalledTimes(1);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /// Scenario: idle or keyboard Enter is observed while the first Escape acknowledgement is held. That new-turn evidence survives delivery, while the three-second floor still starts when the held Escape settles.
+    it.each(["idle then working", "keyboard Enter"] as const)("keeps new-turn evidence during the first interrupt write from %s", async (evidence) => {
+      const { say, write, keyboard, updatePlanner } = await startPrompt();
+      const release = holdNextWrite(write);
+      await say("interrupt");
+      expect(write).toHaveBeenCalledTimes(1);
+      if (evidence === "keyboard Enter") await keyboard("\r");
+      else {
+        updatePlanner({ turn: "idle" });
+        await flush();
+      }
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_001); });
+      await release();
+      if (evidence === "idle then working") {
+        updatePlanner({ turn: "working" });
+        await flush();
+      }
+      write.mockClear();
+      await say("interrupt");
+      expect(write, "evidence must not bypass the floor measured from delivery").not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      await say("interrupt");
+      expect(write, "new-turn evidence seen before acknowledgement must unlock the next interrupt").toHaveBeenCalledTimes(1);
+      expect(report()).toHaveTextContent("Interrupted Planner.");
+    });
+
+    /// Scenario: an old incarnation has a never-settling dictated write and a clear queued behind it. After replacement and re-entering typing mode, the new incarnation can interrupt without inheriting the old line or its pending-command reservation.
+    it("runs a prompt command on a replacement despite a never-settling old incarnation write", async () => {
+      const { say, write, target, updatePlanner } = await startPrompt();
+      write.mockImplementationOnce(() => new Promise<void>(() => undefined));
+      await say("old incarnation draft");
+      await say("clear the prompt");
+      expect(write.mock.calls).toEqual([[target, "old incarnation draft "]]);
+      updatePlanner({ spawnedAtMs: 200, turn: "working" });
+      await flush();
+      await say("typing on");
+      expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
+      await say("interrupt");
+      expect(write.mock.calls.map(([, data]) => data), "replacement must have a fresh command line and reservation").toEqual(["old incarnation draft ", "\x1b"]);
       expect(report()).toHaveTextContent("Interrupted Planner.");
     });
 
@@ -751,24 +847,51 @@ describe("voice control panel", () => {
       expect(report()).toHaveTextContent(/nothing.*(removed|scratch)|changed|keyboard|cannot|can't/i);
     });
 
-    /// Scenario: a queued command holds two dictations apart in time but releases them together after a private prefix. Scratch refuses their combined over-limit burst without sending deletion bytes into the prefix.
-    it("guards scratch against dictated writes released together after a queued command", async () => {
+    /// Scenario: a queued command holds two or three dictations apart in time but releases them together after a private prefix. Scratch refuses the entire over-limit burst, even when its last two writes fit the limit, without sending deletion bytes into the prefix.
+    it.each([
+      { name: "two writes totaling 801 characters", lengths: [400, 399] },
+      { name: "three writes totaling 900 characters", lengths: [299, 299, 299] },
+    ])("guards scratch against dictated writes released together after a queued command ($name)", async ({ lengths }) => {
       const { say, write, target, keyboard } = await startPrompt();
       const release = holdNextWrite(write);
       await say("barrier draft");
       await say("interrupt");
       await keyboard("private prefix");
-      await say("a".repeat(400));
-      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
-      await say("b".repeat(399));
+      const texts = lengths.map((length, index) => String.fromCharCode(97 + index).repeat(length));
+      for (const text of texts) {
+        await say(text);
+        await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_SUBMIT_SETTLE_MS); });
+      }
       expect(write).toHaveBeenCalledTimes(2);
       await release();
-      expect(write.mock.calls.slice(2)).toEqual([[target, "\x1b"], [target, `${"a".repeat(400)} `], [target, `${"b".repeat(399)} `]]);
+      expect(write.mock.calls.slice(2)).toEqual([[target, "\x1b"], ...texts.map((text) => [target, `${text} `])]);
       write.mockClear();
       await say("scratch that");
       expect(write, "coalesced burst must not be scratched into a private prefix").not.toHaveBeenCalled();
       expect(report()).toHaveTextContent(/cannot|can't/i);
       expect(report()).toHaveTextContent(/safely|safe|collapsed|paste|together/i);
+    });
+
+    /// Scenario: type a private keyboard prefix and dictate an 800-character tail before or exactly at the settle boundary. Scratch refuses the oversized shared burst, but removes only the voice tail when the writes were separated by a full settle.
+    it.each([VOICE_STATUS_POLL_MS, VOICE_SUBMIT_SETTLE_MS - 1, VOICE_SUBMIT_SETTLE_MS])("guards scratch after a keyboard prefix with a %i ms landing gap", async (gap) => {
+      const { say, write, target, keyboard } = await startPrompt();
+      await keyboard("private prefix");
+      const keyboardAt = Date.now();
+      await act(async () => { await vi.advanceTimersByTimeAsync(gap - VOICE_STATUS_POLL_MS); });
+      await say("a".repeat(799));
+      expect(Date.now() - keyboardAt).toBe(gap);
+      expect(write.mock.calls).toEqual([[target, "private prefix"], [target, `${"a".repeat(799)} `]]);
+      write.mockClear();
+      await say("scratch that");
+      if (gap < VOICE_SUBMIT_SETTLE_MS) {
+        expect(write, "keyboard prefix plus voice tail exceeds the literal burst limit").not.toHaveBeenCalled();
+        expect(report()).toHaveTextContent(/cannot|can't/i);
+        expect(report()).toHaveTextContent(/safe|collapsed|paste|together/i);
+      } else {
+        expect(write).toHaveBeenCalledWith(target, FIXTURE_PROMPT_KEYS.codex!.deleteChar.bytes.repeat(800));
+        expect(report()).toHaveTextContent(/Removed/);
+      }
+      expect(screen.getByRole("textbox", { name: "Planner terminal input" })).toHaveValue("private prefix");
     });
 
     /** Scenario: dictate two writes and scratch twice. Each scratch deletes only its last write, including the trailing space, and names the removed words in the row. */

@@ -203,14 +203,19 @@ const PaneDictation = createContext<{ agentId: string; label: string } | undefin
  * ("scratch that" and a clear's Undo refuse then). Absent outside the shell,
  * where no voice panel listens.
  */
-const KeyboardInput = createContext<((target: AgentTarget, data: string) => void) | undefined>(undefined);
+const KeyboardInput = createContext<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
 
-/** A terminal's `onTerminalInput`: the write, after telling {@link KeyboardInput} about it. */
+/**
+ * A terminal's `onTerminalInput`: the write, then — in the same tick, before
+ * any of its bytes can reach the daemon — telling {@link KeyboardInput} about
+ * it, with the promise that settles when it has been written.
+ */
 function useKeyboardInput(send: DeckRuntimeState["sendTerminalInput"]): DeckRuntimeState["sendTerminalInput"] {
   const note = useContext(KeyboardInput);
   return useCallback((target, data) => {
-    note?.(target, data);
-    return send(target, data);
+    const sent = send(target, data);
+    note?.(target, data, sent);
+    return sent;
   }, [note, send]);
 }
 
@@ -278,8 +283,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
   /** PRD #1541 — where the voice panel listens for keyboard writes ({@link KeyboardInput}). */
-  const panelKeyboard = useRef<((target: AgentTarget, data: string) => void) | undefined>(undefined);
-  const noteKeyboard = useCallback((target: AgentTarget, data: string) => panelKeyboard.current?.(target, data), []);
+  const panelKeyboard = useRef<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
+  const noteKeyboard = useCallback((target: AgentTarget, data: string, sent: Promise<void>) => panelKeyboard.current?.(target, data, sent), []);
   /**
    * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
    * `closeNewAgent` while the New agent dialog is open, so `close` can close

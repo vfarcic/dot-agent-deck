@@ -84,7 +84,7 @@ import { Mic, MicOff, SquarePen, Undo2, X } from "lucide-react";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import { VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { VOICE_ACTIONS, type VoiceDispatchTarget, type VoicePanelChannel, type VoicePanelContext } from "../lib/voiceActions";
-import type { EndpointSettingsDto, VoiceCommandDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto } from "../lib/bridge";
+import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto, type VoiceDirectoriesDto, type VoiceNewAgentDto, type VoiceOutcomeDto, type VoiceResolvedParamDto, type VoiceResultDto, type VoiceScreen, type VoiceStatusDto } from "../lib/bridge";
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
@@ -579,12 +579,24 @@ const PROMPT_EMPTIED = {
 } as const;
 
 /**
- * PRD #1541 — one voice write into a prompt: its text, when it was handed to
- * the terminal, and when that settled (`undefined` while it is in flight).
- * The two times are what "scratch that" reads to tell whether the agent may
- * have read this write and the one before it in one go ({@link scratchCollapse}).
+ * PRD #1541 — one write into an agent's terminal, from anywhere: voice's
+ * dictations and prompt commands, and the user's own keyboard. Its size, and
+ * when it settled (`undefined` while it is in flight). "scratch that" reads a
+ * run of these to tell whether the agent may have read the write it would
+ * remove together with the input before it ({@link scratchCollapse}).
  */
-type PromptWrite = { text: string; madeAt: number; landedAt?: number };
+type PaneWrite = { chars: number; landedAt?: number };
+/**
+ * PRD #1541 — the recent writes into one agent's terminal, oldest first, and
+ * when the newest write dropped off the front of the list settled — so a run
+ * that reaches past what is kept is known to, rather than assumed not to.
+ */
+type PaneWrites = { writes: PaneWrite[]; droppedLandedAt?: number };
+/** How many writes {@link PaneWrites} keeps per agent. */
+const PANE_WRITES_KEPT = 256;
+
+/** PRD #1541 — one voice write into a prompt: its text, and the terminal write that carried it. */
+type PromptWrite = { text: string; sent: PaneWrite };
 
 /**
  * PRD #1541 — what this app knows about one agent's prompt: the voice writes
@@ -614,13 +626,15 @@ type PromptRecord = {
    */
   revision: number;
   /**
-   * The last interrupt actually delivered here: when its first key went out,
-   * and whether it still `latched` — no new turn evidenced since (a send, or
-   * the turn seen stopped (`sawIdle`) and then working again). A latched
+   * The last interrupt here: when its first key was delivered (`undefined`
+   * while that key is still on its way), and whether it still `latched` — no
+   * new turn evidenced since (a send, or the turn seen stopped (`sawIdle`) and
+   * then working again). It is set before the first key is handed over, so
+   * evidence that arrives while that key is in flight is kept. A latched
    * interrupt refuses another, however old: a status still reading "working"
    * may name the turn that was already interrupted.
    */
-  interrupt?: { at: number; latched: boolean; sawIdle: boolean };
+  interrupt?: { at?: number; latched: boolean; sawIdle: boolean };
 };
 
 let promptRevisions = 0;
@@ -644,9 +658,17 @@ class PaneMoved extends Error {
   }
 }
 
-/** The key one agent's prompt record and write line are kept under. */
+/** The key one agent's prompt record and terminal writes are kept under. */
 function paneKey(aim: { deckId: string; agentId: string }): string {
   return `${aim.deckId}\u0000${aim.agentId}`;
+}
+/**
+ * PRD #1541 — the key one incarnation of an agent's write line is kept under:
+ * a replaced agent gets a line of its own, so it never waits behind (or is
+ * reserved by) a write to the agent it replaced.
+ */
+function lineKey(aim: { deckId: string; agentId: string }, spawnedAtMs: number | undefined): string {
+  return `${paneKey(aim)}\u0000${spawnedAtMs ?? ""}`;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -676,18 +698,37 @@ function scratchRefusal(write: string, limit: number): string | undefined {
 
 /**
  * PRD #1541 — why "scratch that" will not remove `last` because the agent may
- * have read it and `before` as one input, or `undefined` when it would not.
- * An agent that reads more than about 800 characters in one go can fold them
- * into a single pasted block (Claude Code's `[Pasted text]`), which one delete
- * per character would not take back exactly. Two writes are read apart once
- * `last` went out at least {@link VOICE_SUBMIT_SETTLE_MS} after `before`
- * landed; closer than that, they are refused when together they exceed `limit`.
+ * have read it together with the input before it, or `undefined` when it
+ * would not. An agent that reads more than about 800 characters in one go can
+ * fold them into a single pasted block (Claude Code's `[Pasted text]`), which
+ * one delete per character would not take back exactly.
+ *
+ * Reads the burst `last` belongs to: the run of writes into the terminal —
+ * voice's, and the user's own keyboard — each settling less than
+ * {@link VOICE_SUBMIT_SETTLE_MS} after the one before it. Refused when that
+ * run, from its start through `last`, is over `limit` characters, or when its
+ * size cannot be told: a write in it still in flight, or a run that reaches
+ * past the writes {@link PaneWrites} keeps.
  */
-function scratchCollapse(before: PromptWrite | undefined, last: PromptWrite, limit: number): string | undefined {
-  if (before === undefined) return undefined;
-  const apart = before.landedAt !== undefined && last.madeAt - before.landedAt >= VOICE_SUBMIT_SETTLE_MS;
-  if (apart || before.text.length + last.text.length <= limit) return undefined;
-  return `Cannot scratch that — ${quoted(last.text)} followed the words before it so closely that the agent may have read the two together as one paste, so it cannot safely tell what to remove.`;
+function scratchCollapse(history: PaneWrites | undefined, last: PromptWrite, limit: number): string | undefined {
+  const together = `Cannot scratch that — ${quoted(last.text)} followed other input so closely that the agent may have read them together as one paste, so it cannot safely tell what to remove.`;
+  const unknown = `Cannot scratch that — the input around ${quoted(last.text)} has not all arrived yet, so it is not safe to tell whether the agent read it together as one paste.`;
+  const writes = history?.writes ?? [];
+  let index = writes.lastIndexOf(last.sent);
+  if (index < 0) return unknown;
+  let chars = 0;
+  let next: PaneWrite | undefined;
+  for (; index >= 0; index -= 1) {
+    const write = writes[index];
+    if (write.landedAt === undefined) return unknown;
+    if (next?.landedAt !== undefined && next.landedAt - write.landedAt >= VOICE_SUBMIT_SETTLE_MS) return undefined;
+    chars += write.chars;
+    if (chars > limit) return together;
+    next = write;
+  }
+  const dropped = history?.droppedLandedAt;
+  if (dropped !== undefined && next?.landedAt !== undefined && next.landedAt - dropped < VOICE_SUBMIT_SETTLE_MS) return unknown;
+  return undefined;
 }
 
 /**
@@ -1182,7 +1223,7 @@ interface VoiceControlPanelProps {
    * "scratch that" and a clear's Undo know when the prompt holds something
    * voice did not type.
    */
-  keyboard?: { current: ((target: AgentAddress, data: string) => void) | undefined };
+  keyboard?: { current: ((target: AgentAddress, data: string, sent: Promise<void>) => void) | undefined };
 }
 
 /**
@@ -1416,9 +1457,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     lastWrite.current = before === undefined ? landed : Promise.all([before, landed]).then(([a, b]) => a && b);
   }, []);
   /**
-   * PRD #1541 — each agent's write line: everything this panel has handed its
-   * terminal and not yet seen settle, and how many of those are prompt
-   * commands (interrupt, clear, scratch, a clear's Undo).
+   * PRD #1541 — each agent incarnation's write line: everything this panel
+   * has handed its terminal and not yet seen settle, and how many of those
+   * are prompt commands (interrupt, clear, scratch, a clear's Undo). It is the
+   * panel's own queue of dictations and prompt commands: the user's keyboard
+   * and a spoken send's Enter do not go through it.
    *
    * A prompt command waits for every write before it, and a dictated write
    * that arrives while one is running waits for it — a clear is two writes a
@@ -1427,8 +1470,21 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * is how typing mode has always written them.
    */
   const paneLines = useRef(new Map<string, { tail: Promise<void>; inflight: number; commands: number }>());
+  /** The host's view of the pane and the deck, for the entry check. */
+  const paneRef = useRef(pane);
+  paneRef.current = pane;
+  /** PRD #1541 — the incarnation of `aim` when it is the pane on screen. */
+  const incarnationOf = useCallback((aim: AgentAddress) => {
+    const shown = paneRef.current;
+    return shows(shown, aim) ? shown.spawnedAtMs : undefined;
+  }, []);
+  /**
+   * The write line of `aim`'s incarnation on screen: one per incarnation
+   * ({@link lineKey}), so an agent replaced while a write to it never settled
+   * does not hand that stuck line to its replacement.
+   */
   const onPane = useCallback((aim: AgentAddress, kind: "write" | "command", write: () => Promise<void>): Promise<void> => {
-    const key = paneKey(aim);
+    const key = lineKey(aim, incarnationOf(aim));
     let line = paneLines.current.get(key);
     if (!line) {
       line = { tail: Promise.resolve(), inflight: 0, commands: 0 };
@@ -1447,7 +1503,63 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (mine.inflight === 0 && paneLines.current.get(key) === mine) paneLines.current.delete(key);
     });
     return run;
+  }, [incarnationOf]);
+  /**
+   * PRD #1541 — every agent's recent terminal writes, by {@link paneKey}:
+   * voice's and the keyboard's alike, kept apart from the prompt record so
+   * that nothing which empties the record forgets them ({@link scratchCollapse}).
+   */
+  const paneWrites = useRef(new Map<string, PaneWrites>());
+  /** Note a write of `chars` characters handed to `aim`'s terminal, settling with `sent`. A write called off before it went out is forgotten. */
+  const notePaneWrite = useCallback((aim: AgentAddress, chars: number, sent: Promise<unknown>): PaneWrite => {
+    const key = paneKey(aim);
+    let history = paneWrites.current.get(key);
+    if (!history) {
+      history = { writes: [] };
+      paneWrites.current.set(key, history);
+    }
+    const entry: PaneWrite = { chars };
+    const kept = history;
+    kept.writes.push(entry);
+    while (kept.writes.length > PANE_WRITES_KEPT) {
+      const dropped = kept.writes.shift();
+      /* One still in flight is taken as settling now: later than it can have. */
+      kept.droppedLandedAt = dropped?.landedAt ?? Date.now();
+    }
+    void sent.then(
+      () => { entry.landedAt = Date.now(); },
+      (cause) => {
+        if (!(cause instanceof TerminalInputCancelled)) {
+          entry.landedAt = Date.now();
+          return;
+        }
+        const at = kept.writes.indexOf(entry);
+        if (at >= 0) kept.writes.splice(at, 1);
+      },
+    );
+    return entry;
   }, []);
+  /**
+   * PRD #1541 — hand one prompt-command write to `aim`'s terminal, guarded by
+   * `check` at the last moment the app controls: immediately before the
+   * bridge gives it to the daemon, after every earlier write to that terminal
+   * (the keyboard's included) has settled. `check` answers why the write must
+   * not go out, or `undefined`; a write it stops rejects as {@link PaneMoved}
+   * with that reason, having written nothing.
+   */
+  const guardedSend = useCallback((aim: AgentAddress, data: string, check: () => string | undefined): { sent: PaneWrite; done: Promise<void> } => {
+    let why: string | undefined;
+    const write = sendTerminalInput(aim, data, () => {
+      why = check();
+      return why === undefined;
+    });
+    const sent = notePaneWrite(aim, data.length, write);
+    const done = write.catch((cause: unknown) => {
+      if (cause instanceof TerminalInputCancelled) throw new PaneMoved(why ?? "the prompt changed before the keys went out");
+      throw cause;
+    });
+    return { sent, done };
+  }, [notePaneWrite, sendTerminalInput]);
   /** PRD #1541 — every agent's {@link PromptRecord}, by {@link paneKey}. */
   const prompts = useRef(new Map<string, PromptRecord>());
   /** The record for `aim` as it is now: a fresh one when the agent was replaced since. */
@@ -1483,14 +1595,6 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        own. The effect on `choiceShown` below stays as the backstop. */
     if ((was.kind === "awaitingChoice") !== (next.kind === "awaitingChoice")) choiceChanged.current?.(next.kind === "awaitingChoice");
   }, [setNudge]);
-  /** The host's view of the pane and the deck, for the entry check. */
-  const paneRef = useRef(pane);
-  paneRef.current = pane;
-  /** PRD #1541 — the incarnation of `aim` when it is the pane on screen. */
-  const incarnationOf = useCallback((aim: AgentAddress) => {
-    const shown = paneRef.current;
-    return shows(shown, aim) ? shown.spawnedAtMs : undefined;
-  }, []);
   /** PRD #1541 — forget voice's writes into `aim`'s prompt, saying whether what is left is known (empty) and why. */
   const resetPrompt = useCallback((aim: AgentAddress, whole: boolean, why: string) => {
     emptyRecord(promptFor(aim, incarnationOf(aim)), whole, why);
@@ -1859,7 +1963,10 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     const epoch = sendEpoch.current;
     const generation = modeGeneration.current;
     try {
-      await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, VOICE_DICTATION_SUBMIT);
+      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const sent = sendTerminalInput(target, VOICE_DICTATION_SUBMIT);
+      notePaneWrite(target, VOICE_DICTATION_SUBMIT.length, sent);
+      await sent;
       /* PRD #1541 — sent, so the prompt is empty and wholly known again, and
          the agent has a new turn to interrupt. */
       resetPrompt(aim, true, PROMPT_EMPTIED.sent);
@@ -1868,7 +1975,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (sendEpoch.current !== epoch || modeGeneration.current !== generation) return;
       setProblem(sentenceOf(cause));
     }
-  }, [noteSent, resetPrompt, sendTerminalInput]);
+  }, [notePaneWrite, noteSent, resetPrompt, sendTerminalInput]);
   /**
    * Press Enter once every typed write since the last send has landed — the
    * guarded half of a spoken send, shared by "send it" and a trailing send
@@ -2935,17 +3042,18 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (lost) throw new PaneMoved(lost.why);
       const record = promptFor(aim, incarnationOf(aim));
       if (sends) emptyRecord(record, false, PROMPT_EMPTIED.sent);
-      const write: PromptWrite = { text: typed, madeAt: Date.now() };
+      const target = { deckId: aim.deckId, agentId: aim.agentId };
+      const written = sendTerminalInput(target, typed);
+      const write: PromptWrite = { text: typed, sent: notePaneWrite(target, typed.length, written) };
       if (!sends) record.writes.push(write);
       try {
-        await sendTerminalInput({ deckId: aim.deckId, agentId: aim.agentId }, typed);
-        write.landedAt = Date.now();
+        await written;
       } catch (cause) {
         resetPrompt(aim, false, PROMPT_EMPTIED.failed);
         throw cause;
       }
     });
-  }, [incarnationOf, onPane, paneLost, promptFor, resetPrompt, sendTerminalInput]);
+  }, [incarnationOf, notePaneWrite, onPane, paneLost, promptFor, resetPrompt, sendTerminalInput]);
   const typeIntoAgent = useCallback((target: VoiceDispatchTarget) => {
     const mode = panelStateRef.current;
     /* PRD #1260 — while dictating, the words go to the mode's own target and
@@ -3082,7 +3190,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportRefused(voiceNoPromptKey(shown.agentLabel ?? shown.label, command));
       return undefined;
     }
-    if ((paneLines.current.get(paneKey(aim))?.commands ?? 0) > 0) {
+    if ((paneLines.current.get(lineKey(aim, shown.spawnedAtMs))?.commands ?? 0) > 0) {
       reportRefused(voicePromptCommandPending(shown.label));
       return undefined;
     }
@@ -3102,26 +3210,34 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   }, [current, paneLost, promptFor, reportRefused]);
   /**
    * PRD #1541 — run a prompt command's writes on `aim`'s line, each held to
-   * the declaration and to the typing mode it was said in before it goes
-   * out — so ending typing mode ("typing off", Stop typing, Voice off) calls
-   * off a command still waiting and stops a paced one before its next write —
-   * and report how it ended, unless the user has said something since, whose
-   * report this must not cover.
+   * the declaration, to the typing mode it was said in and to the command's
+   * own `holds` (the turn still working, the prompt still at its revision) —
+   * checked before each step, and again by the bridge immediately before each
+   * write is handed to the daemon ({@link guardedSend}). So ending typing mode
+   * ("typing off", Stop typing, Voice off) calls off a command still waiting,
+   * even one whose write is queued behind the user's own typing, and stops a
+   * paced one before its next write. Reports how it ended, unless the user has
+   * said something since, whose report this must not cover.
    */
   const runPromptCommand = useCallback((
     run: { aim: AgentAddress; declared: VoiceContext; generation: number; reported: number },
     writes: () => AsyncGenerator<string | number, void, void>,
     done: () => string,
     stopped: (why: string) => string,
-    after?: { onDone?: () => void; onFail?: () => void },
+    after?: { onDone?: () => void; onFail?: () => void; holds?: () => string | undefined },
   ) => {
+    const check = () => {
+      if (modeGeneration.current !== run.generation) return "typing mode ended";
+      const lost = contextLost(run.declared, current(), { pane: run.aim });
+      if (lost) return lost.why;
+      return after?.holds?.();
+    };
     const command = onPane(run.aim, "command", async () => {
       for await (const step of writes()) {
-        if (modeGeneration.current !== run.generation) throw new PaneMoved("typing mode ended");
-        const lost = contextLost(run.declared, current(), { pane: run.aim });
-        if (lost) throw new PaneMoved(lost.why);
+        const why = check();
+        if (why !== undefined) throw new PaneMoved(why);
         if (typeof step === "number") await sleep(step);
-        else await sendTerminalInput(run.aim, step);
+        else await guardedSend(run.aim, step, check).done;
       }
       after?.onDone?.();
     });
@@ -3133,7 +3249,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         if (reportGeneration.current === run.reported) setProblem(cause instanceof PaneMoved ? stopped(cause.why) : sentenceOf(cause));
       },
     );
-  }, [current, onPane, sendTerminalInput, trackWrite]);
+  }, [current, guardedSend, onPane, trackWrite]);
 
   /**
    * PRD #1541 — interrupt the open agent's turn with the deck's interrupt key
@@ -3163,7 +3279,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       reportRefused(`${run.label} was already interrupted and has not started a new turn since — another interrupt could open a menu instead.`);
       return;
     }
-    if (interrupted !== undefined && Date.now() - interrupted.at < VOICE_INTERRUPT_REPEAT_MS) {
+    if (interrupted?.at !== undefined && Date.now() - interrupted.at < VOICE_INTERRUPT_REPEAT_MS) {
       reportRefused(`${run.label} was just interrupted — wait a moment before interrupting it again.`);
       return;
     }
@@ -3174,16 +3290,30 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       const shown = paneRef.current;
       return shows(shown, aim) && shown.turn === "working";
     };
+    /* The latch this interrupt arms, and the one it replaces should its first
+       key never go out. */
+    const before = record.interrupt;
+    let latch: PromptRecord["interrupt"];
     reportRefused(`Interrupting ${label}…`);
     runPromptCommand(run, async function* () {
       for (const [index, step] of steps.entries()) {
-        if (!working()) throw new PaneMoved(`${label} is not working on anything anymore`);
+        if (index === 0) {
+          /* Armed before the first key is handed over, seeded from the turn as
+             it is now, so a stop, a new turn or a send seen while that key is
+             in flight counts as evidence. */
+          latch = { latched: true, sawIdle: !working() };
+          record.interrupt = latch;
+        }
         yield step.bytes;
         /* Resumed only once the step's write has settled: delivered. */
-        if (index === 0) record.interrupt = { at: Date.now(), latched: true, sawIdle: false };
+        if (index === 0 && latch) latch.at = Date.now();
         if (index < steps.length - 1 && step.pauseAfterMs > 0) yield step.pauseAfterMs;
       }
-    }, () => `Interrupted ${label}.`, (why) => `Stopped interrupting ${label} — ${why}.`);
+    }, () => `Interrupted ${label}.`, (why) => `Stopped interrupting ${label} — ${why}.`, {
+      holds: () => (working() ? undefined : `${label} is not working on anything anymore`),
+      /* The first key never went out: nothing was interrupted, so nothing latches. */
+      onFail: () => { if (latch?.at === undefined && record.interrupt === latch) record.interrupt = before; },
+    });
   }, [promptCommand, reportRefused, runPromptCommand]);
 
   /**
@@ -3203,9 +3333,16 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const restorePrompt = useCallback((aim: AgentAddress, declared: VoiceContext, writes: readonly string[], label: string, revision: number) => {
     const changed = () => promptFor(aim, incarnationOf(aim)).revision !== revision;
-    const lost = contextLost(declared, current(), { pane: aim });
-    if (lost || changed()) {
-      setProblem(`Nothing was restored — ${lost ? lost.why : PROMPT_CHANGED}.`);
+    /* Why a restore write must not go out now, checked before each one and
+       again as the bridge hands it over. Not the typing mode: Undo is a click. */
+    const holds = () => {
+      const moved = contextLost(declared, current(), { pane: aim });
+      if (moved) return moved.why;
+      return changed() ? PROMPT_CHANGED : undefined;
+    };
+    const refused = holds();
+    if (refused !== undefined) {
+      setProblem(`Nothing was restored — ${refused}.`);
       return;
     }
     let restored = 0;
@@ -3213,15 +3350,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       let landedAt: number | undefined;
       for (const text of writes) {
         if (landedAt !== undefined) await sleep(Math.max(0, landedAt + VOICE_SUBMIT_SETTLE_MS - Date.now()));
-        const moved = contextLost(declared, current(), { pane: aim });
-        if (moved) throw new PaneMoved(moved.why);
-        if (changed()) throw new PaneMoved(PROMPT_CHANGED);
+        const why = holds();
+        if (why !== undefined) throw new PaneMoved(why);
         const record = promptFor(aim, incarnationOf(aim));
-        const write: PromptWrite = { text, madeAt: Date.now() };
-        if (record.whole) record.writes.push(write);
-        await sendTerminalInput(aim, text);
+        const { sent, done } = guardedSend(aim, text, holds);
+        if (record.whole) record.writes.push({ text, sent });
+        await done;
         landedAt = Date.now();
-        write.landedAt = landedAt;
         restored += 1;
       }
     });
@@ -3234,7 +3369,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         else setProblem(restored > 0 ? `Stopped restoring ${label}'s prompt — ${cause.why}.` : `Nothing was restored — ${cause.why}.`);
       },
     );
-  }, [current, incarnationOf, onPane, promptFor, resetPrompt, sendTerminalInput, trackWrite]);
+  }, [current, guardedSend, incarnationOf, onPane, promptFor, resetPrompt, trackWrite]);
 
   /**
    * PRD #1541 — clear the open agent's prompt: the deck's clear key, pressed
@@ -3285,13 +3420,14 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * than guesses: nothing on record (see {@link PromptRecord} for what empties
    * it), a write a delete per character might not remove exactly
    * ({@link scratchRefusal}), or one the agent may have read together with
-   * the write before it ({@link scratchCollapse}). A second "scratch that"
-   * removes the write before.
+   * the input before it, voice's or the keyboard's ({@link scratchCollapse}).
+   * A second "scratch that" removes the write before.
    *
    * The write is taken off the record immediately before the deletes go out,
    * not when the command is said, and only while the prompt is still at the
-   * revision it was said against: keyboard input (or anything else that
-   * changes the prompt) while the command waits calls it off untouched.
+   * revision it was said against — checked again as the bridge hands the
+   * deletes over: keyboard input (or anything else that changes the prompt)
+   * while the command waits calls it off untouched.
    */
   const scratchLastDictation = useCallback((target: VoiceDispatchTarget) => {
     const run = promptCommand(target, "scratch");
@@ -3304,7 +3440,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     const last = lastWrite.text;
     const limit = Math.min(VOICE_SCRATCH_MAX_CHARS, run.keys.deleteChar.maxLiteralWriteChars ?? VOICE_SCRATCH_MAX_CHARS);
-    const refusal = scratchRefusal(last, limit) ?? scratchCollapse(record.writes.at(-2), lastWrite, limit);
+    const refusal = scratchRefusal(last, limit) ?? scratchCollapse(paneWrites.current.get(paneKey(run.aim)), lastWrite, limit);
     if (refusal) {
       reportRefused(refusal);
       return;
@@ -3319,6 +3455,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
       if (record.writes.length === 0) record.why = PROMPT_EMPTIED.scratched;
       yield deletes;
     }, () => `Removed ${quoted(last)} from ${run.label}'s prompt.`, (why) => `Nothing was removed — ${why}.`, {
+      holds: () => (record.revision === revision ? undefined : record.why),
       onFail: () => resetPrompt(run.aim, false, PROMPT_EMPTIED.failed),
     });
   }, [promptCommand, reportRefused, resetPrompt, runPromptCommand]);
@@ -3329,12 +3466,13 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    * it and a clear cannot be undone — except after a plain Enter, which sent
    * it and left it empty.
    */
-  const noteKeyboard = useCallback((target: AgentAddress, data: string) => {
+  const noteKeyboard = useCallback((target: AgentAddress, data: string, sent: Promise<void>) => {
+    notePaneWrite(target, data.length, sent);
     if (data === VOICE_DICTATION_SUBMIT) {
       resetPrompt(target, true, PROMPT_EMPTIED.sent);
       noteSent(target);
     } else resetPrompt(target, false, PROMPT_EMPTIED.keyboard);
-  }, [noteSent, resetPrompt]);
+  }, [notePaneWrite, noteSent, resetPrompt]);
 
   /* PRD #1541 — the open agent's turn seen stopped and then working again
      after an interrupt was delivered is evidence of a new turn, which

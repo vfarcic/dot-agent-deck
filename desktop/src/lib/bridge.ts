@@ -1539,6 +1539,17 @@ interface PendingTerminalAttachment {
   activated: boolean;
 }
 
+/**
+ * PRD #1541 — a terminal write whose precondition answered false when its
+ * turn came, so nothing was written (see {@link DeckBridge.sendTerminalInput}).
+ */
+export class TerminalInputCancelled extends Error {
+  constructor() {
+    super("Nothing was sent — the write was called off before it went out.");
+    this.name = "TerminalInputCancelled";
+  }
+}
+
 export interface DeckBridge {
   readonly mode: RuntimeMode;
   /**
@@ -1570,8 +1581,15 @@ export interface DeckBridge {
    * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
    * 2. The target is matched BY VALUE (see {@link AgentTarget}); an
    * unattached target rejects rather than writing anywhere.
+   *
+   * PRD #1541 — `precondition`, when given, is asked once, immediately before
+   * the write is handed to the daemon (after every earlier write to the same
+   * terminal has settled). Answering false writes nothing and rejects with
+   * {@link TerminalInputCancelled}; later input to that terminal is not held
+   * up by it. Voice's prompt commands use it so a key accepted for a turn,
+   * a typing mode or a prompt that has since changed is never sent late.
    */
-  sendTerminalInput(target: AgentTarget, data: string): Promise<void>;
+  sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void>;
   /** This pane's measured grid, for the agent named by the composite identity. */
   resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void>;
   /**
@@ -2622,7 +2640,8 @@ class FixtureDeckBridge implements DeckBridge {
    * the selected deck's key is the same wrong-producer stamp issue #1116's open
    * item 1 describes, reproduced in the fixture.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
+    if (precondition && !precondition()) throw new TerminalInputCancelled();
     this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
@@ -4484,8 +4503,13 @@ export class TauriDeckBridge implements DeckBridge {
    * waits and the pane reattaches, the chunk was typed into a terminal that no
    * longer exists, and it rejects as not attached rather than landing in the
    * replacement.
+   *
+   * PRD #1541 — a chunk with a `precondition` asks it when its turn comes,
+   * after the previous chunk settled and before `desktop_terminal_write` is
+   * invoked; a false answer rejects it with {@link TerminalInputCancelled} and
+   * writes nothing, and the chunks behind it go on as usual.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
     const key = agentKey(target.deckId, target.agentId);
     const accepted = this.sessions.get(key);
     const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
@@ -4494,6 +4518,7 @@ export class TauriDeckBridge implements DeckBridge {
     const write = previous.then(async () => {
       const invoke = await this.getInvoke();
       if (this.sessions.get(key) !== accepted) throw notAttached();
+      if (precondition && !precondition()) throw new TerminalInputCancelled();
       await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
     });
     const tail = write.catch(() => undefined);
