@@ -1633,6 +1633,11 @@ async fn ingest_event_unless(
     // be split by another event.
     if let Some(pane_id) = question_pane.as_deref() {
         let keep = state.pending_question_id_on_pane(pane_id);
+        // Audit A4: when the question arrived, for the keys channel's "did the
+        // user type into the pane since?".
+        registry
+            .question_answers()
+            .note_pending(pane_id, keep.as_deref());
         let reason = if keep.is_some() {
             crate::question::ReleaseReason::Superseded
         } else {
@@ -1649,15 +1654,82 @@ async fn ingest_event_unless(
     true
 }
 
+/// PRD #1542 (audit A6): how long the daemon holds a question for its producer
+/// before it lets go on its own. Every shipped producer stops waiting first —
+/// Claude Code's hook at [`crate::hook::CLAUDE_HOLD_DEADLINE`] (3570 s) and an
+/// `await-answer` child at [`crate::hook::AWAIT_ANSWER_DEADLINE`] (3600 s) — so
+/// this is the backstop for a producer that does not: past it the hold is
+/// released, the question is dropped and every attached client is told, exactly
+/// as when a producer's connection closes.
+pub const QUESTION_HOLD_DEADLINE: Duration = Duration::from_secs(3600 + 120);
+
+/// PRD #1542 (audit A6): the most questions the daemon holds at once, across
+/// every pane. A held question does NOT occupy one of the
+/// [`MAX_CONCURRENT_HOOK_CONNECTIONS`] slots — it gives its slot back once the
+/// hold is registered — so lifecycle and completion hooks (the `PostToolUse`
+/// that clears a question answered by keyboard among them) are never queued
+/// behind waiting prompts. This budget is what bounds the held connections
+/// instead. One pane holds at most one question at a time (a newer one
+/// releases the older), so 64 is twice the hook pool and well above any
+/// orchestration this repository defines; a question raised past it is
+/// applied without its question, so the card still reads Needs Input and the
+/// prompt is answered by keyboard.
+pub const MAX_HELD_QUESTIONS: usize = 64;
+
+/// The most bytes read from a holding producer's connection while it waits.
+/// A holding producer sends nothing more, so any byte at all means it is gone
+/// or misbehaving; the small cap keeps a held connection from costing a
+/// [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] buffer.
+const HELD_CONNECTION_READ_CAP: usize = 1024;
+
+/// The hook loop's bounds — the production values in [`Self::production`],
+/// smaller ones from tests that need to reach them.
+#[derive(Clone, Copy, Debug)]
+struct HookLoopLimits {
+    idle_timeout: Duration,
+    max_connections: usize,
+    hold_deadline: Duration,
+    max_holds: usize,
+}
+
+impl HookLoopLimits {
+    fn production(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            max_connections: MAX_CONCURRENT_HOOK_CONNECTIONS,
+            hold_deadline: QUESTION_HOLD_DEADLINE,
+            max_holds: MAX_HELD_QUESTIONS,
+        }
+    }
+}
+
+/// What [`handle_question_signal`] needs from the connection it runs on.
+struct QuestionConnection<'a, R> {
+    reader: &'a mut R,
+    /// The connection's hook-pool slot, given back once a hold is registered
+    /// (audit A6).
+    slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
+    holds: &'a Arc<tokio::sync::Semaphore>,
+    hold_deadline: Duration,
+}
+
 /// PRD #1542: apply a producer's [`crate::event::QuestionSignal`] and, for a
 /// held question, wait for its answer.
+///
+/// `attested_agent` is the agent the provenance gate attested for the pane
+/// (audit A5/A9): the event is stamped with it, a hold is registered as its,
+/// and a message the gate let through WITHOUT attesting one — an unknown pane,
+/// or a missing token under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` — has its
+/// question metadata removed and is applied as a plain status event.
 ///
 /// The hold is registered BEFORE the event is applied, so the reconciliation
 /// in [`ingest_event`] sees it: an event racing this one that clears the
 /// question releases the hold rather than leaving it to wait for nothing.
 /// After the apply the question must be the pane's pending one, or it was not
 /// accepted (it did not survive sanitizing, or the event was refused) and the
-/// producer is released at once.
+/// producer is released at once. Once held, the connection gives its hook-pool
+/// slot back and waits under [`MAX_HELD_QUESTIONS`] and the hold deadline
+/// instead (audit A6).
 ///
 /// Returns the reply line to write, or `None` when the producer's connection
 /// closed while it waited — the producer is gone, so the question goes too
@@ -1665,10 +1737,11 @@ async fn ingest_event_unless(
 /// [observed]); the status is left for the next event to decide.
 async fn handle_question_signal<R>(
     signal: crate::event::QuestionSignal,
+    attested_agent: Option<String>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
     registry: &Arc<AgentPtyRegistry>,
-    reader: &mut R,
+    conn: QuestionConnection<'_, R>,
 ) -> Option<crate::question::QuestionReply>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -1680,24 +1753,48 @@ where
         hold,
         ..
     } = signal;
-    // The pane the provenance gate attested, not whatever the event claims.
+    // The pane the provenance gate attested, not whatever the event claims —
+    // and the agent it attested, which is who owns the question.
     event.pane_id = Some(pane_id.clone());
+    match &attested_agent {
+        Some(agent_id) => event.agent_id = Some(agent_id.clone()),
+        None => strip_question_metadata(&mut event),
+    }
     admit_producer_event(&mut event);
-    let question_id = event.question().map(|q| q.id);
+    let mut question_id = event.question().map(|q| q.id);
     info!(
         pane_id = %escape_id_for_log(&pane_id),
         question_id = ?question_id,
         hold,
+        attested = attested_agent.is_some(),
         event_type = ?event.event_type,
         "Received question"
     );
-    let holding = match (&question_id, hold) {
-        (Some(id), true) => Some((id.clone(), registry.question_holds().hold(&pane_id, id))),
-        _ => None,
-    };
+    let mut holding = None;
+    if let (Some(id), true, Some(agent_id)) = (&question_id, hold, &attested_agent) {
+        match Arc::clone(conn.holds).try_acquire_owned() {
+            Ok(budget) => {
+                let hold = registry.question_holds().hold(&pane_id, agent_id, id);
+                holding = Some((id.clone(), hold, budget));
+            }
+            Err(_) => {
+                // No budget: the event still applies, without its question,
+                // so the card reads Needs Input and the keyboard answers it.
+                warn!(
+                    pane_id = %escape_id_for_log(&pane_id),
+                    question_id = %id,
+                    limit = MAX_HELD_QUESTIONS,
+                    "question: the daemon already holds as many questions as it allows; \
+                     this one is shown as a plain prompt and answered by keyboard"
+                );
+                event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+                question_id = None;
+            }
+        }
+    }
     registry.set_agent_type(&pane_id, &event.agent_type);
     ingest_event(state, event_tx, registry, event).await;
-    let Some((id, rx)) = holding else {
+    let Some((id, hold, _budget)) = holding else {
         return Some(QuestionReply::released(
             question_id.as_deref().unwrap_or(""),
             ReleaseReason::NotHeld,
@@ -1705,50 +1802,88 @@ where
     };
     let pending = state.read().await.pending_question_id_on_pane(&pane_id);
     if pending.as_deref() != Some(id.as_str()) {
-        registry.question_holds().forget(&id);
+        registry
+            .question_holds()
+            .forget(&pane_id, &id, hold.generation);
         return Some(QuestionReply::released(&id, ReleaseReason::NotHeld));
     }
+    // Held: the hook-pool slot goes back, so this wait never queues another
+    // producer's hook (audit A6). `_budget` bounds it instead.
+    drop(conn.slot.take());
     // Any read outcome means the producer is gone or misbehaving: a holding
     // producer sends nothing more on this connection.
-    let gone =
-        crate::bounded_read::read_capped_line(reader, crate::bounded_read::MAX_HOOK_LINE_BYTES);
+    let gone = crate::bounded_read::read_capped_line(conn.reader, HELD_CONNECTION_READ_CAP);
     tokio::select! {
-        reply = rx => Some(reply.unwrap_or_else(|_| QuestionReply::released(&id, ReleaseReason::Cleared))),
+        reply = hold.rx => Some(reply.unwrap_or_else(|_| QuestionReply::released(&id, ReleaseReason::Cleared))),
         _ = gone => {
-            if registry.question_holds().forget(&id) {
-                // Told to every attached client, not only applied here: a
-                // client still showing the question would offer an answer the
-                // daemon can only refuse. The event names the question and
-                // asserts no status (see `QUESTION_RELEASED_BY_DECK_METADATA_KEY`).
-                let owner = state.read().await.pending_question_owner(&pane_id, &id);
-                if let Some((session_id, agent_type, agent_id)) = owner {
-                    let event = deck_question_event(
-                        session_id,
-                        agent_type,
-                        Some(pane_id.clone()),
-                        agent_id,
-                        &id,
-                        crate::event::EventType::Unknown,
-                        crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY,
-                    );
-                    ingest_event(state, event_tx, registry, event).await;
-                }
-                // The fallback for an event the card refused.
-                let cleared = state.write().await.clear_pending_question(&pane_id, &id);
-                info!(
-                    pane_id = %escape_id_for_log(&pane_id),
-                    question_id = %id,
-                    cleared,
-                    "question: the producer stopped waiting before an answer; the question is cleared"
-                );
-            }
+            drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the producer stopped waiting before an answer").await;
             None
+        }
+        _ = tokio::time::sleep(conn.hold_deadline) => {
+            drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the daemon's hold deadline passed").await;
+            Some(QuestionReply::released(&id, ReleaseReason::Cleared))
         }
     }
 }
 
+/// PRD #1542: drop a held question that will not be answered — its producer's
+/// connection closed, or its hold deadline passed — when the hold
+/// `generation` registered is still the one in place. Told to every attached
+/// client, not only applied here: a client still showing the question would
+/// offer an answer the daemon can only refuse. The event names the question
+/// and asserts no status (see `QUESTION_RELEASED_BY_DECK_METADATA_KEY`).
+async fn drop_held_question(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    id: &str,
+    generation: u64,
+    why: &'static str,
+) {
+    if !registry.question_holds().forget(pane_id, id, generation) {
+        return;
+    }
+    let owner = state.read().await.pending_question_owner(pane_id, id);
+    if let Some((session_id, agent_type, agent_id)) = owner {
+        let event = deck_question_event(
+            session_id,
+            agent_type,
+            Some(pane_id.to_string()),
+            agent_id,
+            id,
+            crate::event::EventType::Unknown,
+            crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY,
+        );
+        ingest_event(state, event_tx, registry, event).await;
+    }
+    // The fallback for an event the card refused.
+    let cleared = state.write().await.clear_pending_question(pane_id, id);
+    info!(
+        pane_id = %escape_id_for_log(pane_id),
+        question_id = %id,
+        cleared,
+        why,
+        "question: released without an answer; the question is cleared"
+    );
+}
+
+/// PRD #1542 (audit A9): remove what a question frame may only carry when the
+/// daemon's provenance gate attested it — the question itself and the
+/// "answered" marker that clears one. Applied to every bare `AgentEvent` on
+/// the hook socket and to a `question` message the gate let through without
+/// attesting a pane. The rest of the frame, its status included, is applied as
+/// it always was, which is what keeps an older hook binary's bare events
+/// working.
+fn strip_question_metadata(event: &mut AgentEvent) {
+    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
+}
+
 /// PRD #1542: an event the daemon itself ingests about the question
-/// `question_id` — its answer (`Thinking`, marked
+/// `question_id` — its answer (`Thinking`, or `Unknown` for a deny, marked
 /// [`crate::event::QUESTION_ANSWERED_BY_DECK_METADATA_KEY`]) or its release
 /// when the producer stopped waiting (`Unknown`, marked
 /// [`crate::event::QUESTION_RELEASED_BY_DECK_METADATA_KEY`]). Both carry
@@ -3162,6 +3297,7 @@ pub const MAX_CONCURRENT_HOOK_CONNECTIONS: usize = 32;
 async fn accept_hook_connection(
     listener: &IpcListener,
     conn_limit: &Arc<tokio::sync::Semaphore>,
+    limit: usize,
     at_cap: &mut bool,
 ) -> io::Result<(tokio::sync::OwnedSemaphorePermit, IpcStream)> {
     let permit = match Arc::clone(conn_limit).try_acquire_owned() {
@@ -3173,7 +3309,7 @@ async fn accept_hook_connection(
             if !*at_cap {
                 *at_cap = true;
                 warn!(
-                    limit = MAX_CONCURRENT_HOOK_CONNECTIONS,
+                    limit,
                     "hook socket at its concurrent-connection cap; further connections wait in \
                      the listen backlog until a slot frees — events are delayed, not dropped"
                 );
@@ -3374,12 +3510,41 @@ async fn run_hook_loop_with_idle_timeout(
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
     idle_timeout: Duration,
 ) -> Result<(), DaemonError> {
+    run_hook_loop_with_limits(
+        listener,
+        state,
+        event_tx,
+        pty_registry,
+        shutdown,
+        worktree_registry,
+        HookLoopLimits::production(idle_timeout),
+    )
+    .await
+}
+
+/// [`run_hook_loop`] with every bound supplied — the seam the PRD #1542 hold
+/// tests use to reach the connection cap, the hold budget and the hold
+/// deadline without spending their production values.
+#[allow(clippy::too_many_arguments)]
+async fn run_hook_loop_with_limits(
+    listener: IpcListener,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    pty_registry: Arc<AgentPtyRegistry>,
+    shutdown: Arc<Notify>,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    limits: HookLoopLimits,
+) -> Result<(), DaemonError> {
+    let idle_timeout = limits.idle_timeout;
     // Issue #319: bound how many hook connections are being served at once.
     // Every accepted connection used to get its own `tokio::spawn` with nothing
     // capping how many could be outstanding, so a producer that opened
     // connections faster than they finished grew the daemon's task set and its
     // per-connection buffers without limit.
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOOK_CONNECTIONS));
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    // PRD #1542 (audit A6): held questions wait under a budget of their own,
+    // not in the connection pool above.
+    let hold_limit = Arc::new(tokio::sync::Semaphore::new(limits.max_holds));
     // Issue #544: the `work-done` and `dispatch` pane writes handed off by the
     // connections below — ordered per recipient pane and bounded in number.
     let deliveries = crate::pane_delivery_queue::PaneDeliveryQueues::new();
@@ -3405,8 +3570,9 @@ async fn run_hook_loop_with_idle_timeout(
                     .release_all(crate::question::ReleaseReason::Shutdown);
                 return Ok(());
             }
-            accept_res = accept_hook_connection(&listener, &conn_limit, &mut at_cap) => match accept_res {
+            accept_res = accept_hook_connection(&listener, &conn_limit, limits.max_connections, &mut at_cap) => match accept_res {
             Ok((permit, stream)) => {
+                let hold_limit = Arc::clone(&hold_limit);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
@@ -3418,7 +3584,10 @@ async fn run_hook_loop_with_idle_timeout(
                     // what the semaphore counts. Holding it in the loop above
                     // instead would bound accepts rather than tasks, which is
                     // not the thing that grows.
-                    let _permit = permit;
+                    //
+                    // An `Option` because a held question gives its slot back
+                    // while it waits (PRD #1542, audit A6).
+                    let mut permit = Some(permit);
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. The write half now
                     // serves every `DaemonMessage` arm — `delegate` since PR
@@ -3623,6 +3792,16 @@ async fn run_hook_loop_with_idle_timeout(
                                     }
                                 }
                             }
+                            // PRD #1542 (audit A5/A9): the agent the gate
+                            // attested, which owns any question this message
+                            // raises. `None` for a message admitted without
+                            // one.
+                            let attested_agent = match &provenance {
+                                crate::hook_provenance::Provenance::Attested { agent_id } => {
+                                    Some(agent_id.clone())
+                                }
+                                _ => None,
+                            };
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
@@ -4005,10 +4184,16 @@ async fn run_hook_loop_with_idle_timeout(
                                     // answered) takes the question with it.
                                     let Some(reply) = handle_question_signal(
                                         signal,
+                                        attested_agent.clone(),
                                         &state,
                                         &event_tx,
                                         &pty_registry,
-                                        &mut reader,
+                                        QuestionConnection {
+                                            reader: &mut reader,
+                                            slot: &mut permit,
+                                            holds: &hold_limit,
+                                            hold_deadline: limits.hold_deadline,
+                                        },
                                     )
                                     .await
                                     else {
@@ -4097,6 +4282,11 @@ async fn run_hook_loop_with_idle_timeout(
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
                             }
+                            // PRD #1542 (audit A9): a bare frame is unattested,
+                            // so it may report a status but neither raise a
+                            // question nor clear one; producers send those as
+                            // `question` messages through the provenance gate.
+                            strip_question_metadata(&mut event);
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
@@ -9549,7 +9739,7 @@ mod question_hold_tests {
             pending("q-first"),
         )
         .await;
-        assert!(registry.question_holds().is_held("q-first"));
+        assert!(registry.question_holds().is_held(PANE, "q-first"));
         drop(first);
         wait_for(&state, "the closed hold to clear its question", |s| {
             s.pending_question_id_on_pane(PANE).is_none()
@@ -9560,7 +9750,7 @@ mod question_hold_tests {
             crate::state::SessionStatus::WaitingForInput,
             "a closed hold says nothing about where the agent went"
         );
-        assert!(!registry.question_holds().is_held("q-first"));
+        assert!(!registry.question_holds().is_held(PANE, "q-first"));
 
         let second = hold("q-second").await;
         wait_for(
@@ -9570,7 +9760,7 @@ mod question_hold_tests {
         )
         .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !registry.question_holds().is_held("q-second") {
+        while !registry.question_holds().is_held(PANE, "q-second") {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the hold never registered"
@@ -9682,7 +9872,7 @@ mod question_hold_tests {
             Some("q-gone")
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !registry.question_holds().is_held("q-gone") {
+        while !registry.question_holds().is_held(PANE, "q-gone") {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the hold never registered"
@@ -9720,5 +9910,499 @@ mod question_hold_tests {
 
         handle.abort();
         registry.shutdown_all();
+    }
+
+    /// A hook loop with chosen bounds, and agents on panes of their own.
+    struct Deck {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        sock: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+        handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    }
+
+    struct Agent {
+        pane: String,
+        id: String,
+        token: String,
+    }
+
+    impl Deck {
+        async fn start(limits: HookLoopLimits) -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(
+                UnixListener::bind(&sock).expect("bind hook socket"),
+            );
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let handle = tokio::spawn({
+                let registry = registry.clone();
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move {
+                    run_hook_loop_with_limits(
+                        listener,
+                        state,
+                        event_tx,
+                        registry,
+                        Arc::new(Notify::new()),
+                        wtr,
+                        limits,
+                    )
+                    .await
+                }
+            });
+            Self {
+                registry,
+                state,
+                event_tx,
+                sock,
+                _dir: dir,
+                handle,
+            }
+        }
+
+        async fn agent(&self, pane: &str) -> Agent {
+            let id = self
+                .registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/sh"),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn shell agent");
+            let token = self.registry.hook_token_of(&id).expect("a hook token");
+            self.state.write().await.register_pane(pane.to_string());
+            Agent {
+                pane: pane.to_string(),
+                id,
+                token,
+            }
+        }
+
+        /// A producer holding `question_id` for `agent`, its connection open.
+        async fn hold(&self, agent: &Agent, question_id: &str) -> UnixStream {
+            let mut event = question_event(&agent.id, question_id);
+            event.pane_id = Some(agent.pane.clone());
+            event.session_id = format!("{}-session", agent.pane);
+            let question = event.question().unwrap();
+            event.set_question(&question);
+            let msg = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+                pane_id: agent.pane.clone(),
+                token: Some(agent.token.clone()),
+                event,
+                hold: true,
+            });
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            stream
+        }
+
+        async fn until_held(&self, agent: &Agent, question_id: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self
+                .registry
+                .question_holds()
+                .is_held(&agent.pane, question_id)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the hold on {} never registered",
+                    agent.pane
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn answer(
+            &self,
+            agent: &Agent,
+            question_id: &str,
+        ) -> Result<(), crate::question::AnswerRefusal> {
+            crate::daemon_protocol::answer_question(
+                &self.registry,
+                &self.state,
+                &self.event_tx,
+                &agent.id,
+                question_id,
+                &[QuestionAnswer {
+                    question_index: 0,
+                    option_indices: vec![1],
+                    text: None,
+                }],
+                false,
+            )
+            .await
+        }
+    }
+
+    impl Drop for Deck {
+        fn drop(&mut self) {
+            self.handle.abort();
+            self.registry.shutdown_all();
+        }
+    }
+
+    fn limits() -> HookLoopLimits {
+        HookLoopLimits::production(HOOK_CONNECTION_IDLE_TIMEOUT)
+    }
+
+    async fn reply_on(stream: UnixStream) -> Option<QuestionReply> {
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => Some(serde_json::from_str(line.trim()).unwrap()),
+            _ => None,
+        }
+    }
+
+    async fn no_reply_within(stream: &mut UnixStream, budget: Duration) -> bool {
+        let mut byte = [0u8; 1];
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(budget, stream.read(&mut byte))
+            .await
+            .is_err()
+    }
+
+    /// Scenario: Two agents on two panes each wait on a question that happens
+    /// to carry the same id. Answering the first agent's question reaches only
+    /// the producer on its own pane; the second agent's producer keeps waiting
+    /// and is still held, and an answer naming the wrong agent for a hold is
+    /// never delivered.
+    #[spec("question/hold/006")]
+    #[tokio::test]
+    async fn question_hold_006_identical_ids_on_two_panes_stay_apart() {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-a6-a").await;
+        let b = deck.agent("pane-a6-b").await;
+        let on_a = deck.hold(&a, "q-same").await;
+        deck.until_held(&a, "q-same").await;
+        let mut on_b = deck.hold(&b, "q-same").await;
+        deck.until_held(&b, "q-same").await;
+        assert!(
+            !deck.registry.question_holds().answer(
+                &b.pane,
+                &a.id,
+                "q-same",
+                QuestionReply::answered("q-same", Vec::new())
+            ),
+            "a hold is answered only for the agent that registered it"
+        );
+        assert!(deck.registry.question_holds().is_held(&b.pane, "q-same"));
+
+        deck.answer(&a, "q-same").await.expect("answered");
+        let reply = reply_on(on_a).await.expect("pane A's producer hears it");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+        assert!(
+            no_reply_within(&mut on_b, Duration::from_millis(300)).await,
+            "pane B's producer heard nothing"
+        );
+        assert!(deck.registry.question_holds().is_held(&b.pane, "q-same"));
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_id_on_pane(&b.pane)
+                .as_deref(),
+            Some("q-same")
+        );
+    }
+
+    /// Scenario: A producer holds a question, and a second registration for the
+    /// same pane and question replaces it. The first producer is told it was
+    /// superseded; when its handler then lets go late — its connection closing,
+    /// or its deadline passing — the replacement's hold and the pending
+    /// question are untouched, and the answer reaches the replacement.
+    #[spec("question/hold/007")]
+    #[tokio::test]
+    async fn question_hold_007_a_superseded_handler_cannot_drop_its_replacement() {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-a7").await;
+        let first = deck.hold(&a, "q-again").await;
+        deck.until_held(&a, "q-again").await;
+        let first_generation = {
+            // The registration in place now is the first one; a late forget
+            // naming it is what a superseded handler would do.
+            let probe = deck
+                .registry
+                .question_holds()
+                .hold("pane-probe", &a.id, "q-probe");
+            probe.generation - 1
+        };
+        let second = deck.hold(&a, "q-again").await;
+        let superseded = reply_on(first).await.expect("the first producer is let go");
+        assert_eq!(
+            superseded.reason,
+            Some(crate::question::ReleaseReason::Superseded)
+        );
+        deck.until_held(&a, "q-again").await;
+
+        drop_held_question(
+            &deck.state,
+            &deck.event_tx,
+            &deck.registry,
+            &a.pane,
+            "q-again",
+            first_generation,
+            "a superseded handler letting go late",
+        )
+        .await;
+        assert!(deck.registry.question_holds().is_held(&a.pane, "q-again"));
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_id_on_pane(&a.pane)
+                .as_deref(),
+            Some("q-again")
+        );
+        deck.answer(&a, "q-again").await.expect("answered");
+        let reply = reply_on(second).await.expect("the replacement hears it");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
+    }
+
+    /// Scenario: With the hook connection pool cut to two, three agents each
+    /// hold a question open. A completion hook for the first agent's tool still
+    /// gets in, clears that question and lets its producer go — held questions
+    /// give their pool slot back. With the hold budget cut to one, a question
+    /// past it still turns the card Needs Input but is not held or offered.
+    #[spec("question/hold/008")]
+    #[tokio::test]
+    async fn question_hold_008_held_questions_never_starve_the_hook_pool() {
+        let deck = Deck::start(HookLoopLimits {
+            max_connections: 2,
+            ..limits()
+        })
+        .await;
+        let agents = [
+            deck.agent("pane-a8-1").await,
+            deck.agent("pane-a8-2").await,
+            deck.agent("pane-a8-3").await,
+        ];
+        let mut producers = Vec::new();
+        for (i, agent) in agents.iter().enumerate() {
+            let id = format!("q-sat-{i}");
+            producers.push(deck.hold(agent, &id).await);
+            deck.until_held(agent, &id).await;
+        }
+        assert_eq!(deck.registry.question_holds().len(), 3);
+
+        // The completion hook: a plain `PostToolUse` for the first agent's Bash.
+        let mut done = question_event(&agents[0].id, "unused");
+        done.metadata.clear();
+        done.event_type = EventType::ToolEnd;
+        done.pane_id = Some(agents[0].pane.clone());
+        done.session_id = format!("{}-session", agents[0].pane);
+        let mut stream = UnixStream::connect(&deck.sock).await.expect("connect");
+        let line = format!("{}\n", serde_json::to_string(&done).unwrap());
+        stream.write_all(line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        wait_for(
+            &deck.state,
+            "the completion hook to clear the first question",
+            |s| s.pending_question_id_on_pane("pane-a8-1").is_none(),
+        )
+        .await;
+        let first = producers.remove(0);
+        let released = reply_on(first).await.expect("the first producer is let go");
+        assert_eq!(
+            released.reason,
+            Some(crate::question::ReleaseReason::Cleared)
+        );
+        assert_eq!(deck.registry.question_holds().len(), 2);
+
+        // The hold budget.
+        let deck = Deck::start(HookLoopLimits {
+            max_holds: 1,
+            ..limits()
+        })
+        .await;
+        let one = deck.agent("pane-a8-b1").await;
+        let two = deck.agent("pane-a8-b2").await;
+        let _held = deck.hold(&one, "q-budget-1").await;
+        deck.until_held(&one, "q-budget-1").await;
+        let over = deck.hold(&two, "q-budget-2").await;
+        let reply = reply_on(over).await.expect("released at once");
+        assert_eq!(reply.reason, Some(crate::question::ReleaseReason::NotHeld));
+        assert!(
+            !deck
+                .registry
+                .question_holds()
+                .is_held(&two.pane, "q-budget-2")
+        );
+        let state = deck.state.read().await;
+        assert_eq!(state.pending_question_id_on_pane(&two.pane), None);
+        assert_eq!(
+            state.sessions["pane-a8-b2-session"].status,
+            crate::state::SessionStatus::WaitingForInput
+        );
+    }
+
+    /// Scenario: A process sends the hook socket a bare event carrying a
+    /// question, and another carrying an "answered" marker. The card takes the
+    /// status, but neither raises nor clears a question: those come only through
+    /// the provenance gate. The same question sent as an unheld `question`
+    /// message with the pane's token is pending at once, and an attested
+    /// "answered" marker clears it; one for a pane the deck never issued a token
+    /// to has its question removed.
+    #[spec("question/detect/011")]
+    #[tokio::test]
+    async fn question_detect_011_bare_frames_cannot_raise_or_clear_a_question() {
+        let deck = Deck::start(limits()).await;
+        let a = deck.agent("pane-a9-detect").await;
+        let session = format!("{}-session", a.pane);
+        let frame = |question_id: &str| {
+            let mut event = question_event(&a.id, question_id);
+            event.pane_id = Some(a.pane.clone());
+            event.session_id = session.clone();
+            event
+        };
+        let send = |line: String| {
+            let sock = deck.sock.clone();
+            async move {
+                let mut stream = UnixStream::connect(&sock).await.expect("connect");
+                stream
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(stream);
+                let mut reply = String::new();
+                let _ = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut reply))
+                    .await;
+                reply
+            }
+        };
+        let unheld = |event: AgentEvent, token: Option<String>, pane: &str| {
+            serde_json::to_string(&crate::event::DaemonMessage::Question(
+                crate::event::QuestionSignal {
+                    pane_id: pane.to_string(),
+                    token,
+                    event,
+                    hold: false,
+                },
+            ))
+            .unwrap()
+        };
+
+        send(serde_json::to_string(&frame("q-bare")).unwrap()).await;
+        wait_for(&deck.state, "the bare frame's status", |s| {
+            s.sessions
+                .get(&session)
+                .is_some_and(|x| x.status == crate::state::SessionStatus::WaitingForInput)
+        })
+        .await;
+        assert_eq!(
+            deck.state.read().await.pending_question_id_on_pane(&a.pane),
+            None,
+            "a bare frame raises no question"
+        );
+
+        let reply = send(unheld(frame("q-gated"), Some(a.token.clone()), &a.pane)).await;
+        let reply: QuestionReply = serde_json::from_str(reply.trim()).expect("one reply line");
+        assert!(!reply.refused());
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_id_on_pane(&a.pane)
+                .as_deref(),
+            Some("q-gated")
+        );
+
+        let mut answered = frame("unused");
+        answered.metadata.clear();
+        answered.event_type = EventType::Thinking;
+        answered.metadata.insert(
+            crate::event::QUESTION_RESOLVED_METADATA_KEY.to_string(),
+            "q-gated".to_string(),
+        );
+        send(serde_json::to_string(&answered).unwrap()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_id_on_pane(&a.pane)
+                .as_deref(),
+            Some("q-gated"),
+            "a bare 'answered' marker clears nothing"
+        );
+        send(unheld(answered, Some(a.token.clone()), &a.pane)).await;
+        wait_for(&deck.state, "the attested marker to clear it", |s| {
+            s.pending_question_id_on_pane("pane-a9-detect").is_none()
+        })
+        .await;
+
+        // A pane the deck never issued a token to: admitted unattested, and
+        // its question removed.
+        deck.state
+            .write()
+            .await
+            .register_pane("pane-stranger".to_string());
+        let mut stranger = frame("q-stranger");
+        stranger.pane_id = Some("pane-stranger".into());
+        stranger.agent_id = None;
+        stranger.session_id = "stranger-session".into();
+        send(unheld(stranger, None, "pane-stranger")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            deck.state
+                .read()
+                .await
+                .pending_question_id_on_pane("pane-stranger"),
+            None
+        );
+    }
+
+    /// Scenario: A producer holds a question and never lets go. When the
+    /// daemon's own hold deadline passes, the producer is told to stop waiting,
+    /// the question is dropped, and every attached client is told — so nothing
+    /// waits on the daemon forever.
+    #[spec("question/hold/009")]
+    #[tokio::test]
+    async fn question_hold_009_the_daemon_releases_a_hold_at_its_deadline() {
+        let deck = Deck::start(HookLoopLimits {
+            hold_deadline: Duration::from_millis(300),
+            ..limits()
+        })
+        .await;
+        let mut events = deck.event_tx.subscribe();
+        let a = deck.agent("pane-a9").await;
+        let producer = deck.hold(&a, "q-deadline").await;
+        deck.until_held(&a, "q-deadline").await;
+        let reply = reply_on(producer).await.expect("released at the deadline");
+        assert_eq!(reply.outcome, ReplyOutcome::Released);
+        assert!(
+            !deck
+                .registry
+                .question_holds()
+                .is_held(&a.pane, "q-deadline")
+        );
+        assert_eq!(
+            deck.state.read().await.pending_question_id_on_pane(&a.pane),
+            None
+        );
+        let released = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("the release is broadcast")
+                .expect("broadcast open");
+            if let BroadcastMsg::Event(event) = msg
+                && event.resolved_question_id() == Some("q-deadline")
+            {
+                break event;
+            }
+        };
+        assert!(released.is_daemon_synthetic());
     }
 }

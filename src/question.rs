@@ -231,11 +231,17 @@ pub enum AnswerRefusal {
     Unsupported,
     /// The held channel closed before the answer reached it.
     ChannelGone,
-    /// Typing the keys failed or was refused part way.
+    /// Typing the keys failed or was refused part way. When at least one key
+    /// went in, the question is left pending but keyboard-only.
     WriteFailed {
         #[serde(default)]
         detail: String,
     },
+    /// The keys channel would type into a pane the user has typed into since
+    /// the question arrived, so the keys could land on a prompt that has
+    /// already moved on — a form partly answered by keyboard, or a prompt
+    /// already dismissed. The user finishes it by keyboard.
+    KeyboardStarted,
     #[serde(other)]
     Unknown,
 }
@@ -252,6 +258,10 @@ impl std::fmt::Display for AnswerRefusal {
             Self::Unsupported => write!(f, "this question has to be answered by keyboard"),
             Self::ChannelGone => write!(f, "the agent stopped waiting for that answer"),
             Self::WriteFailed { detail } => write!(f, "could not send the answer: {detail}"),
+            Self::KeyboardStarted => write!(
+                f,
+                "the agent's terminal was typed into after it asked; finish the answer by keyboard"
+            ),
             Self::Unknown => write!(f, "refused"),
         }
     }
@@ -663,9 +673,9 @@ pub struct BuiltQuestion {
 }
 
 /// The suggestion kind that names Claude Code's option 2, from the first entry
-/// of `permission_suggestions`.
+/// of `permission_suggestions` — the one update that option applies.
 fn claude_suggestion_when(suggestions: Option<&Value>) -> Option<(TableWhen, Value)> {
-    let first = suggestions?.as_array()?.first()?.clone();
+    let first = claude_always_update(suggestions)?;
     let when = match str_field(&first, "type") {
         Some("addDirectories") => TableWhen::SuggestionAddDirectories,
         Some("setMode") => TableWhen::SuggestionSetMode,
@@ -674,7 +684,107 @@ fn claude_suggestion_when(suggestions: Option<&Value>) -> Option<(TableWhen, Val
     Some((when, first))
 }
 
-/// Fill a Claude permission label's `{dir}` / `{rule}` placeholders from the
+/// PRD #1542 (audit A2): the ONE permission update Claude Code's "always"
+/// option stands for — the first `permission_suggestions` entry, whose kind
+/// also chooses the option's label. The held hook sends exactly this update
+/// as `updatedPermissions` ([`claude_decision`]), and the confirmation the user
+/// answers is written from it ([`claude_update_scope`]), so what is confirmed
+/// and what is granted are the same thing. A later suggestion is never sent:
+/// nothing on screen or in the confirmation describes it.
+pub fn claude_always_update(suggestions: Option<&Value>) -> Option<Value> {
+    suggestions?.as_array()?.first().cloned()
+}
+
+/// Where a Claude Code permission update is kept, as the end of a sentence —
+/// `None` for a destination this build does not know, which the caller treats
+/// as "cannot describe it".
+fn claude_destination(update: &Value) -> Option<&'static str> {
+    Some(match str_field(update, "destination")? {
+        "session" => "for the rest of this session",
+        "localSettings" => "in this project's local settings, for later sessions too",
+        "projectSettings" => "in this project's shared settings, for everyone working in it",
+        "userSettings" => "in your user settings, for every project",
+        _ => return None,
+    })
+}
+
+/// A Claude Code permission mode in words, for the label and the confirmation.
+/// `None` for a mode this build does not know.
+fn claude_mode(mode: &str) -> Option<(&'static str, &'static str)> {
+    Some(match mode {
+        "acceptEdits" => (
+            "accept edits",
+            "accept-edits mode: file edits without asking",
+        ),
+        "bypassPermissions" => (
+            "bypass permissions",
+            "bypass-permissions mode: every tool without asking",
+        ),
+        "plan" => ("plan mode", "plan mode"),
+        "default" => ("the default mode", "the default permission mode"),
+        "dontAsk" => (
+            "don't ask",
+            "don't-ask mode: anything not already allowed is denied",
+        ),
+        _ => return None,
+    })
+}
+
+/// PRD #1542 (audit A2): what one Claude Code permission update grants, in
+/// words, for the "always allow" confirmation — written from the update's own
+/// `type`, `mode`, `destination`, `directories` and `rules`, never from a
+/// table. `None` when the update is anything this build cannot describe
+/// faithfully (an unknown type, mode or destination, a rule that is not an
+/// allow, an empty list): the option is then keyboard-only.
+pub fn claude_update_scope(update: &Value) -> Option<String> {
+    let destination = claude_destination(update)?;
+    let list = |key: &str| -> Option<Vec<&str>> {
+        let items: Vec<&str> = update
+            .get(key)?
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<_>>()?;
+        (!items.is_empty()).then_some(items)
+    };
+    match str_field(update, "type")? {
+        "addDirectories" => Some(format!(
+            "access to {} {destination}",
+            list("directories")?.join(", ")
+        )),
+        "setMode" => {
+            let (_, words) = claude_mode(str_field(update, "mode")?)?;
+            Some(format!("switching to {words}, {destination}"))
+        }
+        "addRules" => {
+            if str_field(update, "behavior")? != "allow" {
+                return None;
+            }
+            let rules = update
+                .get("rules")?
+                .as_array()?
+                .iter()
+                .map(|rule| {
+                    let tool = str_field(rule, "toolName").filter(|t| !t.is_empty())?;
+                    Some(match str_field(rule, "ruleContent") {
+                        Some(content) => format!("{tool}({content})"),
+                        None => tool.to_string(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if rules.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{} without asking, {destination}",
+                rules.join(", ")
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Fill a Claude permission label's `{dir}` / `{mode}` placeholders from the
 /// suggestion that names it.
 fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
     let dirs = suggestion
@@ -687,24 +797,10 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
                 .join(", ")
         })
         .unwrap_or_default();
-    let rules = suggestion
-        .get("rules")
-        .and_then(Value::as_array)
-        .map(|rules| {
-            rules
-                .iter()
-                .map(|rule| {
-                    let tool = str_field(rule, "toolName").unwrap_or("");
-                    match str_field(rule, "ruleContent") {
-                        Some(content) => format!("{tool}({content})"),
-                        None => tool.to_string(),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
+    let mode = str_field(suggestion, "mode")
+        .map(|mode| claude_mode(mode).map_or(mode, |(label, _)| label))
         .unwrap_or_default();
-    template.replace("{dir}", &dirs).replace("{rule}", &rules)
+    template.replace("{dir}", &dirs).replace("{mode}", mode)
 }
 
 /// PRD #1542: the question a Claude Code `PermissionRequest` hook payload asks.
@@ -717,7 +813,8 @@ fn claude_suggestion_fill(suggestion: &Value, template: &str) -> String {
 ///   [observed on 2.1.289].
 /// - any other tool → [`QuestionKind::Permission`]: Yes, the "always" option
 ///   named by the payload's first `permission_suggestions` entry when there is
-///   one, and No; held.
+///   one — its scope written from that entry, or keyboard-only when it cannot
+///   be described — and No; held.
 ///
 /// `version` is the Claude Code version when known; the hook does not know it,
 /// and passes `None`.
@@ -815,7 +912,7 @@ pub fn claude_permission_request(
                 Some(value) => claude_suggestion_fill(value, template),
                 None => template.to_string(),
             };
-            let options = table_options(
+            let mut options = table_options(
                 tables,
                 MenuKind::Permission,
                 version,
@@ -823,6 +920,18 @@ pub fn claude_permission_request(
                 &|when| when == TableWhen::Always || Some(when) == wanted,
                 &fill,
             );
+            // The confirmation names exactly what the decision will send, or
+            // the option cannot be sent at all (audit A2).
+            let scope = suggestion_value.as_ref().and_then(claude_update_scope);
+            for option in options
+                .iter_mut()
+                .filter(|o| o.role == OptionRole::AllowAlways)
+            {
+                match &scope {
+                    Some(scope) => option.scope = Some(scope.clone()),
+                    None => option.keyboard_only = true,
+                }
+            }
             BuiltQuestion {
                 question: PendingQuestion {
                     id,
@@ -853,8 +962,10 @@ pub fn claude_permission_request(
 /// another question, or an answer it cannot map onto the payload).
 ///
 /// - Permission: allow-once → `allow`; always → `allow` with
-///   `updatedPermissions` = the payload's own `permission_suggestions`,
-///   verbatim [observed for `setMode`]; deny → `deny` with a message.
+///   `updatedPermissions` = the ONE update the option stands for, the payload's
+///   first `permission_suggestions` entry verbatim ([`claude_always_update`];
+///   [observed for `setMode`]), and nothing when [`claude_update_scope`] cannot
+///   describe it; deny → `deny` with a message.
 /// - Choice: `allow` with `updatedInput` = the payload's `tool_input` with
 ///   `answers` added — `updatedInput` REPLACES the input, so `questions` must
 ///   ride along unchanged [observed]. A single-select answer is the label, a
@@ -872,10 +983,16 @@ pub fn claude_decision(
             let role = answers.first()?.roles.first().copied()?;
             match role {
                 OptionRole::AllowOnce => serde_json::json!({"behavior": "allow"}),
-                OptionRole::AllowAlways => serde_json::json!({
-                    "behavior": "allow",
-                    "updatedPermissions": permission_suggestions.cloned().unwrap_or(Value::Array(Vec::new())),
-                }),
+                OptionRole::AllowAlways => {
+                    // Exactly the one update the option stands for, and only
+                    // one the confirmation could describe (audit A2).
+                    let update = claude_always_update(permission_suggestions)?;
+                    claude_update_scope(&update)?;
+                    serde_json::json!({
+                        "behavior": "allow",
+                        "updatedPermissions": [update],
+                    })
+                }
                 OptionRole::Deny => serde_json::json!({
                     "behavior": "deny",
                     "message": "The user declined this request.",
@@ -1641,6 +1758,140 @@ mod tests {
         assert_eq!(none.sanitized(), None);
     }
 
+    /// Scenario: Claude Code's captured Bash permission prompt carries two
+    /// suggestions — access to a directory, then accept-edits mode. The user
+    /// confirms "always allow" against the sentence the deck shows, and the
+    /// decision the hook prints grants exactly that one update and nothing the
+    /// sentence does not name; an update the deck cannot describe makes the
+    /// option keyboard-only and produces no decision.
+    #[spec("question/hold/005")]
+    #[test]
+    fn question_hold_005_always_allow_grants_exactly_what_was_confirmed() {
+        let payload: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/agent-questions/claude-permission-bash.json"
+        ))
+        .unwrap();
+        let suggestions = payload.get("permission_suggestions");
+        assert_eq!(
+            suggestions.and_then(Value::as_array).map(Vec::len),
+            Some(2),
+            "the fixture is the two-suggestion case"
+        );
+        let question = claude_permission_request(
+            "q-a2".into(),
+            "Bash",
+            payload.get("tool_input"),
+            Some("touch created_m1.txt".into()),
+            suggestions,
+            1,
+            None,
+        )
+        .question;
+        let always = question.questions[0]
+            .options
+            .iter()
+            .find(|o| o.role == OptionRole::AllowAlways)
+            .expect("an always option");
+        assert!(always.answerable());
+        let confirmed = always.scope.clone().expect("a scope to confirm");
+        let reply = QuestionReply::answered(
+            "q-a2",
+            question
+                .validate(&[answer(0, &[always.index], None)], true)
+                .unwrap(),
+        );
+        let decision = claude_decision(&question, payload.get("tool_input"), suggestions, &reply)
+            .expect("a decision");
+        let sent = decision["hookSpecificOutput"]["decision"]["updatedPermissions"]
+            .as_array()
+            .expect("updatedPermissions")
+            .clone();
+        let described: Vec<String> = sent
+            .iter()
+            .map(|u| claude_update_scope(u).expect("every update sent is describable"))
+            .collect();
+        assert_eq!(
+            described,
+            vec![confirmed.clone()],
+            "the confirmed scope is exactly what is granted"
+        );
+        assert_eq!(sent, vec![payload["permission_suggestions"][0].clone()]);
+        assert_eq!(
+            confirmed,
+            "access to /work/proj for the rest of this session"
+        );
+        assert!(
+            !serde_json::to_string(&sent)
+                .unwrap()
+                .contains("acceptEdits")
+        );
+
+        // Per-mode and per-destination wording.
+        let set_mode = |mode: &str, destination: &str| {
+            claude_update_scope(&serde_json::json!({
+                "type": "setMode", "mode": mode, "destination": destination
+            }))
+        };
+        assert_eq!(
+            set_mode("acceptEdits", "session").as_deref(),
+            Some(
+                "switching to accept-edits mode: file edits without asking, for the rest of this session"
+            )
+        );
+        assert!(
+            set_mode("bypassPermissions", "userSettings")
+                .unwrap()
+                .contains("every tool without asking, in your user settings")
+        );
+        assert_eq!(set_mode("warpSpeed", "session"), None);
+        assert_eq!(set_mode("acceptEdits", "somewhere"), None);
+        let label = |mode: &str| {
+            claude_permission_request(
+                "q-m".into(),
+                "Write",
+                None,
+                None,
+                Some(&serde_json::json!([{"type": "setMode", "mode": mode, "destination": "session"}])),
+                1,
+                None,
+            )
+            .question
+            .questions[0]
+            .options[1]
+            .clone()
+        };
+        assert_eq!(
+            label("acceptEdits").label,
+            "Yes, and switch to accept edits for this session"
+        );
+        assert_eq!(
+            label("bypassPermissions").label,
+            "Yes, and switch to bypass permissions for this session"
+        );
+
+        // An update the deck cannot describe: shown, never sendable, and no
+        // decision even if a reply claimed it.
+        let odd =
+            serde_json::json!([{"type": "replaceRules", "rules": [], "destination": "session"}]);
+        let question =
+            claude_permission_request("q-odd".into(), "Bash", None, None, Some(&odd), 1, None)
+                .question;
+        let always = &question.questions[0].options[1];
+        assert_eq!(always.role, OptionRole::AllowAlways);
+        assert!(always.keyboard_only && always.scope.is_none());
+        let forged = QuestionReply::answered(
+            "q-odd",
+            vec![ResolvedAnswer {
+                question_index: 0,
+                option_indices: vec![2],
+                labels: vec![always.label.clone()],
+                roles: vec![OptionRole::AllowAlways],
+                text: None,
+            }],
+        );
+        assert_eq!(claude_decision(&question, None, Some(&odd), &forged), None);
+    }
+
     /// Scenario: Every shape an answer can be wrong in is refused with the
     /// reason a client shows — a missing or doubled question, an option that is
     /// not there, two options on a single-select question, text where no
@@ -1757,6 +2008,7 @@ mod tests {
             AnswerRefusal::Unsupported,
             AnswerRefusal::ChannelGone,
             AnswerRefusal::WriteFailed { detail: "w".into() },
+            AnswerRefusal::KeyboardStarted,
         ] {
             let resp = crate::daemon_protocol::AttachResponse {
                 ok: false,

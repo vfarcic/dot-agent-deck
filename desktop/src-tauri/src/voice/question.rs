@@ -775,6 +775,12 @@ pub fn refusal_outcome(
             "write_failed",
             format!("Couldn't send the answer: {}.", safe_message(detail)),
         ),
+        AnswerRefusal::KeyboardStarted => (
+            "keyboard_started",
+            format!(
+                "{agent}'s prompt was typed into after it asked, so the deck won't type the answer there — finish it by keyboard."
+            ),
+        ),
         AnswerRefusal::Unknown => (
             "unknown",
             "The deck refused that answer — nothing was sent.".to_string(),

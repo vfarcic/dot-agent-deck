@@ -277,7 +277,7 @@ async fn question_state_005_a_newer_question_supersedes_and_releases_the_older()
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<BroadcastMsg>(16);
     let registry = Arc::new(AgentPtyRegistry::new());
 
-    let older = registry.question_holds().hold(PANE, "q-old");
+    let older = registry.question_holds().hold(PANE, "agent-1", "q-old").rx;
     dot_agent_deck::daemon::ingest_event(
         &state,
         &event_tx,
@@ -285,9 +285,9 @@ async fn question_state_005_a_newer_question_supersedes_and_releases_the_older()
         asking(EventType::PermissionRequest, &question("q-old", None)),
     )
     .await;
-    assert!(registry.question_holds().is_held("q-old"));
+    assert!(registry.question_holds().is_held(PANE, "q-old"));
 
-    let newer = registry.question_holds().hold(PANE, "q-new");
+    let newer = registry.question_holds().hold(PANE, "agent-1", "q-new").rx;
     dot_agent_deck::daemon::ingest_event(
         &state,
         &event_tx,
@@ -300,13 +300,13 @@ async fn question_state_005_a_newer_question_supersedes_and_releases_the_older()
     assert_eq!(released.outcome, ReplyOutcome::Released);
     assert_eq!(released.reason, Some(ReleaseReason::Superseded));
     assert_eq!(released.question_id, "q-old");
-    assert!(registry.question_holds().is_held("q-new"));
+    assert!(registry.question_holds().is_held(PANE, "q-new"));
 
     dot_agent_deck::daemon::ingest_event(&state, &event_tx, &registry, event(EventType::Idle))
         .await;
     let released = newer.await.expect("the newer hold is answered");
     assert_eq!(released.reason, Some(ReleaseReason::Cleared));
-    assert!(!registry.question_holds().is_held("q-new"));
+    assert!(!registry.question_holds().is_held(PANE, "q-new"));
 }
 
 /// Scenario: The pending question travels on the session's snapshot — what a

@@ -5046,7 +5046,7 @@ impl std::io::Write for PaneWriter {
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
 
 /// PRD #1542: the hook-socket connections producers hold open for a
-/// question's answer, keyed by question id.
+/// question's answer, keyed by the pane that raised it AND its question id.
 ///
 /// A producer — the Claude Code `PermissionRequest` hook, the OpenCode
 /// plugin's and Pi extension's `await-answer` child — sends
@@ -5057,30 +5057,47 @@ type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>
 /// pending one releases its hold ([`Self::release_pane_except`]), and a
 /// producer that dies closes the connection, which the hook loop reports by
 /// dropping the hold ([`Self::forget`]).
+///
+/// **Owned, not global (audit A5).** A question id is the producer's own
+/// (OpenCode's request id, a Codex `tool_use_id`) or minted by it, so two panes
+/// can carry the same one. A hold is therefore keyed by its pane, records the
+/// agent its provenance gate attested, and is answered only for that pane AND
+/// that agent. Each registration also gets a unique generation, and
+/// [`Self::forget`] removes a hold only when the generation matches — so a
+/// superseded handler whose connection closes late cannot drop the hold that
+/// replaced it.
 #[derive(Default)]
 pub struct HeldQuestions {
-    holds: Mutex<HashMap<String, HeldQuestion>>,
+    holds: Mutex<HashMap<(String, String), HeldQuestion>>,
+    generation: AtomicU64,
 }
 
 struct HeldQuestion {
-    pane_id: String,
+    agent_id: String,
+    generation: u64,
     tx: tokio::sync::oneshot::Sender<crate::question::QuestionReply>,
 }
 
+/// One registration in [`HeldQuestions`]: the receiver the answer arrives on,
+/// and the generation [`HeldQuestions::forget`] must name.
+pub struct QuestionHold {
+    pub generation: u64,
+    pub rx: tokio::sync::oneshot::Receiver<crate::question::QuestionReply>,
+}
+
 impl HeldQuestions {
-    /// Register a hold for `question_id` on `pane_id`. A hold already
-    /// registered under the same id is released as superseded: one question id
-    /// is one connection.
-    pub fn hold(
-        &self,
-        pane_id: &str,
-        question_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<crate::question::QuestionReply> {
+    /// Register a hold for `question_id` raised on `pane_id` by `agent_id` —
+    /// the agent the provenance gate attested, not one the event claims. A
+    /// hold already registered for the same pane and id is released as
+    /// superseded: one question is one connection.
+    pub fn hold(&self, pane_id: &str, agent_id: &str, question_id: &str) -> QuestionHold {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let previous = self.holds.lock().unwrap().insert(
-            question_id.to_string(),
+            (pane_id.to_string(), question_id.to_string()),
             HeldQuestion {
-                pane_id: pane_id.to_string(),
+                agent_id: agent_id.to_string(),
+                generation,
                 tx,
             },
         );
@@ -5090,18 +5107,46 @@ impl HeldQuestions {
                 crate::question::ReleaseReason::Superseded,
             ));
         }
-        rx
+        QuestionHold { generation, rx }
     }
 
-    /// Whether `question_id` is held.
-    pub fn is_held(&self, question_id: &str) -> bool {
-        self.holds.lock().unwrap().contains_key(question_id)
+    /// Whether `question_id` is held on `pane_id`.
+    pub fn is_held(&self, pane_id: &str, question_id: &str) -> bool {
+        self.holds
+            .lock()
+            .unwrap()
+            .contains_key(&(pane_id.to_string(), question_id.to_string()))
     }
 
-    /// Send the answer down `question_id`'s connection. `false` when nothing
-    /// holds it, or the holder has already gone.
-    pub fn answer(&self, question_id: &str, reply: crate::question::QuestionReply) -> bool {
-        let held = self.holds.lock().unwrap().remove(question_id);
+    /// How many holds are registered, across every pane.
+    pub fn len(&self) -> usize {
+        self.holds.lock().unwrap().len()
+    }
+
+    /// Whether no hold is registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Send the answer down the connection holding `question_id` on `pane_id`,
+    /// when `agent_id` is the agent that registered it. `false` when nothing
+    /// holds it, it belongs to another agent (which leaves that hold alone), or
+    /// the holder has already gone.
+    pub fn answer(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        question_id: &str,
+        reply: crate::question::QuestionReply,
+    ) -> bool {
+        let held = {
+            let mut holds = self.holds.lock().unwrap();
+            let key = (pane_id.to_string(), question_id.to_string());
+            match holds.get(&key) {
+                Some(held) if held.agent_id == agent_id => holds.remove(&key),
+                _ => None,
+            }
+        };
         held.is_some_and(|held| held.tx.send(reply).is_ok())
     }
 
@@ -5115,13 +5160,13 @@ impl HeldQuestions {
     ) -> usize {
         let released: Vec<(String, HeldQuestion)> = {
             let mut holds = self.holds.lock().unwrap();
-            let ids: Vec<String> = holds
-                .iter()
-                .filter(|(id, held)| held.pane_id == pane_id && Some(id.as_str()) != keep)
-                .map(|(id, _)| id.clone())
+            let keys: Vec<(String, String)> = holds
+                .keys()
+                .filter(|(pane, id)| pane == pane_id && Some(id.as_str()) != keep)
+                .cloned()
                 .collect();
-            ids.into_iter()
-                .filter_map(|id| holds.remove(&id).map(|held| (id, held)))
+            keys.into_iter()
+                .filter_map(|key| holds.remove(&key).map(|held| (key.1, held)))
                 .collect()
         };
         let count = released.len();
@@ -5135,19 +5180,98 @@ impl HeldQuestions {
 
     /// Release every hold — the daemon is shutting down.
     pub fn release_all(&self, reason: crate::question::ReleaseReason) {
-        let all: Vec<(String, HeldQuestion)> = self.holds.lock().unwrap().drain().collect();
-        for (id, held) in all {
+        let all: Vec<((String, String), HeldQuestion)> =
+            self.holds.lock().unwrap().drain().collect();
+        for ((_, id), held) in all {
             let _ = held
                 .tx
                 .send(crate::question::QuestionReply::released(&id, reason));
         }
     }
 
-    /// Drop `question_id`'s hold without answering: its connection closed.
+    /// Drop the hold `generation` registered for `question_id` on `pane_id`
+    /// without answering — its connection closed, or its deadline passed.
     /// Returns whether it was still held — `false` after an answer or a release
-    /// already took it.
-    pub fn forget(&self, question_id: &str) -> bool {
-        self.holds.lock().unwrap().remove(question_id).is_some()
+    /// already took it, and `false`, leaving it alone, when a later
+    /// registration replaced it.
+    pub fn forget(&self, pane_id: &str, question_id: &str, generation: u64) -> bool {
+        let mut holds = self.holds.lock().unwrap();
+        let key = (pane_id.to_string(), question_id.to_string());
+        if holds
+            .get(&key)
+            .is_some_and(|held| held.generation == generation)
+        {
+            holds.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// PRD #1542 (audit A4): what the daemon's `AnswerQuestion` handler keeps per
+/// agent so two answers can never both reach the agent.
+///
+/// - **One answer at a time per agent.** [`Self::slot`] is a lock the handler
+///   holds from its first read of the pending question to its last write, so a
+///   second client's answer waits and then re-reads a question the first one
+///   has already cleared.
+/// - **Answered once.** The slot remembers the id of the last question the
+///   deck emitted an answer for, so a question the deck answered is refused even
+///   if the event that clears it was not applied.
+/// - **When the question arrived.** [`Self::note_pending`] records, per pane,
+///   the instant the daemon first saw the pending question, so the keys channel
+///   can tell whether the user typed into the pane after it — keys typed into a
+///   prompt the keyboard has already moved on would land somewhere else.
+#[derive(Default)]
+pub struct QuestionAnswers {
+    slots: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<String>>>>>,
+    raised: Mutex<HashMap<String, (String, Instant)>>,
+}
+
+/// Slots kept before idle ones are pruned: one per agent that was ever
+/// answered, so this only matters to a very long-lived daemon.
+const QUESTION_ANSWER_SLOTS_PRUNE_AT: usize = 256;
+
+impl QuestionAnswers {
+    /// `agent_id`'s answer lock; its value is the id of the last question the
+    /// deck emitted an answer for.
+    pub fn slot(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<Option<String>>> {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.len() >= QUESTION_ANSWER_SLOTS_PRUNE_AT {
+            // An idle slot (nobody holds or waits on it) only remembers an
+            // answered id, whose question its own answer already cleared.
+            slots.retain(|_, slot| Arc::strong_count(slot) > 1);
+        }
+        Arc::clone(slots.entry(agent_id.to_string()).or_default())
+    }
+
+    /// Record that `question_id` is the question pending on `pane_id` now
+    /// (`None`: nothing is). The instant is kept from the first time an id is
+    /// seen, so a later event repeating the same question does not move it.
+    pub fn note_pending(&self, pane_id: &str, question_id: Option<&str>) {
+        let mut raised = self.raised.lock().unwrap();
+        match question_id {
+            None => {
+                raised.remove(pane_id);
+            }
+            Some(id) => {
+                if raised.get(pane_id).is_none_or(|(seen, _)| seen != id) {
+                    raised.insert(pane_id.to_string(), (id.to_string(), Instant::now()));
+                }
+            }
+        }
+    }
+
+    /// When the daemon first saw `question_id` pending on `pane_id`, or `None`
+    /// when it has no record of that question there.
+    pub fn raised_at(&self, pane_id: &str, question_id: &str) -> Option<Instant> {
+        self.raised
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .filter(|(id, _)| id == question_id)
+            .map(|(_, at)| *at)
     }
 }
 
@@ -5190,6 +5314,9 @@ pub struct AgentPtyRegistry {
     /// PRD #1542: the hook-socket connections a producer holds open for a
     /// question's answer, by question id — see [`HeldQuestions`].
     question_holds: HeldQuestions,
+    /// PRD #1542 (audit A4): per-agent answer serialization — see
+    /// [`QuestionAnswers`].
+    question_answers: QuestionAnswers,
     /// Total number of explicit `KIND_DETACH` frames the daemon has observed
     /// across all attach-stream connections. Plain socket close (implicit
     /// detach) does *not* increment this — only the M2.5 explicit-detach
@@ -6948,6 +7075,7 @@ impl AgentPtyRegistry {
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
             question_holds: HeldQuestions::default(),
+            question_answers: QuestionAnswers::default(),
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -6974,6 +7102,33 @@ impl AgentPtyRegistry {
     /// PRD #1542: the held question channels — see [`HeldQuestions`].
     pub fn question_holds(&self) -> &HeldQuestions {
         &self.question_holds
+    }
+
+    /// PRD #1542 (audit A4): per-agent answer state — see [`QuestionAnswers`].
+    pub fn question_answers(&self) -> &QuestionAnswers {
+        &self.question_answers
+    }
+
+    /// PRD #1542 (audit A4): whether a user keystroke reached `pane_id` after
+    /// the daemon first saw `question_id` pending there, and after
+    /// `deck_typed_at` — when the deck's own last answer key went in, since
+    /// those are written as user keystrokes ([`Self::write_answer_keys`]) and
+    /// move the same clock. With no record of when the question arrived, any
+    /// keystroke ever counts — the safe reading for a channel that types into
+    /// the pane; every question the daemon ingests has one.
+    pub fn user_typed_since_question(
+        &self,
+        pane_id: &str,
+        question_id: &str,
+        deck_typed_at: Option<Instant>,
+    ) -> bool {
+        let Some(typed) = self.last_user_input_at(pane_id) else {
+            return false;
+        };
+        let Some(raised) = self.question_answers.raised_at(pane_id, question_id) else {
+            return true;
+        };
+        typed >= raised && deck_typed_at.is_none_or(|deck| typed > deck)
     }
 
     /// PRD #1542: type `keys` into `agent_id`'s PTY to answer a question, with

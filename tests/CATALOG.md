@@ -6884,7 +6884,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
 - **Layer:** L1/fast unit (`src/hook.rs`, the hook CLI's event builder on a captured Claude Code 2.1.289 payload, `tests/fixtures/agent-questions/claude-permission-bash.json`).
 - **Agent:** none (captured payload).
-- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory from `permission_suggestions`) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
+- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
 - **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`.
 - **Platform coverage:** mac+linux.
 
@@ -6942,6 +6942,20 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Agent:** none (Devin is not logged in on any measured host).
 - **Asserts:** a Permission question on the keys channel with Devin's eight documented options, of which only Allow once and Deny are answerable.
 - **Does not assert:** anything about a real Devin: the table is documentation-derived and untested.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/010 — A question answered by keys leaves the hook through the provenance gate, with a plain fallback.
+- **Layer:** L1/fast unit (`src/hook.rs`, stand-in daemons on a Unix socket).
+- **Agent:** none (a captured Codex payload).
+- **Asserts:** a Codex approval is sent as an unheld `question` message (`hold: false`) for its pane, carrying the question, and the daemon's one reply line ends it; when no reply comes (an older daemon) or the gate refuses it, the event is re-sent as a plain event with no question metadata.
+- **Does not assert:** the real daemon applying it (`question/detect/011`).
+- **Platform coverage:** mac+linux.
+
+##### question/detect/011 — Bare frames can neither raise nor clear a question; attested ones can.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop on a Unix socket with an attested pane token).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a bare event carrying a question sets the status but no question; an unheld `question` message with the pane's token makes it pending and is acknowledged; a bare "answered" marker clears nothing and an attested one clears it; a message for a pane never issued a token has its question removed.
+- **Does not assert:** the hook CLI's side (`question/detect/010`).
 - **Platform coverage:** mac+linux.
 
 #### question/state
@@ -7025,6 +7039,34 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the handler's agent and id checks (`question/answer/001`).
 - **Platform coverage:** mac+linux.
 
+##### question/answer/006 — The keys channel refuses a pane the keyboard has started on.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`, questions raised through the daemon's ingest, keys read back from the stand-in's PTY echo).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** after a keystroke reaches the pane following the question, a Codex form and a Codex approval are each refused `KeyboardStarted`, nothing is typed and the question stays pending; a keystroke from before the question does not refuse it.
+- **Does not assert:** Codex's own dialog position (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/007 — Two simultaneous answers reach the agent once.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-ins for Codex and Claude Code).
+- **Asserts:** two concurrent answers to one keys question type its key once and exactly one succeeds; two to one held question deliver one reply and exactly one succeeds; a question the deck already answered is refused as stale if it reappears under the same id.
+- **Does not assert:** two separate client processes (the handler is what serialises them).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/008 — A half-typed answer leaves the question keyboard-only.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-in for Codex).
+- **Asserts:** when the user types into the pane between the first and second digit of a form's answer, the second is never typed, the refusal is `KeyboardStarted`, and the question stays pending with an `unsupported` channel, which a second answer cannot use.
+- **Does not assert:** a write failure from the PTY itself (the same branch).
+- **Platform coverage:** mac+linux.
+
+##### question/answer/009 — A deny answered by the deck does not show Thinking.
+- **Layer:** L1/fast unit (`src/daemon_protocol.rs`).
+- **Agent:** none (`/bin/cat` stand-in for Claude Code).
+- **Asserts:** a held deny reaches the holder, clears the question and leaves the card on Needs Input; the deck's broadcast event is `unknown`, names the question and is daemon-synthetic.
+- **Does not assert:** the agent's next event (the agent's own).
+- **Platform coverage:** mac+linux.
+
 #### question/desktop
 
 The desktop half of answering by voice. These tests live in the desktop crate (`desktop/src-tauri/src/voice/question_tests.rs`, run by `cargo test-fast`) and the webview (`desktop/src/components/VoiceQuestion.test.tsx`, run by `pnpm test` in `desktop/`), which linkage-check does not walk, so they are named here by test rather than as `#[spec]` IDs.
@@ -7035,13 +7077,18 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **question/desktop/004** — `question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_s`: a `not_answer` verdict leaves the utterance to ordinary command handling, which dispatches it; "no", a numbered choice's cancel phrase, is the pending question's deny option first; "cancel" calls a started answer off.
 - **question/desktop/005** — vitest `question/desktop/005: always allow is sent only after a confirmation naming its scope`: "always" opens the confirmation and starts no countdown; Cancel sends nothing; Confirm, by click or by saying "confirm", starts the five-second countdown and the send asserts `confirmedAlways`.
 - **question/desktop/006** — vitest `question/desktop/006: …` (three tests): the countdown is called off, with nothing sent, when the pending question's id changes; `questionLost` names each reason (question, pane, replaced, confirmation, deck); every outcome the deck can send back, each refusal and the withheld case included, is what the row says; a non-answer goes on to the command resolver. The Rust side of the sentences is `question_desktop_every_refusal_has_its_sentence`.
+- **question/desktop/007** — `question_desktop_007_the_model_s_choice_must_be_grounded_in_what_was_said` (audit A1): a model answer selecting Allow once for an unrelated utterance, for a "no", citing words the user never said, or citing nothing, is refused and arms nothing; free text not spoken is refused, and spoken free text is taken as the transcript's own words.
+- **question/desktop/008** — vitest `question/desktop/008: a bare yes does not confirm always allow`: with the always-allow confirmation open, "yes", "sure", "ok" and "yes please" leave it open and say to say "confirm", and no countdown starts; "always allow" said again confirms it.
+- **question/desktop/009** — vitest `question/desktop/009: speaking stops the answer countdown before the words are worked out` (audit A3): speech a second before the countdown ends stops it at once, with transcription and resolution stalled far past the end; a resolver error and a refusal leave it stopped; only a fresh complete answer re-arms it.
+- **question/desktop/010** — vitest `question/desktop/010: an answer needs the agent's terminal on screen` (audit A7): over a hidden terminal "yes" is an ordinary command and no question is resolved; hiding the terminal mid-countdown calls it off with nothing sent; `questionLost` reports `hidden`.
+- **question/desktop/011** — `question_desktop_011_a_cancelled_lease_writes_no_frame` (`voice/lease.rs`) and vitest `question/desktop/011: …` (audit A8): a lease cancelled while the send is stalled writes no frame; a cancel arriving before its send kills it; one after the write is reported too late; the panel keeps the form with its Cancel while sending, cancels the lease on a pane change, and always reports the outcome.
 
 #### question/hold
 
 ##### question/hold/001 — The held Claude Code hook prints exactly the decision for its own question.
 - **Layer:** L1/fast unit (`src/hook.rs`, a one-shot stand-in daemon on a Unix socket).
 - **Agent:** none (captured payloads).
-- **Asserts:** the hook sends a held `question` message for its pane; allow once prints `allow`; always prints `allow` with the payload's own `permission_suggestions` as `updatedPermissions`; deny prints `deny`; a form prints `allow` with `updatedInput` = the payload's questions unchanged plus `answers` (a label, an array for the multi-select question, or the typed text).
+- **Asserts:** the hook sends a held `question` message for its pane; allow once prints `allow`; always prints `allow` with the payload's first `permission_suggestions` entry, alone, as `updatedPermissions`; deny prints `deny`; a form prints `allow` with `updatedInput` = the payload's questions unchanged plus `answers` (a label, an array for the multi-select question, or the typed text).
 - **Does not assert:** Claude Code acting on the decision (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
@@ -7064,6 +7111,41 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Agent:** none (`/bin/sh` stand-in).
 - **Asserts:** when a producer holding a question closes its connection without an answer, the daemon broadcasts an event carrying `question_resolved_id` and its own release marker; a client applying the broadcast drops the question and keeps Needs Input, as the daemon does; the frame's `event_type` is `unknown`, which an older client reads as a no-op.
 - **Does not assert:** the desktop's projection of the snapshot (`question/desktop/001`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/005 — Always allow grants exactly what the confirmation names.
+- **Layer:** L1/fast unit (`src/question.rs`, the captured two-suggestion Bash payload).
+- **Agent:** none (captured payloads).
+- **Asserts:** the always option's scope describes the first suggestion, with its `session` destination, and the decision's `updatedPermissions` is that one update, whose own description equals the confirmed scope — the later `setMode` is not sent; per-mode and per-destination wording; an update the deck cannot describe makes the option keyboard-only and produces no decision.
+- **Does not assert:** Claude Code applying the update (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/006 — Identical question ids on two panes stay apart.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook loop with two attested panes).
+- **Agent:** none (`/bin/sh` stand-ins).
+- **Asserts:** answering one agent's question reaches only the producer on its pane; the other pane's producer hears nothing and stays held; a hold is never answered for an agent that did not register it.
+- **Does not assert:** OpenCode or Codex reusing an id (both producers here are stand-ins).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/007 — A superseded handler cannot drop its replacement.
+- **Layer:** L1/fast unit (`src/daemon.rs`).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a second registration for the same pane and question releases the first producer as superseded; the first registration letting go late leaves the replacement held and the question pending, and the answer reaches the replacement.
+- **Does not assert:** the timing of a real producer's close.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/008 — Held questions never starve the hook pool.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with its connection cap cut to two, then its hold budget cut to one).
+- **Agent:** none (`/bin/sh` stand-ins).
+- **Asserts:** with three questions held on a two-slot pool, a completion hook still gets in, clears the first question and releases its producer; past the hold budget a question is not held, its producer is released at once and the card still reads Needs Input.
+- **Does not assert:** the production numbers (32 and 64).
+- **Platform coverage:** mac+linux.
+
+##### question/hold/009 — The daemon releases a hold at its deadline.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with a short hold deadline).
+- **Agent:** none (`/bin/sh` stand-in).
+- **Asserts:** a producer that never lets go is released at the deadline, the question is dropped, and a daemon-synthetic release naming it is broadcast.
+- **Does not assert:** the production deadline.
 - **Platform coverage:** mac+linux.
 
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]

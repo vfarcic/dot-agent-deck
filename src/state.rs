@@ -10555,6 +10555,31 @@ impl AppState {
         cleared
     }
 
+    /// PRD #1542 (audit A4): the deck typed part of `question_id`'s answer on
+    /// `pane_id` and could not finish, so the agent's prompt has moved past
+    /// what the stored question describes. It stays pending — the agent is
+    /// still waiting — but its channel becomes `Unsupported`, so every client
+    /// offers it to the keyboard only. Returns whether a question was marked.
+    pub fn mark_pending_question_keyboard_only(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+    ) -> bool {
+        let mut marked = false;
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id)
+                && let Some(question) = session
+                    .pending_question
+                    .as_mut()
+                    .filter(|q| q.id == question_id)
+            {
+                question.channel = crate::question::AnswerChannel::Unsupported;
+                marked = true;
+            }
+        }
+        marked
+    }
+
     /// [`Self::live_session_for`] over a whole `ListAgents` reply, writing each
     /// answer onto its record's `live` field.
     ///
@@ -15174,10 +15199,11 @@ impl AppState {
                 asserted
             }
             EventType::Unknown => {
-                // Forward-compat catch-all — informational at most. Its one
-                // emitter in this build is the daemon's question release
-                // (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`), which relies on
-                // exactly this: no status change.
+                // Forward-compat catch-all — informational at most. Its two
+                // emitters in this build are the daemon's question release
+                // (`QUESTION_RELEASED_BY_DECK_METADATA_KEY`) and its answer to
+                // a question with a deny (`QUESTION_ANSWERED_BY_DECK_METADATA_KEY`),
+                // which rely on exactly this: no status change.
                 false
             }
             EventType::SessionEnd => unreachable!(),

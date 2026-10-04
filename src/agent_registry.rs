@@ -297,7 +297,7 @@ pub enum TableWhen {
 
 #[derive(Debug)]
 pub struct TableOption {
-    /// The on-screen label. `{dir}`, `{rule}`, `{detail}` and `{patterns}` are
+    /// The on-screen label. `{dir}`, `{mode}`, `{detail}` and `{patterns}` are
     /// filled from the payload.
     pub label: &'static str,
     pub role: crate::question::OptionRole,
@@ -357,35 +357,42 @@ pub static CLAUDE_CODE_QUESTIONS: QuestionTables = QuestionTables {
             menu: MenuKind::Permission,
             options: &[
                 table_option("Yes", AllowOnce, None),
+                // The "always" options carry no `scope` here: what "always"
+                // grants is the permission update the hook sends, so the
+                // producer writes the confirmation's sentence from that update
+                // itself (`crate::question::claude_update_scope`) and makes
+                // the option keyboard-only when it cannot describe it.
+                //
+                // The labels are Claude Code's own on-screen text, kept short
+                // on purpose: the `setMode` label drops the two parentheticals
+                // Claude draws ("(auto-approve file edits and common file
+                // commands)" and the "(shift+tab)" key hint) [observed text in
+                // PRD #1542 follow-up b], which are hints rather than what the
+                // option is. Claude draws "from this project" beside an
+                // `addDirectories` suggestion whose destination is `session`
+                // [observed]; the label keeps Claude's words and the
+                // confirmation says what is actually sent.
                 when(
-                    scoped(
-                        table_option(
-                            "Yes, and always allow access to {dir} from this project",
-                            AllowAlways,
-                            None,
-                        ),
-                        "access to {dir} from this project",
+                    table_option(
+                        "Yes, and always allow access to {dir} from this project",
+                        AllowAlways,
+                        None,
                     ),
                     TableWhen::SuggestionAddDirectories,
                 ),
+                // `{mode}` is filled per mode; only "accept edits" was seen.
                 when(
-                    scoped(
-                        table_option(
-                            "Yes, and switch to accept edits for this session",
-                            AllowAlways,
-                            None,
-                        ),
-                        "file edits for the rest of this session (accept-edits mode)",
+                    table_option(
+                        "Yes, and switch to {mode} for this session",
+                        AllowAlways,
+                        None,
                     ),
                     TableWhen::SuggestionSetMode,
                 ),
                 // Label and index unverified: M1 saw only the two suggestion
                 // kinds above.
                 when(
-                    scoped(
-                        table_option("Yes, and don't ask again", AllowAlways, None),
-                        "{rule}",
-                    ),
+                    table_option("Yes, and don't ask again", AllowAlways, None),
                     TableWhen::SuggestionOther,
                 ),
                 table_option("No", Deny, None),

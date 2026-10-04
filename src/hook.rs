@@ -192,6 +192,14 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // PRD #1542 (audit A9): a frame that raises or clears a question goes
+    // through the daemon's provenance gate as an unheld `question` message —
+    // a bare event carrying either is applied as a plain status.
+    if carries_question_metadata(&event) {
+        send_question_unheld_at(&client_socket_path(), event, UNHELD_QUESTION_WAIT);
+        return ExitCode::SUCCESS;
+    }
+
     let json = match serde_json::to_string(&event) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
@@ -201,8 +209,75 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How long a hook waits for the daemon to acknowledge an unheld question. A
+/// daemon that knows the message answers as soon as it has applied it; this
+/// bound is what an OLDER daemon, which logs the message malformed and never
+/// answers, costs before the hook falls back to a plain event. Kept short
+/// because Codex draws its approval prompt only after its `PermissionRequest`
+/// hook exits [observed on 0.160.0].
+const UNHELD_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `event` raises a question or reports one answered — the metadata
+/// the daemon accepts only from a message its provenance gate attested.
+fn carries_question_metadata(event: &AgentEvent) -> bool {
+    event
+        .metadata
+        .contains_key(crate::event::QUESTION_METADATA_KEY)
+        || event
+            .metadata
+            .contains_key(crate::event::QUESTION_RESOLVED_METADATA_KEY)
+}
+
+/// What [`send_question_unheld_at`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum UnheldSend {
+    /// The daemon applied it through the provenance gate.
+    Attested,
+    /// Refused by the gate, or no daemon answered (an older daemon, or none):
+    /// sent again as a plain event without its question metadata, so the
+    /// status still lands exactly as it did before the deck knew questions.
+    Plain,
+}
+
+/// PRD #1542 (audit A9): send `event` — a question the deck answers by keys
+/// (Codex, Devin, Claude Code's plan approval) or an agent's own "answered"
+/// report (OpenCode's `permission.replied` / `question.replied` /
+/// `question.rejected`) — as an unheld `question` message carrying this pane's
+/// hook token, and wait up to `wait` for the daemon's one reply line.
+fn send_question_unheld_at(
+    path: &std::path::Path,
+    mut event: AgentEvent,
+    wait: std::time::Duration,
+) -> UnheldSend {
+    if let Some(pane_id) = event.pane_id.clone() {
+        let signal = crate::event::DaemonMessage::Question(crate::event::QuestionSignal {
+            pane_id,
+            token: crate::hook_provenance::token_from_env(),
+            event: event.clone(),
+            hold: false,
+        });
+        if let Ok(json) = serde_json::to_string(&signal)
+            && let (SocketReply::Line(line), _) =
+                request_from_socket_at_detailed_with(path, &json, Some(wait), true)
+            && let Ok(reply) = serde_json::from_str::<crate::question::QuestionReply>(&line)
+            && !reply.refused()
+        {
+            return UnheldSend::Attested;
+        }
+    }
+    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+    event
+        .metadata
+        .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
+    if let Ok(json) = serde_json::to_string(&event) {
+        let _ = send_to_socket_at(path, &json);
+    }
+    UnheldSend::Plain
+}
+
 /// PRD #1542: how long a held Claude Code `PermissionRequest` hook waits for
-/// the daemon — 30 s inside the `timeout` the deck installs the hook with
+/// the daemon — 3570 s, ending 30 s BEFORE the 3600 s `timeout` the deck
+/// installs the hook with
 /// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`]), so the hook
 /// exits on its own before Claude Code cancels it. Either way Claude Code then
 /// behaves as if there were no hook, and its dialog, on screen all along, is
@@ -4148,9 +4223,11 @@ mod question_tests {
                 OptionRole::Deny
             ]
         );
+        // The confirmation says what is sent: the suggestion's destination
+        // is `session`, whatever Claude's own label says.
         assert_eq!(
             q.questions[0].options[1].scope.as_deref(),
-            Some("access to /work/proj from this project")
+            Some("access to /work/proj for the rest of this session")
         );
         let tool = q.tool.as_ref().unwrap();
         assert_eq!(tool.name, "Bash");
@@ -4525,6 +4602,89 @@ mod question_tests {
         (dir, path, handle)
     }
 
+    /// Scenario: A Codex approval — answered by keys, so the hook does not
+    /// wait for it — leaves the hook as a `question` message that is not held,
+    /// carrying the pane's hook token, and the daemon's acknowledgement ends
+    /// it. When the daemon answers nothing (an older daemon) or refuses the
+    /// token, the hook sends the event again as a plain one with no question
+    /// in it, so the card still reads Needs Input.
+    #[cfg(unix)]
+    #[spec("question/detect/010")]
+    #[test]
+    fn question_detect_010_unheld_questions_go_through_the_provenance_gate() {
+        let mut event = event_for(AgentType::Codex, &fixture("codex-permission-request.json"));
+        event.pane_id = Some("pane-unheld".into());
+        assert!(carries_question_metadata(&event));
+        let ack =
+            crate::question::QuestionReply::released("x", crate::question::ReleaseReason::NotHeld);
+        let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&ack).unwrap()));
+        assert_eq!(
+            send_question_unheld_at(&path, event.clone(), std::time::Duration::from_secs(10)),
+            UnheldSend::Attested
+        );
+        let sent: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(sent["message_type"], "question");
+        assert_eq!(sent["hold"], false);
+        assert_eq!(sent["pane_id"], "pane-unheld");
+        assert!(sent["event"]["metadata"][crate::event::QUESTION_METADATA_KEY].is_string());
+
+        // An older daemon: it reads the line and answers nothing. The fallback
+        // is a plain event on a second connection, without the question.
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream)
+                    .read_line(&mut line)
+                    .unwrap();
+                lines.push(line);
+            }
+            lines
+        });
+        assert_eq!(
+            send_question_unheld_at(&path, event.clone(), std::time::Duration::from_millis(300)),
+            UnheldSend::Plain
+        );
+        let lines = server.join().unwrap();
+        let plain: AgentEvent = serde_json::from_str(lines[1].trim()).unwrap();
+        assert_eq!(plain.event_type, EventType::PermissionRequest);
+        assert!(!carries_question_metadata(&plain));
+
+        // A refusal from the provenance gate: the same fallback.
+        let refused =
+            crate::question::QuestionReply::released("x", crate::question::ReleaseReason::Refused);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let reply = serde_json::to_string(&refused).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for i in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if i == 0 {
+                    let _ = writeln!(reader.into_inner(), "{reply}");
+                }
+                lines.push(line);
+            }
+            lines
+        });
+        assert_eq!(
+            send_question_unheld_at(&path, event, std::time::Duration::from_secs(10)),
+            UnheldSend::Plain
+        );
+        let lines = server.join().unwrap();
+        let plain: AgentEvent = serde_json::from_str(lines[1].trim()).unwrap();
+        assert!(!carries_question_metadata(&plain));
+    }
+
     fn held_event(payload: &Value) -> (AgentEvent, PendingQuestion) {
         let mut event = event_for(AgentType::ClaudeCode, payload);
         event.pane_id = Some("pane-held".into());
@@ -4553,7 +4713,7 @@ mod question_tests {
     /// Scenario: A held Claude Code permission hook sends its question to a
     /// stand-in daemon as a held `question` message and turns each answer into
     /// exactly the decision Claude Code takes: allow; allow with the payload's
-    /// own suggestions as `updatedPermissions`; deny; and, for a form, allow
+    /// first suggestion as `updatedPermissions`; deny; and, for a form, allow
     /// with `updatedInput` carrying the payload's questions unchanged plus the
     /// answers — a label, an array of labels for the multi-select question, or
     /// the typed text.
@@ -4588,7 +4748,8 @@ mod question_tests {
         let always = decision(&[(0, &[2], None)]);
         assert_eq!(
             always["hookSpecificOutput"]["decision"]["updatedPermissions"],
-            payload["permission_suggestions"]
+            serde_json::json!([payload["permission_suggestions"][0]]),
+            "only the update the option stands for"
         );
         let deny = decision(&[(0, &[3], None)]);
         assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
