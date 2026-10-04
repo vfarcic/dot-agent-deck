@@ -4427,7 +4427,8 @@ mod tests {
     #[cfg(unix)]
     impl RealDeck {
         fn start(tag: &str) -> Self {
-            use dot_agent_deck::daemon_protocol::serve_attach;
+            use dot_agent_deck::daemon_protocol::serve_attach_with_counter;
+            use dot_agent_deck::last_command::{LAST_COMMAND_FILE, LastCommandStore};
             let (dir, socket) = scratch_socket(tag);
             let registry = Arc::new(dot_agent_deck::agent_pty::AgentPtyRegistry::new());
             // The initial receiver is dropped immediately: a broadcast channel
@@ -4436,11 +4437,30 @@ mod tests {
             let (events, _initial) = tokio::sync::broadcast::channel(64);
             let listener = crate::test_listener::bind_owner_only(&socket)
                 .expect("bind the real attach socket");
+            // Issue #1540: this deck's last command, kept in a store under its
+            // own scratch directory — the production daemon loads one from its
+            // state directory in `run_daemon_with`, and a deck that advertises
+            // `last-command` with no store would record nothing.
+            let mut app_state = dot_agent_deck::state::AppState::default();
+            app_state.set_last_command_store(Arc::new(LastCommandStore::load(
+                dir.join("state").join(LAST_COMMAND_FILE),
+            )));
             let server = {
                 let registry = Arc::clone(&registry);
                 let events = events.clone();
                 tokio::spawn(async move {
-                    let _ = serve_attach(listener, registry, events).await;
+                    let _ = serve_attach_with_counter(
+                        listener,
+                        registry,
+                        events,
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(tokio::sync::RwLock::new(app_state)),
+                        None,
+                        Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier()),
+                        dot_agent_deck::spawn::new_reuse_registry(),
+                        dot_agent_deck::issue_dispatch_run::new_worktree_registry(),
+                    )
+                    .await;
                 })
             };
             Self {
@@ -6028,6 +6048,305 @@ mod tests {
             );
         }
         assert_eq!(refused, 0, "nothing was sent to the older deck");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1540 — the New agent dialog's last command is the deck's own.
+    // -----------------------------------------------------------------------
+
+    /// A deck from the release before issue #1540: it starts agents and answers
+    /// the New agent options, but does not advertise `last-command`, so it
+    /// keeps no last command and answers none. Every request after the
+    /// handshake is kept, so a test can read what the app sent it. A start
+    /// whose `display_name` is [`PreLastCommandDeck::REFUSED_NAME`] is refused.
+    #[cfg(unix)]
+    struct PreLastCommandDeck {
+        dir: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl PreLastCommandDeck {
+        const REFUSED_NAME: &'static str = "i1540-refused";
+
+        fn start(tag: &str) -> Self {
+            use dot_agent_deck::daemon_protocol::{
+                CAP_LAST_COMMAND, DAEMON_CAPABILITIES, KIND_REQ, KIND_RESP, read_frame, write_frame,
+            };
+            use dot_agent_deck::new_agent_options::NewAgentOptions;
+            let (dir, socket) = scratch_socket(tag);
+            let listener =
+                tokio::net::UnixListener::bind(&socket).expect("bind the pre-#1540 deck");
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let server = {
+                let requests = Arc::clone(&requests);
+                tokio::spawn(async move {
+                    let mut minted = 0u32;
+                    while let Ok((stream, _peer)) = listener.accept().await {
+                        let (mut reader, mut writer) = stream.into_split();
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut reader).await else {
+                            continue;
+                        };
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&payload).unwrap_or_default();
+                        let response = match request["op"].as_str() {
+                            Some("hello") => {
+                                let mut reply = AttachResponse::hello(PROTOCOL_VERSION)
+                                    .with_running_agents(RunningAgentsSummary::default());
+                                reply.capabilities = Some(
+                                    DAEMON_CAPABILITIES
+                                        .iter()
+                                        .filter(|cap| **cap != CAP_LAST_COMMAND)
+                                        .map(|cap| (*cap).to_string())
+                                        .collect(),
+                                );
+                                reply
+                            }
+                            Some("start-agent")
+                                if request["display_name"] == Self::REFUSED_NAME =>
+                            {
+                                AttachResponse::err("start-agent: refused by the fixture")
+                            }
+                            Some("start-agent") => {
+                                minted += 1;
+                                AttachResponse::with_id(format!("pre-1540-{minted}"))
+                            }
+                            Some("new-agent-options") => {
+                                let mut reply = AttachResponse::ok();
+                                reply.new_agent_options = Some(NewAgentOptions {
+                                    default_command: None,
+                                    default_dir: None,
+                                    agents: Vec::new(),
+                                    experimental: false,
+                                    authoring_kinds: vec!["schedule".into()],
+                                    last_command: None,
+                                });
+                                reply
+                            }
+                            _ => AttachResponse::err("malformed request: unknown variant"),
+                        };
+                        if request["op"] != "hello" {
+                            requests
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(request);
+                        }
+                        let encoded = serde_json::to_vec(&response).expect("serialize the reply");
+                        let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+                    }
+                })
+            };
+            Self {
+                dir,
+                socket,
+                requests,
+                server,
+            }
+        }
+
+        fn requests(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn shutdown(self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The last command the New agent dialog would pre-fill for `deck_wire`,
+    /// whichever shape of options the deck answered.
+    #[cfg(unix)]
+    async fn dialog_last_command(
+        state: &crate::terminal::DesktopState,
+        deck_wire: &str,
+    ) -> Option<String> {
+        match crate::new_agent_options_on(state, deck_wire)
+            .await
+            .expect("the deck answers its options")
+        {
+            crate::dto::DesktopNewAgentOptions::Deck { last_command, .. }
+            | crate::dto::DesktopNewAgentOptions::Unsupported { last_command, .. } => last_command,
+        }
+    }
+
+    /// Scenario: two real, current daemons under **All Decks** — the local
+    /// deck and a remote row routed to the second. The dialog starts `cat -u`
+    /// on the remote deck and `cat -e` on the local one. Each deck's options
+    /// then carry its own command, and this app holds no copy of either. A
+    /// second app state over the same two decks — the app restarted — is
+    /// offered the same two commands, each for its own deck.
+    ///
+    /// **What it fails against.** A dialog that still read the app's in-memory
+    /// value would offer nothing after the restart; one that recorded it
+    /// client-side as well would hold a copy; a value kept globally would
+    /// offer one deck's command for the other.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_keeps_the_last_command_offers_its_own_and_the_app_keeps_no_copy() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1540-keep-local");
+        let remote = RealDeck::start("i1540-keep-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let route = remote.endpoint.as_local().expect("local socket").path();
+        let state = crate::terminal::DesktopState::default();
+        state.tunnels.insert_route(&remote_endpoint, route).await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let on_remote = crate::start_agent_action(
+            &state,
+            &remote_wire,
+            crate::StartAgentRequest {
+                command: Some("cat -u".into()),
+                ..plain_start("i1540-remote")
+            },
+        )
+        .await;
+        let on_local = crate::start_agent_action(
+            &state,
+            &local_wire,
+            crate::StartAgentRequest {
+                command: Some("cat -e".into()),
+                ..plain_start("i1540-local")
+            },
+        )
+        .await;
+        let remote_offer = dialog_last_command(&state, &remote_wire).await;
+        let local_offer = dialog_last_command(&state, &local_wire).await;
+        let app_copies = (
+            state.last_command(&remote_endpoint.identity()),
+            state.last_command(&local.endpoint.identity()),
+        );
+        let restarted = crate::terminal::DesktopState::default();
+        restarted
+            .tunnels
+            .insert_route(&remote_endpoint, route)
+            .await;
+        let remote_after_restart = dialog_last_command(&restarted, &remote_wire).await;
+        let local_after_restart = dialog_last_command(&restarted, &local_wire).await;
+
+        local.shutdown();
+        remote.shutdown();
+
+        on_remote.expect("fixture: the remote deck accepts the start");
+        on_local.expect("fixture: the local deck accepts the start");
+        assert_eq!(
+            remote_offer.as_deref(),
+            Some("cat -u"),
+            "the remote deck's own"
+        );
+        assert_eq!(
+            local_offer.as_deref(),
+            Some("cat -e"),
+            "the local deck's own"
+        );
+        assert_eq!(
+            app_copies,
+            (None, None),
+            "a deck that keeps the last command leaves the app nothing to keep"
+        );
+        assert_eq!(remote_after_restart.as_deref(), Some("cat -u"));
+        assert_eq!(local_after_restart.as_deref(), Some("cat -e"));
+    }
+
+    /// Scenario: under **All Decks**, the remote row is a deck from before
+    /// issue #1540 and the local deck is a current real daemon. The dialog
+    /// starts `codex --model gpt-5.6-sol` on the older deck, then a start
+    /// there that the deck refuses. The older deck's options carry the
+    /// accepted command from this app's memory — the refused one recorded
+    /// nothing — and no start sent it was marked as a form start. The local
+    /// deck, where nothing was started, is offered nothing, and an app
+    /// restarted over the older deck is offered nothing either, because that
+    /// value lived only in the app's memory.
+    ///
+    /// **What it fails against.** A dialog that read the older deck's answer
+    /// for the value would offer nothing; one that recorded before the deck
+    /// answered would offer the refused command; a value kept globally would
+    /// offer the older deck's command on the local deck.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_deck_that_does_not_keep_the_last_command_falls_back_to_the_apps_memory_per_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("i1540-old-local");
+        let older = PreLastCommandDeck::start("i1540-old-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("old-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_wire = deck_wire_id(&remote_endpoint);
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let accepted = crate::start_agent_action(
+            &state,
+            &older_wire,
+            crate::StartAgentRequest {
+                command: Some("codex --model gpt-5.6-sol".into()),
+                ..plain_start("i1540-accepted")
+            },
+        )
+        .await;
+        let refused = crate::start_agent_action(
+            &state,
+            &older_wire,
+            crate::StartAgentRequest {
+                command: Some("claude".into()),
+                ..plain_start(PreLastCommandDeck::REFUSED_NAME)
+            },
+        )
+        .await;
+        let older_offer = dialog_last_command(&state, &older_wire).await;
+        let local_offer = dialog_last_command(&state, &local_wire).await;
+        let restarted = crate::terminal::DesktopState::default();
+        restarted
+            .tunnels
+            .insert_route(&remote_endpoint, &older.socket)
+            .await;
+        let older_after_restart = dialog_last_command(&restarted, &older_wire).await;
+        let sent = older.requests();
+
+        local.shutdown();
+        older.shutdown();
+
+        accepted.expect("fixture: the older deck accepts the first start");
+        assert!(
+            refused.is_err(),
+            "fixture: the older deck refuses the second start"
+        );
+        assert_eq!(
+            older_offer.as_deref(),
+            Some("codex --model gpt-5.6-sol"),
+            "the accepted command, from the app's memory; the refused one recorded nothing"
+        );
+        assert_eq!(local_offer, None, "never another deck's command");
+        assert_eq!(
+            older_after_restart, None,
+            "the in-memory value goes with the app"
+        );
+        let starts: Vec<_> = sent
+            .iter()
+            .filter(|request| request["op"] == "start-agent")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "both starts reached the older deck: {sent:?}"
+        );
+        for start in starts {
+            assert!(
+                start.get("remember_command").is_none(),
+                "no start is marked for a deck that did not advertise it: {start}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

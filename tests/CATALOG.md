@@ -1845,6 +1845,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** genuine agent interaction or the announced-agent readiness gate.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/020 — The last command submitted through one TUI's New Agent form is offered by an independent TUI on the same daemon (issue #1540).
+- **Layer:** L2 PTY-attached, lane 1 (`e2e`, Unix).
+- **Agent:** none (a shell prints a sentinel and runs `cat`, with no LLM).
+- **Asserts:** the first form starts blank and its accepted command visibly runs; after detaching without reopening that form, an independent TUI with a different HOME and an empty `DOT_AGENT_DECK_SESSION` pre-fills the same command in its first form, before the originating client's session can seed the daemon on a form reopen. The surviving named pane confirms both clients use the same daemon. No `default_command` is configured.
+- **Does not assert:** desktop dialog wiring, daemon restart persistence, migration, older-daemon fallback, or isolation between different daemons.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard

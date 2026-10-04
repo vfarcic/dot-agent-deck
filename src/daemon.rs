@@ -802,6 +802,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             .await
             .set_agent_ownership(Arc::downgrade(&ownership));
     }
+    // Issue #1540: the deck's last New-agent-form command, loaded from this
+    // daemon's state directory so it survives a restart. A missing or bad file
+    // loads as "none" and never stops the daemon; see `crate::last_command`.
+    // Read synchronously, like `schedules.toml` below: one small, bounded,
+    // `O_NONBLOCK` read before the daemon serves anything.
+    {
+        let store = crate::last_command::LastCommandStore::load(
+            crate::last_command::LastCommandStore::default_path(),
+        );
+        state.write().await.set_last_command_store(Arc::new(store));
+    }
     let event_tx = daemon.event_tx;
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line

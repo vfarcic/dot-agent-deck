@@ -1435,6 +1435,11 @@ pub struct AppState {
     /// tests, where [`Self::managed_pane_ids`] alone decides. See
     /// [`AgentOwnership`] and [`Self::apply_event`].
     agent_ownership: Option<AgentOwnershipOracle>,
+    /// Issue #1540: the deck's last New-agent-form command, installed once at
+    /// daemon start ([`Self::set_last_command_store`]). `None` in the TUI and in
+    /// unit tests that do not install one, where the daemon dispatch records
+    /// nothing and answers no `last_command`.
+    last_command_store: Option<Arc<crate::last_command::LastCommandStore>>,
     /// Panes whose CURRENT [`SessionState::status`] was last written by an
     /// event carrying no `agent_id` — i.e. by a producer that named no
     /// generation (issue #398, Greptile PR #443 finding #2).
@@ -10486,6 +10491,18 @@ impl AppState {
     /// close, and what that cycle costs.
     pub fn set_agent_ownership(&mut self, ownership: Weak<dyn AgentOwnership>) {
         self.agent_ownership = Some(AgentOwnershipOracle(ownership));
+    }
+
+    /// Issue #1540: install the daemon's last-command store. Called once, by
+    /// [`crate::daemon::run_daemon_with`] after loading it from the daemon's
+    /// state directory; a test installs one over a temp directory.
+    pub fn set_last_command_store(&mut self, store: Arc<crate::last_command::LastCommandStore>) {
+        self.last_command_store = Some(store);
+    }
+
+    /// Issue #1540: the daemon's last-command store, if one is installed.
+    pub fn last_command_store(&self) -> Option<Arc<crate::last_command::LastCommandStore>> {
+        self.last_command_store.clone()
     }
 
     /// Issue #454: may an event naming `(pane_id, agent_id)` drive this state?
