@@ -137,6 +137,7 @@ fn agent_event_003_headless_pi_status_no_hook_no_settings_mutation() {
             agent_type: Some(AgentType::Pi),
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(
