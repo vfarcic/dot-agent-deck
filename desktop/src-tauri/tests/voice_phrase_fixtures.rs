@@ -52,10 +52,11 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice, VoiceDirectories,
-    VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
+    NO_MATCH_ACTION, ParamKind, REMOTE_TIMEOUT, Screen, Transcript, VoiceChoice,
+    VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm,
+    VoiceOutcome,
     dictation::normalise,
-    handle_utterance_with,
+    handle_utterance_with_dictation,
     schema::DECK_HIDDEN_HINT,
     table,
     test_support::{
@@ -179,6 +180,12 @@ struct PhraseFixture {
     resolved_command: Option<String>,
     #[serde(default)]
     pending_action: bool,
+    /// PRD #1541 — run the utterance with typing mode on for the planted
+    /// tester's pane (`handle_utterance_with_dictation`), where nothing reaches
+    /// the model. Absent means `Idle`, which is every fixture that predates it.
+    /// Agent screen only, since typing mode lives there.
+    #[serde(default)]
+    typing_mode: bool,
     /// The candidate values a `param_ambiguous` fixture must offer as a
     /// numbered choice (PRD #1261), compared as a set: the order is the
     /// resolver's and is pinned by the unit tests, while what a fixture can
@@ -539,6 +546,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             fixture.name,
             fixture.screen
         );
+        if fixture.typing_mode {
+            assert_eq!(
+                fixture.screen, "agent",
+                "{}: typing mode lives on the agent screen",
+                fixture.name
+            );
+        }
         if fixture.deck_hidden {
             assert_eq!(
                 fixture.screen, "overview",
@@ -698,9 +712,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
         } else {
             None
         };
+        let typing_target = VoiceDictationTarget {
+            deck_id: "deck-local".to_string(),
+            agent_id: "agent-tester".to_string(),
+        };
         let resolved = tokio::time::timeout(
             REMOTE_TIMEOUT + PER_FIXTURE_GRACE,
-            handle_utterance_with(
+            handle_utterance_with_dictation(
                 resolver.as_ref(),
                 table(),
                 screen,
@@ -708,6 +726,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 &decks,
                 fixture_directories,
                 fixture_new_agent,
+                fixture.typing_mode.then_some(&typing_target),
                 transcript,
                 Default::default(),
                 !fixture.deck_hidden,

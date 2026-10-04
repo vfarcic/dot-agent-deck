@@ -1563,6 +1563,7 @@ impl DaemonClient {
                     // filled one in from its own table would be reinstating the
                     // derivation this field exists to remove.
                     cli_name: None,
+                    prompt_keys: None,
                     crashed: None,
                     orchestrator_context_path: None,
                 })
@@ -6219,6 +6220,7 @@ start = true
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -6283,6 +6285,7 @@ start = true
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -6310,6 +6313,7 @@ start = true
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };

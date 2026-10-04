@@ -410,7 +410,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
   const voiceCancel = useCallback(() => bridge.voiceCancel(), [bridge]);
 
-  const sendTerminalInput = useCallback((target: AgentTarget, data: string) => bridge.sendTerminalInput(target, data), [bridge]);
+  const sendTerminalInput = useCallback((target: AgentTarget, data: string, precondition?: () => boolean) => bridge.sendTerminalInput(target, data, precondition), [bridge]);
   const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
   // Stable for the lifetime of the bridge, because the screens declare their
   // shown set from an effect: an identity that changed every render would fire

@@ -11598,3 +11598,121 @@ impl BroadcastEventLog {
 // executions — 75.4% of everything `cargo test-e2e` selects. Add a new
 // harness unit test to that file, not to this one; the note at its head has
 // the reasoning and the rule for what belongs there.
+
+/// Raw input to one agent the way a client that is NOT the TUI writes it — the
+/// desktop's terminal bridge (`desktop/src-tauri/src/terminal.rs` `write`):
+/// one long-lived attach stream, one `KIND_STREAM_IN` frame per write, bytes
+/// untranslated (PRD #1541). Output is drained on a thread so the daemon
+/// never stalls on this client. Unlike [`TuiDeck::send_keys`] nothing passes
+/// through the TUI's own key handling.
+///
+/// The timed writes live here rather than in an `e2e_*.rs` body because a
+/// pause between two writes is part of what is being written — an agent's
+/// served interrupt carries one between its steps — and Decision 21 keeps
+/// every sleep in `common`.
+///
+/// Dropping it closes the connection and joins the drain thread, so a test
+/// that attaches leaves neither a thread nor a daemon-side connection behind.
+#[cfg(unix)]
+pub struct AttachInput {
+    stream: std::os::unix::net::UnixStream,
+    stop: Arc<AtomicBool>,
+    drain: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl AttachInput {
+    pub fn attach(socket: &Path, agent_id: &str) -> Self {
+        use dot_agent_deck::daemon_protocol::{AttachRequest, KIND_REQ};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(socket).expect("connect to the attach socket");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+        let request = AttachRequest::AttachStream {
+            id: agent_id.to_string(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+            client_id: None,
+        };
+        let payload = serde_json::to_vec(&request).expect("serialize AttachStream");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        stream
+            .write_all(&header)
+            .expect("write AttachStream header");
+        stream
+            .write_all(&payload)
+            .expect("write AttachStream payload");
+        stream.flush().expect("flush AttachStream");
+        let mut reader = stream.try_clone().expect("clone the attach stream");
+        // `shutdown` in `Drop` is what ends this read; the timeout only bounds
+        // the join should a platform not wake a blocked read on shutdown.
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let drain = std::thread::spawn(move || {
+            let mut sink = [0u8; 8192];
+            while !stop_reader.load(Ordering::Relaxed) {
+                match reader.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            stream,
+            stop,
+            drain: Some(drain),
+        }
+    }
+
+    /// One `KIND_STREAM_IN` frame carrying `bytes`.
+    pub fn write(&mut self, bytes: &str) {
+        use dot_agent_deck::daemon_protocol::KIND_STREAM_IN;
+        let mut header = [0u8; 5];
+        header[0] = KIND_STREAM_IN;
+        header[1..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+        self.stream
+            .write_all(&header)
+            .expect("write STREAM_IN header");
+        self.stream
+            .write_all(bytes.as_bytes())
+            .expect("write STREAM_IN payload");
+        self.stream.flush().expect("flush STREAM_IN");
+    }
+
+    /// Each `(bytes, pause)` as its own write, in order, waiting `pause` after
+    /// it before the next.
+    pub fn write_steps<'a>(&mut self, steps: impl IntoIterator<Item = (&'a str, Duration)>) {
+        for (bytes, pause) in steps {
+            self.write(bytes);
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AttachInput {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Shutting the socket down, not just dropping this half, is what
+        // closes it: the drain thread holds a clone of the same socket.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+    }
+}

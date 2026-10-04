@@ -551,6 +551,54 @@ export type AgentTab =
  * daemon. See `OverviewAgent` in `components/AgentOverview.tsx`, which is the
  * compiler-enforced honest projection.
  */
+/**
+ * PRD #1541 — the daemon's agent-type identity (`DesktopAgent.agent_type`):
+ * snake_case wire values, not names anybody reads. `none` covers an
+ * unrecognised command and any type a newer daemon names that this app does
+ * not know.
+ */
+export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+
+/**
+ * PRD #1541 — whether the agent is in the middle of a turn, from the daemon's
+ * status: `working` while it reports thinking, working or compacting, `idle`
+ * while it reports idle or waiting for input. Absent when the status says
+ * neither (no hook state yet, an error, a block, an unknown status) — the deck
+ * did not say, and voice's interrupt treats that as "not working".
+ */
+export type AgentTurn = "working" | "idle";
+
+/**
+ * PRD #1541 — the keys the DECK says interrupt this agent's turn and edit its
+ * prompt (`DesktopPromptKeys`, served by the daemon from its own agent
+ * registry and bounded by the desktop crate). Each `bytes` is written to the
+ * agent's terminal unchanged.
+ */
+export interface PromptKeys {
+  /** Write each step in order, waiting `pauseAfterMs` after each. */
+  interrupt: { bytes: string; pauseAfterMs: number }[];
+  /**
+   * The key that clears the prompt. `per_wrapped_row`: one press per wrapped
+   * screen row (Claude Code); `per_line`: one per logical line. Extra presses
+   * are harmless, so round up. Never more than `maxPressesPerWrite` in one
+   * write, when present, and `pauseBetweenWritesMs` between two writes of
+   * one clear, when present (Claude Code reads two writes sent back to back
+   * as one, and ignores a read that large).
+   */
+  clear: {
+    bytes: string;
+    presses: "per_wrapped_row" | "per_line";
+    maxPressesPerWrite?: number;
+    pauseBetweenWritesMs?: number;
+  };
+  /**
+   * The key that deletes one character, and the longest single write (in
+   * characters) the agent keeps as typed text — absent where no limit was
+   * observed. Voice applies its own 800-character ceiling on top (PRD #1541).
+   */
+  deleteChar: { bytes: string; maxLiteralWriteChars?: number };
+}
+
 export interface AgentSession {
   /** HONEST. Per-daemon monotonic integer, so it is unique only within a daemon. */
   id: string;
@@ -571,6 +619,20 @@ export interface AgentSession {
    * and `spawnedAtMs`.
    */
   cli?: string;
+  /**
+   * HONEST. PRD #1541 — the agent type the daemon reports for this agent.
+   * Optional so a surface built without it reads "the deck did not say".
+   */
+  agentType?: AgentTypeId;
+  /** HONEST. PRD #1541 — mid-turn or idle, from the daemon's status; see {@link AgentTurn}. */
+  turn?: AgentTurn;
+  /**
+   * HONEST. PRD #1541 — the prompt keys the daemon served for this agent.
+   * Absent when the deck has none for it (Devin, an unrecognised agent), is
+   * too old to send them, or sent a set the desktop refused — and never filled
+   * from a table of this app's own (the issue #856 principle).
+   */
+  promptKeys?: PromptKeys;
   /** FIXTURE-ONLY — the daemon tracks no model per agent (PRD #745, #633). */
   model: string;
   /** HONEST. */
@@ -1190,7 +1252,7 @@ export interface DeckRuntimeState {
    * heading — the ids collide across decks by construction.
    */
   terminalInputResults?: Record<string, SendResult>;
-  sendTerminalInput: (target: AgentTarget, data: string) => Promise<void>;
+  sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**
    * PRD #882 — the geometry the daemon has APPLIED per agent, keyed by
