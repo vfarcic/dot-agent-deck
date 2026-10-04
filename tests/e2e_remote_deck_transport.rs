@@ -795,9 +795,9 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
         "the ssh child must still be running while the connection is held"
     );
     drop(connection);
-    // `process_running` reads `/proc` and treats a zombie as exited, so this
-    // cannot be satisfied by an unreaped child — which is half of what the
-    // assertion below is about.
+    // `process_running` treats a zombie as exited, so this observes the ssh
+    // child exiting; on its own it does not tell an unreaped child from a
+    // reaped one.
     common::wait_until(TEARDOWN_TIMEOUT, || {
         !common::process_running(ssh_pid as i32)
     });
