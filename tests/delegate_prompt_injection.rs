@@ -4237,9 +4237,9 @@ impl SilenceHarness {
         }
     }
 
-    /// Returns the worker pane's delegation resolution epoch as it stood the
-    /// moment `handle_delegate` returned — before the dispatch it spawned has
-    /// run, so before the delivered pointer is confirmed and moves it. See
+    /// Returns the worker pane's pointer delivery epoch as it stood the moment
+    /// `handle_delegate` returned — before the dispatch it spawned has run, so
+    /// before the delivered pointer is confirmed and moves it. See
     /// [`Self::wait_until_pointer_confirmed`].
     async fn delegate_and_wait_for_pointer(&self) -> Option<u64> {
         self.state
@@ -4256,7 +4256,7 @@ impl SilenceHarness {
                 &self.event_tx,
             )
             .await;
-        let armed = self.registry.delegation_resolution_epoch(WORKER_PANE);
+        let armed = self.registry.pointer_delivery_epoch(WORKER_PANE);
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
@@ -4285,7 +4285,7 @@ impl SilenceHarness {
     async fn wait_until_pointer_confirmed(&self, armed: Option<u64>) {
         assert!(
             poll_until_after_time_advance(Duration::from_secs(5), || {
-                self.registry.delegation_resolution_epoch(WORKER_PANE) != armed
+                self.registry.pointer_delivery_epoch(WORKER_PANE) != armed
             })
             .await,
             "the delivered pointer was never confirmed, so the silent-worker watch never armed"
@@ -5072,6 +5072,147 @@ fn idle_worker_028_waiting_idle_report_is_dropped_after_work_done() {
 #[cfg(unix)]
 fn idle_worker_029_waiting_silence_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Silence);
+}
+
+/// Scenario: A worker is delegated to and its pointer lands. The orchestrator
+/// then delegates to it again with `--supersede` while the test holds the
+/// newer dispatch on the worker pane's dispatch lock. The first delegation's
+/// no-event window runs out meanwhile, and its "went quiet" report waits on an
+/// unsent draft in the orchestrator's pane. The test releases the lock and the
+/// newer pointer lands; when the orchestrator's draft is sent, the stale report
+/// about the first delegation must not arrive, and the newer delegation's own
+/// report still must.
+#[spec("scheduler/idle-worker/031")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_lands() {
+    const WINDOW: Duration = Duration::from_millis(2000);
+    const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "2000"),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build displaced-silence-report runtime")
+        .block_on(async {
+            const ORCHESTRATOR_DRAFT: &[u8] = b"orchestrator-draft-1526";
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            let first_delivered = Instant::now();
+
+            // Inside the first delegation's window: the newer delegate's
+            // dispatch is held on the worker pane's dispatch lock, so its
+            // pointer cannot land until the test lets it.
+            let dispatch_lock = harness.registry.pane_dispatch_lock(WORKER_PANE);
+            let held = dispatch_lock.lock().await;
+            let pointers_before = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .unwrap_or_default()
+                .windows(POINTER.len())
+                .filter(|window| *window == POINTER)
+                .count();
+            let delivery_before = harness.registry.pointer_delivery_epoch(WORKER_PANE);
+            harness.start_draft_delegate(true).await;
+            harness
+                .send_orchestrator_user_bytes(ORCHESTRATOR_DRAFT)
+                .await;
+            let typed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                ORCHESTRATOR_DRAFT,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&typed, ORCHESTRATOR_DRAFT),
+                "orchestrator draft never reached its PTY: {:?}",
+                String::from_utf8_lossy(&typed)
+            );
+            assert!(
+                first_delivered.elapsed() < WINDOW,
+                "precondition: the setup outlasted the first delegation's window, so its report \
+                 may have fired before the newer delegate was armed"
+            );
+
+            // Past the first window: its report has fired and waits on the
+            // orchestrator's draft.
+            tokio::time::sleep(WINDOW + Duration::from_millis(1000)).await;
+            let waiting = harness.orchestrator_snapshot();
+            assert!(
+                !String::from_utf8_lossy(&waiting).contains(SILENCE_NEEDLE),
+                "the went-quiet report did not wait for the orchestrator's draft: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+
+            // The newer pointer lands while the report about the first
+            // delegation still waits.
+            drop(held);
+            let landed = wait_for_snapshot_where(
+                &harness.registry,
+                &harness.worker_agent_id,
+                Duration::from_secs(5),
+                |snapshot| {
+                    snapshot
+                        .windows(POINTER.len())
+                        .filter(|window| *window == POINTER)
+                        .count()
+                        > pointers_before
+                },
+            )
+            .await;
+            assert!(
+                landed
+                    .windows(POINTER.len())
+                    .filter(|window| *window == POINTER)
+                    .count()
+                    > pointers_before,
+                "the newer pointer never landed once its dispatch was released: {:?}",
+                String::from_utf8_lossy(&landed)
+            );
+            assert!(
+                poll_until_after_time_advance(Duration::from_secs(5), || {
+                    harness.registry.pointer_delivery_epoch(WORKER_PANE) != delivery_before
+                })
+                .await,
+                "the newer pointer's delivery was never confirmed"
+            );
+
+            harness.send_orchestrator_user_bytes(b"\r").await;
+            // The newer delegation's own report, armed when its pointer landed,
+            // is still owed and must arrive.
+            let reported = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                WINDOW + Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&reported),
+                "the newer delegation's went-quiet report never arrived: {:?}",
+                String::from_utf8_lossy(&reported)
+            );
+            // Every chance for a second report to land before counting: the
+            // newer delegation's own report fires a whole window after its
+            // pointer, so whichever arrived first, the other is due within one.
+            tokio::time::sleep(WINDOW + Duration::from_millis(1500)).await;
+            let after = harness.orchestrator_snapshot();
+            let text = String::from_utf8_lossy(&after);
+            assert_eq!(
+                text.matches(SILENCE_NEEDLE).count(),
+                1,
+                "a went-quiet report about a delegation whose question a newer pointer had \
+                 already answered was delivered once the orchestrator's draft was sent \
+                 (Qodo, PR #1502): {text:?}"
+            );
+        });
 }
 
 /// Scenario: Clear an unsent worker draft with Ctrl+U while a production

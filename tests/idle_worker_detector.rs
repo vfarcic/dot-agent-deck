@@ -1803,9 +1803,6 @@ fn waiting_notices_for(snapshot: &str, role: &str) -> usize {
 /// Scenario: Delegate to eleven workers of one orchestration and leave a twelfth undelegated, then have them report `WaitingForInput` through the daemon's real hook ingestion. The delegated `asking-worker`, whose pane shows a question, stays waiting and later re-reports the same wait; `repainted-worker` stays waiting while an untagged report repaints its card, after which its own agent reports only informational events; `cleared-worker`'s agent starts a new hook session and waits in it, and then a delayed report and a delayed `session_start` from its old session arrive; `restarted-worker` waits and then genuinely starts a new hook session whose start carries an earlier timestamp; `already-waiting-worker` was waiting before it was delegated to; `respawned-worker` is a `clear = true` role, so its delegate replaces its agent, and the replacement waits; `handed-over-worker`'s agent is replaced while its delegate's dispatch is held on the pane's dispatch lock, and the replacement waits before the dispatch writes the pointer to it; `flapping-worker` leaves the state again before the debounce; `finishing-worker` sends work-done while still waiting; `impersonated-worker`'s report names an agent id that does not own its pane; `exited-worker`'s agent exits by itself once its task pointer arrives, and a different agent that was never delegated to takes its pane and waits; the undelegated `idle-bystander` waits too. The orchestrator pane must receive exactly one SUBMITTED waiting-for-input notice for each of the first six — the asking worker's quoting its question inside the untrusted pane-text frame — and nothing about the other six, then or after further waiting.
 #[spec("scheduler/idle-worker/021")]
 #[test]
-// Quarantined (CLAUDE.md rule 6): red on both attempts of CI's starved 4-vCPU
-// `e2e-deterministic` runners, green locally. #1526 says how to run it and what lifts it.
-#[ignore = "quarantined: vfarcic, #1526"]
 fn idle_worker_021_a_waiting_delegated_worker_is_reported_to_its_orchestrator() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     // The idle detector is held far beyond the test's runtime, so any daemon
@@ -2271,10 +2268,6 @@ fn worker_hook_event(
 /// Scenario: Delegate to three workers whose agents are each replaced in their pane by a successor that is already waiting for input when it is delegated to again. For two of them a hook event from the REPLACED agent reaches the daemon's real ingestion first, reads the pane's owner, and is held on the state lock until the replacement has happened — one reporting `WaitingForInput`, the other, after an untagged report repainted the successor's card, reporting `thinking`. The orchestrator pane must receive exactly one waiting-for-input notice about each successor, the third worker being the control with no stale event at all.
 #[spec("scheduler/idle-worker/023")]
 #[test]
-// Quarantined (CLAUDE.md rule 6): the same starved-runner loss of a waiting
-// notice as `idle-worker/021`, met on PR #1535's `e2e-deterministic` runs and
-// green locally. #1526 has both, how to run them, and what lifts them.
-#[ignore = "quarantined: vfarcic, #1526"]
 fn idle_worker_023_a_replaced_agents_stale_report_cannot_erase_its_successors_wait() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(Some("600000"));
@@ -2661,6 +2654,137 @@ fn idle_worker_025_a_waiting_episode_ends_and_reopens_with_what_it_is_about() {
             settled.matches(WAITING_NEEDLE).count(),
             5,
             "exactly five waiting notices may reach the orchestrator; snapshot = {settled:?}"
+        );
+    });
+}
+
+/// Scenario: Two workers are already waiting for input when they are delegated to, and the orchestrator has an unsent draft in its pane, so each worker's waiting-for-input notice fires and then waits on that draft. The test holds `held-pointer-worker`'s dispatch on its pane's dispatch lock until its notice is waiting, then lets the task pointer through, so the pointer reaches the worker while the notice is still waiting; `control-worker`'s pointer arrives straight away, before its notice fires. When the user presses Enter on the draft, the orchestrator must receive exactly one notice about each worker.
+#[spec("scheduler/idle-worker/030")]
+#[test]
+fn idle_worker_030_a_waiting_notice_survives_its_own_pointer_landing_while_it_waits() {
+    use std::io::Write as _;
+
+    const HELD: &str = "held-pointer-worker";
+    const CONTROL: &str = "control-worker";
+    const DRAFT: &[u8] = b"orchestrator-draft-1526";
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("600000"));
+    let debounce = Duration::from_millis(600);
+    let _debounce = DebounceEnvGuard::set("600");
+    runtime().block_on(async {
+        let harness = IdleHarness::new(&[HELD, CONTROL], None).await;
+        for role in [HELD, CONTROL] {
+            harness.manage_worker_pane(role).await;
+            harness.worker_event(role, "session_start").await;
+            // At its prompt BEFORE the delegate, so the delegate-time path
+            // opens the episode and its clock starts before the pointer lands.
+            harness.worker_event(role, "waiting_for_input").await;
+        }
+
+        // The user has typed into the orchestrator's pane and not sent it, so
+        // every first write into that pane waits for Enter (issue #544).
+        {
+            let handle = harness
+                .registry
+                .subscribe(&harness.orchestrator_agent_id)
+                .expect("attach the orchestrator");
+            let mut writer = handle.writer.lock().await;
+            writer
+                .write_all(DRAFT)
+                .expect("type the orchestrator's draft");
+            writer.flush().expect("flush the orchestrator's draft");
+        }
+        let typed = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains("orchestrator-draft-1526"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            typed.contains("orchestrator-draft-1526"),
+            "precondition: the orchestrator's draft never reached its PTY; snapshot = {typed:?}"
+        );
+
+        let held_pane = worker_pane(HELD);
+        let dispatch_lock = harness.registry.pane_dispatch_lock(&held_pane);
+        let held = dispatch_lock.lock().await;
+        harness.delegate(&[HELD, CONTROL]).await;
+        let control_agent = harness.worker_agent_ids[CONTROL].clone();
+        let control_pointer = harness
+            .wait_for_snapshot_of(
+                &control_agent,
+                |snapshot| snapshot.contains("worker-task-control-worker.md"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            control_pointer.contains("worker-task-control-worker.md"),
+            "precondition: the control worker never received its task pointer; \
+             snapshot = {control_pointer:?}"
+        );
+        // Well past the debounce: both notices have fired and are waiting on
+        // the orchestrator's draft.
+        tokio::time::sleep(common::load_scaled(debounce * 3)).await;
+        let waiting = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert_eq!(
+            waiting.matches(WAITING_NEEDLE).count(),
+            0,
+            "precondition: the waiting notices did not wait for the orchestrator's draft, so \
+             the held pointer cannot land while one waits; snapshot = {waiting:?}"
+        );
+
+        // The held worker's pointer now lands while its notice waits.
+        drop(held);
+        let held_agent = harness.worker_agent_ids[HELD].clone();
+        let held_pointer = harness
+            .wait_for_snapshot_of(
+                &held_agent,
+                |snapshot| snapshot.contains("worker-task-held-pointer-worker.md"),
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert!(
+            held_pointer.contains("worker-task-held-pointer-worker.md"),
+            "precondition: the held worker never received its task pointer once released; \
+             snapshot = {held_pointer:?}"
+        );
+        // Let the dispatch finish settling the delivery it just made.
+        tokio::time::sleep(common::load_scaled(Duration::from_millis(500))).await;
+
+        // The user sends the draft, which releases every write waiting on it.
+        {
+            let handle = harness
+                .registry
+                .subscribe(&harness.orchestrator_agent_id)
+                .expect("attach the orchestrator");
+            let mut writer = handle.writer.lock().await;
+            writer
+                .write_all(b"\r")
+                .expect("submit the orchestrator's draft");
+            writer.flush().expect("flush the orchestrator's Enter");
+        }
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| {
+                    waiting_notices_for(snapshot, HELD) > 0
+                        && waiting_notices_for(snapshot, CONTROL) > 0
+                },
+                common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+        assert_eq!(
+            waiting_notices_for(&snapshot, CONTROL),
+            1,
+            "control: a worker whose pointer landed before its notice fired was not reported \
+             once the orchestrator's draft was sent; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            waiting_notices_for(&snapshot, HELD),
+            1,
+            "a waiting notice was dropped because the worker's own task pointer landed while \
+             the notice waited on the orchestrator's draft (issue #1526): the delivery of the \
+             delegation the notice is about was treated as resolving it; \
+             snapshot = {snapshot:?}"
         );
     });
 }
