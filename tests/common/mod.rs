@@ -9713,6 +9713,14 @@ pub struct EventSub {
 #[cfg(unix)]
 #[allow(dead_code)]
 impl EventSub {
+    /// Open a `SubscribeEvents` stream against any daemon's attach socket — an
+    /// in-process one ([`InProcDaemon::attach_path`]) as well as a
+    /// `daemon serve`, whose [`DaemonProc::subscribe_events`] is this. Returns
+    /// once the subscription is provably live, like that one.
+    pub fn subscribe(attach_socket: &Path) -> Self {
+        Self::open(attach_socket).expect("open SubscribeEvents stream")
+    }
+
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
     /// (so the daemon's per-connection broadcast receiver exists before we
     /// return — nothing broadcast afterward can be missed), then spawn a reader

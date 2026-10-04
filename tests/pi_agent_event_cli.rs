@@ -22,7 +22,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
-use dot_agent_deck::state::{AppState, SessionStatus};
+use dot_agent_deck::prompt_delivery::{ConfirmationCapability, pane_confirmation_capability};
+use dot_agent_deck::state::{AppState, SessionState, SessionStatus};
 
 const PANE: &str = "pi-cli-pane";
 const AGENT: &str = "pi-cli-agent";
@@ -160,6 +161,59 @@ fn a_lifecycle_only_report_is_unchanged() {
     assert!(event.user_prompt.is_none());
     assert!(event.tool_name.is_none());
     assert!(event.tool_detail.is_none());
+}
+
+/// The confirmation capability the deck reads for `PANE` after `state` applied
+/// what the CLI sent — the input every delivery path re-submits from.
+fn pane_capability(state: &AppState) -> ConfirmationCapability {
+    pane_confirmation_capability(
+        state
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() == Some(PANE))
+            .map(SessionState::confirmation_producer),
+    )
+}
+
+/// Scenario: Report a Pi session start and a submitted prompt the way the
+/// bundled extension does since issue #1567, with `--reports-prompts` on every
+/// report, and apply each frame to a card. From the first frame on, the pane
+/// counts as one that confirms a delivered prompt itself, so the deck may
+/// re-submit a prompt Pi never reported. The same reports without the flag —
+/// what an older extension sends — leave the pane as one that cannot confirm,
+/// so nothing typed into it is ever typed again.
+#[test]
+fn only_a_report_declaring_prompt_reports_makes_a_pi_pane_confirm_its_prompts() {
+    for declared in [false, true] {
+        let mut state = AppState::default();
+        state.register_pane(PANE.to_string());
+        let flag: &[&str] = if declared {
+            &["--reports-prompts"]
+        } else {
+            &[]
+        };
+        let start = agent_event(&[&["--type", "finished", "--cwd", "/work/repo"], flag].concat());
+        state.apply_event(start);
+        let expected = if declared {
+            ConfirmationCapability::Reports
+        } else {
+            ConfirmationCapability::CannotReport
+        };
+        assert_eq!(
+            pane_capability(&state),
+            expected,
+            "declared={declared}: the session-start report alone decides the pane's capability"
+        );
+        let prompt =
+            agent_event(&[&["--type", "prompt", "--prompt", "list the files"], flag].concat());
+        assert_eq!(prompt.user_prompt.as_deref(), Some("list the files"));
+        state.apply_event(prompt);
+        assert_eq!(
+            pane_capability(&state),
+            expected,
+            "declared={declared}: a reported prompt does not change what the producer declared"
+        );
+    }
 }
 
 /// Scenario: Report a prompt and a tool call whose text starts with a dash

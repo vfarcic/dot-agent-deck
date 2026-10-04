@@ -232,6 +232,11 @@ enum Commands {
         /// A short description of the tool call, e.g. its command or path.
         #[arg(long = "tool-detail", allow_hyphen_values = true)]
         tool_detail: Option<String>,
+        /// Declare that the reporter reports every prompt the agent submits,
+        /// so the deck may re-submit a delivered prompt it never reported
+        /// (issue #1567). Sent by the bundled Pi extension on every report.
+        #[arg(long = "reports-prompts")]
+        reports_prompts: bool,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
     /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
@@ -1481,6 +1486,7 @@ fn main() -> ExitCode {
             prompt,
             tool_name,
             tool_detail,
+            reports_prompts,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1519,6 +1525,7 @@ fn main() -> ExitCode {
                     prompt,
                     tool_name,
                     tool_detail,
+                    reports_prompts,
                 },
             );
             let json = match serde_json::to_string(&event) {

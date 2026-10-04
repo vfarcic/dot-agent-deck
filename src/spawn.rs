@@ -4693,6 +4693,130 @@ mod tests {
         }
     }
 
+    /// Issue #1567: a Pi frame is capability only when its producer declares
+    /// that it reports every prompt — the bundled extension from #1567 on. The
+    /// same frame from an older extension, which declares nothing, is not.
+    #[test]
+    fn a_drained_pi_frame_is_capability_only_when_it_declares_prompt_reports() {
+        const PANE_ID: &str = "drain-1567-pane";
+        const AGENT_ID: &str = "drain-1567-agent";
+
+        for declared in [false, true] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let mut event = typed_prompt_watch_event(
+                PANE_ID,
+                AGENT_ID,
+                &format!("{PANE_ID}-session"),
+                EventType::Idle,
+                AgentType::Pi,
+                false,
+            );
+            if declared {
+                event.metadata.insert(
+                    crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
+                    crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
+                );
+            }
+            let _ = tx.send(BroadcastMsg::Event(event));
+            let mut generation = None;
+            let mut capability = false;
+            let mut agent_start = None;
+            assert_eq!(
+                drain_pre_write_events(
+                    &mut rx,
+                    PANE_ID,
+                    AGENT_ID,
+                    &mut generation,
+                    &mut capability,
+                    &mut agent_start,
+                ),
+                None
+            );
+            assert_eq!(
+                capability, declared,
+                "declared={declared}: a Pi frame's capability is its extension's declaration"
+            );
+        }
+    }
+
+    /// Issue #1567: a pane the deck spawned as Pi, whose extension reports a
+    /// session start AFTER the prompt was written. Declaring prompt reports, it
+    /// is a producer that would have confirmed a submitted prompt, so the
+    /// unconfirmed write is re-submitted; declaring nothing — an extension from
+    /// before #1567 — it stays a producer that cannot, and nothing is typed
+    /// into it a second time.
+    #[serial_test::serial(prompt_confirmation_tasks)]
+    #[tokio::test]
+    async fn a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports() {
+        let retry_lands = |declared: bool| async move {
+            let pane_id = format!("pi-1567-{declared}");
+            let prompt = format!("PI-1567-RETRY-{declared}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = spawn_typed_byte_target(&registry, &pane_id, Some(AgentType::Pi));
+            let (tx, rx) = broadcast::channel(8);
+            let confirmation = tokio::spawn(confirm_prompt_delivery(
+                registry.clone(),
+                rx,
+                ConfirmationTask {
+                    pane_id: pane_id.clone(),
+                    agent_id: agent_id.clone(),
+                    prompt: prompt.clone(),
+                    delivery_id: format!("pi-1567-{declared}"),
+                    generation: None,
+                    can_report_prompts: false,
+                    confirmation_floor: Duration::ZERO,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            ));
+            let mut event = typed_prompt_watch_event(
+                &pane_id,
+                &agent_id,
+                &format!("{pane_id}-session"),
+                EventType::Idle,
+                AgentType::Pi,
+                false,
+            );
+            if declared {
+                event.metadata.insert(
+                    crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
+                    crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
+                );
+            }
+            tx.send(BroadcastMsg::Event(event))
+                .expect("send the Pi extension's session-start report");
+            // As in the #559 pair above: the retrying case waits for the
+            // retry's own echo, and the other can only observe an absence, so
+            // its sleep IS the observation — with a zero floor the first window
+            // is 500 ms, so a retry that is going to land has landed by 750 ms.
+            let output = if declared {
+                wait_for_detached_payload_echo(&registry, &agent_id, &prompt).await
+            } else {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                registry.snapshot(&agent_id).expect("pi snapshot")
+            };
+            confirmation.abort();
+            let _ = confirmation.await;
+            drop(tx);
+            registry.shutdown_all();
+            (payload_echoes(&output, &prompt) > 0, output)
+        };
+        let (declared_retried, declared_output) = retry_lands(true).await;
+        assert!(
+            declared_retried,
+            "a deck-spawned Pi pane whose extension declares prompt reports must get the \
+             retry, or a prompt Pi never received is never re-submitted; output={:?}",
+            String::from_utf8_lossy(&declared_output)
+        );
+        let (legacy_retried, legacy_output) = retry_lands(false).await;
+        assert!(
+            !legacy_retried,
+            "a Pi pane whose extension declares nothing was retyped — that extension does \
+             not report every prompt it submits, so a delivered task can be submitted a \
+             second time; output={:?}",
+            String::from_utf8_lossy(&legacy_output)
+        );
+    }
+
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes; a deck-spawned Codex pane whose only post-write producer is a `wrap` that declared Codex's native prompt hook untrusted is never retyped, while its undeclared twin is (issue #559). Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]

@@ -9478,7 +9478,16 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
-    /// selected itself, and that type reports submitted prompts.
+    /// selected itself, and that type can report submitted prompts
+    /// ([`crate::prompt_delivery::agent_reports_submitted_prompt`]).
+    ///
+    /// Issue #1567: for Pi that is a statement about what the pane COULD turn
+    /// out to be — whether this Pi pane reports depends on the extension it
+    /// loaded. That is enough for standing, because standing only lets the
+    /// delivery accept a producer that proves it reports
+    /// ([`crate::event::AgentEvent::reports_submitted_prompt`]) when it
+    /// announces itself; a Pi extension that declares nothing proves nothing
+    /// and arms nothing.
     ///
     /// The second standing for accepting a post-write producer, and the same
     /// KIND of fact as [`Self::agent_declared_launcher_handoff`]: a statement

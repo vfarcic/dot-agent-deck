@@ -8570,6 +8570,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(

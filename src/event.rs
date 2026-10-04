@@ -826,6 +826,36 @@ pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
 /// writes. Readers accept any value; see the key's docs.
 pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
 
+/// Issue #1567: the [`AgentEvent::metadata`] key on which a producer DECLARES
+/// that it reports every prompt it submits (value
+/// [`PROMPT_REPORTS_DECLARED_METADATA_VALUE`]).
+///
+/// The bundled Pi extension sends it on every report from issue #1567 on, via
+/// `dot-agent-deck agent-event --reports-prompts`. Pi's prompt reports come
+/// from an extension the deck ships, and an extension from an older deck does
+/// not report every prompt Pi submits — none before issue #622, and from #622
+/// none that was submitted while Pi was busy. A Pi process keeps the extension
+/// it loaded at start, so the deck meets older ones whenever it outlives an
+/// upgrade. This declaration is what tells the two apart.
+///
+/// Unlike [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] it GRANTS standing
+/// — and only to an agent type whose prompt reporting is
+/// [`crate::prompt_delivery::PromptReporting::WhenDeclared`] (Pi); on any other
+/// type it is inert. That grants nothing a producer could not already take: the
+/// hook socket accepts raw `AgentEvent` JSON from any same-uid process, so a
+/// producer able to send this key could equally declare itself
+/// [`AgentType::ClaudeCode`], whose standing needs no declaration at all. What
+/// it costs when forged is what a forged Claude Code type costs: a retry of an
+/// automatic prompt the producer did not confirm.
+///
+/// Read by [`AgentEvent::declares_prompt_reports`] and by
+/// [`crate::state::SessionState::prompt_reports_declared`].
+pub const PROMPT_REPORTS_DECLARED_METADATA_KEY: &str = "prompt_reports_declared";
+
+/// The [`PROMPT_REPORTS_DECLARED_METADATA_KEY`] value a declaring producer
+/// writes, and the only one that counts.
+pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
+
 /// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
 /// came from, when the agent's hook payload says it came from one.
 ///
@@ -1172,9 +1202,20 @@ impl AgentEvent {
             .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
     }
 
+    /// Issue #1567: did this event's producer declare that it reports every
+    /// prompt it submits (see [`PROMPT_REPORTS_DECLARED_METADATA_KEY`])? Only
+    /// the exact value counts, because this answer GRANTS standing.
+    pub fn declares_prompt_reports(&self) -> bool {
+        self.metadata
+            .get(PROMPT_REPORTS_DECLARED_METADATA_KEY)
+            .is_some_and(|v| v == PROMPT_REPORTS_DECLARED_METADATA_VALUE)
+    }
+
     /// Issue #559: can the producer of THIS event report a submitted prompt —
-    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] for its
-    /// declared type, withdrawn when the event itself declares that it cannot
+    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`] for its
+    /// declared type and what the event itself declares: that it reports
+    /// ([`Self::declares_prompt_reports`], issue #1567, which is what a Pi
+    /// producer needs) or that it cannot
     /// ([`Self::declares_prompt_reports_unavailable`]).
     ///
     /// Every daemon-side capability read goes through this rather than through
@@ -1182,8 +1223,13 @@ impl AgentEvent {
     /// agent it hosts and says nothing about whether that agent's reporting
     /// channel exists.
     pub fn reports_submitted_prompt(&self) -> bool {
-        crate::prompt_delivery::agent_reports_submitted_prompt(&self.agent_type)
-            && !self.declares_prompt_reports_unavailable()
+        crate::prompt_delivery::producer_reports_submitted_prompt(
+            crate::prompt_delivery::ConfirmationProducer {
+                agent_type: &self.agent_type,
+                prompt_reports_declared: self.declares_prompt_reports(),
+                prompt_reports_unavailable: self.declares_prompt_reports_unavailable(),
+            },
+        )
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than

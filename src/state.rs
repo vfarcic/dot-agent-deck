@@ -922,6 +922,24 @@ pub struct SessionState {
     /// read it belong to the TUI that spawned the pane, not to one that
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
+    /// Issue #1567: this session's producer DECLARED that it reports every
+    /// prompt it submits — an event arrived carrying
+    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`], which the bundled
+    /// Pi extension sends on every report from #1567 on. For a Pi session this
+    /// is what makes the pane one that confirms its own prompts; an extension
+    /// from an older deck never sends it, so its pane keeps being one that
+    /// cannot.
+    ///
+    /// Per SESSION and STICKY once set, for the reasons
+    /// [`Self::prompt_reports_unavailable`] is: the answer has to outlive the
+    /// frame that carried it, and a producer that declared it does not stop
+    /// being that producer because one later frame — the extension's bare
+    /// lifecycle retry after a failed report — went out without it. It cannot
+    /// outrank [`Self::prompt_reports_unavailable`]; see
+    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`]. Not carried
+    /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
+    /// TUI learns it again from the producer's next event.
+    pub prompt_reports_declared: bool,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -981,11 +999,17 @@ impl SessionState {
     }
 
     /// Issue #559: this session as a candidate confirmation producer — its
-    /// declared agent type, and whether the session's producer declared it
-    /// cannot report a submitted prompt ([`Self::prompt_reports_unavailable`]).
-    /// The input [`crate::prompt_delivery::pane_confirmation_capability`] takes.
-    pub fn confirmation_producer(&self) -> (&AgentType, bool) {
-        (&self.agent_type, self.prompt_reports_unavailable)
+    /// declared agent type, and what the session's producer declared about its
+    /// prompt reports: that it cannot report a submitted prompt
+    /// ([`Self::prompt_reports_unavailable`]), or (issue #1567) that it reports
+    /// every one ([`Self::prompt_reports_declared`]). The input
+    /// [`crate::prompt_delivery::pane_confirmation_capability`] takes.
+    pub fn confirmation_producer(&self) -> crate::prompt_delivery::ConfirmationProducer<'_> {
+        crate::prompt_delivery::ConfirmationProducer {
+            agent_type: &self.agent_type,
+            prompt_reports_declared: self.prompt_reports_declared,
+            prompt_reports_unavailable: self.prompt_reports_unavailable,
+        }
     }
 
     /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
@@ -7226,9 +7250,11 @@ pub(crate) enum PromptWatch {
     /// the only proof that a re-submission could ever be confirmed.
     ///
     /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
-    /// the agent's id. Pi emits exactly such events and hardcodes
-    /// `user_prompt: None`, so a Pi pane armed a retry loop that could never
-    /// terminate on success and retyped the prompt until the deadline.
+    /// the agent's id. A Pi extension from before issue #622 emits exactly such
+    /// events and never a prompt, so a Pi pane armed a retry loop that could
+    /// never terminate on success and retyped the prompt until the deadline.
+    /// Issue #1567: a Pi frame counts only when its extension declares that it
+    /// reports every prompt.
     ///
     /// Issue #666: `agent_start` carries the FIRST `SessionStart` seen in this
     /// window that satisfies the rearm's facts G ∧ I ∧ W — genuine (not
@@ -10940,6 +10966,7 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         session_id
@@ -15203,6 +15230,7 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -15588,6 +15616,12 @@ impl AppState {
         // `SessionState::prompt_reports_unavailable`.
         if event.declares_prompt_reports_unavailable() {
             session.prompt_reports_unavailable = true;
+        }
+        // Issue #1567: sticky for the same reason — a producer that declared it
+        // reports every prompt is still that producer when one of its frames
+        // goes out bare. See `SessionState::prompt_reports_declared`.
+        if event.declares_prompt_reports() {
+            session.prompt_reports_declared = true;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
@@ -23402,6 +23436,7 @@ while True:
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
 

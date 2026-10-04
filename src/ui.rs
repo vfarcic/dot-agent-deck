@@ -2027,7 +2027,8 @@ struct PromptDelivery {
     /// observed to have a producer that can report a submitted prompt. Sticky
     /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
     /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
-    /// never arms at all.
+    /// arms only once its extension declares that it reports every prompt
+    /// (issue #1567) — never, for an extension from an older deck.
     can_report_prompts: bool,
 }
 
@@ -4395,8 +4396,9 @@ fn apply_seed_send_outcome(
                 log_prompt_probe_submitted("seed", pane_id, delivery_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report
-                // a submitted prompt (Pi). Retrying could never be
+                // A recognized producer that cannot report a submitted
+                // prompt (a Pi extension declaring nothing, a wrapped Codex
+                // whose prompt hook is untrusted). Retrying could never be
                 // confirmed — only retyped — so the write is final.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
@@ -5802,9 +5804,10 @@ fn apply_orchestrator_send_outcome(
                 log_prompt_probe_submitted("orchestrator", start_pane_id, logged_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report a
-                // submitted prompt (Pi). Retrying could never be confirmed —
-                // only retyped — so the write is final and the role finalizes.
+                // A recognized producer that cannot report a submitted prompt
+                // (a Pi extension declaring nothing, a wrapped Codex whose
+                // prompt hook is untrusted). Retrying could never be confirmed
+                // — only retyped — so the write is final and the role finalizes.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
                         "orchestrator",
@@ -21918,6 +21921,7 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22711,6 +22715,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
     }
@@ -24838,6 +24843,7 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         state
@@ -28325,6 +28331,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31119,6 +31126,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31911,6 +31919,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         }
     }
 
@@ -32293,6 +32302,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         // Spacious: get all 3
@@ -32332,6 +32342,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32362,6 +32373,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
