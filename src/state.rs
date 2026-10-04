@@ -10978,6 +10978,13 @@ impl AppState {
         let seq = self.unproven_seq;
         if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
             entry.seq = seq;
+            // Qodo, PR #1559: a key whose card is gone — superseded by a new
+            // generation, closed with its pane, re-keyed — is about to get a
+            // fresh card with an empty journal, so the count of the old one
+            // must not carry over to it.
+            if !self.sessions.contains_key(session_id) {
+                entry.journal_bytes = None;
+            }
             return;
         }
         self.settle_unproven(pane_id);
@@ -11074,6 +11081,17 @@ impl AppState {
             if keep_pane != Some(pane.as_str()) {
                 self.forget_unbacked_pane(&pane);
             }
+        }
+    }
+
+    /// Qodo, PR #1559: drop the cached journal size of the unproven session
+    /// `session_id`, so the next budget pass recounts what its card retains.
+    /// Owed wherever a card's journal is replaced or appended to outside
+    /// `apply_event`'s own accounted push: a cached count that outlives its
+    /// journal makes the budget strip cards for bytes nobody holds.
+    fn forget_unproven_journal_count(&mut self, session_id: &str) {
+        if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
+            entry.journal_bytes = None;
         }
     }
 
@@ -11556,6 +11574,7 @@ impl AppState {
         }
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+        self.forget_unproven_journal_count(&session_id);
         self.sessions.insert(
             session_id.clone(),
             SessionState {
@@ -11736,6 +11755,9 @@ impl AppState {
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         let Some(snap) = live else { return };
+        // The overlay below can push a live-target carrier onto the card's
+        // journal outside the accounted path; recount it at the next pass.
+        self.forget_unproven_journal_count(&session_id);
         self.adopt_hydrated_generation(&pane_id, snap.hook_generation.as_ref());
         let observed = snap
             .last_activity_ms
@@ -11946,6 +11968,11 @@ impl AppState {
                     card.last_activity = observed;
                 }
                 overlay_snapshot_fields(card, snap);
+                // Qodo, PR #1559: the overlay can push a live-target carrier
+                // outside the accounted path; see `forget_unproven_journal_count`.
+                if let Some(entry) = self.unproven_sessions.get_mut(&card.session_id) {
+                    entry.journal_bytes = None;
+                }
             }
         }
     }
@@ -27096,6 +27123,110 @@ while True:
         assert_eq!(
             hook_provenance_audit_unaccounted_cards(&client),
             Vec::<String>::new()
+        );
+    }
+
+    /// The bytes `state` holds cached for the outside card `id`, beside what its
+    /// journal actually retains.
+    fn hook_provenance_journal_accounting(state: &AppState, id: &str) -> (Option<usize>, usize) {
+        (
+            state.unproven_sessions[id].journal_bytes,
+            state.sessions[id]
+                .recent_events
+                .iter()
+                .map(retained_event_bytes)
+                .sum(),
+        )
+    }
+
+    /// Scenario: An outside agent reports five times under one session key with
+    /// a large tool detail, just inside a lowered budget. A new outside agent
+    /// then starts on the same pane under the same key, superseding the first
+    /// card, and reports three times. The new card's accounting must equal what
+    /// its journal holds, and its three reports must all stay whole, since the
+    /// journal is far under budget.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_card_is_superseded_under_its_key() {
+        const DETAIL: usize = 2048;
+        let session = "outside-reused";
+        let pane = "outside-reused-pane";
+        let report = |agent: &str, round: usize| {
+            let mut event = hook_provenance_audit_outside_start(session, pane);
+            event.agent_id = Some(agent.to_string());
+            if round > 0 {
+                event.event_type = EventType::ToolStart;
+                event.tool_name = Some("Bash".to_string());
+            }
+            event.tool_detail = Some(format!("{agent}-{round}-{}", "x".repeat(DETAIL)));
+            event
+        };
+        let mut state = AppState::default();
+        state.set_unproven_journal_budget(6 * (DETAIL + 512));
+        for round in 0..5 {
+            state.apply_event(report("agent-old", round));
+        }
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            (cached, state.sessions[session].recent_events.len()),
+            (Some(retained), 5),
+            "precondition: the first card is counted and nothing was stripped"
+        );
+
+        for round in 0..3 {
+            state.apply_event(report("agent-new", round));
+        }
+
+        let card = &state.sessions[session];
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some("agent-new"),
+            "precondition: the new generation superseded the card"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            cached,
+            Some(retained),
+            "the accounting must equal what the replacement card retains"
+        );
+        let details: Vec<_> = card
+            .recent_events
+            .iter()
+            .map(|event| event.tool_detail.clone())
+            .collect();
+        let expected: Vec<_> = (0..3)
+            .map(|round| report("agent-new", round).tool_detail)
+            .collect();
+        assert_eq!(
+            details, expected,
+            "a replacement journal under budget must keep every report whole"
+        );
+    }
+
+    /// Scenario: An outside card on a pane is counted, then the pane's
+    /// placeholder card is minted under the same key, replacing its journal.
+    /// The cached accounting must not survive the replacement.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_placeholder_replaces_the_card() {
+        let pane = "outside-placeholder-pane";
+        let session = placeholder_session_id(pane);
+        let mut state = AppState::default();
+        let mut event = hook_provenance_audit_outside_start(&session, pane);
+        event.tool_detail = Some("x".repeat(4096));
+        state.apply_event(event);
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert_eq!(cached, Some(retained), "precondition: counted");
+
+        state.insert_placeholder_session(pane.to_string(), None, None, None);
+
+        assert!(
+            state.sessions[&session].recent_events.is_empty(),
+            "precondition: the placeholder replaced the journal"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert!(
+            cached.is_none_or(|bytes| bytes == retained),
+            "the cached count of the replaced journal must not survive: \
+             {cached:?} cached against {retained} retained"
         );
     }
 

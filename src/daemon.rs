@@ -10101,6 +10101,78 @@ mod hook_provenance_audit_tests {
         }
     }
 
+    /// Scenario: A spawn is reserved and handed its token, but its record is not
+    /// published yet — the instant its child is being forked. The child's first
+    /// `SessionStart`, carrying that token, must be attested and draw its card;
+    /// a token this daemon never minted, presented for the same pane, paneless
+    /// spawn included, must still be refused.
+    #[tokio::test]
+    async fn hook_provenance_audit_a_token_minted_for_an_in_flight_spawn_attests_its_first_report()
+    {
+        use crate::hook_provenance::{Provenance, Refusal, classify_event, mint};
+        let pane = "audit-in-flight-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = registry.reserve_spawn_for_test(Some(pane));
+        let (paneless, paneless_token) = registry.reserve_spawn_for_test(None);
+        assert!(
+            registry.hook_token_of(&agent).is_none(),
+            "precondition: no record is published for the reserved spawn"
+        );
+
+        assert_eq!(
+            classify_event(Some(pane), Some(&agent), Some(&token), &*registry),
+            Provenance::Attested {
+                agent_id: agent.clone()
+            },
+            "a token minted for an in-flight spawn names that spawn"
+        );
+        assert_eq!(
+            classify_event(None, Some(&paneless), Some(&paneless_token), &*registry),
+            Provenance::Attested {
+                agent_id: paneless.clone()
+            },
+            "the paneless in-flight spawn resolves the same way"
+        );
+        let never_minted = mint();
+        assert_eq!(
+            classify_event(Some(pane), Some(&agent), Some(&never_minted), &*registry),
+            Provenance::Refused(Refusal::UnknownToken),
+            "control: a token this daemon never minted is still unknown"
+        );
+        assert_eq!(
+            classify_event(None, Some(&paneless), Some(&never_minted), &*registry),
+            Provenance::Refused(Refusal::UnknownToken),
+            "control: the paneless spawn too"
+        );
+
+        let deck = AuditDeck::start(registry).await;
+        deck.send(line(
+            "in-flight-card",
+            Some(pane),
+            Some(&agent),
+            "session_start",
+            Some(&token),
+        ))
+        .await;
+        assert!(
+            deck.card("in-flight-card").await.is_some(),
+            "the in-flight spawn's first SessionStart must be applied"
+        );
+        deck.send(line(
+            "forged-card",
+            Some(pane),
+            Some(&agent),
+            "session_start",
+            Some(&never_minted),
+        ))
+        .await;
+        assert!(
+            deck.card("forged-card").await.is_none(),
+            "control: a SessionStart carrying a never-minted token is refused"
+        );
+        deck.stop().await;
+    }
+
     /// Scenario: An ordinary daemon-spawned pane reports its own start with its
     /// token, then a token-less sender names that card's key with no pane and
     /// no agent — first a running report, then an outside flood, then a

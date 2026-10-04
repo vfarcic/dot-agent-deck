@@ -6588,6 +6588,19 @@ struct RegistryInner {
     /// claims a pane" holds at every instant, which is the invariant
     /// [`AgentPtyRegistry::owns_generation`]'s retirement rule rests on.
     pending_spawns: HashMap<String, Option<String>>,
+    /// Issue #318 (Qodo on PR #1559): the hook capability token of every spawn
+    /// in [`Self::pending_spawns`], keyed by the same pre-allocated agent id.
+    ///
+    /// The child is handed its token before its record is published, and its
+    /// first act can be a `SessionStart` carrying it. Resolving a token only
+    /// against `agents` refused that report as `UnknownToken`, so a new agent's
+    /// first report was lost. [`AgentPtyRegistry::owner_of_hook_token`] reads
+    /// this too, under the same lock, so a token resolves from the instant it
+    /// is minted. Inserted and removed together with the `pending_spawns`
+    /// entry — by [`AgentPtyRegistry::reserve_spawn`] and by
+    /// [`SpawnReservation`] on both its release paths — so a token is
+    /// resolvable from exactly one of the two maps at every instant.
+    pending_hook_tokens: HashMap<String, String>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -6677,6 +6690,7 @@ impl<'a> SpawnReservation<'a> {
     fn give_up(&mut self, inner: &mut RegistryInner) {
         if let Some(id) = self.id.take() {
             inner.pending_spawns.remove(&id);
+            inner.pending_hook_tokens.remove(&id);
         }
         #[cfg(unix)]
         if let Some((pane, prior)) = self.prior_binding.take() {
@@ -6956,6 +6970,7 @@ impl AgentPtyRegistry {
                 hook_token_paneless_agents: HashSet::new(),
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
+                pending_hook_tokens: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
             }),
@@ -10065,71 +10080,27 @@ impl AgentPtyRegistry {
         // happens before `spawn`, not after. The post-fork check below stays —
         // it is the one that is atomic with the `agents.insert`, and this one is
         // not a substitute for it.
-        #[cfg(unix)]
-        let mut prior_binding = None;
-        let preallocated_id = {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(ref candidate) = pane_id_env
-                && (inner.cleanup_holds.contains(candidate.as_str())
-                    || inner
-                        .pending_spawns
-                        .values()
-                        .any(|reserved| reserved.as_deref() == Some(candidate.as_str()))
-                    || inner.agents.values().any(|a| {
-                        a.pane_id_env.as_deref() == Some(candidate.as_str())
-                            && !a.exited.load(Ordering::SeqCst)
-                    }))
-            {
-                // Issue #454 round 3: `cleanup_holds` is the third exclusion and
-                // the one that is not about a live occupant — a `StopAgent` is
-                // mid-way through taking this pane's state apart, and a
-                // generation that claimed it now would have that state deleted
-                // out from under it. See [`Self::hold_pane_for_cleanup`].
-                return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
-            }
-            let id = inner.next_id.to_string();
-            inner.next_id += 1;
-            inner.pending_spawns.insert(id.clone(), pane_id_env.clone());
-            // Issue #1077: from this instant the pane requires a token, and it
-            // keeps requiring one for the life of the daemon — see
-            // `RegistryInner::hook_token_panes`. Recorded under the SAME lock
-            // that reserves the pane, before the fork, so there is no moment at
-            // which a child could exist for this pane without the requirement.
-            // A spawn that then fails leaves the entry behind; that is harmless,
-            // because nothing legitimate signals for a pane with no process.
-            if let Some(ref pane) = pane_id_env {
-                inner.hook_token_panes.insert(pane.clone());
-            } else {
-                // Issue #318: the paneless counterpart, keyed by the id the
-                // spawn will carry. See `RegistryInner::hook_token_paneless_agents`.
-                inner.hook_token_paneless_agents.insert(id.clone());
-            }
-            // Issue #1396 item 3: bind the pane to the directory its prepared
-            // start verified, under the same lock and before the fork, for the
-            // reason the token requirement above is recorded here.
-            // Undone, with the reservation, if this start never publishes its
-            // agent ([`SpawnReservation`]).
-            #[cfg(unix)]
-            if let (Some(pane), Some(dir)) = (pane_id_env.as_ref(), dir) {
-                let prior = inner
-                    .prepared_pane_dirs
-                    .insert(pane.clone(), dir.identity());
-                prior_binding = Some((pane.clone(), prior));
-            }
-            id
-        };
-        let reservation = SpawnReservation {
-            registry: self,
-            id: Some(preallocated_id.clone()),
-            #[cfg(unix)]
-            prior_binding,
-        };
+        //
+        // Issue #318 (Qodo on PR #1559): the hook capability token is minted
+        // BEFORE the reservation and recorded by it, under the same lock. The
+        // child is handed the token below, before its record is published, and
+        // its very first act can be a `SessionStart` carrying it; resolving the
+        // token only against published records refused that report as
+        // `UnknownToken`. See `RegistryInner::pending_hook_tokens`.
+        let hook_token_for_record = crate::hook_provenance::mint();
+        //
+        // Issue #1396 item 3: `reserve_spawn` also binds the pane to the
+        // directory its prepared start verified, in that same acquisition, and
+        // the reservation it returns undoes the binding if this start never
+        // publishes its agent.
+        let (preallocated_id, reservation) =
+            self.reserve_spawn(&pane_id_env, &hook_token_for_record, dir)?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
 
-        // Issue #1077: mint this spawn's hook capability token in the same
-        // breath as its agent id, and for the same reason — the child's
+        // Issue #1077: hand the child the hook capability token minted above,
+        // in the same breath as its agent id and for the same reason — the child's
         // environment is the only channel the daemon has to the CLI the agent
         // will invoke, so the value has to exist before the fork.
         //
@@ -10143,7 +10114,6 @@ impl AgentPtyRegistry {
         // respawned pane would keep answering to its predecessor's token.
         opts.env
             .retain(|(k, _)| k != crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY);
-        let hook_token_for_record = crate::hook_provenance::mint();
         opts.env.push((
             crate::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY.to_string(),
             hook_token_for_record.clone(),
@@ -14903,6 +14873,87 @@ impl AgentPtyRegistry {
         Some(seed)
     }
 
+    /// Issue #454: admit a spawn — pre-allocate its registry id and RESERVE it
+    /// in [`RegistryInner::pending_spawns`], exclusively on its pane id — and
+    /// record that this daemon issued it a hook capability token. Returns the
+    /// pre-allocated id and the [`SpawnReservation`] that holds it.
+    ///
+    /// Issue #318: `hook_token` is the token minted for this spawn, recorded in
+    /// [`RegistryInner::pending_hook_tokens`] under this same acquisition so
+    /// [`Self::owner_of_hook_token`] resolves it before the record is published.
+    ///
+    /// Issue #1396 item 3: a prepared start (`dir` is `Some`) also binds its pane
+    /// to the directory it verified, in [`RegistryInner::prepared_pane_dirs`],
+    /// under this same acquisition and before the fork, for the reason the token
+    /// requirement is recorded here. The returned reservation undoes the
+    /// binding, with the rest of the reservation, if the start never publishes
+    /// its agent.
+    fn reserve_spawn(
+        &self,
+        pane_id_env: &Option<String>,
+        hook_token: &str,
+        dir: SpawnDir<'_>,
+    ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(candidate) = pane_id_env
+            && (inner.cleanup_holds.contains(candidate.as_str())
+                || inner
+                    .pending_spawns
+                    .values()
+                    .any(|reserved| reserved.as_deref() == Some(candidate.as_str()))
+                || inner.agents.values().any(|a| {
+                    a.pane_id_env.as_deref() == Some(candidate.as_str())
+                        && !a.exited.load(Ordering::SeqCst)
+                }))
+        {
+            // Issue #454 round 3: `cleanup_holds` is the third exclusion and
+            // the one that is not about a live occupant — a `StopAgent` is
+            // mid-way through taking this pane's state apart, and a
+            // generation that claimed it now would have that state deleted
+            // out from under it. See [`Self::hold_pane_for_cleanup`].
+            return Err(AgentPtyError::DuplicatePaneId(candidate.clone()));
+        }
+        let id = inner.next_id.to_string();
+        inner.next_id += 1;
+        inner.pending_spawns.insert(id.clone(), pane_id_env.clone());
+        inner
+            .pending_hook_tokens
+            .insert(id.clone(), hook_token.to_string());
+        // Issue #1077: from this instant the pane requires a token, and it
+        // keeps requiring one for the life of the daemon — see
+        // `RegistryInner::hook_token_panes`. Recorded under the SAME lock
+        // that reserves the pane, before the fork, so there is no moment at
+        // which a child could exist for this pane without the requirement.
+        // A spawn that then fails leaves the entry behind; that is harmless,
+        // because nothing legitimate signals for a pane with no process.
+        if let Some(pane) = pane_id_env {
+            inner.hook_token_panes.insert(pane.clone());
+        } else {
+            // Issue #318: the paneless counterpart, keyed by the id the
+            // spawn will carry. See `RegistryInner::hook_token_paneless_agents`.
+            inner.hook_token_paneless_agents.insert(id.clone());
+        }
+        #[cfg(unix)]
+        let prior_binding = match (pane_id_env, dir) {
+            (Some(pane), Some(dir)) => {
+                let prior = inner
+                    .prepared_pane_dirs
+                    .insert(pane.clone(), dir.identity());
+                Some((pane.clone(), prior))
+            }
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let _ = dir;
+        let reservation = SpawnReservation {
+            registry: self,
+            id: Some(id.clone()),
+            #[cfg(unix)]
+            prior_binding,
+        };
+        Ok((id, reservation))
+    }
+
     /// Issue #1077: the record a hook capability token was minted for, or `None`
     /// when this daemon did not mint it.
     ///
@@ -14919,6 +14970,13 @@ impl AgentPtyRegistry {
     /// a survivor into a forger. Liveness is not what the check rests on: the
     /// token names exactly one spawn whether or not that spawn's child is still
     /// running.
+    ///
+    /// **In-flight spawns are included too** (issue #318, Qodo on PR #1559): a
+    /// token resolves from the instant its spawn is reserved, through
+    /// `RegistryInner::pending_hook_tokens`, to that reservation's id and pane —
+    /// because the child holds the token before its record is published, and
+    /// its first report must not be refused as `UnknownToken`. A token that was
+    /// never minted is in neither map.
     pub fn owner_of_hook_token(&self, token: &str) -> Option<crate::hook_provenance::TokenOwner> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -14928,6 +14986,20 @@ impl AgentPtyRegistry {
             .map(|(id, agent)| crate::hook_provenance::TokenOwner {
                 agent_id: id.clone(),
                 pane_id: agent.pane_id_env.clone(),
+            })
+            .or_else(|| {
+                inner
+                    .pending_hook_tokens
+                    .iter()
+                    .find(|(_, minted)| crate::hook_provenance::tokens_match(minted, token))
+                    .and_then(|(id, _)| {
+                        inner.pending_spawns.get(id).map(|pane| {
+                            crate::hook_provenance::TokenOwner {
+                                agent_id: id.clone(),
+                                pane_id: pane.clone(),
+                            }
+                        })
+                    })
             })
     }
 
@@ -14949,6 +15021,26 @@ impl AgentPtyRegistry {
             .agents
             .get(agent_id)
             .map(|a| a.hook_token.clone())
+    }
+
+    /// Test seam for the window between a spawn's reservation and the
+    /// publication of its record: reserves a spawn exactly as
+    /// [`Self::spawn_agent`] does, mints its token, and stops there — no child,
+    /// no record. Returns `(agent_id, token)`. The reservation is deliberately
+    /// left in place, which is the state a real spawn is in while its child is
+    /// being forked.
+    ///
+    /// `#[cfg(test)]` for [`Self::hook_token_of`]'s reason: it hands a token
+    /// back to an in-process caller.
+    #[cfg(test)]
+    pub fn reserve_spawn_for_test(&self, pane_id: Option<&str>) -> (String, String) {
+        let token = crate::hook_provenance::mint();
+        let (id, mut reservation) = self
+            .reserve_spawn(&pane_id.map(str::to_string), &token, None)
+            .expect("reserve a spawn");
+        // Disarm the guard so the reservation outlives this call.
+        reservation.id = None;
+        (id, token)
     }
 
     /// Issue #1077: whether this daemon has EVER issued a hook capability token
