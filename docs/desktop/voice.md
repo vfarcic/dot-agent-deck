@@ -114,7 +114,7 @@ A list is not offered while a confirmation is open, or when more than nine thing
 
 ## Typing mode
 
-When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing"). From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
+When you want to dictate a longer prompt, you do not have to start every sentence with "type". Open the agent's pane and say "type on" (or "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on", "start talking", "speaking on", "start speaking", "dictate on"). Say it on its own: "I was talking on the phone" does not start typing mode. From then on, everything you say is typed into that agent's prompt, word for word, until you stop.
 
 While typing mode is on:
 
@@ -124,12 +124,12 @@ While typing mode is on:
 - Nothing is sent to the agent until you say "send it" (or "send", "submit", "enter", "press enter", "go ahead", "finished", "end") on its own, or press `Enter` yourself. After a send, typing mode stays on, so you can dictate the next prompt the same way.
 - You can also end what you say with "send it", "send", "submit" or "press enter" as a separate last sentence, for example "What's the weather over there? Send it." Everything before it is typed and then sent; the last sentence itself is not typed. The other send phrases ("enter", "go ahead", "finished", "end") send only when said on their own, so "Fix the tests. Go ahead." is typed in full and not sent.
 - If you stop talking for four seconds with words typed but not yet sent, “send it” to send is highlighted as a reminder. It never sends anything itself; the highlight goes away when you speak again, send, or stop typing.
-- Only a handful of things you can say still act as commands, and only when you say them on their own (or, for the four send phrases above, as a separate last sentence): "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing"), the send phrases above, and "voice off" (or "mute", "mic off", "stop listening", "stop voice"). Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
+- Only a handful of things you can say still act as commands, and only when you say them on their own (or, for the four send phrases above, as a separate last sentence): "type off" (or "typing off", "stop typing", "dictation off", "stop dictation", "done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate off"), the send phrases above, and "voice off" (or "mute", "mic off", "stop listening", "stop voice"). Said inside a longer sentence, such as "tell the reviewer to send it when the tests pass", they are typed like anything else. Other commands, such as opening a screen, do not work until you stop typing.
 - If you speak for 30 seconds without a pause, what you said is still typed, and the app tells you it reached the limit.
 
 Typing mode ends, and **nothing is sent** when it does, if you:
 
-- say "type off", or say "voice off", which also turns voice off;
+- say "type off" (or one of the other ways to stop listed above), which leaves voice on, or say "voice off", which also turns voice off. "Stop talking" ends typing mode and leaves voice on; to turn the microphone off, say "voice off" or "stop listening";
 - press **Stop typing** (you can also reach it with `Tab`), which leaves voice on, or press the Voice button, which turns voice off;
 - close the pane (for example with `Escape`), switch the pane to another tab such as **Diff** or **Checks**, open another screen, open another agent, or switch daemons;
 - or a confirmation opens, for example to stop an agent.
