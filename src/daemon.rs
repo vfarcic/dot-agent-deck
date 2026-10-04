@@ -1817,12 +1817,20 @@ fn notify_orchestrator_of_quota_block(
 
 /// Issue #714: normalise a PRODUCER's raw event before it is ingested.
 ///
-/// A producer's `quota_blocked` is admitted: it is status reporting from the
-/// same producers, over the same same-uid socket, as every other status, so it
-/// adds no trust boundary (`crate::hook_provenance` leaves raw events out of
-/// scope). What is guarded is where the privilege is used — the orchestrator
-/// notice is fixed text claimed only for a delegation bound to the event's
-/// agent — and the shape of what is stored, normalised here:
+/// Runs after the raw-event provenance gate
+/// ([`crate::hook_provenance::classify_event`], issue #318), so a refused event
+/// never reaches it. A producer's `quota_blocked` that the gate admitted is
+/// kept, and what it may do depends on the gate's verdict rather than on
+/// anything decided here: an attested report naming its agent latches that
+/// agent's quota block (the gate refuses one naming any agent but its token's),
+/// and the orchestrator notice (fixed text) is claimed only for a delegation
+/// bound to that agent. Under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` a tokenless
+/// report on a pane that was issued a token is admitted the same way, at the
+/// cost [`crate::hook_provenance::Policy::WarnOnly`] describes. An outside
+/// agent's report (`Unattested`) reaches its own unproven card and moves no
+/// latch, so it can raise no notice ([`ingest_hook_event`]). What this
+/// function guards is the shape of what is stored, normalised here for every
+/// admitted event:
 ///
 /// * on a `quota_blocked`, the kind is mapped onto a known value, the reset is
 ///   kept only when it parses and lies in a sane window, and the detail is

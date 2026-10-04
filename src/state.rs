@@ -44,12 +44,15 @@ pub const MAX_UNPROVEN_SESSIONS: usize = 256;
 /// case is about an eighth of that.
 const MAX_UNPROVEN_RECENT_EVENTS: usize = 8;
 
-/// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id.
-/// Subagents that join a wait past this many are counted in
-/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an id
-/// forgotten while its prompt is still open would let the card leave the wait
-/// with that prompt pending.
-const MAX_SUBAGENT_IDS: usize = 64;
+/// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id —
+/// the whole bound on what a wait tracks, at a few kilobytes per session for
+/// ordinary ids. Up to this many subagents a wait is exact: a re-ask from an
+/// id it holds is the same subagent, and a stop from an id it does not hold
+/// is one that never asked. Subagents that join past this many are counted in
+/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an
+/// id forgotten while its prompt is still open would let the card leave the
+/// wait with that prompt pending.
+const MAX_SUBAGENT_IDS: usize = 128;
 
 /// Issue #697: one session [`AppState`] holds as UNPROVEN — see
 /// [`MAX_UNPROVEN_SESSIONS`].
@@ -982,15 +985,19 @@ pub struct SessionState {
 pub struct SubagentWait {
     pub subagent_ids: Vec<String>,
     pub resume_idle: bool,
-    /// Issue #697: how many subagents joined this wait after
-    /// [`MAX_SUBAGENT_IDS`] ids were already recorded. Their ids are not kept,
-    /// so a `SubagentStop` naming an id not in [`Self::subagent_ids`] counts one
-    /// of them off while this is non-zero, and the wait ends only once both are
-    /// empty. Without the ids the count cannot tell a re-ask from a new
-    /// subagent, or a waiting subagent's stop from one that never asked; it
-    /// errs on both sides only past the cap. Additive optional on the wire,
-    /// the `blocked` precedent: an older reader ignores it and a newer one
-    /// reads its absence as zero.
+    /// Issue #697: how many asks arrived from ids not in
+    /// [`Self::subagent_ids`] after [`MAX_SUBAGENT_IDS`] ids were already
+    /// recorded. Their ids are not kept, so a `SubagentStop` naming an id not
+    /// in [`Self::subagent_ids`] counts one off while this is non-zero, and the
+    /// wait ends only once both are empty. Without the ids the count cannot
+    /// tell a re-ask from a new subagent, or a waiting subagent's stop from one
+    /// that never asked, so once a wait holds more than [`MAX_SUBAGENT_IDS`]
+    /// subagents it is approximate in both directions: an untracked subagent
+    /// that asks twice is counted twice and can hold the card on Needs Input
+    /// after it stops (until the main thread moves), and a stop from an
+    /// untracked subagent that never asked counts off one that did. Below that
+    /// it stays zero. Additive optional on the wire, the `blocked` precedent:
+    /// an older reader ignores it and a newer one reads its absence as zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub overflow: u32,
 }
@@ -16179,9 +16186,10 @@ impl AppState {
                     }
                     Some(id) => session.subagent_wait.take().map(|mut wait| {
                         if !wait.subagent_ids.contains(&id) {
-                            // Issue #697: bounded — past the cap a subagent is
+                            // Issue #697: bounded — past the cap an ask is
                             // counted rather than remembered, so the wait stays
-                            // open for it instead of forgetting its prompt.
+                            // open for it instead of forgetting its prompt (see
+                            // `SubagentWait::overflow` for what that costs).
                             if wait.subagent_ids.len() >= MAX_SUBAGENT_IDS {
                                 wait.overflow = wait.overflow.saturating_add(1);
                             } else {
@@ -25503,9 +25511,10 @@ while True:
 
     /// Issue #697 (Qodo on #1559): more subagents waiting at once than a
     /// [`SubagentWait`] remembers by id must not end the wait while one of
-    /// them still has its prompt open. 65 subagents ask for permission, the
-    /// 64 most recent stop, and the card must still read Needs Input until the
-    /// first one — the id that did not fit — stops too.
+    /// them still has its prompt open. One more subagent than
+    /// [`MAX_SUBAGENT_IDS`] asks for permission, all but the first stop —
+    /// the last of them the one counted rather than remembered — and the card
+    /// must still read Needs Input until the first one stops too.
     #[test]
     fn subagent_wait_over_the_id_cap_stays_open_until_every_subagent_stops() {
         let mut state = AppState::default();
@@ -25541,6 +25550,45 @@ while True:
             status(&state),
             SessionStatus::Thinking,
             "the last waiting subagent stopping ends the wait"
+        );
+    }
+
+    /// Issue #697 (Qodo on #1559, r4176756571): a subagent that asks twice is
+    /// still one subagent. 65 subagents ask — past the 64 ids a wait once
+    /// remembered — the 65th asks again, and once all 65 have stopped the wait
+    /// must be over: counting the repeat as a second subagent left the card on
+    /// Needs Input after every subagent had stopped.
+    #[test]
+    fn subagent_wait_a_repeated_ask_is_not_a_new_subagent() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        let total = 65;
+        for i in 0..total {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        let repeated = format!("sub-{}", total - 1);
+        state.apply_event(subagent_event(EventType::PermissionRequest, &repeated, 3));
+
+        for i in 0..total - 1 {
+            state.apply_event(subagent_event(
+                EventType::SubagentStop,
+                &format!("sub-{i}"),
+                4,
+            ));
+            assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, &repeated, 5));
+        assert_eq!(
+            status(&state),
+            SessionStatus::Thinking,
+            "every subagent has stopped, so the wait is over"
         );
     }
 
