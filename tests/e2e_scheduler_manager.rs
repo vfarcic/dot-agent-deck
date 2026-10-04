@@ -681,11 +681,9 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
     drop(scratch);
 }
 
-/// Return the visible synthetic side-pane line markers from a rendered grid.
-/// Comparing the marker sequence isolates pane scrollback from manager-dialog
-/// changes such as moving the selected schedule row.
-/// Sample the visible side-pane markers only once the frame has stopped
-/// changing them.
+/// Sample the visible side-pane markers only from a frame in which the
+/// Schedules dialog is painted down to its bottom border, and once two such
+/// reads agree.
 ///
 /// A single-shot `snapshot_grid()` read is unsound here for the same reason a
 /// single-shot `find_in_grid` is (issues #807/#395): ratatui flushes a frame as
@@ -698,17 +696,32 @@ fn manager_010_blank_default_command_falls_back_to_claude() {
 /// exactly how `manager_016` reddened `e2e-deterministic` on four unrelated
 /// branches -- one of them a pnpm bump carrying no Rust at all.
 ///
-/// Two consecutive agreeing reads is a sound settle here because
-/// `wait_until_grid` sleeps 20ms between polls, which is orders of magnitude
-/// longer than a ratatui frame takes to flush.
+/// Two agreeing reads alone are NOT a settle (issue #818). The deck writes a
+/// frame through a buffered stdout, so a large frame reaches the PTY in several
+/// `write`s, and on a starved machine the deck can be descheduled between two
+/// of them for far longer than the 20ms `wait_until_grid` sleeps between polls.
+/// Both reads then see the same half-painted overlay and agree on it. CI caught
+/// exactly that twice, on runners at 100% CPU pressure: the baseline was read
+/// from an overlay painted only down to the row under `bravo`, its button and
+/// `Esc close` rows still missing, so four markers the full dialog covers were
+/// counted as visible and every later, fully painted read looked like a leak.
+/// The bottom border is the positive signal instead: ratatui emits a frame's
+/// changed cells in row-major order, so once that row is on screen every dialog
+/// row above it is too, and opening the dialog changes no side-pane marker
+/// below it.
 ///
-/// Deliberately settles on ANY value, including an empty set: a genuine wheel
-/// leak could scroll every marker out of view, and this must then return that
-/// empty set so the caller's assertion reports the leak, rather than spinning
-/// to a wait timeout that says nothing about why.
+/// Deliberately settles on ANY marker value, including an empty set: a genuine
+/// wheel leak could scroll every marker out of view, and this must then return
+/// that empty set so the caller's assertion reports the leak, rather than
+/// spinning to a wait timeout that says nothing about why. A leak leaves the
+/// dialog painted, so the border condition does not hold it back.
 fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
     let last: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
     deck.wait_until_grid(what, |grid| {
+        if !schedules_dialog_fully_painted(grid) {
+            *last.borrow_mut() = None;
+            return false;
+        }
         let now = visible_side_scroll_markers(grid);
         let mut prev = last.borrow_mut();
         let settled = prev.as_ref() == Some(&now);
@@ -718,6 +731,26 @@ fn settled_side_scroll_markers(deck: &TuiDeck, what: &str) -> Vec<String> {
     last.into_inner().unwrap_or_default()
 }
 
+/// Whether the Schedules dialog is painted down to its bottom border: a row
+/// holding `└`, a run of `─` exactly as wide as the dialog's top border, and
+/// `┘`. The width comes from the top border, so the card borders behind the
+/// dialog (which carry text such as `Last:` in their bottom edge) cannot
+/// satisfy it.
+fn schedules_dialog_fully_painted(grid: &str) -> bool {
+    let Some(width) = grid.lines().find_map(|line| {
+        let top = &line[line.find("┌ Schedules")?..];
+        let end = top.find('┐')?;
+        Some(top[..end].chars().count() + 1)
+    }) else {
+        return false;
+    };
+    let bottom = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
+    grid.contains(&bottom)
+}
+
+/// Return the visible synthetic side-pane line markers from a rendered grid.
+/// Comparing the marker sequence isolates pane scrollback from manager-dialog
+/// changes such as moving the selected schedule row.
 fn visible_side_scroll_markers(grid: &str) -> Vec<String> {
     const PREFIX: &str = "SIDE_SCROLL_LINE_";
     grid.lines()
