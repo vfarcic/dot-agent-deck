@@ -1975,10 +1975,13 @@ struct PromptDelivery {
     /// the identity of a generation this delivery saw, the count is the number of
     /// conversations it MISSED.
     closures_at_write: Option<u64>,
-    /// Issue #1520: [`crate::state::AppState::event_stream_gaps`] at the instant
-    /// of the FIRST write — stamped beside [`Self::closures_at_write`], at the
-    /// same moment (before the RPC) and for the same reason. `None` until then.
-    /// See [`delivery_outlived_event_gap`].
+    /// Issue #1520: [`crate::state::AppState::event_stream_gaps`] as of the
+    /// request that may have written first. Stamped beside
+    /// [`Self::closures_at_write`] and at the same moment (before the RPC), but
+    /// re-stamped on every request until one may have written: a request the
+    /// daemon refused wrote nothing, and a gap before the write that followed it
+    /// hid nothing the write depends on (Qodo on #1553). `None` until the first
+    /// request. See [`delivery_outlived_event_gap`].
     gaps_at_write: Option<u64>,
     delivery_id: String,
     /// Issue #424 (reviewer blocker 2): which WIRE-IDENTITY epoch this delivery
@@ -4264,8 +4267,13 @@ fn process_pending_seed_prompts(
                 && delivery.closures_at_write.is_none()
             {
                 delivery.closures_at_write = Some(closures);
-                // Issue #1520: and the event-stream gap count, at the same
-                // instant — see [`PromptDelivery::gaps_at_write`].
+            }
+            // Issue #1520: and the event-stream gap count, at the same instant,
+            // re-read for every request until one may have written — see
+            // [`PromptDelivery::gaps_at_write`].
+            if let Some(delivery) = deliveries.get_mut(&sp.pane_id)
+                && !delivery_may_have_written(delivery)
+            {
                 delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
             }
             let issued = IssuedPromptSend {
@@ -4700,12 +4708,23 @@ enum SubmissionEvidence {
 /// counter
 /// because that needs a new wire field for an event (a broken subscription) that
 /// is rare, while stopping is safe with what the daemon already sends. A
-/// delivery that has written nothing (`None`) is untouched: it binds against the
-/// resynchronized state like any other.
+/// delivery that has written nothing is untouched: it binds against the
+/// resynchronized state like any other, and so is one whose every request so far
+/// was refused, which wrote nothing either (see [`delivery_may_have_written`]).
 fn delivery_outlived_event_gap(snapshot: &AppState, delivery: &PromptDelivery) -> bool {
-    delivery
-        .gaps_at_write
-        .is_some_and(|at_write| snapshot.event_stream_gaps() > at_write)
+    delivery_may_have_written(delivery)
+        && delivery
+            .gaps_at_write
+            .is_some_and(|at_write| snapshot.event_stream_gaps() > at_write)
+}
+
+/// Issue #1520: whether any request of this delivery may have put bytes in the
+/// pane — an `Applied` or `Queued` outcome (`attempts`), or a request whose
+/// response was lost after it may have reached the daemon's write
+/// ([`PromptDelivery::write_unacknowledged`]). A refusal, which writes nothing,
+/// is neither.
+fn delivery_may_have_written(delivery: &PromptDelivery) -> bool {
+    delivery.attempts > 0 || delivery.write_unacknowledged
 }
 
 /// Issue #424 (reviewer findings B1/B2, reviewer blocker 1): is the
@@ -5639,8 +5658,11 @@ fn deliver_orchestrator_prompt(
         && delivery.closures_at_write.is_none()
     {
         delivery.closures_at_write = Some(closures);
-        // Issue #1520: see the seed path's twin and
-        // [`PromptDelivery::gaps_at_write`].
+    }
+    // Issue #1520: see the seed path's twin and [`PromptDelivery::gaps_at_write`].
+    if let Some(delivery) = ui.prompt_delivery.get_mut(start_pane_id.as_str())
+        && !delivery_may_have_written(delivery)
+    {
         delivery.gaps_at_write = Some(snapshot.event_stream_gaps());
     }
     let issued = IssuedPromptSend {
@@ -38727,6 +38749,56 @@ mod tests {
         assert!(
             race_delivered,
             "control: once the TUI observes the start itself, the seed binds it and is delivered"
+        );
+    }
+
+    /// Issue #1520 (Qodo on #1553): which deliveries an event-stream gap stops.
+    /// Only one that may have written: an `Applied`/`Queued` outcome, or a
+    /// response lost after the request may have reached the write. One whose
+    /// every request was refused wrote nothing, and is left to bind against the
+    /// resynchronized state; a gap that came before the stamp is not one it
+    /// outlived.
+    #[test]
+    fn an_event_stream_gap_stops_only_a_delivery_that_may_have_written() {
+        let mut snapshot = AppState::default();
+        let stamped = |attempts: u32, write_unacknowledged: bool| PromptDelivery {
+            expected_agent_id: Some("agent".to_string()),
+            expected_session_id: None,
+            observed_generation: None,
+            refusal_generation: None,
+            write_unacknowledged,
+            closures_at_write: Some(0),
+            gaps_at_write: Some(0),
+            delivery_id: "gap-policy".to_string(),
+            epoch: 0,
+            wire_issued: true,
+            attempts,
+            watermark: None,
+            can_report_prompts: false,
+        };
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &stamped(1, false)),
+            "no gap yet, so nothing to outlive"
+        );
+        snapshot.note_event_stream_gap();
+        assert!(
+            delivery_outlived_event_gap(&snapshot, &stamped(1, false)),
+            "an applied write before the gap stops"
+        );
+        assert!(
+            delivery_outlived_event_gap(&snapshot, &stamped(0, true)),
+            "a lost response may have written, so it stops too"
+        );
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &stamped(0, false)),
+            "a delivery whose every request was refused wrote nothing, so a gap must not \
+             stop it"
+        );
+        let mut after = stamped(1, false);
+        after.gaps_at_write = Some(snapshot.event_stream_gaps());
+        assert!(
+            !delivery_outlived_event_gap(&snapshot, &after),
+            "a write stamped after the gap did not outlive it"
         );
     }
 
