@@ -486,7 +486,8 @@ async fn question_desktop_004_a_non_answer_falls_through_and_no_is_the_question_
 /// switch said on its own ("type on", "talking on", "stop speaking", "dictate
 /// off", …) is a non-answer decided locally, with no model call, even while a
 /// free-text option waits for its words, so it goes on to switch typing mode.
-/// An option whose label is exactly that phrase is still answered.
+/// An option the deck can answer whose label is exactly that phrase is still
+/// answered, politely or not; a keyboard-only one does not stop the switch.
 #[tokio::test]
 async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
     use crate::voice::dictation::{DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES};
@@ -551,8 +552,37 @@ async fn question_desktop_013_a_typing_mode_switch_is_not_an_answer() {
     let mut labelled = permission(AnswerChannel::Held);
     labelled.questions[0].options[0].label = "Start typing".to_string();
     let labelled = map_pending_question(&labelled);
-    let verdict = say(&resolver, &labelled, &[], "start typing").await;
-    assert_eq!(form_of(&verdict), [pick(0, &[1])]);
+    for said in [
+        "start typing",
+        "Start typing, please",
+        "Okay, start typing",
+        "Okay, start typing, please.",
+    ] {
+        let verdict = say(&resolver, &labelled, &[], said).await;
+        assert_eq!(form_of(&verdict), [pick(0, &[1])], "{said:?} picks it");
+    }
+    assert_eq!(resolver.question_calls(), 0);
+
+    // An option labelled with the phrase that the deck cannot send — keyboard
+    // only, or on a question the deck cannot answer — leaves it a switch.
+    let mut keyboard_only = permission(AnswerChannel::Held);
+    keyboard_only.questions[0].options[0].label = "Start typing".to_string();
+    keyboard_only.questions[0].options[0].keyboard_only = true;
+    let keyboard_only = map_pending_question(&keyboard_only);
+    let mut unanswerable = permission(AnswerChannel::Unsupported);
+    unanswerable.questions[0].options[0].label = "Start typing".to_string();
+    let unanswerable = map_pending_question(&unanswerable);
+    assert!(!unanswerable.answerable);
+    for question in [&keyboard_only, &unanswerable] {
+        for said in ["start typing", "Okay, start typing, please."] {
+            assert_eq!(
+                say(&resolver, question, &[], said).await,
+                QuestionVerdict::NotAnswer,
+                "{said:?} still switches typing mode over {:?}",
+                question.channel
+            );
+        }
+    }
     assert_eq!(resolver.question_calls(), 0);
 }
 

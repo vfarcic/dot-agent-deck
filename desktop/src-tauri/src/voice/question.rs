@@ -64,7 +64,7 @@ use serde_json::{Value, json};
 use super::Transcript;
 use super::choice::ordinal;
 use super::dictation::{DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES};
-use super::outcome::said_whole;
+use super::outcome::{said_whole, whole_utterance};
 use super::resolver::{IntentError, IntentResolver};
 use super::table::spoken_words;
 use crate::dto::{DesktopPendingQuestion, DesktopQuestion, DesktopQuestionOption, safe_message};
@@ -364,13 +364,19 @@ pub async fn resolve(
         .iter()
         .filter_map(|selection| check_selection(question, selection).ok())
         .collect();
-    let words = spoken_words(transcript.text());
+    let mut words = spoken_words(transcript.text());
     // A typing-mode switch said on its own is never the question's, not even
     // the words a free-text option waits for: it goes on to switch the mode,
     // as it does with no question pending. An option the agent labelled with
-    // exactly those words is still that option.
-    if is_typing_mode_switch(transcript.text()) && !names_an_option(question, &words) {
-        return finish(QuestionVerdict::NotAnswer, None);
+    // exactly those words, and that the deck can answer, is still that option
+    // — its label compared as the switch is, an edge politeness word ignored,
+    // so "okay, start typing" picks it whenever "start typing" would.
+    if is_typing_mode_switch(transcript.text()) {
+        let said = whole_utterance(transcript.text());
+        if !names_an_answerable_option(question, &said) {
+            return finish(QuestionVerdict::NotAnswer, None);
+        }
+        words = said;
     }
     let cancels = CANCEL_PHRASES.contains(&words.join(" ").as_str());
     if cancels && (!form.is_empty() || awaiting_text.is_some()) {
@@ -432,13 +438,17 @@ fn is_typing_mode_switch(text: &str) -> bool {
         || said_whole(text, DICTATION_OFF_PHRASES.iter().copied())
 }
 
-/// Whether `words` are exactly some option's label, on any question.
-fn names_an_option(question: &DesktopPendingQuestion, words: &[String]) -> bool {
-    question
-        .questions
-        .iter()
-        .flat_map(|q| q.options.iter())
-        .any(|option| spoken_words(&option.label) == words)
+/// Whether `words` are exactly the label of some option the deck can answer,
+/// on any question. A keyboard-only option, or any option of a question the
+/// deck cannot answer at all, does not count: saying its label could only be
+/// refused, so it must not stand in the way of a typing-mode switch.
+fn names_an_answerable_option(question: &DesktopPendingQuestion, words: &[String]) -> bool {
+    question.answerable
+        && question
+            .questions
+            .iter()
+            .flat_map(|q| q.options.iter())
+            .any(|option| option.answerable && spoken_words(&option.label) == words)
 }
 
 /// The local fast path: an utterance that is exactly one option's label, or
