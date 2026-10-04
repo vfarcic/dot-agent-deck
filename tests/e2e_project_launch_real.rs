@@ -342,21 +342,11 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
     // while the deck's grid showed the agent's `ls -a` listing the sentinel
     // intact. The grid is the deck's own vt100 render of the pane opened above,
     // so it is the screen a user is looking at. The raw route stays for an agent
-    // whose listing has already scrolled off that screen, polled every ~750 ms
-    // (each read pulls the pane's whole scrollback across the socket) rather
-    // than at the grid's 50 ms.
+    // whose listing has already scrolled off that screen
+    // (`TuiDeck::wait_for_grid_or_pane_text_within` owns both polls).
     const REPORT_WAIT: Duration = Duration::from_secs(240);
-    let sentinel_key = common::search_key(SENTINEL);
-    let polls = std::cell::Cell::new(0u32);
-    let reported = deck.wait_for_grid_predicate_within(REPORT_WAIT, |grid| {
-        if grid.contains(SENTINEL) {
-            return true;
-        }
-        let n = polls.get();
-        polls.set(n + 1);
-        n.is_multiple_of(15)
-            && common::pane_search_key_on(&socket, &agent_id).contains(&sentinel_key)
-    });
+    let reported =
+        deck.wait_for_grid_or_pane_text_within(&socket, &agent_id, SENTINEL, REPORT_WAIT);
     assert!(
         reported,
         "the coordinator never reported the fixture sentinel {SENTINEL:?} within {}s. It was \

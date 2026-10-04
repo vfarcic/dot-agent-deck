@@ -1721,6 +1721,45 @@ impl TuiDeck {
         }
     }
 
+    /// Wait for `needle` on this deck's rendered grid, or in the daemon-side
+    /// scrollback of pane `agent_id` (wrap-insensitively, as
+    /// [`wait_for_pane_text_on`]) for an agent whose output has already scrolled
+    /// off the screen. Returns `true` as soon as either holds, `false` if
+    /// `timeout` elapses.
+    ///
+    /// The grid is the screen a user is looking at, and it is the route that
+    /// matters for an agent that redraws differentially (Claude Code moves the
+    /// cursor over characters already on screen instead of rewriting them, so
+    /// stripping the escapes out of its raw scrollback can drop characters —
+    /// issue #1396). Decision 21: the polling lives here, never in an
+    /// `e2e_*.rs` body. The grid is read every 50 ms; the scrollback, which
+    /// pulls the pane's whole ring across the attach socket, at most every
+    /// 750 ms.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn wait_for_grid_or_pane_text_within(
+        &self,
+        socket: &Path,
+        agent_id: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        const PANE_READ_EVERY: Duration = Duration::from_millis(750);
+        let key = search_key(needle);
+        let next_pane_read = std::cell::Cell::new(Instant::now());
+        self.wait_for_grid_predicate_within(timeout, |grid| {
+            if grid.contains(needle) {
+                return true;
+            }
+            let now = Instant::now();
+            if now < next_pane_read.get() {
+                return false;
+            }
+            next_pane_read.set(now + PANE_READ_EVERY);
+            pane_search_key_on(socket, agent_id).contains(&key)
+        })
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///
