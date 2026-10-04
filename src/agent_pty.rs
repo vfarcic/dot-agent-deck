@@ -19381,6 +19381,71 @@ mod spawn_tests {
         );
     }
 
+    /// Issue #318 against issue #1396 item 2: the non-directory-cwd refusal
+    /// fires inside the fork step, AFTER `reserve_spawn` has reserved the pane
+    /// and recorded its minted hook token as pending. The refusal must give
+    /// both up, or the token would keep resolving to a spawn that never
+    /// happened and the pane would stay reserved. Control: the same pane then
+    /// spawns in a real directory, and that token resolves to the record.
+    #[test]
+    fn a_spawn_refused_for_a_non_directory_cwd_leaves_no_pending_token() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let missing = root.path().join("missing");
+        let missing = missing.to_str().expect("utf-8 tempdir");
+        let real = root.path().to_str().expect("utf-8 tempdir");
+        let pane = "non-dir-cwd-token-318";
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        for pane_env in [Some(pane), None] {
+            let env = pane_env
+                .map(|p| vec![(DOT_AGENT_DECK_PANE_ID.to_string(), p.to_string())])
+                .unwrap_or_default();
+            let opts = SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(missing),
+                env,
+                ..SpawnOptions::default()
+            };
+            match registry.spawn_agent(opts) {
+                Err(AgentPtyError::CwdNotADirectory(_)) => {}
+                other => panic!("{pane_env:?}: expected CwdNotADirectory, got {other:?}"),
+            }
+            let inner = registry.inner.lock().unwrap();
+            assert!(
+                inner.pending_spawns.is_empty(),
+                "{pane_env:?}: the refused spawn must give up its reservation"
+            );
+            assert!(
+                inner.pending_hook_tokens.is_empty(),
+                "{pane_env:?}: the refused spawn must give up its pending token"
+            );
+        }
+        assert!(!registry.has_live_or_reserved_pane(pane));
+
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(real),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("control: the pane spawns in a real directory");
+        let token = registry.hook_token_of(&id).expect("the record's token");
+        assert_eq!(
+            registry.owner_of_hook_token(&token).map(|o| o.agent_id),
+            Some(id)
+        );
+        assert!(
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .pending_hook_tokens
+                .is_empty()
+        );
+        registry.shutdown_all();
+    }
+
     /// Issue #1396 item 2, on a respawn (Greptile / Qodo, PR #1557): a pane whose
     /// recorded cwd has been deleted is refused BEFORE the respawn lifts its
     /// record out and terminates its child, so `pane restart` or a `clear = true`
