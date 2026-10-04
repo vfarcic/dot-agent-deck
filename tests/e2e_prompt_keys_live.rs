@@ -391,7 +391,8 @@ fn prompt_voice_keys_002_clear_empties_a_live_claude_prompt() {
 /// and a dictated tail into its prompt through an attach stream, then write the
 /// delete key the daemon serves once per tail character in one write. Exactly
 /// the tail must go: a word typed straight after reads contiguously after the
-/// kept word and its space, and the agent is still running.
+/// kept word and its space. Then a 500-character dictation is removed the same
+/// way, in one write of 500 deletes, and the agent is still running.
 #[spec("prompt/voice-keys/003")]
 #[test]
 fn prompt_voice_keys_003_delete_char_removes_exactly_the_last_characters() {
@@ -416,7 +417,42 @@ fn prompt_voice_keys_003_delete_char_removes_exactly_the_last_characters() {
         "exactly the tail removed — no more and no less",
         &format!("{KEPT}{NEXT}"),
     );
+
+    // A long dictation, as long as voice ever scratches without nearing the
+    // 800-character paste collapse, removed by one write of deletes. Written
+    // only once the prompt before it is on screen: two writes read together
+    // are one paste to Claude, and 808 characters would collapse.
+    let long = long_dictation(LONG_SCRATCH_CHARS);
+    writer.write(&long);
+    claude.deck.wait_until_grid_then_hold(
+        "the long dictation settled in Claude's input box",
+        BEFORE_SUBMIT,
+        |grid| grid.contains(LONG_MARKER) && !grid.contains("[Pasted"),
+    );
+    writer.write(&claude.keys.delete_char.bytes.repeat(long.chars().count()));
+    writer.write(FINAL);
+    claude.wait_for_input_text(
+        "exactly the long dictation removed — no more and no less",
+        &format!("{KEPT}{NEXT}{FINAL}"),
+    );
     claude.assert_still_running("the deletes");
+}
+
+/// How long `prompt/voice-keys/003`'s long scratch is, in characters.
+const LONG_SCRATCH_CHARS: usize = 500;
+/// The start of the long dictation, which shows it reached the input box.
+const LONG_MARKER: &str = "voicekeys_longtail_5e2b";
+/// What is written after the long dictation is deleted.
+const FINAL: &str = "voicekeys_final_7c19";
+
+/// A dictated write of exactly `chars` characters, as voice writes one: words
+/// and a trailing space, opening with [`LONG_MARKER`].
+fn long_dictation(chars: usize) -> String {
+    let mut text = format!(" {LONG_MARKER} ");
+    while text.chars().count() < chars {
+        text.push_str("and some more dictated words ");
+    }
+    text.chars().take(chars - 1).chain([' ']).collect()
 }
 
 /// How one non-Claude agent is started in the harness, and how it is driven.
