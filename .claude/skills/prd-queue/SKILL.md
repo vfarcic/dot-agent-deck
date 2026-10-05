@@ -159,15 +159,17 @@ done
 
 `--issue-only`, because the file half has already been decided above against `origin/main`, and the script's own file lookup reads the checkout.
 
-**Then check that the unit will read the same PRD.** A dispatched unit is cut from `HEAD` (step 0b), and inside it `/prd-start` finds the file in *its* checkout first. So if `HEAD` and `origin/main` disagree about whether `prds/<n>-*.md` exists — a PRD file committed locally and not pushed, or one removed on the remote since — the row you show and the plan the unit works from are different documents:
+**Then check that the unit will read the same PRD.** A dispatched unit is cut from `HEAD` (step 0b), and inside it `/prd-start` finds the file in *its* checkout first. So if `HEAD` and `origin/main` disagree about `prds/<n>-*.md` — a file committed locally and not pushed, one removed or **edited** on the remote since — the row you show and the plan the unit works from are different documents. Compare blob ids, not names, so an edit counts as well as an add or a removal:
 
 ```bash
 for n in <the candidate numbers>; do
-  a=$(git ls-tree --name-only origin/main prds/ | grep -E "^prds/${n}-" || true)
-  b=$(git ls-tree --name-only HEAD prds/ | grep -E "^prds/${n}-" || true)
-  [ "$a" = "$b" ] || echo "BASE DISAGREES: #$n — origin/main has '${a:-no file}', HEAD has '${b:-no file}'"
+  a=$(git ls-tree origin/main -- prds/ | grep -E "	prds/${n}-" || true)
+  b=$(git ls-tree HEAD -- prds/ | grep -E "	prds/${n}-" || true)
+  [ "$a" = "$b" ] || echo "BASE DISAGREES: #$n — origin/main: '${a:-no file}' / HEAD: '${b:-no file}'"
 done
 ```
+
+(The character before `prds/` in the pattern is a tab: `git ls-tree` prints `<mode> <type> <blob>`, a tab, then the path.)
 
 When step 0b fast-forwarded `HEAD` to `origin/main` this prints nothing. Otherwise mark the row and put it to the runner with step 0b's refusal: dispatching it means the unit reads `HEAD`'s answer, not the one this step printed.
 
