@@ -4790,6 +4790,52 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
     }
 }
 
+/// Scenario: Build the reason the OpenCode preflight gives when the test model
+/// does not answer its probe. A developer must be able to find a model their
+/// login accepts from that text alone: how to list candidates and how to try
+/// one with the probe the preflight runs. The message must not send them to a
+/// model id the provider has been seen rejecting.
+#[test]
+fn the_opencode_probe_failure_says_how_to_find_a_reachable_model() {
+    let message = opencode_probe_failure_message(
+        "anthropic/claude-haiku-4-5-20251001",
+        "exited unsuccessfully (exit status: 1)",
+        "Error: no credentials",
+    );
+
+    // Listing alone is not enough: `opencode models openai` (1.18.34) lists
+    // ids that a ChatGPT login then refuses, so the message must also give
+    // the probe itself. Its placeholder is a bare word: an `<id>` pasted into
+    // a shell is an input redirection, not an argument.
+    assert!(
+        message.contains("opencode models"),
+        "the message must say how to list candidate models:\n{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\""
+        )),
+        "the message must give the probe command to try a candidate:\n{message}"
+    );
+    assert!(
+        message.contains("MODEL_ID replaced by an id from that listing"),
+        "the message must say what to put in place of the placeholder:\n{message}"
+    );
+    assert!(
+        message.contains(OPENCODE_TEST_MODEL_ENV),
+        "the message must name the override to set:\n{message}"
+    );
+
+    // Issue #1564: this id was the message's ChatGPT-login example, and on
+    // 2026-10-04 (OpenCode 1.18.34) such a login rejected it with "not
+    // supported when using Codex with a ChatGPT account". A developer who
+    // followed the hint failed the same preflight again.
+    assert!(
+        !message.contains("gpt-5.4-mini"),
+        "the message recommends a model ChatGPT logins reject:\n{message}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Issue #807/#395 — the grid lookup re-reads, the single-shot one cannot
 // -----------------------------------------------------------------------
@@ -5488,4 +5534,83 @@ fn env_write_refuses_while_runtime_threads_exist_and_not_after_the_runtime_drops
     // stay listed for a moment (see `assert_no_tokio_runtime`), and the
     // assertion is what waits that out.
     env_write::assert_no_tokio_runtime("after the runtime dropped");
+}
+
+// -----------------------------------------------------------------------
+// Issue #1565 — `process_running` on the caller's own exited child
+// -----------------------------------------------------------------------
+
+/// Blocks until `child` has exited WITHOUT reaping it, so it is left a
+/// zombie for as long as the caller holds off `Child::wait`. `WNOWAIT` is what
+/// leaves it unreaped; PR #1556 used the same call on the macOS runner.
+#[cfg(unix)]
+fn wait_for_exit_without_reaping(child: &std::process::Child) {
+    loop {
+        // SAFETY: a zeroed `siginfo_t` is a valid out-parameter, and the pid
+        // is this process's own child.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Interrupted,
+            "waitid(WNOWAIT) on our own child failed: {err}"
+        );
+    }
+}
+
+/// The #397 shape: a test probing its own child after the child has exited
+/// but before the test has reaped it. Off Linux the helper used to fall back to
+/// `kill(pid, 0)`, which succeeds on a zombie, so the exited child read as
+/// running for as long as it stayed unreaped.
+#[cfg(unix)]
+#[test]
+fn process_running_reads_an_exited_unreaped_child_as_gone() {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn `true`");
+    let pid = child.id() as i32;
+    wait_for_exit_without_reaping(&child);
+
+    let running = process_running(pid);
+    let _ = child.wait();
+
+    assert!(
+        !running,
+        "pid {pid} has exited and is only waiting to be reaped by this test, \
+         yet process_running() reports it as running"
+    );
+}
+
+/// Control for the test above: the same helper on the same kind of pid, alive
+/// and then reaped. A zombie-aware probe that read every own child as gone
+/// would pass the test above and fail this one.
+#[cfg(unix)]
+#[test]
+fn process_running_reads_a_live_child_as_running_and_a_reaped_one_as_gone() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn `sleep 30`");
+    let pid = child.id() as i32;
+
+    let live = process_running(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(live, "a live child (pid {pid}) must read as running");
+    assert!(
+        !process_running(pid),
+        "a reaped child (pid {pid}) must read as gone"
+    );
 }

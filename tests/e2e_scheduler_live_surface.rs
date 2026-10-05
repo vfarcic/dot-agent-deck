@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! L2 live-surfacing tests for the daemon-hosted scheduler (PRD #127 finding
 //! #2): a scheduled fire must surface its card to an ALREADY-ATTACHED TUI —
@@ -168,6 +168,7 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
     .expect("write fixture schedules.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
@@ -362,6 +363,7 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
     .expect("write fixture schedules.toml");
 
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");

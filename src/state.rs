@@ -21,6 +21,108 @@ use crate::project_config::{
 pub use crate::quota_block::{BlockedKind, BlockedReason};
 
 const MAX_RECENT_EVENTS: usize = 50;
+
+/// Issues #697 / #601: the most UNPROVEN sessions one [`AppState`] keeps — the
+/// cards of outside agents, admitted on a pane (or as a paneless agent) this
+/// deck never spawned. Counted per session rather than per pane, because one
+/// outside pane can carry any number of sessions.
+///
+/// Admitting one more at the cap evicts the least recently active unproven
+/// session (by the order events were applied, never by a producer timestamp),
+/// so an outside agent that keeps reporting outranks a one-shot flood entry and
+/// the set heals itself after a flood. Cards of agents the deck spawned are
+/// never counted and never evicted. The daemon, an attached TUI and the desktop
+/// apply the same bound; the daemon also announces each eviction
+/// ([`crate::event::UNPROVEN_EVICTED_METADATA_KEY`]) for a client that attached
+/// later and holds a different set.
+pub const MAX_UNPROVEN_SESSIONS: usize = 256;
+
+/// Issue #697: an unproven session's event journal — the
+/// [`MAX_RECENT_EVENTS`] counterpart. Smaller because a card that reports often
+/// should not crowd the others out of [`MAX_UNPROVEN_JOURNAL_BYTES`]. A count
+/// alone does not bound the memory: a retained event is the whole event, and a
+/// hook line may be up to [`crate::bounded_read::MAX_HOOK_LINE_BYTES`] (8 MiB),
+/// so a full set of [`MAX_UNPROVEN_SESSIONS`] journals at this size could
+/// otherwise hold 16 GiB. The byte budget is what bounds them.
+const MAX_UNPROVEN_RECENT_EVENTS: usize = 8;
+
+/// Qodo, PR #1559: the most bytes the journals of every unproven session
+/// together retain, as [`retained_event_bytes`] counts them. Past it, the
+/// journals of the least recently active outside cards give up their oldest
+/// events, down to each card's newest, and then the payload of that newest
+/// event ([`strip_event_payload`]), until the total fits. Neither touches a
+/// card's status, pane, agent or key, which live on the card rather than in
+/// its journal, nor its live target, which every journal event carries forward.
+/// Large enough to hold one event from the longest hook line whole, so the card
+/// of the event being applied keeps it unless every other journal is already
+/// down to a stripped event.
+const MAX_UNPROVEN_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bytes one event retained in a journal holds, approximately: its own
+/// size, its strings, and each metadata entry with a fixed allowance for the
+/// entry's slot and allocations. An estimate, but one that grows with every
+/// byte a producer controls, which is what [`MAX_UNPROVEN_JOURNAL_BYTES`] needs.
+fn retained_event_bytes(event: &AgentEvent) -> usize {
+    const METADATA_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<String>() + 16;
+    let strings: usize = [
+        Some(&event.session_id),
+        event.tool_name.as_ref(),
+        event.tool_detail.as_ref(),
+        event.cwd.as_ref(),
+        event.user_prompt.as_ref(),
+        event.pane_id.as_ref(),
+        event.agent_id.as_ref(),
+        event.agent_version.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::len)
+    .sum();
+    let metadata: usize = event
+        .metadata
+        .iter()
+        .map(|(key, value)| key.len() + value.len() + METADATA_ENTRY_OVERHEAD)
+        .sum();
+    std::mem::size_of::<AgentEvent>() + strings + metadata
+}
+
+/// Drop what a retained event reports beyond its identity — see
+/// [`MAX_UNPROVEN_JOURNAL_BYTES`]. Keeps the key, pane, agent, type, kind,
+/// timestamp and live target.
+fn strip_event_payload(event: &mut AgentEvent) {
+    event.tool_name = None;
+    event.tool_detail = None;
+    event.cwd = None;
+    event.user_prompt = None;
+    event.agent_version = None;
+    event.metadata = HashMap::new();
+}
+
+/// Issue #697: the most subagent ids one [`SubagentWait`] remembers by id —
+/// the whole bound on what a wait tracks, at a few kilobytes per session for
+/// ordinary ids. Up to this many subagents a wait is exact: a re-ask from an
+/// id it holds is the same subagent, and a stop from an id it does not hold
+/// is one that never asked. Subagents that join past this many are counted in
+/// [`SubagentWait::overflow`] instead of being remembered, never dropped: an
+/// id forgotten while its prompt is still open would let the card leave the
+/// wait with that prompt pending.
+const MAX_SUBAGENT_IDS: usize = 128;
+
+/// Issue #697: one session [`AppState`] holds as UNPROVEN — see
+/// [`MAX_UNPROVEN_SESSIONS`].
+#[derive(Debug, Clone)]
+struct UnprovenSession {
+    /// Position in [`AppState::unproven_seq`]'s order of the last event
+    /// applied to this session. The eviction order.
+    seq: u64,
+    /// The pane the session sits on, so evicting it can clear what this state
+    /// keeps per pane once nothing is left there.
+    pane_id: Option<String>,
+    /// What the card's journal retains, by [`retained_event_bytes`], kept up
+    /// to date as the journal changes. `None` until first counted: a card can
+    /// reach this accounting with a journal already on it.
+    journal_bytes: Option<usize>,
+}
 /// The session key a pane's PLACEHOLDER card is filed under — the one
 /// [`AppState::insert_placeholder_session`] mints.
 ///
@@ -923,9 +1025,11 @@ pub struct SessionState {
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
     /// Issue #1567: this session's producer DECLARED that it reports every
-    /// prompt it submits — an event arrived carrying
+    /// prompt it submits — an ATTESTED event arrived carrying
     /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`], which the bundled
-    /// Pi extension sends on every report from #1567 on. For a Pi session this
+    /// Pi extension sends on every report from #1567 on
+    /// ([`crate::event::AgentEvent::declares_prompt_reports`]), and the session
+    /// is not an outside agent's unproven card. For a Pi session this
     /// is what makes the pane one that confirms its own prompts; an extension
     /// from an older deck never sends it, so its pane keeps being one that
     /// cannot.
@@ -959,6 +1063,25 @@ pub struct SessionState {
 pub struct SubagentWait {
     pub subagent_ids: Vec<String>,
     pub resume_idle: bool,
+    /// Issue #697: how many asks arrived from ids not in
+    /// [`Self::subagent_ids`] after [`MAX_SUBAGENT_IDS`] ids were already
+    /// recorded. Their ids are not kept, so a `SubagentStop` naming an id not
+    /// in [`Self::subagent_ids`] counts one off while this is non-zero, and the
+    /// wait ends only once both are empty. Without the ids the count cannot
+    /// tell a re-ask from a new subagent, or a waiting subagent's stop from one
+    /// that never asked, so once a wait holds more than [`MAX_SUBAGENT_IDS`]
+    /// subagents it is approximate in both directions: an untracked subagent
+    /// that asks twice is counted twice and can hold the card on Needs Input
+    /// after it stops (until the main thread moves), and a stop from an
+    /// untracked subagent that never asked counts off one that did. Below that
+    /// it stays zero. Additive optional on the wire, the `blocked` precedent:
+    /// an older reader ignores it and a newer one reads its absence as zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub overflow: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SessionState {
@@ -1496,13 +1619,60 @@ pub struct AppState {
     pane_started_at: HashMap<String, DateTime<Utc>>,
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
-    /// Pane IDs created by our app — events from unknown panes are rejected.
+    /// Pane ids this process holds as its OWN: panes it registered itself
+    /// ([`Self::register_pane`] — a TUI's own panes, the desktop fold's, the
+    /// daemon's orchestration role panes), plus, in a process with no
+    /// ownership oracle, a pane whose first event is an unmarked `SessionStart`
+    /// arriving before its `register_pane` (the TUI's startup race).
+    ///
+    /// Issue #601: an outside agent's pane is NEVER recorded here. Before, any
+    /// `SessionStart` for an unknown pane auto-registered it, so one forged
+    /// start made the pane "ours" for the rest of the process's life. A pane
+    /// whose admission rests only on its sender's own word sits in the unproven
+    /// set instead ([`Self::unproven_sessions`]), which is bounded and confers
+    /// no ownership. Even an entry here is subordinate to a registry claim
+    /// ([`Self::registration_admits`]); in the daemon, the ownership proof is
+    /// the registry ([`AgentOwnership`]), not this set.
     pub managed_pane_ids: HashSet<String>,
+    /// Issues #601 / #697: the sessions this state holds as UNPROVEN — cards
+    /// admitted on nothing but their sender's own word, for a pane (or a
+    /// paneless agent) this deck never spawned. A pane counts as an outside
+    /// agent's for exactly as long as at least one of these sits on it
+    /// ([`Self::foreign_admits`]), so evicting or ending its last session also
+    /// withdraws the pane's admission. Bounded by [`MAX_UNPROVEN_SESSIONS`].
+    ///
+    /// Keyed by card id. An entry whose card is gone is dropped at the end of
+    /// the event that removed it ([`Self::settle_unproven`]).
+    unproven_sessions: HashMap<String, UnprovenSession>,
+    /// Issue #697: the clock [`UnprovenSession::seq`] is read from — one tick
+    /// per event applied to an unproven session.
+    unproven_seq: u64,
+    /// Issue #697: the daemon's evictions, as the `SessionEnd` announcements an
+    /// attached client applies, waiting for `crate::daemon::ingest_event` to
+    /// broadcast them after the event that caused them — or, for the outside
+    /// cards a registration removed ([`Self::register_pane`]), for the spawn
+    /// path that registered the pane ([`Self::announce_unproven_evictions`]). Filled only when an
+    /// ownership oracle is installed (the daemon), so a TUI or the desktop fold
+    /// never accumulates it; bounded by [`MAX_UNPROVEN_SESSIONS`] regardless.
+    pending_unproven_evictions: Vec<AgentEvent>,
+    /// Qodo, PR #1559: a test's override of [`MAX_UNPROVEN_JOURNAL_BYTES`], so
+    /// a regression can exercise the budget without allocating it. `None`
+    /// everywhere outside tests.
+    unproven_journal_budget: Option<usize>,
+    /// Whether the event [`Self::apply_event_unsettled`] last admitted was
+    /// admitted as UNPROVEN — read by the daemon's waiting-for-input watch,
+    /// which keeps history only for the deck's own agents (audit finding 4).
+    applied_unproven: bool,
     /// Issue #454: the daemon's registry-backed answer to "do I own this
     /// agent?", installed once at daemon start. `None` in the TUI and in unit
     /// tests, where [`Self::managed_pane_ids`] alone decides. See
     /// [`AgentOwnership`] and [`Self::apply_event`].
     agent_ownership: Option<AgentOwnershipOracle>,
+    /// Issue #1540: the deck's last New-agent-form command, installed once at
+    /// daemon start ([`Self::set_last_command_store`]). `None` in the TUI and in
+    /// unit tests that do not install one, where the daemon dispatch records
+    /// nothing and answers no `last_command`.
+    last_command_store: Option<Arc<crate::last_command::LastCommandStore>>,
     /// Panes whose CURRENT [`SessionState::status`] was last written by an
     /// event carrying no `agent_id` — i.e. by a producer that named no
     /// generation (issue #398, Greptile PR #443 finding #2).
@@ -4193,17 +4363,42 @@ impl AppState {
         event: AgentEvent,
         registry: &Arc<AgentPtyRegistry>,
     ) {
+        self.apply_hook_event_watching_waiting(event, registry, None);
+    }
+
+    /// Issue #318: [`Self::apply_event_watching_waiting`] for a raw hook event
+    /// the provenance gate ATTESTED, with `attested_agent` the agent its token
+    /// was minted for (audit finding 2). An event that names no agent is
+    /// admitted only if that generation still speaks for the pane, asked here
+    /// under the state lock — the gate asked too, but a successor can claim the
+    /// pane in between, and the pane alone would then credit the report to the
+    /// successor. The event's own absent `agent_id` is left as it is, so the
+    /// untagged-status rules downstream are unchanged.
+    ///
+    /// The attested agent travels as an argument rather than as state on
+    /// `self`, so nothing outlives the call — not even an unwind out of it.
+    pub fn apply_hook_event_watching_waiting(
+        &mut self,
+        event: AgentEvent,
+        registry: &Arc<AgentPtyRegistry>,
+        attested_agent: Option<&str>,
+    ) {
         let pane_id = event.pane_id.clone();
         let event_agent_id = event.agent_id.clone();
         let generation_before = pane_id
             .as_deref()
             .and_then(|pane_id| self.pane_hook_session.get(pane_id).cloned());
         let (event_session_id, event_timestamp) = (event.session_id.clone(), event.timestamp);
-        let applied = self.apply_event_reporting(event);
+        let applied = self.apply_event_reporting(event, attested_agent);
         let Some(pane_id) = pane_id else {
             return;
         };
-        if applied == AppliedEvent::Rejected {
+        // Audit finding 4: an outside agent's report keeps no waiting-watch
+        // history. The watch serves the deck's own generations — an episode
+        // needs the pane's live registry agent and a commission made to it —
+        // and history kept per outside pane would be a map any sender could
+        // grow one invented pane id at a time, outliving the bounded card.
+        if applied == AppliedEvent::Rejected || self.applied_unproven {
             return;
         }
         // A report from a hook session the pane has already moved past — the
@@ -8518,6 +8713,7 @@ async fn dispatch_one_owned(
                             identity,
                             cwd.as_deref(),
                         );
+                        state.announce_unproven_evictions(&event_tx);
                     }
                 }
                 // Issue #962: the replacement holds the title from here on (a
@@ -10634,8 +10830,454 @@ impl AppState {
     }
 
     /// Register a pane ID as managed by our app.
+    ///
+    /// Issue #601: registering a pane is the process asserting that the pane
+    /// is its own, so any card on it that this state held as an outside
+    /// agent's stops counting as unproven.
+    ///
+    /// The outside cards themselves go too (reviewer S2): a card left behind
+    /// would be counted nowhere, so it could never be evicted, and would show
+    /// as a second, stale card beside the pane's real one. What this state
+    /// kept per pane for them is cleared with them when nothing else is left on
+    /// the pane, so the deck's agent starts on a clean pane.
+    ///
+    /// On the daemon each card removed this way is announced like an eviction
+    /// (Qodo, PR #1559): an attached client that does not register the pane
+    /// itself would otherwise keep showing it. The caller broadcasts the queue
+    /// ([`Self::announce_unproven_evictions`]); one that does not leaves it for
+    /// the next ingested event to drain.
     pub fn register_pane(&mut self, pane_id: String) {
+        let outside: Vec<String> = self
+            .unproven_sessions
+            .iter()
+            .filter(|(_, entry)| entry.pane_id.as_deref() == Some(pane_id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &outside {
+            self.unproven_sessions.remove(id);
+            if let Some(session) = self.sessions.remove(id) {
+                let pane = session.pane_id.clone();
+                self.queue_unproven_eviction(id, session, pane);
+            }
+        }
+        if !outside.is_empty()
+            && !self.managed_pane_ids.contains(&pane_id)
+            && !self
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(pane_id.as_str()))
+        {
+            self.clear_pane_maps(&pane_id);
+        }
         self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// Whether `session_id` names a card this state holds as PROVEN — one
+    /// that is not an outside agent's (audit finding 1).
+    fn is_proven_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id) && !self.unproven_sessions.contains_key(session_id)
+    }
+
+    /// Issue #601: is `pane_id` currently admitted as an OUTSIDE agent's pane —
+    /// does at least one unproven session sit on it? Subordinate to a registry
+    /// claim, like [`Self::registration_admits`]: a pane the registry claims is
+    /// generation-checked whatever this state recorded about it earlier.
+    fn foreign_admits(&self, pane_id: &str) -> bool {
+        !self.managed_pane_ids.contains(pane_id)
+            && self.unproven_sessions.iter().any(|(id, entry)| {
+                entry.pane_id.as_deref() == Some(pane_id) && self.sessions.contains_key(id)
+            })
+            && !matches!(
+                self.oracle_ownership(Some(pane_id), None),
+                Some(Ownership::Owned)
+            )
+    }
+
+    /// Issue #697: how many unproven sessions this state holds. See
+    /// [`MAX_UNPROVEN_SESSIONS`].
+    pub fn unproven_session_count(&self) -> usize {
+        self.unproven_sessions
+            .keys()
+            .filter(|id| self.sessions.contains_key(*id))
+            .count()
+    }
+
+    /// Issue #697 (audit): the sizes of every per-pane and per-agent map an
+    /// UNPROVEN event can reach, by name, so a flood test can assert what this
+    /// state retains rather than only the cards it shows.
+    #[cfg(test)]
+    pub(crate) fn retained_map_sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("sessions", self.sessions.len()),
+            ("unproven_sessions", self.unproven_sessions.len()),
+            (
+                "pending_unproven_evictions",
+                self.pending_unproven_evictions.len(),
+            ),
+            ("managed_pane_ids", self.managed_pane_ids.len()),
+            ("pane_started_at", self.pane_started_at.len()),
+            ("pane_hook_session", self.pane_hook_session.len()),
+            (
+                "pane_generation_closures",
+                self.pane_generation_closures.len(),
+            ),
+            (
+                "pane_generation_announced",
+                self.pane_generation_announced.len(),
+            ),
+            ("untagged_status_panes", self.untagged_status_panes.len()),
+            (
+                "waiting_superseded_sessions",
+                self.waiting_superseded_sessions.len(),
+            ),
+            (
+                "agent_generation_closures",
+                self.agent_generation_closures.len(),
+            ),
+        ]
+    }
+
+    /// Qodo, PR #1559: lower [`MAX_UNPROVEN_JOURNAL_BYTES`] for this state.
+    #[cfg(test)]
+    pub(crate) fn set_unproven_journal_budget(&mut self, bytes: usize) {
+        self.unproven_journal_budget = Some(bytes);
+    }
+
+    /// Issue #697: take the daemon's queued eviction announcements, oldest
+    /// first. See [`Self::pending_unproven_evictions`].
+    pub fn take_unproven_evictions(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.pending_unproven_evictions)
+    }
+
+    /// Issue #697: broadcast the daemon's queued eviction announcements to
+    /// attached clients, oldest first. For a daemon path that removes outside
+    /// cards outside an ingested event — a spawn registering its pane
+    /// ([`Self::register_pane`]) — so a client that does not register that pane
+    /// itself still drops the card. A no-op outside the daemon, whose queue
+    /// stays empty.
+    pub(crate) fn announce_unproven_evictions(
+        &mut self,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+    ) {
+        for eviction in self.take_unproven_evictions() {
+            let _ = event_tx.send(BroadcastMsg::Event(eviction));
+        }
+    }
+
+    /// Issue #697: queue the announcement that the outside card `id`, whose
+    /// session was `session` on `pane`, is gone — on the daemon only (an
+    /// ownership oracle is installed), where an attached client holding the
+    /// same card applies it ([`Self::apply_unproven_eviction`]).
+    fn queue_unproven_eviction(&mut self, id: &str, session: SessionState, pane: Option<String>) {
+        if self.agent_ownership.is_none() {
+            return;
+        }
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        if self.pending_unproven_evictions.len() >= MAX_UNPROVEN_SESSIONS {
+            self.pending_unproven_evictions.remove(0);
+        }
+        self.pending_unproven_evictions.push(AgentEvent {
+            session_id: id.to_string(),
+            agent_type: session.agent_type,
+            event_type: EventType::SessionEnd,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: pane,
+            agent_id: session.agent_id,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    /// Issue #697: record activity on the unproven session `session_id`, about
+    /// to be created or updated by an event on `pane_id`. A new session at the
+    /// cap first evicts the least recently active unproven session.
+    fn note_unproven_activity(&mut self, session_id: &str, pane_id: Option<&str>) {
+        self.unproven_seq = self.unproven_seq.wrapping_add(1);
+        let seq = self.unproven_seq;
+        if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
+            entry.seq = seq;
+            // Qodo, PR #1559: a key whose card is gone — superseded by a new
+            // generation, closed with its pane, re-keyed — is about to get a
+            // fresh card with an empty journal, so the count of the old one
+            // must not carry over to it.
+            if !self.sessions.contains_key(session_id) {
+                entry.journal_bytes = None;
+            }
+            return;
+        }
+        self.settle_unproven(pane_id);
+        while self.unproven_sessions.len() >= MAX_UNPROVEN_SESSIONS {
+            if !self.evict_least_recent_unproven(pane_id) {
+                break;
+            }
+        }
+        self.unproven_sessions.insert(
+            session_id.to_string(),
+            UnprovenSession {
+                seq,
+                pane_id: pane_id.map(str::to_string),
+                journal_bytes: None,
+            },
+        );
+    }
+
+    /// Issue #697: evict the least recently active unproven session. Returns
+    /// `false` when there is none. `keep_pane` is the pane of the event being
+    /// applied, whose per-pane state that event has already written and must
+    /// keep.
+    fn evict_least_recent_unproven(&mut self, keep_pane: Option<&str>) -> bool {
+        let Some(id) = self
+            .unproven_sessions
+            .iter()
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(id, _)| id.clone())
+        else {
+            return false;
+        };
+        let entry = self
+            .unproven_sessions
+            .remove(&id)
+            .expect("the key was just read");
+        let removed = self.sessions.remove(&id);
+        // Audit finding 5: the card's own pane is the eviction's target — the
+        // card may have learnt a pane after it was first recorded, and a
+        // client applying the announcement matches on the card's pane.
+        let card_pane = removed
+            .as_ref()
+            .map_or(entry.pane_id.clone(), |session| session.pane_id.clone());
+        if let Some(session) = removed {
+            self.queue_unproven_eviction(&id, session, card_pane.clone());
+        }
+        tracing::debug!(
+            session_id = %crate::config_validation::escape_id_for_log(&id),
+            cap = MAX_UNPROVEN_SESSIONS,
+            "unproven sessions at cap; evicted the least recently active"
+        );
+        for pane in [entry.pane_id.as_deref(), card_pane.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if keep_pane != Some(pane) {
+                self.forget_unbacked_pane(pane);
+            }
+        }
+        true
+    }
+
+    /// Issue #697: drop the unproven entries whose card is gone, and clear
+    /// what this state keeps per pane for an outside pane that no longer has
+    /// any card. `keep_pane` as for [`Self::evict_least_recent_unproven`].
+    ///
+    /// Also keeps each entry's pane in step with its card's (audit finding 5):
+    /// a card admitted without a pane can learn one later, and an entry still
+    /// naming the old pane would clear the wrong pane's maps when the card goes
+    /// and announce its eviction under a pane no client's card carries. A pane
+    /// the card has left is cleared like one whose card is gone.
+    fn settle_unproven(&mut self, keep_pane: Option<&str>) {
+        // Reviewer S5: managed-only traffic does no per-event work here.
+        if self.unproven_sessions.is_empty() {
+            return;
+        }
+        let sessions = &self.sessions;
+        let mut gone_panes = Vec::new();
+        self.unproven_sessions.retain(|id, entry| {
+            let Some(session) = sessions.get(id) else {
+                if let Some(pane) = entry.pane_id.clone() {
+                    gone_panes.push(pane);
+                }
+                return false;
+            };
+            if session.pane_id != entry.pane_id {
+                if let Some(pane) = entry.pane_id.take() {
+                    gone_panes.push(pane);
+                }
+                entry.pane_id.clone_from(&session.pane_id);
+            }
+            true
+        });
+        for pane in gone_panes {
+            if keep_pane != Some(pane.as_str()) {
+                self.forget_unbacked_pane(&pane);
+            }
+        }
+    }
+
+    /// Qodo, PR #1559: drop the cached journal size of the unproven session
+    /// `session_id`, so the next budget pass recounts what its card retains.
+    /// Owed wherever a card's journal is replaced or appended to outside
+    /// `apply_event`'s own accounted push: a cached count that outlives its
+    /// journal makes the budget strip cards for bytes nobody holds.
+    fn forget_unproven_journal_count(&mut self, session_id: &str) {
+        if let Some(entry) = self.unproven_sessions.get_mut(session_id) {
+            entry.journal_bytes = None;
+        }
+    }
+
+    /// Qodo, PR #1559: bring the unproven journals within
+    /// [`MAX_UNPROVEN_JOURNAL_BYTES`], least recently active card first. See
+    /// the constant for what goes and what every card keeps.
+    fn enforce_unproven_journal_budget(&mut self) {
+        let budget = self
+            .unproven_journal_budget
+            .unwrap_or(MAX_UNPROVEN_JOURNAL_BYTES);
+        let mut total = 0usize;
+        let mut order = Vec::with_capacity(self.unproven_sessions.len());
+        for (id, entry) in &mut self.unproven_sessions {
+            let Some(session) = self.sessions.get(id) else {
+                continue;
+            };
+            let bytes = *entry.journal_bytes.get_or_insert_with(|| {
+                session.recent_events.iter().map(retained_event_bytes).sum()
+            });
+            total += bytes;
+            order.push((entry.seq, id.clone()));
+        }
+        if total <= budget {
+            return;
+        }
+        order.sort_unstable();
+        // First the older events, down to each card's newest; then the payload
+        // of that newest event.
+        for strip in [false, true] {
+            for (_, id) in &order {
+                if total <= budget {
+                    return;
+                }
+                let (Some(session), Some(entry)) = (
+                    self.sessions.get_mut(id),
+                    self.unproven_sessions.get_mut(id),
+                ) else {
+                    continue;
+                };
+                let before = entry.journal_bytes.unwrap_or_default();
+                let mut freed = 0;
+                if strip {
+                    if let Some(event) = session.recent_events.back_mut() {
+                        let full = retained_event_bytes(event);
+                        strip_event_payload(event);
+                        freed = full.saturating_sub(retained_event_bytes(event));
+                    }
+                } else {
+                    while total.saturating_sub(freed) > budget && session.recent_events.len() > 1 {
+                        if let Some(old) = session.recent_events.pop_front() {
+                            freed += retained_event_bytes(&old);
+                        }
+                    }
+                }
+                entry.journal_bytes = Some(before.saturating_sub(freed));
+                total = total.saturating_sub(freed);
+            }
+        }
+    }
+
+    /// Issue #697: clear the per-pane maps this state keeps for `pane_id`, if
+    /// the pane now has no card at all and is neither this process's own nor
+    /// claimed by the registry. Those maps are otherwise only cleared when a
+    /// managed pane closes, so without this every outside pane id ever seen
+    /// would leave entries behind.
+    fn forget_unbacked_pane(&mut self, pane_id: &str) {
+        if self.managed_pane_ids.contains(pane_id)
+            || self
+                .sessions
+                .values()
+                .any(|session| session.pane_id.as_deref() == Some(pane_id))
+            || matches!(
+                self.oracle_ownership(Some(pane_id), None),
+                Some(Ownership::Owned)
+            )
+        {
+            return;
+        }
+        self.clear_pane_maps(pane_id);
+    }
+
+    /// The per-pane maps an event can write for a pane, cleared together. See
+    /// [`Self::forget_unbacked_pane`] and [`Self::register_pane`].
+    fn clear_pane_maps(&mut self, pane_id: &str) {
+        self.pane_started_at.remove(pane_id);
+        self.pane_hook_session.remove(pane_id);
+        self.pane_generation_closures.remove(pane_id);
+        self.pane_generation_announced.remove(pane_id);
+        self.untagged_status_panes.remove(pane_id);
+        self.waiting_superseded_sessions.remove(pane_id);
+    }
+
+    /// Issue #697: apply the daemon's announcement that it evicted the unproven
+    /// session `event` names ([`crate::event::UNPROVEN_EVICTED_METADATA_KEY`]).
+    /// Idempotent: a client that already evicted the same session, or never
+    /// held it, has nothing to remove.
+    ///
+    /// A card leaves the outside-card accounting if and only if it leaves
+    /// [`Self::sessions`] (round-3 audit B1). Dropping only the accounting
+    /// would leave a card counted nowhere: outside the budget, read as one of
+    /// this process's own, and refusing its own sender's reports.
+    fn apply_unproven_eviction(&mut self, event: &AgentEvent) {
+        let Some(card) = self.unproven_eviction_target(event) else {
+            return;
+        };
+        self.sessions.remove(&card);
+        self.unproven_sessions.remove(&card);
+        if let Some(pane) = event.pane_id.as_deref() {
+            self.forget_unbacked_pane(pane);
+        }
+    }
+
+    /// The card a daemon eviction announcement names on this process, if any.
+    ///
+    /// Only a card THIS process holds as an outside agent's (round-2 audit):
+    /// the daemon files a daemon-restart survivor's reports as an outside
+    /// agent's, so it can evict a card under the key and pane of a survivor's
+    /// card a client still holds as its own — and an outside sender can choose
+    /// both. And only one on the announced pane: the same key on another pane
+    /// is a different card.
+    ///
+    /// The daemon and a client can file one outside card under different keys
+    /// (round-3 audit B1): the cross-pane re-key ([`Self::apply_event_unsettled`])
+    /// depends on the cards each side already holds, and a client that attached
+    /// late holds fewer. So a card on the announced pane whose key is the
+    /// announced one with that pane's qualification added or removed, any
+    /// number of times, may be the same card. Any other divergence — an
+    /// adoption that landed differently, say — matches nothing here; the
+    /// client's card then stays counted against its own budget and goes when
+    /// that budget evicts it.
+    ///
+    /// Spelling alone does not identify the card (round-4 audit B1): a
+    /// producer's literal key can equal another session's qualified one, so a
+    /// client can hold two such cards on one pane. The candidate must also name
+    /// the evicted card's agent — `None` included — and must be the only one
+    /// that does. When more than one remains this declines and removes nothing
+    /// rather than guess: a wrong guess loses a live card and its journal,
+    /// while declining only leaves a card for the client's own budget to retire.
+    fn unproven_eviction_target(&self, event: &AgentEvent) -> Option<String> {
+        let pane = event.pane_id.as_deref();
+        let prefix = pane.map(|pane| format!("{pane}::"));
+        fn unqualified<'a>(mut key: &'a str, prefix: Option<&str>) -> &'a str {
+            if let Some(prefix) = prefix {
+                while let Some(rest) = key.strip_prefix(prefix) {
+                    key = rest;
+                }
+            }
+            key
+        }
+        let announced = unqualified(&event.session_id, prefix.as_deref());
+        let mut candidates = self.unproven_sessions.keys().filter(|id| {
+            unqualified(id, prefix.as_deref()) == announced
+                && self.sessions.get(id.as_str()).is_some_and(|session| {
+                    session.pane_id.as_deref() == pane && session.agent_id == event.agent_id
+                })
+        });
+        let target = candidates.next()?;
+        candidates.next().is_none().then(|| target.clone())
     }
 
     /// Issue #454: install the daemon's registry-backed ownership oracle.
@@ -10654,16 +11296,30 @@ impl AppState {
         self.agent_ownership = Some(AgentOwnershipOracle(ownership));
     }
 
+    /// Issue #1540: install the daemon's last-command store. Called once, by
+    /// [`crate::daemon::run_daemon_with`] after loading it from the daemon's
+    /// state directory; a test installs one over a temp directory.
+    pub fn set_last_command_store(&mut self, store: Arc<crate::last_command::LastCommandStore>) {
+        self.last_command_store = Some(store);
+    }
+
+    /// Issue #1540: the daemon's last-command store, if one is installed.
+    pub fn last_command_store(&self) -> Option<Arc<crate::last_command::LastCommandStore>> {
+        self.last_command_store.clone()
+    }
+
     /// Issue #454: may an event naming `(pane_id, agent_id)` drive this state?
     ///
     /// Two independent grounds, because two different kinds of process ask:
     ///
     /// * **explicitly registered** — [`Self::register_pane`], i.e. the TUI's own
-    ///   panes, the daemon's orchestration role panes, and the
-    ///   `SessionStart` auto-registration below. This is the historical rule and
-    ///   is unchanged, and it is deliberately still PANE-scoped: a process that
-    ///   registers a pane by hand is asserting the pane is its own, and has no
-    ///   generation to name;
+    ///   panes, the daemon's orchestration role panes, and, in a process with no
+    ///   oracle, the TUI's startup-race auto-registration in
+    ///   [`Self::apply_event`]. It is deliberately still PANE-scoped: a process
+    ///   that registers a pane by hand is asserting the pane is its own, and has
+    ///   no generation to name. An outside agent's pane is never registered
+    ///   (issue #601); it is admitted by [`Self::foreign_admits`] instead, and
+    ///   only to its own unproven cards;
     /// * **owned by the registry** — the daemon's answer, which IS
     ///   generation-scoped. See [`AgentOwnership`] for the exact rule; the short
     ///   version is that a tagged event has to come from the generation that
@@ -10715,7 +11371,9 @@ impl AppState {
     ///
     /// Otherwise the historical rule stands: a process that manages no panes at
     /// all is watching EXTERNAL agents and takes their pane-less events; one
-    /// that manages panes is not, and rejects them.
+    /// that manages panes is not, and rejects them. Since issue #601 an outside
+    /// agent's card no longer puts its pane into [`Self::managed_pane_ids`], so
+    /// one outside `SessionStart` no longer flips a process out of that mode.
     fn admits_paneless_event(&self, agent_id: Option<&str>) -> bool {
         matches!(
             self.oracle_ownership(None, agent_id),
@@ -10944,6 +11602,7 @@ impl AppState {
         }
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
+        self.forget_unproven_journal_count(&session_id);
         self.sessions.insert(
             session_id.clone(),
             SessionState {
@@ -11125,6 +11784,9 @@ impl AppState {
         let session_id =
             self.insert_placeholder_session(pane_id.clone(), cwd, effective_agent_type, agent_id);
         let Some(snap) = live else { return };
+        // The overlay below can push a live-target carrier onto the card's
+        // journal outside the accounted path; recount it at the next pass.
+        self.forget_unproven_journal_count(&session_id);
         self.adopt_hydrated_generation(&pane_id, snap.hook_generation.as_ref());
         let observed = snap
             .last_activity_ms
@@ -11335,6 +11997,11 @@ impl AppState {
                     card.last_activity = observed;
                 }
                 overlay_snapshot_fields(card, snap);
+                // Qodo, PR #1559: the overlay can push a live-target carrier
+                // outside the accounted path; see `forget_unproven_journal_count`.
+                if let Some(entry) = self.unproven_sessions.get_mut(&card.session_id) {
+                    entry.journal_bytes = None;
+                }
             }
         }
     }
@@ -13142,6 +13809,22 @@ pub async fn handle_restart_role_with_state(
             _ => None,
         };
         let Some((role_index, role_config)) = role_config_indexed else {
+            // Issue #1396 item 2 (agent review, PR #1557): a directory that has
+            // been deleted has no config to read either, and "could not resolve
+            // the role" sends the user to the wrong file. Name the cause, in the
+            // words the respawn's own check would have used.
+            if let Some(c) = cwd.as_deref()
+                && !std::path::Path::new(c).is_dir()
+            {
+                return RestartRoleResponse {
+                    error: Some(format!(
+                        "failed to restart role `{}`: {}. Nothing was restarted.",
+                        signal.role,
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(c.to_string())
+                    )),
+                    ..Default::default()
+                };
+            }
             return RestartRoleResponse {
                 error: Some(format!(
                     "could not resolve role `{}` in this project's .dot-agent-deck.toml, so \
@@ -13276,6 +13959,7 @@ pub async fn handle_restart_role_with_state(
                 let pane_id = resolved.pane_id.clone();
                 let cwd = resolved.cwd.clone();
                 let title = resolved.title.clone();
+                let event_tx = event_tx.clone();
                 tokio::spawn(async move {
                     let mut state = state.write().await;
                     // Issue #962: the same restore `dispatch_one_owned`'s re-create
@@ -13295,6 +13979,7 @@ pub async fn handle_restart_role_with_state(
                         identity,
                         cwd.as_deref(),
                     );
+                    state.announce_unproven_evictions(&event_tx);
                 });
             }
             RestartRoleResponse {
@@ -13551,6 +14236,7 @@ pub async fn handle_spawn_role_with_state(
             resolved.identity,
             resolved.cwd.as_deref(),
         );
+        state_guard.announce_unproven_evictions(event_tx);
     }
 
     // Best-effort, like `surface_spawned_orchestration`'s own
@@ -14091,13 +14777,39 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, event: AgentEvent) {
-        let _ = self.apply_event_reporting(event);
+        let _ = self.apply_event_reporting(event, None);
     }
 
     /// [`Self::apply_event`], reporting what it did with the event — see
     /// [`AppliedEvent`]. The daemon's waiting-for-input watch is the one caller
     /// that needs the answer (issue #447).
-    fn apply_event_reporting(&mut self, mut event: AgentEvent) -> AppliedEvent {
+    ///
+    /// `attested_agent` is the generation an attested hook event's token was
+    /// minted for (see [`Self::apply_hook_event_watching_waiting`]); `None` for
+    /// every other event.
+    fn apply_event_reporting(
+        &mut self,
+        event: AgentEvent,
+        attested_agent: Option<&str>,
+    ) -> AppliedEvent {
+        self.applied_unproven = false;
+        let applied = self.apply_event_unsettled(event, attested_agent);
+        // Issue #697: whatever the event removed, the unproven bookkeeping
+        // follows it — see [`Self::settle_unproven`].
+        self.settle_unproven(None);
+        if self.applied_unproven {
+            self.enforce_unproven_journal_budget();
+        }
+        applied
+    }
+
+    /// The body of [`Self::apply_event_reporting`], before the unproven-session
+    /// bookkeeping is settled.
+    fn apply_event_unsettled(
+        &mut self,
+        mut event: AgentEvent,
+        attested_agent: Option<&str>,
+    ) -> AppliedEvent {
         // PRD #1223: the daemon's pane-closed announcement is a statement ABOUT
         // a pane, not a producer's conversation ending, so none of the
         // `SessionEnd` machinery below applies to it — in particular its
@@ -14107,6 +14819,14 @@ impl AppState {
                 self.apply_daemon_pane_closed(pane_id, event.agent_id.as_deref());
             }
             return AppliedEvent::StatusAsserted;
+        }
+        // Issue #697: the daemon evicted an outside agent's card to stay within
+        // `MAX_UNPROVEN_SESSIONS`. Like the pane-closed announcement it is a
+        // statement about a card, not a conversation ending, and it must not
+        // restore a placeholder for what it removes.
+        if event.is_unproven_eviction() {
+            self.apply_unproven_eviction(&event);
+            return AppliedEvent::Rejected;
         }
         // Issue #714: the daemon's lift of a replaced agent's block is a
         // statement about ONE existing card — the replaced agent's. A client
@@ -14237,81 +14957,137 @@ impl AppState {
         // through, and the daemon's answer binds it to `event.pane_id` — a pane
         // is a reusable slot, so "someone owns P" was never evidence that THIS
         // report belongs to P's current occupant. See [`AgentOwnership`].
+        //
+        // Issue #601: and admission now records HOW an event was admitted. An
+        // event admitted on nothing but its sender's word — an outside agent's
+        // pane, or a paneless agent this deck never spawned — is UNPROVEN: it
+        // may draw and update its own card, but that card never makes its pane
+        // one of ours and counts against `MAX_UNPROVEN_SESSIONS` (#697). The
+        // daemon decides it (its oracle, plus the hook gate's
+        // `crate::event::UNPROVEN_METADATA_KEY` marker); an attached client has
+        // no registry and reads the daemon's marker.
+        //
+        // The marker is AUTHORITATIVE (audit finding 3). It is the hook gate's
+        // verdict that the sender holds no capability for what it names, and a
+        // later ownership lookup on the ids the sender chose must not overturn
+        // it: a pane can be issued a token between the gate classifying an
+        // event and this applying it, and the lookup would then credit the
+        // forgery to the agent that just arrived. So a marked event never takes
+        // the owned arm, in the daemon or in a client.
+        //
+        // One exception, in a client only, and it is NOT an ownership grant: an
+        // event the daemon ALSO marked as coming from a pane it holds no live
+        // agent on — an orphaned orchestration role pane (issue #770), or any
+        // pane ([`crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY`], round 3) —
+        // on a pane this client registered as its own, may update the bounded
+        // reporting state (and, for a role pane, the orphan badge) of the ONE
+        // card already on that pane: the daemon-restart survivor's, which a
+        // client attached across the restart still shows, and whose reports the
+        // new daemon cannot attest. It goes through
+        // [`Self::apply_orphan_survivor_report`] and nothing below: it creates,
+        // re-keys, adopts, retires and removes no card, writes no per-agent or
+        // per-pane record, and only lands when it names the card's own agent
+        // (round-2 audit findings 1-3). The daemon stamps both verdicts under
+        // its state lock, from a registry and role map read there, so a pane it
+        // has since spawned an agent on is not stamped.
+        let marked_unproven = event.is_unproven();
+        // Audit finding 2: the generation an attested event that named no agent
+        // is judged by — its token's own spawn (see
+        // [`Self::apply_hook_event_watching_waiting`]).
+        let admission_agent = event
+            .agent_id
+            .clone()
+            .or(attested_agent.map(str::to_string));
+        let unproven;
         if let Some(ref pane_id) = event.pane_id {
-            if !self.owns_pane_event(pane_id, event.agent_id.as_deref()) {
-                if event.event_type == EventType::SessionStart {
-                    // Defense in depth (auditor finding #1 follow-up):
-                    // reject the synthetic dead-slot id format from the
-                    // auto-register branch so a forged hook event can't
-                    // bring an `__dead-slot__-…` id into existence.
-                    // Production never sets a synthetic id as
-                    // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
-                    // admits the format on its own (it only checks for
-                    // `[A-Za-z0-9_-]`).
-                    if crate::ui::is_dead_slot_pane_id(pane_id) {
-                        return AppliedEvent::Rejected;
-                    }
-                    // Round 2, and the reason this is NOT a widening of the
-                    // pre-existing `SessionStart` escape hatch (#601, out of
-                    // scope): auto-registration exists for the STARTUP RACE, a
-                    // hook that fires before `register_pane` is called for a
-                    // pane this process is about to own. A pane the registry
-                    // ALREADY has a generation for is not in that race — the
-                    // generation-scoped check just above has looked and found
-                    // one, under a different id. Registering it here would be
-                    // strictly worse than doing nothing: `managed_pane_ids` is
-                    // permanent and pane-scoped, so one forged `SessionStart`
-                    // would turn a generation-checked pane into a bearer-token
-                    // one for the rest of the daemon's life. Deny instead.
-                    //
-                    // A pane the registry has never heard of keeps the
-                    // historical behaviour verbatim, so #601 is neither fixed
-                    // nor made worse here.
-                    //
-                    // Round 3 (reviewer blocker 2), and the reason this branch
-                    // is a `match` rather than an `if`: promoting a pane on the
-                    // strength of the registry NOT claiming it is a case where
-                    // absence GRANTS, so only a positive `Unclaimed` will do. A
-                    // `bool` answer made a registry that could not be asked —
-                    // poisoned lock, dropped `Weak` — indistinguishable from one
-                    // that had looked and found nothing, and the fail-closed
-                    // denial inside the oracle therefore arrived here as an
-                    // admission: one forged `SessionStart` against a real,
-                    // registry-held pane promoted it into `managed_pane_ids`
-                    // permanently, and every later event for it then matched the
-                    // pane-scoped ground and skipped the oracle entirely.
-                    match self.oracle_ownership(Some(pane_id.as_str()), None) {
-                        // The registry claims this pane; it is not in the
-                        // startup race and stays generation-checked.
-                        Some(Ownership::Owned) => return AppliedEvent::Rejected,
-                        // The registry could not answer. That is not evidence
-                        // that the pane is free, and this is the one place where
-                        // treating it as evidence would hand out a permanent
-                        // bearer token.
-                        Some(Ownership::Unknown) => return AppliedEvent::Rejected,
-                        // Genuinely unclaimed, or no registry at all (the TUI,
-                        // whose own panes are exactly what this race is about).
-                        Some(Ownership::Unclaimed) | None => {}
-                    }
-                    // Auto-register the pane to handle the startup race where
-                    // the hook fires before register_pane is called.
-                    //
-                    // The check above and this insert are still not atomic
-                    // against a concurrent spawn reserving the pane — they take
-                    // different locks and cannot be made atomic here. They do
-                    // not have to be: `Self::registration_admits` makes what
-                    // this inserts SUBORDINATE to a registry claim at every
-                    // later use, so a pane the registry claims by then is
-                    // generation-checked regardless of how it got into this set
-                    // (reviewer finding 3).
-                    self.managed_pane_ids.insert(pane_id.clone());
-                } else {
+            let owned =
+                !marked_unproven && self.owns_pane_event(pane_id, admission_agent.as_deref());
+            if owned {
+                unproven = false;
+            } else if marked_unproven && self.managed_pane_ids.contains(pane_id) {
+                if self.agent_ownership.is_none()
+                    && (event.is_orchestration_orphaned() || event.is_daemon_no_live_agent())
+                    && let Some(card) =
+                        self.orphan_survivor_card(pane_id, event.agent_id.as_deref())
+                {
+                    return self.apply_orphan_survivor_report(&card, event);
+                }
+                // A pane this process registered as its own: an unproven event
+                // is neither its owner's report nor an outside agent's pane.
+                return AppliedEvent::Rejected;
+            } else if self.foreign_admits(pane_id) {
+                unproven = true;
+            } else if event.event_type == EventType::SessionStart {
+                // Defense in depth (auditor finding #1 follow-up):
+                // reject the synthetic dead-slot id format from the
+                // auto-register branch so a forged hook event can't
+                // bring an `__dead-slot__-…` id into existence.
+                // Production never sets a synthetic id as
+                // `DOT_AGENT_DECK_PANE_ID`, but `is_valid_pane_id_env`
+                // admits the format on its own (it only checks for
+                // `[A-Za-z0-9_-]`).
+                if crate::ui::is_dead_slot_pane_id(pane_id) {
                     return AppliedEvent::Rejected;
                 }
+                // Round 2: a pane the registry ALREADY has a generation for is
+                // not an unknown pane — the generation-scoped check just above
+                // has looked and found one, under a different id. Admitting it
+                // here would let one forged `SessionStart` draw a card on a
+                // generation-checked pane. Deny instead.
+                //
+                // Round 3 (reviewer blocker 2), and the reason this branch is a
+                // `match` rather than an `if`: admitting a pane on the strength
+                // of the registry NOT claiming it is a case where absence
+                // GRANTS, so only a positive `Unclaimed` will do. A registry that
+                // could not be asked — poisoned lock, dropped `Weak` — is not
+                // evidence that the pane is free.
+                match self.oracle_ownership(Some(pane_id.as_str()), None) {
+                    Some(Ownership::Owned) | Some(Ownership::Unknown) => {
+                        return AppliedEvent::Rejected;
+                    }
+                    // Genuinely unclaimed, or no registry at all (the TUI,
+                    // whose own panes are exactly what the startup race is
+                    // about).
+                    Some(Ownership::Unclaimed) | None => {}
+                }
+                if marked_unproven || self.agent_ownership.is_some() {
+                    // Issue #601: an outside agent's start. With an oracle
+                    // installed (the daemon), anything reaching this branch is
+                    // by definition not registry-proven; a client reads the
+                    // daemon's marker. Either way the card is admitted, but the
+                    // pane is NOT promoted into `managed_pane_ids` — before
+                    // this, one forged `SessionStart` made a pane "ours" for the
+                    // life of the process. The pane joins the unproven set when
+                    // its session is created below, so a start a later guard
+                    // rejects records nothing.
+                    unproven = true;
+                } else {
+                    // The TUI's startup race: a hook from one of its own panes
+                    // fires before `register_pane` is called. The daemon never
+                    // marks such a pane (it issued it a token), so an unmarked
+                    // start is this process's own pane arriving early.
+                    //
+                    // Not atomic against a concurrent claim; it does not have to
+                    // be: `Self::registration_admits` makes what this inserts
+                    // SUBORDINATE to a registry claim at every later use
+                    // (reviewer finding 3).
+                    self.managed_pane_ids.insert(pane_id.clone());
+                    unproven = false;
+                }
+            } else {
+                return AppliedEvent::Rejected;
             }
         } else if !self.admits_paneless_event(event.agent_id.as_deref()) {
             return AppliedEvent::Rejected;
+        } else {
+            unproven = marked_unproven
+                || (self.agent_ownership.is_some()
+                    && !matches!(
+                        self.oracle_ownership(None, event.agent_id.as_deref()),
+                        Some(Ownership::Owned)
+                    ));
         }
+        self.applied_unproven = unproven;
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
         // is not evidence of a takeover and may retire nothing. Hoisted above
         // the reuse guard for issue #398 — the adoption fallback below needs the
@@ -14417,6 +15193,59 @@ impl AppState {
             }
         }
 
+        // Issue #601, audit finding 1: an unproven event may reach only an
+        // outside agent's own card. Checked here, on the key every later seam
+        // resolves the frame through, and before any of them mutates anything:
+        // a key naming a card this process holds as PROVEN is refused whatever
+        // either side's pane is. The re-key above only separates two panes that
+        // are both named, so a paneless frame naming a paned card's key, or a
+        // paned frame naming a paneless card's key, arrives here still on that
+        // card — and would otherwise update it, enrol it in the evictable
+        // unproven set, relocate it, or end it.
+        if unproven && self.is_proven_session(&event.session_id) {
+            return AppliedEvent::Rejected;
+        }
+
+        // Issue #318 (Greptile, PR #1559): a frame the daemon attested to one
+        // agent that names no agent itself may not reach a card of ANOTHER
+        // agent's. The daemon re-checks that such a frame's token generation
+        // still holds its pane, but a successor can claim the pane between that
+        // check and the broadcast, and this client — which has no registry —
+        // would then land the replaced generation's report on the successor's
+        // card: the direct key (Pi reports every generation under one
+        // pane-derived key), or the one card on the pane the untagged adoption
+        // below picks. For a `SessionEnd` that would remove the successor's card
+        // and restore a bare placeholder. Checked before anything below mutates,
+        // and only in a client: the daemon judges the same frame by the token's
+        // generation (`attested_agent`). The frame's own absent `agent_id` is
+        // left as it is, so the untagged rules downstream are unchanged. See
+        // [`crate::event::ATTESTED_OWNER_METADATA_KEY`].
+        if self.agent_ownership.is_none()
+            && event.agent_id.is_none()
+            && let Some(owner) = event.attested_owner()
+        {
+            let foreign = |session: &SessionState| {
+                session
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|agent| agent != owner)
+            };
+            let direct_is_foreign = self.sessions.get(&event.session_id).is_some_and(foreign);
+            let adopted_is_foreign = claims_generation
+                && event.pane_id.as_deref().is_some_and(|pane_id| {
+                    let mut others = self.sessions.iter().filter(|(id, session)| {
+                        session.pane_id.as_deref() == Some(pane_id) && **id != event.session_id
+                    });
+                    match (others.next(), others.next()) {
+                        (Some((_, only)), None) => foreign(only),
+                        _ => false,
+                    }
+                });
+            if direct_is_foreign || adopted_is_foreign {
+                return AppliedEvent::Rejected;
+            }
+        }
+
         // PRD #110: reuse the existing session card for the same pane
         // ONLY when the agent_id matches (or both sides are absent for
         // pre-F9 backward-compat). A different agent_id means the agent
@@ -14460,50 +15289,54 @@ impl AppState {
         // guess — the pane is already ambiguous at that point, and picking one
         // would be the same coin-flip this fix exists to remove.
         if let Some(ref pane_id) = event.pane_id {
-            let on_pane =
-                |session: &SessionState| session.pane_id.as_ref().is_some_and(|p| p == pane_id);
-            let existing_id = self
-                .sessions
-                .iter()
-                .find_map(|(id, session)| {
-                    (on_pane(session)
-                        && id != &event.session_id
-                        && session.agent_id == event.agent_id)
-                        .then(|| id.clone())
-                })
-                .or_else(|| {
-                    if event.agent_id.is_some() {
-                        return None;
-                    }
-                    // Greptile PR #443 finding #1: a TERMINAL frame must never
-                    // adopt. `SessionEnd` is not handled by the status path
-                    // below — it hits the terminal branch, which REMOVES
-                    // `event.session_id` and rebuilds a bare placeholder. So
-                    // adopting one would hand that branch the tagged session
-                    // and destroy exactly what the `None` carve-out exists to
-                    // protect: `recent_events`, `tool_count`, `first_prompts`.
-                    // Before this PR an untagged `SessionEnd` resolved to no
-                    // session at all and was a silent no-op; excluding it here
-                    // keeps precisely that behaviour, so the fix cannot lose
-                    // history on any path.
-                    //
-                    // The narrower reading — "an untagged end can't name a
-                    // generation, so it cannot prove THIS one ended" — is the
-                    // same rule the retire block applies one screen down, where
-                    // `claims_generation` excludes `SessionEnd` for its own
-                    // reasons. An untagged end simply is not evidence.
-                    if !claims_generation {
-                        return None;
-                    }
-                    let mut candidates = self
-                        .sessions
-                        .iter()
-                        .filter(|(id, session)| on_pane(session) && *id != &event.session_id);
-                    match (candidates.next(), candidates.next()) {
-                        (Some((id, _)), None) => Some(id.clone()),
-                        _ => None,
-                    }
-                });
+            // An unproven frame may adopt only an outside agent's card (audit
+            // finding 1); a proven one may adopt any.
+            let unproven_sessions = &self.unproven_sessions;
+            let on_pane = |id: &String, session: &SessionState| {
+                session.pane_id.as_ref().is_some_and(|p| p == pane_id)
+                    && (!unproven || unproven_sessions.contains_key(id))
+            };
+            let existing_id =
+                self.sessions
+                    .iter()
+                    .find_map(|(id, session)| {
+                        (on_pane(id, session)
+                            && id != &event.session_id
+                            && session.agent_id == event.agent_id)
+                            .then(|| id.clone())
+                    })
+                    .or_else(|| {
+                        if event.agent_id.is_some() {
+                            return None;
+                        }
+                        // Greptile PR #443 finding #1: a TERMINAL frame must never
+                        // adopt. `SessionEnd` is not handled by the status path
+                        // below — it hits the terminal branch, which REMOVES
+                        // `event.session_id` and rebuilds a bare placeholder. So
+                        // adopting one would hand that branch the tagged session
+                        // and destroy exactly what the `None` carve-out exists to
+                        // protect: `recent_events`, `tool_count`, `first_prompts`.
+                        // Before this PR an untagged `SessionEnd` resolved to no
+                        // session at all and was a silent no-op; excluding it here
+                        // keeps precisely that behaviour, so the fix cannot lose
+                        // history on any path.
+                        //
+                        // The narrower reading — "an untagged end can't name a
+                        // generation, so it cannot prove THIS one ended" — is the
+                        // same rule the retire block applies one screen down, where
+                        // `claims_generation` excludes `SessionEnd` for its own
+                        // reasons. An untagged end simply is not evidence.
+                        if !claims_generation {
+                            return None;
+                        }
+                        let mut candidates = self.sessions.iter().filter(|(id, session)| {
+                            on_pane(id, session) && *id != &event.session_id
+                        });
+                        match (candidates.next(), candidates.next()) {
+                            (Some((id, _)), None) => Some(id.clone()),
+                            _ => None,
+                        }
+                    });
             if let Some(existing_id) = existing_id {
                 let old_id = std::mem::replace(&mut event.session_id, existing_id);
                 if old_id != event.session_id {
@@ -14691,6 +15524,7 @@ impl AppState {
                     session.pane_id.as_ref().is_some_and(|p| p == pane_id)
                         && *id != &event.session_id
                         && session.agent_id != event.agent_id
+                        && (!unproven || self.unproven_sessions.contains_key(*id))
                         && self.supersedes_generation(&event, session)
                 })
                 .map(|(id, _)| id.clone())
@@ -14890,10 +15724,13 @@ impl AppState {
                 // ROUND-2 AUDIT (finding 1): the named id is not taken at face
                 // value, and that check is the whole difference between a
                 // witness and a weapon. `owns_pane_event` admits an event whose
-                // pane is merely in `managed_pane_ids`, and an entry there is
-                // itself establishable by posting a `SessionStart` for an
-                // INVENTED pane id ([`Self::apply_event`]'s `SessionStart`
-                // branch inserts one when no oracle claims the pane). So without
+                // pane is merely in `managed_pane_ids`, and in a process with no
+                // oracle an entry there is still establishable by posting an
+                // unmarked `SessionStart` for an INVENTED pane id (the TUI's
+                // startup-race branch). In the daemon it no longer is (issue
+                // #601: an outside start is recorded as unproven, never in
+                // `managed_pane_ids`), but the registry check below is what
+                // holds in every process, so it stays. So without
                 // this, any same-uid process holding the hook socket could post
                 // a `SessionEnd` for a pane it invented while naming a VICTIM
                 // agent that sits on a different pane, and the victim's every
@@ -14926,7 +15763,17 @@ impl AppState {
                 // hook loop, `crate::daemon_protocol::serve_attach_with_counter`
                 // ahead of its accept loop, idempotently), so in the daemon this
                 // is an ownership check and not the historical fallback.
-                if let Some(agent_id) = event.agent_id.as_deref()
+                //
+                // Issue #697: and never for an unproven event. A client with no
+                // oracle reads the `None` arm above, so without this an outside
+                // agent's `SessionEnd` naming any id it liked would grow this
+                // agent-keyed map without bound there. A frame carrying the
+                // daemon's unproven marker is always unproven here: the one
+                // marked frame that reaches a card of this process's own, the
+                // orphan survivor's report, returned above without getting here.
+                if !unproven
+                    && !marked_unproven
+                    && let Some(agent_id) = event.agent_id.as_deref()
                     && matches!(
                         self.oracle_ownership(Some(pane_id.as_str()), Some(agent_id)),
                         None | Some(Ownership::Owned)
@@ -15194,6 +16041,23 @@ impl AppState {
             }
         }
 
+        // Issue #697: account for the card this event lands on. An unproven
+        // event's card is (or becomes) an unproven session, and creating one at
+        // `MAX_UNPROVEN_SESSIONS` evicts the least recently active first — here,
+        // before the card is resolved, so the eviction can never remove it. A
+        // proven event landing on a card this state held as unproven is the
+        // owner speaking for it, and the card stops counting.
+        if unproven {
+            self.note_unproven_activity(&event.session_id, event.pane_id.as_deref());
+        } else {
+            self.unproven_sessions.remove(&event.session_id);
+        }
+        let journal_cap = if unproven {
+            MAX_UNPROVEN_RECENT_EVENTS
+        } else {
+            MAX_RECENT_EVENTS
+        };
+
         let pane_started = event
             .pane_id
             .as_ref()
@@ -15345,6 +16209,101 @@ impl AppState {
         // arm reports for itself rather than being classified from outside,
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
+        let asserted_status = Self::apply_status_transition(session, &event);
+
+        // Issue #770: carry the daemon's orphaned-role verdict onto the card.
+        // One-way: the marker only ever ARRIVES (see the field's doc comment for
+        // why there is no un-orphaning edge), and an unmarked event from an
+        // older daemon must not clear a verdict a newer one already reported.
+        if event.is_orchestration_orphaned() {
+            session.orchestration_orphaned = true;
+        }
+
+        // Issue #559: the same one-way shape, for the same reason — the marker
+        // only withdraws standing, so no later frame may restore it. See
+        // `SessionState::prompt_reports_unavailable`.
+        if event.declares_prompt_reports_unavailable() {
+            session.prompt_reports_unavailable = true;
+        }
+        // Issue #1567: sticky for the same reason — a producer that declared it
+        // reports every prompt is still that producer when one of its frames
+        // goes out bare. Unlike the marker above this one GRANTS standing, so
+        // it is taken only from a frame the daemon's hook-provenance gate
+        // attested (`AgentEvent::declares_prompt_reports`) and never onto an
+        // outside agent's unproven card. See
+        // `SessionState::prompt_reports_declared`.
+        if !unproven && event.declares_prompt_reports() {
+            session.prompt_reports_declared = true;
+        }
+
+        // PRD #20 blocker-2: keep the live-target durable across the bounded
+        // journal. An event that omits `live_target` inherits the session's
+        // last-declared one, so the descriptor is never lost when the original
+        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
+        // A new declaration on the event itself always wins.
+        if event.live_target.is_none() {
+            event.live_target = session
+                .recent_events
+                .iter()
+                .rev()
+                .find_map(|e| e.live_target);
+        }
+
+        // Qodo, PR #1559: an outside card's journal is counted against
+        // `MAX_UNPROVEN_JOURNAL_BYTES` as it changes.
+        let mut journal_entry = if unproven {
+            self.unproven_sessions.get_mut(&event.session_id)
+        } else {
+            None
+        };
+        let pushed = journal_entry
+            .as_ref()
+            .and_then(|entry| entry.journal_bytes)
+            .map(|_| retained_event_bytes(&event));
+        session.recent_events.push_back(event);
+        let mut popped = 0;
+        while session.recent_events.len() > journal_cap {
+            if let Some(old) = session.recent_events.pop_front()
+                && pushed.is_some()
+            {
+                popped += retained_event_bytes(&old);
+            }
+        }
+        if let (Some(entry), Some(pushed)) = (journal_entry.as_mut(), pushed) {
+            entry.journal_bytes = entry
+                .journal_bytes
+                .map(|bytes| (bytes + pushed).saturating_sub(popped));
+        }
+
+        // The `session` borrow is done, so the pane-level provenance captured
+        // above can be recorded — but ONLY if this frame actually asserted the
+        // status now on the card. A tagged frame that asserted CLEARS the mark:
+        // an identified producer stating the current status is exactly the
+        // evidence the gate wants, so a pane recovers the carve-out on the next
+        // real hook rather than being poisoned for the session by one untagged
+        // frame. A frame that asserted nothing changes nothing here, so it can
+        // neither launder an untagged status into a trusted one nor cast doubt
+        // on a status it did not write.
+        if asserted_status && let Some(pane_id) = provenance_pane {
+            if provenance_untagged {
+                self.untagged_status_panes.insert(pane_id);
+            } else {
+                self.untagged_status_panes.remove(&pane_id);
+            }
+        }
+        if asserted_status {
+            AppliedEvent::StatusAsserted
+        } else {
+            AppliedEvent::StatusKept
+        }
+    }
+
+    /// The status a frame writes on `session`, and whether it ASSERTED one
+    /// (see the comment at the call in [`Self::apply_event_unsettled`]). Every
+    /// event type but `SessionEnd`, which the caller handles first. Shared with
+    /// [`Self::apply_orphan_survivor_report`], so the one card an orphaned role
+    /// pane's report may reach follows exactly the status rules every card does.
+    fn apply_status_transition(session: &mut SessionState, event: &AgentEvent) -> bool {
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
         // `session.idle` after its `session.error`, Claude Code's `idle_prompt`
@@ -15363,7 +16322,7 @@ impl AppState {
         if session.status == SessionStatus::Blocked
             && !quota_blocked
             && !quota_lift
-            && crate::quota_block::is_work_evidence(&event)
+            && crate::quota_block::is_work_evidence(event)
         {
             session.status = SessionStatus::Thinking;
             session.blocked = None;
@@ -15478,11 +16437,20 @@ impl AppState {
                         Some(SubagentWait {
                             subagent_ids: vec![id],
                             resume_idle: session.status == SessionStatus::Idle,
+                            overflow: 0,
                         })
                     }
                     Some(id) => session.subagent_wait.take().map(|mut wait| {
                         if !wait.subagent_ids.contains(&id) {
-                            wait.subagent_ids.push(id);
+                            // Issue #697: bounded — past the cap an ask is
+                            // counted rather than remembered, so the wait stays
+                            // open for it instead of forgetting its prompt (see
+                            // `SubagentWait::overflow` for what that costs).
+                            if wait.subagent_ids.len() >= MAX_SUBAGENT_IDS {
+                                wait.overflow = wait.overflow.saturating_add(1);
+                            } else {
+                                wait.subagent_ids.push(id);
+                            }
                         }
                         wait
                     }),
@@ -15509,10 +16477,16 @@ impl AppState {
                     && let Some(ended) =
                         event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY)
                     && let Some(wait) = session.subagent_wait.as_mut()
-                    && wait.subagent_ids.contains(ended) =>
+                    && (wait.subagent_ids.contains(ended) || wait.overflow > 0) =>
             {
-                wait.subagent_ids.retain(|id| id != ended);
-                let asserted = wait.subagent_ids.is_empty();
+                // Issue #697: an id the wait does not hold is one of the
+                // subagents counted past the cap (see `SubagentWait::overflow`).
+                if wait.subagent_ids.contains(ended) {
+                    wait.subagent_ids.retain(|id| id != ended);
+                } else {
+                    wait.overflow -= 1;
+                }
+                let asserted = wait.subagent_ids.is_empty() && wait.overflow == 0;
                 if asserted {
                     session.status = if wait.resume_idle {
                         SessionStatus::Idle
@@ -15602,63 +16576,81 @@ impl AppState {
         {
             session.shell_synthetic_working = false;
         }
+        asserted_status
+    }
 
-        // Issue #770: carry the daemon's orphaned-role verdict onto the card.
-        // One-way: the marker only ever ARRIVES (see the field's doc comment for
-        // why there is no un-orphaning edge), and an unmarked event from an
-        // older daemon must not clear a verdict a newer one already reported.
+    /// Round-2 audit findings 1-3: the card a restart survivor's report — from
+    /// an orphaned role pane, or (round 3) any pane the daemon holds no live
+    /// agent on — may reach on a client — the ONE card on `pane_id` this process holds as its
+    /// own, and only when the report names that card's agent (both absent
+    /// counts). Anything else on the pane, more than one card, or a different
+    /// agent, and there is no such card: the report is an outside agent's and
+    /// is refused like any other unproven report on a registered pane.
+    ///
+    /// Bound to the agent so a report the daemon stamped orphaned cannot drive
+    /// a card a NEW generation drew on the pane, even if the stamp were wrong.
+    fn orphan_survivor_card(&self, pane_id: &str, agent_id: Option<&str>) -> Option<String> {
+        let mut on_pane = self.sessions.iter().filter(|(id, session)| {
+            session.pane_id.as_deref() == Some(pane_id) && !self.unproven_sessions.contains_key(*id)
+        });
+        match (on_pane.next(), on_pane.next()) {
+            (Some((id, session)), None) if session.agent_id.as_deref() == agent_id => {
+                Some(id.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #770 on a client, narrowed by round-2 audit findings 1-3 and
+    /// widened to plain panes in round 3: apply a restart survivor's report to
+    /// its card `card_id` (see [`Self::orphan_survivor_card`]) and to nothing
+    /// else. The report keeps its unproven standing: it may move that card's
+    /// bounded reporting state — status, the status transition's tool, block
+    /// and wait fields, last activity and the capped event journal — and, for
+    /// a report the daemon stamped orphaned, set its orphan badge. Whatever
+    /// session key it names is ignored, so it cannot reach another card; it
+    /// creates, re-keys and removes no card, a `SessionEnd` only settles the
+    /// card `Idle`, and it writes none of the per-pane or per-agent records an
+    /// owner's report keeps, so no number of them can grow this process's
+    /// state.
+    fn apply_orphan_survivor_report(
+        &mut self,
+        card_id: &str,
+        mut event: AgentEvent,
+    ) -> AppliedEvent {
+        self.applied_unproven = true;
+        let Some(session) = self.sessions.get_mut(card_id) else {
+            return AppliedEvent::Rejected;
+        };
+        // The badge is for a role pane's survivor only; a plain pane's has
+        // no role to have lost.
         if event.is_orchestration_orphaned() {
             session.orchestration_orphaned = true;
         }
-
-        // Issue #559: the same one-way shape, for the same reason — the marker
-        // only withdraws standing, so no later frame may restore it. See
-        // `SessionState::prompt_reports_unavailable`.
-        if event.declares_prompt_reports_unavailable() {
-            session.prompt_reports_unavailable = true;
+        if event.timestamp > session.last_activity {
+            session.last_activity = event.timestamp;
         }
-        // Issue #1567: sticky for the same reason — a producer that declared it
-        // reports every prompt is still that producer when one of its frames
-        // goes out bare. See `SessionState::prompt_reports_declared`.
-        if event.declares_prompt_reports() {
-            session.prompt_reports_declared = true;
+        if event.event_type == EventType::SessionEnd {
+            session.status = SessionStatus::Idle;
+            session.active_tool = None;
+            session.blocked = None;
+            session.subagent_wait = None;
+            session.shell_synthetic_working = false;
+            return AppliedEvent::StatusAsserted;
         }
-
-        // PRD #20 blocker-2: keep the live-target durable across the bounded
-        // journal. An event that omits `live_target` inherits the session's
-        // last-declared one, so the descriptor is never lost when the original
-        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
-        // A new declaration on the event itself always wins.
-        if event.live_target.is_none() {
-            event.live_target = session
-                .recent_events
-                .iter()
-                .rev()
-                .find_map(|e| e.live_target);
-        }
-
+        let asserted = Self::apply_status_transition(session, &event);
+        event.session_id = card_id.to_string();
+        // Qodo, PR #1559: the card's live target is not reporting state, so the
+        // report carries the card's own — never one of its own, which would
+        // let an unproven report make the card writable — and it stays durable
+        // once the declaring event ages out of the bounded journal, as the
+        // owner's path keeps it (PRD #20 blocker-2).
+        event.live_target = session.live_target();
         session.recent_events.push_back(event);
-        if session.recent_events.len() > MAX_RECENT_EVENTS {
+        while session.recent_events.len() > MAX_RECENT_EVENTS {
             session.recent_events.pop_front();
         }
-
-        // The `session` borrow is done, so the pane-level provenance captured
-        // above can be recorded — but ONLY if this frame actually asserted the
-        // status now on the card. A tagged frame that asserted CLEARS the mark:
-        // an identified producer stating the current status is exactly the
-        // evidence the gate wants, so a pane recovers the carve-out on the next
-        // real hook rather than being poisoned for the session by one untagged
-        // frame. A frame that asserted nothing changes nothing here, so it can
-        // neither launder an untagged status into a trusted one nor cast doubt
-        // on a status it did not write.
-        if asserted_status && let Some(pane_id) = provenance_pane {
-            if provenance_untagged {
-                self.untagged_status_panes.insert(pane_id);
-            } else {
-                self.untagged_status_panes.remove(&pane_id);
-            }
-        }
-        if asserted_status {
+        if asserted {
             AppliedEvent::StatusAsserted
         } else {
             AppliedEvent::StatusKept
@@ -24194,6 +25186,7 @@ while True:
         registry.shutdown_all();
     }
 
+    /// Scenario: A forged start cannot register a registry-owned pane, while an external agent's start and later status still produce its own foreign card without promoting its pane into managed ownership.
     /// Binding admission to the generation opens a door that has to be shut in
     /// the same change: an event whose `agent_id` does not match now FAILS the
     /// ownership check, and a `SessionStart` that fails it lands in the
@@ -24238,16 +25231,135 @@ while True:
             "the generation that actually owns the pane must still be admitted"
         );
 
-        // And an UNCLAIMED pane keeps the historical escape hatch verbatim.
+        // An unclaimed pane keeps the external-card compatibility path, but
+        // a declaration by its sender must never become proof of ownership.
         let mut startup_race = agent_event_cli_payload("unclaimed-pane-454", "tui-agent-454");
         startup_race.session_id = "startup-race-session-454".to_string();
         startup_race.event_type = EventType::SessionStart;
+        state.apply_event(startup_race.clone());
+        startup_race.event_type = EventType::Thinking;
         state.apply_event(startup_race);
+        assert_eq!(
+            state.sessions["startup-race-session-454"].status,
+            SessionStatus::Thinking
+        );
+        assert_eq!(
+            state.sessions["startup-race-session-454"]
+                .pane_id
+                .as_deref(),
+            Some("unclaimed-pane-454")
+        );
         assert!(
-            state.managed_pane_ids.contains("unclaimed-pane-454"),
-            "a pane the registry has never heard of still auto-registers — that \
-             is the TUI startup race, and narrowing it is #601's job, not this \
-             change's"
+            !state.managed_pane_ids.contains("unclaimed-pane-454"),
+            "issue #601: a foreign SessionStart must not promote its pane into managed_pane_ids"
+        );
+    }
+
+    fn foreign_provenance_event(index: usize, kind: EventType, activity: i64) -> AgentEvent {
+        let mut event = agent_event_cli_payload(
+            &format!("foreign-pane-{index}"),
+            &format!("foreign-agent-{index}"),
+        );
+        event.session_id = format!("foreign-card-{index}");
+        event.event_type = kind;
+        event.timestamp = Utc::now() + chrono::Duration::seconds(activity);
+        event
+    }
+
+    /// Scenario: Admit a small number of external agents and let each report status after its start. All their foreign cards must remain visible and independently update, without acquiring managed ownership.
+    #[test]
+    fn hook_provenance_foreign_subcap_cards_are_retained() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+        for index in 0..8 {
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::SessionStart,
+                index as i64,
+            ));
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::Thinking,
+                index as i64 + 10,
+            ));
+        }
+        assert_eq!(
+            state.sessions.len(),
+            8,
+            "sub-cap foreign cards must all remain visible"
+        );
+        for index in 0..8 {
+            assert_eq!(
+                state.sessions[&format!("foreign-card-{index}")].status,
+                SessionStatus::Thinking
+            );
+        }
+        assert!(
+            state.managed_pane_ids.is_empty(),
+            "foreign cards cannot assert managed ownership"
+        );
+    }
+
+    /// Scenario: Fill the external-card budget, refresh the oldest card, then admit one more external agent. Only the least recently active foreign card must disappear, its later token-less status must not resurrect it, and the older managed card must survive outside the budget.
+    #[test]
+    fn hook_provenance_foreign_flood_evicts_lru_and_preserves_managed_card() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.to_string());
+        let mut managed = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        managed.session_id = "managed-card".to_string();
+        managed.event_type = EventType::SessionStart;
+        state.apply_event(managed);
+        for index in 0..crate::state::MAX_UNPROVEN_SESSIONS {
+            state.apply_event(foreign_provenance_event(
+                index,
+                EventType::SessionStart,
+                index as i64 + 1,
+            ));
+        }
+        assert_eq!(
+            state.sessions.len(),
+            crate::state::MAX_UNPROVEN_SESSIONS + 1,
+            "managed cards must not consume the foreign-card budget"
+        );
+        state.apply_event(foreign_provenance_event(0, EventType::Thinking, 1000));
+        state.apply_event(foreign_provenance_event(
+            crate::state::MAX_UNPROVEN_SESSIONS,
+            EventType::SessionStart,
+            1001,
+        ));
+        let foreign_count = state
+            .sessions
+            .values()
+            .filter(|session| session.pane_id.as_deref() != Some(CLI_PANE))
+            .count();
+        assert!(
+            foreign_count <= crate::state::MAX_UNPROVEN_SESSIONS,
+            "issue #697: unproven cards exceed the {}-entry cap: {foreign_count}",
+            crate::state::MAX_UNPROVEN_SESSIONS,
+        );
+        assert!(
+            state.sessions.contains_key("managed-card"),
+            "an older managed card must never be evicted"
+        );
+        assert!(
+            state.sessions.contains_key("foreign-card-0"),
+            "recent activity must refresh LRU position"
+        );
+        assert!(
+            !state.sessions.contains_key("foreign-card-1"),
+            "least recently active foreign card must be evicted"
+        );
+        assert_eq!(
+            state.managed_pane_ids,
+            HashSet::from([CLI_PANE.to_string()]),
+            "foreign pane auto-registration must not grow the managed set"
+        );
+        state.apply_event(foreign_provenance_event(1, EventType::Thinking, 1002));
+        assert!(
+            !state.sessions.contains_key("foreign-card-1"),
+            "eviction must remove foreign pane admission as well as the session; a status without SessionStart resurrected the card"
         );
     }
 
@@ -24645,6 +25757,121 @@ while True:
         assert!(session(&state).blocked.is_none());
     }
 
+    fn subagent_event(event_type: EventType, subagent_id: &str, secs: i64) -> AgentEvent {
+        let mut event = quota_event(event_type, secs);
+        event.metadata.insert(
+            crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+            subagent_id.to_string(),
+        );
+        event
+    }
+
+    /// Issue #697 (Qodo on #1559): more subagents waiting at once than a
+    /// [`SubagentWait`] remembers by id must not end the wait while one of
+    /// them still has its prompt open. One more subagent than
+    /// [`MAX_SUBAGENT_IDS`] asks for permission, all but the first stop —
+    /// the last of them the one counted rather than remembered — and the card
+    /// must still read Needs Input until the first one stops too.
+    #[test]
+    fn subagent_wait_over_the_id_cap_stays_open_until_every_subagent_stops() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        let total = MAX_SUBAGENT_IDS + 1;
+        for i in 0..total {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        assert_eq!(status(&state), SessionStatus::WaitingForInput);
+
+        for i in (1..total).rev() {
+            state.apply_event(subagent_event(
+                EventType::SubagentStop,
+                &format!("sub-{i}"),
+                3,
+            ));
+            assert_eq!(
+                status(&state),
+                SessionStatus::WaitingForInput,
+                "sub-0 still has its prompt open after sub-{i} stopped"
+            );
+        }
+
+        state.apply_event(subagent_event(EventType::SubagentStop, "sub-0", 4));
+        assert_eq!(
+            status(&state),
+            SessionStatus::Thinking,
+            "the last waiting subagent stopping ends the wait"
+        );
+    }
+
+    /// Issue #697 (Qodo on #1559, r4176756571): a subagent that asks twice is
+    /// still one subagent. 65 subagents ask — past the 64 ids a wait once
+    /// remembered — the 65th asks again, and once all 65 have stopped the wait
+    /// must be over: counting the repeat as a second subagent left the card on
+    /// Needs Input after every subagent had stopped.
+    #[test]
+    fn subagent_wait_a_repeated_ask_is_not_a_new_subagent() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        let total = 65;
+        for i in 0..total {
+            state.apply_event(subagent_event(
+                EventType::PermissionRequest,
+                &format!("sub-{i}"),
+                2,
+            ));
+        }
+        let repeated = format!("sub-{}", total - 1);
+        state.apply_event(subagent_event(EventType::PermissionRequest, &repeated, 3));
+
+        for i in 0..total - 1 {
+            state.apply_event(subagent_event(
+                EventType::SubagentStop,
+                &format!("sub-{i}"),
+                4,
+            ));
+            assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, &repeated, 5));
+        assert_eq!(
+            status(&state),
+            SessionStatus::Thinking,
+            "every subagent has stopped, so the wait is over"
+        );
+    }
+
+    /// Issue #697 control: under the cap the wait behaves as before — it ends
+    /// on the stop of the last subagent recorded, and a stop from a subagent
+    /// that never asked does not end it early.
+    #[test]
+    fn subagent_wait_under_the_id_cap_ends_on_the_last_recorded_stop() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::Thinking, 1));
+        let status = |state: &AppState| state.sessions["gen-q"].status.clone();
+
+        for id in ["a", "b", "c"] {
+            state.apply_event(subagent_event(EventType::PermissionRequest, id, 2));
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, "never-asked", 3));
+        assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        for id in ["a", "b"] {
+            state.apply_event(subagent_event(EventType::SubagentStop, id, 3));
+            assert_eq!(status(&state), SessionStatus::WaitingForInput);
+        }
+        state.apply_event(subagent_event(EventType::SubagentStop, "c", 4));
+        assert_eq!(status(&state), SessionStatus::Thinking);
+    }
+
     /// Scenario: Serialize a live snapshot whose status is Blocked and decode it
     /// with a reader that predates the variant. The older reader must decode
     /// the whole record with the status as Unknown and ignore the reason, and
@@ -24992,5 +26219,1147 @@ while True:
         }]);
         assert!(windowed.contains("; resets in 2 hours"), "{windowed}");
         assert!(!windowed.contains("credits do not reset"), "{windowed}");
+    }
+
+    fn hook_provenance_audit_unproven(mut event: AgentEvent) -> AgentEvent {
+        event.metadata.insert(
+            crate::event::UNPROVEN_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        event
+    }
+
+    /// Scenario: The daemon's registry owns a pane, and an event carrying the
+    /// daemon's unproven marker arrives for it — a start naming no agent, then
+    /// a running report naming the owner — after the owner's own card exists.
+    /// Neither may draw a card or move the owner's, because the marker is the
+    /// gate's verdict and a later ownership lookup must not overturn it.
+    #[test]
+    fn hook_provenance_audit_daemon_reads_the_unproven_marker_as_authoritative() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "owner-card".to_string();
+        own.event_type = EventType::SessionStart;
+        state.apply_event(own.clone());
+        let before = state.sessions["owner-card"].clone();
+
+        let mut start = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        start.agent_id = None;
+        start.session_id = "forged-start".to_string();
+        start.event_type = EventType::SessionStart;
+        state.apply_event(hook_provenance_audit_unproven(start));
+        assert!(!state.sessions.contains_key("forged-start"));
+
+        let mut status = own;
+        status.event_type = EventType::Thinking;
+        state.apply_event(hook_provenance_audit_unproven(status));
+        assert_eq!(state.sessions["owner-card"].status, before.status);
+        assert_eq!(state.unproven_session_count(), 0);
+    }
+
+    /// Scenario: A client with no registry registered a pane as its own and
+    /// holds its card. An event the daemon marked unproven for that pane must
+    /// not drive the card or draw a second one; one that the daemon ALSO marked
+    /// as coming from an orphaned role pane (the daemon-restart survivor) still
+    /// reaches the card and badges it.
+    #[test]
+    fn hook_provenance_audit_client_marker_is_authoritative_except_for_an_orphan() {
+        let mut client = AppState::default();
+        client.register_pane(CLI_PANE.to_string());
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "owner-card".to_string();
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own.clone());
+        let before = client.sessions["owner-card"].status.clone();
+
+        let mut status = own.clone();
+        status.event_type = EventType::Thinking;
+        client.apply_event(hook_provenance_audit_unproven(status.clone()));
+        assert_eq!(client.sessions["owner-card"].status, before);
+        let mut start = own.clone();
+        start.agent_id = None;
+        start.session_id = "forged-start".to_string();
+        client.apply_event(hook_provenance_audit_unproven(start));
+        assert!(!client.sessions.contains_key("forged-start"));
+
+        let mut orphaned = hook_provenance_audit_unproven(status);
+        orphaned.metadata.insert(
+            crate::event::ORCHESTRATION_ORPHANED_METADATA_KEY.to_string(),
+            crate::event::ORCHESTRATION_ORPHANED_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(orphaned);
+        assert_eq!(
+            client.sessions["owner-card"].status,
+            SessionStatus::Thinking
+        );
+        assert!(client.sessions["owner-card"].orchestration_orphaned);
+    }
+
+    /// Scenario: An outside agent draws a card on a pane, and the deck then
+    /// registers that pane as its own. The outside card must go with the
+    /// registration rather than linger as an untracked second card.
+    #[test]
+    fn hook_provenance_audit_registering_a_pane_removes_its_outside_cards() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+        let mut outside = agent_event_cli_payload("collide-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        state.apply_event(outside);
+        assert_eq!(state.unproven_session_count(), 1, "precondition");
+        state.register_pane("collide-pane".to_string());
+        assert!(
+            !state.sessions.contains_key("outside-card"),
+            "an outside card on a pane the deck now owns must be removed"
+        );
+        assert_eq!(state.unproven_session_count(), 0);
+    }
+
+    /// Scenario: In a process with no registry, an outside agent's marked
+    /// paneless start, status and end name the key of a card on a pane the
+    /// process registered; and an outside agent's marked events on its own
+    /// pane name the key of a paneless card the process admitted earlier.
+    /// Neither may change, relocate or remove the card it collides with.
+    #[test]
+    fn hook_provenance_audit_client_unproven_collisions_leave_proven_cards_alone() {
+        let mut client = AppState::default();
+        let mut own = agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID);
+        own.session_id = "paneless-own".to_string();
+        own.pane_id = None;
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own);
+        assert!(client.sessions.contains_key("paneless-own"), "precondition");
+
+        let mut outside = agent_event_cli_payload("outside-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        client.apply_event(hook_provenance_audit_unproven(outside.clone()));
+        for kind in [EventType::Thinking, EventType::SessionEnd] {
+            let mut collide = outside.clone();
+            collide.session_id = "paneless-own".to_string();
+            collide.event_type = kind.clone();
+            client.apply_event(hook_provenance_audit_unproven(collide));
+            let card = client
+                .sessions
+                .get("paneless-own")
+                .unwrap_or_else(|| panic!("{kind:?}: the card is gone"));
+            assert_eq!(card.pane_id, None, "{kind:?}");
+            assert_eq!(card.status, SessionStatus::Idle, "{kind:?}");
+        }
+    }
+
+    /// Scenario: Agent B owns a pane and has its card. An attested report that
+    /// names no agent arrives for that pane, but its token was minted for the
+    /// replaced agent A — the successor claimed the pane after the gate looked.
+    /// Judged under the state lock by A's generation, it must leave B's card
+    /// alone; the same report attested to B itself still lands.
+    #[test]
+    fn hook_provenance_audit_apply_judges_an_untagged_report_by_its_tokens_generation() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::owning(CLI_PANE, "agent-b"));
+        let mut own = agent_event_cli_payload(CLI_PANE, "agent-b");
+        own.session_id = "successor-card".to_string();
+        own.event_type = EventType::SessionStart;
+        state.apply_event(own.clone());
+        let mut untagged = own;
+        untagged.agent_id = None;
+        untagged.event_type = EventType::Thinking;
+
+        let _ = state.apply_event_reporting(untagged.clone(), Some("agent-a"));
+        assert_eq!(
+            state.sessions["successor-card"].status,
+            SessionStatus::Idle,
+            "a replaced generation's untagged report must not drive its successor's card"
+        );
+
+        let _ = state.apply_event_reporting(untagged, Some("agent-b"));
+        assert_eq!(
+            state.sessions["successor-card"].status,
+            SessionStatus::Thinking
+        );
+    }
+
+    /// The role pane the round-2 orphan regressions use, and the survivor
+    /// agent the client's card on it belongs to.
+    const AUDIT_ORPHAN_PANE: &str = "sched-audit-orphan-7-r0";
+    const AUDIT_SURVIVOR: &str = "survivor-3";
+
+    /// An event as the daemon broadcasts an outside report from an orphaned
+    /// role pane: stamped orphaned by the real stamp of a post-restart daemon,
+    /// and marked unproven because that daemon never issued the pane a token.
+    fn hook_provenance_audit_orphan_frame(
+        session: &str,
+        agent: Option<&str>,
+        kind: EventType,
+    ) -> AgentEvent {
+        let mut event = agent_event_cli_payload(AUDIT_ORPHAN_PANE, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        AppState::default().stamp_orchestration_orphan(&mut event, false);
+        assert!(event.is_orchestration_orphaned(), "precondition: stamped");
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// A client with no registry that still holds a daemon-restart survivor's
+    /// card on its registered role pane, beside a proven paneless card.
+    fn hook_provenance_audit_orphan_client() -> AppState {
+        // The paneless card first: a client admits one only while it manages
+        // no pane, and it keeps the card once it registers one.
+        let mut client = AppState::default();
+        let mut paneless = agent_event_cli_payload(AUDIT_ORPHAN_PANE, "paneless-agent");
+        paneless.session_id = "paneless-victim".to_string();
+        paneless.pane_id = None;
+        paneless.event_type = EventType::SessionStart;
+        client.apply_event(paneless);
+        client.register_pane(AUDIT_ORPHAN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_ORPHAN_PANE, AUDIT_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        client.apply_event(survivor);
+        assert_eq!(client.sessions.len(), 2, "precondition: two cards");
+        client
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane, beside an unrelated paneless card. Outside reports the daemon
+    /// stamped orphaned for that pane — a running report, a start under a
+    /// fresh key and a session end, each naming the paneless card's key or an
+    /// invented agent — must never change, re-key or remove the paneless card,
+    /// draw a new card, or remove the survivor's card. The survivor's own
+    /// reports still update its card's status and orphan badge.
+    #[test]
+    fn hook_provenance_audit_client_orphan_exception_reaches_only_the_survivors_card() {
+        let mut client = hook_provenance_audit_orphan_client();
+        let victim = client.sessions["paneless-victim"].clone();
+        for (session, agent, kind) in [
+            ("paneless-victim", Some("invented-9"), EventType::Thinking),
+            ("paneless-victim", Some(AUDIT_SURVIVOR), EventType::Thinking),
+            ("fresh-key", Some("invented-9"), EventType::SessionStart),
+            ("fresh-key", Some(AUDIT_SURVIVOR), EventType::SessionStart),
+            (
+                "paneless-victim",
+                Some("invented-9"),
+                EventType::SessionStart,
+            ),
+            ("paneless-victim", Some("invented-9"), EventType::SessionEnd),
+            (
+                "paneless-victim",
+                Some(AUDIT_SURVIVOR),
+                EventType::SessionEnd,
+            ),
+            ("survivor-card", Some("invented-9"), EventType::SessionEnd),
+        ] {
+            client.apply_event(hook_provenance_audit_orphan_frame(
+                session,
+                agent,
+                kind.clone(),
+            ));
+            let what = format!("{kind:?} naming {session} as {agent:?}");
+            let card = client
+                .sessions
+                .get("paneless-victim")
+                .unwrap_or_else(|| panic!("{what}: the paneless card was removed"));
+            assert_eq!(
+                (&card.pane_id, &card.status, &card.agent_id),
+                (&victim.pane_id, &victim.status, &victim.agent_id),
+                "{what}: the paneless card must be untouched"
+            );
+            assert!(!card.orchestration_orphaned, "{what}: badge leaked");
+            assert!(
+                client.sessions.contains_key("survivor-card"),
+                "{what}: the survivor's card must not be removed"
+            );
+            assert_eq!(client.sessions.len(), 2, "{what}: no card may be drawn");
+            assert_eq!(client.unproven_session_count(), 0, "{what}");
+        }
+
+        // The survivor's own running report still reaches its card.
+        let mut client = hook_provenance_audit_orphan_client();
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some(AUDIT_SURVIVOR),
+            EventType::Thinking,
+        ));
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(card.status, SessionStatus::Thinking);
+        assert!(card.orchestration_orphaned);
+        assert_eq!(card.agent_id.as_deref(), Some(AUDIT_SURVIVOR));
+        // An invented agent's report on the pane does not.
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some("invented-9"),
+            EventType::Idle,
+        ));
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Thinking,
+            "the exception is bound to the survivor's own identity"
+        );
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane, and the daemon announces it evicted an outside card under the
+    /// survivor card's own key and pane — the daemon files the survivor's
+    /// reports as an outside agent's. The client's own card must stay; an
+    /// outside card the client holds under an announced key still goes.
+    #[test]
+    fn hook_provenance_audit_client_eviction_removes_only_an_outside_card() {
+        let mut client = hook_provenance_audit_orphan_client();
+        let mut eviction = agent_event_cli_payload(AUDIT_ORPHAN_PANE, AUDIT_SURVIVOR);
+        eviction.session_id = "survivor-card".to_string();
+        eviction.event_type = EventType::SessionEnd;
+        eviction.metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(eviction);
+        assert!(
+            client.sessions.contains_key("survivor-card"),
+            "an eviction announcement removes only a card the client holds as an outside agent's"
+        );
+
+        let mut outside = agent_event_cli_payload("outside-pane", "outside-agent");
+        outside.session_id = "outside-card".to_string();
+        outside.event_type = EventType::SessionStart;
+        client.apply_event(hook_provenance_audit_unproven(outside.clone()));
+        assert!(client.sessions.contains_key("outside-card"), "precondition");
+        outside.event_type = EventType::SessionEnd;
+        outside.metadata.insert(
+            crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        client.apply_event(outside);
+        assert!(!client.sessions.contains_key("outside-card"));
+    }
+
+    /// Scenario: A client still shows a restart survivor's card on its role
+    /// pane. Outside reports stamped orphaned for that pane arrive as far more
+    /// start/end pairs than the outside-card budget, each naming a fresh
+    /// session and a fresh agent id. No map the client keeps may grow with
+    /// them — in particular no agent-keyed closure record may be written.
+    #[test]
+    fn hook_provenance_audit_client_orphan_flood_retains_nothing_per_agent() {
+        let mut client = hook_provenance_audit_orphan_client();
+        for index in 0..MAX_UNPROVEN_SESSIONS * 3 {
+            let session = format!("orphan-flood-{index}");
+            let agent = format!("orphan-flood-agent-{index}");
+            for kind in [EventType::SessionStart, EventType::SessionEnd] {
+                client.apply_event(hook_provenance_audit_orphan_frame(
+                    &session,
+                    Some(&agent),
+                    kind,
+                ));
+            }
+        }
+        // The survivor's own end writes no agent-keyed witness either: the
+        // frame is still an outside report.
+        client.apply_event(hook_provenance_audit_orphan_frame(
+            "survivor-card",
+            Some(AUDIT_SURVIVOR),
+            EventType::SessionEnd,
+        ));
+        let sizes = client.retained_map_sizes();
+        for (map, size) in &sizes {
+            assert!(
+                *size <= 2,
+                "`{map}` retains {size} entries after an orphan flood: {sizes:?}"
+            );
+        }
+        let closures = sizes
+            .iter()
+            .find(|(map, _)| *map == "agent_generation_closures")
+            .map(|(_, size)| *size);
+        assert_eq!(closures, Some(0), "{sizes:?}");
+        assert!(!client.agent_generation_ended(AUDIT_SURVIVOR));
+    }
+
+    /// An outside agent's start on `pane`, as the daemon relays it.
+    fn hook_provenance_audit_outside_start(session: &str, pane: &str) -> AgentEvent {
+        let mut event = agent_event_cli_payload(pane, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = None;
+        event.event_type = EventType::SessionStart;
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// The cards `state` holds that are counted nowhere: neither on a pane it
+    /// registered nor in its outside-card accounting. Such a card is outside
+    /// the budget and is read as one of the process's own.
+    fn hook_provenance_audit_unaccounted_cards(state: &AppState) -> Vec<String> {
+        let mut ids: Vec<String> = state
+            .sessions
+            .iter()
+            .filter(|(id, session)| {
+                !state.unproven_sessions.contains_key(*id)
+                    && !session
+                        .pane_id
+                        .as_ref()
+                        .is_some_and(|pane| state.managed_pane_ids.contains(pane))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Scenario: Before a client attaches, the daemon holds an outside card
+    /// `s` on pane A, close to its outside-card budget. After the client
+    /// attaches, an outside start for `s` arrives on pane B: the daemon files
+    /// it under a pane-qualified key, the client under `s`. The daemon then
+    /// evicts its card on A and announces it. The client's card on B must stay
+    /// an outside card, counted against its budget, and must go when the daemon
+    /// later evicts the card it holds for B.
+    #[test]
+    fn hook_provenance_audit_mismatched_eviction_neither_promotes_nor_strands() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        // What an attached client sees: the frame as relayed, then whatever
+        // the daemon evicted to make room for it.
+        let relay = |daemon: &mut AppState, client: &mut AppState, event: AgentEvent| {
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+        };
+
+        // Before the client attaches.
+        daemon.apply_event(hook_provenance_audit_outside_start("s", "pane-a"));
+        for index in 0..MAX_UNPROVEN_SESSIONS - 2 {
+            daemon.apply_event(hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            ));
+        }
+        assert!(daemon.take_unproven_evictions().is_empty(), "precondition");
+
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("s", "pane-b"),
+        );
+        assert!(
+            daemon.sessions.contains_key("pane-b::s"),
+            "precondition: the daemon qualified the key"
+        );
+        assert_eq!(
+            client.sessions["s"].pane_id.as_deref(),
+            Some("pane-b"),
+            "precondition: the client did not"
+        );
+
+        // The daemon is at its budget: this evicts its card `s` on pane A.
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("trigger", "pane-t"),
+        );
+        assert!(!daemon.sessions.contains_key("s"), "precondition: evicted");
+        assert!(
+            client.sessions.contains_key("s"),
+            "the announcement named pane A; the client's card is on pane B"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new(),
+            "a mismatched eviction must not drop a card's accounting and keep the card"
+        );
+        assert!(!client.is_proven_session("s"), "the card was promoted");
+
+        // Refresh the daemon's fillers, which the client does not hold, so its
+        // card for pane B is the least recently active; the next start evicts
+        // it, under the daemon's own key for it.
+        for index in 0..MAX_UNPROVEN_SESSIONS - 2 {
+            let mut refresh = hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            );
+            refresh.event_type = EventType::Thinking;
+            relay(&mut daemon, &mut client, refresh);
+        }
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_start("trigger-2", "pane-u"),
+        );
+        assert!(
+            !daemon.sessions.contains_key("pane-b::s"),
+            "precondition: the daemon evicted its card for pane B"
+        );
+        assert!(
+            !client.sessions.contains_key("s"),
+            "the client's card for pane B must go with the daemon's, whatever \
+             key each side filed it under"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A plain (non-role) pane a client registered before a daemon restart,
+    /// and the survivor agent its card belongs to.
+    const AUDIT_PLAIN_PANE: &str = "audit-plain-survivor-pane";
+    const AUDIT_PLAIN_SURVIVOR: &str = "plain-survivor-5";
+
+    /// An event as a post-restart daemon broadcasts a report from a plain pane
+    /// it holds no live agent on: unproven, and stamped as such.
+    fn hook_provenance_audit_plain_frame(
+        session: &str,
+        agent: Option<&str>,
+        kind: EventType,
+    ) -> AgentEvent {
+        assert!(!crate::spawn::is_orchestration_role_pane_id(
+            AUDIT_PLAIN_PANE
+        ));
+        let mut event = agent_event_cli_payload(AUDIT_PLAIN_PANE, "unused");
+        event.session_id = session.to_string();
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        event.metadata.insert(
+            crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY.to_string(),
+            crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+        );
+        hook_provenance_audit_unproven(event)
+    }
+
+    /// A client with no registry that still holds a plain pane's restart
+    /// survivor card, beside a proven paneless card.
+    fn hook_provenance_audit_plain_client() -> AppState {
+        let mut client = AppState::default();
+        let mut paneless = agent_event_cli_payload(AUDIT_PLAIN_PANE, "paneless-agent");
+        paneless.session_id = "paneless-victim".to_string();
+        paneless.pane_id = None;
+        paneless.event_type = EventType::SessionStart;
+        client.apply_event(paneless);
+        client.register_pane(AUDIT_PLAIN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_PLAIN_PANE, AUDIT_PLAIN_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        client.apply_event(survivor);
+        assert_eq!(client.sessions.len(), 2, "precondition: two cards");
+        client
+    }
+
+    /// Scenario: A client stayed attached across a daemon restart and still
+    /// shows a plain pane's surviving agent, beside an unrelated paneless card.
+    /// The survivor's own running report, which the new daemon marks as coming
+    /// from a pane it holds no live agent on, updates the card without an
+    /// orphan badge, and its end settles the card Idle. Reports naming an
+    /// invented agent, the paneless card's key or a fresh key change no other
+    /// card and draw none, and a report without the daemon's verdict is refused.
+    #[test]
+    fn hook_provenance_audit_client_plain_survivor_reaches_only_its_own_card() {
+        let mut client = hook_provenance_audit_plain_client();
+        client.apply_event(hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        ));
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(
+            card.status,
+            SessionStatus::Thinking,
+            "the plain survivor's own report must update its card"
+        );
+        assert!(!card.orchestration_orphaned, "a plain pane has no role");
+        assert_eq!(card.agent_id.as_deref(), Some(AUDIT_PLAIN_SURVIVOR));
+
+        let victim = client.sessions["paneless-victim"].clone();
+        for (session, agent, kind) in [
+            ("survivor-card", Some("invented-9"), EventType::Idle),
+            ("paneless-victim", Some("invented-9"), EventType::Idle),
+            ("fresh-key", Some("invented-9"), EventType::SessionStart),
+            (
+                "fresh-key",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                EventType::SessionStart,
+            ),
+            (
+                "paneless-victim",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                EventType::SessionEnd,
+            ),
+            ("survivor-card", Some("invented-9"), EventType::SessionEnd),
+        ] {
+            client.apply_event(hook_provenance_audit_plain_frame(
+                session,
+                agent,
+                kind.clone(),
+            ));
+            let what = format!("{kind:?} naming {session} as {agent:?}");
+            let card = client
+                .sessions
+                .get("paneless-victim")
+                .unwrap_or_else(|| panic!("{what}: the paneless card was removed"));
+            assert_eq!(
+                (&card.pane_id, &card.status, &card.agent_id),
+                (&victim.pane_id, &victim.status, &victim.agent_id),
+                "{what}: the paneless card must be untouched"
+            );
+            assert!(
+                client.sessions.contains_key("survivor-card"),
+                "{what}: the survivor's card must not be removed"
+            );
+            assert_eq!(client.sessions.len(), 2, "{what}: no card may be drawn");
+            assert_eq!(client.unproven_session_count(), 0, "{what}");
+            assert!(!client.sessions["survivor-card"].orchestration_orphaned);
+        }
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Idle,
+            "the survivor's own end settles its card"
+        );
+
+        // An invented agent's report does not reach the survivor's card.
+        let mut client = hook_provenance_audit_plain_client();
+        client.apply_event(hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some("invented-9"),
+            EventType::Thinking,
+        ));
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Idle,
+            "the exception is bound to the survivor's own identity"
+        );
+        // Nor does an unproven report the daemon did not mark.
+        let mut unmarked = hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        );
+        unmarked
+            .metadata
+            .remove(crate::event::DAEMON_NO_LIVE_AGENT_METADATA_KEY);
+        client.apply_event(unmarked);
+        assert_eq!(client.sessions["survivor-card"].status, SessionStatus::Idle);
+        assert_eq!(client.agent_generation_closures.len(), 0);
+    }
+
+    /// Scenario: A client stayed attached across a daemon restart and still
+    /// shows a plain pane's surviving agent, whose start declared a
+    /// history-only live target. The survivor then reports more times than the
+    /// card's journal holds, and finally sends a report declaring a live,
+    /// writable target. The card must stay history-only throughout: a restart
+    /// survivor's reports move reporting state, never what the card accepts.
+    #[test]
+    fn hook_provenance_audit_survivor_reports_keep_the_cards_live_target() {
+        let history_only = crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Process,
+            writable: crate::event::Writable::HistoryOnly,
+        };
+        let mut client = AppState::default();
+        client.register_pane(AUDIT_PLAIN_PANE.to_string());
+        let mut survivor = agent_event_cli_payload(AUDIT_PLAIN_PANE, AUDIT_PLAIN_SURVIVOR);
+        survivor.session_id = "survivor-card".to_string();
+        survivor.event_type = EventType::SessionStart;
+        survivor.live_target = Some(history_only);
+        client.apply_event(survivor);
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "precondition: a history-only card"
+        );
+
+        for round in 0..MAX_RECENT_EVENTS + 5 {
+            let kind = if round % 2 == 0 {
+                EventType::Thinking
+            } else {
+                EventType::Idle
+            };
+            client.apply_event(hook_provenance_audit_plain_frame(
+                "survivor-card",
+                Some(AUDIT_PLAIN_SURVIVOR),
+                kind,
+            ));
+        }
+        let card = &client.sessions["survivor-card"];
+        assert_eq!(card.recent_events.len(), MAX_RECENT_EVENTS);
+        assert_eq!(
+            card.live_target(),
+            Some(history_only),
+            "the declaration must outlive the journal's capacity"
+        );
+        assert_eq!(card.writable(), crate::event::Writable::HistoryOnly);
+
+        let mut redeclare = hook_provenance_audit_plain_frame(
+            "survivor-card",
+            Some(AUDIT_PLAIN_SURVIVOR),
+            EventType::Thinking,
+        );
+        redeclare.live_target = Some(crate::event::LiveTarget {
+            kind: crate::event::TargetKind::Pty,
+            writable: crate::event::Writable::Live,
+        });
+        client.apply_event(redeclare);
+        assert_eq!(
+            client.sessions["survivor-card"].status,
+            SessionStatus::Thinking,
+            "precondition: the report landed"
+        );
+        assert_eq!(
+            client.sessions["survivor-card"].writable(),
+            crate::event::Writable::HistoryOnly,
+            "an unproven survivor report must not make its card writable"
+        );
+    }
+
+    /// Scenario: Round after round, a client holds an outside card and the
+    /// daemon announces an eviction under that card's key but a different
+    /// pane — what a key the two sides filed differently produces. The client
+    /// must never hold more outside cards than its budget, and every card it
+    /// holds must stay counted.
+    #[test]
+    fn hook_provenance_audit_mismatched_evictions_keep_the_client_bounded() {
+        let mut client = AppState::default();
+        for round in 0..MAX_UNPROVEN_SESSIONS * 3 {
+            let session = format!("round-{round}");
+            client.apply_event(hook_provenance_audit_outside_start(
+                &session,
+                &format!("held-pane-{round}"),
+            ));
+            let mut eviction =
+                hook_provenance_audit_outside_start(&session, &format!("other-pane-{round}"));
+            eviction.metadata.clear();
+            eviction.event_type = EventType::SessionEnd;
+            eviction.metadata.insert(
+                crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+            );
+            client.apply_event(eviction);
+            assert_eq!(
+                hook_provenance_audit_unaccounted_cards(&client),
+                Vec::<String>::new(),
+                "round {round}"
+            );
+            assert!(
+                client.sessions.len() <= MAX_UNPROVEN_SESSIONS,
+                "round {round}: {} cards",
+                client.sessions.len()
+            );
+        }
+    }
+
+    /// An outside report at a fixed instant, `seconds` past the epoch.
+    fn hook_provenance_audit_outside_at(
+        session: &str,
+        pane: &str,
+        agent: Option<&str>,
+        kind: EventType,
+        seconds: i64,
+    ) -> AgentEvent {
+        let mut event = hook_provenance_audit_outside_start(session, pane);
+        event.agent_id = agent.map(str::to_string);
+        event.event_type = kind;
+        event.timestamp = DateTime::from_timestamp(seconds, 0).expect("in range");
+        event
+    }
+
+    /// Scenario: Before a client attaches, the daemon holds an outside card
+    /// `s` on pane A. After it attaches, an outside start for `s` arrives on
+    /// pane B — the daemon files it as `pane-b::s`, the client as `s` — and
+    /// then a running report from a different agent under the literal key
+    /// `pane-b::s`, which the client files as a second card. When the daemon
+    /// evicts its own `pane-b::s`, which names no agent, the client must keep
+    /// the other agent's card: it is not the card the daemon evicted.
+    #[test]
+    fn hook_provenance_audit_eviction_reconciliation_matches_the_evicted_agent() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        let relay = |daemon: &mut AppState, client: &mut AppState, event: AgentEvent| {
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+        };
+
+        // Before the client attaches.
+        daemon.apply_event(hook_provenance_audit_outside_at(
+            "s",
+            "pane-a",
+            None,
+            EventType::SessionStart,
+            10,
+        ));
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_at("s", "pane-b", None, EventType::SessionStart, 10),
+        );
+        relay(
+            &mut daemon,
+            &mut client,
+            hook_provenance_audit_outside_at(
+                "pane-b::s",
+                "pane-b",
+                Some("other-agent"),
+                EventType::Thinking,
+                0,
+            ),
+        );
+        assert_eq!(
+            daemon.sessions["pane-b::s"].agent_id, None,
+            "precondition: the daemon's pane-b::s names no agent"
+        );
+        assert_eq!(client.sessions["s"].agent_id, None, "precondition");
+        assert_eq!(
+            client.sessions["pane-b::s"].agent_id.as_deref(),
+            Some("other-agent"),
+            "precondition: the client holds the other agent's card under the literal key"
+        );
+
+        // Fill the daemon's budget until it evicts its pane-b::s, and hand the
+        // client only the announcements. Relaying the fillers as well would
+        // grow the client in step, so its own budget would retire the same
+        // cards at the same moment and hide which path removed them.
+        let mut index = 0;
+        while daemon.sessions.contains_key("pane-b::s") {
+            daemon.apply_event(hook_provenance_audit_outside_start(
+                &format!("filler-{index}"),
+                &format!("filler-pane-{index}"),
+            ));
+            for eviction in daemon.take_unproven_evictions() {
+                client.apply_event(eviction);
+            }
+            index += 1;
+            assert!(
+                index <= MAX_UNPROVEN_SESSIONS * 2,
+                "the daemon never evicted"
+            );
+        }
+        let other = client
+            .sessions
+            .get("pane-b::s")
+            .expect("the other agent's card must survive an eviction naming no agent");
+        assert_eq!(other.agent_id.as_deref(), Some("other-agent"));
+        assert!(
+            !client.sessions.contains_key("s"),
+            "the client's card naming no agent is the one the daemon evicted"
+        );
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Scenario: A client holds two outside cards on one pane under keys that
+    /// differ only by that pane's qualification, and both name no agent. The
+    /// daemon announces an eviction under each of those spellings, naming no
+    /// agent either. The client cannot tell which card the daemon meant, so it
+    /// removes neither; its own budget must still bound it afterwards, with
+    /// every card counted.
+    ///
+    /// No sequence of reports tried reaches this state — the client folds a
+    /// second same-agent report on a pane into the card already there — so the
+    /// second card is filed directly, the way the outside-card accounting
+    /// would file it.
+    #[test]
+    fn hook_provenance_audit_ambiguous_eviction_removes_nothing() {
+        let mut client = AppState::default();
+        client.apply_event(hook_provenance_audit_outside_at(
+            "s",
+            "pane-b",
+            None,
+            EventType::SessionStart,
+            10,
+        ));
+        let twin = client.sessions["s"].clone();
+        client.sessions.insert("pane-b::s".to_string(), twin);
+        client.note_unproven_activity("pane-b::s", Some("pane-b"));
+        assert!(
+            client.sessions.contains_key("s") && client.sessions.contains_key("pane-b::s"),
+            "precondition: two cards on pane-b"
+        );
+        assert_eq!(client.unproven_session_count(), 2, "precondition");
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new(),
+            "precondition"
+        );
+
+        for announced in ["pane-b::s", "s", "pane-b::pane-b::s"] {
+            let mut eviction = hook_provenance_audit_outside_at(
+                announced,
+                "pane-b",
+                None,
+                EventType::SessionEnd,
+                20,
+            );
+            eviction.metadata.clear();
+            eviction.metadata.insert(
+                crate::event::UNPROVEN_EVICTED_METADATA_KEY.to_string(),
+                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+            );
+            client.apply_event(eviction);
+            assert!(
+                client.sessions.contains_key("s") && client.sessions.contains_key("pane-b::s"),
+                "an ambiguous eviction under `{announced}` must remove nothing"
+            );
+            assert_eq!(
+                hook_provenance_audit_unaccounted_cards(&client),
+                Vec::<String>::new(),
+                "{announced}"
+            );
+        }
+
+        // The client's own budget still bounds it.
+        for index in 0..MAX_UNPROVEN_SESSIONS * 2 {
+            client.apply_event(hook_provenance_audit_outside_start(
+                &format!("flood-{index}"),
+                &format!("flood-pane-{index}"),
+            ));
+            assert!(client.sessions.len() <= MAX_UNPROVEN_SESSIONS, "{index}");
+        }
+        assert!(!client.sessions.contains_key("s"));
+        assert!(!client.sessions.contains_key("pane-b::s"));
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Scenario: The daemon and an attached client both hold an outside card
+    /// on pane P, and the client also holds one of its own cards on pane Q and
+    /// an outside card on pane R. The daemon then spawns an agent on P and
+    /// registers it. The client, which never registers P itself, must drop its
+    /// outside card on P from the daemon's announcement and keep the other two.
+    #[test]
+    fn hook_provenance_daemon_register_pane_announces_the_outside_cards_it_drops() {
+        let mut daemon = AppState::default();
+        let _ownership = install_ownership(&mut daemon, StubOwnership::default());
+        let mut client = AppState::default();
+        client.register_pane("pane-q".to_string());
+        let mut own = agent_event_cli_payload("pane-q", "agent-q");
+        own.session_id = "own-card".to_string();
+        own.event_type = EventType::SessionStart;
+        client.apply_event(own);
+        for (session, pane) in [("outside-p", "pane-p"), ("outside-r", "pane-r")] {
+            let event = hook_provenance_audit_outside_start(session, pane);
+            daemon.apply_event(event.clone());
+            client.apply_event(event);
+        }
+        assert!(daemon.take_unproven_evictions().is_empty(), "precondition");
+        assert!(client.sessions.contains_key("outside-p"), "precondition");
+
+        daemon.register_pane("pane-p".to_string());
+        assert!(!daemon.sessions.contains_key("outside-p"));
+        for announcement in daemon.take_unproven_evictions() {
+            client.apply_event(announcement);
+        }
+
+        assert!(
+            !client.sessions.contains_key("outside-p"),
+            "the client must drop the outside card the daemon dropped"
+        );
+        assert!(client.sessions.contains_key("outside-r"));
+        assert!(client.sessions.contains_key("own-card"));
+        assert_eq!(client.unproven_session_count(), 1);
+        assert_eq!(
+            hook_provenance_audit_unaccounted_cards(&client),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The bytes `state` holds cached for the outside card `id`, beside what its
+    /// journal actually retains.
+    fn hook_provenance_journal_accounting(state: &AppState, id: &str) -> (Option<usize>, usize) {
+        (
+            state.unproven_sessions[id].journal_bytes,
+            state.sessions[id]
+                .recent_events
+                .iter()
+                .map(retained_event_bytes)
+                .sum(),
+        )
+    }
+
+    /// Scenario: An outside agent reports five times under one session key with
+    /// a large tool detail, just inside a lowered budget. A new outside agent
+    /// then starts on the same pane under the same key, superseding the first
+    /// card, and reports three times. The new card's accounting must equal what
+    /// its journal holds, and its three reports must all stay whole, since the
+    /// journal is far under budget.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_card_is_superseded_under_its_key() {
+        const DETAIL: usize = 2048;
+        let session = "outside-reused";
+        let pane = "outside-reused-pane";
+        let report = |agent: &str, round: usize| {
+            let mut event = hook_provenance_audit_outside_start(session, pane);
+            event.agent_id = Some(agent.to_string());
+            if round > 0 {
+                event.event_type = EventType::ToolStart;
+                event.tool_name = Some("Bash".to_string());
+            }
+            event.tool_detail = Some(format!("{agent}-{round}-{}", "x".repeat(DETAIL)));
+            event
+        };
+        let mut state = AppState::default();
+        state.set_unproven_journal_budget(6 * (DETAIL + 512));
+        for round in 0..5 {
+            state.apply_event(report("agent-old", round));
+        }
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            (cached, state.sessions[session].recent_events.len()),
+            (Some(retained), 5),
+            "precondition: the first card is counted and nothing was stripped"
+        );
+
+        for round in 0..3 {
+            state.apply_event(report("agent-new", round));
+        }
+
+        let card = &state.sessions[session];
+        assert_eq!(
+            card.agent_id.as_deref(),
+            Some("agent-new"),
+            "precondition: the new generation superseded the card"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, session);
+        assert_eq!(
+            cached,
+            Some(retained),
+            "the accounting must equal what the replacement card retains"
+        );
+        let details: Vec<_> = card
+            .recent_events
+            .iter()
+            .map(|event| event.tool_detail.clone())
+            .collect();
+        let expected: Vec<_> = (0..3)
+            .map(|round| report("agent-new", round).tool_detail)
+            .collect();
+        assert_eq!(
+            details, expected,
+            "a replacement journal under budget must keep every report whole"
+        );
+    }
+
+    /// Scenario: An outside card on a pane is counted, then the pane's
+    /// placeholder card is minted under the same key, replacing its journal.
+    /// The cached accounting must not survive the replacement.
+    #[test]
+    fn hook_provenance_journal_accounting_resets_when_a_placeholder_replaces_the_card() {
+        let pane = "outside-placeholder-pane";
+        let session = placeholder_session_id(pane);
+        let mut state = AppState::default();
+        let mut event = hook_provenance_audit_outside_start(&session, pane);
+        event.tool_detail = Some("x".repeat(4096));
+        state.apply_event(event);
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert_eq!(cached, Some(retained), "precondition: counted");
+
+        state.insert_placeholder_session(pane.to_string(), None, None, None);
+
+        assert!(
+            state.sessions[&session].recent_events.is_empty(),
+            "precondition: the placeholder replaced the journal"
+        );
+        let (cached, retained) = hook_provenance_journal_accounting(&state, &session);
+        assert!(
+            cached.is_none_or(|bytes| bytes == retained),
+            "the cached count of the replaced journal must not survive: \
+             {cached:?} cached against {retained} retained"
+        );
+    }
+
+    /// The bytes [`hook_provenance_journal_budget_keeps_every_card`] counts
+    /// for one retained event: its strings and its metadata.
+    fn hook_provenance_journal_payload_bytes(event: &AgentEvent) -> usize {
+        [
+            Some(&event.session_id),
+            event.tool_name.as_ref(),
+            event.tool_detail.as_ref(),
+            event.cwd.as_ref(),
+            event.user_prompt.as_ref(),
+            event.pane_id.as_ref(),
+            event.agent_id.as_ref(),
+            event.agent_version.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum::<usize>()
+            + event
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+    }
+
+    /// Scenario: Thirty-two outside agents each send eight reports carrying a
+    /// large tool detail, far more than this state's lowered budget for
+    /// outside-card journals. Every card must stay, with the status, pane and
+    /// agent its last report gave it; the journals must fit the budget; and
+    /// the most recently active card must keep its newest report whole.
+    #[test]
+    fn hook_provenance_journal_budget_keeps_every_card() {
+        const CARDS: usize = 32;
+        const DETAIL: usize = 2048;
+        const BUDGET: usize = 64 * 1024;
+        let mut bounded = AppState::default();
+        bounded.set_unproven_journal_budget(BUDGET);
+        let mut reference = AppState::default();
+        for card in 0..CARDS {
+            let session = format!("outside-{card}");
+            let pane = format!("outside-pane-{card}");
+            for round in 0..MAX_UNPROVEN_RECENT_EVENTS {
+                let mut event = hook_provenance_audit_outside_start(&session, &pane);
+                event.agent_id = Some(format!("agent-{card}"));
+                if round > 0 {
+                    event.event_type = if round % 2 == 0 {
+                        EventType::Thinking
+                    } else {
+                        EventType::ToolStart
+                    };
+                    event.tool_name = Some("Bash".to_string());
+                }
+                event.tool_detail = Some(format!("{card}-{round}-{}", "x".repeat(DETAIL)));
+                bounded.apply_event(event.clone());
+                reference.apply_event(event);
+            }
+        }
+
+        assert_eq!(bounded.unproven_session_count(), CARDS);
+        let retained: usize = bounded
+            .sessions
+            .values()
+            .flat_map(|session| session.recent_events.iter())
+            .map(hook_provenance_journal_payload_bytes)
+            .sum();
+        assert!(
+            retained <= BUDGET,
+            "outside journals retain {retained} payload bytes against a {BUDGET}-byte budget"
+        );
+        for (id, expected) in &reference.sessions {
+            let card = bounded
+                .sessions
+                .get(id)
+                .unwrap_or_else(|| panic!("card {id} must survive the budget"));
+            assert_eq!(card.status, expected.status, "{id}");
+            assert_eq!(card.pane_id, expected.pane_id, "{id}");
+            assert_eq!(card.agent_id, expected.agent_id, "{id}");
+            assert_eq!(card.agent_type, expected.agent_type, "{id}");
+        }
+        let last = format!("outside-{}", CARDS - 1);
+        assert_eq!(
+            bounded.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            reference.sessions[&last]
+                .recent_events
+                .back()
+                .map(|e| &e.tool_detail),
+            "the most recently active card keeps its newest report whole"
+        );
     }
 }

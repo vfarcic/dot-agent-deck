@@ -681,6 +681,14 @@ The report names the worker's pane; the daemon log names the role and, for a fai
 
 Without `--force`, `pane restart` restarts only a worker whose agent has exited. An agent that is running but hung has not exited, so it is refused the same way. Look at the worker's pane; if it is stuck, run `dot-agent-deck pane restart <role> --force`. The orchestrator can use `--force` when it sees this message; if you want force-restarts to stay your decision, say so in its `prompt_template`.
 
+### `pane restart` says the worker's working directory "is not a directory"
+
+The directory the worker runs in has been deleted, or a file now has its path. Nothing was restarted and the running worker was left as it was. Put the directory back, or close the orchestration and start it again from a directory that exists.
+
+### `pane restart` says the prepared working directory "was replaced"
+
+The role was started from the desktop app's New agent dialog or Runs screen, and the directory at its path is no longer the one that launch checked: the project was moved away and another directory put in its place. Nothing was restarted and the running worker was left as it was. Move the original directory back, or start the orchestration again from the desktop app.
+
 ### `pane spawn` says the role "is already running in this orchestration"
 
 `pane spawn` starts a role that has no pane; it does not start a second copy. To run two workers of the same kind, give the second its own role name in `.dot-agent-deck.toml` (for example `reviewer2`) and spawn that.

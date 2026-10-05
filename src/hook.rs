@@ -166,7 +166,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let json = match serde_json::to_string(&event) {
+    // Issue #318: present this pane's hook capability token, so the daemon can
+    // tell this pane's own report from one naming it from outside.
+    let token = crate::hook_provenance::token_from_env();
+    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
@@ -1903,19 +1906,36 @@ mod tests {
     }
 
     /// Issue #1567: `--reports-prompts` becomes the declaration marker on any
-    /// report, so a Pi pane counts as confirming its own prompts; without it
-    /// the frame declares nothing, as every report from an older extension.
+    /// report; without it the frame declares nothing, as every report from an
+    /// older extension. The marker the CLI stamps is not yet standing: only
+    /// once the daemon's hook-provenance gate attests the frame
+    /// (`ATTESTED_OWNER_METADATA_KEY`) does a Pi pane count as confirming.
     #[test]
     fn agent_event_cli_declares_prompt_reports_only_when_asked() {
         for reports_prompts in [false, true] {
-            let event = build_agent_event_cli(
+            let mut event = build_agent_event_cli(
                 "pane-7".into(),
-                None,
+                Some("agent-7".into()),
                 EventType::Idle,
                 AgentEventDetail {
                     reports_prompts,
                     ..Default::default()
                 },
+            );
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY)
+                    .map(String::as_str),
+                reports_prompts.then_some(crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE)
+            );
+            assert!(
+                !event.declares_prompt_reports() && !event.reports_submitted_prompt(),
+                "reports_prompts={reports_prompts}: an unattested frame declares nothing"
+            );
+            event.metadata.insert(
+                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+                "agent-7".to_string(),
             );
             assert_eq!(event.declares_prompt_reports(), reports_prompts);
             assert_eq!(event.reports_submitted_prompt(), reports_prompts);

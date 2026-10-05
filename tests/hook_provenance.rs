@@ -31,6 +31,10 @@ use std::os::unix::net::UnixListener;
 /// `work-done` is the ordinary case (the verb reads nothing back) and for
 /// `delegate` is `SocketReply::NoReply`, a documented success.
 fn capture_one_line(args: &[&str], token: Option<&str>) -> String {
+    capture_one_line_with_input(args, token, None)
+}
+
+fn capture_one_line_with_input(args: &[&str], token: Option<&str>, input: Option<&str>) -> String {
     let dir = common::harness_tempdir().expect("create temp dir for the stub hook socket");
     let socket_path = dir.path().join("hook.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind stub hook socket");
@@ -58,7 +62,21 @@ fn capture_one_line(args: &[&str], token: Option<&str>) -> String {
             cmd.env_remove("DOT_AGENT_DECK_PANE_CAPABILITY");
         }
     }
-    let output = cmd.output().expect("run the real CLI");
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("run the real CLI");
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("hook input");
+    } else {
+        drop(child.stdin.take());
+    }
+    let output = child.wait_with_output().expect("wait for CLI");
     let line = captured.join().expect("stub thread");
     assert!(
         output.status.success(),
@@ -72,6 +90,30 @@ fn capture_one_line(args: &[&str], token: Option<&str>) -> String {
 
 /// A token of the shape the daemon mints — 64 lowercase hex characters.
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Scenario: Run the real status CLI against a capturing socket with a pane capability in its environment. Its raw event must carry that capability as token.
+#[test]
+fn agent_event_forwards_the_hook_token_from_its_environment() {
+    let line = capture_one_line(&["agent-event", "--type", "running"], Some(TOKEN));
+    assert!(
+        line.contains(&format!("\"token\":\"{TOKEN}\"")),
+        "the agent-event CLI did not forward DOT_AGENT_DECK_PANE_CAPABILITY: {line}"
+    );
+}
+
+/// Scenario: Run the real hook CLI with a SessionStart on stdin and a pane capability in its environment. The event written to the socket must carry that capability as token.
+#[test]
+fn hook_forwards_the_hook_token_from_its_environment() {
+    let line = capture_one_line_with_input(
+        &["hook", "--agent", "claude-code"],
+        Some(TOKEN),
+        Some(r#"{"hook_event_name":"SessionStart","session_id":"cli-hook-session"}"#),
+    );
+    assert!(
+        line.contains(&format!("\"token\":\"{TOKEN}\"")),
+        "the hook CLI did not forward DOT_AGENT_DECK_PANE_CAPABILITY: {line}"
+    );
+}
 
 #[test]
 fn work_done_forwards_the_hook_token_from_its_environment() {
@@ -94,6 +136,7 @@ fn delegate_forwards_the_hook_token_from_its_environment() {
     );
 }
 
+/// Scenario: Run signal, status and hook CLIs without a capability. Every captured payload must omit the token key entirely for older-daemon compatibility.
 /// The cross-version half. A CLI with no token must not put the key on the wire
 /// at all, so a daemon that predates the field receives exactly the JSON it
 /// always received.
@@ -102,8 +145,12 @@ fn a_cli_with_no_token_omits_the_key_entirely() {
     for args in [
         vec!["work-done", "--task", "done"],
         vec!["delegate", "--to", "worker", "--task", "do it"],
+        vec!["agent-event", "--type", "running"],
+        vec!["hook", "--agent", "claude-code"],
     ] {
-        let line = capture_one_line(&args, None);
+        let input = (args[0] == "hook")
+            .then_some(r#"{"hook_event_name":"SessionStart","session_id":"cli-hook-session"}"#);
+        let line = capture_one_line_with_input(&args, None, input);
         assert!(
             !line.contains("token"),
             "{args:?} put a token key on the wire with nothing to put in it, which is not the \

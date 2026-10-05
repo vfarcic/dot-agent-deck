@@ -191,6 +191,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -214,6 +215,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             agent_type: Some(AgentType::Codex),
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -237,6 +239,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -439,6 +442,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -503,6 +507,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -590,6 +595,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -702,6 +708,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -732,6 +739,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         authoring_kind: None,
+        remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -763,6 +771,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
     };
@@ -788,6 +797,7 @@ fn agent_record_omits_agent_type_when_none() {
         live: None,
         spawned_at_ms: None,
         cli_name: None,
+        prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
     };
@@ -912,6 +922,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         },
@@ -927,6 +938,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         },
@@ -1011,6 +1023,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 authoring_kind: None,
+                remember_command: false,
             },
         )
         .await;
@@ -4488,6 +4501,7 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         },
     )
     .await;
@@ -5154,4 +5168,138 @@ async fn registry_resize_clamps_oversized_cols() {
 #[tokio::test]
 async fn registry_resize_clamps_both() {
     assert_resize_clamps(u16::MAX, u16::MAX, 4096, 4096).await;
+}
+
+/// Issue #1396 item 2: a plain `start-agent` whose `cwd` is not a directory —
+/// a regular file, or a path that does not exist — is refused, and nothing is
+/// spawned. portable-pty's `as_command` replaces such a cwd with `$HOME`
+/// without a word, so before this the agent was started in the home directory
+/// and the deck recorded the path the caller asked for. `HOME` is pinned to a
+/// sandbox directory through the request's own env, which is the value that
+/// fallback reads, so a regression shows up as a marker there instead of in
+/// the developer's real home.
+#[tokio::test]
+async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
+    let server = start_server().await;
+    let sandbox = test_temp::tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    let file = sandbox.path().join("a-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let missing = sandbox.path().join("missing");
+
+    let start = |cwd: &Path| AttachRequest::StartAgent {
+        command: Some("echo x > marker".into()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        display_name: None,
+        rows: 24,
+        cols: 80,
+        env: vec![
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("SHELL".into(), "/bin/sh".into()),
+        ],
+        tab_membership: None,
+        agent_type: None,
+        seed: None,
+        authoring_kind: None,
+        remember_command: false,
+    };
+
+    for (what, cwd) in [("a regular file", &file), ("a missing path", &missing)] {
+        let spawned_before = server.registry.agent_records().len();
+        let mut stream = UnixStream::connect(&server.path).await.unwrap();
+        write_request(&mut stream, &start(cwd)).await;
+        let resp = read_response(&mut stream).await;
+        // A served start runs its command asynchronously; give `echo` the time
+        // it needs before looking for where it ran.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !home.join("marker").exists(),
+            "{what}: the agent was started in $HOME instead of being refused; response = {resp:?}"
+        );
+        assert!(
+            !resp.ok && resp.id.is_none(),
+            "{what}: a start-agent whose cwd is not a directory must be refused; response = {resp:?}"
+        );
+        let error = resp.error.unwrap_or_default();
+        assert!(
+            error.contains("not a directory"),
+            "{what}: the refusal must say why: {error:?}"
+        );
+        assert_eq!(
+            server.registry.agent_records().len(),
+            spawned_before,
+            "{what}: a refused start-agent must not have spawned a pane"
+        );
+    }
+
+    // Control: the same request with a real directory is served, and runs there.
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &start(&project)).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        resp.ok,
+        "control: a directory cwd must be served: {:?}",
+        resp.error
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !project.join("marker").exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        project.join("marker").exists(),
+        "control: the agent must have run in the requested directory"
+    );
+    assert!(!home.join("marker").exists());
+
+    // A pane a prepared start created, re-created by a plain `start-agent`
+    // after its project directory was deleted (agent review, PR #1557): the same
+    // not-a-directory refusal, not the stale-preparation one. "Prepare again" is
+    // the remedy for a directory that was REPLACED; for one that is gone it
+    // would only send the user round the loop.
+    const PANE: &str = "prepared-deleted-1396";
+    let prepared = sandbox.path().join("prepared");
+    std::fs::create_dir(&prepared).unwrap();
+    let verified = dot_agent_deck::project_resolve::VerifiedProjectDir::open(&prepared).unwrap();
+    let prepared_id = server
+        .registry
+        .spawn_agent_in(
+            dot_agent_deck::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(prepared.to_str().unwrap()),
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE.into())],
+                ..Default::default()
+            },
+            &verified,
+        )
+        .unwrap();
+    drop(verified);
+    server.registry.close_agent(&prepared_id).unwrap();
+    std::fs::remove_dir(&prepared).unwrap();
+
+    let mut request = start(&prepared);
+    if let AttachRequest::StartAgent { env, .. } = &mut request {
+        env.push(("DOT_AGENT_DECK_PANE_ID".into(), PANE.into()));
+    }
+    let spawned_before = server.registry.agent_records().len();
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(&mut stream, &request).await;
+    let resp = read_response(&mut stream).await;
+    assert!(
+        !resp.ok && resp.id.is_none(),
+        "a prepared pane whose directory was deleted must be refused; response = {resp:?}"
+    );
+    let error = resp.error.unwrap_or_default();
+    assert!(
+        error.starts_with(&format!(
+            "{}:",
+            dot_agent_deck::daemon_protocol::START_ERR_CWD_NOT_A_DIRECTORY
+        )),
+        "a deleted prepared directory gets the not-a-directory refusal, not a stale-preparation \
+         one: {error:?}"
+    );
+    assert_eq!(server.registry.agent_records().len(), spawned_before);
+    server.registry.shutdown_all();
 }

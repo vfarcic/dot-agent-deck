@@ -234,24 +234,62 @@ fn is_pipe_name_token(token: &str) -> bool {
 #[cfg(windows)]
 pub(crate) fn current_user_sid() -> std::io::Result<String> {
     static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-    match SID.get_or_init(|| current_user_sid_string().map_err(|err| err.to_string())) {
+    match SID.get_or_init(|| token_sid_string(TokenSid::User).map_err(|err| err.to_string())) {
         Ok(sid) => Ok(sid.clone()),
         Err(message) => Err(std::io::Error::other(message.clone())),
     }
 }
 
-/// Read the calling process's user SID and return it in the canonical string
-/// form (`S-<revision>-<authority>-<sub-authority>…`).
+/// The SID the process token assigns as the owner of objects it creates without
+/// an explicit owner (its `TokenOwner`), in canonical string form, cached.
+///
+/// For an ordinary token this is the user's own SID. Under an elevated
+/// administrator token it is normally `BUILTIN\Administrators` (`S-1-5-32-544`),
+/// so a file the process creates with a default security descriptor is owned by
+/// that group rather than by [`current_user_sid`] — which is why a check on such
+/// a file has to accept this SID too. A token's default owner is fixed for the
+/// life of the process for our purposes (nothing here calls
+/// `SetTokenInformation`), so it is resolved once, like the user SID.
+#[cfg(windows)]
+pub(crate) fn token_default_owner_sid() -> std::io::Result<String> {
+    static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    match SID
+        .get_or_init(|| token_sid_string(TokenSid::DefaultOwner).map_err(|err| err.to_string()))
+    {
+        Ok(sid) => Ok(sid.clone()),
+        Err(message) => Err(std::io::Error::other(message.clone())),
+    }
+}
+
+/// Which SID [`token_sid_string`] reads from the process token.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum TokenSid {
+    /// `TokenUser`: the user the process runs as.
+    User,
+    /// `TokenOwner`: the owner given to objects created without one.
+    DefaultOwner,
+}
+
+/// Read one SID from the calling process's token and return it in the
+/// canonical string form (`S-<revision>-<authority>-<sub-authority>…`).
 ///
 /// Uses the token rather than any env var so the value is identical in the
 /// daemon and in every client, however their environments were scrubbed (see
 /// [`endpoint_user_suffix`]).
 #[cfg(windows)]
-fn current_user_sid_string() -> std::io::Result<String> {
+fn token_sid_string(which: TokenSid) -> std::io::Result<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let class = match which {
+        TokenSid::User => TokenUser,
+        TokenSid::DefaultOwner => TokenOwner,
+    };
 
     /// Closes the opened process token on every exit path below.
     struct TokenHandle(HANDLE);
@@ -276,33 +314,30 @@ fn current_user_sid_string() -> std::io::Result<String> {
     let mut needed: u32 = 0;
     // SAFETY: null buffer + zero length is the probe form; `needed` is a valid
     // out-pointer.
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
         return Err(std::io::Error::last_os_error());
     }
 
-    // `TOKEN_USER` leads with a pointer, so the buffer must be pointer-aligned;
-    // a `Vec<u8>` is only byte-aligned. `Vec<u64>` is (over-)aligned for every
-    // Windows target we build.
+    // `TOKEN_USER` and `TOKEN_OWNER` both lead with a pointer, so the buffer
+    // must be pointer-aligned; a `Vec<u8>` is only byte-aligned. `Vec<u64>` is
+    // (over-)aligned for every Windows target we build.
     let mut buf = vec![0u64; needed.div_ceil(8) as usize];
     // SAFETY: `buf` owns at least `needed` bytes of writable, 8-byte-aligned
     // storage, and `needed` is passed as its true length.
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
+    if unsafe { GetTokenInformation(token.0, class, buf.as_mut_ptr().cast(), needed, &mut needed) }
+        == 0
     {
         return Err(std::io::Error::last_os_error());
     }
 
-    // SAFETY: on success the buffer holds a `TOKEN_USER` followed by the
-    // variable-length SID it points into; both stay valid as long as `buf`.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    // SAFETY: on success the buffer holds the structure `class` names (a
+    // `TOKEN_USER` or a `TOKEN_OWNER`) followed by the variable-length SID it
+    // points into; both stay valid as long as `buf`.
+    let sid = match which {
+        TokenSid::User => unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+        TokenSid::DefaultOwner => unsafe { (*buf.as_ptr().cast::<TOKEN_OWNER>()).Owner },
+    };
 
     let mut wide: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sid` is the token's SID and `wide` a valid out-pointer; on
