@@ -98,6 +98,8 @@ It does not appear when the daemon runs the same release as the app, when the da
    - If what is running changes while you decide, nothing is stopped and the dialog shows the new list and asks again.
 
    With nothing running, there is nothing to ask, and the daemon restarts straight away.
+
+   Once the daemon has agreed to restart, it starts no new agents: **New agent** on that daemon, or a start from a terminal, fails with `the daemon is restarting; start the agent again once it is back`. Start it again once the upgrade has finished.
 4. The dialog ends with what happened, in one of these forms:
 
 | Title | What it means | What to do |

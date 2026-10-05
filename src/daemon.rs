@@ -1174,16 +1174,40 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     match restart_control.take_successor_plan() {
         crate::daemon_restart::SuccessorPlan::Nothing => {}
         crate::daemon_restart::SuccessorPlan::Spawn(target) => {
-            match crate::daemon_attach::spawn_restart_successor(
-                &crate::config::state_dir(),
-                &target,
-            ) {
-                Ok(pid) => info!(pid, target = %target.display(), "successor daemon spawned"),
-                Err(e) => error!(
+            // Audit A5: the drain took a while, and an installer may have
+            // replaced the file since it was verified. Spawn it only if it is
+            // still the verified file, or it verifies again as the same
+            // version; otherwise start nothing — the client's Verifying stage
+            // reports that no new daemon answered, and the next client
+            // lazy-spawns its own.
+            match restart_control.recheck_successor(&target) {
+                Err(reason) => error!(
                     target = %target.display(),
-                    error = %e,
-                    "could not spawn the successor daemon; none is running until a client starts one"
+                    %reason,
+                    "not spawning the successor daemon; none is running until a client starts one"
                 ),
+                Ok(check) => {
+                    if let crate::daemon_restart::SuccessorCheck::Reverified(version) = &check {
+                        warn!(
+                            target = %target.display(),
+                            %version,
+                            "the installed build changed after it was verified; it verified again"
+                        );
+                    }
+                    match crate::daemon_attach::spawn_restart_successor(
+                        &crate::config::state_dir(),
+                        &target,
+                    ) {
+                        Ok(pid) => {
+                            info!(pid, target = %target.display(), "successor daemon spawned")
+                        }
+                        Err(e) => error!(
+                            target = %target.display(),
+                            error = %e,
+                            "could not spawn the successor daemon; none is running until a client starts one"
+                        ),
+                    }
+                }
             }
         }
         crate::daemon_restart::SuccessorPlan::LeaveToSupervisor(supervisor) => info!(

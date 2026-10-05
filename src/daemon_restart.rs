@@ -264,6 +264,65 @@ pub fn verify_restart_target(
     expected: Option<&str>,
     timeout: Duration,
 ) -> Result<String, (RestartRefusalReason, String)> {
+    verify_restart_target_pinned(target, expected, timeout).map(|verified| verified.version)
+}
+
+/// Which file a path named when it was checked: device and inode where the
+/// platform has them, plus size and modification time (PRD #1487 audit A5).
+/// Read through symlinks, so a repointed Homebrew link reads as a different
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    /// The identity of what `meta` describes.
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Self {
+            dev,
+            ino,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+
+    /// The identity of the file at `path` now, following symlinks.
+    pub fn read(path: &Path) -> std::io::Result<Self> {
+        std::fs::metadata(path).map(|meta| Self::of(&meta))
+    }
+}
+
+/// A restart target that passed [`verify_restart_target`]: where it is, what
+/// it reported, and which file it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTarget {
+    pub path: PathBuf,
+    pub version: String,
+    pub identity: FileIdentity,
+}
+
+/// [`verify_restart_target`], keeping the identity of the file it checked so
+/// the successor spawn can tell whether the path still names it.
+///
+/// The identity is read before `--version` runs and again after; a file that
+/// changed in between is refused, so the identity kept is the one whose
+/// answer was read.
+pub fn verify_restart_target_pinned(
+    target: &Path,
+    expected: Option<&str>,
+    timeout: Duration,
+) -> Result<VerifiedTarget, (RestartRefusalReason, String)> {
     let shown = target.display();
     let meta = std::fs::metadata(target).map_err(|e| {
         (
@@ -311,7 +370,51 @@ pub fn verify_restart_target(
             ),
         ));
     }
-    Ok(version)
+    let identity = FileIdentity::of(&meta);
+    if FileIdentity::read(target).ok() != Some(identity) {
+        return Err((
+            RestartRefusalReason::TargetMissing,
+            format!("the installed build at {shown} changed while it was being checked"),
+        ));
+    }
+    Ok(VerifiedTarget {
+        path: target.to_path_buf(),
+        version,
+        identity,
+    })
+}
+
+/// What [`RestartControl::recheck_successor`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuccessorCheck {
+    /// Nothing was verified for that path, so there is nothing to compare.
+    NotPinned,
+    /// The path still names the file that was verified.
+    Unchanged,
+    /// The path names a different file now, and it passed verification
+    /// against the version the first check reported.
+    Reverified(String),
+}
+
+/// The successor re-check, pure apart from the filesystem: the identity of
+/// `verified.path` now against the one recorded, and on a difference a fresh
+/// [`verify_restart_target`] expecting `verified.version`.
+///
+/// What remains is the window between this check and the spawn itself, and
+/// under a service manager the manager starts whatever its unit names — this
+/// check never runs there (see [`SuccessorPlan::LeaveToSupervisor`]).
+pub fn recheck_verified_target(
+    verified: &VerifiedTarget,
+    timeout: Duration,
+) -> Result<SuccessorCheck, String> {
+    if FileIdentity::read(&verified.path).ok() == Some(verified.identity) {
+        return Ok(SuccessorCheck::Unchanged);
+    }
+    verify_restart_target(&verified.path, Some(&verified.version), timeout)
+        .map(SuccessorCheck::Reverified)
+        .map_err(|(_, message)| {
+            format!("the installed build changed after it was verified, and {message}")
+        })
 }
 
 fn strip_v(v: &str) -> &str {
@@ -441,6 +544,22 @@ pub struct RestartControl {
     successor: StdMutex<Option<PathBuf>>,
     handed_off: AtomicBool,
     install: InstallRecord,
+    /// The identity of the verified successor, for the re-check just before it
+    /// is spawned (audit A5). `None` when nothing was verified.
+    pinned: StdMutex<Option<VerifiedTarget>>,
+    /// A pause the restart handler takes just before it writes `Accepted`, so
+    /// a unit test can interleave work with a reservation it holds.
+    #[cfg(test)]
+    checkpoint: StdMutex<Option<RestartCheckpoint>>,
+}
+
+/// One pause in the restart handler (test only): it signals `reached`, then
+/// waits for `resume`.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RestartCheckpoint {
+    pub reached: std::sync::Arc<tokio::sync::Notify>,
+    pub resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl RestartControl {
@@ -451,6 +570,27 @@ impl RestartControl {
             successor: StdMutex::new(None),
             handed_off: AtomicBool::new(false),
             install,
+            pinned: StdMutex::new(None),
+            #[cfg(test)]
+            checkpoint: StdMutex::new(None),
+        }
+    }
+
+    /// Arm a one-shot pause before the next acceptance is written (test only).
+    #[cfg(test)]
+    pub(crate) fn pause_before_accepting(&self) -> RestartCheckpoint {
+        let checkpoint = RestartCheckpoint::default();
+        *self.checkpoint.lock().unwrap() = Some(checkpoint.clone());
+        checkpoint
+    }
+
+    /// Take the armed pause, if any (test only).
+    #[cfg(test)]
+    pub(crate) async fn checkpoint(&self) {
+        let armed = self.checkpoint.lock().unwrap().take();
+        if let Some(checkpoint) = armed {
+            checkpoint.reached.notify_one();
+            checkpoint.resume.notified().await;
         }
     }
 
@@ -479,6 +619,33 @@ impl RestartControl {
     pub fn mark_accepted(&self, successor: Option<PathBuf>) {
         *self.successor.lock().unwrap_or_else(|p| p.into_inner()) = successor;
         self.accepted.store(true, Ordering::SeqCst);
+    }
+
+    /// [`Self::mark_accepted`] for a successor that was verified, keeping what
+    /// was verified so [`Self::recheck_successor`] can tell whether the file at
+    /// that path is still the one checked (audit A5).
+    pub fn mark_accepted_verified(&self, verified: VerifiedTarget) {
+        let path = verified.path.clone();
+        *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = Some(verified);
+        self.mark_accepted(Some(path));
+    }
+
+    /// Just before `target` is spawned: whether it may be. Passes when nothing
+    /// was pinned for that path, or the file there is still the verified one
+    /// ([`FileIdentity`]); otherwise the new file is verified again, against
+    /// the version the first check reported, and refused if that fails.
+    pub fn recheck_successor(&self, target: &Path) -> Result<SuccessorCheck, String> {
+        let pinned = self
+            .pinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match pinned {
+            Some(verified) if verified.path == target => {
+                recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT)
+            }
+            _ => Ok(SuccessorCheck::NotPinned),
+        }
     }
 
     /// Whether a restart has been accepted.
@@ -858,6 +1025,74 @@ mod tests {
             "{}",
             err.1
         );
+    }
+
+    /// Replace the file at `path` atomically, as an installer does: write a
+    /// sibling, then rename it over.
+    #[cfg(unix)]
+    fn replace(dir: &Path, path: &Path, body: &str) {
+        let staged = script(dir, "staged", body, 0o755);
+        std::fs::rename(staged, path).unwrap();
+    }
+
+    /// Scenario: the successor is re-checked just before it is spawned (PRD
+    /// #1487 audit A5). The same file passes untouched; a replacement of the
+    /// same version passes after verifying again; a replacement reporting
+    /// another version, or one that is gone, is refused — so the daemon starts
+    /// nothing rather than a build nobody verified.
+    #[cfg(unix)]
+    #[test]
+    fn the_successor_is_rechecked_against_the_verified_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(dir.path(), "dad", "echo 'dot-agent-deck 0.46.0'", 0o755);
+        let verified =
+            verify_restart_target_pinned(&p, Some("0.46.0"), RESTART_VERIFY_TIMEOUT).unwrap();
+        assert_eq!(verified.version, "0.46.0");
+        assert_eq!(verified.identity, FileIdentity::read(&p).unwrap());
+        assert_eq!(
+            recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT),
+            Ok(SuccessorCheck::Unchanged)
+        );
+
+        replace(dir.path(), &p, "echo 'dot-agent-deck 0.46.0' # rebuilt");
+        assert_ne!(FileIdentity::read(&p).unwrap(), verified.identity);
+        assert_eq!(
+            recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT),
+            Ok(SuccessorCheck::Reverified("0.46.0".into()))
+        );
+
+        replace(dir.path(), &p, "echo 'dot-agent-deck 0.47.0'");
+        let err = recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT).unwrap_err();
+        assert!(
+            err.contains("changed after it was verified") && err.contains("0.47.0"),
+            "{err}"
+        );
+
+        std::fs::remove_file(&p).unwrap();
+        assert!(recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT).is_err());
+    }
+
+    /// Scenario: the control only re-checks the path it pinned; a successor
+    /// accepted without verification (or another path) has nothing to compare.
+    #[cfg(unix)]
+    #[test]
+    fn the_control_rechecks_only_a_pinned_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(dir.path(), "dad", "echo 'dot-agent-deck 0.46.0'", 0o755);
+        let control = RestartControl::default();
+        assert_eq!(control.recheck_successor(&p), Ok(SuccessorCheck::NotPinned));
+        control.mark_accepted_verified(
+            verify_restart_target_pinned(&p, None, RESTART_VERIFY_TIMEOUT).unwrap(),
+        );
+        assert!(control.is_accepted());
+        assert_eq!(control.recheck_successor(&p), Ok(SuccessorCheck::Unchanged));
+        assert_eq!(
+            control.recheck_successor(&dir.path().join("other")),
+            Ok(SuccessorCheck::NotPinned)
+        );
+        replace(dir.path(), &p, "echo 'dot-agent-deck 0.45.0'");
+        assert!(control.recheck_successor(&p).is_err());
+        assert_eq!(control.take_successor(), Some(p));
     }
 
     #[cfg(unix)]

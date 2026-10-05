@@ -4151,10 +4151,19 @@ fn restart_refusal(reason: RestartRefusalReason, message: String) -> AttachRespo
 /// 2. `Installed` mode: resolve and verify the target. A failure is `Refused`
 ///    and nothing has been touched — before the live-set check, so nobody is
 ///    asked to confirm a restart that cannot happen.
-/// 3. Snapshot what is at stake, from the same sources `StopDaemon` reads.
+/// 3. Reserve, then snapshot what is at stake from the same sources
+///    `StopDaemon` reads (audit A2). The reservation is the `AppState` write
+///    guard, which holds every role-map change until it is released, plus the
+///    registry's [admission freeze](AgentPtyRegistry::freeze_admission), which
+///    refuses every new agent — a spawn still forking included — so nothing
+///    can join what the snapshot names.
 /// 4. Apply [`crate::daemon_restart::restart_decision`]; ask if it says so.
-/// 5. Write `Accepted` — a failed write aborts the restart (`?`).
-/// 6. Latch acceptance and record the successor; release the lock.
+///    Asking releases the reservation first: what changes while the user
+///    decides makes their confirmation stale, and they are asked again.
+/// 5. Write `Accepted` — a failed write aborts the restart (`?`), and the
+///    reservation is released with nothing stopped.
+/// 6. Latch acceptance and record the successor; keep the admission freeze
+///    (the drain follows), release the role maps and the lock.
 /// 7. Disclose (#1109): the teardown inventory, then one line naming the target.
 /// 8. Drain, then signal shutdown. `run_daemon_with` spawns the successor once
 ///    the sockets are released.
@@ -4171,7 +4180,7 @@ async fn handle_restart_daemon(
 ) -> io::Result<()> {
     use crate::daemon_restart::{
         RESTART_VERIFY_TIMEOUT, resolve_restart_target, restart_decision, stop_set,
-        verify_restart_target,
+        verify_restart_target_pinned,
     };
 
     // 1.
@@ -4205,7 +4214,7 @@ async fn handle_restart_daemon(
             let check_target = target.clone();
             let check_expected = expected_version.clone();
             let verified = tokio::task::spawn_blocking(move || {
-                verify_restart_target(
+                verify_restart_target_pinned(
                     &check_target,
                     check_expected.as_deref(),
                     RESTART_VERIFY_TIMEOUT,
@@ -4219,7 +4228,10 @@ async fn handle_restart_daemon(
                 ))
             });
             match verified {
-                Ok(version) => (Some(target), Some(version)),
+                Ok(verified) => {
+                    let version = verified.version.clone();
+                    (Some(verified), Some(version))
+                }
                 Err((reason, message)) => {
                     warn!(?reason, target = %target.display(), "RestartDaemon refused: {message}");
                     return write_resp(stream, &restart_refusal(reason, message)).await;
@@ -4229,12 +4241,17 @@ async fn handle_restart_daemon(
         RestartSuccessor::ClientSpawns => (None, expected_version.clone()),
     };
 
-    // 3.
-    let roles = state.read().await.live_orchestration_roles(registry);
+    // 3. Role maps first, so the admission freeze is held no longer than the
+    // snapshot and the reply need it.
+    let role_maps = state.write().await;
+    let admission = registry.freeze_admission();
+    let roles = role_maps.live_orchestration_roles(registry);
     let at_stake = stop_set(&roles, &registry.agent_records());
 
     // 4.
     if let Some(reply) = restart_decision(&at_stake, confirm.as_ref()) {
+        drop(admission);
+        drop(role_maps);
         let stale = matches!(
             reply,
             RestartDaemonReply::NeedsConfirmation { stale: true, .. }
@@ -4261,7 +4278,11 @@ async fn handle_restart_daemon(
         return write_resp(stream, &resp).await;
     }
 
-    // 5.
+    #[cfg(test)]
+    restart.checkpoint().await;
+
+    // 5. A failed write returns here, dropping the reservation: nothing was
+    // stopped, and agents may start again.
     let mut resp = AttachResponse::ok();
     resp.restart = Some(RestartDaemonReply::Accepted {
         from_version: env!("DAD_VERSION").to_string(),
@@ -4272,18 +4293,35 @@ async fn handle_restart_daemon(
     write_resp(stream, &resp).await?;
 
     // 6.
-    restart.mark_accepted(target.clone());
+    let shown_target = target
+        .as_ref()
+        .map(|t| t.path.display().to_string())
+        .unwrap_or_default();
+    match target {
+        Some(verified) => restart.mark_accepted_verified(verified),
+        None => restart.mark_accepted(None),
+    }
+    admission.keep();
+    drop(role_maps);
     drop(guard);
 
     // 7.
     crate::daemon_stop::log_teardown_inventory(state, registry, "restart-daemon").await;
-    warn!(
-        target = %target.as_deref().map(|t| t.display().to_string()).unwrap_or_default(),
-        to_version = to_version.as_deref().unwrap_or(""),
-        successor = ?mode,
-        "RestartDaemon accepted — restarting onto the installed build; every agent and \
-         orchestration role named above was confirmed by the client"
-    );
+    match mode {
+        RestartSuccessor::Installed => warn!(
+            target = %shown_target,
+            to_version = to_version.as_deref().unwrap_or(""),
+            successor = ?mode,
+            "RestartDaemon accepted — restarting onto the installed build; every agent and \
+             orchestration role named above was confirmed by the client"
+        ),
+        RestartSuccessor::ClientSpawns => warn!(
+            to_version = to_version.as_deref().unwrap_or(""),
+            successor = ?mode,
+            "RestartDaemon accepted — stopping so the client can start its own build; every \
+             agent and orchestration role named above was confirmed by the client"
+        ),
+    }
 
     // 8.
     let registry_for_shutdown = registry.clone();
@@ -4673,6 +4711,20 @@ async fn handle_connection(
                 write_resp(
                     &mut stream,
                     &AttachResponse::err("start-agent: daemon is shutting down"),
+                )
+                .await?;
+                return Ok(());
+            }
+            // PRD #1487 audit A2: a restart is deciding, or draining, and its
+            // reservation refuses new agents. The spawn path checks the same
+            // flag under its publishing lock; this answers early and plainly.
+            if registry.is_admission_frozen() {
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "start-agent: {}",
+                        crate::agent_pty::ADMISSION_FROZEN_REASON
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -11173,5 +11225,252 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         server.abort();
+    }
+
+    /// PRD #1487 audit A2: a daemon serving the attach socket with a
+    /// `RestartControl` the test holds, so it can arm the handler's pause.
+    #[cfg(unix)]
+    struct RestartFixture {
+        _dir: tempfile::TempDir,
+        cwd: String,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        restart: Arc<crate::daemon_restart::RestartControl>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl RestartFixture {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+            let sock = dir.path().join("attach.sock");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let (event_tx, _rx) = broadcast::channel(16);
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let restart = Arc::new(crate::daemon_restart::RestartControl::default());
+            let listener = bind_attach_listener(&sock).expect("bind the attach socket");
+            let server = {
+                let registry = registry.clone();
+                let restart = restart.clone();
+                tokio::spawn(async move {
+                    let _ = serve_attach_with_restart(
+                        listener,
+                        registry,
+                        event_tx,
+                        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        state,
+                        None,
+                        Arc::new(crate::scheduler::Scheduler::with_stderr_notifier()),
+                        crate::spawn::new_reuse_registry(),
+                        crate::issue_dispatch_run::new_worktree_registry(),
+                        restart,
+                    )
+                    .await;
+                })
+            };
+            Self {
+                cwd: dir.path().to_string_lossy().into_owned(),
+                _dir: dir,
+                sock,
+                registry,
+                restart,
+                server,
+            }
+        }
+
+        fn client(&self) -> crate::daemon_client::DaemonClient {
+            crate::daemon_client::DaemonClient::new(self.sock.clone())
+        }
+
+        /// Start a long-lived agent over the wire, as a client would.
+        async fn start_agent(&self) -> Result<String, crate::daemon_client::ClientError> {
+            self.client()
+                .start_agent(crate::daemon_client::StartAgentOptions {
+                    command: Some("cat".to_string()),
+                    cwd: Some(self.cwd.clone()),
+                    ..crate::daemon_client::StartAgentOptions::default()
+                })
+                .await
+        }
+
+        fn request(confirm: Option<RestartStopSet>) -> crate::daemon_client::RestartDaemonRequest {
+            crate::daemon_client::RestartDaemonRequest {
+                confirm,
+                expected_version: None,
+                successor: RestartSuccessor::ClientSpawns,
+            }
+        }
+
+        async fn restart(&self, confirm: Option<RestartStopSet>) -> RestartDaemonReply {
+            match self.client().restart_daemon(Self::request(confirm)).await {
+                Ok(crate::daemon_client::GatedQuery::Answered(reply)) => reply,
+                other => panic!("no restart answer: {other:?}"),
+            }
+        }
+
+        fn agent_ids(&self) -> std::collections::BTreeSet<String> {
+            self.registry
+                .agent_records()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestartFixture {
+        fn drop(&mut self) {
+            self.registry.shutdown_all();
+            self.server.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    fn stop_set_ids(set: &RestartStopSet) -> std::collections::BTreeSet<String> {
+        set.agents.iter().map(|a| a.id.clone()).collect()
+    }
+
+    /// Scenario: a client confirms restarting a daemon running one agent.
+    /// Held at a barrier between the handler's check and its acceptance, a
+    /// second client tries to start an agent: it is refused with "the daemon
+    /// is restarting", so the drain stops exactly the confirmed agent and
+    /// nothing unnamed (PRD #1487 audit A2, D6).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_racing_an_accepted_restart_is_refused_not_stopped_unnamed() {
+        let fx = RestartFixture::start().await;
+        let confirmed_agent = fx.start_agent().await.expect("the confirmed agent starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let checkpoint = fx.restart.pause_before_accepting();
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm.clone()));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the handler reached its acceptance barrier");
+
+        // Between validation and acceptance: the reservation refuses the start.
+        let raced = tokio::time::timeout(Duration::from_secs(30), fx.start_agent())
+            .await
+            .expect("a refused start answers promptly");
+        let err = raced.expect_err("a start during the reservation must be refused");
+        assert!(
+            err.to_string().contains("the daemon is restarting"),
+            "the refusal says why: {err}"
+        );
+        assert_eq!(
+            fx.agent_ids(),
+            std::collections::BTreeSet::from([confirmed_agent.clone()]),
+            "nothing joined the registry behind the confirmed snapshot"
+        );
+
+        checkpoint.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(RestartDaemonReply::Accepted {
+                stopping,
+                ..
+            })) => assert_eq!(
+                stop_set_ids(&stopping),
+                std::collections::BTreeSet::from([confirmed_agent])
+            ),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        assert!(fx.restart.is_accepted());
+        assert!(
+            fx.registry.is_admission_frozen(),
+            "an accepted restart keeps refusing starts until the daemon exits"
+        );
+    }
+
+    /// Scenario: the client that asked for the restart goes away while the
+    /// handler is at its acceptance barrier, so the acceptance cannot be
+    /// delivered. Nothing is stopped, no restart is latched, and agents can
+    /// start again — the reservation is released (PRD #1487 audit A2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_undeliverable_acceptance_releases_the_reservation_and_stops_nothing() {
+        let fx = RestartFixture::start().await;
+        let survivor = fx.start_agent().await.expect("an agent starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let checkpoint = fx.restart.pause_before_accepting();
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the handler reached its acceptance barrier");
+        assert!(fx.registry.is_admission_frozen());
+        // The client hangs up: its end of the connection closes.
+        restarting.abort();
+        let _ = restarting.await;
+        checkpoint.resume.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while fx.registry.is_admission_frozen() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reservation was never released after a failed acceptance"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!fx.restart.is_accepted(), "no restart was latched");
+        assert!(!fx.registry.is_shutting_down(), "nothing was drained");
+        assert!(fx.agent_ids().contains(&survivor), "the agent survived");
+        let later = fx.start_agent().await.expect("agents start again");
+        assert_eq!(fx.agent_ids().len(), 2, "{later}");
+    }
+
+    /// Scenario: the daemon asks for confirmation; while the user decides, a
+    /// new agent starts — the question released the reservation, so the start
+    /// succeeds. The confirmation that arrives names only the old agent, so the
+    /// daemon asks again, naming both, and stops nothing (PRD #1487 audit A2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_started_while_the_user_decides_forces_a_fresh_confirmation() {
+        let fx = RestartFixture::start().await;
+        let first = fx.start_agent().await.expect("an agent starts");
+        let asked = match fx.restart(None).await {
+            RestartDaemonReply::NeedsConfirmation { at_stake, stale } => {
+                assert!(!stale);
+                at_stake
+            }
+            other => panic!("expected NeedsConfirmation, got {other:?}"),
+        };
+        assert!(
+            !fx.registry.is_admission_frozen(),
+            "asking releases the reservation"
+        );
+        let second = fx
+            .start_agent()
+            .await
+            .expect("a start while the user decides");
+
+        match fx.restart(Some(asked)).await {
+            RestartDaemonReply::NeedsConfirmation { at_stake, stale } => {
+                assert!(stale, "the confirmed set is stale");
+                assert_eq!(
+                    stop_set_ids(&at_stake),
+                    std::collections::BTreeSet::from([first.clone(), second.clone()])
+                );
+            }
+            other => panic!("expected a fresh confirmation, got {other:?}"),
+        }
+        assert!(!fx.restart.is_accepted());
+        assert_eq!(
+            fx.agent_ids(),
+            std::collections::BTreeSet::from([first, second]),
+            "both agents survived"
+        );
     }
 }

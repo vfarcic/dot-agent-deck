@@ -380,6 +380,29 @@ pub trait SshExecutor {
         }
         Ok(CappedOutput { output, truncated })
     }
+
+    /// [`run_capped`](Self::run_capped) under a laptop-side wall-clock
+    /// `deadline` of the call's own, whatever the executor was built for.
+    ///
+    /// PRD #1487 audit A1: the remote-upgrade executor is deliberately built
+    /// with no wall-clock kill, because a release download may legitimately
+    /// take minutes. The short plumbing commands that reach the remote daemon
+    /// run on the same ssh target and jump route, but a reply to one of them is
+    /// a few KiB and arrives in seconds, so they must be bounded per command:
+    /// both streams capped while they drain, and the session killed at
+    /// `deadline`. The production [`SystemSshExecutor`] does exactly that; this
+    /// default, for fakes whose transport is already bounded, ignores
+    /// `deadline` and falls back to [`run_capped`](Self::run_capped).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        let _ = deadline;
+        self.run_capped(target, command, max_capture_bytes)
+    }
 }
 
 /// Issue #858: seconds of headroom the laptop-side wallclock kill gets on top
@@ -455,6 +478,10 @@ pub struct SystemSshExecutor {
     /// capping a slow-but-alive transfer. `None` keeps the original behavior.
     /// Mutually exclusive with `wallclock_timeout` by construction.
     keepalive: Option<SshKeepalive>,
+    /// The ssh client to run: `ssh`, found on `PATH`. Only a unit test points
+    /// it elsewhere, at a stand-in that misbehaves the way a hostile remote
+    /// would, so the production executor's own bounds are what get exercised.
+    program: std::ffi::OsString,
 }
 
 /// PRD #161 FIX 3: ssh keepalive parameters for the remote-upgrade executor.
@@ -475,6 +502,7 @@ impl SystemSshExecutor {
             wallclock_timeout: None,
             observation: false,
             keepalive: None,
+            program: "ssh".into(),
         }
     }
 
@@ -487,6 +515,7 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: false,
             keepalive: None,
+            program: "ssh".into(),
         }
     }
 
@@ -505,6 +534,7 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: true,
             keepalive: None,
+            program: "ssh".into(),
         }
     }
 
@@ -525,6 +555,7 @@ impl SystemSshExecutor {
                 interval,
                 count_max,
             }),
+            program: "ssh".into(),
         }
     }
 
@@ -538,10 +569,18 @@ impl SystemSshExecutor {
         self.wallclock_timeout.map(wallclock_kill_secs)
     }
 
+    /// Run `program` instead of `ssh` — a test's stand-in for a misbehaving
+    /// remote. Everything else about the executor stays as built.
+    #[cfg(test)]
+    pub(crate) fn with_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
+        self.program = program.into();
+        self
+    }
+
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
     pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(&self.program);
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
@@ -805,6 +844,55 @@ impl SshExecutor for SystemSshExecutor {
                 stderr,
             },
             truncated,
+        })
+    }
+
+    /// Always bounded, whatever this executor was built for: both streams are
+    /// capped at `max_capture_bytes` while they drain, and the session is
+    /// killed at `deadline` (or at this executor's own kill deadline, when it
+    /// has a shorter one). The ssh options the executor was built with — the
+    /// upgrade path's keepalives, a jump host — are kept, so the command takes
+    /// the same route as every other session to that deck (PRD #1487 audit A1).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        // Whole seconds, at least one: `run_local_bounded`'s granularity.
+        let mut secs = deadline.as_secs().max(1);
+        if let Some(own) = self.kill_deadline_secs() {
+            secs = secs.min(own);
+        }
+        let mut cmd = self.build_command(target, command);
+        let capture = run_local_bounded(&mut cmd, secs, max_capture_bytes).map_err(|source| {
+            SshError::Io {
+                target: target.user_host(),
+                source,
+            }
+        })?;
+        let Some(status) = capture.status else {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "the remote command did not finish within {secs}s, so it was stopped"
+                ),
+            });
+        };
+        let status = status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&capture.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&capture.stderr).into_owned();
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+        Ok(CappedOutput {
+            output: SshOutput {
+                status,
+                stdout,
+                stderr,
+            },
+            truncated: capture.truncated,
         })
     }
 }

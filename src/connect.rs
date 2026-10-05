@@ -1024,6 +1024,11 @@ fn maybe_nudge_upgrade<R: BufRead, W: Write>(
         Some(n) if n > 0 => format!(" ({n} running agents)"),
         _ => String::new(),
     };
+    // Remote-reported: the display copy only (PRD #1487 audit A3).
+    let remote_version = &crate::untrusted_text::display_line(
+        remote_version,
+        crate::untrusted_text::REMOTE_NAME_MAX_BYTES,
+    );
     write!(
         output,
         "Remote '{name}' runs {remote_version}; you have {local_version}{agents_note}. Upgrade and connect? [y/N] "

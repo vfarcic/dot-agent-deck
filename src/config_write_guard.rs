@@ -22,8 +22,12 @@
 //!   environment hands that child.
 //! - **Automatically in a test process**: in the lib target's own unit tests
 //!   (`cfg(test)`), and in any process `cargo nextest` started or that inherited
-//!   its `NEXTEST` variable — every integration-test binary under this repo's
-//!   test aliases, and every child that did not clear its environment. When
+//!   its environment — every integration-test binary under this repo's test
+//!   aliases, and every child that did not clear its environment. Both `NEXTEST`
+//!   and `NEXTEST_RUN_ID` must be non-empty: nextest sets the pair for every
+//!   test it runs, while a stray `NEXTEST=1` left in a user's shell is one
+//!   variable, and arming on it alone would refuse that user's real config
+//!   writes (PRD #1487 review S4). When
 //!   [`ROOT_ENV`] is unset there, the roots default to the places tests make
 //!   scratch directories ([`default_test_roots`]); the user's home is not one
 //!   of them.
@@ -39,6 +43,19 @@
 //! appended. A missing component that is a `..`, or an entry that exists but
 //! cannot be resolved (a dangling symlink), is refused rather than guessed at.
 //! The result must lie under one canonicalized root.
+//!
+//! # What it is not
+//!
+//! Best-effort protection against **accidental** misconfiguration — a test
+//! that forgot to isolate `HOME` — and not a sandbox (PRD #1487 audit A4). The
+//! check judges the path when it is called; the writer then creates, renames
+//! and removes by pathname. A fixture that swaps a directory on the path for a
+//! symlink *between* the check and the write — a concurrent ancestor swap — is
+//! outside what it guarantees. Nothing in the deck does that, and a test that
+//! did would be attacking its own fixture.
+//!
+//! A refusal is logged at `warn!` with the destination and the reason, so a
+//! write that did not happen is never silent.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -53,6 +70,17 @@ pub const ROOT_ENV: &str = "DOT_AGENT_DECK_TEST_CONFIG_ROOT";
 /// owned root. Call it before the first side effect of a write — a
 /// `create_dir_all`, a temp file, a backup, a rename or a removal.
 pub(crate) fn ensure_config_write_allowed(dest: &Path) -> io::Result<()> {
+    check_config_write(dest).inspect_err(|e| {
+        tracing::warn!(
+            destination = %dest.display(),
+            reason = %e,
+            "agent config write refused by test containment"
+        );
+    })
+}
+
+/// [`ensure_config_write_allowed`] without the log line.
+fn check_config_write(dest: &Path) -> io::Result<()> {
     let Some(roots) = armed_roots()? else {
         return Ok(());
     };
@@ -111,10 +139,19 @@ fn armed_roots() -> io::Result<Option<Vec<PathBuf>>> {
 
 /// Whether this process is a test: the lib's own unit-test binary, or a
 /// process `cargo nextest` started (directly or as an ancestor whose
-/// environment was inherited). `NEXTEST` is set by nextest for every test it
-/// runs, and nextest is what every test alias in `.cargo/config.toml` runs.
+/// environment was inherited). nextest sets `NEXTEST` and `NEXTEST_RUN_ID` for
+/// every test it runs, and nextest is what every test alias in
+/// `.cargo/config.toml` runs. Both are required (review S4): `NEXTEST` alone is
+/// a generic-looking name a user's shell can carry for unrelated reasons.
 fn running_under_test_runner() -> bool {
-    cfg!(test) || std::env::var_os("NEXTEST").is_some_and(|value| !value.is_empty())
+    cfg!(test) || nextest_armed(|name| std::env::var_os(name))
+}
+
+/// The nextest half of [`running_under_test_runner`], over an environment
+/// lookup so it can be tested without touching the process environment.
+fn nextest_armed(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let set = |name: &str| var(name).is_some_and(|value| !value.is_empty());
+    set("NEXTEST") && set("NEXTEST_RUN_ID")
 }
 
 /// Where tests make scratch directories, used as the owned roots when a test
@@ -201,5 +238,29 @@ mod tests {
         std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).unwrap();
         assert!(resolve_for_containment(&root.join("dangling/file")).is_err());
         assert!(running_under_test_runner());
+    }
+
+    /// Scenario: a stray `NEXTEST` alone does not arm containment; nextest's
+    /// own pair does (PRD #1487 review S4).
+    #[test]
+    fn nextest_arms_only_with_its_run_id() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        assert!(!nextest_armed(env(&[("NEXTEST", "1")])));
+        assert!(!nextest_armed(env(&[
+            ("NEXTEST", "1"),
+            ("NEXTEST_RUN_ID", "")
+        ])));
+        assert!(!nextest_armed(env(&[("NEXTEST_RUN_ID", "r")])));
+        assert!(nextest_armed(env(&[
+            ("NEXTEST", "1"),
+            ("NEXTEST_RUN_ID", "r")
+        ])));
     }
 }

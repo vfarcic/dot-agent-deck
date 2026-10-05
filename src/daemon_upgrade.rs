@@ -39,6 +39,10 @@ use crate::daemon_protocol::{
 };
 use crate::remote::{SshExecutor, SystemSshExecutor};
 use crate::remote_daemon::{RemoteDaemonError, SshDaemonPort};
+use crate::untrusted_text::{
+    REMOTE_MESSAGE_MAX_BYTES, REMOTE_NAME_MAX_BYTES, REMOTE_PATH_MAX_BYTES, display_line,
+    display_message,
+};
 
 // ---------------------------------------------------------------------------
 // Result and progress types
@@ -116,9 +120,20 @@ pub struct UpgradeProgress {
     pub detail: Option<String>,
 }
 
+/// The display copy of a remote-reported version (audit A3).
+fn shown_version(raw: &str) -> String {
+    display_line(raw, REMOTE_NAME_MAX_BYTES)
+}
+
 impl UpgradeOutcome {
     /// Plain-language rendering for a person; the CLI prints it. Clients with
     /// their own surface may build their own from the fields instead.
+    ///
+    /// Every remote-reported field — versions, names, paths, a refusal or
+    /// failure reason — is shown through [`crate::untrusted_text`]'s display
+    /// sanitizers, so a hostile or broken remote cannot steer the terminal it
+    /// is printed to (PRD #1487 audit A3). The outcome itself keeps the raw
+    /// values.
     pub fn summary(&self, deck: &str) -> String {
         match self {
             Self::Restarted {
@@ -126,6 +141,8 @@ impl UpgradeOutcome {
                 to_version,
                 stopped,
             } => {
+                let from_version = shown_version(from_version);
+                let to_version = shown_version(to_version);
                 let mut text = format!(
                     "Restarted the daemon on '{deck}' onto the new build (was {from_version}, now {to_version})."
                 );
@@ -140,9 +157,10 @@ impl UpgradeOutcome {
                 installed_version,
                 reason,
             } => {
+                let installed_version = &shown_version(installed_version);
                 let running = from_version
                     .as_deref()
-                    .map(|v| format!(" It keeps running {v}."))
+                    .map(|v| format!(" It keeps running {}.", shown_version(v)))
                     .unwrap_or_default();
                 match reason {
                     NotRestartedReason::KeptByUser { at_stake } => format!(
@@ -174,9 +192,11 @@ impl UpgradeOutcome {
                 daemon_version,
                 remedy,
             } => {
+                let installed_version = shown_version(installed_version);
+                let remedy = display_message(remedy, REMOTE_MESSAGE_MAX_BYTES);
                 let daemon = daemon_version
                     .as_deref()
-                    .map(|v| format!(" ({v})"))
+                    .map(|v| format!(" ({})", shown_version(v)))
                     .unwrap_or_default();
                 format!(
                     "Installed {installed_version} on '{deck}', but the running daemon{daemon} is too old to restart itself, so it keeps running. {remedy}"
@@ -192,6 +212,8 @@ impl UpgradeOutcome {
                     UpgradeStage::Restarting => "restarting the daemon",
                     UpgradeStage::Verifying => "checking the restarted daemon",
                 };
+                let reason = display_message(reason, REMOTE_MESSAGE_MAX_BYTES);
+                let installed_version = installed_version.as_deref().map(shown_version);
                 let mut text = format!("Upgrade of '{deck}' failed while {doing}: {reason}");
                 match (stage, installed_version) {
                     (UpgradeStage::Verifying, Some(v)) => text.push_str(&format!(
@@ -217,22 +239,30 @@ impl UpgradeOutcome {
 
 /// The agents and roles in `set`, one per line, indented — what the restart
 /// question and the summaries name.
+///
+/// Every field is remote-supplied (a remote daemon's stop set arrives over ssh
+/// as JSON, and a working directory is whatever the filesystem holds), so each
+/// is shown through [`display_line`]: no control or bidi character, no line
+/// break of its own, and a bounded length (PRD #1487 audit A3). This is the
+/// display copy only — the confirmation sent back is the set as received.
 pub fn describe_stop_set(set: &RestartStopSet) -> String {
+    let name = |raw: &str| display_line(raw, REMOTE_NAME_MAX_BYTES);
     let mut text = String::new();
     if !set.agents.is_empty() {
         text.push_str("  Agents:\n");
         for agent in &set.agents {
+            let label = name(&agent.label);
             let mut place = Vec::new();
             if let Some(pane) = &agent.pane_id {
-                place.push(format!("pane {pane}"));
+                place.push(format!("pane {}", name(pane)));
             }
             if let Some(cwd) = &agent.cwd {
-                place.push(format!("in {cwd}"));
+                place.push(format!("in {}", display_line(cwd, REMOTE_PATH_MAX_BYTES)));
             }
             if place.is_empty() {
-                text.push_str(&format!("    {}\n", agent.label));
+                text.push_str(&format!("    {label}\n"));
             } else {
-                text.push_str(&format!("    {} ({})\n", agent.label, place.join(", ")));
+                text.push_str(&format!("    {label} ({})\n", place.join(", ")));
             }
         }
     }
@@ -246,7 +276,9 @@ pub fn describe_stop_set(set: &RestartStopSet) -> String {
             };
             text.push_str(&format!(
                 "    {}: {} in pane {}{lead}\n",
-                role.orchestration, role.role, role.pane_id
+                name(&role.orchestration),
+                name(&role.role),
+                name(&role.pane_id)
             ));
         }
     }
@@ -294,18 +326,20 @@ pub trait Installer {
     fn install(&self, version: &str) -> Result<InstalledBuild, String>;
 }
 
-/// Why [`DaemonPort::probe`] learned nothing.
+/// Why a [`DaemonPort`] call — the probe or the restart request — got no
+/// answer from the running daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProbeError {
+pub enum PortError {
     /// The installed build cannot reach the running daemon: it predates the
-    /// command that asks. Not a failure of the upgrade — the build is in
+    /// command that asks (the probe, or the restart request — PRD #1487 review
+    /// S1, so the restart path no longer blames the daemon). Not a failure of the upgrade — the build is in
     /// place — so it becomes [`NotRestartedReason::InstalledBuildTooOld`].
     InstalledBuildTooOld(String),
     /// Anything else, in plain language.
     Other(String),
 }
 
-impl std::fmt::Display for ProbeError {
+impl std::fmt::Display for PortError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InstalledBuildTooOld(reason) | Self::Other(reason) => f.write_str(reason),
@@ -313,13 +347,13 @@ impl std::fmt::Display for ProbeError {
     }
 }
 
-impl From<String> for ProbeError {
+impl From<String> for PortError {
     fn from(reason: String) -> Self {
         Self::Other(reason)
     }
 }
 
-impl From<&str> for ProbeError {
+impl From<&str> for PortError {
     fn from(reason: &str) -> Self {
         Self::Other(reason.to_string())
     }
@@ -329,12 +363,16 @@ impl From<&str> for ProbeError {
 pub trait DaemonPort {
     /// The running daemon's `Hello`, or `Ok(None)` when none is running. Never
     /// starts one.
-    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError>;
+    fn probe(&self) -> Result<Option<AttachResponse>, PortError>;
     /// Send the restart request. Must go through
     /// [`DaemonClient::restart_daemon`], which withholds it from a daemon that
     /// does not advertise it — `Unsupported` then means the daemon is too old.
-    fn restart(&self, req: &RestartDaemonRequest)
-    -> Result<GatedQuery<RestartDaemonReply>, String>;
+    /// [`PortError::InstalledBuildTooOld`] means the build that would send it
+    /// is too old instead.
+    fn restart(
+        &self,
+        req: &RestartDaemonRequest,
+    ) -> Result<GatedQuery<RestartDaemonReply>, PortError>;
     /// Told what the installer put in place, before the first probe — a port
     /// that runs the installed binary repoints itself here.
     fn installed(&self, _build: &InstalledBuild) {}
@@ -533,14 +571,14 @@ fn run_upgrade(
                 reason: NotRestartedReason::NoDaemonRunning,
             };
         }
-        Err(ProbeError::InstalledBuildTooOld(_)) => {
+        Err(PortError::InstalledBuildTooOld(_)) => {
             return UpgradeOutcome::InstalledNotRestarted {
                 from_version: None,
                 installed_version: installed.version,
                 reason: NotRestartedReason::InstalledBuildTooOld,
             };
         }
-        Err(ProbeError::Other(reason)) => return restarting_failed(reason),
+        Err(PortError::Other(reason)) => return restarting_failed(reason),
     };
     let from_version = hello.daemon_version.clone();
     let from_build = hello.build_version.clone();
@@ -559,7 +597,10 @@ fn run_upgrade(
             successor: plan.successor,
         };
         match daemon.restart(&request) {
-            Err(reason) => return restarting_failed(reason),
+            Err(PortError::InstalledBuildTooOld(_)) => {
+                return not_restarted(NotRestartedReason::InstalledBuildTooOld);
+            }
+            Err(PortError::Other(reason)) => return restarting_failed(reason),
             Ok(GatedQuery::Unsupported) => {
                 return daemon.legacy_restart(decider).unwrap_or_else(|| {
                     UpgradeOutcome::InstalledDaemonTooOld {
@@ -895,24 +936,24 @@ impl Installer for NoInstall {
 
 /// A remote daemon, reached through the remote's freshly installed binary.
 impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
-    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError> {
+    fn probe(&self) -> Result<Option<AttachResponse>, PortError> {
         match SshDaemonPort::probe(self) {
             Ok(probe) if probe.running => Ok(probe.hello),
             Ok(_) => Ok(None),
             Err(RemoteDaemonError::Unsupported { .. }) => {
-                Err(ProbeError::InstalledBuildTooOld(format!(
+                Err(PortError::InstalledBuildTooOld(format!(
                     "the installed build at {} is too old to report on the running daemon",
                     self.binary()
                 )))
             }
-            Err(e) => Err(ProbeError::Other(e.to_string())),
+            Err(e) => Err(PortError::Other(e.to_string())),
         }
     }
 
     fn restart(
         &self,
         req: &RestartDaemonRequest,
-    ) -> Result<GatedQuery<RestartDaemonReply>, String> {
+    ) -> Result<GatedQuery<RestartDaemonReply>, PortError> {
         match self.restart_installed(req.expected_version.as_deref(), req.confirm.as_ref()) {
             Ok(report) if report.unsupported => Ok(GatedQuery::Unsupported),
             Ok(report) => match report.reply {
@@ -923,12 +964,16 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
                 }
                 None => Err("the remote reported no answer from the daemon".into()),
             },
-            // An installed build too old to drive the restart (Homebrew can
-            // land an older tap release): the daemon cannot be asked.
+            // The installed build is too old to drive the restart (Homebrew
+            // can land an older tap release): the daemon was never asked, and
+            // it is the installed build that is too old, not the daemon.
             Err(RemoteDaemonError::Unsupported { .. } | RemoteDaemonError::Malformed(_)) => {
-                Ok(GatedQuery::Unsupported)
+                Err(PortError::InstalledBuildTooOld(format!(
+                    "the installed build at {} is too old to ask the running daemon to restart",
+                    self.binary()
+                )))
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(PortError::Other(e.to_string())),
         }
     }
 
@@ -990,7 +1035,7 @@ impl WireDaemonPort {
 }
 
 impl DaemonPort for WireDaemonPort {
-    fn probe(&self) -> Result<Option<AttachResponse>, ProbeError> {
+    fn probe(&self) -> Result<Option<AttachResponse>, PortError> {
         self.handle
             .block_on(async {
                 tokio::time::timeout(LOCAL_PROBE_TIMEOUT, self.client.probe_running()).await
@@ -1001,16 +1046,16 @@ impl DaemonPort for WireDaemonPort {
                     LOCAL_PROBE_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| ProbeError::Other(e.to_string()))
+            .map_err(|e| PortError::Other(e.to_string()))
     }
 
     fn restart(
         &self,
         req: &RestartDaemonRequest,
-    ) -> Result<GatedQuery<RestartDaemonReply>, String> {
+    ) -> Result<GatedQuery<RestartDaemonReply>, PortError> {
         self.handle
             .block_on(self.client.restart_daemon(req.clone()))
-            .map_err(|e| e.to_string())
+            .map_err(|e| PortError::Other(e.to_string()))
     }
 
     fn spawn_successor(&self) -> Result<(), String> {
@@ -1160,8 +1205,8 @@ mod tests {
         h
     }
 
-    type Probe = Result<Option<AttachResponse>, ProbeError>;
-    type Restart = Result<GatedQuery<RestartDaemonReply>, String>;
+    type Probe = Result<Option<AttachResponse>, PortError>;
+    type Restart = Result<GatedQuery<RestartDaemonReply>, PortError>;
 
     /// Scripted probes and restart replies; the last probe repeats.
     struct FakePort {
@@ -1624,7 +1669,7 @@ mod tests {
     #[test]
     fn an_installed_build_too_old_to_probe_leaves_the_daemon_running() {
         let port = FakePort::new(
-            vec![Err(ProbeError::InstalledBuildTooOld(
+            vec![Err(PortError::InstalledBuildTooOld(
                 "the installed build at ~/.local/bin/dot-agent-deck is too old".into(),
             ))],
             vec![],
@@ -1651,6 +1696,61 @@ mod tests {
         assert!(summary.contains("keeps running"), "{summary}");
         assert!(summary.contains("dot-agent-deck connect box"), "{summary}");
         assert!(!summary.contains("failed"), "{summary}");
+    }
+
+    /// PRD #1487 review S1: the installed build answers `daemon probe` but not
+    /// `daemon restart-installed` (an older Homebrew tap release). The outcome
+    /// names the installed build as too old — never the daemon, which was
+    /// never asked.
+    #[test]
+    fn an_installed_build_too_old_to_restart_is_named_not_the_daemon() {
+        use crate::daemon_restart::DaemonProbe;
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct ProbesButCannotRestart;
+        impl SshExecutor for ProbesButCannotRestart {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if command.ends_with("daemon probe --json") {
+                    let probe = DaemonProbe {
+                        running: true,
+                        hello: Some(hello("0.39.0", "old")),
+                    };
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: serde_json::to_string(&probe).unwrap(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(SshOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "error: unrecognized subcommand 'restart-installed'".into(),
+                })
+            }
+        }
+        let port = SshDaemonPort::new(
+            ProbesButCannotRestart,
+            SshTarget::parse("u@h", 22, None),
+            "~/.local/bin/dot-agent-deck",
+        );
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::Homebrew),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::InstalledNotRestarted {
+                from_version: Some("0.39.0".into()),
+                installed_version: "0.40.0".into(),
+                reason: NotRestartedReason::InstalledBuildTooOld,
+            }
+        );
+        let summary = outcome.summary("box");
+        assert!(summary.contains("0.40.0 is too old"), "{summary}");
+        assert!(!summary.contains("daemon (0.39.0) is too old"), "{summary}");
+        assert!(!summary.contains("too old to restart itself"), "{summary}");
     }
 
     /// The same case through the real ssh port: the remote binary exits with
@@ -1683,7 +1783,7 @@ mod tests {
         );
         let probed = DaemonPort::probe(&port);
         assert!(
-            matches!(probed, Err(ProbeError::InstalledBuildTooOld(_))),
+            matches!(probed, Err(PortError::InstalledBuildTooOld(_))),
             "{probed:?}"
         );
 
@@ -1917,6 +2017,169 @@ mod tests {
             }
             assert_eq!(text.contains("changed since you were asked"), input == "\n");
         }
+    }
+
+    /// A remote daemon's stop set as it arrives over ssh: JSON whose escaped
+    /// strings decode to CSI and OSC sequences (clear screen, home, an OSC 52
+    /// clipboard write), C1 controls, line breaks and bidi overrides.
+    fn hostile_stop_set() -> RestartStopSet {
+        serde_json::from_str(
+            r#"{
+              "agents": [{
+                "id": "a1",
+                "label": "coder\u001b[2J\u001b[H\u001b]52;c;cm0gLXJmIH4=\u0007",
+                "pane_id": "p1\nRestart now? [r] / Keep current daemon [K]: ",
+                "cwd": "/work/\u202egnp.exe\u202c\r\n"
+              }],
+              "roles": [{
+                "pane_id": "p1\u0085",
+                "role": "coder\u009b31m",
+                "orchestration": "team\u2066\u001b]8;;http://x\u0007",
+                "is_orchestrator": false
+              }]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// Nothing a terminal could act on: no C0 control but `\n`, no C1, no
+    /// bidi override.
+    fn assert_inert(text: &str) {
+        for c in text.chars() {
+            assert!(
+                c == '\n' || !(c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+                "control or bidi {c:?} reached the terminal in {text:?}"
+            );
+        }
+    }
+
+    /// Scenario: a remote daemon answers the restart with a stop set whose
+    /// labels, pane, cwd, role and orchestration carry escape sequences, line
+    /// breaks and bidi overrides. The question shows one line per agent and
+    /// role, emits no terminal control, and the confirmation sent back still
+    /// names the original identities (PRD #1487 audit A3).
+    #[test]
+    fn a_hostile_remote_stop_set_cannot_steer_the_confirmation_terminal() {
+        let hostile = hostile_stop_set();
+        let port = FakePort::new(
+            vec![
+                Ok(Some(hello("0.1.0", "old"))),
+                Ok(Some(hello("0.2.0", "new"))),
+            ],
+            vec![
+                Ok(GatedQuery::Answered(
+                    RestartDaemonReply::NeedsConfirmation {
+                        at_stake: hostile.clone(),
+                        stale: false,
+                    },
+                )),
+                Ok(GatedQuery::Answered(RestartDaemonReply::Accepted {
+                    from_version: "0.1.0".into(),
+                    to_version: Some("0.2.0".into()),
+                    successor: RestartSuccessor::Installed,
+                    stopping: hostile.clone(),
+                })),
+            ],
+        );
+        let mut out = Vec::new();
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+            &port,
+            &TtyDecider::new("r\n".as_bytes(), &mut out),
+            &remote_plan(),
+        );
+        let asked = String::from_utf8(out).unwrap();
+        assert_inert(&asked);
+        // The genuine question and list are intact: a header, one agent line,
+        // a header, one role line, then the question on the last line.
+        let lines: Vec<&str> = asked.lines().collect();
+        assert_eq!(lines.len(), 6, "{asked}");
+        assert!(
+            lines[0].starts_with("Restarting the daemon on 'box'"),
+            "{asked}"
+        );
+        assert_eq!(lines[1], "  Agents:");
+        assert!(lines[2].starts_with("    coder[2J[H]52;c;"), "{asked}");
+        assert!(lines[2].contains("(pane p1Restart now?"), "{asked}");
+        assert!(lines[2].ends_with("in /work/gnp.exe)"), "{asked}");
+        assert_eq!(lines[3], "  Orchestration roles:");
+        assert!(
+            lines[4].starts_with("    team]8;;http://x: coder31m in pane p1"),
+            "{asked}"
+        );
+        assert!(
+            lines[5].starts_with("Restart now? [r] / Keep current daemon [K]:"),
+            "{asked}"
+        );
+
+        // What went back to the daemon is the set as received, not the display
+        // copy: the daemon compares identities.
+        let requests = port.requests.borrow();
+        assert_eq!(requests[1].confirm.as_ref(), Some(&hostile));
+
+        let summary = outcome.summary("box");
+        assert!(
+            summary.starts_with("Restarted the daemon on 'box'"),
+            "{summary}"
+        );
+        assert_inert(&summary);
+    }
+
+    /// Scenario: remote-reported versions and a refusal message carrying
+    /// escape sequences and bidi overrides are shown inert in every summary
+    /// arm, and a remote cannot make a summary arbitrarily long.
+    #[test]
+    fn remote_versions_and_messages_in_summaries_are_inert_and_bounded() {
+        let evil_version = "0.1.0\u{1b}]0;pwned\u{7}\u{202e}";
+        let evil_reason = format!("refused\u{1b}[31m\n\u{9b}2J{}", "x".repeat(100_000));
+        let outcomes = [
+            UpgradeOutcome::Restarted {
+                from_version: evil_version.into(),
+                to_version: evil_version.into(),
+                stopped: hostile_stop_set(),
+            },
+            UpgradeOutcome::InstalledNotRestarted {
+                from_version: Some(evil_version.into()),
+                installed_version: evil_version.into(),
+                reason: NotRestartedReason::KeptByUser {
+                    at_stake: hostile_stop_set(),
+                },
+            },
+            UpgradeOutcome::InstalledNotRestarted {
+                from_version: Some(evil_version.into()),
+                installed_version: evil_version.into(),
+                reason: NotRestartedReason::InstalledBuildTooOld,
+            },
+            UpgradeOutcome::InstalledDaemonTooOld {
+                installed_version: evil_version.into(),
+                daemon_version: Some(evil_version.into()),
+                remedy: "connect".into(),
+            },
+            UpgradeOutcome::Failed {
+                stage: UpgradeStage::Restarting,
+                reason: evil_reason.clone(),
+                installed_version: Some(evil_version.into()),
+            },
+        ];
+        for outcome in outcomes {
+            let summary = outcome.summary("box");
+            assert_inert(&summary);
+            assert!(summary.contains("0.1.0]0;pwned"), "{summary}");
+            assert!(
+                summary.len() < 16 * 1024,
+                "unbounded: {} bytes",
+                summary.len()
+            );
+        }
+        // The failure reason keeps its own line break; the CSI residue is text.
+        let failed = UpgradeOutcome::Failed {
+            stage: UpgradeStage::Restarting,
+            reason: evil_reason,
+            installed_version: None,
+        }
+        .summary("box");
+        assert!(failed.contains("refused[31m\n2Jxxx"), "{failed}");
+        assert!(failed.contains('…'), "a clamped reason is marked: {failed}");
     }
 
     #[test]

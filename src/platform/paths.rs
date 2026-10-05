@@ -1277,6 +1277,18 @@ pub(crate) fn pin_is_repairable(pin: &str) -> bool {
     }
 }
 
+/// Whether `path` is positively a live, durable deck install: absolute, reported
+/// to exist, an executable file, and not cargo build output. Every term must be
+/// established — a path whose existence cannot be read is not one. The
+/// automatic hook install keeps another install's entry only on this
+/// (`agent_hook_config::auto_install_keeps`).
+pub(crate) fn is_live_durable_install(path: &Path) -> bool {
+    path.is_absolute()
+        && matches!(path.try_exists(), Ok(true))
+        && is_executable_file(path)
+        && !is_build_artifact_path(path)
+}
+
 /// Single-quote `path` for a POSIX shell only when it contains a character
 /// outside a conservative safe set; otherwise return it unchanged. Canonical
 /// copy of the identical helper duplicated in `codex_hooks_manage.rs` and

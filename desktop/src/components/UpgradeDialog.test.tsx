@@ -187,4 +187,31 @@ describe("UpgradeDialog", () => {
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon replaced");
     expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("The daemon on this machine now runs 0.45.0");
   });
+
+  /**
+   * Scenario: a remote daemon's stop set and outcome carry escape sequences,
+   * line breaks and bidi overrides (PRD #1487 audit A3). The question and the
+   * outcome render them as inert text: no control or bidi character reaches
+   * the DOM, and every agent and role is still listed.
+   */
+  it("renders a hostile remote stop set and outcome as inert text", async () => {
+    const hostile: UpgradeStopSet = {
+      agents: [{ id: "7", label: "coder\u001b[2J\u001b]52;c;cm0=\u0007", paneId: "2\nKeep current daemon", cwd: "/work/\u202egnp.exe" }],
+      roles: [{ paneId: "1\u0085", role: "lead\u009b31m", orchestration: "tdd\u2066", isOrchestrator: true }],
+    };
+    const unsafe = /[\u0000-\u001F\u007F-\u009F\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/;
+    const { runtime, emit, finish } = controlledRuntime();
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit({ ...decision, atStake: hostile });
+    const list = within(screen.getByTestId("upgrade-decision")).getByTestId("upgrade-at-stake");
+    expect(list.textContent ?? "").not.toMatch(unsafe);
+    expect(list).toHaveTextContent("Agent coder[2J]52;c;cm0= (pane 2Keep current daemon, in /work/gnp.exe)");
+    expect(list).toHaveTextContent("Role lead31m of tdd, pane 1 (the orchestrator)");
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    await finish({ outcome: "failed", stage: "restarting", reason: "refused\u001b]0;pwned\u0007\u202e", installedVersion: "0.45.0\u001b[31m" });
+    const outcome = screen.getByTestId("upgrade-outcome");
+    expect(outcome.textContent ?? "").not.toMatch(unsafe);
+    expect(outcome).toHaveTextContent("refused]0;pwned");
+  });
 });

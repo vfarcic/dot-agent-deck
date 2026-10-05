@@ -5153,6 +5153,39 @@ impl std::io::Write for PaneWriter {
     }
 }
 
+/// Why a spawn is refused while a restart holds its reservation
+/// ([`AgentPtyRegistry::freeze_admission`]).
+pub const ADMISSION_FROZEN_REASON: &str =
+    "the daemon is restarting; start the agent again once it is back";
+
+/// A restart's hold on agent admission ([`AgentPtyRegistry::freeze_admission`]).
+/// Dropping it lets agents start again — the restart answered without
+/// restarting, or could not deliver its acceptance. [`Self::keep`] leaves
+/// admission refused for good, for an accepted restart whose drain follows.
+#[must_use = "dropping the reservation re-admits agents at once"]
+pub struct AdmissionFreeze<'a> {
+    registry: &'a AgentPtyRegistry,
+    release_on_drop: bool,
+}
+
+impl AdmissionFreeze<'_> {
+    /// The restart was accepted: admission stays refused until the daemon
+    /// exits.
+    pub fn keep(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for AdmissionFreeze<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.registry
+                .admission_frozen
+                .store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// See [`AgentPtyRegistry::pause_next_echo_watch_for_test`].
 #[cfg(test)]
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
@@ -5215,6 +5248,14 @@ pub struct AgentPtyRegistry {
     /// the original shutdown for ownership of each `Child`. Read by
     /// [`shutdown_all_graceful`]; a second call returns immediately.
     shutting_down: AtomicBool,
+    /// PRD #1487 audit A2: set while a `restart-daemon` request holds its
+    /// reservation — from the moment it snapshots what a restart would stop
+    /// until it either answers without restarting (cleared) or is accepted
+    /// (left set; the shutdown latch follows). Every spawn checks it beside
+    /// [`Self::shutting_down`], at entry and again under the lock that
+    /// publishes the agent, so no agent can join the registry after the
+    /// snapshot the client confirmed. See [`Self::freeze_admission`].
+    admission_frozen: AtomicBool,
     /// PRD #127 M2.2 (deliver-on-idle) + issue #424 F1: what each pane's input
     /// box is holding — the user-keystroke clock the scheduler's reuse path
     /// debounces on, and the record of what THIS daemon's guarded sends put
@@ -5352,7 +5393,16 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_echo_watch_for_test`].
     #[cfg(test)]
     echo_watch_pause: EchoWatchPause,
+    /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
+    /// child is forked and waits, before it takes the publishing lock — see
+    /// [`Self::pause_next_publish_for_test`].
+    #[cfg(test)]
+    publish_pause: PublishPause,
 }
+
+/// See [`AgentPtyRegistry::pause_next_publish_for_test`].
+#[cfg(test)]
+type PublishPause = Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>;
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
 /// how often focus claims can re-apply sizes.
@@ -7051,6 +7101,7 @@ impl AgentPtyRegistry {
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
+            admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             draft_defer_cap: crate::draft_deferral::draft_defer_cap_from_env(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -7068,6 +7119,8 @@ impl AgentPtyRegistry {
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
+            #[cfg(test)]
+            publish_pause: Mutex::new(None),
         }
     }
 
@@ -9521,6 +9574,20 @@ impl AgentPtyRegistry {
         (reached_rx, release_tx)
     }
 
+    /// PRD #1487 audit A2 test seam: park the next spawn after its child is
+    /// forked and before it takes the lock that publishes it. The first
+    /// receiver yields once the spawn is parked; sending on (or dropping) the
+    /// returned sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn pause_next_publish_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.publish_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
     /// Issue #542 test seam: does any pane-keyed clock hold `pane_id_env`?
     #[cfg(test)]
     fn pane_input_tracks(&self, pane_id_env: &str) -> bool {
@@ -9999,6 +10066,11 @@ impl AgentPtyRegistry {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
         }
+        // PRD #1487 audit A2: a restart's reservation refuses new agents too.
+        // Guard B re-checks it under the publishing lock.
+        if self.admission_frozen.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
+        }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
         // moving `opts` into `spawn`, so the registry retains a copy for
@@ -10300,6 +10372,14 @@ impl AgentPtyRegistry {
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
+        #[cfg(test)]
+        {
+            let pause = self.publish_pause.lock().unwrap().take();
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
         // PRD #745 M11: the child exists as of the line above, so this is the
         // instant to record — before the lock acquisition below, which can
         // block behind any other registry operation. An OBSERVATION of when the
@@ -10329,6 +10409,14 @@ impl AgentPtyRegistry {
         if self.shutting_down.load(Ordering::SeqCst) {
             reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+        // PRD #1487 audit A2: the same re-check for a restart's reservation,
+        // and atomic with the insert for the same reason. A spawn that was
+        // already forking when the reservation was taken lands here and is
+        // refused — its child killed by `guard` — so it cannot publish an
+        // agent the restart's snapshot did not name.
+        if self.admission_frozen.load(Ordering::SeqCst) {
+            return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
         }
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
@@ -15416,6 +15504,33 @@ impl AgentPtyRegistry {
     /// `KIND_SHUTDOWN` arrival.
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// PRD #1487 audit A2: refuse every new agent until the returned
+    /// reservation is dropped (or [kept](AdmissionFreeze::keep)).
+    ///
+    /// The flag is set while holding the lock that publishes agents, so the
+    /// registry a caller reads after this returns is final: an agent already
+    /// published is in it, and a spawn still forking is refused at its
+    /// publishing check (Guard B in `spawn_agent_with_dir`). That is what lets
+    /// a restart name exactly what it will stop — the snapshot it confirms is
+    /// the set its drain finds, give or take agents that exit on their own.
+    ///
+    /// Refused, not held: a start that lands while a restart is deciding fails
+    /// at once with a message saying the daemon is restarting, rather than
+    /// waiting on a decision that may take a client round trip.
+    pub fn freeze_admission(&self) -> AdmissionFreeze<'_> {
+        let _publishing = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        self.admission_frozen.store(true, Ordering::SeqCst);
+        AdmissionFreeze {
+            registry: self,
+            release_on_drop: true,
+        }
+    }
+
+    /// Whether a restart's reservation currently refuses new agents.
+    pub fn is_admission_frozen(&self) -> bool {
+        self.admission_frozen.load(Ordering::SeqCst)
     }
 
     /// SIGKILL every agent in `agents` — the whole descendant tree of each —
@@ -27284,6 +27399,80 @@ mod spawn_tests {
             "signal independence must not be bought by dropping the reap — a \
              child that is signalled and never waited on is a zombie"
         );
+    }
+
+    /// Scenario: a restart's reservation (PRD #1487 audit A2). A spawn whose
+    /// child is already forked when the reservation is taken cannot publish
+    /// afterwards — it is refused and its child killed — so the snapshot read
+    /// under the reservation is the whole registry. New spawns are refused
+    /// while it is held; dropping it re-admits them, and a kept reservation
+    /// keeps refusing.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_reservation_refuses_spawns_including_one_already_forking() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (reached, release) = registry.pause_next_publish_for_test();
+        let in_flight = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                })
+            })
+        };
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the in-flight spawn forked its child");
+
+        let reservation = registry.freeze_admission();
+        assert!(registry.is_admission_frozen());
+        let snapshot = registry.agent_records();
+        assert!(snapshot.is_empty(), "nothing was published yet");
+        release.send(()).unwrap();
+        let refused = in_flight.join().unwrap();
+        match refused {
+            Err(AgentPtyError::Spawn(reason)) => assert_eq!(reason, ADMISSION_FROZEN_REASON),
+            other => panic!("the in-flight spawn published under a reservation: {other:?}"),
+        }
+        assert_eq!(
+            registry.agent_records().len(),
+            snapshot.len(),
+            "the registry is still exactly the snapshot"
+        );
+        assert!(
+            matches!(
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                }),
+                Err(AgentPtyError::Spawn(_))
+            ),
+            "a new spawn is refused while the reservation is held"
+        );
+
+        drop(reservation);
+        assert!(!registry.is_admission_frozen());
+        let admitted = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("a released reservation re-admits spawns");
+        assert_eq!(registry.agent_records().len(), 1);
+
+        registry.freeze_admission().keep();
+        assert!(registry.is_admission_frozen(), "a kept reservation stays");
+        assert!(
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                })
+                .is_err()
+        );
+        let _ = registry.close_agent(&admitted);
+        registry.shutdown_all();
     }
 
     /// Control for the wedged tests: with nothing wedged, the very same two

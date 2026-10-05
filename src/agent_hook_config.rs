@@ -1243,13 +1243,20 @@ pub(crate) enum InstallMode {
     Automatic,
 }
 
-/// Whether an automatic install keeps a deck entry pinned to `exe`: an absolute
-/// path to an executable that is not cargo build output — the inverse of
-/// [`crate::platform::paths::pin_is_repairable`], so "dead or unusable" means
-/// exactly what dead-pin repair has always meant. A pin that cannot be stat'ed
-/// is kept, which errs toward writing nothing.
+/// Whether an automatic install keeps a deck entry pinned to `exe`: only a
+/// POSITIVELY live, durable install — an absolute path the OS reports exists,
+/// to an executable file, that is not cargo build output
+/// ([`crate::platform::paths::is_build_artifact_path`], which reads cargo's
+/// own layout through `is_cargo_output_dir`).
+///
+/// Fails safe toward replacing (PRD #1487 review): a pin whose existence
+/// cannot be determined is NOT kept, so an unreadable sibling stays
+/// replaceable exactly as before the keep rule existed, rather than stranding a
+/// stale entry beside the installing binary's. That is deliberately stricter
+/// than [`crate::platform::paths::pin_is_repairable`], which leaves such a pin
+/// alone because repair is a rewrite nobody asked for.
 pub(crate) fn auto_install_keeps(exe: &str) -> bool {
-    !crate::platform::paths::pin_is_repairable(exe)
+    crate::platform::paths::is_live_durable_install(std::path::Path::new(exe))
 }
 
 /// The live, durable deck entry an [`InstallMode::Automatic`] install keeps in
@@ -1366,6 +1373,48 @@ fn process_label() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Scenario: an automatic install keeps another install's entry only when
+    /// that install is positively live and durable. A missing pin, a
+    /// non-executable file, cargo build output, a relative pin and a pin whose
+    /// existence cannot be read all stay replaceable (PRD #1487 review: fail
+    /// safe toward replacing).
+    #[cfg(unix)]
+    #[test]
+    fn auto_install_keeps_only_a_positively_live_durable_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let root = dir.path();
+        let exe = |path: &Path, mode: u32| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let live = exe(&root.join("install/bin/dot-agent-deck"), 0o755);
+        assert!(auto_install_keeps(&live));
+        assert!(!auto_install_keeps(
+            &root.join("gone/dot-agent-deck").to_string_lossy()
+        ));
+        let not_exec = exe(&root.join("plain/dot-agent-deck"), 0o644);
+        assert!(!auto_install_keeps(&not_exec));
+        let built = exe(&root.join("target/debug/dot-agent-deck"), 0o755);
+        assert!(!auto_install_keeps(&built));
+        assert!(!auto_install_keeps("dot-agent-deck"));
+
+        // Unreadable: a directory with no search permission makes the pin's
+        // existence undeterminable. (Skipped where permissions do not bind,
+        // e.g. as root.)
+        let locked = root.join("locked");
+        let hidden = exe(&locked.join("dot-agent-deck"), 0o755);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let undeterminable = Path::new(&hidden).try_exists().is_err();
+        let kept = auto_install_keeps(&hidden);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if undeterminable {
+            assert!(!kept, "a pin that cannot be stat'ed must stay replaceable");
+        }
+    }
 
     #[cfg(unix)]
     fn config_fingerprint(path: &Path) -> (Vec<u8>, u64, i64, i64) {

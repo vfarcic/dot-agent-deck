@@ -14,6 +14,7 @@
 //! own port trait in [`crate::daemon_upgrade`].
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -26,6 +27,33 @@ use crate::remote::{RemoteEntry, SshError, SshExecutor, SshTarget};
 /// full capability list and a running-agents summary is a few KiB; anything
 /// near this is not a reply this build wrote.
 pub const REMOTE_DAEMON_REPLY_CAP: usize = 256 * 1024;
+
+/// What one plumbing command may spend before the remote binary has anything
+/// to say: ssh's own connect phase (the upgrade executor's `ConnectTimeout`),
+/// then the remote binary starting and doing its own bounded handshake with
+/// the daemon there.
+const PLUMBING_START_ALLOWANCE: Duration =
+    Duration::from_secs(crate::daemon_upgrade::UPGRADE_SSH_CONNECT_TIMEOUT + 15);
+
+/// Laptop-side wall-clock bound on one `daemon probe --json` (PRD #1487 audit
+/// A1). The remote side is a single bounded `Hello`, so nothing but the start
+/// allowance is owed.
+pub const REMOTE_PROBE_DEADLINE: Duration = PLUMBING_START_ALLOWANCE;
+
+/// Laptop-side wall-clock bound on one `daemon restart-installed --json`: the
+/// start allowance plus the whole restart round trip the remote client itself
+/// allows ([`crate::daemon_client::RESTART_REQUEST_TIMEOUT`]), which already
+/// covers the daemon checking the installed build
+/// ([`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`]). The drain happens after
+/// the daemon has answered, so it costs this command nothing.
+pub const REMOTE_RESTART_DEADLINE: Duration =
+    PLUMBING_START_ALLOWANCE.saturating_add(crate::daemon_client::RESTART_REQUEST_TIMEOUT);
+
+// The restart round trip must leave room for the check inside it.
+const _: () = assert!(
+    crate::daemon_client::RESTART_REQUEST_TIMEOUT.as_secs()
+        > crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_secs()
+);
 
 /// The exit code clap uses for a usage error — what a deck binary that predates
 /// a plumbing subcommand exits with when asked to run it.
@@ -59,6 +87,8 @@ pub struct SshDaemonPort<E: SshExecutor> {
     executor: E,
     target: SshTarget,
     binary: RefCell<String>,
+    probe_deadline: Duration,
+    restart_deadline: Duration,
 }
 
 impl<E: SshExecutor> SshDaemonPort<E> {
@@ -67,7 +97,17 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             executor,
             target,
             binary: RefCell::new(binary.into()),
+            probe_deadline: REMOTE_PROBE_DEADLINE,
+            restart_deadline: REMOTE_RESTART_DEADLINE,
         }
+    }
+
+    /// Bound each probe and each restart request by these wall-clock deadlines
+    /// instead of [`REMOTE_PROBE_DEADLINE`] / [`REMOTE_RESTART_DEADLINE`].
+    pub fn with_deadlines(mut self, probe: Duration, restart: Duration) -> Self {
+        self.probe_deadline = probe;
+        self.restart_deadline = restart;
+        self
     }
 
     /// The port for a deck-list row: its ssh target (jump host included) and
@@ -94,7 +134,7 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// `daemon probe --json` on the remote: whether a daemon runs at that
     /// machine's endpoint, and its `Hello` reply. Never starts one.
     pub fn probe(&self) -> Result<DaemonProbe, RemoteDaemonError> {
-        self.run_json("daemon probe --json")
+        self.run_json("daemon probe --json", self.probe_deadline)
     }
 
     /// `daemon restart-installed --json` on the remote: ask that machine's
@@ -115,19 +155,40 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             args.push_str(" --confirm-hex ");
             args.push_str(&encode_stop_set_hex(set));
         }
-        self.run_json(&args)
+        self.run_json(&args, self.restart_deadline)
     }
 
     /// Run `<binary> <args>` and parse the last non-empty stdout line as `T`.
-    fn run_json<T: DeserializeOwned>(&self, args: &str) -> Result<T, RemoteDaemonError> {
+    ///
+    /// Bounded however the executor was built (audit A1): each stream is
+    /// capped at [`REMOTE_DAEMON_REPLY_CAP`] while it drains and the session is
+    /// killed at `deadline`, through [`SshExecutor::run_capped_within`] — so a
+    /// remote that streams without end, or never finishes, costs a bounded
+    /// amount of memory and time even on the keepalive-only upgrade executor.
+    fn run_json<T: DeserializeOwned>(
+        &self,
+        args: &str,
+        deadline: Duration,
+    ) -> Result<T, RemoteDaemonError> {
         // The binary is a `RemoteBinaryPath` or the `~/.local/bin` constant,
         // both free of shell metacharacters, and left unquoted so the remote
         // shell expands `~` (see `RemoteEntry::remote_binary`).
         let command = format!("{} {args}", self.binary.borrow());
-        let capped = self
-            .executor
-            .run_capped(&self.target, &command, REMOTE_DAEMON_REPLY_CAP)?;
+        let capped = self.executor.run_capped_within(
+            &self.target,
+            &command,
+            REMOTE_DAEMON_REPLY_CAP,
+            deadline,
+        )?;
         let output = capped.output;
+        // A stream that reached the cap is not a reply this build wrote,
+        // whatever the exit status — and a remote that kept writing past it
+        // usually dies of the closed pipe, so its status says nothing useful.
+        if capped.truncated {
+            return Err(RemoteDaemonError::Malformed(format!(
+                "more than {REMOTE_DAEMON_REPLY_CAP} bytes"
+            )));
+        }
         // Remote-controlled text: scrubbed before it can reach a terminal.
         let stderr = crate::remote::scrub_remote_text(output.stderr.trim());
         if output.status == CLAP_USAGE_EXIT {
@@ -138,11 +199,6 @@ impl<E: SshExecutor> SshDaemonPort<E> {
                 status: output.status,
                 stderr,
             });
-        }
-        if capped.truncated {
-            return Err(RemoteDaemonError::Malformed(format!(
-                "more than {REMOTE_DAEMON_REPLY_CAP} bytes"
-            )));
         }
         let line = output
             .stdout
@@ -262,5 +318,132 @@ mod tests {
             )
         );
         assert!(!commands[0].contains(';') && !commands[0].contains('\''));
+    }
+
+    /// PRD #1487 audit A1: the production executor shape — the upgrade path's
+    /// keepalive-only [`crate::daemon_upgrade::upgrade_ssh_executor`], which
+    /// imposes no wall-clock kill of its own — with `ssh` swapped for a stand-in
+    /// that behaves like a hostile or broken remote. Each stand-in `exec`s one
+    /// process, as `ssh` itself is one process.
+    #[cfg(unix)]
+    mod production_executor_bounds {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        const DEADLINE: Duration = Duration::from_secs(2);
+        /// Far above `DEADLINE`, far below "forever": an unbounded run fails
+        /// the test instead of hanging the tier.
+        const MUST_RETURN_WITHIN: Duration = Duration::from_secs(30);
+
+        fn port_running(
+            dir: &std::path::Path,
+            body: &str,
+        ) -> SshDaemonPort<crate::remote::SystemSshExecutor> {
+            let script = dir.join("ssh");
+            crate::test_isolation::write_script(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            SshDaemonPort::new(
+                crate::daemon_upgrade::upgrade_ssh_executor().with_program(&script),
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            )
+            .with_deadlines(DEADLINE, DEADLINE)
+        }
+
+        /// A flood is stopped at the cap: the drainer closes the pipe, the
+        /// stand-in dies of it, and the reply is refused as over the cap —
+        /// long before the deadline.
+        fn assert_refused_at_cap<T: std::fmt::Debug>(
+            started: Instant,
+            result: Result<T, RemoteDaemonError>,
+        ) {
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < MUST_RETURN_WITHIN,
+                "the command was not bounded: {elapsed:?}"
+            );
+            match result {
+                Err(RemoteDaemonError::Malformed(why)) => assert!(
+                    why.contains(&format!("more than {REMOTE_DAEMON_REPLY_CAP} bytes")),
+                    "unexpected reason: {why}"
+                ),
+                other => panic!("expected the cap to refuse the flood, got {other:?}"),
+            }
+        }
+
+        fn assert_stopped_at_deadline<T: std::fmt::Debug>(
+            started: Instant,
+            result: Result<T, RemoteDaemonError>,
+        ) {
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < MUST_RETURN_WITHIN,
+                "the command was not bounded: {elapsed:?}"
+            );
+            match result {
+                Err(RemoteDaemonError::Ssh(SshError::Other { detail, .. })) => assert!(
+                    detail.contains("did not finish within 2s"),
+                    "unexpected detail: {detail}"
+                ),
+                other => panic!("expected the deadline to stop the command, got {other:?}"),
+            }
+        }
+
+        /// Scenario: the remote command prints without end on stdout. The
+        /// drainer stops at the reply cap and closes the pipe, so the stream is
+        /// never accumulated, and the reply is refused as over the cap.
+        #[test]
+        fn an_endless_stdout_reply_is_capped_and_stopped() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let p = port_running(dir.path(), "exec yes");
+            let started = Instant::now();
+            assert_refused_at_cap(started, p.probe());
+        }
+
+        /// Scenario: the same flood on stderr, which `Command::output()` would
+        /// have collected for as long as the remote kept writing.
+        #[test]
+        fn an_endless_stderr_reply_is_capped_and_stopped() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let p = port_running(dir.path(), "exec yes >&2");
+            let started = Instant::now();
+            assert_refused_at_cap(started, p.restart_installed(None, None));
+        }
+
+        /// Scenario: a remote command that never finishes and prints nothing,
+        /// over a transport that stays alive — keepalives cannot see it.
+        #[test]
+        fn a_remote_command_that_never_finishes_is_stopped() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let p = port_running(dir.path(), "exec sleep 600");
+            let started = Instant::now();
+            assert_stopped_at_deadline(started, p.probe());
+            let started = Instant::now();
+            assert_stopped_at_deadline(started, p.restart_installed(Some("0.46.0"), None));
+        }
+
+        /// Scenario: a reply that fits is still read and parsed through the
+        /// bounded path.
+        #[test]
+        fn a_well_formed_reply_still_parses() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let line = serde_json::to_string(&DaemonProbe {
+                running: false,
+                hello: None,
+            })
+            .unwrap();
+            let p = port_running(dir.path(), &format!("printf '%s\\n' '{line}'"));
+            assert!(!p.probe().unwrap().running);
+        }
+    }
+
+    #[test]
+    fn the_restart_deadline_leaves_room_for_the_whole_restart_round_trip() {
+        assert!(REMOTE_RESTART_DEADLINE > crate::daemon_client::RESTART_REQUEST_TIMEOUT);
+        assert!(REMOTE_RESTART_DEADLINE > REMOTE_PROBE_DEADLINE);
+        assert!(
+            REMOTE_PROBE_DEADLINE.as_secs() > crate::daemon_upgrade::UPGRADE_SSH_CONNECT_TIMEOUT
+        );
     }
 }
