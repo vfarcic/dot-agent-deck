@@ -21,11 +21,14 @@ set -uo pipefail
 #   AUTHOR_TRUSTED=yes|no    whether the issue was opened by an owner, member or collaborator
 #   REASON=...               why SOURCE is `none`, or why PRD_CONTENT is `no`
 #
+# An issue PRD must be OPEN: a closed one is finished or abandoned work.
+#
 # An issue body "carries PRD content" when, outside fenced code blocks, it has
 # a heading starting with "Problem", a heading starting with "Solution", and a
 # heading starting with "Milestones" with at least one task-list item
 # (`- [ ] …`, `- [x] …`, `- [~] …`, `- [!] …`) before the next heading of the
-# same or a higher level. A one-line issue, or the old stub that only pointed
+# same or a higher level. Headings and items indented four spaces or more are
+# indented code, not structure. A one-line issue, or the old stub that only pointed
 # at a `prds/` file, has none of that and is refused.
 #
 # An issue PRD also has to have been opened by someone with write access
@@ -43,25 +46,45 @@ flatten() { # strip control characters, so a value can never end its own record
 
 # Judge a body on stdin. Prints PRD_CONTENT=… and, when it is `no`, REASON=….
 check_body() {
+  # A CommonMark subset, enough to tell a plan from quoted text: a heading or a
+  # top-level task-list item counts only when indented by at most three spaces
+  # (four or more, or a tab, is an indented code block), and a fenced code block
+  # ends only at a fence of the same character that is at least as long as the
+  # one that opened it.
   awk '
-    BEGIN { fence = 0; problem = 0; solution = 0; milestones = 0; inm = 0; mlevel = 0; boxes = 0 }
-    /^ *(```|~~~)/ { fence = !fence; next }
-    fence { next }
-    /^ *#+[ \t]/ {
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    BEGIN { fence = ""; problem = 0; solution = 0; milestones = 0; inm = 0; mlevel = 0; boxes = 0 }
+    {
       line = $0
-      sub(/^ */, "", line)
-      match(line, /^#+/)
-      level = RLENGTH
-      text = substr(line, level + 1)
-      sub(/^[ \t]+/, "", text)
-      text = tolower(text)
-      if (inm && level <= mlevel) inm = 0
-      if (text ~ /^problem/) problem = 1
-      if (text ~ /^solution/) solution = 1
-      if (text ~ /^milestones/) { milestones = 1; inm = 1; mlevel = level }
-      next
+      if (line ~ /^\t/ || indent(line) > 3) { if (fence == "") next }
+      body = line
+      sub(/^ */, "", body)
+      if (match(body, /^(```+|~~~+)/)) {
+        run = substr(body, 1, RLENGTH)
+        if (fence == "") {
+          fence = run
+          next
+        }
+        rest = substr(body, RLENGTH + 1)
+        if (substr(run, 1, 1) == substr(fence, 1, 1) && length(run) >= length(fence) && rest ~ /^[ \t]*$/ && indent(line) <= 3) fence = ""
+        next
+      }
+      if (fence != "") next
+      if (body ~ /^#+[ \t]/) {
+        match(body, /^#+/)
+        level = RLENGTH
+        if (level > 6) next
+        text = substr(body, level + 1)
+        sub(/^[ \t]+/, "", text)
+        text = tolower(text)
+        if (inm && level <= mlevel) inm = 0
+        if (text ~ /^problem/) problem = 1
+        if (text ~ /^solution/) solution = 1
+        if (text ~ /^milestones/) { milestones = 1; inm = 1; mlevel = level }
+        next
+      }
+      if (inm && body ~ /^[-*+] \[[ xX~!]\][ \t]+[^ \t]/) boxes++
     }
-    inm && /^[ \t]*[-*+] \[[ xX~!]\][ \t]+[^ \t]/ { boxes++ }
     END {
       missing = ""
       if (!problem) missing = missing " Problem"
@@ -162,6 +185,11 @@ echo "AUTHOR_TRUSTED=$trusted"
 if [ "$content" != yes ]; then
   echo "SOURCE=none"
   echo "REASON=$(flatten "issue #${n} carries no PRD content: ${why}")"
+  exit 0
+fi
+if [ "$state" != OPEN ]; then
+  echo "SOURCE=none"
+  echo "REASON=issue #${n} is closed, so it is not a PRD to work on (reopen it first)"
   exit 0
 fi
 if [ "$trusted" != yes ]; then

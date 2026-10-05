@@ -73,20 +73,21 @@ The issue title is the PRD's title, prefixed `PRD: ` as the existing PRD issues 
 
 ## Editing the body
 
-Edit the newest body, and change only what you came to change:
+Edit the newest body, and change only what you came to change. Fetch it with its timestamp **immediately before** editing — not a copy fetched at the start of the session:
 
 ```bash
 gh issue view <n> --json body --jq .body > .dot-agent-deck/prd-<n>-body.md
+gh issue view <n> --json updatedAt --jq .updatedAt     # note this value
 ```
 
-Read it **immediately before** editing — not a copy fetched at the start of the session — then change that file with your file-editing tool, and write it back:
+Change that file with your file-editing tool. Then, **just before writing it back, read `updatedAt` again**: if it moved, someone else wrote to the issue meanwhile — discard your copy, fetch again, and re-apply your change. A comment moves it too, so this sometimes repeats work that needed no repeating; that is the cheaper error. Only when it has not moved:
 
 ```bash
 gh issue edit <n> --body-file .dot-agent-deck/prd-<n>-body.md
 gh issue view <n> --json body --jq .body | diff - .dot-agent-deck/prd-<n>-body.md && rm .dot-agent-deck/prd-<n>-body.md
 ```
 
-The re-read narrows the window in which another edit can be lost; it does not close it, which is why the record goes in comments. Never write the body with `--body "…"` or a heredoc: PRD text is full of backticks and `$`, which the shell rewrites before `gh` sees them. `.dot-agent-deck/` is ignored by git, so the scratch file never reaches a commit.
+**This narrows the race and does not close it.** GitHub offers no conditional write for an issue body, so an edit landing between the last `updatedAt` read and `gh issue edit` is still lost, silently, and the read-back cannot tell — it confirms only that the body is now yours. That residual window is seconds wide where an unchecked fetch-edit-write is as wide as the editing session, and it is why everything append-only goes in comments: keep body edits to the plan itself, and rare. Never write the body with `--body "…"` or a heredoc: PRD text is full of backticks and `$`, which the shell rewrites before `gh` sees them. `.dot-agent-deck/` is ignored by git, so the scratch file never reaches a commit.
 
 ## Comments
 

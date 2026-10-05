@@ -4,10 +4,10 @@ set -euo pipefail
 # Create a git worktree for PRD work with a descriptive branch name.
 # Usage: create.sh <prd-number> [prd-title]
 #
-# If prd-title is not provided, the script reads it from prds/<number>-*.md
-# when that file exists, and from the PRD's GitHub issue otherwise (issue
-# #1591: a new PRD lives in its issue and has no file). Either way it asks
-# ../prd-start/prd-source.sh, the one place that decides where a PRD lives.
+# The script locates the PRD through ../prd-start/prd-source.sh, the one place
+# that decides where a PRD lives: prds/<number>-*.md when that file exists, and
+# the PRD's GitHub issue otherwise (issue #1591: a new PRD lives in its issue
+# and has no file). If prd-title is not provided, it is taken from there.
 # This script validates everything and creates the worktree, or reports errors.
 
 if [ $# -lt 1 ]; then
@@ -19,20 +19,23 @@ fi
 prd_number="$1"
 prd_title="${2:-}"
 
-# --- Resolve PRD title if not provided ---
+# --- Locate the PRD, and resolve its title if not provided ---
+#
+# Always looked up, even with a title supplied, so that an issue number that
+# cannot be read stops here instead of getting a worktree, and PRD_SOURCE is
+# reported either way.
 
-prd_source="unknown"
+located=$(bash "$(dirname "$0")/../prd-start/prd-source.sh" "$prd_number" || true)
+prd_source=$(printf '%s\n' "$located" | sed -n 's/^SOURCE=//p' | head -1)
+found_title=$(printf '%s\n' "$located" | sed -n 's/^TITLE=//p' | head -1)
+if [ -z "$found_title" ]; then
+  echo "ERROR=true"
+  echo "MESSAGE=No PRD file matches prds/${prd_number}-*.md and issue #${prd_number} could not be read: $(printf '%s\n' "$located" | sed -n 's/^REASON=//p' | head -1)"
+  exit 0
+fi
 if [ -z "$prd_title" ]; then
-  located=$(bash "$(dirname "$0")/../prd-start/prd-source.sh" "$prd_number" || true)
-  prd_source=$(printf '%s\n' "$located" | sed -n 's/^SOURCE=//p' | head -1)
-  prd_title=$(printf '%s\n' "$located" | sed -n 's/^TITLE=//p' | head -1)
-  if [ -z "$prd_title" ]; then
-    echo "ERROR=true"
-    echo "MESSAGE=No PRD file matches prds/${prd_number}-*.md and issue #${prd_number} could not be read: $(printf '%s\n' "$located" | sed -n 's/^REASON=//p' | head -1)"
-    exit 0
-  fi
   # An issue title carries the "PRD:" / "PRD #123:" prefix a file heading does.
-  prd_title=$(echo "$prd_title" | sed -E 's/^PRD *#?[0-9]* *[:\-] *//')
+  prd_title=$(echo "$found_title" | sed -E 's/^PRD *#?[0-9]* *[:\-] *//')
 fi
 
 # --- Generate branch name ---

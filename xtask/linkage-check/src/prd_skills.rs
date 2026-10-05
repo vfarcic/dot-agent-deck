@@ -140,12 +140,22 @@ impl Sandbox {
     }
 
     /// The issue `gh api` returns, as the REST API shapes it.
-    fn with_issue(mut self, title: &str, body: &str, association: &str) -> Self {
+    fn with_issue(self, title: &str, body: &str, association: &str) -> Self {
+        self.with_issue_in_state(title, body, association, "open")
+    }
+
+    fn with_issue_in_state(
+        mut self,
+        title: &str,
+        body: &str,
+        association: &str,
+        state: &str,
+    ) -> Self {
         let json = serde_json::json!({
             "number": 42,
             "title": title,
             "body": body,
-            "state": "open",
+            "state": state,
             "author_association": association,
         });
         let p = self.repo.parent().unwrap().join("issue.json");
@@ -493,6 +503,99 @@ fn prd_skills_014_worktree_prd_reports_an_unreadable_issue() {
     }
     let sb = Sandbox::new();
     let text = stdout(&sb.run(&create_sh(), &["42"], None));
+    assert_eq!(record(&text, "ERROR"), Some("true"), "{text}");
+    assert!(!sb.calls().contains("worktree add"), "{}", sb.calls());
+}
+
+#[test]
+fn prd_skills_018_a_fence_ends_only_at_a_matching_fence() {
+    if !tools_present() {
+        return;
+    }
+    const HEAD: &str = "## Problem\n\nx\n\n## Solution\n\ny\n\n## Milestones\n\n";
+    // A four-backtick fence quoting a three-backtick block: the inner ``` does
+    // not close it, so the checkbox after it is still quoted.
+    let longer = format!("{HEAD}````\n```\n- [ ] quoted\n````\n");
+    let (ok, out) = check_body(&longer);
+    assert!(
+        !ok,
+        "a shorter inner fence must not close the outer one:\n{out}"
+    );
+
+    // A ~~~ line does not close a ``` fence.
+    let mixed = format!("{HEAD}```\n~~~\n- [ ] quoted\n```\n");
+    let (ok, out) = check_body(&mixed);
+    assert!(
+        !ok,
+        "a fence of the other character must not close it:\n{out}"
+    );
+
+    // Headings inside a fence opened before them are quoted too.
+    let quoted_headings = "```\n## Problem\n## Solution\n## Milestones\n- [ ] quoted\n```\n";
+    let (ok, out) = check_body(quoted_headings);
+    assert!(!ok, "headings inside a fence are not structure:\n{out}");
+
+    // ...and a real fence that closes properly leaves the plan after it intact.
+    let closed = format!("```\n- [ ] quoted\n```\n\n{HEAD}- [ ] real\n");
+    let (ok, out) = check_body(&closed);
+    assert!(ok, "a closed fence must not hide what follows it:\n{out}");
+}
+
+#[test]
+fn prd_skills_019_indented_code_is_not_structure() {
+    if !tools_present() {
+        return;
+    }
+    let indented = "    ## Problem\n    ## Solution\n    ## Milestones\n    - [ ] quoted\n";
+    let (ok, out) = check_body(indented);
+    assert!(!ok, "four-space-indented text is a code block:\n{out}");
+
+    let tabbed = "## Problem\n\nx\n\n## Solution\n\ny\n\n## Milestones\n\n\t- [ ] quoted\n";
+    let (ok, out) = check_body(tabbed);
+    assert!(!ok, "a tab-indented checkbox is a code block:\n{out}");
+
+    let shallow = "   ## Problem\n\nx\n\n## Solution\n\ny\n\n## Milestones\n\n   - [ ] real\n";
+    let (ok, out) = check_body(shallow);
+    assert!(
+        ok,
+        "up to three spaces of indent is still structure:\n{out}"
+    );
+}
+
+#[test]
+fn prd_skills_020_a_closed_issue_is_not_a_prd_to_work_on() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new().with_issue_in_state("PRD: done", PRD_BODY, "OWNER", "closed");
+    let text = stdout(&sb.run(&prd_source(), &["42"], None));
+    assert_eq!(record(&text, "STATE"), Some("CLOSED"), "{text}");
+    assert_eq!(record(&text, "SOURCE"), Some("none"), "{text}");
+    assert!(
+        record(&text, "REASON").is_some_and(|r| r.contains("closed")),
+        "{text}"
+    );
+}
+
+#[test]
+fn prd_skills_021_worktree_prd_looks_the_prd_up_even_with_a_title_supplied() {
+    if !tools_present() {
+        return;
+    }
+    // Readable issue: the supplied title names the branch, and the source is reported.
+    let sb = Sandbox::new().with_issue("PRD: Close agents", PRD_BODY, "OWNER");
+    let text = stdout(&sb.run(&create_sh(), &["42", "Short Name"], None));
+    assert_eq!(record(&text, "SUCCESS"), Some("true"), "{text}");
+    assert_eq!(
+        record(&text, "BRANCH_NAME"),
+        Some("prd-42-short-name"),
+        "{text}"
+    );
+    assert_eq!(record(&text, "PRD_SOURCE"), Some("issue"), "{text}");
+
+    // Unreadable issue and no file: a supplied title does not get a worktree.
+    let sb = Sandbox::new();
+    let text = stdout(&sb.run(&create_sh(), &["42", "Short Name"], None));
     assert_eq!(record(&text, "ERROR"), Some("true"), "{text}");
     assert!(!sb.calls().contains("worktree add"), "{}", sb.calls());
 }
