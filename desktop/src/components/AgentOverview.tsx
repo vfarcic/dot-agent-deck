@@ -653,6 +653,37 @@ const DASHBOARD_SCROLL_OVERLAP = 48;
 /** The least a spoken scroll moves, for a window too short to measure a screen from. */
 const DASHBOARD_SCROLL_MIN = 120;
 
+/** How far an arrow key moves the dashboard when the keyboard is forwarded to it, as a browser's arrow step. */
+const DASHBOARD_ARROW_STEP = 40;
+
+/**
+ * Where keys stay with what they were typed into rather than scroll the
+ * dashboard: fields, terminals, dialogs, lists and menus, which use the same
+ * keys themselves, and the dashboard's own region, which scrolls natively
+ * once it has focus.
+ */
+const DASHBOARD_KEYS_STAY = "input, textarea, select, [contenteditable='true'], .xterm, [role='dialog'], [role='alertdialog'], [role='listbox'], [role='menu'], [role='menubar'], [role='slider'], .overview-body";
+
+/**
+ * Issue #1492 — the scroll a key asks of the dashboard while focus is outside
+ * its region, as the window took those keys before the dashboard scrolled in
+ * a region of its own: Page Up/Down, Home and End wherever they are not
+ * someone else's, and the arrows and Space only with nothing focused, since a
+ * focused control may use them.
+ */
+function dashboardKeyScroll(key: string, shift: boolean, nothingFocused: boolean): DashboardScroll | number | undefined {
+  if (shift && key !== " ") return undefined;
+  if (key === "PageDown") return "down";
+  if (key === "PageUp") return "up";
+  if (key === "Home") return "top";
+  if (key === "End") return "bottom";
+  if (!nothingFocused) return undefined;
+  if (key === " ") return shift ? "up" : "down";
+  if (key === "ArrowDown") return DASHBOARD_ARROW_STEP;
+  if (key === "ArrowUp") return -DASHBOARD_ARROW_STEP;
+  return undefined;
+}
+
 /** Already at the bottom, for "scroll down". */
 export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
 /** Already at the top, for "scroll up". */
@@ -1114,6 +1145,25 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const rowNumbers = useMemo(() => (
     voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined
   ), [numberedAgents, voiceOn]);
+  /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
+     outside the dashboard's region (see `dashboardKeyScroll`). */
+  useEffect(() => {
+    if (!rowsShown || confirm) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target;
+      const nothingFocused = !(target instanceof Element) || target === document.body || target === document.documentElement;
+      if (!nothingFocused && target.closest(DASHBOARD_KEYS_STAY)) return;
+      const scroll = dashboardKeyScroll(event.key, event.shiftKey, nothingFocused);
+      const region = bodyRef.current;
+      if (scroll === undefined || !region) return;
+      event.preventDefault();
+      if (typeof scroll === "number") region.scrollBy({ top: scroll });
+      else scrollDashboard(region, scroll);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [confirm, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
      digit, and a field or terminal keeps its own. */
@@ -1282,7 +1332,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           </div>
         )}
 
-        <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef}>
+        {/* Focusable (issue #1492): it is the dashboard's scroll region, and a region the keyboard cannot reach cannot be scrolled from it. */}
+        <section className="overview-body" aria-label="Agent dashboard" ref={bodyRef} tabIndex={0}>
           {newAgentNotice && (
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>

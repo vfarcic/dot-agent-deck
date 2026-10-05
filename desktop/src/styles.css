@@ -1261,6 +1261,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    clips them; otherwise they sit at their static place below the window and
    make the window scroll as well. */
 .overview-screen .overview-body { position: relative; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+/* Focusable so the keyboard can scroll it; the ring sits inside the region, which would clip one drawn outside. */
+.overview-screen .overview-body:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .overview-body::-webkit-scrollbar { width: 12px; }
 .overview-body::-webkit-scrollbar-track { background: var(--canvas); }
 .overview-body::-webkit-scrollbar-thumb { min-height: 40px; border: 3px solid var(--canvas); border-radius: 6px; background: var(--line-strong); }

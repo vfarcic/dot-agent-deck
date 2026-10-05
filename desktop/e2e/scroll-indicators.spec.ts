@@ -73,4 +73,54 @@ test.describe("scroll indicators", () => {
     const tall = await terminalScrollbar(page);
     expect(tall.opacity).toBe(0);
   });
+
+  /** Scenario: the dashboard scrolls from the keyboard as the window did: Page Down, End and Page Up with nothing focused or with a top-bar button focused, and the arrow keys once the dashboard itself has focus. Keys pressed inside the Settings sheet or typed into the New agent dialog's Filter field leave it where it is. */
+  test("the dashboard scrolls from the keyboard", async ({ page }) => {
+    await openDashboard(page, 420);
+    const region = page.locator(".overview-body");
+    const top = () => region.evaluate((element) => element.scrollTop);
+    const room = await region.evaluate((element) => element.scrollHeight - element.clientHeight);
+    expect(room).toBeGreaterThan(0);
+
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("PageDown");
+    await expect.poll(top).toBeGreaterThan(0);
+    await page.keyboard.press("End");
+    await expect.poll(top).toBeGreaterThanOrEqual(room - 1);
+    await page.keyboard.press("Home");
+    await expect.poll(top).toBe(0);
+
+    await page.getByTestId("overview-refresh").focus();
+    await page.keyboard.press("PageDown");
+    await expect.poll(top).toBeGreaterThan(0);
+    await page.keyboard.press("PageUp");
+    await expect.poll(top).toBe(0);
+
+    await region.focus();
+    await page.keyboard.press("ArrowDown");
+    await expect.poll(top).toBeGreaterThan(0);
+
+    // Settings leaves the dashboard's rows mounted, so this is the stand-down
+    // for keys pressed inside a dialog rather than the handler being absent.
+    await page.getByTestId("open-settings").click();
+    await page.getByRole("button", { name: "Close settings" }).focus();
+    await page.waitForTimeout(500);
+    const behindSettings = await top();
+    await page.keyboard.press("End");
+    await page.keyboard.press("PageDown");
+    await page.waitForTimeout(500);
+    expect(await top()).toBe(behindSettings);
+    await page.getByRole("button", { name: "Close settings" }).click();
+
+    await page.getByTestId("overview-new-agent").click();
+    await page.getByTestId("new-agent-deck-list").getByRole("option").first().click();
+    await page.getByTestId("new-agent-filter").focus();
+    // Measured once Chromium's animated arrow-key scroll above has settled.
+    await page.waitForTimeout(500);
+    const before = await top();
+    await page.keyboard.press("End");
+    await page.keyboard.press("PageDown");
+    await page.waitForTimeout(500);
+    expect(await top()).toBe(before);
+  });
 });
