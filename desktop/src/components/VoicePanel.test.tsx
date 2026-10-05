@@ -237,6 +237,7 @@ describe("VoicePanel", () => {
     // Issue #1495: the start of each agent's last prompt and its directory's
     // NAME now go, so the negation is narrowed to what still does not.
     expect(disclosure).toHaveTextContent("the start of the last prompt it was sent (at most 80 characters)");
+    expect(disclosure).toHaveTextContent("the name of its working directory (with the name of the folder above it when two agents' directories share a name)");
     expect(disclosure).toHaveTextContent("This app adds no field of its own for a full filesystem path, a daemon or agent id, more of a prompt than that start, or a tool's arguments");
     expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
     expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
