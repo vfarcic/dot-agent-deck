@@ -457,16 +457,33 @@ fn directory_labels(agents: &[DesktopAgent]) -> Vec<Option<String>> {
             let shared = agents.iter().any(|other| {
                 cwd(other).is_some_and(|other| other != path && directory_name(other) == Some(name))
             });
-            let label = match path[..path.len() - name.len()]
+            let raw_name = name;
+            let name = shown(raw_name, FACT_CHARS)?;
+            let Some(parent) = path[..path.len() - raw_name.len()]
                 .trim_end_matches(['/', '\\'])
                 .rsplit(['/', '\\'])
                 .next()
                 .filter(|parent| shared && !parent.is_empty())
-            {
-                Some(parent) => format!("{parent}/{name}"),
-                None => name.to_string(),
+                .and_then(|parent| shown(parent, usize::MAX))
+            else {
+                return Some(name);
             };
-            shown(&label, FACT_CHARS)
+            // Cut from the START, at a word: the end of the parent and the
+            // name are what tell two such directories apart (Qodo on PR
+            // #1529), and `outcome::agent_facets` answers to the trailing
+            // words of a parent.
+            let room = FACT_CHARS.saturating_sub(name.chars().count() + 2);
+            Some(if parent.chars().count() <= room {
+                format!("{parent}/{name}")
+            } else {
+                let skip = parent.chars().count() - room;
+                let tail: String = parent.chars().skip(skip).collect();
+                let tail = tail
+                    .split_once(|c: char| !c.is_alphanumeric())
+                    .map_or(tail.as_str(), |(_, rest)| rest)
+                    .to_string();
+                format!("\u{2026}{tail}/{name}")
+            })
         })
         .collect()
 }
@@ -1316,6 +1333,46 @@ pub(crate) mod tests {
         assert_eq!(on_screen[3]["label"], "reviewer");
         assert_eq!(on_screen[4]["orchestration"], "docs-1502");
         assert_eq!(on_screen[4]["directory"], "handbook");
+    }
+
+    #[test]
+    fn voice_prompt_state_keeps_the_end_of_a_long_parent() {
+        // Two `api` directories under long parents that differ only at their
+        // END: cut from the start, each label keeps the name and the words
+        // that tell them apart, within the bound — and the resolver answers
+        // to the label as shown (Qodo on PR #1529).
+        let commands = commands();
+        let long = "a-very-long-organisation-prefix".repeat(4);
+        let mut one = dashboard_agent("1", Some("Atlas"), "codex");
+        one.cwd = Some(format!("/home/dev/{long}-payments/api"));
+        let mut two = dashboard_agent("2", Some("Boreas"), "codex");
+        two.cwd = Some(format!("/home/dev/{long}-billing/api"));
+        let agents = vec![one, two];
+        let transcript = Transcript::new("open the one in api");
+        let state = state(&request(&transcript, &commands, &agents));
+        let labels: Vec<String> = (0..2)
+            .map(|index| {
+                state["agents_on_screen"][index]["directory"]
+                    .as_str()
+                    .expect("a directory")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            labels[0].starts_with('\u{2026}') && labels[0].ends_with("-payments/api"),
+            "{labels:?}"
+        );
+        assert!(labels[1].ends_with("-billing/api"), "{labels:?}");
+        for label in &labels {
+            assert!(label.chars().count() <= FACT_CHARS, "{label}");
+        }
+        for (label, id) in labels.iter().zip(["1", "2"]) {
+            assert!(
+                matches!(crate::voice::outcome::resolve_agent_ref(label, &agents),
+                    crate::voice::outcome::AgentRefMatch::One { id: found, .. } if found == id),
+                "{label}"
+            );
+        }
     }
 
     #[test]

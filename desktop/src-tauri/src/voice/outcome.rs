@@ -1439,6 +1439,19 @@ fn resolve_param(
             .collect::<Vec<_>>()
             .join(" ")
     };
+    // What the transcript resolves to by itself, when it is a reference the
+    // words alone can settle: one with a recency word, or one that is nothing
+    // but the category ("the agent", "the one"). `None` for every other
+    // utterance, which is the model's to read.
+    let settled_by_the_words = |heard: &str| {
+        let (mut said, content) = reference_words(heard);
+        let by_recency = Recency::said(&mut said).is_some();
+        let bare_category = content.is_empty()
+            && said
+                .iter()
+                .any(|word| AGENT_CATEGORY_WORDS.contains(&word.as_str()));
+        (by_recency || bare_category).then(|| resolve_agent_ref_on(heard, agents, decks))
+    };
     // Whether the transcript names a fact of another agent that the agent
     // `id` lacks ([`excluded_by_another`]).
     let heard_against = |id: &str| {
@@ -1519,7 +1532,16 @@ fn resolve_param(
             // #1529): a word of it that another agent's names account for,
             // and this one's do not, rules this one out.
             AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
-            AgentRefMatch::One { id, label } => Ok(param(id, label)),
+            // Where the user's own words settle the reference without the
+            // model — "the newest agent", or a bare "the agent" with several
+            // here — they decide, whatever label the model answered with
+            // (Qodo on PR #1529): recency is the agent that started last or
+            // first, and a bare category is the numbered choice.
+            AgentRefMatch::One { id, label } => match settled_by_the_words(&heard_facts) {
+                Some(AgentRefMatch::One { id, label }) => Ok(param(id, label)),
+                Some(AgentRefMatch::Ambiguous(candidates)) => Err(Unmet::Ambiguous(candidates)),
+                _ => Ok(param(id, label)),
+            },
             AgentRefMatch::None => Err(Unmet::NoMatch),
             // Issue #1495 — the model's words tie, and the USER's may not: for
             // "show the reviewer in the PRD 1487 orchestration" the model was
@@ -4040,16 +4062,29 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
     // model is shown two agents whose directories share a name
     // (`prompt::state`), and so how it may answer. A whole name, so it counts
     // only when both words were said: the parent alone names nothing.
+    //
+    // And with only the parent's LAST words, down to one, because a long
+    // parent is shown cut from its start (`prompt::directory_labels`), and
+    // the model may answer with the words it was shown.
     if let Some(path) = agent.cwd.as_deref()
         && let Some(name) = directory_name(path)
     {
         let parent = path.trim().trim_end_matches(['/', '\\']);
         if let Some(parent) = directory_name(&parent[..parent.len() - name.len()]) {
             add(&format!("{parent}/{name}"));
+            let parent_words = word_sequence(parent);
+            for kept in 1..parent_words.len().min(PARENT_WORDS_KEPT + 1) {
+                let tail = parent_words[parent_words.len() - kept..].join(" ");
+                add(&format!("{tail}/{name}"));
+            }
         }
     }
     facets
 }
+
+/// The most trailing words of a directory's parent [`agent_facets`] registers
+/// as a shortened `parent/name` form.
+const PARENT_WORDS_KEPT: usize = 8;
 
 /// An agent type the way people say it, first the way the registry labels it
 /// — `claude_code` is "Claude Code", or just "Claude". Empty for a type with no
@@ -7698,6 +7733,42 @@ mod tests {
         let outcome = run(&resolver, Screen::Overview, &with_open, said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{outcome:?}"
+        );
+
+        // Where the user's words settle it alone, they decide over the
+        // model's label: the newest agent is Vega whatever the model named,
+        // and a bare "open the agent" with several here is the choice.
+        let said = "open the newest agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+            "{outcome:?}"
+        );
+        let said = "open the agent";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Juno"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::ParamAmbiguous { candidates, .. } if candidates.len() == agents.len()),
+            "{outcome:?}"
+        );
+        // A reference the words alone do not settle is still the model's:
+        // "show me the one fixing the scroll" answered as Juno opens Juno.
+        let said = "show me the one fixing the scroll";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Juno"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
             "{outcome:?}"
         );
 
