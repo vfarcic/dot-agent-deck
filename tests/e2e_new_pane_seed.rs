@@ -383,3 +383,90 @@ fn new_pane_015_form_has_no_agent_selector() {
         command_field_value(grid).ends_with('x')
     });
 }
+
+/// Scenario: Submit a distinctive shell command through the first TUI's New
+/// Agent form, observe its output, and detach without reopening the form while
+/// the daemon keeps the pane running.
+/// Attach an independent TUI with a different HOME and empty session file to
+/// that same daemon; its first New Agent form must offer the accepted command
+/// before the originating client's session can seed it by reopening its form.
+#[cfg(unix)]
+#[spec("prompt/new-pane/020")]
+#[test]
+fn new_pane_020_last_command_shared_with_independent_client() {
+    const COMMAND: &str = "sh -c 'echo READY1540; cat'";
+    const PANE_NAME: &str = "Shared command pane";
+    let sessions = common::harness_tempdir().expect("independent client sessions");
+    let first_session = sessions.path().join("first-session.toml");
+    let second_session = sessions.path().join("second-session.toml");
+    let config = sessions.path().join("empty-config.toml");
+    std::fs::write(&config, "").expect("empty config with no default_command");
+    std::fs::write(&first_session, "").expect("empty first session");
+    std::fs::write(&second_session, "").expect("empty second session");
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[(
+            "DOT_AGENT_DECK_CONFIG",
+            config.to_str().expect("config path"),
+        )],
+    );
+    let client = |session: &std::path::Path| {
+        TuiDeck::builder()
+            .with_env(
+                "DOT_AGENT_DECK_SOCKET",
+                daemon.hook_socket.to_string_lossy(),
+            )
+            .with_env(
+                "DOT_AGENT_DECK_ATTACH_SOCKET",
+                daemon.attach_socket.to_string_lossy(),
+            )
+            .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
+            .with_env("DOT_AGENT_DECK_SESSION", session.to_string_lossy())
+            .launch_with_fixture("minimal")
+    };
+
+    let mut first = client(&first_session);
+    let initial = open_new_pane_form(&first);
+    assert_eq!(command_field_value(&initial), "", "Grid:\n{initial}");
+    first.send_keys(b"\r"); // Mode → Name
+    first.send_keys(PANE_NAME.as_bytes());
+    first.send_keys(b"\r"); // Name → Command
+    first.send_keys(COMMAND.as_bytes());
+    first.send_keys(b"\r"); // submit the plain New Agent form
+    first.wait_for_string("[Command Mode Ctrl+D]");
+    first.wait_for_string("READY1540"); // the accepted command visibly ran
+
+    // Detach without reopening: the originating client's saved command must
+    // not seed the daemon before the independent client's first form opens.
+    first.send_keys(b"\x04"); // command mode
+    first.send_keys(b"\x03");
+    first.wait_for_string("Quit dot-agent-deck?");
+    first.send_keys(b"\r"); // Detach (default), preserving the daemon and pane
+    assert_eq!(
+        first.wait_for_exit_within(std::time::Duration::from_secs(30)),
+        Some(true),
+        "the first client must detach cleanly"
+    );
+
+    // The first fixture remains alive so its running pane's cwd still exists.
+    // Neither its HOME nor its session file is available to the second TUI.
+    assert_eq!(
+        std::fs::read_to_string(&second_session).expect("read second session"),
+        "",
+        "the independent client's session must still be empty before launch"
+    );
+    let second = client(&second_session);
+    second.wait_for_string(PANE_NAME); // same daemon, with the surviving pane
+    second.send_keys(b"\x0e");
+    second.wait_for_string("Select Directory");
+    second.send_keys(b" ");
+    second.wait_for_string("Tab: switch");
+    let grid = second.snapshot_grid();
+    assert_eq!(
+        command_field_value(&grid),
+        COMMAND,
+        "an independent TUI with an empty session must pre-fill Command from the \
+         same daemon's last accepted New Agent form submission.\nGrid:\n{grid}"
+    );
+}

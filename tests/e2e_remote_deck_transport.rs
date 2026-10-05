@@ -522,6 +522,7 @@ fn start_stand_in(daemon: &DaemonProc, display_name: &str, pane_id: &str) {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -795,17 +796,40 @@ fn observe_002_a_remote_deck_is_reached_over_a_real_ssh_tunnel() {
         "the ssh child must still be running while the connection is held"
     );
     drop(connection);
-    // `process_running` reads `/proc` and treats a zombie as exited, so this
-    // cannot be satisfied by an unreaped child — which is half of what the
-    // assertion below is about.
+    // `process_running` treats a zombie as exited, so this observes the ssh
+    // child exiting and nothing more; the reap is checked separately below.
     common::wait_until(TEARDOWN_TIMEOUT, || {
         !common::process_running(ssh_pid as i32)
     });
     assert!(
         !common::process_running(ssh_pid as i32),
-        "`EndpointConnection`'s Drop must kill and reap the ssh child (pid \
-         {ssh_pid}); an app that leaks one per reconnect is the orphan this \
-         transport was built to avoid"
+        "`EndpointConnection`'s Drop must kill the ssh child (pid {ssh_pid}); \
+         an app that leaks one per reconnect is the orphan this transport was \
+         built to avoid"
+    );
+    // The ssh child is this test process's own child, and Drop reaps it before
+    // returning. `waitid` sees only this process's children, alive or zombie,
+    // so `ECHILD` shows the reap happened rather than just the exit, and an
+    // unrelated process that has since reused the pid cannot answer for it.
+    // `WNOWAIT` leaves a zombie unreaped, so the probe cannot do Drop's job.
+    // SAFETY: a zeroed `siginfo_t` is a valid out-parameter; WNOHANG|WNOWAIT
+    // neither blocks nor reaps.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let probe = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            ssh_pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    let reaped =
+        probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    assert!(
+        reaped,
+        "`EndpointConnection`'s Drop must also reap the ssh child (pid \
+         {ssh_pid}): it exited but is still a zombie, which every reconnect \
+         would leave behind"
     );
     assert!(
         !forwarded.exists(),

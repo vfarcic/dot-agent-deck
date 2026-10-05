@@ -1,5 +1,6 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
 
 /**
@@ -193,7 +194,42 @@ const evidence: EvidenceItem[] = [
   },
 ];
 
-const agents: AgentSession[] = [
+/**
+ * PRD #1541 — the agent identity a deck reports beside the binary: its type,
+ * whether it is mid-turn, and its prompt keys.
+ *
+ * The keys come from `prompt-keys.json`, which the desktop crate's
+ * `the_browser_fixture_prompt_keys_match_the_registry` pins to what a deck
+ * built from this tree serves, so the preview presses the real keys. Devin
+ * and an unrecognised binary get no keys, as from a real deck.
+ */
+export const FIXTURE_PROMPT_KEYS = PROMPT_KEYS_JSON as Partial<Record<AgentTypeId, PromptKeys>>;
+
+const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
+  claude: "claude_code",
+  opencode: "open_code",
+  codex: "codex",
+  pi: "pi",
+  devin: "devin",
+};
+
+export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
+  const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
+  const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
+  // What `agentTurn` makes of the daemon status each fixture status stands for.
+  const turn = status === "running" ? "working" : status === "waiting" ? "idle" : undefined;
+  return {
+    agentType,
+    ...(turn ? { turn } : {}),
+    ...(promptKeys ? { promptKeys } : {}),
+  };
+}
+
+function withAgentIdentity(agent: AgentSession): AgentSession {
+  return { ...agent, ...fixtureAgentIdentity(agent.cli, agent.status) };
+}
+
+const agents: AgentSession[] = ([
   {
     id: "planner",
     daemonId: FIXTURE_DAEMON_ID,
@@ -312,7 +348,7 @@ const agents: AgentSession[] = [
     handoffIds: [],
     artifacts: [],
   },
-];
+] satisfies AgentSession[]).map(withAgentIdentity);
 
 /** One agent in the crowded scenario, described only by what a daemon reports. */
 interface CrowdedSeed {
@@ -374,6 +410,7 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     role: seed.role,
     displayName: seed.displayName,
     cli: seed.cli,
+    ...fixtureAgentIdentity(seed.cli, seed.status),
     model: "Unavailable",
     status: seed.status,
     task: seed.lastUserPrompt
@@ -1059,6 +1096,14 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
    */
   readonly params?: readonly VoiceResolvedParamDto[];
   /**
+   * PRD #1541 — a typing-mode prompt command: dispatched only while typing
+   * mode is on, and never by the generic phrase match below. Outside the mode
+   * on the agent screen its phrases (less {@link FIXTURE_TYPING_STOP_PHRASES})
+   * are answered with {@link FIXTURE_TYPING_MODE_FIRST}, as `local_intercept`
+   * answers them.
+   */
+  readonly typingOnly?: true;
+  /**
    * Words this row is matched by as a PREFIX rather than by equality, with
    * everything after them becoming the row's `spoken_prefix` param.
    *
@@ -1173,7 +1218,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // (`voice::dictation::DICTATION_ON_PHRASES` and `DICTATION_OFF_PHRASES`)
     // matched by its whole-utterance rule ({@link fixtureSaidWhole}) ahead of
     // the opener row, as `local_intercept` checks them.
-    phrases: ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"],
+    phrases: [
+      "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
+      "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+    ],
     action: "dictation_on",
     invoke: "startDictation",
     screens: ["agent"],
@@ -1181,7 +1229,10 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Typing to the agent.",
   },
   {
-    phrases: ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"],
+    phrases: [
+      "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
+      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+    ],
     action: "dictation_off",
     invoke: "stopDictation",
     screens: ["agent"],
@@ -1206,6 +1257,38 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     screens: ["agent"],
     unavailableHint: "sending a prompt needs an agent's pane open — open one first",
     report: "Sent.",
+  },
+  {
+    // PRD #1541 — the typing-mode prompt commands. The phrases are
+    // `voice::dictation::INTERRUPT_PHRASES` followed by `TYPING_STOP_PHRASES`
+    // (interrupt's bare "stop" forms, live only in typing mode),
+    // `CLEAR_PROMPT_PHRASES` and `SCRATCH_PHRASES`; `fixture.test.ts` compares
+    // each row with Rust's lists.
+    phrases: ["interrupt", "interrupt it", "interrupt that", "stop", "stop it", "stop that"],
+    action: "interrupt_agent",
+    invoke: "interruptAgent",
+    screens: ["agent"],
+    unavailableHint: "interrupting an agent works in its pane, in typing mode",
+    report: "Interrupted the agent.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["clear the prompt", "clear prompt", "clear it", "clear all", "clear everything", "delete everything"],
+    action: "clear_prompt",
+    invoke: "clearAgentPrompt",
+    screens: ["agent"],
+    unavailableHint: "clearing a prompt works in an agent's pane, in typing mode",
+    report: "Cleared the prompt.",
+    typingOnly: true,
+  },
+  {
+    phrases: ["scratch that", "scratch it", "scratch the last part", "scratch the last sentence", "scratch the last prompt", "delete that", "undo that"],
+    action: "scratch_that",
+    invoke: "scratchLastDictation",
+    screens: ["agent"],
+    unavailableHint: "scratching dictated words works in an agent's pane, in typing mode",
+    report: "Scratched the last dictation.",
+    typingOnly: true,
   },
   {
     // PR #1451 round 3, change 5 — the New agent browser's Filter box.
@@ -1345,7 +1428,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      whole. The same rule here, over this module's own rows, in
      `dictation_intercept`'s order: the biggest stop first. */
   if (dictating) {
-    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt"]);
+    const reserved = fixtureReserved(utterance, ["voice_off", "dictation_off", "submit_prompt", "interrupt_agent", "clear_prompt", "scratch_that"]);
     /* PR #1451 round 3 — `trailing_send`: a separate final send sentence types
        what precedes it and asks the panel to send after it. */
     const prompt = reserved ? undefined : fixtureTrailingSend(utterance);
@@ -1369,6 +1452,19 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
      the same whole-utterance rule, ahead of the `type` opener — "type on"
      opens with `type` and would otherwise type the word "on". */
   const reserved = fixtureReserved(utterance, ["dictation_on", "dictation_off", "submit_prompt"]);
+  /* PRD #1541 — a typing-mode prompt command said with the mode OFF: on the
+     agent screen it runs nothing and says to say "typing on" first. On the
+     other screens Rust's model answers it, which the preview stands in for
+     with the row's own hint. A bare "stop" is neither: Rust hands it to the
+     model, and here it falls through like any other phrase. */
+  const typingOnly = reserved || fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES)
+    ? undefined
+    : FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.typingOnly && fixtureSaidWhole(utterance, candidate.phrases));
+  if (typingOnly) {
+    const hint = screen === "agent" ? FIXTURE_TYPING_MODE_FIRST : typingOnly.unavailableHint;
+    const sentence = screen === "agent" ? `${hint[0].toUpperCase()}${hint.slice(1)}.` : `Not here — ${hint}.`;
+    return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: typingOnly.action, hint, sentence } };
+  }
   if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
     const hint = "opening an agent works from the Daemons screen or the agent dashboard";
     if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
@@ -1394,7 +1490,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
     };
   }
   const command = reserved
-    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.phrases.includes(spoken))
+    ?? FIXTURE_VOICE_COMMANDS.find((candidate) => !candidate.typingOnly && candidate.phrases.includes(spoken))
     ?? FIXTURE_VOICE_COMMANDS.find((candidate) => (candidate.openers ?? []).some((opener) => fixtureOpening(utterance, opener) !== undefined));
   if (!command) {
     return { ...stub, outcome: { kind: "no_match", transcript: utterance, sentence: fixtureHeard(utterance, "no matching action") } };
@@ -1600,6 +1696,15 @@ function fixtureSaidWhole(utterance: string, phrases: readonly string[]): boolea
  * the whole utterance.
  */
 const FIXTURE_TRAILING_SEND_PHRASES: readonly string[] = ["send", "send it", "submit", "press enter"];
+
+/**
+ * `voice::dictation::TYPING_STOP_PHRASES` — interrupt's bare "stop" forms,
+ * which interrupt only in typing mode and are not answered locally outside it.
+ */
+const FIXTURE_TYPING_STOP_PHRASES: readonly string[] = ["stop", "stop it", "stop that"];
+
+/** `voice::outcome::TYPING_MODE_FIRST_HINT`, which `fixture.test.ts` compares. */
+const FIXTURE_TYPING_MODE_FIRST = "say “typing on” first — interrupting, clearing and scratching work in typing mode";
 
 /**
  * `voice::outcome::trailing_send`: the words before a separate final sentence

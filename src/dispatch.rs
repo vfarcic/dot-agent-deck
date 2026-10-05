@@ -2289,6 +2289,70 @@ mod tests {
         );
     }
 
+    /// Issue #1396 item 4: `dispatch --orchestration <name>` naming an
+    /// orchestration the repo declares twice, with roles both times, is refused
+    /// as ambiguous — the rule `PrepareOrchestration` follows since #1233 —
+    /// instead of starting the first declaration's roles for a caller that may
+    /// have meant the second. Refused before any git work, like a typo.
+    #[tokio::test]
+    async fn an_ambiguous_orchestration_name_is_refused_without_creating_a_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n",
+        )
+        .unwrap();
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: registry.clone(),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let result = handle_dispatch(
+            &ctx,
+            "ambiguous-unit",
+            "task",
+            Some(&crate::event::DispatchShape::Orchestration {
+                name: Some("dup".into()),
+            }),
+        )
+        .await;
+        registry.shutdown_all();
+
+        assert!(
+            !result.success,
+            "an orchestration name declared twice with roles must be refused, not resolved to \
+             the first declaration: {}",
+            result.message
+        );
+        assert!(
+            result
+                .message
+                .contains(crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION),
+            "the refusal must carry the code PrepareOrchestration uses for the same case: {}",
+            result.message
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "no worktree may be created for a shape that was refused"
+        );
+        assert!(
+            !branch_exists(tmp.path(), &repo, "agent/dispatch-ambiguous-unit"),
+            "no branch may be left behind either"
+        );
+    }
+
     /// The wire choice maps onto the spawn override, and ABSENT stays absent —
     /// that is what preserves the pre-selector behaviour for an older CLI.
     #[test]

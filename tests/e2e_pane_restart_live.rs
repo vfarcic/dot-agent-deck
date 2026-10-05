@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! Upstream PR #918 review fix round: PTY-attached L2 coverage for `pane
 //! restart <role>` — the coverage gap every existing `pane/restart/*` entry
@@ -174,7 +174,9 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
         Duration::from_secs(30),
     );
 
-    deck.wait_until_quiescent();
+    // The successful restart response orders the delegate below. A live TUI
+    // keeps emitting redraw bytes, so terminal silence is not a readiness
+    // signal; the delegated pointer rendered in coder's pane proves reachability.
 
     let delegate_output = run_delegate_cli(
         &deck,

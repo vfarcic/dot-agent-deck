@@ -1521,7 +1521,9 @@ fn main() -> ExitCode {
                     tool_detail,
                 },
             );
-            let json = match serde_json::to_string(&event) {
+            // Issue #318: present this pane's hook capability token.
+            let token = dot_agent_deck::hook_provenance::token_from_env();
+            let json = match dot_agent_deck::event::agent_event_line(&event, token.as_deref()) {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!("Failed to serialize agent-event: {e}");

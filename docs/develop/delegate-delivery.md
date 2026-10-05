@@ -118,9 +118,9 @@ PR #1398 made every daemon-originated first write wait while the target pane hol
 
 ## Trust bounds
 
-Both signals the loop trusts are same-user and unattested, and [hook-provenance.md](hook-provenance.md) records them beside the others:
+Both signals the loop trusts are same-user, and [hook-provenance.md](hook-provenance.md) records them beside the others:
 
-- **Forged turn events.** Raw `AgentEvent`s carry no provenance token for any agent today, so a same-user process that knows a worker's pane and agent ids can forge a `Thinking` and stop that worker's re-sends. Requiring attestation would stop the retry for every real hook too. A forged event costs what the deck did before #1383 — the pointer is not re-sent — and the went-quiet report still covers a worker that then says nothing.
+- **Forged turn events.** Since issue #318 a raw `AgentEvent` naming a deck-spawned worker's pane must carry that worker's hook capability token, so a same-user process that merely knows the worker's pane and agent ids can no longer forge a `Thinking` to stop its re-sends; the daemon refuses it before it reaches the delivery watch. What remains is the same-uid residual the whole token mechanism carries — a process that reads the worker's environment holds its token — and `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, under which a token-less event is admitted. A forged event that does get through costs what the deck did before #1383 — the pointer is not re-sent — and the went-quiet report still covers a worker that then says nothing.
 - **Early echo.** Covered above: printing the id early makes the first Enter as early as the fixed delay it replaced, and reaches only that worker's own submit.
 
 ## Residuals

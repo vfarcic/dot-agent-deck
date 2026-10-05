@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! PTY-attached, REAL-binary proof of the hook-socket provenance gate (issue
 //! #1077), under the DEFAULT policy.
@@ -44,6 +44,131 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::daemon_protocol::TabMembership;
 use spec::spec;
+
+/// Scenario: Open a real deck whose orchestrator command reports waiting, running and waiting from inside its own pane, then forge running and SessionStart from outside that pane with its public identity and no token. Its visible card must keep the legitimate status and identity after each forgery, and its own later finished event must still drive the card to Idle.
+#[spec("orchestration/provenance/003")]
+#[test]
+fn provenance_003_outside_status_events_cannot_drive_a_spawned_panes_card() {
+    use dot_agent_deck::event::EventType;
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env("DOT_AGENT_DECK_HOOK_PROVENANCE", "enforce")
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "0")
+        .with_env("DAD_TEST_BIN", env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .launch_with_fixture("status-provenance");
+    deck.wait_for_string("No active agents");
+    let sub = deck.subscribe_events();
+    open_orchestration(&deck);
+    let (_, agent) = orchestration_ids(&deck);
+    let record = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.id == agent)
+        .expect("orchestrator record");
+    let pane = record.pane_id_env.expect("pane id");
+    sub.wait_for(
+        |event| {
+            event.pane_id.as_deref() == Some(&pane)
+                && event.event_type == EventType::WaitingForInput
+        },
+        Duration::from_secs(20),
+    );
+    std::fs::write(deck.workdir().join("status-running"), b"go").expect("release own running");
+    let own_running = sub.wait_for(
+        |event| event.pane_id.as_deref() == Some(&pane) && event.event_type == EventType::Thinking,
+        Duration::from_secs(20),
+    );
+    deck.wait_until_grid("own status renders Thinking", |grid| {
+        grid.contains("orchestrator") && grid.contains("Thinking")
+    });
+    std::fs::write(deck.workdir().join("status-waiting"), b"go").expect("release own waiting");
+    let own_waiting = sub.wait_for(
+        |event| {
+            event.pane_id.as_deref() == Some(&pane)
+                && event.event_type == EventType::WaitingForInput
+                && event.timestamp > own_running.timestamp
+        },
+        Duration::from_secs(20),
+    );
+    deck.wait_until_grid("own status renders Needs Input", |grid| {
+        grid.contains("orchestrator") && grid.contains("Needs Input")
+    });
+
+    let forged = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["agent-event", "--type", "running"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &pane)
+        .env("DOT_AGENT_DECK_AGENT_ID", &agent)
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("outside status CLI");
+    assert!(
+        forged.status.success() && forged.stdout.is_empty(),
+        "raw status CLI remains fire-and-forget"
+    );
+    let forgery_landed = sub
+        .try_wait_for(
+            |event| {
+                event.pane_id.as_deref() == Some(&pane)
+                    && event.event_type == EventType::Thinking
+                    && event.timestamp > own_waiting.timestamp
+            },
+            Duration::from_secs(2),
+        )
+        .is_some();
+    if forgery_landed {
+        deck.wait_until_grid(
+            "outside running erroneously drove the visible card",
+            |grid| grid.contains("orchestrator") && grid.contains("Thinking"),
+        );
+    }
+    assert!(
+        !forgery_landed,
+        "issue #318: outside agent-event --type running reached attach clients and drove the pane's card; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.wait_until_grid_then_hold(
+        "outside running cannot change the card",
+        Duration::from_millis(500),
+        |grid| grid.contains("Needs Input") && !grid.contains("Thinking"),
+    );
+
+    // Reading to EOF is an ingestion barrier: the absence below is checked
+    // after the daemon processed the forged SessionStart, not after a sleep.
+    use std::io::{Read, Write};
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(deck.hook_socket_path()).expect("hook socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read bound");
+    let start = serde_json::json!({"session_id": "forged-318", "pane_id": pane, "agent_id": agent,
+        "agent_type": "pi", "event_type": "session_start", "timestamp": chrono::Utc::now(),
+        "metadata": {"display_name": "FORGED-318-CARD"}});
+    writeln!(stream, "{start}").expect("forged SessionStart");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).expect("ingestion barrier");
+    assert!(reply.is_empty(), "raw hook events must remain silent");
+    deck.wait_until_grid_then_hold(
+        "forged SessionStart cannot retire or rename the card",
+        Duration::from_millis(500),
+        |grid| grid.contains("Needs Input") && !grid.contains("FORGED-318"),
+    );
+    assert!(
+        !sub.snapshot()
+            .iter()
+            .any(|event| event.session_id == "forged-318"),
+        "forged SessionStart must never reach attach clients"
+    );
+    std::fs::write(deck.workdir().join("status-finished"), b"go").expect("release own finished");
+    deck.wait_until_grid("own later status still drives the card", |grid| {
+        grid.contains("orchestrator") && grid.contains("Idle") && !grid.contains("Needs Input")
+    });
+}
 
 /// The report the worker's own pane sends first. Its arrival proves the
 /// legitimate path is live — the daemon's role maps are populated and the
@@ -179,6 +304,7 @@ fn provenance_001_a_forged_work_done_is_refused_while_the_pane_s_own_still_lands
     // this process to have one.
     let forged = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .arg("work-done")
+        .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
         .arg("--task")
         .arg(format!("Forged completion. {FORGED_SENTINEL}"))
         .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())

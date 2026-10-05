@@ -166,7 +166,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let json = match serde_json::to_string(&event) {
+    // Issue #318: present this pane's hook capability token, so the daemon can
+    // tell this pane's own report from one naming it from outside.
+    let token = crate::hook_provenance::token_from_env();
+    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };

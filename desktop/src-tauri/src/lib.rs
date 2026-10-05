@@ -53,7 +53,8 @@ use dot_agent_deck::agent_pty::{
 };
 use dot_agent_deck::authoring_seeds::AuthoringKind;
 use dot_agent_deck::daemon_client::{
-    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, StartAgentOptions,
+    ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, LastCommandKeeper,
+    StartAgentOptions,
 };
 use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{
@@ -2056,8 +2057,14 @@ const LISTING_OPTIONS_UNSUPPORTED: &str = "This daemon cannot show hidden or sym
 
 /// PRD #1223 M4: what the New agent form needs to know about the deck
 /// `deck_id` names — its default command, its agent registry, its experimental
-/// flag, the authoring kinds it can compose — plus the command this app last
-/// started a plain agent with there.
+/// flag, the authoring kinds it can compose — plus that deck's last command.
+///
+/// The last command comes from the deck itself when it keeps one (issue #1540,
+/// [`LastCommandKeeper::Daemon`]), so the TUI's form and this dialog offer the
+/// same value and it survives a restart of the app. Against a deck that does
+/// not, it is the command this app last started an agent with there, from
+/// [`DesktopState::last_command`]. Either way it is that deck's own value:
+/// one deck's command is never offered for another.
 ///
 /// A deck that predates the query answers
 /// [`DesktopNewAgentOptions::Unsupported`], carrying this app's own compiled
@@ -2153,7 +2160,18 @@ async fn new_agent_options_on(
         .new_agent_options()
         .await
         .map_err(|error| safe_message(error.to_string()))?;
-    let last_command = state.last_command(&scope.identity());
+    let keeper = daemon
+        .client
+        .last_command_keeper()
+        .await
+        .map_err(|error| safe_message(error.to_string()))?;
+    let last_command = match (&answer, keeper) {
+        // Issue #1540: the deck keeps it, so its answer is the value — even
+        // when that is "none", because this app records nothing for such a
+        // deck and an in-memory value here could only be stale.
+        (GatedQuery::Answered(options), LastCommandKeeper::Daemon) => options.last_command.clone(),
+        _ => state.last_command(&scope.identity()),
+    };
     Ok(match answer {
         GatedQuery::Answered(options) => DesktopNewAgentOptions::Deck {
             default_command: options.default_command,
@@ -4139,6 +4157,15 @@ struct StartedAgent {
 /// `DOT_AGENT_DECK_PANE_ID` (which the deck requires here, because the seed is
 /// delivered to that pane), and the same last-command record.
 ///
+/// # The last command (PRD #1223 M4, issue #1540)
+///
+/// Both starts go through the client's form-start methods, which mark the
+/// start as one from the New agent form for a deck that keeps the last command
+/// itself; that deck records it once it has accepted the start. Against a deck
+/// that does not ([`LastCommandKeeper::Client`]), this app keeps it in memory
+/// per deck instead ([`DesktopState::remember_last_command`]), and only after
+/// the start was accepted. A refused start records nothing anywhere.
+///
 /// The command must already be resolved. A blank one means the deck's default
 /// shell, which cannot act on a seed, so the dialog resolves it the way the
 /// TUI's `resolve_authoring_command` does and this refuses one that arrives
@@ -4199,7 +4226,8 @@ async fn start_agent_action(
     // Kept for the per-deck last command (PRD #1223 M4), recorded only once the
     // deck has accepted the start — a refused start leaves the value it had.
     // An authoring start records too, as the TUI's `record_candidate` does for
-    // every form-submitted command.
+    // every form-submitted command. Recorded here only for a deck that does not
+    // keep it itself (issue #1540).
     let requested_command = command.clone();
     let options = StartAgentOptions {
         command,
@@ -4216,19 +4244,26 @@ async fn start_agent_action(
     // PRD #1223 audit F4: bounded like every role start, so the New agent
     // dialog — which cannot be closed while a start is in flight (audit F5) —
     // always gets an answer.
-    let agent_id = match authoring_kind {
-        None => bounded_plain_start(daemon.client.start_agent(options)).await?,
+    let started = match authoring_kind {
+        None => bounded_plain_start(daemon.client.start_form_agent(options)).await?,
         Some(kind) => {
-            match bounded_plain_start(daemon.client.start_authoring_agent(options, kind)).await? {
-                GatedQuery::Answered(agent_id) => agent_id,
+            match bounded_plain_start(daemon.client.start_form_authoring_agent(options, kind))
+                .await?
+            {
+                GatedQuery::Answered(started) => started,
                 GatedQuery::Unsupported => return Err(authoring_unsupported_message(kind)),
             }
         }
     };
-    if let Some(command) = requested_command.as_deref() {
+    if started.last_command == LastCommandKeeper::Client
+        && let Some(command) = requested_command.as_deref()
+    {
         state.remember_last_command(&scope.identity(), command);
     }
-    Ok(StartedAgent { agent_id, scope })
+    Ok(StartedAgent {
+        agent_id: started.agent_id,
+        scope,
+    })
 }
 
 /// One plain or authoring start under [`ORCHESTRATION_ROLE_START_TIMEOUT`] (PRD #1223

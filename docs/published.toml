@@ -100,7 +100,7 @@ description = "The desktop app's settings and desktop.toml: appearance, zoom, th
 [[page]]
 slug = "desktop/voice"
 title = "Voice Control"
-description = "Turn on and use voice control in the desktop app: dictating to an agent in typing mode, choosing between matches, the speech and command services it needs, their settings, and what is sent where."
+description = "Turn on and use voice control in the desktop app: dictating to an agent in typing mode, interrupting it and clearing or scratching its prompt, choosing between matches, the speech and command services it needs, their settings, and what is sent where."
 
 [[page]]
 slug = "troubleshooting"

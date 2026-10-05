@@ -5,6 +5,7 @@
 // build compiles; on Unix every test still runs exactly as before. A named-pipe
 // port of this harness for Windows is tracked by #164 (M10).
 #![cfg(unix)]
+
 //! PRD #76 M2.x — TUI session-list rehydration on bootstrap.
 //!
 //! The bug: in external-daemon mode the TUI never queried the daemon for
@@ -42,6 +43,9 @@ mod test_temp;
 // calls the same `arm()`.
 #[path = "common/child_lifetime_bound.rs"]
 mod child_lifetime_bound;
+
+#[path = "common/hook_capability.rs"]
+mod hook_capability;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -177,6 +181,9 @@ async fn run_real_agent_event(
     let hook_path = daemon.hook_path.clone();
     let pane_id_owned = pane_id.to_string();
     let agent_id_owned = agent_id.to_string();
+    let token = hook_capability::recorded_hook_capability(cwd, agent_id)
+        .await
+        .expect("managed capability");
     let cwd = cwd.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -189,6 +196,7 @@ async fn run_real_agent_event(
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", token)
             .output()
             .expect("run real agent-event CLI for reconnect")
     })
@@ -3147,6 +3155,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
+                    prompt_keys: None,
                     crashed: None,
                     orchestrator_context_path: None,
                 };
@@ -3503,7 +3512,7 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     let client = DaemonClient::new(daemon.attach_path.clone());
     let agent_id = client
         .start_agent(StartAgentOptions {
-            command: Some("cat".to_string()),
+            command: Some(hook_capability::capability_export_command("cat")),
             cwd: Some(cwd.path().to_string_lossy().into_owned()),
             env: vec![(
                 DOT_AGENT_DECK_PANE_ID.to_string(),
