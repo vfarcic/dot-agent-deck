@@ -10,7 +10,7 @@ user-invocable: true
 
 You are helping update an existing Product Requirements Document (PRD) based on implementation work completed. This command analyzes git commits and code changes, enhanced by conversation context, to track PRD completion progress and propose evidence-based updates.
 
-**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD the progress update itself needs no commit**: the checkboxes are ticked in the body and the progress note is a comment; only the implementation work is committed, on its branch.
+**Where the PRD lives.** Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD the progress update itself needs no commit**: the checkboxes are ticked in the body and the progress note is a comment; only the implementation work is committed, on its branch.
 
 ## Process Overview
 

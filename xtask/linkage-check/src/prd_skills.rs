@@ -642,6 +642,48 @@ fn prd_skills_022_prd_start_never_skips_the_lookup() {
     );
 }
 
+/// The PRD skills are ours outright: none of them names `dot-ai`. Where they
+/// came from is in git history (`git log --follow`), and saying it in the
+/// skill only costs every agent that runs it.
+#[test]
+fn prd_skills_023_the_prd_skills_do_not_name_dot_ai() {
+    let skills = repo_root().join(".claude/skills");
+    let mut hits = Vec::new();
+    for skill in [
+        "prd-create",
+        "prd-start",
+        "prd-next",
+        "prd-update-progress",
+        "prd-update-decisions",
+        "prd-close",
+        "prds-get",
+        "worktree-prd",
+    ] {
+        for entry in fs::read_dir(skills.join(skill))
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            let Ok(text) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for (i, line) in text.lines().enumerate() {
+                if line.to_lowercase().contains("dot-ai") {
+                    hits.push(format!(
+                        "{skill}/{}:{}",
+                        entry.file_name().to_string_lossy(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "the PRD skills name `dot-ai`:\n{}",
+        hits.join("\n")
+    );
+}
+
 /// The body template `issue-prd.md` documents, which `prd-create` writes, is
 /// one the script accepts — so the documented layout and the check that gates
 /// `prd-queue` cannot drift apart.

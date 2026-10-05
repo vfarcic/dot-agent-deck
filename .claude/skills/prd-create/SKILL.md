@@ -10,7 +10,7 @@ user-invocable: true
 
 You are helping create a Product Requirements Document (PRD) for a new feature. **In this repository the PRD is its GitHub issue**: the issue body is the project management document — milestone tracking and implementation plan — and its comments are the record of progress and decisions. Nothing is written under `prds/` and nothing is committed (issue #1591).
 
-This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. The layout of an issue PRD — what goes in the body, what goes in comments, how to edit the body without losing someone else's edit — is in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md); read it before writing the body. Older PRDs that already have a `prds/<n>-*.md` file keep it; this skill never creates one.
+The layout of an issue PRD — what goes in the body, what goes in comments, how to edit the body without losing someone else's edit — is in [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md); read it before writing the body. Older PRDs that already have a `prds/<n>-*.md` file keep it; this skill never creates one.
 
 ## Process
 

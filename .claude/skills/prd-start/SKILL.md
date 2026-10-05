@@ -12,7 +12,7 @@ You are helping initiate active implementation work on a specific Product Requir
 
 **IMPORTANT**: Do NOT include time estimates or effort estimates in your responses. Focus on setup and readiness without speculating on duration.
 
-**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`issue-prd.md`](issue-prd.md) is how to read and write the issue case.
+**Where the PRD lives.** Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`issue-prd.md`](issue-prd.md) is how to read and write the issue case.
 
 ## Process Overview
 

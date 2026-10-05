@@ -8,7 +8,7 @@ user-invocable: true
 
 Close a PRD that is already implemented (in previous work or external projects) or is no longer needed. This workflow records why, closes the GitHub issue, and — for an older PRD that has a file — archives the file.
 
-**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue, and closing it is closing the issue with a closing comment: **no file move and no commit**. An older PRD keeps its `prds/<n>-*.md` file, and archiving that file is a commit — which here goes through a PR, because `main` is protected (CLAUDE.md rule 8) and the mirror's "commit directly to main" step is refused with `GH013` (or, for an admin, silently bypasses the review). `bash .claude/skills/prd-start/prd-source.sh <n>` says which case you are in, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) has the issue conventions.
+**Where the PRD lives.** Since issue #1591 a new PRD is its GitHub issue, and closing it is closing the issue with a closing comment: **no file move and no commit**. An older PRD keeps its `prds/<n>-*.md` file, and archiving that file is a commit — which here goes through a PR, because `main` is protected (CLAUDE.md rule 8): a direct push is refused with `GH013` (or, for an admin, silently bypasses the review). `bash .claude/skills/prd-start/prd-source.sh <n>` says which case you are in, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) has the issue conventions.
 
 ## When to Use This Command
 
@@ -33,7 +33,7 @@ Close a PRD that is already implemented (in previous work or external projects) 
 /prd-close 20
 
 # With PRD number and reason
-/prd-close 20 "Already implemented by dot-ai-controller"
+/prd-close 20 "Already implemented by PRs #<a> and #<b>"
 ```
 
 **Note**: If any `gh` command fails with "command not found", inform the user that GitHub CLI is required and provide the installation link: https://cli.github.com/
@@ -208,31 +208,28 @@ Then run `/pr-create`, with `Closes #[number]` in the PR body. No `[skip ci]`: t
 
 ## Example Scenarios
 
-### Example 1: Already Implemented in External Project
+### Example 1: Already Implemented by Earlier Work
 
 ```bash
-/prd-close 20 "Implemented by dot-ai-controller"
+/prd-close 20 "Implemented by PRs #<a> and #<b>"
 ```
 
 **Closure Comment:**
 ```markdown
 ## ✅ PRD #20 Closed - Already Implemented
 
-This PRD requested proactive Kubernetes cluster monitoring with AI-powered remediation.
-**Core functionality (60-80%) is already implemented** by the separate
-[dot-ai-controller](https://github.com/vfarcic/dot-ai-controller) project.
+This PRD requested exporting a session's history so it can be shared or archived.
+**All core requirements are already implemented** by work that shipped under other
+issues, in PRs #<a> and #<b>.
 
 | Requirement | Implementation | Status |
 |-------------|----------------|--------|
-| Continuous health checks | Event-based monitoring via K8s events | ✅ Complete |
-| Intelligent alerting | Slack notifications with AI analysis | ✅ Complete |
-| Automated remediation | Automatic/manual modes with confidence thresholds | ✅ Complete |
-| Anomaly detection | AI-powered event analysis | ✅ Complete |
+| Export a session's history | PR #<a> | ✅ Complete |
+| Choose the export format | PR #<a> | ✅ Complete |
+| Export from the desktop app | PR #<b> | ✅ Complete |
 
-**Not Implemented** (advanced features, may be future PRD):
-- Continuous metrics monitoring (Prometheus-style)
-- Predictive analytics with baseline learning
-- Multi-channel alerting (email, PagerDuty)
+**Not Implemented** (deferred, may be a future PRD):
+- Scheduled automatic exports
 ```
 
 ### Example 2: Duplicate PRD

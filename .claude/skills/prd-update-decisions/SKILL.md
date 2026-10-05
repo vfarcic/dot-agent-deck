@@ -10,7 +10,7 @@ user-invocable: true
 
 You are updating a PRD based on design decisions, strategic changes, and architectural choices made during conversations. This command captures conceptual changes that may not yet be reflected in code but affect requirements, approach, or scope.
 
-**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD, recording a decision needs no commit.**
+**Where the PRD lives.** Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD, recording a decision needs no commit.**
 
 ## Process Overview
 

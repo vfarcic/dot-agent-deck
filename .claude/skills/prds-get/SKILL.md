@@ -8,7 +8,7 @@ user-invocable: true
 
 Fetch all open GitHub issues from this project that have the 'PRD' label.
 
-This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue (the body is the PRD) and an older one keeps its `prds/<n>-*.md` file — see [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md).
+Since issue #1591 a new PRD is its GitHub issue (the body is the PRD) and an older one keeps its `prds/<n>-*.md` file — see [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md).
 
 **Note**: If any `gh` command fails with "command not found", inform the user that GitHub CLI is required and provide the installation link: https://cli.github.com/
 

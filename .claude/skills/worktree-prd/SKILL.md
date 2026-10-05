@@ -8,7 +8,7 @@ user-invocable: true
 
 Create a git worktree with a descriptive branch name based on the PRD title.
 
-This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a `prds/` file. Since issue #1591 a new PRD lives in its GitHub issue ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md)), so the title comes from the file when one exists and from the issue otherwise.
+Since issue #1591 a new PRD lives in its GitHub issue ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md)), so the title comes from the file when one exists and from the issue otherwise.
 
 ## Workflow
 
