@@ -1455,7 +1455,11 @@ fn resolve_param(
     // Whether the transcript names a fact of another agent that the agent
     // `id` lacks ([`excluded_by_another`]).
     let heard_against = |id: &str| {
-        let (said, content) = reference_words(&heard_facts);
+        let (mut said, content) = reference_words(&heard_facts);
+        // A recency word is an ORDER, settled below, not a fact an agent
+        // has to account for (Qodo on PR #1529).
+        Recency::said(&mut said);
+        let content: BTreeSet<String> = content.intersection(&said).cloned().collect();
         agents
             .iter()
             .find(|agent| agent.id == id)
@@ -2778,12 +2782,18 @@ pub fn resolve_agent_ref_on(
     // Facets are spelled by [`spoken_text`], so the reference is too: the
     // model answers `work/api` the way it was shown it.
     let spelled = normalize(&spoken_text(spoken));
+    // A value the model was shown cut short, ending in an ellipsis — a long
+    // directory name (`prompt::directory_labels`) — is matched as the start of
+    // a facet, as long as enough of it is left to mean something (Qodo on PR
+    // #1529).
+    let cut = spoken.trim_end().ends_with('\u{2026}') && spelled.chars().count() >= CUT_FACET_CHARS;
     let known: Vec<&DesktopAgent> = agents
         .iter()
         .filter(|agent| {
-            agent_facets(agent)
-                .iter()
-                .any(|name| normalize(name) == reference || normalize(name) == spelled)
+            agent_facets(agent).iter().any(|name| {
+                let name = normalize(name);
+                name == reference || name == spelled || (cut && name.starts_with(&spelled))
+            })
         })
         .collect();
     if !known.is_empty() {
@@ -2861,8 +2871,22 @@ fn quotes_last_prompt(spoken: &str, agent: &DesktopAgent) -> bool {
             .collect()
     };
     let quoted = in_order(spoken);
-    quoted.len() >= QUOTED_PROMPT_WORDS && in_order(prompt).starts_with(&quoted)
+    let prompt = in_order(prompt);
+    let Some((last, whole)) = quoted.split_last() else {
+        return false;
+    };
+    // The model is shown the prompt cut at `LAST_PROMPT_CHARS`, usually
+    // inside a word ("resiz…"), and may quote it back that way (Qodo on PR
+    // #1529): every word but the last must match, the last may be cut short.
+    quoted.len() >= QUOTED_PROMPT_WORDS
+        && prompt.len() >= quoted.len()
+        && prompt.starts_with(whole)
+        && prompt[whole.len()].starts_with(last.as_str())
 }
+
+/// The fewest characters of a facet, quoted back cut short, that still name
+/// one ([`resolve_agent_ref_on`]).
+const CUT_FACET_CHARS: usize = 16;
 
 /// The fewest words of a last prompt that count as quoting it.
 const QUOTED_PROMPT_WORDS: usize = 3;
@@ -7767,6 +7791,34 @@ mod tests {
             IntentAnswer::new("open_agent").with_param("agent", "Juno"),
         );
         let outcome = run(&resolver, Screen::Overview, &agents, said).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
+            "{outcome:?}"
+        );
+
+        // Values the model was shown cut short resolve back: a last prompt
+        // cut inside a word, and a long directory name cut with an ellipsis.
+        assert!(matches!(
+            resolve_agent_ref_on("Fix the scroll jump when the terminal pane resiz\u{2026}", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-juno"
+        ));
+        let mut long_named = agent("13", Some("Hydra"), "codex");
+        long_named.cwd = Some(format!("/srv/{}", "x".repeat(120)));
+        let with_long = vec![long_named, agent("14", Some("Lyra"), "codex")];
+        assert!(matches!(
+            resolve_agent_ref_on(&format!("{}\u{2026}", "x".repeat(79)), &with_long, &decks()),
+            AgentRefMatch::One { id, .. } if id == "13"
+        ));
+        // A recency word is an order, not a fact: beside an agent called
+        // "newest", "open the newest agent in billing" still opens Juno.
+        let mut with_newest = agents.clone();
+        with_newest.push(agent("15", Some("newest"), "pi"));
+        let said = "open the newest agent in billing";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "agent in billing"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &with_newest, said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-juno"),
             "{outcome:?}"
