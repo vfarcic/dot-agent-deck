@@ -17,6 +17,8 @@
 //! differently there, and it has no procfs) rather than a clear refusal.
 
 #[cfg(target_os = "linux")]
+mod breaks;
+#[cfg(target_os = "linux")]
 mod buildgate;
 #[cfg(target_os = "linux")]
 mod buildlock;
