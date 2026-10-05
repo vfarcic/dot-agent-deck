@@ -44111,6 +44111,7 @@ mod tests {
             cli_name: None,
             crashed: None,
             orchestrator_context_path: None,
+            prompt_keys: None,
         };
         crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));
         let crate::event::BroadcastMsg::Event(mut event) =
