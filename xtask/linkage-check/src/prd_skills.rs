@@ -609,17 +609,35 @@ fn prd_skills_021_worktree_prd_looks_the_prd_up_even_with_a_title_supplied() {
 fn prd_skills_022_prd_start_never_skips_the_lookup() {
     let text = fs::read_to_string(repo_root().join(".claude/skills/prd-start/SKILL.md"))
         .expect("read prd-start/SKILL.md");
-    assert!(
-        text.contains("## Step 1b: Locate the PRD (Always)") && text.contains("prd-source.sh"),
-        "prd-start must keep its always-run lookup step"
+    let pos = |h: &str| {
+        text.find(h)
+            .unwrap_or_else(|| panic!("prd-start/SKILL.md has no `{h}` heading"))
+    };
+    let (step0, step1, step1b, step2) = (
+        pos("## Step 0:"),
+        pos("## Step 1:"),
+        pos("## Step 1b: Locate the PRD (Always)"),
+        pos("## Step 2:"),
     );
-    let bypasses: Vec<&str> = text
+    // Step 1 falls through into Step 1b, which falls through into Step 2.
+    assert!(
+        step0 < step1 && step1 < step1b && step1b < step2,
+        "Step 1b must sit between Step 1 and Step 2, so detection flows into the lookup"
+    );
+    assert!(
+        text[step1b..step2].contains("prd-source.sh"),
+        "Step 1b must run prd-source.sh"
+    );
+    // Steps 0 and 0b are the shortcuts: any later step they name, however it
+    // is phrased, must be reached through Step 1b.
+    let later = Regex::new(r"(?i)\bstep\s*([2-9]|[1-9][0-9])\b").unwrap();
+    let bypasses: Vec<&str> = text[step0..step1]
         .lines()
-        .filter(|l| l.contains("to Step 2") && !l.contains("Step 1b"))
+        .filter(|l| later.is_match(l) && !l.contains("Step 1b"))
         .collect();
     assert!(
         bypasses.is_empty(),
-        "these route to Step 2 without the Step 1b lookup:\n{}",
+        "these shortcuts name a later step without routing through Step 1b:\n{}",
         bypasses.join("\n")
     );
 }
