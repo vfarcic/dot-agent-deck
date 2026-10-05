@@ -3936,28 +3936,50 @@ mod tests {
         }
     }
 
+    /// Issue #1567: the daemon's provenance verdict a Pi report carries on its
+    /// broadcast.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PiReportProvenance {
+        /// Attested to the pane's own spawn token (`daemon_attested_owner`).
+        Attested,
+        /// An outside agent's frame, admitted to its own card
+        /// (`daemon_unproven`).
+        Unproven,
+        /// Neither stamp: a token-less frame for a deck pane admitted under
+        /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, or one relayed by a daemon
+        /// from before #318.
+        Unstamped,
+    }
+
     /// Issue #1567: what a Pi report's metadata carries on the daemon's
     /// broadcast — the extension's prompt-report declaration when `declared`,
-    /// and the daemon's provenance verdict: attested to `agent_id` when
-    /// `attested`, the unproven marker otherwise (an outside agent's frame,
-    /// which #318's gate admits only to its own card).
-    fn mark_pi_report(event: &mut AgentEvent, agent_id: &str, declared: bool, attested: bool) {
+    /// and the daemon's provenance verdict.
+    fn mark_pi_report(
+        event: &mut AgentEvent,
+        agent_id: &str,
+        declared: bool,
+        provenance: PiReportProvenance,
+    ) {
         if declared {
             event.metadata.insert(
                 crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
                 crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
             );
         }
-        if attested {
-            event.metadata.insert(
-                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
-                agent_id.to_string(),
-            );
-        } else {
-            event.metadata.insert(
-                crate::event::UNPROVEN_METADATA_KEY.to_string(),
-                crate::event::UNPROVEN_METADATA_VALUE.to_string(),
-            );
+        match provenance {
+            PiReportProvenance::Attested => {
+                event.metadata.insert(
+                    crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+                    agent_id.to_string(),
+                );
+            }
+            PiReportProvenance::Unproven => {
+                event.metadata.insert(
+                    crate::event::UNPROVEN_METADATA_KEY.to_string(),
+                    crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+                );
+            }
+            PiReportProvenance::Unstamped => {}
         }
     }
 
@@ -4735,14 +4757,21 @@ mod tests {
     /// that it reports every prompt — the bundled extension from #1567 on — on
     /// a frame the daemon's hook-provenance gate attested. The same frame from
     /// an older extension, which declares nothing, is not; nor is a declaring
-    /// frame the gate did not attest (an outside agent's, or a forgery
-    /// presenting no token).
+    /// frame the gate did not attest — an outside agent's (stamped unproven),
+    /// or one carrying neither stamp (a token-less frame admitted under the
+    /// `warn` policy, or one relayed by a pre-#318 daemon).
     #[test]
     fn a_drained_pi_frame_is_capability_only_when_it_declares_prompt_reports() {
         const PANE_ID: &str = "drain-1567-pane";
         const AGENT_ID: &str = "drain-1567-agent";
 
-        for (declared, attested) in [(false, true), (true, true), (true, false)] {
+        use PiReportProvenance::{Attested, Unproven, Unstamped};
+        for (declared, provenance) in [
+            (false, Attested),
+            (true, Attested),
+            (true, Unproven),
+            (true, Unstamped),
+        ] {
             let (tx, mut rx) = broadcast::channel(8);
             let mut event = typed_prompt_watch_event(
                 PANE_ID,
@@ -4752,7 +4781,7 @@ mod tests {
                 AgentType::Pi,
                 false,
             );
-            mark_pi_report(&mut event, AGENT_ID, declared, attested);
+            mark_pi_report(&mut event, AGENT_ID, declared, provenance);
             let _ = tx.send(BroadcastMsg::Event(event));
             let mut generation = None;
             let mut capability = false;
@@ -4770,9 +4799,9 @@ mod tests {
             );
             assert_eq!(
                 capability,
-                declared && attested,
-                "declared={declared} attested={attested}: a Pi frame's capability is its \
-                 extension's declaration on an attested frame"
+                declared && provenance == Attested,
+                "declared={declared} provenance={provenance:?}: a Pi frame's capability is \
+                 its extension's declaration on an attested frame"
             );
         }
     }
@@ -4783,13 +4812,15 @@ mod tests {
     /// submitted prompt, so the unconfirmed write is re-submitted; declaring
     /// nothing — an extension from before #1567 — it stays a producer that
     /// cannot, and nothing is typed into it a second time; and a declaration on
-    /// a frame the hook-provenance gate did not attest grants nothing either.
+    /// a frame the hook-provenance gate did not attest, whether stamped
+    /// unproven or carrying neither stamp, grants nothing either.
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
     async fn a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports() {
-        let retry_lands = |declared: bool, attested: bool| async move {
-            let pane_id = format!("pi-1567-{declared}-{attested}");
-            let prompt = format!("PI-1567-RETRY-{declared}-{attested}");
+        use PiReportProvenance::{Attested, Unproven, Unstamped};
+        let retry_lands = |declared: bool, provenance: PiReportProvenance| async move {
+            let pane_id = format!("pi-1567-{declared}-{provenance:?}");
+            let prompt = format!("PI-1567-RETRY-{declared}-{provenance:?}");
             let registry = Arc::new(AgentPtyRegistry::new());
             let agent_id = spawn_typed_byte_target(&registry, &pane_id, Some(AgentType::Pi));
             let (tx, rx) = broadcast::channel(8);
@@ -4800,7 +4831,7 @@ mod tests {
                     pane_id: pane_id.clone(),
                     agent_id: agent_id.clone(),
                     prompt: prompt.clone(),
-                    delivery_id: format!("pi-1567-{declared}-{attested}"),
+                    delivery_id: format!("pi-1567-{declared}-{provenance:?}"),
                     generation: None,
                     can_report_prompts: false,
                     confirmation_floor: Duration::ZERO,
@@ -4815,14 +4846,14 @@ mod tests {
                 AgentType::Pi,
                 false,
             );
-            mark_pi_report(&mut event, &agent_id, declared, attested);
+            mark_pi_report(&mut event, &agent_id, declared, provenance);
             tx.send(BroadcastMsg::Event(event))
                 .expect("send the Pi extension's session-start report");
             // As in the #559 pair above: the retrying case waits for the
             // retry's own echo, and the other can only observe an absence, so
             // its sleep IS the observation — with a zero floor the first window
             // is 500 ms, so a retry that is going to land has landed by 750 ms.
-            let output = if declared && attested {
+            let output = if declared && provenance == Attested {
                 wait_for_detached_payload_echo(&registry, &agent_id, &prompt).await
             } else {
                 tokio::time::sleep(Duration::from_millis(750)).await;
@@ -4834,14 +4865,14 @@ mod tests {
             registry.shutdown_all();
             (payload_echoes(&output, &prompt) > 0, output)
         };
-        let (declared_retried, declared_output) = retry_lands(true, true).await;
+        let (declared_retried, declared_output) = retry_lands(true, Attested).await;
         assert!(
             declared_retried,
             "a deck-spawned Pi pane whose extension declares prompt reports must get the \
              retry, or a prompt Pi never received is never re-submitted; output={:?}",
             String::from_utf8_lossy(&declared_output)
         );
-        let (legacy_retried, legacy_output) = retry_lands(false, true).await;
+        let (legacy_retried, legacy_output) = retry_lands(false, Attested).await;
         assert!(
             !legacy_retried,
             "a Pi pane whose extension declares nothing was retyped — that extension does \
@@ -4849,14 +4880,16 @@ mod tests {
              second time; output={:?}",
             String::from_utf8_lossy(&legacy_output)
         );
-        let (forged_retried, forged_output) = retry_lands(true, false).await;
-        assert!(
-            !forged_retried,
-            "a declaration on a frame the hook-provenance gate did not attest — an outside \
-             agent's, or one presenting no token — granted re-submission into a deck-spawned \
-             Pi pane; output={:?}",
-            String::from_utf8_lossy(&forged_output)
-        );
+        for provenance in [Unproven, Unstamped] {
+            let (forged_retried, forged_output) = retry_lands(true, provenance).await;
+            assert!(
+                !forged_retried,
+                "a declaration on a frame the hook-provenance gate did not attest \
+                 ({provenance:?}) granted re-submission into a deck-spawned Pi pane; \
+                 output={:?}",
+                String::from_utf8_lossy(&forged_output)
+            );
+        }
     }
 
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes; a deck-spawned Codex pane whose only post-write producer is a `wrap` that declared Codex's native prompt hook untrusted is never retyped, while its undeclared twin is (issue #559). Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.

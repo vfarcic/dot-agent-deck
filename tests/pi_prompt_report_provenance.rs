@@ -144,13 +144,7 @@ fn capability(state: &AppState, pane_id: &str) -> ConfirmationCapability {
     )
 }
 
-/// Scenario: Spawn two Pi stand-ins through an in-process daemon, so each is
-/// issued its own hook capability token. From each pane, run the real
-/// `agent-event --type finished` with that pane's token — with
-/// `--reports-prompts` from one, without it from the other. The daemon
-/// attests both frames to their spawns; only the declaring pane then counts as
-/// one that confirms its own prompts, in the daemon and in a client applying
-/// the broadcast frame, and the other stays one that cannot.
+/// Scenario: Two deck-spawned Pi stand-ins each send the real `agent-event` with their own token, one with `--reports-prompts` and one without. Only the declaring pane then counts as one that confirms its prompts, in the daemon and in a client.
 #[spec("status/agent-event/007")]
 #[test]
 fn agent_event_007_an_attested_declaration_makes_only_its_own_pi_pane_confirm_prompts() {
@@ -204,14 +198,10 @@ fn agent_event_007_an_attested_declaration_makes_only_its_own_pi_pane_confirm_pr
     });
 }
 
-/// Scenario: Send Pi reports declaring prompt reports that the hook-provenance
-/// gate does not attest: the real CLI from a pane the daemon never spawned
-/// (no token), a raw line from that pane that also forges the daemon's own
-/// attested-owner marker, and the real CLI claiming a deck-spawned Pi pane
-/// without its token. The first two are admitted only as an outside agent's
-/// unproven card and grant nothing, in the daemon or in a client applying
-/// them; the third is refused outright, and the deck's pane stays one that
-/// cannot confirm.
+// The three cases: the real CLI from a pane the daemon never spawned (no
+// token), a raw line from that pane forging the daemon's attested-owner
+// marker, and the real CLI claiming a deck-spawned Pi pane without its token.
+/// Scenario: Send prompt-report declarations the hook-provenance gate does not attest, from an outside pane, with a forged attestation, and token-less on a deck pane. None of them makes any pane one that confirms its prompts, and the token-less one is refused outright.
 #[spec("status/agent-event/008")]
 #[test]
 fn agent_event_008_an_unattested_declaration_grants_nothing() {
