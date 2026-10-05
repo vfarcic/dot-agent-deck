@@ -566,6 +566,8 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
     let path = codex_home.join("hooks.json");
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across processes too: every wrapper starting a Codex pane runs this.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -742,6 +744,7 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
     let path = codex_home.join("hooks.json");
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1972,6 +1975,11 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
 
     std::fs::create_dir_all(home)?;
     let path = home.join(CONFIG_TOML);
+    // Held across the read, the edit and the publish, against every other
+    // process recording trust here — several Codex panes starting at once each
+    // run this (`codex/trust/008`). The callers' `INSTALL_LOCK` covers threads
+    // of this process only.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
     let existing = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
@@ -2165,6 +2173,105 @@ pub fn auto_install_and_trust_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
+
+    /// The child half of `codex_trust_008`: when re-executed with these set,
+    /// record `TRUST_RACE_KEYS` trust records into the shared home, each
+    /// through its own `edit_trust_state` call, exactly as a separate deck
+    /// process does when it starts a Codex pane. A no-op otherwise.
+    const TRUST_RACE_HOME: &str = "DAD_TEST_TRUST_RACE_HOME";
+    const TRUST_RACE_WRITER: &str = "DAD_TEST_TRUST_RACE_WRITER";
+    const TRUST_RACE_WRITERS: usize = 8;
+    const TRUST_RACE_KEYS: usize = 20;
+
+    #[test]
+    fn trust_race_child_writer() {
+        let (Ok(home), Ok(writer)) = (
+            std::env::var(TRUST_RACE_HOME),
+            std::env::var(TRUST_RACE_WRITER),
+        ) else {
+            return;
+        };
+        for n in 0..TRUST_RACE_KEYS {
+            let key = format!("{home}/hooks.json:writer{writer}_key{n}:0:0");
+            edit_trust_state(Path::new(&home), |state| {
+                upsert_trust_record(state, &key, "sha256:race")
+            })
+            .expect("record trust");
+        }
+    }
+
+    /// Scenario: Start eight separate processes at once against one fresh Codex
+    /// home, each recording twenty trust records of its own through the deck's
+    /// trust write, as eight Codex panes starting together do. Every one of the
+    /// 160 records must be in `config.toml` afterwards, and no temp file may be
+    /// left beside it.
+    #[spec("codex/trust/008")]
+    #[test]
+    fn codex_trust_008_concurrent_trust_writers_keep_every_record() {
+        let home = tempfile::tempdir().expect("codex home tempdir");
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        let children: Vec<_> = (0..TRUST_RACE_WRITERS)
+            .map(|writer| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "codex_hooks_manage::tests::trust_race_child_writer",
+                        "--exact",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(TRUST_RACE_HOME, home.path())
+                    .env(TRUST_RACE_WRITER, writer.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("re-exec this test binary")
+            })
+            .collect();
+        for child in children {
+            let out = child.wait_with_output().expect("wait for a writer");
+            assert!(
+                out.status.success(),
+                "a trust writer failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let config =
+            std::fs::read_to_string(home.path().join(CONFIG_TOML)).expect("read config.toml");
+        let doc = config
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid TOML");
+        let state = doc["hooks"]["state"]
+            .as_table_like()
+            .expect("hooks.state table");
+        let home_str = home.path().display().to_string();
+        let missing: Vec<String> = (0..TRUST_RACE_WRITERS)
+            .flat_map(|writer| {
+                let home_str = home_str.clone();
+                (0..TRUST_RACE_KEYS)
+                    .map(move |n| format!("{home_str}/hooks.json:writer{writer}_key{n}:0:0"))
+            })
+            .filter(|key| state.get(key).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} trust records were lost to a concurrent writer, e.g. {:?}",
+            missing.len(),
+            TRUST_RACE_WRITERS * TRUST_RACE_KEYS,
+            missing.first()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(home.path())
+            .expect("list the home")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
 
     /// Codex's hook commands are quoted for the HOST's shell — the half of #734
     /// that is a real behaviour change, and the half no test on a POSIX box can

@@ -11,11 +11,17 @@ use std::sync::{Mutex, MutexGuard};
 /// same reasoning as `hooks_manage::SETTINGS_LOCK` and
 /// `codex_hooks_manage::INSTALL_LOCK`.
 ///
-/// What it does NOT close is the cross-PROCESS lost update — two deck binaries
-/// starting at the same instant, or a deck racing a hand-edit of the plugin.
-/// That needs an advisory file lock, which no sibling adapter has either; the
-/// atomic publish means the loser of such a race loses a whole update rather
-/// than leaving OpenCode a torn JavaScript file to load.
+/// What it does NOT close is the cross-PROCESS race — two deck binaries
+/// starting at the same instant, or a deck racing a hand-edit of the plugin —
+/// and, unlike the sibling adapters (`agent_hook_config::lock_config`, issue
+/// #1493's follow-up), this one deliberately takes no file lock for it. Those
+/// adapters MERGE their entries into a file other writers also add to, so a
+/// lost update there drops someone else's entry. This file is the deck's own
+/// generated JavaScript, rewritten whole every time; the only thing read back
+/// is the pinned `BINARY_PATH`, and two racing writers each publish a complete
+/// plugin pinning a usable binary (the one they found, or their own). So the
+/// loser loses nothing anyone else wrote, and the atomic publish already keeps
+/// OpenCode from ever loading a torn file.
 static PLUGIN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Take [`PLUGIN_LOCK`], recovering from a poisoned mutex rather than

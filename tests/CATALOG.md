@@ -5094,8 +5094,15 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast real-binary subprocess integration: the real `hooks install --agent codex`, an isolated Codex home, a seeded durable deck, and a deterministic `codex app-server` stand-in.
 - **Agent:** `hooks.json` seeded with three user rules under `PreToolUse`; `[hooks.state]` seeded with two deck-hash records at positions the stand-in does not list — `pre_tool_use:2:0`, which the file holds, and `pre_tool_use:9:0`, which it does not; the listing names only the deck's hook, so the sweep runs.
 - **Asserts:** the record at `2:0` survives and the one at `9:0` is removed — the shape a listing taken before a concurrent deck process rewrote `hooks.json` and trusted a new position produces, where the listing alone would call the fresh record stale. RED with the file check reverted.
-- **Does not assert:** a real concurrent process (the ordering argument is on `sweep_stale_deck_trust_records`); the lost update any two concurrent `config.toml` writers have, which predates the sweep.
+- **Does not assert:** a real concurrent process (the ordering argument is on `sweep_stale_deck_trust_records`); the lost update two concurrent `config.toml` writers used to have, which the cross-process lock closes (`codex/trust/008`).
 - **Platform coverage:** mac+linux (unix-only test file).
+
+##### codex/trust/008 — Concurrent deck processes recording Codex hook trust keep every record (issue #1493 follow-up).
+- **Layer:** L1/fast, real separate processes (`src/codex_hooks_manage.rs`): the test re-executes its own binary eight times, each child (`trust_race_child_writer`) recording twenty trust records through `edit_trust_state` into one shared temp Codex home.
+- **Agent:** none; the deck's trust write as eight starting Codex panes run it.
+- **Asserts:** all 160 `[hooks.state."<key>"]` records are in `config.toml` afterwards, and no `.tmp.` file is left beside it. RED before the fix: 127 of 160 records lost to a concurrent writer's rename.
+- **Does not assert:** Codex's own writes to `config.toml` (`/hooks` in its UI), which take no part in the deck's lock; the Claude and Devin writers, which share the lock helper (`agent_hook_config::lock_config`) and its unit tests (`the_config_lock_*`, `stale_temp_pid_recognises_only_the_deck_temp_shape`) but have no multi-process test of their own.
+- **Platform coverage:** mac+linux+windows.
 
 #### codex/spawn
 
