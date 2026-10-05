@@ -3699,6 +3699,7 @@ fn selector_voice_decks(
             address: None,
             local: false,
             unavailable: Some(voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
         },
         voice::VoiceDeckSelection {
             token: crate::settings::ALL_SELECTION_TOKEN.to_string(),
@@ -5876,7 +5877,7 @@ mod tests {
 
         // All daemons is a selection, not a daemon a new agent can start on:
         // named for the New agent dialog, it is refused with that reason.
-        let mut decks = voice_decks(&[], None);
+        let mut decks = voice_decks(&[], None, None);
         selector_voice_decks(Some(&section), &mut decks, None);
         let said = "new agent on all daemons";
         let resolver = voice::StubResolver::new().answering(

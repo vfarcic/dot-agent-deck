@@ -469,6 +469,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
@@ -505,6 +506,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: Some("ops@10.0.0.7".to_string()),
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+            holds_agents: false,
         },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-inmotion".to_string(),
@@ -512,6 +514,7 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: Some("ops@10.0.0.8".to_string()),
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+            holds_agents: false,
         },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says

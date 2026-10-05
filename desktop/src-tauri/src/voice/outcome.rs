@@ -2992,7 +2992,10 @@ fn names_another_daemon(
 ) -> bool {
     decks
         .iter()
-        .filter(|deck| !deck.holds_agents)
+        // All daemons is the Daemon selector's selection, not a daemon an
+        // agent can be on (#1491): "all" in "stop all the testers" is not
+        // another daemon.
+        .filter(|deck| !deck.holds_agents && deck.id != super::ALL_DECKS_ID)
         .flat_map(daemon_names)
         .any(|name| name.said_of(said, agents, qualified_only))
 }
@@ -4413,6 +4416,7 @@ mod tests {
             address: None,
             local: false,
             unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+            holds_agents: false,
         });
         assert!(matches!(
             resolve_deck_ref("all demons", &decks),
@@ -11282,6 +11286,7 @@ mod tests {
                 address: Some(address.to_string()),
                 local: false,
                 unavailable: None,
+                holds_agents: false,
             });
         }
         for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
