@@ -755,6 +755,20 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
 - **Platform coverage:** mac+linux+windows.
 
+
+##### status/agent-event/007 — An ATTESTED Pi report declaring prompt reports (`agent-event --reports-prompts`) makes only its own pane one that confirms its prompts; an attested report that declares nothing leaves its pane non-confirming (issue #1567).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon via `common::spawn_inprocess_daemon`, two Pi-typed `cat` stand-ins spawned through its attach socket (each exports its per-spawn hook capability token via `common::capability_export_command`), and the REAL `dot-agent-deck agent-event` CLI run as a subprocess with that pane's token. The daemon's broadcast is applied to a client `AppState`, standing in for an attached TUI.
+- **Agent:** synthetic (stand-in panes; the reports come from the real CLI).
+- **Asserts:** each broadcast frame carries `daemon_attested_owner` naming its own spawn; the declaring pane's frame answers `declares_prompt_reports()` / `reports_submitted_prompt()` true, and the pane reads `ConfirmationCapability::Reports` in the daemon's state and in the client; the non-declaring pane's frame answers false and the pane reads `CannotReport` in both.
+- **Does not assert:** the real Pi extension sending the flag (lane 2: `scheduler/pi/002`, `chain-smoke/pi/003`); what a confirming pane's delivery then does (`spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`).
+- **Platform coverage:** mac+linux.
+
+##### status/agent-event/008 — A Pi prompt-report declaration the hook-provenance gate does NOT attest grants nothing: an outside pane's token-less report, the same with a forged `daemon_attested_owner`, and a token-less report claiming a deck-spawned Pi pane (issue #1567, PR #1559's gate).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon, the REAL `agent-event` CLI with no token, and one raw JSON line written straight to the daemon's hook socket. The daemon's broadcast is applied to a client `AppState`.
+- **Agent:** synthetic (an outside pane the daemon never spawned, and a Pi-typed `cat` stand-in it did).
+- **Asserts:** the outside pane's CLI frame is broadcast `daemon_unproven` with no attested owner and declares nothing; the raw forged frame arrives with the producer's `daemon_attested_owner` STRIPPED and declares nothing; neither makes the outside pane `Reports` in the client or the daemon, and the daemon's outside card never records `prompt_reports_declared`; the token-less frame naming the deck-spawned Pi pane is refused (no broadcast within 1.5 s) and that pane is not `Reports`. RED with the attestation requirement removed from `AgentEvent::declares_prompt_reports`.
+- **Does not assert:** the same-uid residual `docs/develop/hook-provenance.md` names (a process that reads a deck agent's own token can speak for that pane); `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, under which a token-less frame for a deck pane is admitted but carries no attestation stamp, so it declares nothing by the same rule.
+- **Platform coverage:** mac+linux.
 #### status/supersede
 
 ##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
@@ -5246,6 +5260,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
 
+##### chain-smoke/pi/003 — A delegate's task pointer TYPED into an idle real `pi` worker is confirmed by the worker's own prompt report, and submitted exactly once (issue #1567).
+- **Layer:** L2 (in-process daemon; a real pi worker PTY via `AgentPtyRegistry::spawn_agent` with the bundled extension staged into its HOME; the daemon's event stream read through `common::EventSub::subscribe` on the in-process attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. No role config, so `handle_delegate` does not respawn the worker: the pointer is typed into the running pane, not handed over natively. The orchestrator side is the deterministic synthetic `DelegateSignal`, as in `chain-smoke/pi/002`.
+- **Agent:** REAL `pi` worker (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the worker's session-start report (`Idle`) carries `prompt_reports_declared`; after the delegate, a declared `Pi` `Thinking` report whose `user_prompt` is the `worker-task-coder.md` pointer arrives within 50 s (the proof the in-place re-delivery waits for); the worker creates `pi_delegate_sentinel_6b1c.txt` (`PI_DELEGATE_SENTINEL_OK`) and signals work-done; and until 10 s past the first re-delivery — pinned at 60 s with `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`, so it was still pending when the report arrived — no second report of the pointer's delivery id appears, so the report stopped the re-delivery.
+- **Does not assert:** a delegate into a BUSY pi worker (queued by pi as a steering message; the extension's `input` report is pinned by its TS unit tests); the `clear = true` native path (`chain-smoke/pi/002`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
+
 #### pane/drift
 
 ##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` survives the next session snapshot flush (issue #868).
@@ -6278,6 +6300,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the delegate/work-done chain (covered by `chain-smoke/pi/001`); the exact lifecycle→state mapping across running/waiting/finished (covered synthetically by `status/agent-event/003` and the TS unit tests); a dashboard-attached Pi pane (the synthetic dashboard render is `dashboard/pane/007`; the real-agent unattended path is the M4.2 value here).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap Haiku `-p` turn (and the status assertion resolves on boot, before the turn completes) — well under Decision 23's <$0.05/run bound.
+
+##### scheduler/pi/002 — A scheduled prompt the deck TYPES into an interactive real `pi` pane is confirmed by Pi's own prompt report, so a Pi pane is a prompt-confirming agent (issue #1567).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, `DOT_AGENT_DECK_SCHEDULES` pointing at a one-schedule fixture and `DOT_AGENT_DECK_LOG` at a file in the test's scratch dir; the fire is a `RunNow` over the attached deck's own attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. The schedule's `command` is an INTERACTIVE `pi --provider anthropic --model claude-haiku-4-5 --approve` (no prompt on the command line) and its `prompt` is the directive, so the prompt goes through the daemon's spawn-time PTY delivery (`crate::spawn`) rather than a native `get-seed` hand-off. The bundled extension comes from the daemon-startup auto-materialize. Records a `.cast`, but is not marked for the reel.
+- **Agent:** REAL `pi` (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the Pi pane's card on the attached TUI's grid shows `Prmt:` (the typed-in prompt, which only Pi's own report puts there); the deck log records `prompt delivery confirmed by the agent's submitted prompt` and never `delivery cannot be confirmed by this agent` (the delivery treated the Pi pane as confirming, and was confirmed); pi creates `pi_confirm_sentinel_3a7f.txt` with `PI_CONFIRM_SENTINEL_OK`. Prints the write → confirmation latency and the re-submission count from the log, as evidence for Pi's confirmation-latency floor.
+- **Does not assert:** whether the first write landed or a re-submission was needed (both end confirmed; the count is printed); the exact prompt text on the card (cut to the card's width); an older extension keeping the old behaviour (fast tier: `spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`, `tests/pi_agent_event_cli.rs`); a prompt queued while pi is busy (the extension's `input` report is pinned by its TS unit tests).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one short Haiku turn (create a file) — well under Decision 23's <$0.05/run bound.
 
 #### scheduler/reuse
 

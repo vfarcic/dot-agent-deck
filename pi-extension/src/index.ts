@@ -28,11 +28,10 @@ import {
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
+	createReporter,
 	createSerialQueue,
+	DeckExecError,
 	execFailureMessage,
-	isAgentState,
-	isUnsupportedFlagFailure,
-	legacyAgentEventArgv,
 	piEventReport,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
@@ -68,16 +67,6 @@ async function runDeck(
 		throw new DeckExecError(failure, outcome);
 	}
 	return outcome;
-}
-
-/** A non-zero exit from the deck CLI, keeping the exec result it came from. */
-class DeckExecError extends Error {
-	readonly outcome: { code: number; stdout: string; stderr: string };
-
-	constructor(message: string, outcome: { code: number; stdout: string; stderr: string }) {
-		super(message);
-		this.outcome = outcome;
-	}
 }
 
 export default function orchestratorExtension(pi: ExtensionAPI): void {
@@ -141,45 +130,23 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// down) must never break the agent loop, so failures are swallowed here —
 	// unlike the tools above, which surface errors to the LLM.
 	//
-	// `legacyCli` is set once a CLI has refused the detail flags as unknown
-	// (`isUnsupportedFlagFailure`) and accepted the bare lifecycle argv — an
-	// older deck (see `legacyAgentEventArgv`). From then on only lifecycle
-	// reports are sent, bare, so status keeps working and no report is spent on
-	// a flag that CLI cannot read. Any other failure (no daemon, a transient
-	// socket error) still gets the bare retry for that one report but leaves
-	// the session's detail reporting on.
-	let legacyCli = false;
-	// Every report, with its retry, runs to completion before the next one
+	// Every report starts out carrying the detail and the prompt-report
+	// declaration (issue #1567) and steps down only when the deck's CLI refuses
+	// a flag as unknown — an older deck; see `createReporter`. A deck that
+	// predates the declaration still gets the detail, and one that predates the
+	// detail still gets the status.
+	const reporter = createReporter((argv, signal) => runDeck(pi, argv, signal));
+	// Every report, with its retries, runs to completion before the next one
 	// starts, so the deck receives them in the order Pi emitted them.
 	const inOrder = createSerialQueue();
 	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> =>
-		inOrder(() => reportNow(eventName, event, ctx));
-	const reportNow = async (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
-		const decided = piEventReport(eventName, event, ctx.cwd);
-		if (!decided) {
-			return;
-		}
-		const fallback = legacyAgentEventArgv(decided);
-		if (legacyCli) {
-			if (isAgentState(decided.type)) {
-				await runDeck(pi, fallback ?? buildAgentEventArgv(decided.type), ctx.signal).catch(() => {});
+		inOrder(async () => {
+			const decided = piEventReport(eventName, event, ctx.cwd);
+			if (!decided) {
+				return;
 			}
-			return;
-		}
-		try {
-			await runDeck(pi, buildAgentEventArgv(decided.type, decided.detail), ctx.signal);
-		} catch (err) {
-			// Best-effort. Retry a lifecycle report the way an older CLI reads it.
-			if (fallback) {
-				try {
-					await runDeck(pi, fallback, ctx.signal);
-					legacyCli = err instanceof DeckExecError && isUnsupportedFlagFailure(err.outcome);
-				} catch {
-					// Intentionally ignored — card reporting is best-effort.
-				}
-			}
-		}
-	};
+			await reporter.send(decided, ctx.signal);
+		});
 
 	// --- PRD #201: NATIVE prompt delivery on session_start ----------------
 	// Pull the seed/prompt the daemon prepared for this pane (`get-seed`) and,
@@ -225,6 +192,13 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// end can never reach the deck ahead of its start.
 	pi.on("before_agent_start", async (event, ctx) => {
 		await report("before_agent_start", event, ctx);
+	});
+	// Issue #1567: a prompt submitted while Pi is busy is queued and never
+	// reaches `before_agent_start`; `piEventReport` reports exactly that
+	// `input` and ignores every other. Returns nothing, so Pi carries on with
+	// the input unchanged.
+	pi.on("input", async (event, ctx) => {
+		await report("input", event, ctx);
 	});
 	pi.on("agent_start", async (event, ctx) => {
 		await report("agent_start", event, ctx);
