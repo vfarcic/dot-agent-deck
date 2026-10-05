@@ -2878,10 +2878,17 @@ fn quotes_last_prompt(spoken: &str, agent: &DesktopAgent) -> bool {
     // The model is shown the prompt cut at `LAST_PROMPT_CHARS`, usually
     // inside a word ("resiz…"), and may quote it back that way (Qodo on PR
     // #1529): every word but the last must match, the last may be cut short.
+    // Only a quote that SAYS it was cut, with the ellipsis it was shown with:
+    // otherwise "Fix the cat" would also reach "Fix the catalogue".
+    let cut = spoken.trim_end().ends_with('\u{2026}');
     quoted.len() >= QUOTED_PROMPT_WORDS
         && prompt.len() >= quoted.len()
         && prompt.starts_with(whole)
-        && prompt[whole.len()].starts_with(last.as_str())
+        && if cut {
+            prompt[whole.len()].starts_with(last.as_str())
+        } else {
+            prompt[whole.len()] == *last
+        }
 }
 
 /// The fewest characters of a facet, quoted back cut short, that still name
@@ -7808,6 +7815,17 @@ mod tests {
         assert!(matches!(
             resolve_agent_ref_on(&format!("{}\u{2026}", "x".repeat(79)), &with_long, &decks()),
             AgentRefMatch::One { id, .. } if id == "13"
+        ));
+        // Without the ellipsis a quote is held to whole words: "Fix the cat"
+        // reaches the cat, not the catalogue too.
+        let mut cat = agent("16", Some("Cat"), "codex");
+        cat.last_user_prompt = Some("Fix the cat".to_string());
+        let mut catalogue = agent("17", Some("Catalogue"), "codex");
+        catalogue.last_user_prompt = Some("Fix the catalogue".to_string());
+        let pets = vec![cat, catalogue];
+        assert!(matches!(
+            resolve_agent_ref_on("Fix the cat", &pets, &decks()),
+            AgentRefMatch::One { id, .. } if id == "16"
         ));
         // A recency word is an order, not a fact: beside an agent called
         // "newest", "open the newest agent in billing" still opens Juno.
