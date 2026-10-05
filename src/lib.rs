@@ -12,6 +12,8 @@ pub mod codex_rollout_tail;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;
+// PRD #1487: refuses agent-config writes outside an owned root in a test process.
+pub mod config_write_guard;
 pub mod connect;
 pub mod daemon;
 pub mod daemon_attach;

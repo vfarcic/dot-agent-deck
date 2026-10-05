@@ -107,15 +107,15 @@ const OBSERVED_READINESS_DELIVERY_CEILING: Duration = Duration::from_secs(10);
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
+    previous: Vec<(String, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    fn set(values: &[(&'static str, &str)]) -> Self {
+    fn set(values: &[(&str, &str)]) -> Self {
         common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let mut previous = Vec::with_capacity(values.len());
         for (key, value) in values {
-            previous.push((*key, std::env::var_os(key)));
+            previous.push(((*key).to_string(), std::env::var_os(key)));
             // SAFETY: a stated residual — see `ENV_LOCK` for the threads that
             // exist here. The caller holds that lock for the guard's lifetime.
             unsafe { std::env::set_var(key, value) };
@@ -134,11 +134,11 @@ impl EnvGuard {
     /// has almost certainly left one behind, which would silently floor the very
     /// skip the caller is measuring.
     #[cfg(unix)]
-    fn unset(keys: &[&'static str]) -> Self {
+    fn unset(keys: &[&str]) -> Self {
         common::env_write::assert_no_tokio_runtime("EnvGuard::unset");
         let mut previous = Vec::with_capacity(keys.len());
         for key in keys {
-            previous.push((*key, std::env::var_os(key)));
+            previous.push(((*key).to_string(), std::env::var_os(key)));
             // SAFETY: as in `EnvGuard::set`.
             unsafe { std::env::remove_var(key) };
         }
@@ -315,6 +315,19 @@ async fn advance_and_run(duration: Duration) {
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
+    let owned_contents;
+    let contents = if path.file_name().is_some_and(|name| name == "codex") {
+        // Execute this check on the stand-in itself, including every respawn;
+        // checking only the parent SpawnOptions would miss lost inherited env.
+        owned_contents = contents.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n[ -n \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\" ] || { echo FIXTURE-ROOT-MISSING >&2; exit 93; }\nfor value in \"$HOME\" \"$CODEX_HOME\" \"$XDG_CONFIG_HOME\"; do\ncase \"$value\" in \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\"/*) ;; *) echo FIXTURE-HOME-ESCAPE >&2; exit 93 ;; esac\ndone\n",
+            1,
+        );
+        owned_contents.as_str()
+    } else {
+        contents
+    };
     std::fs::write(path, contents).expect("write synthetic agent executable");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod synthetic agent executable");
@@ -331,6 +344,43 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
         deck_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+/// Pin every agent-config destination in the initial spawn's saved environment;
+/// the registry carries this same environment into replacement/respawn launches.
+#[cfg(unix)]
+fn owned_wrapped_agent_env(
+    root: &std::path::Path,
+    mut env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let home = root.join("agent-home");
+    let codex = home.join(".codex");
+    let xdg = home.join(".config");
+    for dir in [&home, &codex, &xdg] {
+        std::fs::create_dir_all(dir).expect("create owned wrapped-agent home");
+    }
+    let installed = home.join(".local/bin/dot-agent-deck");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    write_executable(&installed, "#!/bin/sh\nexit 0\n");
+    for (key, path) in [
+        ("HOME", home.clone()),
+        ("CODEX_HOME", codex),
+        ("XDG_CONFIG_HOME", xdg),
+        ("CLAUDE_CONFIG_DIR", home.join(".claude")),
+        ("DEVIN_CONFIG_DIR", home.join(".config/devin")),
+        ("PI_CODING_AGENT_DIR", home.join(".pi/agent")),
+        (
+            "DOT_AGENT_DECK_STATE_DIR",
+            home.join(".local/state/dot-agent-deck"),
+        ),
+        ("DOT_AGENT_DECK_TEST_CONFIG_ROOT", root.to_path_buf()),
+    ] {
+        debug_assert!(path.starts_with(root), "{key} escaped the owned fixture");
+        env.retain(|(existing, _)| existing != key);
+        env.push((key.to_string(), path.display().to_string()));
+    }
+    env.push(("DOT_AGENT_DECK_TEST_CONFIG_WRITE".into(), "1".into()));
+    env
 }
 
 #[cfg(unix)]
@@ -958,14 +1008,17 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped Codex stand-in");
@@ -1681,14 +1734,17 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped ready stand-in");
@@ -1995,14 +2051,17 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped interface-fact stand-in");
@@ -2459,6 +2518,15 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
         (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
         ("PATH", &path),
     ]);
+    // SpawnRequest has no per-child config environment. The outer test holds
+    // ENV_LOCK, so pin the ambient homes for this entire scheduled spawn run —
+    // set here, before the runtime exists, like every other guard (issue #1516).
+    let homes = owned_wrapped_agent_env(cwd.path(), Vec::new());
+    let values: Vec<(&str, &str)> = homes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let _homes = EnvGuard::set(&values);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -2640,10 +2708,13 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped worker");

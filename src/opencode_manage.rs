@@ -548,19 +548,36 @@ export default DotAgentDeckPlugin;
 /// upgrade migrates the layout in place. Shared by every install path
 /// (auto + explicit + test seam).
 fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
+    write_plugin_reporting(root, binary_path).map(|(path, _)| path)
+}
+
+/// [`write_plugin`], also reporting whether anything on disk changed. A plugin
+/// already holding exactly these bytes, with no stale nested layout beside it,
+/// is left untouched — same bytes, inode and mtime (PRD #1487).
+fn write_plugin_reporting(root: &Path, binary_path: &str) -> std::io::Result<(PathBuf, bool)> {
     let plugin_dir = root.join("plugin");
+    let path = plugin_file(root);
+    let stale = stale_plugin_dir(root);
+    // PRD #1487: before the directory, the stale-layout removal and the temp
+    // file. The stale directory sits beside the plugin, so it is judged too.
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    crate::config_write_guard::ensure_config_write_allowed(&stale)?;
+
+    let content = plugin_template(binary_path);
+    if !stale.is_dir() && std::fs::read(&path).is_ok_and(|existing| existing == content.as_bytes())
+    {
+        return Ok((path, false));
+    }
+
     std::fs::create_dir_all(&plugin_dir)?;
 
     // Migrate away from the pre-flat nested layout OpenCode never scanned.
     // Best-effort: a failure to remove the dead dir must not abort the install
     // of the working flat file.
-    let stale = stale_plugin_dir(root);
     if stale.is_dir() {
         let _ = std::fs::remove_dir_all(&stale);
     }
 
-    let path = plugin_file(root);
-    let content = plugin_template(binary_path);
     // PRD #381 audit, MEDIUM-2. This was `std::fs::write`, the only one of the
     // four config writers not publishing atomically — and the file it writes is
     // JavaScript OpenCode *executes*. `fs::write` follows a pre-created symlink
@@ -571,7 +588,7 @@ fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
     // one in is what puts the OpenCode plugin behind that fix too.)
     crate::agent_hook_config::write_atomic(&plugin_dir, &path, content.as_bytes())?;
 
-    Ok(path)
+    Ok((path, true))
 }
 
 /// The `BINARY_PATH` an already-installed plugin under `root` pins, or `None`
@@ -614,6 +631,8 @@ fn existing_binary_path(root: &Path) -> Option<String> {
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
 /// a line naming what was removed. A missing path is reported, not an error.
 fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
+    // PRD #1487: a removal is a write too, and is refused the same way.
+    crate::config_write_guard::ensure_config_write_allowed(path)?;
     if !path.exists() {
         println!("No OpenCode plugin found to remove.");
         return Ok(());
@@ -663,15 +682,30 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
             Some(_) => (binary_path.to_string(), true),
             None => (binary_path.to_string(), false),
         };
-        match write_plugin(root, &pinned) {
+        match write_plugin_reporting(root, &pinned) {
+            // Already current: nothing was written, so nothing is announced.
+            Ok((_, false)) => {}
             // Repair logs what it changed: silently mutating global config is
             // the same class of thing that caused this bug.
-            Ok(path) if repairing => tracing::info!(
-                "repaired the OpenCode plugin at {}: its BINARY_PATH was not a usable \
-                 durable path, now pinned to {pinned}",
-                path.display()
+            Ok((path, true)) if repairing => {
+                tracing::info!(
+                    "repaired the OpenCode plugin at {}: its BINARY_PATH was not a usable \
+                     durable path, now pinned to {pinned}",
+                    path.display()
+                );
+                crate::agent_hook_config::log_auto_install_change(
+                    "opencode",
+                    &path,
+                    &pinned,
+                    "opencode startup auto-install",
+                );
+            }
+            Ok((path, true)) => crate::agent_hook_config::log_auto_install_change(
+                "opencode",
+                &path,
+                &pinned,
+                "opencode startup auto-install",
             ),
-            Ok(path) => tracing::info!("auto-installed OpenCode plugin: {}", path.display()),
             Err(e) => tracing::warn!(
                 "auto-install: failed to write OpenCode plugin under {}: {e}",
                 root.display()
@@ -798,10 +832,100 @@ pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[cfg(unix)]
     use spec::spec;
+
+    #[cfg(unix)]
+    pub(crate) fn config_test_install(root: &Path) -> std::io::Result<()> {
+        install_to_roots(
+            &[],
+            || root.to_path_buf(),
+            "/opt/dot-agent-deck",
+            &mut Vec::new(),
+        )
+    }
+
+    /// Scenario: Install the same OpenCode plugin explicitly a second time. Its bytes, inode and mtime stay unchanged, and repeated removal leaves the missing file absent.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_opencode_explicit_install_preserves_file() {
+        check_no_op_opencode_install(false);
+    }
+
+    /// Scenario: Automatically install an already current OpenCode plugin. The file keeps its bytes, inode and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_opencode_automatic_install_preserves_file() {
+        check_no_op_opencode_install(true);
+    }
+
+    #[cfg(unix)]
+    fn check_no_op_opencode_install(automatic: bool) {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home/.config/opencode");
+        let binary = fixture.path().join("installed/dot-agent-deck");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            &binary,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let binary = binary.to_str().unwrap();
+        let path = write_plugin(&root, binary).unwrap();
+        {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456),
+                    ),
+                )
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            if automatic {
+                auto_install_to(std::slice::from_ref(&root), binary);
+            } else {
+                install_to_roots(
+                    std::slice::from_ref(&root),
+                    || unreachable!(),
+                    binary,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                (after.ino(), after.mtime(), after.mtime_nsec()),
+                (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+                "OpenCode no-op install must preserve inode and mtime (automatic={automatic})"
+            );
+        }
+        uninstall_from(&path).unwrap();
+        let parent_before = std::fs::metadata(path.parent().unwrap()).unwrap();
+        uninstall_from(&path).unwrap();
+        let parent_after = std::fs::metadata(path.parent().unwrap()).unwrap();
+        assert_eq!(
+            (
+                parent_after.ino(),
+                parent_after.mtime(),
+                parent_after.mtime_nsec()
+            ),
+            (
+                parent_before.ino(),
+                parent_before.mtime(),
+                parent_before.mtime_nsec()
+            )
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn plugin_template_uses_exec_file_sync() {

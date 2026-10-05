@@ -191,6 +191,8 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 
 The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
 
+The deck keeps one entry of its own per hook event. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`, or the desktop app's bundled copy and a CLI), whichever copy installs last replaces the other's entries where they are, rather than adding a second set; your own hooks, and their order, are left alone. To choose which copy the hooks call, run `dot-agent-deck hooks install` from that copy. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
+
 To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
 
 ```bash

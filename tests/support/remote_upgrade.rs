@@ -267,6 +267,7 @@ impl Remote {
                     agent_type: None,
                     seed: None,
                     authoring_kind: None,
+                    remember_command: false,
                 },
             )
             .unwrap();

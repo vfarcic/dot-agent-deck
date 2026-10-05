@@ -681,13 +681,15 @@ fn self_heal_judges_an_exe_suffixed_pin_by_the_platforms_own_convention() {
     }
 }
 
-/// The safety property that makes self-heal tolerable: a deck rule whose path
-/// EXISTS but differs from what would be written is left alone. PRD #381 Open
-/// Question 3 — the trigger is "the target is missing", never "the target is
-/// not what I would have written", because the second reading is what would let
-/// a startup silently repoint a developer's or a user's deliberate choice.
+/// One deck entry per event (PRD #1487), which reverses PRD #381 Open Question
+/// 3's "leave a still-valid different deck path alone": a second live install's
+/// rule is replaced in place by the durable one rather than kept beside it,
+/// because two rules deliver every hook event twice and an added rule is a new
+/// untrusted hook Codex holds every start on. The replaced command must be the
+/// deck's own shape under the deck's basename; a user's command is never
+/// touched (see the consolidation tests in `agent_hook_config`).
 #[test]
-fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
+fn self_heal_replaces_a_different_still_valid_deck_path_in_place() {
     let fixture = Fixture::new();
     let home = fixture.home();
     let artifact = fixture.build_artifact();
@@ -716,12 +718,14 @@ fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
 
     let commands = deck_commands(&settings, CLAUDE_SUFFIX);
     assert!(
-        commands.contains(&other_command),
-        "an existing, still-valid deck path was rewritten: {commands:?}"
+        !commands.contains(&other_command),
+        "a second deck install's rule must be replaced, not kept beside the new one: {commands:?}"
     );
+    let durable_command = format!("{} {CLAUDE_SUFFIX}", durable.display());
     assert!(
-        commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
-        "the durable rule was not added alongside it: {commands:?}"
+        commands.contains(&durable_command)
+            && commands.iter().all(|command| *command == durable_command),
+        "every deck rule must now call the durable binary: {commands:?}"
     );
 }
 

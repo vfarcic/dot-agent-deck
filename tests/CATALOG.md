@@ -2397,12 +2397,37 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
 - **Platform coverage:** linux.
 
-##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
+##### hooks/install/006 — The unattended startup install consolidates valid deck pins while keeping user handlers at their existing indices.
 - **Layer:** L2.
 - **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
-- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The two events diverge on WHERE the deck's command ends up, which is issue #1034 — under the installed event it is refreshed at the index it already occupied, the array gains no rule, and the user's handler stays at `…:0:1`; under the retired event, where there is nothing to refresh it with, it is swept out of the user's rule as before and that event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Asserts:** real startup consolidates the installed `PreToolUse` event to one current deck command, refreshing it in place while the user's handler stays at `…:0:1` with its matcher. A second valid deck pin is removed from that installed event. Under retired `SessionEnd`, the user's handler and the other installation's existing rule survive the current installation's retired-event sweep.
 - **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
 - **Platform coverage:** linux.
+
+#### hooks/containment
+
+##### hooks/containment/001 — A real Codex wrapper writes only its sandbox home, and repeat startup leaves current definitions untouched.
+- **Layer:** L2, lane 1 (real binary with a pane id, piped input/output).
+- **Agent:** none (`/bin/true` stands in for the wrapped child).
+- **Asserts:** hooks are installed in an owned sandbox and name its installed binary; a second automatic install preserves bytes, inode and mtime. Separate fake operator Codex, Claude, Devin, OpenCode and Pi files preserve bytes, inode and mtime.
+- **Does not assert:** real Codex trust screens, PTY rendering, or model execution.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/002 — A test-marked real wrapper without an owned root refuses before directory creation.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** omitting the owned root creates no Codex home, temporary file or backup; separate fake operator configs are unchanged.
+- **Does not assert:** a fatal wrapper exit; automatic installation may warn and continue to its child.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/003 — A CODEX_HOME override cannot escape the wrapper's owned root through a symlink.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a symlink from the sandbox to a separate fake operator home cannot rewrite hooks or trust config, create a backup or leave a temporary file. All fake operator configs keep bytes, inode and mtime.
+- **Does not assert:** other agents' environment overrides (covered by the shared config-writer unit tests), races replacing symlinks during a write, or a real agent trust dialog.
+- **Platform coverage:** mac+linux.
+
+#### hooks/install (continued)
 
 ##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
 - **Layer:** fast real-binary-subprocess integration (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`; no PTY, no daemon, no LLM, no `e2e` feature gate).
@@ -5370,14 +5395,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/008 — A surplus copy of this binary's own deck rule is dropped without moving the user (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and keeps the vacated rule object in place as an empty one so no later index moves.
-- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test.
+- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and drops the vacated rule because it is trailing, so nothing after it moves (PRD #1487; an interior vacated rule is kept as an empty one, pinned by `agent_hook_config`'s consolidation unit tests).
+- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test, whose vacated rule is trailing and therefore dropped.
 - **Platform coverage:** mac+linux.
 
 ##### codex/hooks/009 — A legacy flat deck rule is swept without disturbing the nested ones (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves. Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
+- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx`, and the trailing rule the flat command vacated is dropped, which moves nothing (PRD #1487). Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
 - **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex would index a handler inside a flat rule if it ever supported one (it lists none today, which is why that shape claims nothing).
 - **Platform coverage:** mac+linux.
 

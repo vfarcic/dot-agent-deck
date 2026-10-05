@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 use serde_json::{Value, json};
 
 use crate::agent_hook_config::{
-    binary_names_match, executables_match, pin_is_same_named, rule_command_strs,
-    strip_deck_commands, unquote_if_needed,
+    binary_names_match, executables_match, rule_command_strs, strip_deck_commands,
+    unquote_if_needed,
 };
 // Exercised only by this module's own tests, which drive the platform-convention
 // arithmetic with both hosts' conventions injected (see `binary_names_match_under`).
@@ -458,6 +458,8 @@ fn load_settings_or_refuse(path: &Path) -> io::Result<Value> {
 /// inside the window between the truncate and the write sees an empty file; a
 /// crash between them leaves one on disk permanently.
 fn write_settings(path: &Path, settings: &Value) -> io::Result<()> {
+    // PRD #1487: before the directory and the temp file exist.
+    crate::config_write_guard::ensure_config_write_allowed(path)?;
     if let Some(parent) = path.parent() {
         // `create_dir_all("")` is a documented no-op, so a bare relative
         // filename (whose parent is `""`) needs no special case here.
@@ -541,6 +543,8 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
+    // Removes the temp file on every early return and on unwind (PRD #1487).
+    let mut cleanup = crate::agent_hook_config::TempFileGuard::new(tmp.clone());
 
     let published = (|| {
         #[cfg(unix)]
@@ -556,10 +560,8 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     })();
 
     drop(file);
-    if let Err(e) = published.and_then(|()| std::fs::rename(&tmp, dest)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    published.and_then(|()| std::fs::rename(&tmp, dest))?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -699,40 +701,21 @@ fn ensure_hook_array<'a>(
         .unwrap()
 }
 
-/// What one [`install_impl`] pass did: which hook types got a fresh rule, which
-/// were already current, and how many deck-owned commands it removed as stale.
+/// What one [`install_impl`] pass did: which hook types it changed, which were
+/// already current, and how many deck-owned commands it removed.
 ///
-/// `repaired` is what makes PRD #381 M4's self-heal *observable*, and it is not
-/// cosmetic. `auto_install` returns early when nothing was installed — and a
-/// settings file holding BOTH a dead deck rule and the current one lands in
-/// exactly that state: the dead rule is pruned in memory, every hook type
-/// reports `skipped`, and the repair is then dropped on the floor instead of
-/// being written. Counting the prune separately is what gets it published, and
-/// logged.
+/// `repaired` is what makes PRD #381 M4's self-heal *observable* in the log.
+/// Whether anything is published is decided by comparing the settings before
+/// and after the pass instead (PRD #1487), so a pass that only pruned is still
+/// written and a pass that changed nothing is not.
 struct InstallOutcome {
     installed: Vec<&'static str>,
     skipped: Vec<&'static str>,
-    /// Deck-owned commands removed as stale: a rule whose binary is positively
-    /// gone ([`command_is_dead_deck`]), or any deck rule left under a hook type
-    /// the deck no longer installs. Never a user-authored command — both
-    /// predicates are gated on deck ownership first.
+    /// Deck-owned commands removed: a duplicate install's command
+    /// consolidated away, a stale pin, or any deck rule left under a hook type
+    /// the deck no longer installs. Never a user-authored command — every
+    /// predicate is gated on deck ownership first.
     repaired: usize,
-    /// Issue #1171: live deck rules for the same binary NAME at a different
-    /// path, which this install LEAVES IN PLACE and which therefore each
-    /// deliver the same hook event.
-    ///
-    /// Reported rather than pruned, deliberately.
-    /// `hook_rule_identification_011` pins the opposite policy — two on-disk
-    /// builds sharing a basename are distinct deployments and each keep their
-    /// rule — so collapsing them here would overturn a documented property
-    /// rather than fix a bug. What was actually wrong is that it happened in
-    /// silence: `remote add` on a host that already had the deck installed
-    /// produced two rules per event, and the only hint was `hooks uninstall`
-    /// later reporting twice the expected count.
-    ///
-    /// Sorted and de-duplicated across hook types, so a reader sees each other
-    /// install once rather than ten times.
-    coexisting: std::collections::BTreeSet<String>,
 }
 
 fn install_impl(
@@ -750,7 +733,6 @@ fn install_impl(
     // Claude Code that no longer accepts it (a downgrade), which would
     // otherwise switch off every hook in the file.
     let mut repaired = 0usize;
-    let mut coexisting = std::collections::BTreeSet::new();
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
         if !hook_types.contains(&key.as_str()) {
@@ -773,51 +755,54 @@ fn install_impl(
 
     for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
-
-        // Prune STALE deck-owned rules sharing the installing binary's own
-        // basename — the shape N worktree builds actually take: every
-        // `target/debug/dot-agent-deck` is a distinct real path with the SAME
-        // basename, so a rebuilt or removed worktree leaves a dead rule with
-        // that basename behind, and a fresh install from a surviving worktree
-        // is the natural point to drop it. Scoped narrowly two ways: (1) only
-        // rules ALREADY identified as deck-owned by `rule_is_ours` — never a
-        // general "delete anything pointing at a missing path" sweep, which
-        // would delete a user's own hooks for tools that simply are not
-        // installed right now (test 014's coexisting `nonexistent-tool` rule);
-        // (2) only rules whose basename matches the CURRENTLY installing
-        // binary's basename — a genuinely different-looking deck binary
-        // installed under a fictional/not-yet-real path (as most of this
-        // file's fixtures are) must not be swept up just because it happens
-        // not to exist on disk (test 003 pins this: installing `/b/…` must
-        // never prune `/a/…`'s unrelated rule).
-        repaired += strip_deck_commands(rules, |cmd| command_is_dead_deck(cmd, binary_path));
+        let before = rules.clone();
+        let deck_commands_before = rule_command_strs(rules)
+            .into_iter()
+            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .count();
 
         let expected = make_rule(binary_path, hook_type);
+        let command = expected["hooks"][0]["command"]
+            .as_str()
+            .expect("make_rule writes a command")
+            .to_string();
 
-        let already_current = rules.iter().any(|rule| rule == &expected);
-
-        // Normalize down to a single fresh rule, but only for THIS binary —
-        // leave rules belonging to a genuinely different deck binary alone —
-        // except a LEGACY rule under the historical default name, which always
-        // migrates to whichever binary is currently installing.
-        let removed = strip_deck_commands(rules, |cmd| command_matches_binary(cmd, binary_path));
-
-        // Issue #1171: whatever deck rules survived that strip and name the
-        // same binary as us are other installs of the deck, alive and at
-        // another path. They are left alone (see `coexisting`), but they are no
-        // longer left unmentioned.
-        for command in rule_command_strs(rules) {
-            if let Some(exe) = owned_command_executable(command)
-                && !executables_match(&exe, binary_path)
-                && pin_is_same_named(&exe, binary_path)
-            {
-                coexisting.insert(exe);
+        // ONE deck rule per hook type (PRD #1487), shared with the Codex and
+        // Devin writers: the first deck command — this binary's, a legacy
+        // rule, or any other install of the deck under its basename, live or
+        // dead — is refreshed where it sits and every other copy is
+        // consolidated away, leaving the user's handlers where they were.
+        // Before this, a second still-valid install kept its own rule and
+        // every hook event was delivered once per rule (issue #1171).
+        match crate::agent_hook_config::consolidate_deck_handlers_in_place(rules, &command, |cmd| {
+            command_is_deck_install(cmd, binary_path)
+        }) {
+            Some((rule_idx, _)) => {
+                // A rule holding only the deck's command is the deck's own:
+                // rewrite it whole so its `matcher` is the current one (the
+                // `Notification` rule carries one). A rule the user shares is
+                // left alone apart from the command.
+                let deck_only = rules[rule_idx]
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| handlers.len() == 1)
+                    && rules[rule_idx].get("command").is_none();
+                if deck_only {
+                    rules[rule_idx] = expected;
+                }
+            }
+            None => {
+                strip_deck_commands(rules, |cmd| command_is_deck_install(cmd, binary_path));
+                rules.push(expected);
             }
         }
 
-        rules.push(expected);
-
-        if already_current && removed == 1 {
+        let deck_commands_after = rule_command_strs(rules)
+            .into_iter()
+            .filter(|cmd| command_is_deck_install(cmd, binary_path))
+            .count();
+        repaired += deck_commands_before.saturating_sub(deck_commands_after);
+        if *rules == before {
             skipped.push(hook_type);
         } else {
             installed.push(hook_type);
@@ -828,7 +813,6 @@ fn install_impl(
         installed,
         skipped,
         repaired,
-        coexisting,
     }
 }
 
@@ -1048,6 +1032,19 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// begin with, the same way [`executables_match`]'s `canonicalize` call can
 /// already fail to resolve a path for reasons unrelated to the binary's
 /// health. That gap is unchanged by this fix.
+/// Whether an install by `binary_path` owns `command` under a hook type it
+/// installs (PRD #1487): this binary's command or a legacy rule
+/// ([`command_matches_binary`]), or any other install of the deck sharing its
+/// basename, live or dead
+/// ([`crate::agent_hook_config::is_replaceable_deck_install`]).
+fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
+    command_matches_binary(command, binary_path)
+        || owned_command_executable(command).is_some_and(|exe| {
+            crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path)
+        })
+}
+
+#[cfg(test)]
 fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
     // The no-basename fail-safe (an empty or `..`-terminated installing path,
     // or a non-UTF-8 one prunes nothing) lives in `pin_is_dead_sibling`. The
@@ -1145,12 +1142,12 @@ pub fn auto_install_to_gated(
             return;
         }
     };
+    let before = settings.clone();
     let outcome = install_impl(&mut settings, &binary_path, stop_failure());
 
-    // A pass that only PRUNED (a dead deck rule sitting beside the current one)
-    // installs nothing, and returning here on `installed.is_empty()` alone
-    // would drop that repair instead of publishing it — PRD #381 M4.
-    if outcome.installed.is_empty() && outcome.repaired == 0 {
+    // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
+    // still a change and is published — PRD #381 M4.
+    if settings == before {
         return;
     }
 
@@ -1158,6 +1155,12 @@ pub fn auto_install_to_gated(
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
         return;
     }
+    crate::agent_hook_config::log_auto_install_change(
+        "claude-code",
+        path,
+        &binary_path,
+        "claude-code startup auto-install",
+    );
 
     // Repair logs what it changed. Silently mutating global config is the same
     // class of thing that caused this bug, so a self-heal that leaves no trace
@@ -1206,40 +1209,21 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
+    let before = settings.clone();
     let InstallOutcome {
-        installed,
-        skipped,
-        coexisting,
-        ..
+        installed, skipped, ..
     } = install_impl(&mut settings, &binary_path, stop_failure);
 
-    write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    // Equal settings are not rewritten (PRD #1487).
+    if settings != before {
+        write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
 
     if !installed.is_empty() {
         println!("Installed hooks: {}", installed.join(", "));
     }
     if !skipped.is_empty() {
         println!("Already installed (skipped): {}", skipped.join(", "));
-    }
-    if !coexisting.is_empty() {
-        let (plural, verb) = if coexisting.len() == 1 {
-            ("", "has")
-        } else {
-            ("s", "have")
-        };
-        println!(
-            "Note: {} other dot-agent-deck install{plural} still {verb} hook rules here:",
-            coexisting.len()
-        );
-        for other in &coexisting {
-            println!("  {other}");
-        }
-        println!(
-            "  Every hook event is delivered once per rule, and all of them reach the same \
-             daemon, so the extra deliveries are redundant. To collapse them, run \
-             `dot-agent-deck hooks uninstall` and then `hooks install` from whichever \
-             install you want to keep."
-        );
     }
     if !stop_failure {
         let (major, minor, patch) = STOP_FAILURE_MIN_CLAUDE_VERSION;
@@ -1310,7 +1294,11 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
     let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
+    let before = settings.clone();
     install_impl(&mut settings, binary_path, stop_failure);
+    if settings == before {
+        return Ok(());
+    }
     write_settings(path, &settings)
 }
 
@@ -1523,73 +1511,36 @@ mod tests {
         ));
     }
 
-    /// Issue #1171: two LIVE deck installs sharing a basename at different
-    /// paths each keep a rule — and the install now says so instead of leaving
-    /// it silent.
-    ///
-    /// The exact shape found in the wild: a Mac with the deck from Homebrew,
-    /// then `remote add` installing a second copy under `~/.local/bin`. Ten
-    /// events ended up with two rules each, every hook was delivered twice, and
-    /// the only hint was a later `hooks uninstall` reporting 20 removals.
-    ///
-    /// Not macOS-specific in the slightest — it fires on any host that already
-    /// has the deck installed by any means (apt, nix, Homebrew, a manual copy).
-    /// It was merely found on a Mac.
-    ///
-    /// Both files are real and executable on purpose: a dead sibling is already
-    /// pruned by `command_is_dead_deck`, so the duplicate only survives when the
-    /// other install is genuinely alive, which is exactly the Homebrew case.
-    /// The rules are deliberately NOT collapsed here — see `InstallOutcome::coexisting`.
+    /// Scenario: Install Claude hooks from one live deck, then another at a different path. The second replaces the first and leaves exactly one command per event.
     #[test]
-    fn a_live_same_named_deck_at_another_path_is_reported_not_pruned() {
-        let a_dir = crate::test_temp::tempdir().expect("install a tempdir");
-        let b_dir = crate::test_temp::tempdir().expect("install b tempdir");
-        let a = a_dir.path().join(DEFAULT_BINARY_NAME);
-        let b = b_dir.path().join(DEFAULT_BINARY_NAME);
-        for path in [&a, &b] {
-            crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").expect("seed binary");
+    fn a_live_same_named_deck_at_another_path_replaces_the_previous_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let a = fixture.path().join("first/dot-agent-deck");
+        let b = fixture.path().join("second/dot-agent-deck");
+        for binary in [&a, &b] {
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            crate::test_isolation::write_script(binary, b"#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-            }
+            std::fs::set_permissions(
+                binary,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
         }
-        let (a, b) = (
-            a.to_str().expect("utf-8").to_string(),
-            b.to_str().expect("utf-8").to_string(),
-        );
-
         let mut settings = serde_json::json!({});
-        let first = install_impl(&mut settings, &a, false);
-        assert!(
-            first.coexisting.is_empty(),
-            "the first install has nothing to coexist with: {:?}",
-            first.coexisting
+        install_impl(&mut settings, a.to_str().unwrap(), false);
+        install_impl(&mut settings, b.to_str().unwrap(), false);
+        let commands = crate::agent_hook_config::rule_command_strs(
+            settings["hooks"]["PreToolUse"].as_array().unwrap(),
         );
-
-        let second = install_impl(&mut settings, &b, false);
-        assert_eq!(
-            second.coexisting.iter().cloned().collect::<Vec<_>>(),
-            vec![a.clone()],
-            "installing `{b}` must REPORT the live same-named deck still at `{a}`"
-        );
-
-        // Reported, not pruned: `hook_rule_identification_011` pins that these
-        // stay two distinct deployments, and this must not quietly reverse it.
-        let rules = settings["hooks"]["PreToolUse"]
-            .as_array()
-            .expect("PreToolUse rules");
-        let commands = crate::agent_hook_config::rule_command_strs(rules);
         assert_eq!(
             commands.len(),
-            2,
-            "both installs keep their rule; got {commands:?}"
+            1,
+            "one deck command per event: {commands:?}"
         );
-        assert!(
-            commands.iter().any(|c| c.starts_with(&a))
-                && commands.iter().any(|c| c.starts_with(&b)),
-            "one rule per install, not one replacing the other: {commands:?}"
+        assert_eq!(
+            commands[0],
+            format!("{} {HOOK_COMMAND_SUFFIX}", b.display())
         );
     }
 

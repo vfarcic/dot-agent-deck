@@ -175,12 +175,19 @@ fn build_command_for(
 /// publish lands is still the destination's own, applied by `fchmod`, which no
 /// umask filters.
 pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    // PRD #1487: before the temp file exists, so a refused test write leaves
+    // nothing behind. The temp sits in `dest`'s own directory, so judging
+    // `dest` judges it too.
+    crate::config_write_guard::ensure_config_write_allowed(dest)?;
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("config");
 
     let (mut file, tmp) = create_temp(dir, name)?;
+    // Removes the temp file on every early return AND on unwind; disarmed only
+    // once the rename has consumed it.
+    let mut cleanup = TempFileGuard::new(tmp.clone());
 
     // Everything after the create is fallible with a temp file already on disk,
     // so it runs in one closure and shares a single cleanup path. The previous
@@ -203,10 +210,8 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     })();
     drop(file);
 
-    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, dest)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    written.and_then(|()| std::fs::rename(&tmp, dest))?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -441,6 +446,40 @@ pub(crate) enum Backup {
     Failed,
 }
 
+/// Removes a publish's temp file when dropped, unless [`TempFileGuard::disarm`]
+/// ran first — so the temp goes on every returned error and on a panic between
+/// its creation and the rename (PRD #1487), not only on the error arms someone
+/// remembered to clean up after. A process killed outright still runs no
+/// destructor; nothing here sweeps such leftovers.
+pub(crate) struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// The temp file was renamed into place; there is nothing left to remove.
+    pub(crate) fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "could not remove the abandoned temp file {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Preserve `bytes` — the content of a config file that would not parse — beside
 /// the original as `<file name>.bak`, **unless that name is already taken**, and
 /// report what happened.
@@ -518,6 +557,11 @@ pub(crate) fn backup_malformed(dest: &Path, bytes: &[u8]) -> Backup {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
+    // PRD #1487: the same containment `write_atomic` applies, before the temp
+    // exists — a refused test write makes no copy and leaves nothing behind.
+    if crate::config_write_guard::ensure_config_write_allowed(&backup).is_err() {
+        return Backup::Failed;
+    }
 
     // The complete copy goes to an unpredictable temp first and is published
     // by `hard_link`, which is atomic and never replaces: it fails with
@@ -1065,10 +1109,545 @@ pub(crate) fn strip_deck_commands(
     removed
 }
 
+/// Whether `exe` — the unquoted executable of a command that already has the
+/// deck's hook-command shape — is a deck INSTALL the installing binary may
+/// replace: the same binary ([`executables_match`]), or any executable sharing
+/// its basename ([`pin_is_same_named`]), live or dead.
+///
+/// This is the "one deck entry per event" ownership test (PRD #1487), and it
+/// deliberately reverses issue #730's preserve-a-valid-sibling policy for the
+/// events an install writes: two installs of the deck (Homebrew's and
+/// `~/.local/bin`'s, a sidecar and a CLI, a build left on `$PATH`) each kept a
+/// rule, every hook event was delivered once per rule, and an added rule is a
+/// new untrusted hook Codex holds every start on until someone reviews it.
+///
+/// The identity check is the suffix shape plus the basename — the same gate
+/// dead-pin repair has used since PRD #381. It never matches a command naming a
+/// differently named executable, so a user's handler that merely ends with the
+/// deck's verb survives unless it also names a `dot-agent-deck` (or whatever
+/// the installing binary is called). Nothing is executed to verify it.
+pub(crate) fn is_replaceable_deck_install(exe: &str, binary_path: &str) -> bool {
+    executables_match(exe, binary_path) || pin_is_same_named(exe, binary_path)
+}
+
+/// Refresh the deck's command inside ONE event array **without moving any
+/// handler that is not the deck's**, and consolidate the deck's other copies in
+/// that array to the one it keeps (PRD #1487). Returns where the kept copy sits,
+/// or `None` when there is nothing to claim — no nested handler `is_own`
+/// accepts, or a legacy flat `{"command": …}` deck rule reached before any —
+/// and the caller then falls back to strip-then-append, which moves nothing that
+/// was not removed.
+///
+/// Shared by the Codex, Claude and Devin writers so the three apply one policy
+/// (CLAUDE.md rule 20). Position matters most to Codex, which keys a trust
+/// grant by `<event>:<group_idx>:<handler_idx>` (issue #1034 — the measurement
+/// is on `codex_hooks_manage::refresh_deck_rule_in_place`), so the rules below
+/// are written for it and cost the other two nothing:
+///
+/// - The FIRST own handler in walk order (rules in order, handlers in order) is
+///   claimed and its `command` overwritten in place; every other key on it, and
+///   the rule's `matcher`, are left as they are.
+/// - Every later own handler is removed **only from the tail of its rule**,
+///   where removing it shifts nothing. An own handler that a non-deck handler
+///   follows inside the same rule is kept and refreshed instead, because
+///   removing it would re-key the handler after it — so in that one shape a
+///   duplicate survives, and it runs the current deck rather than a stale pin.
+/// - A rule this pass emptied is dropped only when it is TRAILING; an interior
+///   one stays as an empty rule so every rule after it keeps its index (Codex
+///   accepts and ignores an empty rule — measured on 0.149.0).
+/// - A legacy flat own command after the claim is removed; the rule object
+///   stays unless it is trailing and was emptied by that.
+pub(crate) fn consolidate_deck_handlers_in_place(
+    rules: &mut Vec<Value>,
+    command: &str,
+    is_own: impl Fn(&str) -> bool,
+) -> Option<(usize, usize)> {
+    let own = |value: &Value| value.as_str().is_some_and(&is_own);
+
+    let mut claim = None;
+    'scan: for (rule_idx, rule) in rules.iter().enumerate() {
+        if let Some(handlers) = rule.get("hooks").and_then(Value::as_array) {
+            for (handler_idx, handler) in handlers.iter().enumerate() {
+                if handler.get("command").is_some_and(&own) {
+                    claim = Some((rule_idx, handler_idx));
+                    break 'scan;
+                }
+            }
+        }
+        if rule.get("command").is_some_and(&own) {
+            return None;
+        }
+    }
+    let (claimed_rule, claimed_handler) = claim?;
+
+    let mut emptied = vec![false; rules.len()];
+    for (rule_idx, rule) in rules.iter_mut().enumerate().skip(claimed_rule) {
+        let had_a_handler = rule_retains_a_handler(rule);
+        if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
+            while let Some(last_idx) = handlers.len().checked_sub(1) {
+                if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
+                    || !handlers[last_idx].get("command").is_some_and(&own)
+                {
+                    break;
+                }
+                handlers.pop();
+            }
+        }
+        if rule.get("command").is_some_and(&own)
+            && let Some(object) = rule.as_object_mut()
+        {
+            object.remove("command");
+        }
+        emptied[rule_idx] = had_a_handler && !rule_retains_a_handler(rule);
+    }
+
+    for rule in rules.iter_mut().skip(claimed_rule) {
+        let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for handler in handlers.iter_mut() {
+            if !handler.get("command").is_some_and(&own) {
+                continue;
+            }
+            let Some(object) = handler.as_object_mut() else {
+                continue;
+            };
+            object.insert("command".into(), Value::String(command.to_string()));
+            // Only when absent: an existing `type` is not ours to change.
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String("command".into()));
+        }
+    }
+
+    while rules.len() > claimed_rule + 1 && emptied[rules.len() - 1] {
+        rules.pop();
+    }
+    Some((claimed_rule, claimed_handler))
+}
+
+/// Log an automatic install that actually changed an agent's config (PRD
+/// #1487). A no-op logs nothing at info: what this records is that the deck
+/// rewrote somebody else's file, which is exactly what went unnoticed when test
+/// fixtures rewrote the operator's real Codex hooks.
+pub(crate) fn log_auto_install_change(
+    agent: &str,
+    destination: &Path,
+    binary: &str,
+    trigger: &str,
+) {
+    tracing::info!(
+        agent,
+        destination = %destination.display(),
+        binary,
+        trigger,
+        pid = std::process::id(),
+        process = %process_label(),
+        "auto-install changed agent hook config"
+    );
+}
+
+/// The deck subcommand this process is running (`daemon serve`, `wrap`, or the
+/// TUI when there is none), for [`log_auto_install_change`]. Only the leading
+/// words that are not flags — never an argument value that could carry a path
+/// or a secret.
+fn process_label() -> String {
+    let words: Vec<String> = std::env::args()
+        .skip(1)
+        .take_while(|arg| !arg.starts_with('-'))
+        .take(2)
+        .filter(|arg| arg.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        .collect();
+    if words.is_empty() {
+        "tui".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn config_fingerprint(path: &Path) -> (Vec<u8>, u64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).expect("stat fixture config");
+        (
+            std::fs::read(path).expect("read fixture config"),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn install_config(agent: &str, home: &Path, binary: &str) -> io::Result<()> {
+        match agent {
+            "codex" => crate::codex_hooks_manage::install_to(home, binary),
+            "claude-code" => crate::hooks_manage::install_to(&home.join("settings.json"), binary),
+            "devin" => crate::devin_hooks_manage::install_to(home, binary),
+            _ => panic!("unknown fixture agent"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn uninstall_config(agent: &str, home: &Path) -> io::Result<()> {
+        match agent {
+            "codex" => crate::codex_hooks_manage::uninstall_from(home),
+            "claude-code" => crate::hooks_manage::uninstall_from(&home.join("settings.json")),
+            "devin" => crate::devin_hooks_manage::uninstall_from(home).map(|_| ()),
+            _ => panic!("unknown fixture agent"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn config_name(agent: &str) -> &str {
+        match agent {
+            "codex" => "hooks.json",
+            "claude-code" => "settings.json",
+            "devin" => "config.json",
+            _ => panic!("unknown fixture agent"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn no_op_preserves_config(agent: &str, uninstall: bool) {
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let binary = fixture.path().join("installed/dot-agent-deck");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            &binary,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path = home.join(config_name(agent));
+        if uninstall {
+            std::fs::write(&path, b"{\"hooks\":{}, \"userSetting\":true}\n").unwrap();
+        } else {
+            install_config(agent, &home, binary.to_str().unwrap()).unwrap();
+            // Deliberately keep the same definitions with user formatting.
+            let document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+            )
+            .unwrap();
+        let before = config_fingerprint(&path);
+        if uninstall {
+            uninstall_config(agent, &home).unwrap();
+        } else {
+            install_config(agent, &home, binary.to_str().unwrap()).unwrap();
+        }
+        assert_eq!(
+            config_fingerprint(&path),
+            before,
+            "{agent}: equal merged definitions must preserve bytes, inode and mtime"
+        );
+    }
+
+    /// Scenario: Repeat a Codex install with identical definitions and user formatting. Its hooks file must keep its bytes, inode and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_codex_install_preserves_file() {
+        no_op_preserves_config("codex", false);
+    }
+
+    /// Scenario: Uninstall Codex hooks from a user file with no deck entries. Nothing on disk may change.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_codex_uninstall_preserves_file() {
+        no_op_preserves_config("codex", true);
+    }
+
+    /// Scenario: Repeat a Claude install with identical definitions and user formatting. Its settings file must keep its bytes, inode and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_claude_install_preserves_file() {
+        no_op_preserves_config("claude-code", false);
+    }
+
+    /// Scenario: Uninstall Claude hooks from settings containing no deck hooks. The file remains untouched.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_claude_uninstall_preserves_file() {
+        no_op_preserves_config("claude-code", true);
+    }
+
+    /// Scenario: Repeat a Devin install with identical definitions and user formatting. Its config file must keep its bytes, inode and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_devin_install_preserves_file() {
+        no_op_preserves_config("devin", false);
+    }
+
+    /// Scenario: Uninstall Devin hooks from a config containing no deck hooks. The file remains untouched.
+    #[cfg(unix)]
+    #[test]
+    fn config_no_op_devin_uninstall_preserves_file() {
+        no_op_preserves_config("devin", true);
+    }
+
+    #[cfg(unix)]
+    fn consolidate_config(agent: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let old = fixture.path().join("old/dot-agent-deck");
+        let new = fixture.path().join("new/dot-agent-deck");
+        for binary in [&old, &new] {
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            crate::test_isolation::write_script(binary, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(
+                binary,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let suffix = format!("hook --agent {agent}");
+        let old_command = build_command(old.to_str().unwrap(), &suffix, HookShell::Posix);
+        let new_command = build_command(new.to_str().unwrap(), &suffix, HookShell::Posix);
+        let user = json!({"type":"command", "command":"/user/audit-handler"});
+        let lookalike = json!({"type":"command", "command":format!("/user/not-the-deck {suffix}")});
+        let original = json!({"hooks":{"PreToolUse":[
+            {"matcher":"Bash", "hooks":[{"type":"command", "command":old_command}, user]},
+            {"hooks":[{"type":"command", "command":old_command}]},
+            {"matcher":"Read", "hooks":[lookalike]},
+            {"hooks":[{"type":"command", "command":old_command}]}
+        ]}, "userSetting":true});
+        let path = home.join(config_name(agent));
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        install_config(agent, &home, new.to_str().unwrap()).unwrap();
+        let document: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rules = document["hooks"]["PreToolUse"].as_array().unwrap();
+        let commands = rule_command_strs(rules);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| **c == old_command || **c == new_command)
+                .count(),
+            1,
+            "{agent}: a different valid install must consolidate deck duplicates to one: {document:#}"
+        );
+        assert_eq!(
+            document["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            new_command
+        );
+        assert_eq!(
+            document["hooks"]["PreToolUse"][0]["hooks"][1], user,
+            "user handler index changed"
+        );
+        assert_eq!(
+            document["hooks"]["PreToolUse"][2], original["hooks"]["PreToolUse"][2],
+            "foreign handler or its group index changed"
+        );
+        assert_eq!(document["userSetting"], true);
+    }
+
+    /// Scenario: Install Codex from a different valid path over duplicate deck entries mixed with user handlers. Only one deck entry remains, while user handlers keep their positions.
+    #[cfg(unix)]
+    #[test]
+    fn config_consolidation_codex_preserves_user_indices() {
+        consolidate_config("codex");
+    }
+
+    /// Scenario: Install Claude from a different valid path over duplicate deck entries mixed with user handlers. Only one deck entry remains, while user handlers keep their positions.
+    #[cfg(unix)]
+    #[test]
+    fn config_consolidation_claude_preserves_user_indices() {
+        consolidate_config("claude-code");
+    }
+
+    /// Scenario: Install Devin from a different valid path over duplicate deck entries mixed with user handlers. Only one deck entry remains, while user handlers keep their positions.
+    #[cfg(unix)]
+    #[test]
+    fn config_consolidation_devin_preserves_user_indices() {
+        consolidate_config("devin");
+    }
+
+    // Re-exec rather than mutating process-global HOME while test threads run.
+    // Contract assumed for the coder: this explicit test marker arms containment;
+    // the root is mandatory and every writer must check it before any mutation.
+    #[cfg(unix)]
+    fn containment_case(agent: &str, case: &str) -> Vec<String> {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let sandbox = fixture.path().join("sandbox");
+        let operator = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&operator).unwrap();
+        let destination = match case {
+            "inside" | "missing-root" => sandbox.join("new-config"),
+            "outside" | "malformed" | "uninstall" => operator.join("new-config"),
+            "lexical" => sandbox.join("../fake-operator-home/new-config"),
+            "symlink" => {
+                std::os::unix::fs::symlink(&operator, sandbox.join("escape")).unwrap();
+                sandbox.join("escape/new-config")
+            }
+            _ => unreachable!(),
+        };
+        let mut snapshots = Vec::new();
+        if case == "malformed" || case == "uninstall" {
+            std::fs::create_dir_all(&destination).unwrap();
+            let path = if agent == "opencode" {
+                destination.join("plugin/dot-agent-deck.js")
+            } else if agent == "pi" {
+                destination.join("dot-agent-deck.ts")
+            } else {
+                destination.join(config_name(agent))
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = if case == "malformed" {
+                b"{ malformed user config".to_vec()
+            } else {
+                serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command", "command":format!("/opt/dot-agent-deck hook --agent {agent}")}]}]}})).unwrap()
+            };
+            std::fs::write(&path, bytes).unwrap();
+            snapshots.push((path.clone(), config_fingerprint(&path)));
+        }
+        let home = sandbox.join("home");
+        let installed = home.join(".local/bin/dot-agent-deck");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(&installed, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            &installed,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_hook_config::tests::config_containment_child",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env("CODEX_HOME", &destination)
+            .env("XDG_CONFIG_HOME", &destination)
+            .env("PI_CODING_AGENT_DIR", &destination)
+            .env("DOT_AGENT_DECK_TEST_CONFIG_WRITE", "1")
+            .env(
+                "DOT_AGENT_DECK_TEST_CONFIG_ROOT",
+                if case == "missing-root" {
+                    "".into()
+                } else {
+                    sandbox.as_os_str().to_owned()
+                },
+            )
+            .env("DAD_CONFIG_TEST_AGENT", agent)
+            .env("DAD_CONFIG_TEST_DEST", &destination)
+            .env("DAD_CONFIG_TEST_CASE", case)
+            .output()
+            .unwrap();
+        let mut problems = Vec::new();
+        if !output.status.success() {
+            problems.push(format!(
+                "{agent}/{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        for (path, before) in snapshots {
+            if !path.exists() || config_fingerprint(&path) != before {
+                problems.push(format!(
+                    "{agent}/{case}: refused writer changed operator config {}",
+                    path.display()
+                ));
+            }
+        }
+        if case != "inside" {
+            if case == "malformed" || case == "uninstall" {
+                let entries: Vec<_> = std::fs::read_dir(&destination)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name())
+                    .collect();
+                if entries.len() != 1 {
+                    problems.push(format!(
+                        "{agent}/{case}: refused writer created a temp or backup: {entries:?}"
+                    ));
+                }
+            } else {
+                if destination.exists() {
+                    problems.push(format!("{agent}/{case}: refused writer created its destination before checking containment"));
+                }
+            }
+        } else {
+            if !destination.exists() {
+                problems.push(format!(
+                    "{agent}/{case}: the owned-root control never wrote config"
+                ));
+            }
+        }
+        problems
+    }
+
+    /// Scenario: Re-execute each config writer with an owned home, then with no root, an outside destination, a symlink escape, and existing malformed or installed files. Refusals happen before directory, temporary-file, backup or deletion side effects.
+    #[cfg(unix)]
+    #[test]
+    fn config_containment_all_agent_writers_refuse_unowned_destinations() {
+        let mut problems = Vec::new();
+        for agent in ["codex", "claude-code", "devin", "opencode", "pi"] {
+            for case in [
+                "inside",
+                "missing-root",
+                "outside",
+                "lexical",
+                "symlink",
+                "malformed",
+                "uninstall",
+            ] {
+                // Pi materializes extensions but has no config-uninstall API.
+                if agent == "pi" && case == "uninstall" {
+                    continue;
+                }
+                problems.extend(containment_case(agent, case));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// Scenario: In a child process with explicit sandbox variables, call the selected real agent-config writer and require an owned write or an early refusal. This helper is inert without its parent test's selector.
+    #[cfg(unix)]
+    #[test]
+    fn config_containment_child() {
+        let Ok(agent) = std::env::var("DAD_CONFIG_TEST_AGENT") else {
+            return;
+        };
+        let destination = PathBuf::from(std::env::var_os("DAD_CONFIG_TEST_DEST").unwrap());
+        let case = std::env::var("DAD_CONFIG_TEST_CASE").unwrap();
+        let result = match agent.as_str() {
+            "opencode" => {
+                // Explicit install's fallback comes from XDG_CONFIG_HOME.
+                // Preserve a missing destination so the guard precedes mkdir.
+                if case == "uninstall" {
+                    crate::opencode_manage::uninstall_from(
+                        &destination.join("plugin/dot-agent-deck.js"),
+                    )
+                } else {
+                    crate::opencode_manage::tests::config_test_install(&destination)
+                }
+            }
+            "pi" => crate::orchestrator_ext::materialize(&destination).map(|_| ()),
+            _ if case == "uninstall" => uninstall_config(&agent, &destination),
+            _ => install_config(&agent, &destination, "/opt/dot-agent-deck"),
+        };
+        if case == "inside" {
+            result.expect("owned config writer control must work");
+        } else {
+            assert!(
+                result.is_err(),
+                "{agent}/{case}: writer must refuse before touching an unowned config destination"
+            );
+        }
+    }
 
     #[test]
     fn build_command_appends_the_agent_suffix_and_quotes_only_when_needed() {

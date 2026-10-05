@@ -754,9 +754,9 @@ fn durable_path_string(path: &Path) -> Option<String> {
     path.to_str().map(str::to_string)
 }
 
-/// Whether `path` runs through a cargo build-output directory: a path
-/// **component** `debug` or `release` whose immediate parent component is
-/// `target`.
+/// Whether `path` is cargo build output: it runs through a path **component**
+/// `debug` or `release` whose immediate parent component is `target`, or it
+/// sits directly in a cargo profile directory of any name (below).
 ///
 /// Component-wise, not a substring search, and that is load-bearing rather
 /// than fastidious. `path.contains("target/debug")` would also catch a user
@@ -765,13 +765,41 @@ fn durable_path_string(path: &Path) -> Option<String> {
 /// the separator is `\`. Matching components makes the test mean what it says
 /// on both platforms.
 ///
-/// Known and accepted limitation: it recognises the **default** layout only. A
-/// `CARGO_TARGET_DIR=/tmp/build` puts artifacts at `/tmp/build/debug/…`, whose
-/// `debug` has no `target` parent, so such a build is treated as durable. PRD
-/// #381 defines the check as `target/debug` / `target/release`, which is the
-/// layout every path in the field report had; widening it to "any `debug` or
-/// `release` component" would reject legitimate install prefixes.
+/// **A custom target directory is recognised by what cargo puts beside the
+/// binary, not by its name** (PRD #1487). `CARGO_TARGET_DIR` puts artifacts at
+/// `<dir>/debug/…`, whose `debug` has no `target` parent, and the component
+/// test alone treated such a build as durable — on a `$PATH` entry it even
+/// outranked a real install, and its path went into the operator's real Codex
+/// hooks. Every cargo profile directory, whatever the target dir is called and
+/// whatever the profile or `--target` triple, holds cargo's own `.fingerprint/`
+/// and `deps/` directories beside the binaries ([`is_cargo_output_dir`]); an
+/// install directory (`~/.local/bin`, `/usr/local/bin`, a Homebrew keg,
+/// `~/.cargo/bin`, which `cargo install` copies into) holds neither. A
+/// compile-time provenance stamp was the alternative and cannot answer this:
+/// every deck binary is cargo output, and the question is whether this copy is
+/// still sitting in the build tree, which only its location can say.
+///
+/// Widening the name test instead — "any `debug` or `release` component" —
+/// would reject legitimate install prefixes, and still miss a renamed profile.
 pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
+    is_default_target_layout(path) || path.parent().is_some_and(is_cargo_output_dir)
+}
+
+/// Whether `dir` is a cargo profile output directory (`<target-dir>/<profile>`
+/// or its `deps/`, where test binaries live): it, or for `deps/` its parent,
+/// holds both cargo's `.fingerprint/` and `deps/` directories. A filesystem
+/// probe, so a directory that does not exist is not one.
+pub(crate) fn is_cargo_output_dir(dir: &Path) -> bool {
+    let holds_cargo_layout =
+        |profile: &Path| profile.join(".fingerprint").is_dir() && profile.join("deps").is_dir();
+    holds_cargo_layout(dir)
+        || (dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+            && dir.parent().is_some_and(holds_cargo_layout))
+}
+
+/// The component half of [`is_build_artifact_path`]: `target/debug` or
+/// `target/release` anywhere in `path`.
+fn is_default_target_layout(path: &Path) -> bool {
     use std::ffi::OsStr;
     use std::path::Component;
 
@@ -828,7 +856,11 @@ fn is_installed_location(exe: &Path, home: &Path, path_value: Option<&std::ffi::
     path_value.is_some_and(|value| {
         std::env::split_paths(value)
             .filter(|dir| !is_untrustworthy_path_entry(dir))
-            .any(|dir| !is_build_artifact_path(&dir) && lexical_absolute(&dir) == parent)
+            .any(|dir| {
+                !is_build_artifact_path(&dir)
+                    && !is_cargo_output_dir(&dir)
+                    && lexical_absolute(&dir) == parent
+            })
     })
 }
 
@@ -3890,6 +3922,41 @@ mod tests {
                 link.to_str().expect("link path is UTF-8"),
                 "canonicalizing the 2a candidate would resolve a durable symlink straight back \
                  to the artifact it points at"
+            );
+        }
+    }
+
+    /// Scenario: Resolve a running binary built into a custom cargo target directory, both on and off PATH. Prefer the installed binary, and refuse the artifact when no install is available.
+    #[test]
+    fn durable_binary_path_custom_cargo_target_never_becomes_an_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        let name = durable_binary_file_name();
+        let installed = home.join(".local/bin").join(&name);
+        write_stub_executable(&installed);
+        let build = fixture
+            .path()
+            .join("dot-agent-deck-p1487-docs-target/debug");
+        let artifact = build.join(&name);
+        write_stub_executable(&artifact);
+        // Real cargo output has these directories even with a custom target name.
+        std::fs::create_dir_all(build.join(".fingerprint")).unwrap();
+        std::fs::create_dir_all(build.join("deps")).unwrap();
+        let path = std::env::join_paths([&build]).unwrap();
+        for path_value in [None, Some(path.as_os_str())] {
+            let result = durable_binary_path_with(Ok(artifact.clone()), &home, path_value);
+            assert_eq!(
+                assert_durable(&result),
+                installed.to_str().unwrap(),
+                "custom cargo output must never beat the installed binary (PATH={path_value:?})"
+            );
+        }
+        std::fs::remove_file(&installed).unwrap();
+        for path_value in [None, Some(path.as_os_str())] {
+            let result = durable_binary_path_with(Ok(artifact.clone()), &home, path_value);
+            assert!(
+                result.is_err(),
+                "custom cargo output must be refused without an install: {result:?}"
             );
         }
     }
