@@ -1548,7 +1548,8 @@ shut it down, end that agent, terminate the one that is stuck. Set `agent` the w
 does. It never stops anything by itself: the app shows the same confirmation the row's button shows
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
-"close the tester" close the VIEW (`close`) and stop nothing. Ending a whole orchestration is
+"close the tester" close the VIEW (`close`) and stop nothing — and "start" is its opposite: "start
+it" is never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"

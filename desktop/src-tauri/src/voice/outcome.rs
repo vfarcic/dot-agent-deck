@@ -997,7 +997,7 @@ pub async fn handle_utterance_with_dictation(
                 directories,
                 new_agent,
                 row.id != SWITCH_DECK_ROW,
-                &row.id,
+                row,
             )
         };
         match step {
@@ -1409,7 +1409,7 @@ fn resolve_param(
     directories: Option<&VoiceDirectories>,
     new_agent: Option<&VoiceNewAgent>,
     for_new_agent: bool,
-    row: &str,
+    row: &CommandRow,
 ) -> Result<ResolvedParam, Unmet> {
     let param = |value: String, label: String| ResolvedParam {
         name: spec.name.clone(),
@@ -1420,10 +1420,29 @@ fn resolve_param(
         deck_identity: None,
         names: Vec::new(),
     };
+    // The transcript less the words that asked for the ACTION — "open" in
+    // "open Mercury" is the verb, not a fact about an agent, and an agent
+    // called Open must not rule Mercury out (Qodo on PR #1529). In order, so
+    // a daemon qualifier ("on build box") still reads as one.
+    let heard_facts = {
+        let vocabulary: BTreeSet<String> = match &row.grounding {
+            ActionGrounding::HeardAs(entries) => entries
+                .iter()
+                .chain(&row.grounding_also)
+                .flat_map(|entry| word_sequence(entry))
+                .collect(),
+            _ => BTreeSet::new(),
+        };
+        word_sequence(transcript.text())
+            .into_iter()
+            .filter(|word| !vocabulary.contains(word))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     // Whether the transcript names a fact of another agent that the agent
     // `id` lacks ([`excluded_by_another`]).
     let heard_against = |id: &str| {
-        let (said, content) = reference_words(transcript.text());
+        let (said, content) = reference_words(&heard_facts);
         agents
             .iter()
             .find(|agent| agent.id == id)
@@ -1451,7 +1470,7 @@ fn resolve_param(
             // Dictation's only: `name_new_agent` marks its own prefix, and a
             // name marked whole is not one of these introductions (Qodo on
             // PR #1529).
-            Some(_) if row != DICTATE_ROW => Err(Unmet::NoMatch),
+            Some(_) if row.id != DICTATE_ROW => Err(Unmet::NoMatch),
             Some(_) => match opening_with(transcript.text(), &MARKED_WHOLE_INTRODUCTIONS)
                 .and_then(|opening| Some((opening, strip_opening(transcript.text(), opening)?)))
                 .filter(|(_, rest)| !rest.trim().is_empty())
@@ -1514,7 +1533,7 @@ fn resolve_param(
                     .filter(|agent| candidates.iter().any(|tied| tied.value == agent.id))
                     .cloned()
                     .collect();
-                match resolve_agent_ref_on(transcript.text(), &tied, decks) {
+                match resolve_agent_ref_on(&heard_facts, &tied, decks) {
                     AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
                     AgentRefMatch::One { id, .. } => {
                         let label = agents
@@ -7662,6 +7681,21 @@ mod tests {
         )
         .await
         .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
+            "{outcome:?}"
+        );
+
+        // The words that asked for the ACTION are not facts about an agent:
+        // beside an agent called Open, "open Mercury" still opens Mercury.
+        let mut with_open = agents.clone();
+        with_open.push(agent("12", Some("Open"), "pi"));
+        let said = "open Mercury";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Mercury"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &with_open, said).await;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-mercury"),
             "{outcome:?}"
