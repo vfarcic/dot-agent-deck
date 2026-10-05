@@ -64,6 +64,8 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
+use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
+
 /// The fixed command signature that identifies a deck-authored Devin hook. Every
 /// deck hook command is `<binary_path> hook --agent devin`, so a command ending
 /// in this exact suffix is deck-owned.
@@ -305,7 +307,12 @@ fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
 /// `binary_path` is passed alongside the already-built `command` because the two
 /// answer different questions: `command` is what gets WRITTEN, `binary_path` is
 /// what decides which existing deck commands may be overwritten.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+///
+/// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
+/// install is kept rather than replaced, and an event with none gets that
+/// install's command — the policy the Codex writer documents (PRD #1487).
+/// Returns the binary the installed events now name.
+fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: InstallMode) -> String {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -358,15 +365,37 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
     }
 
-    let entry = json!({
-        "hooks": [ { "type": "command", "command": command } ]
-    });
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            deck_command_executable,
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => DEVIN_HOOK_EVENTS.iter().find_map(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
     for &event in DEVIN_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(arr),
+        };
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
+        let entry = json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        });
         // ONE deck rule per event (PRD #1487), the policy the Codex and Claude
         // writers share: the first deck command — this binary's or any other
         // install of the deck under its basename, live or dead — is refreshed
@@ -379,9 +408,10 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         .is_none()
         {
             strip_deck_commands(arr, |cmd| command_is_deck_install(cmd, binary_path));
-            arr.push(entry.clone());
+            arr.push(entry);
         }
     }
+    KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)
 }
 
 /// Remove the deck's hooks from an existing config value, leaving user hooks and
@@ -487,12 +517,23 @@ fn read_config(path: &Path) -> io::Result<Value> {
 /// writing the file atomically (creating the dir if needed). `binary_path` is
 /// the absolute `dot-agent-deck` path the hook command should invoke.
 pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
-    install_to_reporting(config_dir, binary_path).map(|_| ())
+    install_to_reporting(config_dir, binary_path, InstallMode::Explicit).map(|_| ())
 }
 
-/// [`install_to`], reporting whether it changed the config. Equal merged
-/// definitions are not written (PRD #1487).
-fn install_to_reporting(config_dir: &Path, binary_path: &str) -> io::Result<bool> {
+/// The automatic install's seam: [`install_to`] under
+/// [`InstallMode::Automatic`], which keeps another live durable install's entry
+/// (PRD #1487). Returns whether the config changed and the binary it names.
+pub(crate) fn auto_install_to(config_dir: &Path, binary_path: &str) -> io::Result<(bool, String)> {
+    install_to_reporting(config_dir, binary_path, InstallMode::Automatic)
+}
+
+/// [`install_to`], reporting whether it changed the config and the binary the
+/// deck's entries name. Equal merged definitions are not written (PRD #1487).
+fn install_to_reporting(
+    config_dir: &Path,
+    binary_path: &str,
+    mode: InstallMode,
+) -> io::Result<(bool, String)> {
     let path = config_path(config_dir);
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
@@ -508,13 +549,13 @@ fn install_to_reporting(config_dir: &Path, binary_path: &str) -> io::Result<bool
     let command =
         crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
     let before = root.clone();
-    install_impl(&mut root, &command, binary_path);
+    let named = install_impl(&mut root, &command, binary_path, mode);
     if root == before {
-        return Ok(false);
+        return Ok((false, named));
     }
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())?;
-    Ok(true)
+    Ok((true, named))
 }
 
 /// Testable core: remove the deck's hooks from `<config_dir>/config.json`.
@@ -585,14 +626,14 @@ pub fn auto_install() {
         }
     };
 
-    match install_to_reporting(&config_dir, &binary_path) {
-        Ok(true) => crate::agent_hook_config::log_auto_install_change(
+    match auto_install_to(&config_dir, &binary_path) {
+        Ok((true, named)) => crate::agent_hook_config::log_auto_install_change(
             "devin",
             &config_path(&config_dir),
-            &binary_path,
+            &named,
             "devin startup auto-install",
         ),
-        Ok(false) => {}
+        Ok((false, _)) => {}
         Err(e) => tracing::warn!("auto-install: failed to write Devin hooks: {e}"),
     }
 }

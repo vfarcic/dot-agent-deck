@@ -179,13 +179,13 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(test)]
+// Unix-only: the one test needs a symlink.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     /// The lib's unit tests are armed by `cfg(test)` alone, and resolve a path
     /// through a symlink and `..` the way the kernel does.
-    #[cfg(unix)]
     #[test]
     fn resolve_follows_symlinks_and_parent_components() {
         let fixture = crate::test_temp::tempdir().unwrap();

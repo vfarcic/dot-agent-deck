@@ -681,15 +681,19 @@ fn self_heal_judges_an_exe_suffixed_pin_by_the_platforms_own_convention() {
     }
 }
 
-/// One deck entry per event (PRD #1487), which reverses PRD #381 Open Question
-/// 3's "leave a still-valid different deck path alone": a second live install's
-/// rule is replaced in place by the durable one rather than kept beside it,
-/// because two rules deliver every hook event twice and an added rule is a new
-/// untrusted hook Codex holds every start on. The replaced command must be the
-/// deck's own shape under the deck's basename; a user's command is never
-/// touched (see the consolidation tests in `agent_hook_config`).
+/// The safety property that makes self-heal tolerable: a deck rule whose path
+/// EXISTS but differs from what would be written is left alone by an automatic
+/// install. PRD #381 Open Question 3 — the trigger is "the target is unusable",
+/// never "the target is not what I would have written", because the second
+/// reading is what would let a startup silently repoint a developer's or a
+/// user's deliberate choice. PRD #1487 keeps that for automatic installs, so two
+/// installs that each resolve to themselves do not take turns rewriting the
+/// file, and adds "one deck entry per event": the hook types with no deck rule
+/// get the kept install's command too, not a second binary's. An explicit
+/// `hooks install` still replaces it (`agent_hook_config`'s
+/// `config_explicit_install_*` tests).
 #[test]
-fn self_heal_replaces_a_different_still_valid_deck_path_in_place() {
+fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
     let fixture = Fixture::new();
     let home = fixture.home();
     let artifact = fixture.build_artifact();
@@ -718,14 +722,13 @@ fn self_heal_replaces_a_different_still_valid_deck_path_in_place() {
 
     let commands = deck_commands(&settings, CLAUDE_SUFFIX);
     assert!(
-        !commands.contains(&other_command),
-        "a second deck install's rule must be replaced, not kept beside the new one: {commands:?}"
+        commands.len() > 1 && commands.iter().all(|command| *command == other_command),
+        "an existing, still-valid deck path must be kept, and be the one the other hook types \
+         are installed with: {commands:?}"
     );
-    let durable_command = format!("{} {CLAUDE_SUFFIX}", durable.display());
     assert!(
-        commands.contains(&durable_command)
-            && commands.iter().all(|command| *command == durable_command),
-        "every deck rule must now call the durable binary: {commands:?}"
+        !commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
+        "a second install's rule was added beside the kept one: {commands:?}"
     );
 }
 

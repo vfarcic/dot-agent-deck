@@ -716,6 +716,9 @@ struct InstallOutcome {
     /// the deck no longer installs. Never a user-authored command — every
     /// predicate is gated on deck ownership first.
     repaired: usize,
+    /// The binary the installed hook types name afterwards: `binary_path`,
+    /// unless an automatic install kept another live durable install's entry.
+    named: String,
 }
 
 fn install_impl(
@@ -723,6 +726,27 @@ fn install_impl(
     binary_path: &str,
     with_stop_failure: bool,
 ) -> InstallOutcome {
+    install_impl_in(
+        settings,
+        binary_path,
+        with_stop_failure,
+        crate::agent_hook_config::InstallMode::Explicit,
+    )
+}
+
+/// [`install_impl`] with the install mode spelled out. Under
+/// [`crate::agent_hook_config::InstallMode::Automatic`] a deck command naming
+/// another live, durable install is kept as the hook type's one entry, rule and
+/// all, and a hook type with none gets that install's command — the policy the
+/// Codex writer documents (PRD #1487).
+fn install_impl_in(
+    settings: &mut Value,
+    binary_path: &str,
+    with_stop_failure: bool,
+    mode: crate::agent_hook_config::InstallMode,
+) -> InstallOutcome {
+    use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
+
     let hook_types = hook_types(with_stop_failure);
     let hooks_obj = ensure_hooks_object(settings);
 
@@ -753,6 +777,26 @@ fn install_impl(
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
 
+    // Only current-format commands are kept: a legacy `<path> hook` rule is a
+    // retired shape, migrated whoever wrote it.
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            |cmd| current_format_executable(cmd).map(|exe| unquote_if_needed(exe).into_owned()),
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => hook_types.iter().find_map(|hook_type| {
+            hooks_obj
+                .get(*hook_type)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
+
     for &hook_type in &hook_types {
         let rules = ensure_hook_array(hooks_obj, hook_type);
         let before = rules.clone();
@@ -761,11 +805,21 @@ fn install_impl(
             .filter(|cmd| command_is_deck_install(cmd, binary_path))
             .count();
 
-        let expected = make_rule(binary_path, hook_type);
-        let command = expected["hooks"][0]["command"]
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(rules),
+        };
+        let mut expected = make_rule(binary_path, hook_type);
+        let own_command = expected["hooks"][0]["command"]
             .as_str()
             .expect("make_rule writes a command")
             .to_string();
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), &own_command)
+            .to_string();
+        expected["hooks"][0]["command"] = Value::String(command.clone());
+        // Another install's rule is left exactly as that install wrote it,
+        // `matcher` included (PRD #1487).
+        let keeps_other = matches!(kept_here, Some(KeptDeckEntry::Other { .. }));
 
         // ONE deck rule per hook type (PRD #1487), shared with the Codex and
         // Devin writers: the first deck command — this binary's, a legacy
@@ -782,10 +836,11 @@ fn install_impl(
                 // rewrite it whole so its `matcher` is the current one (the
                 // `Notification` rule carries one). A rule the user shares is
                 // left alone apart from the command.
-                let deck_only = rules[rule_idx]
-                    .get("hooks")
-                    .and_then(Value::as_array)
-                    .is_some_and(|handlers| handlers.len() == 1)
+                let deck_only = !keeps_other
+                    && rules[rule_idx]
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|handlers| handlers.len() == 1)
                     && rules[rule_idx].get("command").is_none();
                 if deck_only {
                     rules[rule_idx] = expected;
@@ -813,6 +868,7 @@ fn install_impl(
         installed,
         skipped,
         repaired,
+        named: KeptDeckEntry::named_binary(keeper.as_ref(), binary_path),
     }
 }
 
@@ -1143,7 +1199,12 @@ pub fn auto_install_to_gated(
         }
     };
     let before = settings.clone();
-    let outcome = install_impl(&mut settings, &binary_path, stop_failure());
+    let outcome = install_impl_in(
+        &mut settings,
+        &binary_path,
+        stop_failure(),
+        crate::agent_hook_config::InstallMode::Automatic,
+    );
 
     // Equal settings are not a write (PRD #1487); a pass that only PRUNED is
     // still a change and is published — PRD #381 M4.
@@ -1155,6 +1216,7 @@ pub fn auto_install_to_gated(
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
         return;
     }
+    let binary_path = outcome.named.clone();
     crate::agent_hook_config::log_auto_install_change(
         "claude-code",
         path,

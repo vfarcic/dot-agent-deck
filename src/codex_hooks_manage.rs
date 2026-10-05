@@ -84,6 +84,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
+
 /// The fixed command signature that identifies a deck-authored Codex hook. Every
 /// deck hook command is `<binary_path> hook --agent codex`, so a command ending
 /// in this exact suffix is deck-owned. Matching the full verb (rather than the
@@ -358,7 +360,14 @@ fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path
 /// [`refresh_deck_rule_in_place`], which carries the measurement. The one place
 /// an index can still move is the retired-event sweep below, because removing a
 /// rule is what that sweep IS.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+///
+/// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
+/// install is kept rather than replaced (PRD #1487 —
+/// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
+/// no such entry gets the first kept install's command rather than this
+/// binary's, so the file keeps naming one install. Returns the binary the
+/// installed events now name, which is what the trust write has to be about.
+fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: InstallMode) -> String {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -408,15 +417,37 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
     }
 
-    let entry = json!({
-        "hooks": [ { "type": "command", "command": command } ]
-    });
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            deck_command_executable,
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => CODEX_HOOK_EVENTS.iter().find_map(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
     for &event in CODEX_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(arr),
+        };
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
+        let entry = json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        });
         // Normalize down to ONE deck rule per event (PRD #1487): this
         // binary's own, plus every other install of the deck sharing its
         // basename, live or dead — a different still-valid install is
@@ -443,9 +474,10 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         // papered over with a tombstone rule.
         if !refresh_deck_rule_in_place(arr, command, binary_path) {
             strip_deck_commands(arr, |cmd| command_is_deck_install(cmd, binary_path));
-            arr.push(entry.clone());
+            arr.push(entry);
         }
     }
+    KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)
 }
 
 /// Reject a structurally-incompatible existing `hooks.json` shape without
@@ -489,14 +521,29 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 /// call errors (never discarded); a structurally-incompatible shape errors
 /// WITHOUT touching the file; unreadable content propagates its error unwritten.
 pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
-    install_to_reporting(codex_home, binary_path).map(|_| ())
+    install_to_reporting(codex_home, binary_path, InstallMode::Explicit).map(|_| ())
 }
 
-/// [`install_to`], reporting whether it changed the definitions. Equal merged
-/// definitions are not written at all (PRD #1487): the file keeps its bytes,
-/// formatting, inode and mtime, so an unchanged install is invisible to Codex
-/// and to anything watching the file.
-fn install_to_reporting(codex_home: &Path, binary_path: &str) -> std::io::Result<bool> {
+/// The automatic install's seam: [`install_to`] under
+/// [`InstallMode::Automatic`], which keeps another live durable install's entry
+/// rather than replacing it (PRD #1487). Returns whether the file changed and
+/// the binary its entries now name.
+pub(crate) fn auto_install_to(
+    codex_home: &Path,
+    binary_path: &str,
+) -> std::io::Result<(bool, String)> {
+    install_to_reporting(codex_home, binary_path, InstallMode::Automatic)
+}
+
+/// [`install_to`], reporting whether it changed the definitions and the binary
+/// they name. Equal merged definitions are not written at all (PRD #1487): the
+/// file keeps its bytes, formatting, inode and mtime, so an unchanged install
+/// is invisible to Codex and to anything watching the file.
+fn install_to_reporting(
+    codex_home: &Path,
+    binary_path: &str,
+    mode: InstallMode,
+) -> std::io::Result<(bool, String)> {
     let path = codex_home.join("hooks.json");
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
@@ -541,13 +588,13 @@ fn install_to_reporting(codex_home: &Path, binary_path: &str) -> std::io::Result
     // duplication that a future edit to either site quietly breaks.
     let command = expected_hook_command(binary_path);
     let before = root.clone();
-    install_impl(&mut root, &command, binary_path);
+    let named = install_impl(&mut root, &command, binary_path, mode);
     if root == before {
-        return Ok(false);
+        return Ok((false, named));
     }
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())?;
-    Ok(true)
+    Ok((true, named))
 }
 
 /// Whether the active `CODEX_HOME`'s `hooks.json` declares any command hook NOT
@@ -641,8 +688,10 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// `auto_install`): a missing home or unwritable dir degrades to the coarse
 /// stdout fallback rather than blocking the spawn.
 ///
-/// Returns the durable binary path the definitions were written for, or `None`
-/// if nothing was written. The caller needs it to build the expected command
+/// Returns the binary the deck's definitions name afterwards, or `None` if the
+/// install failed. That is this process's durable path unless another live,
+/// durable install's entry was already there — an automatic install keeps that
+/// one rather than replacing it (PRD #1487). The caller needs it to build the expected command
 /// [`trust_deck_hooks_in`] compares against (issue #730) — the SAME value, so
 /// install and trust can never be about two different binaries.
 pub fn auto_install() -> Option<String> {
@@ -658,20 +707,25 @@ pub fn auto_install() -> Option<String> {
             return None;
         }
     };
-    match install_to_reporting(&home, &binary_path) {
-        Ok(true) => crate::agent_hook_config::log_auto_install_change(
-            "codex",
-            &home.join("hooks.json"),
-            &binary_path,
-            "codex auto-install",
-        ),
-        Ok(false) => {}
+    // Automatic: another live durable install's entry is kept, and the trust
+    // write is then about that install's command (PRD #1487).
+    match auto_install_to(&home, &binary_path) {
+        Ok((changed, named)) => {
+            if changed {
+                crate::agent_hook_config::log_auto_install_change(
+                    "codex",
+                    &home.join("hooks.json"),
+                    &named,
+                    "codex auto-install",
+                );
+            }
+            Some(named)
+        }
         Err(e) => {
             tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
-            return None;
+            None
         }
     }
-    Some(binary_path)
 }
 
 /// The exact hook command the deck writes for `binary_path` — what

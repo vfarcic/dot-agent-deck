@@ -675,7 +675,20 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         // Node's `execFileSync` then resolves that persisted bare name through
         // the AGENT's `$PATH` (PRD #381 audit, MEDIUM-1 — issue #536's own
         // vector).
+        //
+        // PRD #1487: a plugin pinning ANOTHER live, durable install is not
+        // regenerated at all. Two installs of the deck each resolve to
+        // themselves, and a template that differs between their versions would
+        // otherwise be rewritten by whichever started last, every start. The
+        // pinned install refreshes its own template when it starts; `hooks
+        // install --agent opencode` is how a user picks a different one.
         let (pinned, repairing) = match existing_binary_path(root) {
+            Some(existing)
+                if crate::agent_hook_config::auto_install_keeps(&existing)
+                    && !crate::agent_hook_config::executables_match(&existing, binary_path) =>
+            {
+                continue;
+            }
             Some(existing) if !crate::platform::paths::pin_is_repairable(&existing) => {
                 (existing, false)
             }
@@ -845,6 +858,146 @@ pub(crate) mod tests {
             "/opt/dot-agent-deck",
             &mut Vec::new(),
         )
+    }
+
+    // PRD #1487 ruling: an automatic install keeps a plugin pinned to another
+    // live, durable install as it is; explicit install still repins it.
+
+    #[cfg(unix)]
+    fn seed_deck(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    fn plugin_fingerprint(path: &Path) -> (Vec<u8>, u64, i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn age_plugin(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+            )
+            .unwrap();
+    }
+
+    /// Scenario: An OpenCode plugin pins live install A with another version's template. An automatic install from B leaves it byte for byte, inode and mtime included.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_keeps_a_live_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        let path = write_plugin(&root, &a).unwrap();
+        // Another version's template: the bytes differ from what B would write.
+        let mut older = std::fs::read(&path).unwrap();
+        older.extend_from_slice(b"// written by another deck version\n");
+        std::fs::write(&path, older).unwrap();
+        age_plugin(&path);
+        let before = plugin_fingerprint(&path);
+
+        auto_install_to(std::slice::from_ref(&root), &b);
+
+        assert_eq!(plugin_fingerprint(&path), before);
+        assert_eq!(existing_binary_path(&root).as_deref(), Some(a.as_str()));
+    }
+
+    /// Scenario: An OpenCode plugin pins install A, which is then deleted or is cargo build output. An automatic install from B repins it to B.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_opencode_replaces_a_dead_or_build_install() {
+        for unusable in ["dead", "cargo-output"] {
+            let fixture = crate::test_temp::tempdir().unwrap();
+            let root = fixture.path().join("fake-operator-home").join("opencode");
+            let a = if unusable == "dead" {
+                seed_deck(&fixture.path().join("pruned").join("dot-agent-deck"))
+            } else {
+                let profile = fixture.path().join("custom-target").join("debug");
+                std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+                std::fs::create_dir_all(profile.join("deps")).unwrap();
+                seed_deck(&profile.join("dot-agent-deck"))
+            };
+            let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+            write_plugin(&root, &a).unwrap();
+            if unusable == "dead" {
+                std::fs::remove_file(&a).unwrap();
+            }
+
+            auto_install_to(std::slice::from_ref(&root), &b);
+
+            assert_eq!(
+                existing_binary_path(&root).as_deref(),
+                Some(b.as_str()),
+                "a {unusable} pin is repinned to B"
+            );
+        }
+    }
+
+    /// Scenario: An OpenCode plugin pins live install A. The explicit install from B repins it to B.
+    #[cfg(unix)]
+    #[test]
+    fn config_explicit_install_opencode_replaces_a_live_install() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        write_plugin(&root, &a).unwrap();
+
+        install_to_roots(
+            std::slice::from_ref(&root),
+            || unreachable!(),
+            &b,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(existing_binary_path(&root).as_deref(), Some(b.as_str()));
+    }
+
+    /// Scenario: Alternate automatic OpenCode installs from A, B, A, B into a root with no plugin. Only the first writes; the plugin then keeps its bytes, inode and mtime and pins A.
+    #[cfg(unix)]
+    #[test]
+    fn config_alternating_auto_installs_opencode_write_once() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let root = fixture.path().join("fake-operator-home").join("opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+
+        auto_install_to(std::slice::from_ref(&root), &a);
+        let path = plugin_file(&root);
+        age_plugin(&path);
+        let first = plugin_fingerprint(&path);
+        for (start, binary) in [&b, &a, &b].into_iter().enumerate() {
+            auto_install_to(std::slice::from_ref(&root), binary);
+            assert_eq!(
+                plugin_fingerprint(&path),
+                first,
+                "automatic start {} (A, B, A, B) rewrote the plugin",
+                start + 2
+            );
+        }
+        assert_eq!(existing_binary_path(&root).as_deref(), Some(a.as_str()));
     }
 
     /// Scenario: Install the same OpenCode plugin explicitly a second time. Its bytes, inode and mtime stay unchanged, and repeated removal leaves the missing file absent.
@@ -1531,7 +1684,10 @@ pub(crate) mod tests {
             "a commented-out marker must not be read as the pin"
         );
 
-        auto_install_to(std::slice::from_ref(&root), "/bin/deck-launching");
+        // Launched by the pinned install itself: the one automatic install that
+        // still regenerates the file. A plugin pinning ANOTHER live install is
+        // left as it is (PRD #1487), which would prove nothing here.
+        auto_install_to(std::slice::from_ref(&root), pin);
         let after = std::fs::read_to_string(&file).expect("read regenerated plugin");
         assert!(
             !after.contains("/tmp/attacker/dot-agent-deck"),

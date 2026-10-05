@@ -1226,6 +1226,103 @@ pub(crate) fn consolidate_deck_handlers_in_place(
     Some((claimed_rule, claimed_handler))
 }
 
+/// Which kind of install is running, because the two treat another install's
+/// working entry differently (PRD #1487).
+///
+/// - [`InstallMode::Explicit`] is `hooks install`: the user asked for THIS
+///   binary, so it replaces whatever deck entry is there.
+/// - [`InstallMode::Automatic`] is every silent path (TUI and daemon startup,
+///   `wrap --agent codex`): a deck entry naming another install that is live and
+///   durable is kept as the one entry, so two installs that each resolve to
+///   themselves (Homebrew's TUI and a `~/.local/bin` daemon, the desktop's
+///   bundled daemon and a CLI) do not rewrite the agent's config on every start.
+///   See [`auto_install_kept_entry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallMode {
+    Explicit,
+    Automatic,
+}
+
+/// Whether an automatic install keeps a deck entry pinned to `exe`: an absolute
+/// path to an executable that is not cargo build output — the inverse of
+/// [`crate::platform::paths::pin_is_repairable`], so "dead or unusable" means
+/// exactly what dead-pin repair has always meant. A pin that cannot be stat'ed
+/// is kept, which errs toward writing nothing.
+pub(crate) fn auto_install_keeps(exe: &str) -> bool {
+    !crate::platform::paths::pin_is_repairable(exe)
+}
+
+/// The live, durable deck entry an [`InstallMode::Automatic`] install keeps in
+/// one event array — see [`auto_install_kept_entry`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeptDeckEntry {
+    /// The installing binary's own: the ordinary refresh writes the same
+    /// command, so there is nothing to keep apart from it.
+    ThisBinary,
+    /// Another install's: written back verbatim, so it stays byte for byte.
+    Other { command: String, exe: String },
+}
+
+impl KeptDeckEntry {
+    /// The command an event array is written with, given what it keeps itself
+    /// (`here`) and what the file's first kept entry is (`keeper`, for an
+    /// event with no live entry of its own): another install's command when
+    /// one decides it, else `own` — so an automatic install leaves the file
+    /// naming the install it already names.
+    pub(crate) fn command_for<'a>(
+        here: Option<&'a Self>,
+        keeper: Option<&'a Self>,
+        own: &'a str,
+    ) -> &'a str {
+        match here.or(keeper) {
+            Some(Self::Other { command, .. }) => command,
+            Some(Self::ThisBinary) | None => own,
+        }
+    }
+
+    /// The binary the deck's entries name after an install whose file-wide
+    /// keeper is `keeper`.
+    pub(crate) fn named_binary(keeper: Option<&Self>, binary_path: &str) -> String {
+        match keeper {
+            Some(Self::Other { exe, .. }) => exe.clone(),
+            Some(Self::ThisBinary) | None => binary_path.to_string(),
+        }
+    }
+}
+
+/// For an [`InstallMode::Automatic`] install by `binary_path`: the first deck
+/// command in `rules` (walk order, nested handlers) that `is_own` accepts and
+/// whose executable is a live durable install ([`auto_install_keeps`]), or
+/// `None` when no deck entry there is.
+///
+/// The caller writes another install's command back instead of its own, so
+/// [`consolidate_deck_handlers_in_place`] keeps that entry where it sits, byte
+/// for byte, and still consolidates the other deck copies down to it. A dead or
+/// build-output entry ahead of it is overwritten in place with the kept command.
+pub(crate) fn auto_install_kept_entry(
+    rules: &[Value],
+    binary_path: &str,
+    is_own: impl Fn(&str) -> bool,
+    executable_of: impl Fn(&str) -> Option<String>,
+) -> Option<KeptDeckEntry> {
+    let (command, exe) = rules
+        .iter()
+        .filter_map(|rule| rule.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|handler| handler.get("command").and_then(Value::as_str))
+        .filter(|command| is_own(command))
+        .find_map(|command| {
+            executable_of(command)
+                .filter(|exe| auto_install_keeps(exe))
+                .map(|exe| (command.to_string(), exe))
+        })?;
+    Some(if executables_match(&exe, binary_path) {
+        KeptDeckEntry::ThisBinary
+    } else {
+        KeptDeckEntry::Other { command, exe }
+    })
+}
+
 /// Log an automatic install that actually changed an agent's config (PRD
 /// #1487). A no-op logs nothing at info: what this records is that the deck
 /// rewrote somebody else's file, which is exactly what went unnoticed when test
@@ -1473,6 +1570,386 @@ mod tests {
     #[test]
     fn config_consolidation_devin_preserves_user_indices() {
         consolidate_config("devin");
+    }
+
+    // PRD #1487 ruling: an AUTOMATIC install keeps another live, durable
+    // install's deck entry; only a dead or build-output one is replaced, and an
+    // explicit `hooks install` still replaces whatever is there.
+
+    #[cfg(unix)]
+    fn seed_deck(path: &Path) -> String {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::test_isolation::write_script(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// The binary an automatic install says the file names, where the writer
+    /// reports one (Claude's seam does not).
+    #[cfg(unix)]
+    fn auto_install_config(agent: &str, home: &Path, binary: &str) -> Option<String> {
+        match agent {
+            "codex" => Some(
+                crate::codex_hooks_manage::auto_install_to(home, binary)
+                    .unwrap()
+                    .1,
+            ),
+            "claude-code" => {
+                crate::hooks_manage::auto_install_to(&home.join("settings.json"), || {
+                    Ok(binary.to_string())
+                });
+                None
+            }
+            "devin" => Some(
+                crate::devin_hooks_manage::auto_install_to(home, binary)
+                    .unwrap()
+                    .1,
+            ),
+            _ => panic!("unknown fixture agent"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn age_config(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+            )
+            .unwrap();
+    }
+
+    /// One event's deck commands as `(rule_idx, handler_idx, command)`.
+    #[cfg(unix)]
+    type DeckPositions = Vec<(usize, usize, String)>;
+
+    /// Every event's [`DeckPositions`].
+    #[cfg(unix)]
+    fn deck_positions(agent: &str, path: &Path) -> Vec<(String, DeckPositions)> {
+        let suffix = format!("hook --agent {agent}");
+        let document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        for (event, rules) in document["hooks"].as_object().unwrap() {
+            let mut positions = Vec::new();
+            for (rule_idx, rule) in rules.as_array().unwrap().iter().enumerate() {
+                for (handler_idx, handler) in
+                    rule["hooks"].as_array().into_iter().flatten().enumerate()
+                {
+                    if let Some(command) = handler["command"].as_str()
+                        && command.ends_with(&suffix)
+                    {
+                        positions.push((rule_idx, handler_idx, command.to_string()));
+                    }
+                }
+            }
+            out.push((event.clone(), positions));
+        }
+        out
+    }
+
+    /// Put a user rule in front of every event's rules (so a replacement in
+    /// place is told apart from an append) and, when given, a rule holding
+    /// `trailing` after them.
+    #[cfg(unix)]
+    fn surround_deck_rules(path: &Path, trailing: Option<&str>) {
+        let mut document: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for rules in document["hooks"].as_object_mut().unwrap().values_mut() {
+            let rules = rules.as_array_mut().unwrap();
+            rules.insert(
+                0,
+                json!({"hooks":[{"type":"command", "command":"/user/audit-handler"}]}),
+            );
+            if let Some(command) = trailing {
+                rules.push(json!({"hooks":[{"type":"command", "command":command}]}));
+            }
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_every_event_names(agent: &str, path: &Path, binary: &str, why: &str) {
+        let expected = build_command(binary, &format!("hook --agent {agent}"), HookShell::Posix);
+        for (event, positions) in deck_positions(agent, path) {
+            assert_eq!(
+                positions,
+                vec![(1, 0, expected.clone())],
+                "{agent}/{event}: {why}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn auto_keeps_a_live_install(agent: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+        age_config(&path);
+        let before = config_fingerprint(&path);
+
+        let named = auto_install_config(agent, &home, &b);
+
+        assert_eq!(
+            config_fingerprint(&path),
+            before,
+            "{agent}: an automatic install from B must not touch a file whose deck entry names \
+             a live install A"
+        );
+        if let Some(named) = named {
+            assert_eq!(named, a, "{agent}: the entries still name A");
+        }
+    }
+
+    /// Scenario: Install Codex hooks from live install A, then auto-install from install B. The hooks file keeps its bytes, inode and mtime and still names A.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_keeps_a_live_install() {
+        auto_keeps_a_live_install("codex");
+    }
+
+    /// Scenario: Install Claude hooks from live install A, then auto-install from install B. The settings file keeps its bytes, inode and mtime.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_keeps_a_live_install() {
+        auto_keeps_a_live_install("claude-code");
+    }
+
+    /// Scenario: Install Devin hooks from live install A, then auto-install from install B. The config file keeps its bytes, inode and mtime and still names A.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_keeps_a_live_install() {
+        auto_keeps_a_live_install("devin");
+    }
+
+    #[cfg(unix)]
+    fn auto_replaces_an_unusable_install(agent: &str, unusable: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = match unusable {
+            "dead" => seed_deck(&fixture.path().join("pruned").join("dot-agent-deck")),
+            "cargo-output" => {
+                // A custom target-dir name: recognised by cargo's own siblings.
+                let profile = fixture.path().join("custom-target").join("debug");
+                std::fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+                std::fs::create_dir_all(profile.join("deps")).unwrap();
+                seed_deck(&profile.join("dot-agent-deck"))
+            }
+            _ => unreachable!(),
+        };
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        if unusable == "dead" {
+            std::fs::remove_file(&a).unwrap();
+        }
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+
+        let named = auto_install_config(agent, &home, &b);
+
+        assert_every_event_names(
+            agent,
+            &path,
+            &b,
+            &format!("a {unusable} A entry is replaced by B in place"),
+        );
+        if let Some(named) = named {
+            assert_eq!(named, b);
+        }
+    }
+
+    /// Scenario: Install Codex hooks from A, delete A, then auto-install from B. B's command replaces A's at the same position, after the user's rule.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_replaces_a_dead_install_in_place() {
+        auto_replaces_an_unusable_install("codex", "dead");
+    }
+
+    /// Scenario: Install Claude hooks from A, delete A, then auto-install from B. B's command replaces A's at the same position, after the user's rule.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_replaces_a_dead_install_in_place() {
+        auto_replaces_an_unusable_install("claude-code", "dead");
+    }
+
+    /// Scenario: Install Devin hooks from A, delete A, then auto-install from B. B's command replaces A's at the same position, after the user's rule.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_replaces_a_dead_install_in_place() {
+        auto_replaces_an_unusable_install("devin", "dead");
+    }
+
+    /// Scenario: Install Codex hooks from a cargo build in a custom target dir, then auto-install from B. The build-output entry is replaced by B in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_replaces_cargo_output() {
+        auto_replaces_an_unusable_install("codex", "cargo-output");
+    }
+
+    /// Scenario: Install Claude hooks from a cargo build in a custom target dir, then auto-install from B. The build-output entry is replaced by B in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_replaces_cargo_output() {
+        auto_replaces_an_unusable_install("claude-code", "cargo-output");
+    }
+
+    /// Scenario: Install Devin hooks from a cargo build in a custom target dir, then auto-install from B. The build-output entry is replaced by B in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_replaces_cargo_output() {
+        auto_replaces_an_unusable_install("devin", "cargo-output");
+    }
+
+    #[cfg(unix)]
+    fn explicit_replaces_a_live_install(agent: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        surround_deck_rules(&path, None);
+
+        install_config(agent, &home, &b).unwrap();
+
+        assert_every_event_names(
+            agent,
+            &path,
+            &b,
+            "an explicit install from B replaces live A in place",
+        );
+    }
+
+    /// Scenario: Install Codex hooks from live A, then run the explicit install from B. B's command replaces A's in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_explicit_install_codex_replaces_a_live_install() {
+        explicit_replaces_a_live_install("codex");
+    }
+
+    /// Scenario: Install Claude hooks from live A, then run the explicit install from B. B's command replaces A's in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_explicit_install_claude_replaces_a_live_install() {
+        explicit_replaces_a_live_install("claude-code");
+    }
+
+    /// Scenario: Install Devin hooks from live A, then run the explicit install from B. B's command replaces A's in place.
+    #[cfg(unix)]
+    #[test]
+    fn config_explicit_install_devin_replaces_a_live_install() {
+        explicit_replaces_a_live_install("devin");
+    }
+
+    #[cfg(unix)]
+    fn auto_consolidates_duplicates_to_the_kept_install(agent: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        install_config(agent, &home, &a).unwrap();
+        let path = home.join(config_name(agent));
+        let b_command = build_command(&b, &format!("hook --agent {agent}"), HookShell::Posix);
+        surround_deck_rules(&path, Some(&b_command));
+
+        auto_install_config(agent, &home, &b);
+
+        assert_every_event_names(
+            agent,
+            &path,
+            &a,
+            "B's duplicate is consolidated into live A's entry, which keeps its position",
+        );
+    }
+
+    /// Scenario: A Codex hooks file names live A and, after it, a duplicate entry for B. Auto-install from B leaves only A's entry, where it was.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_codex_consolidates_duplicates_to_the_kept_install() {
+        auto_consolidates_duplicates_to_the_kept_install("codex");
+    }
+
+    /// Scenario: A Claude settings file names live A and, after it, a duplicate entry for B. Auto-install from B leaves only A's entry, where it was.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_claude_consolidates_duplicates_to_the_kept_install() {
+        auto_consolidates_duplicates_to_the_kept_install("claude-code");
+    }
+
+    /// Scenario: A Devin config names live A and, after it, a duplicate entry for B. Auto-install from B leaves only A's entry, where it was.
+    #[cfg(unix)]
+    #[test]
+    fn config_auto_install_devin_consolidates_duplicates_to_the_kept_install() {
+        auto_consolidates_duplicates_to_the_kept_install("devin");
+    }
+
+    #[cfg(unix)]
+    fn alternating_auto_installs_write_once(agent: &str) {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let home = fixture.path().join("fake-operator-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let a = seed_deck(&fixture.path().join("homebrew").join("dot-agent-deck"));
+        let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
+        let path = home.join(config_name(agent));
+        if agent == "claude-code" {
+            // Claude's automatic install needs an existing settings file.
+            std::fs::write(&path, b"{}").unwrap();
+        }
+
+        auto_install_config(agent, &home, &a);
+        age_config(&path);
+        let first = config_fingerprint(&path);
+        for (start, binary) in [&b, &a, &b].into_iter().enumerate() {
+            auto_install_config(agent, &home, binary);
+            assert_eq!(
+                config_fingerprint(&path),
+                first,
+                "{agent}: automatic start {} (A, B, A, B) rewrote the file",
+                start + 2
+            );
+        }
+        let a_command = build_command(&a, &format!("hook --agent {agent}"), HookShell::Posix);
+        for (event, positions) in deck_positions(agent, &path) {
+            assert_eq!(
+                positions,
+                vec![(0, 0, a_command.clone())],
+                "{agent}/{event}"
+            );
+        }
+    }
+
+    /// Scenario: Alternate automatic Codex installs from A, B, A, B. Only the first writes; the file then keeps its bytes, inode and mtime and names A.
+    #[cfg(unix)]
+    #[test]
+    fn config_alternating_auto_installs_codex_write_once() {
+        alternating_auto_installs_write_once("codex");
+    }
+
+    /// Scenario: Alternate automatic Claude installs from A, B, A, B. Only the first writes; the file then keeps its bytes, inode and mtime and names A.
+    #[cfg(unix)]
+    #[test]
+    fn config_alternating_auto_installs_claude_write_once() {
+        alternating_auto_installs_write_once("claude-code");
+    }
+
+    /// Scenario: Alternate automatic Devin installs from A, B, A, B. Only the first writes; the file then keeps its bytes, inode and mtime and names A.
+    #[cfg(unix)]
+    #[test]
+    fn config_alternating_auto_installs_devin_write_once() {
+        alternating_auto_installs_write_once("devin");
     }
 
     // Re-exec rather than mutating process-global HOME while test threads run.

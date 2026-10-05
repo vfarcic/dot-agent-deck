@@ -3932,11 +3932,14 @@ mod tests {
         let fixture = crate::test_temp::tempdir().unwrap();
         let home = fixture.path().join("fake-operator-home");
         let name = durable_binary_file_name();
-        let installed = home.join(".local/bin").join(&name);
+        // Component-wise: the resolver builds its candidate with the host's
+        // separator, and this is compared to it as a string.
+        let installed = home.join(".local").join("bin").join(&name);
         write_stub_executable(&installed);
         let build = fixture
             .path()
-            .join("dot-agent-deck-p1487-docs-target/debug");
+            .join("dot-agent-deck-p1487-docs-target")
+            .join("debug");
         let artifact = build.join(&name);
         write_stub_executable(&artifact);
         // Real cargo output has these directories even with a custom target name.
