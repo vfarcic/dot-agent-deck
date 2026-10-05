@@ -984,6 +984,14 @@ jobs:
       # into a target dir of its own in the build namespace; on a laptop the flag
       # asks for a human to review those files first, and on this throwaway VM
       # there is nothing for them to reach.
+      #
+      # Exit 3 is a DECLARED BREAK (issue #1596): every tell was measured, and
+      # each one that failed failed the way a contract break that the daemon's
+      # build declares in `CONTRACT_BREAKS` and the client's does not says it
+      # will, with the daemon's refusal in the run's log. Rule 12 records that
+      # as the outcome rather than as a regression, so the job reports it with
+      # a warning and passes. Any other non-zero exit, a failure no declared
+      # break accounts for included, fails the job.
       - if: steps.plan.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -991,9 +999,33 @@ jobs:
           PREVIOUS: ${{ steps.plan.outputs.previous }}
           REPO: ${{ github.repository }}
         run: |
+          rc=0
           cargo xver --repo "$REPO" --branch "$COMMIT" --previous "$PREVIOUS" \
             --direction both --probe generic --allow-build-changes --min-free-gib 15 \
-            --runs-root /xr
+            --runs-root /xr || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::warning title=cross-version declared contract break::$COMMIT against $PREVIOUS: a tell failed exactly as a contract break declared between the two builds says it will. That is the rule 12 outcome to record, not a regression; the job summary and the evidence artifact name the break."
+            exit 0
+          fi
+          exit "$rc"
+      # Each evidence file's verdict line, in the job summary, so a declared
+      # break (or a failure) is readable without downloading the artifact.
+      - name: Summarise the verdicts
+        if: always() && steps.plan.outcome == 'success'
+        run: |
+          {
+            echo "### cross-version"
+            echo
+            shopt -s nullglob
+            files=(.dot-agent-deck/xver-evidence/*.md)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "No evidence file was written."
+            fi
+            for f in "${files[@]}"; do
+              verdict=$(grep -m1 '^\*\*Verdict:' "$f" || head -n 3 "$f" | tail -n 1)
+              echo "- \`$(basename "$f")\`: $verdict"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the evidence
         if: always() && steps.plan.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

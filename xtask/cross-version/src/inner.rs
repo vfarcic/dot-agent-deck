@@ -1618,14 +1618,10 @@ fn with_attached_tui(
         }
         Err(e) => (false, format!("the status never changed: {e}")),
     };
-    ev.tell(
+    ev.tell_in_parts(
         "tell-4",
         "hooks (work-done, status) still arrived",
-        if work_done_arrived && status_ok {
-            Verdict::Pass
-        } else {
-            Verdict::Fail
-        },
+        &[("work-done", work_done_arrived), ("status", status_ok)],
         format!(
             "work-done: issued `{} work-done --task \"{work_done_sentinel}\"` from inside the \
              `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in the \
@@ -1855,10 +1851,11 @@ fn with_attached_tui(
         })?;
     }
 
-    ev.excerpt(
-        "sandbox deck.log (tail)",
-        tail(&std::fs::read_to_string(&sb.log).unwrap_or_default(), 80),
-    );
+    let deck_log = std::fs::read_to_string(&sb.log).unwrap_or_default();
+    // A failed tell that a break declared by the daemon's build, and not the
+    // client's, accounts for is that break's intended outcome (issue #1596).
+    crate::breaks::explain(ev, plan.direction, &deck_log);
+    ev.excerpt("sandbox deck.log (tail)", tail(&deck_log, 80));
     Ok(())
 }
 
@@ -3233,7 +3230,9 @@ pub fn compare_hellos(old_raw: &str, new_raw: &str) -> Result<Vec<String>, Strin
         format!(
             "CONTRACT_BREAKS differ: old {obr:?}, branch {nbr:?}. The desktop's \
              `classify_handshake` refuses across any difference in that list, so a new app would \
-             refuse this older daemon outright — a surface this harness does not exercise"
+             refuse this older daemon outright — a surface this harness does not exercise. A tell \
+             that fails the way one of these breaks says it will, with the daemon's refusal \
+             logged, is reported as a DECLARED BREAK rather than a FAIL (`breaks.rs`)"
         )
     });
     Ok(notes)

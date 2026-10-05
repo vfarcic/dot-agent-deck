@@ -52,6 +52,28 @@ pub struct Tell {
     /// The measured value the verdict was taken from — a count, a pid, a
     /// scraped line. One or more lines; rendered as a blockquote.
     pub detail: String,
+    /// For a tell asserted in named halves (tell-4's `work-done` and
+    /// `status`), the halves that failed. Empty for a tell recorded whole, and
+    /// for one that passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_parts: Vec<String>,
+    /// Set on a FAILED tell when a contract break the two builds declare
+    /// differently accounts for every half that failed, with the evidence
+    /// (`breaks.rs`). Such a tell does not make the run FAIL: the run is a
+    /// [`RunVerdict::DeclaredBreak`] instead, once everything else holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_break: Option<BreakExplanation>,
+}
+
+/// Why a failed tell is a declared break's intended outcome (`breaks.rs`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BreakExplanation {
+    /// Which half failed and which break accounts for it, short enough for
+    /// the verdict line: `` `status` half: `318-hook-event-capability-token` ``.
+    pub summary: String,
+    /// The evidence: what the break does, which build declares it, and the
+    /// daemon's refusal line from the sandbox `deck.log`.
+    pub detail: String,
 }
 
 /// The run's overall result.
@@ -73,6 +95,11 @@ pub enum RunVerdict {
     /// interoperate (or the old client's fallback damaged something), and from
     /// `Incomplete`, which means the harness could not tell.
     OldClientCannotDiscover(String),
+    /// Every tell was measured, and every one that failed failed in the way a
+    /// contract break declared by one build and not the other says it will:
+    /// the intended outcome of that break, recorded as rule 12 asks, not a
+    /// regression (issue #1596). Which break, and which tell, is the payload.
+    DeclaredBreak(String),
 }
 
 impl RunVerdict {
@@ -85,6 +112,7 @@ impl RunVerdict {
             RunVerdict::OldClientCannotDiscover(why) => {
                 format!("OLD CLIENT CANNOT DISCOVER THE BRANCH DAEMON — {why}")
             }
+            RunVerdict::DeclaredBreak(why) => format!("DECLARED BREAK — {why}"),
         }
     }
 }
@@ -186,7 +214,35 @@ impl Evidence {
             title,
             verdict,
             detail,
+            failed_parts: Vec::new(),
+            declared_break: None,
         });
+    }
+
+    /// Record a tell asserted in named halves: it passes only when every half
+    /// held, and the halves that did not are kept by name, so a reader — and
+    /// `breaks.rs` — can tell which one failed without parsing the detail.
+    pub fn tell_in_parts(
+        &mut self,
+        id: &str,
+        title: impl Into<String>,
+        parts: &[(&str, bool)],
+        detail: impl Into<String>,
+    ) {
+        let failed: Vec<String> = parts
+            .iter()
+            .filter(|(_, held)| !held)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let verdict = if failed.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        };
+        self.tell(id, title, verdict, detail);
+        if let Some(t) = self.tells.last_mut() {
+            t.failed_parts = failed;
+        }
     }
 
     pub fn isolated(&mut self, msg: impl Into<String>) {
@@ -209,8 +265,26 @@ impl Evidence {
         self.excerpts.push((title.into(), body.into()));
     }
 
+    /// Whether no tell failed, other than one a declared contract break
+    /// explains ([`Tell::declared_break`]).
     pub fn passed(&self) -> bool {
-        !self.tells.iter().any(|t| t.verdict == Verdict::Fail)
+        !self
+            .tells
+            .iter()
+            .any(|t| t.verdict == Verdict::Fail && t.declared_break.is_none())
+    }
+
+    /// The failed tells a declared contract break explains, as one line each.
+    pub fn declared_breaks(&self) -> Vec<String> {
+        self.tells
+            .iter()
+            .filter(|t| t.verdict == Verdict::Fail)
+            .filter_map(|t| {
+                t.declared_break
+                    .as_ref()
+                    .map(|why| format!("{}, {}", t.id, why.summary))
+            })
+            .collect()
     }
 
     /// The tells this run must have recorded, by id: the COMPLETE set for its
@@ -268,7 +342,13 @@ impl Evidence {
     /// measured inside a namespace that did not hold is not a measurement of
     /// the branch.
     ///
-    /// The order is the argument. A failed tell outranks a measured
+    /// The order is the argument. A failed tell a declared break does not
+    /// explain outranks everything after it, and a declared break ranks LAST,
+    /// below an unmeasured tell: "this failure is the intended outcome of a
+    /// declared break" is only a claim when every other tell was measured and
+    /// held, which is what a pass needs too.
+    ///
+    /// A failed tell outranks a measured
     /// non-discovery, because a failed collateral check there means the old
     /// client's fallback DID damage something — which is a finding, not the
     /// disclosed downgrade. An unmeasured tell outranks it too: "the old client
@@ -303,6 +383,10 @@ impl Evidence {
         if let Some(what) = &self.discovery {
             return RunVerdict::OldClientCannotDiscover(what.clone());
         }
+        let declared = self.declared_breaks();
+        if !declared.is_empty() {
+            return RunVerdict::DeclaredBreak(declared.join("; "));
+        }
         RunVerdict::Pass
     }
 
@@ -320,6 +404,17 @@ impl Evidence {
             if reverse { " (reverse)" } else { "" }
         );
         let _ = writeln!(s, "**Verdict: {verdict}**\n");
+        if matches!(self.verdict(), RunVerdict::DeclaredBreak(_)) {
+            let _ = writeln!(
+                s,
+                "**Every tell was measured, and each one that failed failed exactly as a contract \
+                 break says it will**: a break the daemon's build declares in `CONTRACT_BREAKS` and \
+                 the client's build does not, with the refusal that break describes found in the \
+                 sandbox `deck.log`. CLAUDE.md rule 12 records a declared break as the outcome, not \
+                 as a regression. A failure no declared break accounts for would have made this \
+                 run FAIL (`xtask/cross-version/src/breaks.rs`).\n"
+            );
+        }
         if let Some(note) = &self.skip_build {
             let _ = writeln!(
                 s,
@@ -464,9 +559,19 @@ impl Evidence {
             }
         );
         for t in &self.tells {
-            let _ = writeln!(s, "### {} — {} · {}\n", t.id, t.title, t.verdict.marker());
+            let marker = match (&t.declared_break, t.verdict) {
+                (Some(_), Verdict::Fail) => "**FAIL**, explained by a declared contract break",
+                _ => t.verdict.marker(),
+            };
+            let _ = writeln!(s, "### {} — {} · {marker}\n", t.id, t.title);
             for line in t.detail.lines() {
                 let _ = writeln!(s, "> {line}");
+            }
+            if !t.failed_parts.is_empty() {
+                let _ = writeln!(s, ">\n> failed: {}", t.failed_parts.join(", "));
+            }
+            if let (Some(why), Verdict::Fail) = (&t.declared_break, t.verdict) {
+                let _ = writeln!(s, ">\n> **declared break:** {}", why.detail);
             }
             let _ = writeln!(s);
         }
@@ -656,6 +761,8 @@ mod tests {
             title: "t".into(),
             verdict: Verdict::NotChecked,
             detail: "no ss(8) on this host".into(),
+            failed_parts: Vec::new(),
+            declared_break: None,
         });
         assert!(e.missing_tells().is_empty(), "every tell was recorded");
         assert!(e.passed(), "nothing failed");
@@ -671,6 +778,8 @@ mod tests {
             title: "t".into(),
             verdict: Verdict::Fail,
             detail: "2 lines, expected 1".into(),
+            failed_parts: Vec::new(),
+            declared_break: None,
         });
         assert!(!e.passed());
         assert!(e.render().contains("**Verdict: FAIL**"));
@@ -766,6 +875,8 @@ mod tests {
             title: "t".into(),
             verdict: Verdict::Pass,
             detail: "first\nsecond".into(),
+            failed_parts: Vec::new(),
+            declared_break: None,
         });
         let out = e.render();
         assert!(out.contains("> first\n> second"), "{out}");
@@ -1014,16 +1125,19 @@ mod expected_set_tests {
         );
     }
 
-    /// Every id passed to `tell` as a string literal in `src`.
+    /// Every id passed to `tell` or `tell_in_parts` as a string literal in
+    /// `src`.
     fn literal_tell_ids(src: &str) -> BTreeSet<String> {
         let mut ids = BTreeSet::new();
-        let mut rest = src;
-        while let Some(i) = rest.find(".tell(") {
-            rest = &rest[i + ".tell(".len()..];
-            if let Some(lit) = rest.trim_start().strip_prefix('"')
-                && let Some(end) = lit.find('"')
-            {
-                ids.insert(lit[..end].to_string());
+        for call in [".tell(", ".tell_in_parts("] {
+            let mut rest = src;
+            while let Some(i) = rest.find(call) {
+                rest = &rest[i + call.len()..];
+                if let Some(lit) = rest.trim_start().strip_prefix('"')
+                    && let Some(end) = lit.find('"')
+                {
+                    ids.insert(lit[..end].to_string());
+                }
             }
         }
         ids

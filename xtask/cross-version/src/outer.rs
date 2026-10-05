@@ -483,8 +483,9 @@ pub fn main() -> ExitCode {
         }
     };
     match run(&opts) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+        Ok(Outcome::Pass) => ExitCode::SUCCESS,
+        Ok(Outcome::DeclaredBreak) => ExitCode::from(DECLARED_BREAK_EXIT),
+        Ok(Outcome::NotPass) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("\nxver: {e}");
             ExitCode::FAILURE
@@ -1478,7 +1479,7 @@ fn clone_moved(fetched: &str, head_now: &str, status_now: &str) -> Option<String
 // The run
 // ---------------------------------------------------------------------------
 
-fn run(opts: &Opts) -> Result<bool, String> {
+fn run(opts: &Opts) -> Result<Outcome, String> {
     check_evidence_arg(opts.evidence.as_deref(), opts.direction)?;
     let directions = opts.direction.directions();
     // Refuse a probe/direction combination before anything is built. With
@@ -1517,21 +1518,21 @@ fn run(opts: &Opts) -> Result<bool, String> {
         previous.tag,
         previous.describe()
     );
-    let mut all_passed = true;
+    let mut worst = Outcome::Pass;
     let mut first_err = None;
     for (d, (probe, how)) in directions.into_iter().zip(probes) {
         match run_one(opts, &previous, d, probe, how) {
-            Ok(passed) => all_passed &= passed,
+            Ok(outcome) => worst = worst.max(outcome),
             Err(e) => {
                 eprintln!("\nxver ({}): {e}", d.name());
-                all_passed = false;
+                worst = Outcome::NotPass;
                 first_err.get_or_insert(e);
             }
         }
     }
     match first_err {
         Some(e) => Err(e),
-        None => Ok(all_passed),
+        None => Ok(worst),
     }
 }
 
@@ -1543,7 +1544,7 @@ fn run_one(
     direction: Direction,
     probe: Probe,
     probe_selection: String,
-) -> Result<bool, String> {
+) -> Result<Outcome, String> {
     let root = repo_root()?;
     let parent = root
         .parent()
@@ -1852,18 +1853,23 @@ fn run_one(
     );
 
     let verdict = ev.verdict();
-    let passed = run_passed(&verdict, outcome.is_ok(), clean);
-    let disposal = if passed && !opts.keep_sandbox {
+    let result = run_outcome(&verdict, outcome.is_ok(), clean);
+    let disposal = if result != Outcome::NotPass && !opts.keep_sandbox {
         match remove_sandbox(&sb, &runs_root) {
             Ok(()) => format!(
-                "the sandbox `{}` was removed after the clean pass",
-                sb.root.display()
+                "the sandbox `{}` was removed after the clean {}",
+                sb.root.display(),
+                if result == Outcome::Pass {
+                    "pass"
+                } else {
+                    "declared break"
+                }
             ),
             Err(e) => format!("the sandbox `{}` was kept: {e}", sb.root.display()),
         }
     } else {
         format!(
-            "the sandbox `{}` was kept (not a clean pass, or --keep-sandbox)",
+            "the sandbox `{}` was kept (not a clean pass or declared break, or --keep-sandbox)",
             sb.root.display()
         )
     };
@@ -1876,7 +1882,7 @@ fn run_one(
         evidence_path.display()
     );
     println!("xver ({}): {}", direction.name(), verdict.label());
-    Ok(passed)
+    Ok(result)
 }
 
 /// What the evidence says about the build lock a run took.
@@ -1916,12 +1922,40 @@ fn record_outer_abort(ev: &mut Evidence, e: &str) {
     }
 }
 
-/// Whether a run counts as a clean pass: the exit status, and whether the
-/// sandbox may be removed. Only a PASS verdict qualifies — FAIL, INCOMPLETE
-/// and a measured non-discovery all exit non-zero — and only when the outer
-/// half itself completed and every postcondition held.
-fn run_passed(verdict: &RunVerdict, outer_completed: bool, postconditions_clean: bool) -> bool {
-    *verdict == RunVerdict::Pass && outer_completed && postconditions_clean
+/// How a run ended, ordered from best to worst so `both` reports the worse of
+/// its two directions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Outcome {
+    /// A PASS, with the outer half complete and every postcondition met.
+    Pass,
+    /// The same, except that the verdict is a declared contract break
+    /// (`breaks.rs`): the intended outcome of a break the two builds declare
+    /// differently, recorded rather than failed (issue #1596).
+    DeclaredBreak,
+    /// Everything else: FAIL, INCOMPLETE, a measured non-discovery, an outer
+    /// abort, or a postcondition that did not hold.
+    NotPass,
+}
+
+/// The exit status of a command whose every direction was a clean pass or a
+/// clean declared break, and at least one a declared break. Distinct from 0 so
+/// a script cannot take it for a pass, and from 1 so CI can record it instead
+/// of failing (`.github/workflows/ci.yml`'s `cross-version` job).
+const DECLARED_BREAK_EXIT: u8 = 3;
+
+/// How a run ended: the exit status, and whether the sandbox may be removed.
+/// Only a PASS verdict, or a DECLARED BREAK one, qualifies — FAIL, INCOMPLETE
+/// and a measured non-discovery are all [`Outcome::NotPass`] — and only when
+/// the outer half itself completed and every postcondition held.
+fn run_outcome(verdict: &RunVerdict, outer_completed: bool, postconditions_clean: bool) -> Outcome {
+    if !(outer_completed && postconditions_clean) {
+        return Outcome::NotPass;
+    }
+    match verdict {
+        RunVerdict::Pass => Outcome::Pass,
+        RunVerdict::DeclaredBreak(_) => Outcome::DeclaredBreak,
+        _ => Outcome::NotPass,
+    }
 }
 
 /// Write a file only its owner can read.
@@ -2679,7 +2713,7 @@ mod tests {
     }
 }
 
-/// The outer half's verdict glue: `run_passed`, `record_outer_abort` and the
+/// The outer half's verdict glue: `run_outcome`, `record_outer_abort` and the
 /// postcondition judging decide the exit status and whether the run was clean,
 /// so they are covered here rather than trusted.
 #[cfg(test)]
@@ -2720,9 +2754,17 @@ mod verdict_tests {
     fn only_a_pass_with_the_outer_half_complete_and_every_postcondition_met_is_clean() {
         let v = with_tells(&[Verdict::Pass; 4]).verdict();
         assert_eq!(v, RunVerdict::Pass);
-        assert!(run_passed(&v, true, true));
-        assert!(!run_passed(&v, false, true), "the outer half aborted");
-        assert!(!run_passed(&v, true, false), "a postcondition did not hold");
+        assert_eq!(run_outcome(&v, true, true), Outcome::Pass);
+        assert_eq!(
+            run_outcome(&v, false, true),
+            Outcome::NotPass,
+            "the outer half aborted"
+        );
+        assert_eq!(
+            run_outcome(&v, true, false),
+            Outcome::NotPass,
+            "a postcondition did not hold"
+        );
     }
 
     /// Issue #1530: four passing tells measured on a binary that is not a
@@ -2740,7 +2782,7 @@ mod verdict_tests {
             matches!(v, RunVerdict::Incomplete(ref why) if why.contains("3715d563") && why.contains(head)),
             "{v:?}"
         );
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
         let md = ev.render();
         assert!(
             md.contains("| commit built | **`3715d563` — NOT the branch HEAD"),
@@ -2757,14 +2799,14 @@ mod verdict_tests {
             matches!(v, RunVerdict::Incomplete(ref why) if why.contains("host endpoint changed")),
             "{v:?}"
         );
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
     fn any_failing_tell_is_a_fail_even_beside_an_unmeasured_one() {
         let v = with_tells(&[Verdict::Pass, Verdict::NotChecked, Verdict::Fail]).verdict();
         assert_eq!(v, RunVerdict::Fail);
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2777,7 +2819,7 @@ mod verdict_tests {
         ])
         .verdict();
         assert!(matches!(v, RunVerdict::Incomplete(_)), "{v:?}");
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2792,7 +2834,7 @@ mod verdict_tests {
         ev.discovery = Some("the old TUI lazy-spawned its own daemon".into());
         let v = ev.verdict();
         assert!(matches!(v, RunVerdict::OldClientCannotDiscover(_)), "{v:?}");
-        assert!(!run_passed(&v, true, true));
+        assert_eq!(run_outcome(&v, true, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2802,7 +2844,7 @@ mod verdict_tests {
         assert_eq!(ev.verdict(), RunVerdict::Fail);
         assert_eq!(ev.tells.len(), 1);
         assert_eq!(ev.tells[0].id, "aborted");
-        assert!(!run_passed(&ev.verdict(), false, true));
+        assert_eq!(run_outcome(&ev.verdict(), false, true), Outcome::NotPass);
     }
 
     #[test]
@@ -2816,9 +2858,33 @@ mod verdict_tests {
         );
         let v = ev.verdict();
         assert_eq!(v, RunVerdict::Pass);
-        assert!(
-            !run_passed(&v, false, true),
+        assert_eq!(
+            run_outcome(&v, false, true),
+            Outcome::NotPass,
             "the abort alone keeps it from being a clean pass"
+        );
+    }
+
+    /// Issue #1596: a declared break is its own outcome, with its own exit
+    /// status — clean only under the same conditions a pass is, and the worse
+    /// of the two when `both` reports one direction of each.
+    #[test]
+    fn a_declared_break_is_its_own_outcome_and_only_when_clean() {
+        let v = RunVerdict::DeclaredBreak("tell-4 (status half)".into());
+        assert_eq!(run_outcome(&v, true, true), Outcome::DeclaredBreak);
+        assert_eq!(run_outcome(&v, false, true), Outcome::NotPass);
+        assert_eq!(run_outcome(&v, true, false), Outcome::NotPass);
+        assert_eq!(
+            Outcome::Pass.max(Outcome::DeclaredBreak),
+            Outcome::DeclaredBreak
+        );
+        assert_eq!(
+            Outcome::DeclaredBreak.max(Outcome::NotPass),
+            Outcome::NotPass
+        );
+        assert_eq!(
+            DECLARED_BREAK_EXIT, 3,
+            "0 is a pass, 1 a failure, and ci.yml reads 3"
         );
     }
 
@@ -2896,7 +2962,11 @@ mod verdict_tests {
                 "{name}: {:?}",
                 ev.verdict()
             );
-            assert!(!run_passed(&ev.verdict(), true, clean), "{name}");
+            assert_eq!(
+                run_outcome(&ev.verdict(), true, clean),
+                Outcome::NotPass,
+                "{name}"
+            );
             assert!(
                 ev.postconditions
                     .iter()
