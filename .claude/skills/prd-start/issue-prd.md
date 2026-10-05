@@ -76,6 +76,7 @@ The issue title is the PRD's title, prefixed `PRD: ` as the existing PRD issues 
 Edit the newest body, and change only what you came to change. Fetch it with its timestamp **immediately before** editing — not a copy fetched at the start of the session:
 
 ```bash
+mkdir -p .dot-agent-deck     # absent in a fresh checkout or a new worktree
 gh issue view <n> --json body --jq .body > .dot-agent-deck/prd-<n>-body.md
 gh issue view <n> --json updatedAt --jq .updatedAt     # note this value
 ```
@@ -94,6 +95,7 @@ gh issue view <n> --json body --jq .body | diff - .dot-agent-deck/prd-<n>-body.m
 Post with a file for the same reason:
 
 ```bash
+mkdir -p .dot-agent-deck
 gh issue comment <n> --body-file .dot-agent-deck/prd-<n>-comment.md && rm .dot-agent-deck/prd-<n>-comment.md
 ```
 
