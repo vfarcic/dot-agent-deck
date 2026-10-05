@@ -84,18 +84,20 @@ action = "switch_deck"
 outcome = "dispatch"
 resolved_deck = "deck-inmotion"
 
-# Two daemons hold "box". Since issue #1491 the model's pick is not held
-# against the transcript, and the shipping model settles this tie itself, on
-# the connected box, in every run measured (7 of 7, 2026-10-03), although the
-# instructions tell it to answer a tie with the user's words. A switch stops
-# nothing and the next one undoes it, so its pick stands.
+# Two daemons hold "box". The instructions ask the model to answer a tie with
+# the user's words, which the app asks about; since issue #1491 its pick is not
+# held against the transcript, and the shipping model settles this tie itself,
+# on the connected box, in every run measured (7 of 7, 2026-10-03). A switch
+# stops nothing and the next one undoes it, so either answer passes — only a
+# deck outside the tie fails.
 [[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"
 screen = "overview"
 action = "switch_deck"
-outcome = "dispatch"
-resolved_deck = "deck-build-box"
+outcome = "param_ambiguous"
+candidates = ["deck-build-box", "deck-stale-box"]
+tie_may_be_settled = true
 
 [[fixtures]]
 name = "switch-deck-unknown"

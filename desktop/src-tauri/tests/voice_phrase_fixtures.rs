@@ -113,6 +113,14 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// On a `param_ambiguous` fixture over decks alone: the model may also
+    /// settle the tie itself, dispatching one of the `candidates` (issue
+    /// #1491). The instructions ask it to answer a tie with the user's words,
+    /// and the shipping model picks one of the tied decks instead; a switch is
+    /// undone by the next one, so either answer is correct and only a deck
+    /// outside the tie fails.
+    #[serde(default)]
+    tie_may_be_settled: bool,
     /// The report must say the deck the user named cannot take a new agent
     /// (PRD #1223): the planted `ci@stale-box` cannot take one, so the New
     /// agent dialog does not list it, the model is shown it only as one in
@@ -616,6 +624,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             "{}: `candidates` is required on, and only on, a `param_ambiguous` fixture",
             fixture.name
         );
+        assert!(
+            !fixture.tie_may_be_settled || fixture.outcome == OutcomeKind::ParamAmbiguous,
+            "{}: `tie_may_be_settled` belongs only on a `param_ambiguous` fixture",
+            fixture.name
+        );
         if let Some(expected) = fixture.resolved_agent.as_deref() {
             let planted = if fixture.generated_run {
                 &generated_run_agents
@@ -881,8 +894,21 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     || fixture.action != "open_deck"
                     || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
                         if hint == DECK_HIDDEN_HINT);
+                // A tie the model settled itself, on one of the decks tied.
+                let settled_tie = fixture.tie_may_be_settled
+                    && actual_outcome == OutcomeKind::Dispatch
+                    && resolved_deck(&answer.outcome).is_some_and(|id| {
+                        fixture
+                            .candidates
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|candidate| candidate == id)
+                    });
+                let outcome_matches =
+                    (actual_outcome == fixture.outcome && candidates_match) || settled_tie;
                 if action_matches
-                    && actual_outcome == fixture.outcome
+                    && outcome_matches
                     && agent_matches
                     && deck_matches
                     && dir_matches
@@ -892,7 +918,6 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && prefix_matches
                     && filter_matches
                     && command_matches
-                    && candidates_match
                     && deck_named
                     && deck_eligible
                     && unavailable_named

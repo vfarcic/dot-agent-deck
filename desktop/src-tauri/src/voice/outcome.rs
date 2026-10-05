@@ -1025,7 +1025,13 @@ pub async fn handle_utterance_with_dictation(
             // ([`implied_param`]) — the report says what the dialog shows.
             Err(unmet) if spec.optional => {
                 let implied = implied_param(spec, decks);
-                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript, implied.as_ref()));
+                notes.push(unmet.dropped_note(
+                    spec.kind,
+                    spoken,
+                    &transcript,
+                    implied.as_ref(),
+                    decks,
+                ));
                 resolved.extend(implied);
             }
             Err(unmet) => {
@@ -1167,15 +1173,17 @@ impl Unmet {
         spoken: &str,
         transcript: &Transcript,
         implied: Option<&ResolvedParam>,
+        decks: &[VoiceDeck],
     ) -> String {
         let noun = kind.noun();
         // Issue #1491: the model answers a deck with its listed label
         // (`ci@stale-box` for "the stale box"), whose words the user did not
         // all say. A deck that cannot take a new agent is still named back
-        // with its reason when the user said a word of its name; only a deck
-        // they did not mention at all is the model's invention.
+        // with its reason when the user said a word of its name that no other
+        // deck's name has; a deck they did not single out is the model's
+        // guess, and is not attributed to them.
         let mentioned = matches!(self, Unmet::DeckUnavailable { label, .. }
-            if mentioned(label, transcript.text()));
+            if mentioned(label, transcript.text(), decks));
         let (head, detail) = if !said(spoken, transcript.text()) && !mentioned {
             (format!("I did not catch which {noun}"), None)
         } else {
@@ -1282,11 +1290,21 @@ fn preselected_note(param: &ResolvedParam) -> String {
     )
 }
 
-/// Whether the transcript carries at least one content word of `name`
-/// ([`content_words`]) — "stale" or "box" of `ci@stale-box`.
-fn mentioned(name: &str, transcript: &str) -> bool {
+/// Whether the transcript carries a content word of the deck labelled
+/// `label` ([`content_words`]) that no other deck's spoken names hold —
+/// "stale" of `ci@stale-box` beside `ops@build-box`, but not their shared
+/// "box".
+fn mentioned(label: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
     let heard = Heard::new(transcript);
-    content_words(name).iter().any(|word| heard.word(word))
+    let elsewhere: BTreeSet<String> = decks
+        .iter()
+        .filter(|deck| deck.label != label)
+        .flat_map(deck_spoken_names)
+        .flat_map(|name| content_words(&name))
+        .collect();
+    content_words(label)
+        .iter()
+        .any(|word| !elsewhere.contains(word) && heard.word(word))
 }
 
 /// Whether the user SAID `spoken`: it has a content word ([`content_words`])
@@ -3352,8 +3370,13 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 }
 
 /// The words that say a reference IS to a deck without saying which one: the
-/// field's name, before and since issue #1045, and the articles around it.
-const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+/// field's name, before and since issue #1045, the articles around it, and
+/// "demon", how speech-to-text writes "daemon" (issue #1491), for a model that
+/// echoes the user's words — with Names withheld, or when nothing it was
+/// shown fits.
+const DECK_CATEGORY_WORDS: [&str; 9] = [
+    "daemon", "daemons", "deck", "decks", "demon", "demons", "the", "a", "an",
+];
 
 /// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
 /// that names no deck.
@@ -3674,6 +3697,31 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Scenario (issue #1491): speech-to-text writes "daemon" as "demon". A
+    /// model that echoes the user's words — with Names withheld, or when
+    /// nothing it was shown fits — hands over "all demons" or a bare "demon",
+    /// and each resolves exactly as "all daemons" and "daemon" do.
+    #[test]
+    fn voice_outcome_deck_ref_reads_demon_as_daemon() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+        });
+        assert!(matches!(
+            resolve_deck_ref("all demons", &decks),
+            DeckRefMatch::One { id, .. } if id == crate::voice::ALL_DECKS_ID
+        ));
+        assert_eq!(
+            resolve_deck_ref("demon", &decks),
+            resolve_deck_ref("daemon", &decks)
+        );
+        assert_eq!(resolve_deck_ref("demon", &decks), DeckRefMatch::None);
     }
 
     #[test]
@@ -5218,6 +5266,26 @@ mod tests {
             outcome.sentence(),
             "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
              can't take a new agent: it is not connected, so none is preselected."
+        );
+
+        // Qodo on PR #1504: beside another deck that cannot take one and shares
+        // "box", the user's "build box" does not single out the stale box the
+        // model guessed, so that deck is not named back as if they had.
+        let two_boxes = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck("deck-build", "ops@build-box", false, NOT_CONNECTED),
+            unavailable_deck("deck-stale", "ci@stale-box", false, NOT_CONNECTED),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &two_boxes,
+            IntentAnswer::new("open_new_agent").with_param("deck", "ci@stale-box"),
+            "new agent on the build box",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. I did not catch which daemon. \
+             Preselected daemon: Local deck."
         );
 
         // The model's own invention of it is not caught, like any invented deck.
