@@ -113,10 +113,19 @@ struct PhraseFixture {
     /// against the planted fleet the way `resolved_agent` is against agents.
     #[serde(default)]
     resolved_deck: Option<String>,
+    /// On a `param_ambiguous` fixture over decks alone: the model may also
+    /// settle the tie itself, dispatching one of the `candidates` (issue
+    /// #1491). The instructions ask it to answer a tie with the user's words,
+    /// and the shipping model picks one of the tied decks instead; a switch is
+    /// undone by the next one, so either answer is correct and only a deck
+    /// outside the tie fails.
+    #[serde(default)]
+    tie_may_be_settled: bool,
     /// The report must say the deck the user named cannot take a new agent
     /// (PRD #1223): the planted `ci@stale-box` cannot take one, so the New
-    /// agent dialog does not list it, it is never offered to the model and
-    /// never preselected, and naming it must be answered with its short reason.
+    /// agent dialog does not list it, the model is shown it only as one in
+    /// `decks_without_new_agent`, it is never preselected, and naming it must be
+    /// answered with its short reason.
     #[serde(default)]
     names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
@@ -440,9 +449,20 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     .collect();
     // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
     // and one remote, labelled the way the overview labels them — plus a
-    // remote the New agent dialog shows DISABLED, which the model is never
-    // shown, so no fixture can preselect it (checked on every fixture below).
+    // remote the New agent dialog shows DISABLED, which the model sees only
+    // among `decks_without_new_agent` and no fixture may preselect (checked on
+    // every fixture below).
+    // Issue #1491 — and the Daemon selector's All daemons entry, which the app
+    // appends to every utterance's decks (`selector_voice_decks`) the same way:
+    // switchable, and never offered to the New agent dialog.
     let decks = vec![
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: dot_agent_deck_desktop::voice::ALL_DECKS_ID.to_string(),
+            label: dot_agent_deck_desktop::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_IS_EVERY_DAEMON.to_string()),
+        },
         dot_agent_deck_desktop::voice::VoiceDeck {
             id: "deck-local".to_string(),
             label: "Local deck".to_string(),
@@ -463,6 +483,24 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             address: None,
             local: false,
             unavailable: Some(STALE_BOX_REASON.to_string()),
+        },
+        // A daemon named as one word, which speech-to-text splits ("mini PC"),
+        // and one the app is not connected to, as every daemon but the one
+        // shown is under a single-daemon selection: switchable, never offered
+        // to the New agent dialog.
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-minipc".to_string(),
+            label: "minipc".to_string(),
+            address: Some("ops@10.0.0.7".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+        },
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-inmotion".to_string(),
+            label: "inmotion".to_string(),
+            address: Some("ops@10.0.0.8".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
         },
     ];
     // PRD #1223 — what the New agent dialog's browser shows when a fixture says
@@ -584,6 +622,11 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             fixture.candidates.is_some(),
             fixture.outcome == OutcomeKind::ParamAmbiguous,
             "{}: `candidates` is required on, and only on, a `param_ambiguous` fixture",
+            fixture.name
+        );
+        assert!(
+            !fixture.tie_may_be_settled || fixture.outcome == OutcomeKind::ParamAmbiguous,
+            "{}: `tie_may_be_settled` belongs only on a `param_ambiguous` fixture",
             fixture.name
         );
         if let Some(expected) = fixture.resolved_agent.as_deref() {
@@ -851,8 +894,21 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     || fixture.action != "open_deck"
                     || matches!(&answer.outcome, VoiceOutcome::Unavailable { hint, .. }
                         if hint == DECK_HIDDEN_HINT);
+                // A tie the model settled itself, on one of the decks tied.
+                let settled_tie = fixture.tie_may_be_settled
+                    && actual_outcome == OutcomeKind::Dispatch
+                    && resolved_deck(&answer.outcome).is_some_and(|id| {
+                        fixture
+                            .candidates
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|candidate| candidate == id)
+                    });
+                let outcome_matches =
+                    (actual_outcome == fixture.outcome && candidates_match) || settled_tie;
                 if action_matches
-                    && actual_outcome == fixture.outcome
+                    && outcome_matches
                     && agent_matches
                     && deck_matches
                     && dir_matches
@@ -862,7 +918,6 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && prefix_matches
                     && filter_matches
                     && command_matches
-                    && candidates_match
                     && deck_named
                     && deck_eligible
                     && unavailable_named

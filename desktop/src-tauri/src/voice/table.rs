@@ -3183,12 +3183,17 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "daemon" (or "deck", its name before #1045)
-        // alone — no shared verb — so a steered pick needs the user to have
-        // talked about a daemon (see commands.toml).
+        // Grounded by the word "daemon" (or "deck", its name before #1045,
+        // or "demon", how speech-to-text writes it) alone — no shared verb —
+        // so a steered pick needs the user to have talked about a daemon (see
+        // commands.toml).
         assert_eq!(
             table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec!["daemon".to_string(), "deck".to_string()])
+            ActionGrounding::HeardAs(vec![
+                "daemon".to_string(),
+                "deck".to_string(),
+                "demon".to_string()
+            ])
         );
     }
 

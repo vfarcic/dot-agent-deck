@@ -1024,6 +1024,26 @@ pub struct SessionState {
     /// read it belong to the TUI that spawned the pane, not to one that
     /// reattached later. See [`Self::confirmation_producer`].
     pub prompt_reports_unavailable: bool,
+    /// Issue #1567: this session's producer DECLARED that it reports every
+    /// prompt it submits — an ATTESTED event arrived carrying
+    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`], which the bundled
+    /// Pi extension sends on every report from #1567 on
+    /// ([`crate::event::AgentEvent::declares_prompt_reports`]), and the session
+    /// is not an outside agent's unproven card. For a Pi session this
+    /// is what makes the pane one that confirms its own prompts; an extension
+    /// from an older deck never sends it, so its pane keeps being one that
+    /// cannot.
+    ///
+    /// Per SESSION and STICKY once set, for the reasons
+    /// [`Self::prompt_reports_unavailable`] is: the answer has to outlive the
+    /// frame that carried it, and a producer that declared it does not stop
+    /// being that producer because one later frame — the extension's bare
+    /// lifecycle retry after a failed report — went out without it. It cannot
+    /// outrank [`Self::prompt_reports_unavailable`]; see
+    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`]. Not carried
+    /// by [`SessionSnapshot`], for the same reason as that field: a reconnecting
+    /// TUI learns it again from the producer's next event.
+    pub prompt_reports_declared: bool,
 }
 
 /// Issue #1364: who raised a [`SessionStatus::WaitingForInput`] that came from
@@ -1102,11 +1122,17 @@ impl SessionState {
     }
 
     /// Issue #559: this session as a candidate confirmation producer — its
-    /// declared agent type, and whether the session's producer declared it
-    /// cannot report a submitted prompt ([`Self::prompt_reports_unavailable`]).
-    /// The input [`crate::prompt_delivery::pane_confirmation_capability`] takes.
-    pub fn confirmation_producer(&self) -> (&AgentType, bool) {
-        (&self.agent_type, self.prompt_reports_unavailable)
+    /// declared agent type, and what the session's producer declared about its
+    /// prompt reports: that it cannot report a submitted prompt
+    /// ([`Self::prompt_reports_unavailable`]), or (issue #1567) that it reports
+    /// every one ([`Self::prompt_reports_declared`]). The input
+    /// [`crate::prompt_delivery::pane_confirmation_capability`] takes.
+    pub fn confirmation_producer(&self) -> crate::prompt_delivery::ConfirmationProducer<'_> {
+        crate::prompt_delivery::ConfirmationProducer {
+            agent_type: &self.agent_type,
+            prompt_reports_declared: self.prompt_reports_declared,
+            prompt_reports_unavailable: self.prompt_reports_unavailable,
+        }
     }
 
     /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
@@ -1591,6 +1617,13 @@ pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
+    /// Issue #1507: per pane, the daemon registry id its card-surfacing
+    /// `SessionStart` named ([`crate::event::SURFACED_AGENT_ID_METADATA_KEY`]),
+    /// as a number. Read by the dashboard's creation-order sort for a card
+    /// that has no `agent_id` of its own yet — a live-surfaced card before its
+    /// agent's first real hook, or a pane that never sends one. Order only:
+    /// nothing here is identity, and dropped with the pane.
+    pane_surfaced_agent_seq: HashMap<String, u64>,
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
     /// Pane ids this process holds as its OWN: panes it registered itself
@@ -7419,9 +7452,11 @@ pub(crate) enum PromptWatch {
     /// the only proof that a re-submission could ever be confirmed.
     ///
     /// Reviewer finding B4: this used to be `hooked`, set by ANY event carrying
-    /// the agent's id. Pi emits exactly such events and hardcodes
-    /// `user_prompt: None`, so a Pi pane armed a retry loop that could never
-    /// terminate on success and retyped the prompt until the deadline.
+    /// the agent's id. A Pi extension from before issue #622 emits exactly such
+    /// events and never a prompt, so a Pi pane armed a retry loop that could
+    /// never terminate on success and retyped the prompt until the deadline.
+    /// Issue #1567: a Pi frame counts only when its extension declares that it
+    /// reports every prompt.
     ///
     /// Issue #666: `agent_start` carries the FIRST `SessionStart` seen in this
     /// window that satisfies the rearm's facts G ∧ I ∧ W — genuine (not
@@ -11481,6 +11516,9 @@ impl AppState {
         // comparing against it, enough to get the successor's card deleted by
         // the render-thread half. A pane id reused after a close is a new pane.
         self.pane_started_at.remove(pane_id);
+        // Issue #1507: likewise its surfaced creation order — a successor on a
+        // reused pane id surfaces with its own.
+        self.pane_surfaced_agent_seq.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -11597,6 +11635,7 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         session_id
@@ -11868,7 +11907,11 @@ impl AppState {
     ///
     /// Called with the new subscription already open and BEFORE any of its
     /// events are applied, so the reply was built after everything this state
-    /// holds and is the newer account of every pane it covers.
+    /// holds and is the newer account of every pane it covers. Issue #1555:
+    /// where the daemon offers `SubscribeEventsWithSnapshot`, the reply and the
+    /// subscription are one request, and the daemon opens the subscription at the
+    /// instant it reads the reply's live state, so none of the subscription's
+    /// events is one the reply already includes.
     ///
     /// For each record whose pane this state manages and which carries a live
     /// snapshot:
@@ -11895,11 +11938,13 @@ impl AppState {
     /// What it does NOT repair, deliberately. A record with no live snapshot, and
     /// a pane this state does not manage, are left as they are, and an agent the
     /// reply no longer lists keeps its card: a pane whose agent is gone is ended
-    /// by its own attach stream closing, not by this one. Events already queued
-    /// on the new subscription are applied after the snapshot and can replay a
-    /// transition it already includes, counting a closure twice or briefly
-    /// moving the generation back until the rest of the queue lands; telling
-    /// them apart needs a stream position the wire does not carry. None of these can mis-deliver a prompt:
+    /// by its own attach stream closing, not by this one. From a daemon that
+    /// predates `SubscribeEventsWithSnapshot`, which is resynchronized with
+    /// `SubscribeEvents` then `ListAgents`, events broadcast between those two
+    /// requests are queued on the new subscription AND included in the reply,
+    /// and are applied after it: they can replay a transition it already
+    /// includes, counting a closure twice or briefly moving the generation back
+    /// until the rest of the queue lands. None of these can mis-deliver a prompt:
     /// a delivery that may have written before the gap stops on the gap itself
     /// ([`Self::event_stream_gaps`], bumped here as well, so one written while
     /// the subscriber was disconnected stops too), and one that has not written
@@ -12767,6 +12812,7 @@ impl AppState {
     /// identity for the pane goes with the entry regardless of variant.
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
+        self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -12784,6 +12830,12 @@ impl AppState {
                 spawn_context_removal(path);
             }
         }
+    }
+
+    /// Issue #1507: the daemon registry id `pane_id`'s card-surfacing
+    /// `SessionStart` named, as a number — see `pane_surfaced_agent_seq`.
+    pub fn pane_surfaced_agent_seq(&self, pane_id: &str) -> Option<u64> {
+        self.pane_surfaced_agent_seq.get(pane_id).copied()
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -16065,6 +16117,7 @@ impl AppState {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -16127,6 +16180,22 @@ impl AppState {
             .and_then(|n| crate::untrusted_text::sanitize_display_name(n))
         {
             session.display_name = Some(name);
+        }
+
+        // Issue #1507: a daemon card-surfacing start names the registry id of
+        // the agent it draws, for creation order only — the session's own
+        // `agent_id` stays `None` so the agent's real `SessionStart` still
+        // supersedes it. Only the daemon's marked start is read: a hook cannot
+        // move a card by claiming an id. (The marker is producer-writable, so a
+        // forged one can reorder a card, which is all this key can do.)
+        if event.is_card_surface_session_start()
+            && let Some(pane_id) = event.pane_id.as_ref()
+            && let Some(seq) = event
+                .metadata
+                .get(crate::event::SURFACED_AGENT_ID_METADATA_KEY)
+                .and_then(|id| id.parse::<u64>().ok())
+        {
+            self.pane_surfaced_agent_seq.insert(pane_id.clone(), seq);
         }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
@@ -16194,6 +16263,16 @@ impl AppState {
         // `SessionState::prompt_reports_unavailable`.
         if event.declares_prompt_reports_unavailable() {
             session.prompt_reports_unavailable = true;
+        }
+        // Issue #1567: sticky for the same reason — a producer that declared it
+        // reports every prompt is still that producer when one of its frames
+        // goes out bare. Unlike the marker above this one GRANTS standing, so
+        // it is taken only from a frame the daemon's hook-provenance gate
+        // attested (`AgentEvent::declares_prompt_reports`) and never onto an
+        // outside agent's unproven card. See
+        // `SessionState::prompt_reports_declared`.
+        if !unproven && event.declares_prompt_reports() {
+            session.prompt_reports_declared = true;
         }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
@@ -24388,6 +24467,7 @@ while True:
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
 

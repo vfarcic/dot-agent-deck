@@ -461,6 +461,17 @@ pub const AGENT_EVENT_TYPES: [&str; 6] = [
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// `AgentEvent.metadata` key carrying the daemon registry id of the agent a
+/// card-surfacing `SessionStart` draws (issue #1507), so an already-attached
+/// TUI can place the live card in creation order before the agent's first real
+/// hook — and at all for a pane that never sends one (a shell, `cat`).
+///
+/// ORDER ONLY, never identity: the event's own `agent_id` stays `None` so the
+/// agent's real `SessionStart` still supersedes the placeholder (see
+/// `surface_spawned_pane`). Additive on the wire: an older daemon sends no key
+/// and the card falls back to the pane-id order, and an older TUI ignores it.
+pub const SURFACED_AGENT_ID_METADATA_KEY: &str = "surfaced_agent_id";
+
 /// `AgentEvent.metadata` key carrying a DAEMON-AUTHORED report that an
 /// automatic prompt delivery failed on this pane (issue #424).
 ///
@@ -917,6 +928,40 @@ pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY: &str =
 /// writes. Readers accept any value; see the key's docs.
 pub const WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_VALUE: &str = "1";
 
+/// Issue #1567: the [`AgentEvent::metadata`] key on which a producer DECLARES
+/// that it reports every prompt it submits (value
+/// [`PROMPT_REPORTS_DECLARED_METADATA_VALUE`]).
+///
+/// The bundled Pi extension sends it on every report from issue #1567 on, via
+/// `dot-agent-deck agent-event --reports-prompts`. Pi's prompt reports come
+/// from an extension the deck ships, and an extension from an older deck does
+/// not report every prompt Pi submits — none before issue #622, and from #622
+/// none that was submitted while Pi was busy. A Pi process keeps the extension
+/// it loaded at start, so the deck meets older ones whenever it outlives an
+/// upgrade. This declaration is what tells the two apart.
+///
+/// Unlike [`WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`] it GRANTS standing
+/// — and only to an agent type whose prompt reporting is
+/// [`crate::prompt_delivery::PromptReporting::WhenDeclared`] (Pi); on any other
+/// type it is inert. Because it grants, it is read only from a frame the
+/// daemon's hook-provenance gate ATTESTED ([`crate::hook_provenance`]): one
+/// carrying [`ATTESTED_OWNER_METADATA_KEY`], which the daemon sets only for a
+/// frame whose per-spawn capability token resolved to the pane and agent it
+/// names, and never with [`UNPROVEN_METADATA_KEY`]. Both are daemon-authoritative
+/// — `ingest_event` strips a producer's copy — so an outside agent's frame, a
+/// token-less one, or one relayed by a daemon older than issue #318 declares
+/// nothing, whatever this key says. What the attestation does not reach is the
+/// same-uid residual `crate::hook_provenance` names: a process that reads a
+/// deck agent's own token can speak for that pane in this as in everything else.
+///
+/// Read by [`AgentEvent::declares_prompt_reports`] and by
+/// [`crate::state::SessionState::prompt_reports_declared`].
+pub const PROMPT_REPORTS_DECLARED_METADATA_KEY: &str = "prompt_reports_declared";
+
+/// The [`PROMPT_REPORTS_DECLARED_METADATA_KEY`] value a declaring producer
+/// writes, and the only one that counts.
+pub const PROMPT_REPORTS_DECLARED_METADATA_VALUE: &str = "1";
+
 /// Issue #1354: the [`AgentEvent::metadata`] key naming the SUBAGENT an event
 /// came from, when the agent's hook payload says it came from one.
 ///
@@ -1301,9 +1346,25 @@ impl AgentEvent {
             .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
     }
 
+    /// Issue #1567: did this event's producer declare that it reports every
+    /// prompt it submits (see [`PROMPT_REPORTS_DECLARED_METADATA_KEY`]), on a
+    /// frame the daemon ATTESTED? Only the exact value counts, and only on a
+    /// frame carrying the daemon's attested-owner stamp and not its unproven
+    /// one, because this answer GRANTS standing.
+    pub fn declares_prompt_reports(&self) -> bool {
+        self.attested_owner().is_some()
+            && !self.is_unproven()
+            && self
+                .metadata
+                .get(PROMPT_REPORTS_DECLARED_METADATA_KEY)
+                .is_some_and(|v| v == PROMPT_REPORTS_DECLARED_METADATA_VALUE)
+    }
+
     /// Issue #559: can the producer of THIS event report a submitted prompt —
-    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] for its
-    /// declared type, withdrawn when the event itself declares that it cannot
+    /// [`crate::prompt_delivery::producer_reports_submitted_prompt`] for its
+    /// declared type and what the event itself declares: that it reports
+    /// ([`Self::declares_prompt_reports`], issue #1567, which is what a Pi
+    /// producer needs) or that it cannot
     /// ([`Self::declares_prompt_reports_unavailable`]).
     ///
     /// Every daemon-side capability read goes through this rather than through
@@ -1311,8 +1372,13 @@ impl AgentEvent {
     /// agent it hosts and says nothing about whether that agent's reporting
     /// channel exists.
     pub fn reports_submitted_prompt(&self) -> bool {
-        crate::prompt_delivery::agent_reports_submitted_prompt(&self.agent_type)
-            && !self.declares_prompt_reports_unavailable()
+        crate::prompt_delivery::producer_reports_submitted_prompt(
+            crate::prompt_delivery::ConfirmationProducer {
+                agent_type: &self.agent_type,
+                prompt_reports_declared: self.declares_prompt_reports(),
+                prompt_reports_unavailable: self.declares_prompt_reports_unavailable(),
+            },
+        )
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than

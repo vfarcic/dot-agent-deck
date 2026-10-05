@@ -30,6 +30,66 @@ action = "switch_deck"
 outcome = "dispatch"
 resolved_deck = "deck-local"
 
+# Issue #1491: the selector's All daemons entry, by the phrasings users say.
+# `open_overview` changes no selection, so none of these may route there.
+[[fixtures]]
+name = "switch-deck-select-all-daemons"
+utterance = "select all daemons"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-switch-to-all-daemons"
+utterance = "switch to all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-show-all-daemons"
+utterance = "show all daemons"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+[[fixtures]]
+name = "switch-deck-daemon-to-all"
+utterance = "switch daemon to all"
+screen = "deck"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "all-daemons"
+
+# A one-word daemon name as speech-to-text writes it: split, with a comma, and
+# "daemon" heard as "demon" — measured from a real transcript.
+[[fixtures]]
+name = "switch-deck-mini-pc-demon"
+utterance = "Select mini PC, Demon."
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-minipc"
+
+# Issue #1491: speech-to-text glued "deck" onto the name — measured from a
+# real transcript. The model answers with the listed daemon it meant.
+[[fixtures]]
+name = "switch-deck-in-motion-deck-glued"
+utterance = "Switch to InMotionDeck"
+screen = "overview"
+action = "switch_deck"
+outcome = "dispatch"
+resolved_deck = "deck-inmotion"
+
+# Two daemons hold "box". The instructions ask the model to answer a tie with
+# the user's words, which the app asks about; since issue #1491 its pick is not
+# held against the transcript, and the shipping model settles this tie itself,
+# on the connected box, in every run measured (7 of 7, 2026-10-03). A switch
+# stops nothing and the next one undoes it, so either answer passes — only a
+# deck outside the tie fails.
 [[fixtures]]
 name = "switch-deck-ambiguous-box"
 utterance = "switch deck to the box"
@@ -37,6 +97,7 @@ screen = "overview"
 action = "switch_deck"
 outcome = "param_ambiguous"
 candidates = ["deck-build-box", "deck-stale-box"]
+tie_may_be_settled = true
 
 [[fixtures]]
 name = "switch-deck-unknown"
@@ -296,6 +357,16 @@ resolved_deck = "deck-local"
 [[fixtures]]
 name = "choose-deck-by-its-label"
 utterance = "deck build box"
+screen = "overview"
+dialog = true
+action = "choose_deck"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+# Issue #1491: "deck" glued onto the daemon's name, in the dialog's field.
+[[fixtures]]
+name = "choose-deck-glued-name"
+utterance = "Daemon BuildBoxDeck."
 screen = "overview"
 dialog = true
 action = "choose_deck"
@@ -1231,9 +1302,10 @@ outcome = "dispatch"
 resolved_deck = "deck-local"
 
 # PRD #1223 — a deck that cannot take a new agent (`ci@stale-box`, not
-# connected), which the New agent dialog does not list (PR #1451 round 3). It is
-# never offered to the model, so it cannot be preselected — the harness checks
-# that on every fixture — and when the user names it the report must say in one
+# connected), which the New agent dialog does not list (PR #1451 round 3). The
+# model sees it only among `decks_without_new_agent` (issue #1491), and it is
+# never preselected — the harness checks that on every fixture — and when the
+# user names it the report must say in one
 # line that it can't take a new agent, with its short reason, rather than claim
 # a preselection the dialog will not make.
 [[fixtures]]
@@ -1259,6 +1331,16 @@ outcome = "unavailable"
 [[fixtures]]
 name = "open-dir-by-name"
 utterance = "open dir billing service"
+screen = "overview"
+listing = true
+action = "open_dir"
+outcome = "dispatch"
+resolved_dir = "/home/dev/code/billing-service"
+
+# Issue #1491: a listed name as speech-to-text can write it, run together.
+[[fixtures]]
+name = "open-dir-glued-name"
+utterance = "open dir BillingService"
 screen = "overview"
 listing = true
 action = "open_dir"

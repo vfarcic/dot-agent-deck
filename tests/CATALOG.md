@@ -163,7 +163,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/density/004 — A rendered card has no trailing blank rows below its content at any density tier (PRD #147).
 - **Layer:** L1 (ratatui `TestBackend`, buffer inspection).
 - **Agent:** none.
-- **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
+- **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Minimal, Compact, Normal, and Spacious — reserved card height equals rendered content height.
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
@@ -173,6 +173,34 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** an `Idle` session rendered at Spacious density keeps its ordinary card content — prompt line, dir line, agent-type badge — and carries the `Idle` status badge whose leading dot is inked at the flash-on tick and blank at the flash-off tick, matching the indicator Normal renders for the same session. Pins the fallback that idle cards use in **every** density now that issue #519 removed the Spacious-only ASCII-art overlay, which used to `Clear` this content and paint generated frames over it.
 - **Does not assert:** the removed art path itself (deleted, with no seam left to drive); the flash period, covered by the `flash_dot` unit test.
 - **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/006 — When Compact cannot fit every card, the grid draws every card at the 3-row Minimal density instead of scrolling (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through the real `render_card_grid` via `render_card_grid_to_buffer`).
+- **Agent:** none (the seven synthetic idle role cards of `dashboard/grid/001`).
+- **Asserts:** control first — on a 79x37 deck (one card column, 35 rows for cards) the seven cards are each 5 rows tall, nothing is hidden, and the buffer matches a snapshot recorded before the Minimal tier existed. Then on a 79x25 deck, where seven Compact cards need 35 of the 23 card rows, all seven cards are drawn, each exactly 3 rows (heights measured from the drawn corners), the title carries no `↑`/`↓` marker, and every card has its status badge on the top border, `Dir:` as its one inner row, and `Last:` / `Tools:` on the bottom border.
+- **Does not assert:** the two-pass column search that keeps Minimal from displacing a wider Compact layout (`choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere` unit test); status rows at Minimal (`dashboard/density/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/007 — At Minimal density a Blocked reason or `Orphaned` row takes the `Dir:` row's place (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through `render_card_grid_to_buffer`).
+- **Agent:** none (seven synthetic role cards; the second Blocked on depleted credits, the third orphaned).
+- **Asserts:** on the 79x25 deck every card is 3 rows; the Blocked card keeps its `Blocked` badge on the top border and shows its `⚠ Credits …` reason as its middle row with no `Dir:`; the orphaned card shows `Orphaned — delegation unavailable` as its middle row with no `Dir:`; the other five cards keep `Dir:`.
+- **Does not assert:** a card that is both Blocked and orphaned (at Minimal it shows the `Orphaned` row, the first status row — `fit_card_rows`' doc); Blocked text truncation or reset formatting (`status/badge/002`, `status/badge/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/008 — A deck too large even for Minimal scrolls at Compact exactly as before (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through `render_card_grid_to_buffer`).
+- **Agent:** none.
+- **Asserts:** seven role cards on a 79x20 deck, where even Minimal needs 21 of the 18 card rows, draw three 5-row Compact cards and a title carrying `(↓4)`; the buffer matches a snapshot recorded before the Minimal tier existed.
+- **Does not assert:** scrolling by selection (`dashboard/grid/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/009 — The real binary draws every card at Minimal when Compact cannot fit them (issue #1568).
+- **Layer:** L2 (PTY + vt100, real `dot-agent-deck` binary, `tests/e2e_card_density.rs`).
+- **Agent:** none — eight synthetic Claude Code `SessionStart` hook events written to the deck's hook socket.
+- **Asserts:** in a 79x30 terminal, which holds eight cards at the 3-row Minimal height but not at Compact's 5, all eight cards appear, each 3 rows tall (measured from the drawn corners), each with a `Dir:` row and a `Last:` counter, and the deck title carries no `↑`/`↓` marker.
+- **Does not assert:** a real agent's card content (density selection does not depend on what reports the session); status rows at Minimal (`dashboard/density/007`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, for the hook socket).
 
 #### dashboard/grid
 
@@ -195,6 +223,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none.
 - **Asserts:** seven roles on a 90x12 deck, too small at every column count 90 columns allows, genuinely overflows (two of seven cards drawn) and carries `(↓5)` in a title that still names all `7 agent(s)`; the column count is **not** escalated, since narrowing every card buys nothing once completeness is out of reach. Selecting the last card scrolls the window down and flips the marker to `(↑5)`. Closes the asymmetry the issue names — the scheduled-tasks header signalled its hidden rows while the card grid rendered its title plain.
 - **Does not assert:** which key scrolls the grid (selection movement does, via `dashboard/selection/*`); the indicator's format, pinned by the `scroll_indicator_reports_only_what_is_hidden` unit test shared with the scheduled-tasks modal.
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/order
+
+##### dashboard/order/001 — Agents the desktop app or `dispatch` created are listed in creation order (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (twelve synthetic agents seeded through the TUI's startup hydration path, `AppState::seed_hydrated_session`, with daemon agent ids `1`..`12`).
+- **Asserts:** a desktop-created dispatcher (`desktop-9ff5ffc73955d0fe-0`) and eleven dispatched units (`sched-dispatch-…-N`), none with a numeric pane id, are drawn top to bottom in the order the daemon created them — dispatcher first — and a second render draws the same order. Before the fix every non-numeric pane id sorted as `u64::MAX`, so all twelve tied and took `HashMap` order; with twelve agents that matches creation order with odds of 1 in 12!.
+- **Does not assert:** the desktop app's own order (it renders the daemon's `ListAgents` order, which is sorted by the same numeric agent id); agents surfaced live to an already-attached TUI rather than hydrated (`dashboard/order/004`); filtering (`dashboard/filter/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/002 — TUI-created panes and daemon-spawned agents interleave in creation order (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (five synthetic hydrated agents).
+- **Asserts:** agents created from the TUI (numeric pane ids `0`, `1`), the desktop app and `dispatch`, interleaved in time, are drawn in creation order rather than with every numeric pane first; and daemon agent id `10` is drawn after `9`, i.e. ids compare as numbers, as the daemon's own list does.
+- **Does not assert:** sessions with no daemon agent id (hook-only sessions from a legacy hook script), which keep the old pane-id / start-time fallback after every agent that has one.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/003 — An orchestration tab keeps role order even when a role was respawned (issue #1507 control).
+- **Layer:** L1 (in-module `src/ui.rs` test on `filter_sessions` + `sort_by_role_order`, the same two steps the main loop scopes an orchestration tab with).
+- **Agent:** none (three synthetic role sessions).
+- **Asserts:** with an orchestrator that carries the newest daemon agent id of its three roles (a `clear = true` respawn), creation order alone puts it last, and the tab's role-order sort still puts it first, followed by the other roles in config order.
+- **Does not assert:** the rendered orchestration tab (`tabs/orchestration/*`); the respawn itself.
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/order/004 — An agent the daemon surfaces live to an attached TUI takes its creation position before its first hook (issue #1507).
+- **Layer:** L1 (in-module `src/ui.rs` test: the daemon's real `spawn::surface_attach_started_agent` broadcast applied through `AppState::apply_event`, then `render_frame` into a ratatui `TestBackend`, inline `insta` snapshot of the card order).
+- **Agent:** none (a hydrated dispatcher, two live-surfaced units that have sent no hook, and a later TUI-created pane).
+- **Asserts:** the cards read dispatcher, unit, unit, TUI pane — the live-surfaced units are placed by the registry id their card-surfacing `SessionStart` names (`SURFACED_AGENT_ID_METADATA_KEY`), while the event's own `agent_id` stays `None`. Control: the same surface without that key, as a daemon predating it sends, falls back after every card that has an id.
+- **Does not assert:** the supersession of the surfaced card by the agent's real `SessionStart` (covered by the `status/supersede/*` and `prompt/pane-input/033` tests); a live-surfaced orchestration tab, whose role order `dashboard/order/003` covers.
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/card-stats
@@ -755,6 +813,20 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
 - **Platform coverage:** mac+linux+windows.
 
+
+##### status/agent-event/007 — An ATTESTED Pi report declaring prompt reports (`agent-event --reports-prompts`) makes only its own pane one that confirms its prompts; an attested report that declares nothing leaves its pane non-confirming (issue #1567).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon via `common::spawn_inprocess_daemon`, two Pi-typed `cat` stand-ins spawned through its attach socket (each exports its per-spawn hook capability token via `common::capability_export_command`), and the REAL `dot-agent-deck agent-event` CLI run as a subprocess with that pane's token. The daemon's broadcast is applied to a client `AppState`, standing in for an attached TUI.
+- **Agent:** synthetic (stand-in panes; the reports come from the real CLI).
+- **Asserts:** each broadcast frame carries `daemon_attested_owner` naming its own spawn; the declaring pane's frame answers `declares_prompt_reports()` / `reports_submitted_prompt()` true, and the pane reads `ConfirmationCapability::Reports` in the daemon's state and in the client; the non-declaring pane's frame answers false and the pane reads `CannotReport` in both.
+- **Does not assert:** the real Pi extension sending the flag (lane 2: `scheduler/pi/002`, `chain-smoke/pi/003`); what a confirming pane's delivery then does (`spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`).
+- **Platform coverage:** mac+linux.
+
+##### status/agent-event/008 — A Pi prompt-report declaration the hook-provenance gate does NOT attest grants nothing: an outside pane's token-less report, the same with a forged `daemon_attested_owner`, and a token-less report claiming a deck-spawned Pi pane (issue #1567, PR #1559's gate).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon, the REAL `agent-event` CLI with no token, and one raw JSON line written straight to the daemon's hook socket. The daemon's broadcast is applied to a client `AppState`.
+- **Agent:** synthetic (an outside pane the daemon never spawned, and a Pi-typed `cat` stand-in it did).
+- **Asserts:** the outside pane's CLI frame is broadcast `daemon_unproven` with no attested owner and declares nothing; the raw forged frame arrives with the producer's `daemon_attested_owner` STRIPPED and declares nothing; neither makes the outside pane `Reports` in the client or the daemon, and the daemon's outside card never records `prompt_reports_declared`; the token-less frame naming the deck-spawned Pi pane is refused (no broadcast within 1.5 s) and that pane is not `Reports`. RED with the attestation requirement removed from `AgentEvent::declares_prompt_reports`.
+- **Does not assert:** the same-uid residual `docs/develop/hook-provenance.md` names (a process that reads a deck agent's own token can speak for that pane); `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, under which a token-less frame for a deck pane is admitted but carries no attestation stamp, so it declares nothing by the same rule.
+- **Platform coverage:** mac+linux.
 #### status/supersede
 
 ##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
@@ -4672,16 +4744,16 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Platform coverage:** mac+linux.
 
 ##### session/live/018 — A TUI event subscriber that reconnects after its stream is torn down brings the client state back into agreement with the daemon (issue #1520).
-- **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`; the `ListAgents` reply is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
+- **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`, and, run a second time as a daemon that advertises it (issue #1555), `Hello` and `SubscribeEventsWithSnapshot`; the snapshot is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
 - **Agent:** none (synthetic Claude Code hook events).
-- **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected. Before the fix it stayed on `(gen-a, Idle, 0)`.
-- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a `ListAgents` that fails once and is retried on a fresh subscription, and a card refreshed from a snapshot with no newer stamp.
+- **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected — against both kinds of daemon. Before the fix it stayed on `(gen-a, Idle, 0)`.
+- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a snapshot that fails once and is retried on a fresh subscription, a card refreshed from a snapshot with no newer stamp, and (issue #1555, `events_the_snapshot_already_includes_are_not_replayed_over_it`) a conversation that rolls over between the resubscribe and the snapshot: through `SubscribeEventsWithSnapshot` the closure is counted once, and its control shows the older daemon's unordered resync replaying the window. That the real daemon opens the subscription and reads the snapshot under one `AppState` guard is `daemon_protocol::tests::an_ordered_subscription_never_carries_an_event_its_snapshot_includes`.
 - **Platform coverage:** mac+linux.
 
 ##### session/live/019 — A running TUI whose event stream breaks and reconnects shows the status it missed (issue #1520).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_reconnect_agent_type.rs`, `#![cfg(feature = "e2e")]`): a real `daemon serve` with a real `StartAgent` pane, the real binary attached through the vt100 `TuiDeck` harness, and the real `agent-event` CLI. The break is the `e2e`-build-only seam `e2e_subscriber_breaks` in `main.rs`, set through `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON`: it drops the first matching event and tears the subscription down once, standing in for a lagged stream, which a PTY test cannot provoke on cue.
 - **Agent:** none (a `sh -c 'sleep 600'` pane declared `Pi`; the status comes from the real `agent-event --type running` CLI).
-- **Asserts:** the card, already on screen, shows `Thinking` after the one event that would have told the TUI so was lost with the stream; the daemon applied it, and the reconnect's resync carried it over.
+- **Asserts:** the card, already on screen, shows `Thinking` after the one event that would have told the TUI so was lost with the stream; the daemon applied it, and the reconnect's resync carried it over (through `SubscribeEventsWithSnapshot`, which the same build's daemon advertises, issue #1555).
 - **Does not assert:** a real lag or daemon restart (the seam stands in for both); a prompt delivery across the gap (`prompt/pane-input/047`); the generation and closure count (`session/live/018`).
 - **Platform coverage:** mac+linux.
 
@@ -5244,6 +5316,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Asserts:** the full WORKER chain — the pi worker AUTO-SUBMITTED the daemon-injected single-line `worker-task-coder.md` pointer, read its task file, and created the sentinel `pi_worker_sentinel_9d2e.txt` (contents `PI_WORKER_SENTINEL_OK`) — proving it RECEIVED and DID the delegated task; and the daemon wrote `.dot-agent-deck/work-done-coder.md`, proving the pi worker SIGNALLED work-done over the hook socket (via the footer `dot-agent-deck work-done` CLI or the extension's native `work_done` tool — either routes the same `WorkDone` signal, so the file's appearance is a path-agnostic proof). Generous per-step timeouts (240s sentinel / 120s work-done) sized to confidence, not token cost (Design Decision #7).
 - **Does not assert:** exact agent phrasing / the exact task text (the sentinel filename + content are the literal tokens that must survive); WHICH work-done path pi took (CLI vs native tool — both produce the same file); the `clear = true`-respawn worker path with pi (isolated out via `clear = false`; that path's 10s-fallback fragility is tracked for the companion PRD); the extension's per-event status mapping (covered by the TS unit tests + synthetic `status/agent-event/003`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
+- **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
+
+##### chain-smoke/pi/003 — A delegate's task pointer TYPED into an idle real `pi` worker is confirmed by the worker's own prompt report, and submitted exactly once (issue #1567).
+- **Layer:** L2 (in-process daemon; a real pi worker PTY via `AgentPtyRegistry::spawn_agent` with the bundled extension staged into its HOME; the daemon's event stream read through `common::EventSub::subscribe` on the in-process attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. No role config, so `handle_delegate` does not respawn the worker: the pointer is typed into the running pane, not handed over natively. The orchestrator side is the deterministic synthetic `DelegateSignal`, as in `chain-smoke/pi/002`.
+- **Agent:** REAL `pi` worker (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the worker's session-start report (`Idle`) carries `prompt_reports_declared`; after the delegate, a declared `Pi` `Thinking` report whose `user_prompt` is the `worker-task-coder.md` pointer arrives within 50 s (the proof the in-place re-delivery waits for); the worker creates `pi_delegate_sentinel_6b1c.txt` (`PI_DELEGATE_SENTINEL_OK`) and signals work-done; and until 10 s past the first re-delivery — pinned at 60 s with `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`, so it was still pending when the report arrived — no second report of the pointer's delivery id appears, so the report stopped the re-delivery.
+- **Does not assert:** a delegate into a BUSY pi worker (queued by pi as a steering message; the extension's `input` report is pinned by its TS unit tests); the `clear = true` native path (`chain-smoke/pi/002`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
 
 #### pane/drift
@@ -6279,6 +6359,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap Haiku `-p` turn (and the status assertion resolves on boot, before the turn completes) — well under Decision 23's <$0.05/run bound.
 
+##### scheduler/pi/002 — A scheduled prompt the deck TYPES into an interactive real `pi` pane is confirmed by Pi's own prompt report, so a Pi pane is a prompt-confirming agent (issue #1567).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, `DOT_AGENT_DECK_SCHEDULES` pointing at a one-schedule fixture and `DOT_AGENT_DECK_LOG` at a file in the test's scratch dir; the fire is a `RunNow` over the attached deck's own attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. The schedule's `command` is an INTERACTIVE `pi --provider anthropic --model claude-haiku-4-5 --approve` (no prompt on the command line) and its `prompt` is the directive, so the prompt goes through the daemon's spawn-time PTY delivery (`crate::spawn`) rather than a native `get-seed` hand-off. The bundled extension comes from the daemon-startup auto-materialize. Records a `.cast`, but is not marked for the reel.
+- **Agent:** REAL `pi` (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the Pi pane's card on the attached TUI's grid shows `Prmt:` (the typed-in prompt, which only Pi's own report puts there); the deck log records `prompt delivery confirmed by the agent's submitted prompt` and never `delivery cannot be confirmed by this agent` (the delivery treated the Pi pane as confirming, and was confirmed); pi creates `pi_confirm_sentinel_3a7f.txt` with `PI_CONFIRM_SENTINEL_OK`. Prints the write → confirmation latency and the re-submission count from the log, as evidence for Pi's confirmation-latency floor.
+- **Does not assert:** whether the first write landed or a re-submission was needed (both end confirmed; the count is printed); the exact prompt text on the card (cut to the card's width); an older extension keeping the old behaviour (fast tier: `spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`, `tests/pi_agent_event_cli.rs`); a prompt queued while pi is busy (the extension's `input` report is pinned by its TS unit tests).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one short Haiku turn (create a file) — well under Decision 23's <$0.05/run bound.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).
@@ -6942,7 +7030,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### newagent/visibility/001 — Desktop-started plain agents surface without selection on fresh and live TUI attachment.
 - **Layer:** L2 lane 1, PTY-attached (a headless real daemon receives the desktop-shaped `StartAgent`, then a real TUI attaches through `TuiDeck`; a transparent test-only attach proxy deterministically gates the mid-attach ordering; two-client cases add a production `DaemonClient` with its own live `SubscribeEvents` stream beside the TUI, both against a pre-started daemon and against one the TUI lazily spawned; the control starts the same named command through the TUI's own new-agent form).
 - **Agent:** none (both paths run a `sleep 600` stand-in; no credential).
-- **Asserts:** the TUI-native control visibly renders the named plain pane; the desktop-shaped request carries cwd, command, display name, a minted `DOT_AGENT_DECK_PANE_ID`, 24×80 dimensions, no tab membership, and the agent type inferred from its command. Starting before attachment hydrates the named card without input. From an already-attached empty TUI, the first desktop start renders one bordered card under the `1 agent(s)` dashboard header and command-mode dashboard footer before any selection; a click selects that card while retaining the same dashboard view. In a separate untouched attachment, two desktop starts produce two dashboard cards, and a third retains all three bordered cards together under the `3 agent(s)` header and dashboard footer. With a second production client subscribed, both its stream and the already-attached TUI receive the first start whether the daemon was pre-started or lazily spawned by that TUI. The desktop-shaped immediate post-start `ListAgents` refetch includes the accepted agent and does not prevent the TUI card from surfacing even when it completes before the second client's queued event is consumed. Three deterministic mid-attach attempts capture an explicitly empty `ListAgents` response, confirm the TUI's subscription is active, forward the started pane's daemon-authored card-surface event, and only then release the stale empty hydration response; the first card must remain visible after startup settles. Regression guard: before `9d66ef6b`, the daemon registered the pane but direct `StartAgent` published no card-surface event, so the live grid remained `No active agents`.
+- **Asserts:** the TUI-native control visibly renders the named plain pane; the desktop-shaped request carries cwd, command, display name, a minted `DOT_AGENT_DECK_PANE_ID`, 24×80 dimensions, no tab membership, and the agent type inferred from its command. Starting before attachment hydrates the named card without input. From an already-attached empty TUI, the first desktop start renders one bordered card under the `1 agent(s)` dashboard header and command-mode dashboard footer before any selection; a click selects that card while retaining the same dashboard view. In a separate untouched attachment, two desktop starts produce two dashboard cards, and a third retains all three bordered cards together under the `3 agent(s)` header and dashboard footer; an agent then created through the TUI's own form becomes card 4 while the three desktop cards keep numbers 1-3 in start order (issue #1507: the hookless desktop cards are placed only by the daemon id on their card-surfacing start — without it they sorted after the TUI card — and before #1507 they took `HashMap` order). With a second production client subscribed, both its stream and the already-attached TUI receive the first start whether the daemon was pre-started or lazily spawned by that TUI. The desktop-shaped immediate post-start `ListAgents` refetch includes the accepted agent and does not prevent the TUI card from surfacing even when it completes before the second client's queued event is consumed. Three deterministic mid-attach attempts capture an explicitly empty `ListAgents` response, confirm the TUI's subscription is active, forward the started pane's daemon-authored card-surface event, and only then release the stale empty hydration response; the first card must remain visible after startup settles. Regression guard: before `9d66ef6b`, the daemon registered the pane but direct `StartAgent` published no card-surface event, so the live grid remained `No active agents`.
 - **Does not assert:** the real Tauri process, webview, form, or snapshot emission (there is no `tauri-driver` tier, #953); agent work or hook delivery; card text beyond the labels and stand-in empty-state body, colors, or timing.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — `DaemonProc` binds Unix-domain sockets and `TuiDeck` uses a PTY).
 
