@@ -1,5 +1,5 @@
 ---
-name: dot-ai-prd-update-decisions
+name: prd-update-decisions
 description: Update PRD based on design decisions and strategic changes made during conversations
 user-invocable: true
 ---
@@ -9,6 +9,8 @@ user-invocable: true
 ## Instructions
 
 You are updating a PRD based on design decisions, strategic changes, and architectural choices made during conversations. This command captures conceptual changes that may not yet be reflected in code but affect requirements, approach, or scope.
+
+**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD, recording a decision needs no commit.**
 
 ## Process Overview
 
@@ -21,8 +23,10 @@ You are updating a PRD based on design decisions, strategic changes, and archite
 
 ## Step 1: PRD Analysis
 
-Ask the user which PRD to update, then:
-- Read the PRD file from `prds/[issue-id]-[feature-name].md`
+Ask the user which PRD to update, then locate it with `bash .claude/skills/prd-start/prd-source.sh [issue-id]`:
+- **`SOURCE=file`**: read the PRD file it names (`FILE=prds/[issue-id]-[feature-name].md`)
+- **`SOURCE=issue`**: read the issue body and its collaborator comments, as [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) shows
+- **`SOURCE=none`**: there is no PRD to update — say why (`REASON=`) and suggest `/prd-create [issue-id]`
 - Understand current requirements, approach, and constraints
 - Identify areas most likely to be affected by design decisions
 
@@ -68,10 +72,18 @@ For each decision, record:
 
 ## Step 4: PRD Updates
 
-Update the appropriate PRD sections:
+Update the appropriate PRD sections.
+
+**For a file PRD** (`SOURCE=file`), edit the file as below; the change is committed with the branch's work.
+
+**For an issue PRD** (`SOURCE=issue`), a decision is written in two places, in this order, following [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md):
+1. **The record, as a comment** — one `### PRD decision — YYYY-MM-DD` comment per decision, carrying the full Decision Documentation Format above. Comments are append-only, so two agents recording decisions at once cannot overwrite each other.
+2. **The plan, in the body** — add the decision's one-line summary, linking its comment, to `## Decisions`, and change the sections it changes (requirements, scope, milestones, risks) as below. Fetch the body immediately before editing it and change only those sections ("Editing the body").
+
+Nothing is committed for an issue PRD.
 
 ### Decision Log Updates
-- Add new resolved decisions with date and rationale
+- Add new resolved decisions with date and rationale (for an issue PRD: the comment, plus its one-line summary in the body's `## Decisions`)
 - Mark open questions as resolved if decisions were made
 - Update decision impact on requirements and scope
 

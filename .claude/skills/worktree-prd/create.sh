@@ -4,7 +4,10 @@ set -euo pipefail
 # Create a git worktree for PRD work with a descriptive branch name.
 # Usage: create.sh <prd-number> [prd-title]
 #
-# If prd-title is not provided, the script reads it from prds/<number>-*.md.
+# If prd-title is not provided, the script reads it from prds/<number>-*.md
+# when that file exists, and from the PRD's GitHub issue otherwise (issue
+# #1591: a new PRD lives in its issue and has no file). Either way it asks
+# ../prd-start/prd-source.sh, the one place that decides where a PRD lives.
 # This script validates everything and creates the worktree, or reports errors.
 
 if [ $# -lt 1 ]; then
@@ -18,17 +21,18 @@ prd_title="${2:-}"
 
 # --- Resolve PRD title if not provided ---
 
+prd_source="unknown"
 if [ -z "$prd_title" ]; then
-  prd_file=$(find prds/ -maxdepth 1 -name "${prd_number}-*.md" -print -quit 2>/dev/null || true)
-  if [ -z "$prd_file" ]; then
+  located=$(bash "$(dirname "$0")/../prd-start/prd-source.sh" "$prd_number" || true)
+  prd_source=$(printf '%s\n' "$located" | sed -n 's/^SOURCE=//p' | head -1)
+  prd_title=$(printf '%s\n' "$located" | sed -n 's/^TITLE=//p' | head -1)
+  if [ -z "$prd_title" ]; then
     echo "ERROR=true"
-    echo "MESSAGE=No PRD file found matching prds/${prd_number}-*.md"
+    echo "MESSAGE=No PRD file matches prds/${prd_number}-*.md and issue #${prd_number} could not be read: $(printf '%s\n' "$located" | sed -n 's/^REASON=//p' | head -1)"
     exit 0
   fi
-  # Extract title from first heading line.
-  # Handles: "# PRD #123: Title", "## PRD #123 - Title", "# Title"
-  first_line=$(head -1 "$prd_file")
-  prd_title=$(echo "$first_line" | sed -E 's/^#+ *(PRD *#?[0-9]* *[:\-] *)?//')
+  # An issue title carries the "PRD:" / "PRD #123:" prefix a file heading does.
+  prd_title=$(echo "$prd_title" | sed -E 's/^PRD *#?[0-9]* *[:\-] *//')
 fi
 
 # --- Generate branch name ---
@@ -97,4 +101,5 @@ echo "SUCCESS=true"
 echo "BRANCH_NAME=${branch_name}"
 echo "WORKTREE_PATH=${worktree_path}"
 echo "PRD_TITLE=${prd_title}"
+echo "PRD_SOURCE=${prd_source}"
 echo "GIT_OUTPUT=${output}"

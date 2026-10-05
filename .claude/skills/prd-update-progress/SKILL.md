@@ -1,5 +1,5 @@
 ---
-name: dot-ai-prd-update-progress
+name: prd-update-progress
 description: Update PRD progress based on git commits and code changes, enhanced by conversation context
 user-invocable: true
 ---
@@ -9,6 +9,8 @@ user-invocable: true
 ## Instructions
 
 You are helping update an existing Product Requirements Document (PRD) based on implementation work completed. This command analyzes git commits and code changes, enhanced by conversation context, to track PRD completion progress and propose evidence-based updates.
+
+**Where the PRD lives.** This skill is a project-local fork of the `dot-ai` mirror of the same name (CLAUDE.md rule 13), changed only where it assumed the PRD is a file. Since issue #1591 a new PRD is its GitHub issue — the body is the PRD, the comments are its record — and an older PRD keeps its `prds/<n>-*.md` file. `bash .claude/skills/prd-start/prd-source.sh <n>` says which, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) is how to read and write the issue case. **For an issue PRD the progress update itself needs no commit**: the checkboxes are ticked in the body and the progress note is a comment; only the implementation work is committed, on its branch.
 
 ## Process Overview
 
@@ -28,7 +30,7 @@ You are helping update an existing Product Requirements Document (PRD) based on 
 
 1. **Current Work Context**: Look for recent conversation about specific PRD work, features, or issues
 2. **Git Branch Analysis**: Check current git branch for PRD indicators (feature/prd-*, issue numbers)
-3. **Recent File Activity**: Identify recently modified PRD files in `prds/` directory
+3. **Recent File Activity**: Identify recently modified PRD files in `prds/` directory (older PRDs), or the PRD issue the branch or recent commits name
 4. **Todo List Context**: Check if TodoWrite tool shows PRD-specific tasks in progress
 
 **Detection Priority Order:**
@@ -37,6 +39,8 @@ You are helping update an existing Product Requirements Document (PRD) based on 
 - If TodoWrite shows PRD-specific tasks → Use that PRD context
 - If only one PRD file recently modified → Use that PRD
 - If multiple PRDs possible → Ask user to clarify
+
+**Then locate it:** `bash .claude/skills/prd-start/prd-source.sh [issue-id]`. `SOURCE=file` → the PRD is the file it names, as before. `SOURCE=issue` → the PRD is the issue body (`gh issue view [issue-id]`), and its earlier progress is in the collaborator comments ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md), "Comments"). `SOURCE=none` → there is no PRD to update: say why (`REASON=`) and stop.
 
 ## Step 2: Context-First Progress Analysis
 
@@ -87,7 +91,7 @@ Identify different types of changes:
 ### **CRITICAL**: Systematic Checkbox Scanning
 **MUST perform this step to avoid missing requirements:**
 
-1. **Scan ALL unchecked items** in the PRD using grep or search
+1. **Scan ALL unchecked items** in the PRD using grep or search (for an issue PRD, in the body fetched with `gh issue view [issue-id] --json body --jq .body`)
 2. **Categorize each unchecked requirement** by type:
    - **Implementation** (code, features, technical tasks)
    - **Documentation** (guides, examples, cross-references)
@@ -227,6 +231,13 @@ When applying updates:
 3. **Preserve unchecked items** that still need work
 4. **Update completion percentages** realistically
 
+**For a file PRD**, edit the file; Step 8 commits it with the work.
+
+**For an issue PRD**, follow [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md):
+1. **Tick the confirmed checkboxes in the body** — fetch it immediately before editing, change only those checkboxes (and any section a divergence in Step 5 changes), and write it back with `--body-file` ("Editing the body").
+2. **Post one progress comment** — `### PRD progress — YYYY-MM-DD`, carrying the completed items with their evidence (commits, files, tests named), the remaining work, and the completion status from Step 4. This is the record a file PRD kept in its own text; as a comment it cannot overwrite another agent's.
+3. **Record a divergence as a decision** — a `### PRD decision` comment, as `/prd-update-decisions` does, rather than only a line in the progress note.
+
 ## Step 7.5: Code Example Validation
 
 When updating PRDs based on implementation progress:
@@ -262,7 +273,7 @@ When updating PRDs based on implementation progress:
 
 ## Step 8: Commit Progress Updates
 
-After successfully updating the PRD, commit all changes to preserve the progress checkpoint:
+After successfully updating the PRD, commit all changes to preserve the progress checkpoint. For an issue PRD the commit carries the implementation work only — the PRD update is already on GitHub — so if there is no work to commit, there is nothing to do here:
 
 ### Commit Implementation Work
 ```bash
@@ -277,7 +288,7 @@ git status
 git commit -m "feat(prd-X): implement [brief description of completed work]
 
 - [Brief list of key implementation achievements]
-- Updated PRD checkboxes for completed items
+- Updated PRD checkboxes for completed items (file PRD) / in issue #X (issue PRD)
 
 Progress: X% complete - [next major milestone]"
 ```
@@ -314,7 +325,7 @@ To continue working on this PRD:
 
 To finalize:
 1. Clear/reset the conversation context
-2. Run `/pr-create` to open the pull request. The PRD moves to `prds/done/` as part of that branch's work, and the issue closes on merge via `Closes #N`.
+2. Run `/pr-create` to open the pull request, with `Closes #N` in its body so the issue closes on merge. A file PRD also moves to `prds/done/` as part of that branch's work; an issue PRD has nothing to move — closing the issue is what archives it.
 
 ---
 
