@@ -572,22 +572,28 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # work-done 240s) against the default 3 x 60s kill window. Alone it takes ~48s;
 # at load ~60 it was killed at 180s with no diagnostics (met on PR #1523).
 # 6 x 60s = 360s sits just above the declared budget, so a stuck run fails on
-# its own assertion, naming the stage; the test's waits are untouched. The
-# filter tracks the TEST FUNCTION name and must follow any rename.
+# its own assertion, naming the stage; the test's waits are untouched. The test
+# pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 420s to match, or
+# the daemon and its agents would be reaped at the 300s harness default before
+# this window could be used (Qodo on PR #1523). The filter tracks the TEST
+# FUNCTION name and must follow any rename.
 [[profile.default.overrides]]
 filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 # `codex/worker/001` drives a REAL Codex orchestration worker through a
-# delegated task and its `work-done`, and declares ~407s of its own waits (2s,
-# 45s, 240s, 120s) against the default 3 x 60s kill window. Alone it takes
-# 26-110s; beside other real-agent tests it was killed at 190s with no
-# diagnostics (met on PR #1523). 8 x 60s = 480s sits just above the declared
-# budget, so a stuck run fails on its own assertion; the test's waits are
-# untouched. The filter tracks the TEST FUNCTION name and must follow any rename.
+# delegated task and its `work-done`. Alone it takes 26-110s; beside other
+# real-agent tests it was killed at the default 3 x 60s with no diagnostics (met
+# on PR #1523). Its window is 5 x 60s = 300s and NOT the ~407s its own waits
+# add up to, because 300s is the most it can use: the worker is spawned through
+# an in-process registry whose lifetime reaper reads the test process's own
+# `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, pinned to the 300s harness default
+# before `main` (`tests/common/child_lifetime_bound.rs`), so the wrapped Codex
+# is reaped at 300s whatever this says (Qodo on PR #1523). The filter tracks the
+# TEST FUNCTION name and must follow any rename.
 [[profile.default.overrides]]
 filter = 'test(codex_worker_001_real_worker_receives_delegate_and_signals_work_done)'
-slow-timeout = { period = "60s", terminate-after = 8 }
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

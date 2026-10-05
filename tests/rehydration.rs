@@ -2992,6 +2992,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
 
     // The live snapshot the daemon would have attached on reconnect.
     let snap = SessionSnapshot {
+        output_set_status: false,
         subagent_wait: None,
         status: SessionStatus::Working,
         agent_type: Some(AgentType::ClaudeCode),
@@ -3128,6 +3129,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                     rows: 0,
                     cols: 0,
                     live: Some(SessionSnapshot {
+                        output_set_status: false,
                         subagent_wait: None,
                         status: SessionStatus::Working,
                         agent_type: Some(AgentType::ClaudeCode),

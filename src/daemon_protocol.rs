@@ -8921,6 +8921,7 @@ mod tests {
             SessionStatus::Error,
         ] {
             let snap = SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: status.clone(),
                 agent_type: Some(AgentType::ClaudeCode),
@@ -8962,6 +8963,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: Some(SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::ClaudeCode),

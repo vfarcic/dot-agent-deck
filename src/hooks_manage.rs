@@ -381,6 +381,19 @@ fn lock_settings(path: &Path) -> io::Result<SettingsGuard> {
     })
 }
 
+/// [`lock_settings`] for an INSTALL, which may be the first write ever: the
+/// settings directory is created before the lock is taken, because a lock beside
+/// a directory that does not exist yet is no lock at all — two first installs
+/// would each read empty settings and the later publish would drop the earlier
+/// one's hooks (Qodo on PR #1523). Uninstall keeps [`lock_settings`] and
+/// creates nothing.
+fn lock_settings_for_install(path: &Path) -> io::Result<SettingsGuard> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    lock_settings(path)
+}
+
 /// [`lock_settings`]'s two locks, released together. The file lock is declared
 /// first so it is dropped first, before the mutex.
 struct SettingsGuard {
@@ -1190,7 +1203,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
-    let _guard = lock_settings(&path).map_err(|e| e.to_string())?;
+    let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let InstallOutcome {
@@ -1295,7 +1308,7 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
-    let _guard = lock_settings(path)?;
+    let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     install_impl(&mut settings, binary_path, stop_failure);
     write_settings(path, &settings)

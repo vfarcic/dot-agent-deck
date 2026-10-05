@@ -2714,8 +2714,9 @@ fn run_wrap_pty(
     let mut fwd = SignalForwarder::new(child_pid);
     // Issue #1493: only a Codex whose prompt hook this spawn could not vouch
     // for; with the hooks running, they decide its status and output does not.
-    let mut quiet_output_idle = (has_tty_output
-        && emitter.agent_type == AgentType::Codex
+    // Not gated on a terminal output: a redirected stdout/stderr is teed with
+    // the same `interface`, which records its bytes too (Qodo on PR #1523).
+    let mut quiet_output_idle = (emitter.agent_type == AgentType::Codex
         && emitter.prompt_reports_unavailable)
         .then(QuietOutputIdle::new);
     let status = loop {
@@ -2917,8 +2918,17 @@ fn run_wrap_pipe(
         &emitter.agent_type,
     ))));
 
-    let out_thread = spawn_pipe_tee(child_stdout, libc::STDOUT_FILENO, emitter, &detector, None);
-    let err_thread = spawn_pipe_tee(child_stderr, libc::STDERR_FILENO, emitter, &detector, None);
+    // Issue #1493 (Qodo on PR #1523): a Codex whose prompt hook is not running
+    // still needs its output's quiet noticed here, or its card holds the first
+    // Thinking until the process exits. The watch is used for its last-output
+    // time only — `claim` is never called on this path, so it announces no
+    // interface readiness (see `spawn_pipe_tee`).
+    let quiet = (emitter.agent_type == AgentType::Codex && emitter.prompt_reports_unavailable)
+        .then(|| (QuietOutputIdle::new(), Arc::new(InterfaceWatch::new(None))));
+    let watch = quiet.as_ref().map(|(_, watch)| watch);
+    let out_thread = spawn_pipe_tee(child_stdout, libc::STDOUT_FILENO, emitter, &detector, watch);
+    let err_thread = spawn_pipe_tee(child_stderr, libc::STDERR_FILENO, emitter, &detector, watch);
+    let mut quiet = quiet;
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
     // stdin, dropping `child_stdin` closes it so an EOF-sensitive child finishes.
@@ -2956,6 +2966,9 @@ fn run_wrap_pipe(
     let mut fwd = SignalForwarder::new(child_pid);
     let status = loop {
         fwd.tick();
+        if let Some((quiet, watch)) = quiet.as_mut() {
+            quiet.tick(&detector, watch, emitter);
+        }
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
             Ok(None) => {}
@@ -3006,9 +3019,11 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     let detector = Arc::clone(detector);
     // Issue #243: `Some` on the interactive path, where a redirected descriptor
     // is still one of the ways a wrapped child's interface can reach the user, so
-    // its bytes count as the child painting. `None` on the wholly non-interactive
-    // pipe path: there is no terminal there for an interface to exist on, and a
-    // batch `codex exec --json` run is never the target of a readiness gate.
+    // its bytes count as the child painting. On the wholly non-interactive pipe
+    // path it is `None`, except for a Codex whose prompt hook is not running,
+    // where the watch only records when output last arrived for its quiet-output
+    // Idle (issue #1493): nothing there ever asks it about readiness, since
+    // there is no terminal for an interface to exist on.
     let interface = interface.map(Arc::clone);
     std::thread::spawn(move || match interface {
         Some(watch) => tee(
