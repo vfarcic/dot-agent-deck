@@ -57,6 +57,12 @@ pub struct Tell {
     /// for one that passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_parts: Vec<String>,
+    /// The pane a failed half measured, as the daemon itself named it — for
+    /// tell-4's `status` half, the reviewer's pane id from the last readable
+    /// `daemon status` rows. `breaks.rs` requires a refusal to name this pane
+    /// before attributing the failure to a declared break.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_pane: Option<String>,
     /// Set on a FAILED tell when a contract break the two builds declare
     /// differently accounts for every half that failed, with the evidence
     /// (`breaks.rs`). Such a tell does not make the run FAIL: the run is a
@@ -215,6 +221,7 @@ impl Evidence {
             verdict,
             detail,
             failed_parts: Vec::new(),
+            subject_pane: None,
             declared_break: None,
         });
     }
@@ -762,6 +769,7 @@ mod tests {
             verdict: Verdict::NotChecked,
             detail: "no ss(8) on this host".into(),
             failed_parts: Vec::new(),
+            subject_pane: None,
             declared_break: None,
         });
         assert!(e.missing_tells().is_empty(), "every tell was recorded");
@@ -779,6 +787,7 @@ mod tests {
             verdict: Verdict::Fail,
             detail: "2 lines, expected 1".into(),
             failed_parts: Vec::new(),
+            subject_pane: None,
             declared_break: None,
         });
         assert!(!e.passed());
@@ -876,6 +885,7 @@ mod tests {
             verdict: Verdict::Pass,
             detail: "first\nsecond".into(),
             failed_parts: Vec::new(),
+            subject_pane: None,
             declared_break: None,
         });
         let out = e.render();

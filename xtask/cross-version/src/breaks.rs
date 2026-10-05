@@ -19,8 +19,13 @@
 //!   CLIENT does not — so the break is declared between these two builds, in
 //!   the direction that refuses the client;
 //! * one line of the sandbox `deck.log` carries every piece of the effect's
-//!   log signature: the daemon refused for the reason the break gives, in this
-//!   run.
+//!   log signature and names the pane the failed half measured
+//!   ([`crate::report::Tell::subject_pane`]): the daemon refused that pane's
+//!   message, for the reason the break gives, in this run.
+//!
+//! A half the harness could not measure is not named like one that measured a
+//! refusal: tell-4 calls its status half `status-query` when `daemon status`
+//! could not be read, and no effect names that.
 //!
 //! Anything short of that stays a failure: a tell failing with no break
 //! declared between the builds, a break declared but no refusal logged, or a
@@ -43,6 +48,20 @@ pub struct KnownEffect {
     /// Substrings that must all appear on ONE line of the sandbox `deck.log`:
     /// the daemon's refusal, in its own words.
     pub log_signature: &'static [&'static str],
+    /// The field that line names the refused message's pane in, as
+    /// `<field><pane>`; the pane must be the tell's
+    /// [`subject_pane`](crate::report::Tell::subject_pane).
+    pub pane_field: &'static str,
+    /// Where the daemon writes the signature and the pane field, as
+    /// `(source file, text in it)` — one pin per piece, so a reworded refusal
+    /// fails `every_known_effect_is_pinned_to_the_source` rather than quietly
+    /// turning a declared break back into a FAIL. A message split across source
+    /// lines is matched with its continuation escapes joined.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the source-pin guard test only")
+    )]
+    pub source_pins: &'static [(&'static str, &'static str)],
     /// Why the break fails that half, for the evidence file.
     pub why: &'static str,
 }
@@ -55,7 +74,22 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[KnownEffect {
     part: "status",
     log_signature: &[
         "refused a status event whose hook capability token",
+        "verb=\"agent_event\"",
         "reason=\"missing_token\"",
+    ],
+    pane_field: "claimed_pane=",
+    source_pins: &[
+        (
+            "src/daemon.rs",
+            "hook socket: refused a status event whose hook capability token",
+        ),
+        ("src/daemon.rs", "verb = \"agent_event\","),
+        ("src/daemon.rs", "reason = refusal.code(),"),
+        (
+            "src/hook_provenance.rs",
+            "Refusal::Missing => \"missing_token\",",
+        ),
+        ("src/daemon.rs", "claimed_pane = %escape_id_for_log("),
     ],
     why: "a daemon declaring it refuses a status report from a deck-spawned pane that carries \
           no hook capability token, and a CLI from a build that does not declare it sends \
@@ -109,7 +143,13 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
         let mut explained = Vec::new();
         let mut unexplained = Vec::new();
         for part in &tell.failed_parts {
-            match explain_part(&tell.id, part, &declared, deck_log) {
+            match explain_part(
+                &tell.id,
+                part,
+                tell.subject_pane.as_deref(),
+                &declared,
+                deck_log,
+            ) {
                 Ok(why) => explained.push(why),
                 Err(why) => unexplained.push(format!("`{part}`: {why}")),
             }
@@ -138,6 +178,7 @@ pub fn explain(ev: &mut Evidence, direction: Direction, deck_log: &str) {
 fn explain_part(
     tell: &str,
     part: &str,
+    subject_pane: Option<&str>,
     declared: &[&String],
     deck_log: &str,
 ) -> Result<(String, String), String> {
@@ -157,12 +198,22 @@ fn explain_part(
             ));
             continue;
         }
-        let Some(line) = deck_log
-            .lines()
-            .find(|l| effect.log_signature.iter().all(|sig| l.contains(sig)))
-        else {
+        let Some(pane) = subject_pane else {
             why_not.push(format!(
-                "`{}` is declared, but the daemon logged no refusal matching {:?}",
+                "`{}` is declared, but the run did not record which pane the failed half \
+                 measured, so no refusal can be tied to it",
+                effect.id
+            ));
+            continue;
+        };
+        let pane_token = format!("{}{pane}", effect.pane_field);
+        let Some(line) = deck_log.lines().find(|l| {
+            effect.log_signature.iter().all(|sig| l.contains(sig))
+                && l.split_whitespace().any(|w| w == pane_token)
+        }) else {
+            why_not.push(format!(
+                "`{}` is declared, but the daemon logged no refusal matching {:?} for \
+                 `{pane_token}`",
                 effect.id, effect.log_signature
             ));
             continue;
@@ -210,8 +261,18 @@ mod tests {
 
     /// The PR #1595 reverse run, reduced to what decides its verdict: every
     /// expected tell measured, tell-4's `work-done` half held and its `status`
-    /// half did not.
+    /// half did not, with the daemon answering `daemon status` and naming the
+    /// reviewer's pane `3`.
     fn reverse_run(new_hello: &str, work_done: bool) -> Evidence {
+        reverse_run_with(new_hello, work_done, "status", Some("3"))
+    }
+
+    fn reverse_run_with(
+        new_hello: &str,
+        work_done: bool,
+        status_part: &str,
+        subject_pane: Option<&str>,
+    ) -> Evidence {
         let mut ev = Evidence {
             branch: "6f38d2a559ba4bca111f2419d9c71e0e80d8c77e".into(),
             direction: Direction::Reverse,
@@ -225,9 +286,10 @@ mod tests {
         ev.tell_in_parts(
             "tell-4",
             "hooks (work-done, status) still arrived",
-            &[("work-done", work_done), ("status", false)],
+            &[("work-done", work_done), (status_part, false)],
             "status: the status never changed",
         );
+        ev.tells.last_mut().unwrap().subject_pane = subject_pane.map(str::to_string);
         assert!(
             CONTRACT_TELLS
                 .iter()
@@ -319,6 +381,45 @@ mod tests {
         );
     }
 
+    /// Control (review of #1597): `daemon status` could not be read at all, so
+    /// the status half measured nothing. A refusal in the log does not make
+    /// that a declared break.
+    #[test]
+    fn a_status_query_that_could_not_be_read_is_not_a_declared_break() {
+        let mut ev = reverse_run_with(BRANCH_HELLO, true, "status-query", None);
+        explain(&mut ev, Direction::Reverse, &deck_log(true));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        let mut ev = reverse_run_with(BRANCH_HELLO, true, "status-query", Some("3"));
+        explain(&mut ev, Direction::Reverse, &deck_log(true));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// Control: the refusal names a pane other than the one the failed half
+    /// measured, so it is some other message's refusal.
+    #[test]
+    fn a_refusal_for_another_pane_does_not_explain_the_failure() {
+        let mut ev = reverse_run_with(BRANCH_HELLO, true, "status", Some("2"));
+        explain(&mut ev, Direction::Reverse, &deck_log(true));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+        assert!(
+            ev.steps.iter().any(|s| s.contains("claimed_pane=2")),
+            "{:?}",
+            ev.steps
+        );
+        // `claimed_pane=3` must not satisfy a pane `3x`, nor `3` a `33`.
+        let mut ev = reverse_run_with(BRANCH_HELLO, true, "status", Some("33"));
+        explain(&mut ev, Direction::Reverse, &deck_log(true));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
+    /// Control: a run that did not record the pane cannot tie a refusal to it.
+    #[test]
+    fn a_failed_half_with_no_recorded_pane_is_not_explained() {
+        let mut ev = reverse_run_with(BRANCH_HELLO, true, "status", None);
+        explain(&mut ev, Direction::Reverse, &deck_log(true));
+        assert_eq!(ev.verdict(), RunVerdict::Fail);
+    }
+
     /// Control: forward, the daemon is the previous release, which does not
     /// declare #318, so the break cannot be what refused the client.
     #[test]
@@ -387,10 +488,12 @@ mod tests {
         out
     }
 
-    /// Every known effect names an entry `CONTRACT_BREAKS` really carries, and
-    /// its log signature is what this tree's daemon really writes, so a
-    /// renamed break or reworded refusal turns this red rather than quietly
-    /// turning a declared break back into a FAIL on every PR.
+    /// Every known effect names an entry `CONTRACT_BREAKS` really carries and
+    /// a tell the scenario records, and every one of its source pins is text
+    /// the daemon's source really contains, so a renamed break or reworded
+    /// refusal turns this red rather than quietly turning a declared break back
+    /// into a FAIL on every PR. Each effect needs at least as many pins as
+    /// signature pieces plus its pane field.
     #[test]
     fn every_known_effect_is_pinned_to_the_source() {
         let protocol = include_str!("../../../src/daemon_protocol.rs");
@@ -399,8 +502,14 @@ mod tests {
             .expect("CONTRACT_BREAKS in src/daemon_protocol.rs");
         let list = &protocol[list_start..];
         let list = &list[..list.find("];").expect("the list's end")];
-        let daemon = joined(include_str!("../../../src/daemon.rs"));
-        let provenance = include_str!("../../../src/hook_provenance.rs");
+        let source = |file: &str| -> String {
+            joined(match file {
+                "src/daemon.rs" => include_str!("../../../src/daemon.rs"),
+                "src/hook_provenance.rs" => include_str!("../../../src/hook_provenance.rs"),
+                other => panic!("a source pin names {other}, which this test does not read"),
+            })
+        };
+        assert!(!KNOWN_EFFECTS.is_empty());
         for effect in KNOWN_EFFECTS {
             assert!(
                 list.contains(&format!("\"{}\"", effect.id)),
@@ -412,16 +521,27 @@ mod tests {
                 "`{}` names an unknown tell",
                 effect.id
             );
+            assert!(
+                effect.source_pins.len() > effect.log_signature.len(),
+                "`{}` pins fewer places than it has signature pieces and a pane field",
+                effect.id
+            );
+            for (file, text) in effect.source_pins {
+                assert!(
+                    source(file).contains(text),
+                    "`{}`: {file} no longer contains {text:?}",
+                    effect.id
+                );
+            }
         }
+        // The pins really are what the #1595 run's daemon wrote.
         let status = &KNOWN_EFFECTS[0];
-        assert_eq!(status.id, "318-hook-event-capability-token");
         assert!(
-            daemon.contains(&format!("hook socket: {}", status.log_signature[0])),
-            "src/daemon.rs no longer logs {:?}",
-            status.log_signature[0]
+            status
+                .log_signature
+                .iter()
+                .all(|sig| REFUSAL_LINE.contains(sig))
+                && REFUSAL_LINE.contains(&format!("{}3 ", status.pane_field))
         );
-        assert!(daemon.contains("reason = refusal.code(),"));
-        assert!(provenance.contains("Refusal::Missing => \"missing_token\","));
-        assert_eq!(status.log_signature[1], "reason=\"missing_token\"");
     }
 }

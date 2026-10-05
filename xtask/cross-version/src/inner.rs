@@ -616,8 +616,54 @@ pub(crate) fn daemon_status(
         .collect()))
 }
 
-/// Poll `daemon status` until `pred` holds over its rows. Every poll is a client
-/// and passes the pre-connect assertion first.
+/// How a [`poll_status`] ended.
+pub(crate) enum StatusWait {
+    /// `pred` held over these rows.
+    Satisfied(Vec<StatusRow>),
+    /// The daemon answered with readable rows until the deadline, and `pred`
+    /// never held over them: these are the last ones.
+    Unsatisfied(Vec<StatusRow>, String),
+    /// The last poll before the deadline could not be read at all.
+    Failing(String),
+}
+
+/// Poll `daemon status` until `pred` holds over its rows, keeping apart a
+/// daemon that answered without the change from a query that failed. Every
+/// poll is a client and passes the pre-connect assertion first.
+pub(crate) fn poll_status(
+    g: &Guard<'_>,
+    bin: &Path,
+    label: &str,
+    timeout: Duration,
+    ev: &mut Evidence,
+    pred: impl Fn(&[StatusRow]) -> bool,
+) -> Result<StatusWait, Abort> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = daemon_status(g, bin, label, ev)?;
+        if let Ok(rows) = &last
+            && pred(rows)
+        {
+            return Ok(StatusWait::Satisfied(rows.clone()));
+        }
+        if Instant::now() >= deadline {
+            return Ok(match last {
+                Ok(rows) => {
+                    let why = format!(
+                        "daemon status never satisfied the condition within {timeout:?}; last rows: {rows:?}"
+                    );
+                    StatusWait::Unsatisfied(rows, why)
+                }
+                Err(e) => StatusWait::Failing(format!(
+                    "daemon status kept failing within {timeout:?}: {e}"
+                )),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// [`poll_status`], for a caller that only needs the rows or why not.
 pub(crate) fn wait_for_status(
     g: &Guard<'_>,
     bin: &Path,
@@ -626,26 +672,10 @@ pub(crate) fn wait_for_status(
     ev: &mut Evidence,
     pred: impl Fn(&[StatusRow]) -> bool,
 ) -> Result<Result<Vec<StatusRow>, String>, Abort> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let last = daemon_status(g, bin, label, ev)?;
-        if let Ok(rows) = &last
-            && pred(rows)
-        {
-            return Ok(Ok(rows.clone()));
-        }
-        if Instant::now() >= deadline {
-            return Ok(match last {
-                Ok(rows) => Err(format!(
-                    "daemon status never satisfied the condition within {timeout:?}; last rows: {rows:?}"
-                )),
-                Err(e) => Err(format!(
-                    "daemon status kept failing within {timeout:?}: {e}"
-                )),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    Ok(match poll_status(g, bin, label, timeout, ev, pred)? {
+        StatusWait::Satisfied(rows) => Ok(rows),
+        StatusWait::Unsatisfied(_, why) | StatusWait::Failing(why) => Err(why),
+    })
 }
 
 pub(crate) fn count_in_file(path: &Path, needle: &str) -> usize {
@@ -1590,7 +1620,7 @@ fn with_attached_tui(
     );
     refused |= refused_by_lock(tui);
     let client_cli = format!("{} CLI: daemon status", cast.client_side);
-    let status_rows = wait_for_status(
+    let status_wait = poll_status(
         g,
         &cast.client_bin,
         &client_cli,
@@ -1602,10 +1632,14 @@ fn with_attached_tui(
             })
         },
     )?;
-    let (status_ok, status_note) = match &status_rows {
-        Ok(rows) => {
+    // The status half is named `status` only when the daemon answered with
+    // readable rows that never showed the change; a query that could not be
+    // read is `status-query`, which no declared break explains (`breaks.rs`).
+    let (status_part, status_ok, status_note, reviewer_pane) = match &status_wait {
+        StatusWait::Satisfied(rows) => {
             let row = rows.iter().find(|r| r.role.contains(ROLE_REVIEWER));
             (
+                "status",
                 true,
                 format!(
                     "`daemon status --json`, asked by the {} binary of the {} daemon, reports the \
@@ -1614,14 +1648,29 @@ fn with_attached_tui(
                     cast.daemon_side.to_uppercase(),
                     row.map(|r| r.status.clone()).unwrap_or_default()
                 ),
+                None,
             )
         }
-        Err(e) => (false, format!("the status never changed: {e}")),
+        StatusWait::Unsatisfied(rows, why) => (
+            "status",
+            false,
+            format!("the status never changed: {why}"),
+            rows.iter()
+                .find(|r| r.role.contains(ROLE_REVIEWER))
+                .map(|r| r.pane_id.clone())
+                .filter(|p| !p.is_empty()),
+        ),
+        StatusWait::Failing(why) => (
+            "status-query",
+            false,
+            format!("the status could not be read: {why}"),
+            None,
+        ),
     };
     ev.tell_in_parts(
         "tell-4",
         "hooks (work-done, status) still arrived",
-        &[("work-done", work_done_arrived), ("status", status_ok)],
+        &[("work-done", work_done_arrived), (status_part, status_ok)],
         format!(
             "work-done: issued `{} work-done --task \"{work_done_sentinel}\"` from inside the \
              `{ROLE_REVIEWER}` pane; the daemon's feedback line \"{feedback}\" {} in the \
@@ -1645,6 +1694,9 @@ fn with_attached_tui(
             }
         ),
     );
+    if let Some(t) = ev.tells.last_mut() {
+        t.subject_pane = reviewer_pane;
+    }
 
     // --- the branch-specific stimulus, reverse only --------------------------
     if cast.direction == Direction::Reverse {
