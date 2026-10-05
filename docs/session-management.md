@@ -82,6 +82,12 @@ Minimal is used only when there are more cards than fit at Compact. Each card is
 | ` history ` in the title | A session the deck shows but does not drive, such as a Codex session run under `dot-agent-deck wrap` in another terminal | The deck shows its status but cannot type into it. | Type into it in the terminal where it runs. |
 | ` view-only ` in the title | A session whose input channel this build does not recognise (for example, reported by a newer daemon) | The deck shows it but cannot deliver input to it. | Type into it where it runs, or upgrade this client. |
 
+### Agents the deck did not start
+
+*This section is about the TUI. The desktop app lists the agents the daemon started, so an agent you start yourself has no card there.*
+
+An agent you start yourself, outside the deck, still gets a card when its hooks report to the deck. Such a card is removed when that agent's session ends, rather than being left behind as an empty card. The deck keeps up to 256 of these cards at a time: when another arrives beyond that, the one that has been quiet the longest is removed, and it comes back the next time that agent starts a session. Cards of agents the running daemon started never count toward that limit and are never removed to make room. An agent that kept running across a daemon restart was started by the previous daemon, so in a TUI you open after the restart it counts as one of these cards. A TUI that stayed open through the restart keeps the card it already had for that agent instead: the card keeps updating, does not count toward the limit and is never removed to make room, and when the agent's session ends the card stays and shows Idle, still marked orphaned if the agent belonged to an orchestration, rather than disappearing. A TUI older than the daemon leaves an empty card for the pane where one of these cards is removed.
+
 ## Resuming Sessions
 
 *This section is about the TUI. The desktop app keeps no workspace of its own: it shows the agents the daemon has, and closing it leaves them running.*

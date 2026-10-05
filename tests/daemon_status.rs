@@ -328,7 +328,7 @@ async fn start_tui_managed_agent(
     wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
     DaemonClient::new(daemon.attach_path.clone())
         .start_agent(StartAgentOptions {
-            command: Some("cat".to_string()),
+            command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd.to_string()),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
             agent_type: Some(AgentType::Pi),
@@ -352,6 +352,9 @@ async fn run_agent_event_cli(
     let hook_path = daemon.hook_path.clone();
     let pane_id_owned = pane_id.to_string();
     let agent_id_owned = agent_id.to_string();
+    let token = common::recorded_hook_capability(cwd, agent_id)
+        .await
+        .expect("managed capability");
     let cwd = cwd.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -364,6 +367,7 @@ async fn run_agent_event_cli(
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .env("DOT_AGENT_DECK_PANE_CAPABILITY", token)
             .output()
             .expect("run the real `dot-agent-deck agent-event --type running` CLI")
     })
@@ -428,7 +432,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     let driven_agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&common::capability_export_command("cat")),
             cwd: Some(&cwd_str),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), DRIVEN_PANE.to_string())],
             ..SpawnOptions::default()
@@ -446,8 +450,13 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
 
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&thinking_event(DRIVEN_PANE, &driven_agent_id, None))
-            .expect("serialize driven Thinking event"),
+        &dot_agent_deck::event::agent_event_line(
+            &thinking_event(DRIVEN_PANE, &driven_agent_id, None),
+            common::recorded_hook_capability(cwd.path(), &driven_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize driven Thinking event"),
     )
     .expect("write driven Thinking event");
     wait_for_live_session(
@@ -537,7 +546,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
     let agent_id = DaemonClient::new(daemon.attach_path.clone())
         .start_agent(StartAgentOptions {
-            command: Some("cat".to_string()),
+            command: Some(common::capability_export_command("cat")),
             cwd: Some(cwd_str.clone()),
             display_name: Some(JSON_LABEL.to_string()),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string())],
@@ -559,7 +568,13 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     tool_event.tool_name = Some(JSON_TOOL.to_string());
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&tool_event).expect("serialize populated schema-row ToolStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &tool_event,
+            common::recorded_hook_capability(cwd.path(), &agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize populated schema-row ToolStart"),
     )
     .expect("write populated schema-row ToolStart to the daemon hook socket");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -778,7 +793,7 @@ async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     let agent_id = daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some("cat"),
+            command: Some(&common::capability_export_command("cat")),
             cwd: Some(&cwd_str),
             env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), LEAK_PANE.to_string())],
             ..SpawnOptions::default()
@@ -791,7 +806,13 @@ async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     event.tool_detail = Some(TOOL_DETAIL_SENTINEL.to_string());
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize sentinel-carrying ToolStart event"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize sentinel-carrying ToolStart event"),
     )
     .expect("write sentinel-carrying ToolStart event");
     wait_for_live_session(&daemon, LEAK_PANE, &agent_id, Duration::from_secs(5)).await;

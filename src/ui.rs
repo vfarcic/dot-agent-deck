@@ -2049,7 +2049,8 @@ struct PromptDelivery {
     /// observed to have a producer that can report a submitted prompt. Sticky
     /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
     /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
-    /// never arms at all.
+    /// arms only once its extension declares that it reports every prompt
+    /// (issue #1567) — never, for an extension from an older deck.
     can_report_prompts: bool,
 }
 
@@ -2581,6 +2582,10 @@ struct UiState {
     /// those never overwrite the recorded value. Always (re)set right before each
     /// `Action::SpawnPane` dispatch, so a failed spawn never leaks a stale value.
     pending_last_command: Option<String>,
+    /// Issue #1540 — reads the attached daemon's remembered command for the
+    /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
+    /// (tests), and the form then seeds from [`Self::last_command`] as before.
+    last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2731,6 +2736,7 @@ impl UiState {
             // the event loop; defaults to None so a fresh install seeds blank.
             last_command: None,
             pending_last_command: None,
+            last_command_reader: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -4417,8 +4423,9 @@ fn apply_seed_send_outcome(
                 log_prompt_probe_submitted("seed", pane_id, delivery_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report
-                // a submitted prompt (Pi). Retrying could never be
+                // A recognized producer that cannot report a submitted
+                // prompt (a Pi extension declaring nothing, a wrapped Codex
+                // whose prompt hook is untrusted). Retrying could never be
                 // confirmed — only retyped — so the write is final.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
@@ -5824,9 +5831,10 @@ fn apply_orchestrator_send_outcome(
                 log_prompt_probe_submitted("orchestrator", start_pane_id, logged_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report a
-                // submitted prompt (Pi). Retrying could never be confirmed —
-                // only retyped — so the write is final and the role finalizes.
+                // A recognized producer that cannot report a submitted prompt
+                // (a Pi extension declaring nothing, a wrapped Codex whose
+                // prompt hook is untrusted). Retrying could never be confirmed
+                // — only retyped — so the write is final and the role finalizes.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
                         "orchestrator",
@@ -9898,10 +9906,11 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // PRD #196: seed via the fallback chain — explicit `default_command`
-            // (unchanged precedence) → recorded `last_command` → blank.
-            let command =
-                resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
+            // PRD #196 / issue #1540: seed via the fallback chain — explicit
+            // `default_command` (unchanged precedence) → the deck's last command
+            // (the daemon's, or this TUI's own against a daemon that keeps none)
+            // → blank.
+            let command = form_seed_command(ui);
             let orchestrations = match load_project_config(&dir) {
                 Ok(Some(config)) => {
                     if config.legacy_modes_declared {
@@ -9946,6 +9955,76 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
     ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// Issue #1540: the `Ctrl+n` form's Command pre-fill, read from the attached
+/// daemon when it keeps the deck's last command. Skips the daemon entirely when
+/// `default_command` is set, since that wins anyway. A daemon that keeps the
+/// value but has none yet is offered this TUI's own (`session.toml`) value —
+/// the migration, retried here so a daemon restarted since startup gets it too.
+/// A daemon that does not answer within [`FORM_SEED_TIMEOUT`] is treated like
+/// one that keeps nothing: the form opens on this TUI's own value.
+fn form_seed_command(ui: &UiState) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    let session = ui.last_command.as_deref();
+    let daemon = if ui.config.default_command.is_empty() {
+        ui.last_command_reader
+            .as_ref()
+            .and_then(|reader| reader.read(FORM_SEED_TIMEOUT))
+    } else {
+        None
+    };
+    let (keeper, daemon_command) = match &daemon {
+        Some(answer) => (answer.keeper, answer.command.as_deref()),
+        None => (LastCommandKeeper::Client, None),
+    };
+    if keeper == LastCommandKeeper::Daemon
+        && daemon_command.is_none_or(|c| c.trim().is_empty())
+        && let (Some(reader), Some(command)) = (
+            ui.last_command_reader.as_ref(),
+            session.filter(|c| !c.trim().is_empty()),
+        )
+    {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
+    resolve_form_seed_command(&ui.config.default_command, daemon_command, keeper, session)
+}
+
+/// Issue #1540: the budget for reading the daemon's last command when the
+/// `Ctrl+n` form opens. The same 500ms as [`CLOSE_PREVIEW_TIMEOUT`], the other
+/// interactive key path that waits on the daemon for what it shows, and larger
+/// than [`DAEMON_HINT_TIMEOUT`] because the answer is what the form shows rather
+/// than a hint beside it, so giving up early on a busy daemon would visibly show
+/// the wrong command. Still bounded, because the key press waits on it, and it
+/// fails open to this TUI's own value.
+const FORM_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Issue #1540: [`resolve_seed_command`] with the deck's last command chosen by
+/// who keeps it. A [`LastCommandKeeper::Daemon`] deck offers the daemon's value,
+/// and this TUI's own (`session`) only while the daemon has none — the value the
+/// migration is handing over. A [`LastCommandKeeper::Client`] deck (an older
+/// daemon) offers only this TUI's own, as before. Blank values are skipped;
+/// the chosen one is used verbatim.
+///
+/// [`LastCommandKeeper::Daemon`]: crate::daemon_client::LastCommandKeeper::Daemon
+/// [`LastCommandKeeper::Client`]: crate::daemon_client::LastCommandKeeper::Client
+fn resolve_form_seed_command(
+    default_command: &str,
+    daemon_last_command: Option<&str>,
+    keeper: crate::daemon_client::LastCommandKeeper,
+    session_last_command: Option<&str>,
+) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    fn nonblank(value: Option<&str>) -> Option<&str> {
+        value.filter(|s| !s.trim().is_empty())
+    }
+    let last = match keeper {
+        LastCommandKeeper::Daemon => {
+            nonblank(daemon_last_command).or(nonblank(session_last_command))
+        }
+        LastCommandKeeper::Client => nonblank(session_last_command),
+    };
+    resolve_seed_command(default_command, last)
 }
 
 /// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
@@ -11843,6 +11922,10 @@ fn dispatch_action(
                             // PRD #201: single-pane spawn, not a Pi
                             // orchestrator — no native seed.
                             seed: None,
+                            // Issue #1540: this IS a New agent form submit,
+                            // so a deck that keeps the last command records
+                            // it once it has accepted the start.
+                            remember_command: true,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -13256,6 +13339,20 @@ pub fn run_tui(
     // has to win over whichever landing tab they chose.
     let restored_session = config::SavedSession::load();
     ui.last_command = restored_session.last_command;
+    // Issue #1540: the form's pre-fill comes from the attached daemon when it
+    // keeps the deck's last command. Hand it the value this TUI kept before the
+    // daemon did; the daemon takes it only if it has none, so a newer command
+    // another client recorded is never overwritten.
+    ui.last_command_reader = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::last_command_reader);
+    if let (Some(reader), Some(command)) = (
+        ui.last_command_reader.as_ref(),
+        ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
+    ) {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
     let saved_focus = restored_session.focus;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
@@ -13906,6 +14003,8 @@ pub fn run_tui(
                     agent_type: agent_type.clone(),
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
+                    // Issue #1540: a restore is not a form submit.
+                    remember_command: false,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -21950,6 +22049,7 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22743,6 +22843,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
     }
@@ -24140,6 +24241,136 @@ mod tests {
         );
     }
 
+    /// Assert on the Command row drawn by the production form renderer.
+    fn assert_form_command_seed(command: String, expected: &str) {
+        let form = NewPaneFormState::new(
+            PathBuf::from("/fixture"),
+            "seed-check".to_string(),
+            command,
+            vec![],
+        );
+        let grid = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, &form);
+        }));
+        let row = grid
+            .lines()
+            .find(|row| row.contains("Command:"))
+            .expect("the New Agent form must render its Command row");
+        let actual = row
+            .split_once("Command:")
+            .expect("Command label")
+            .1
+            .split('\u{2502}')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        assert_eq!(
+            actual, expected,
+            "New Agent Command pre-fill.\nGrid:\n{grid}"
+        );
+    }
+
+    /// Scenario: Open a New Agent form with different configured, daemon and
+    /// session commands. The rendered Command row prefers the configured default,
+    /// then the daemon's remembered command, then blank when neither has a value.
+    #[test]
+    fn resolve_form_seed_command_daemon_precedence() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                Some("daemon-command"),
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("configured-command", None, None, "configured-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "daemon-command",
+            ),
+            ("", Some("daemon-command"), None, "daemon-command"),
+            ("", None, None, ""),
+            ("", Some(""), None, ""),
+            ("", Some("   "), None, ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form against an older daemon that leaves the
+    /// client in charge of remembering commands. Its rendered Command row keeps
+    /// using the session value below the configured default and ignores daemon values.
+    #[test]
+    fn resolve_form_seed_command_older_daemon_session_fallback() {
+        use crate::daemon_client::LastCommandKeeper::Client;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                None,
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("", None, Some("session-command"), "session-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "session-command",
+            ),
+            ("", Some("daemon-command"), None, ""),
+            ("", None, None, ""),
+            ("", None, Some(""), ""),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Client, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form after connecting to a capable daemon
+    /// with no remembered command and a session that remembers one. The rendered
+    /// Command row shows the migration value, while an existing daemon value wins.
+    #[test]
+    fn resolve_form_seed_command_migration_prefills_form() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "",
+                None,
+                Some("migrated-session-command"),
+                "migrated-session-command",
+            ),
+            (
+                "configured-command",
+                None,
+                Some("migrated-session-command"),
+                "configured-command",
+            ),
+            (
+                "",
+                Some("daemon-command"),
+                Some("migrated-session-command"),
+                "daemon-command",
+            ),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
     /// PRD #196: the record decision fires for ANY non-empty form-submitted
     /// command regardless of mode — a plain interactive spawn AND an authoring-mode
     /// form (schedule / issue-dispatch) both record — and only an empty/whitespace
@@ -24870,6 +25101,7 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         state
@@ -28357,6 +28589,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31151,6 +31384,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31943,6 +32177,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         }
     }
 
@@ -32375,6 +32610,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         // Spacious: get all 3
@@ -32414,6 +32650,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32444,6 +32681,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);

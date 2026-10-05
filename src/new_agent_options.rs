@@ -162,6 +162,21 @@ pub struct NewAgentOptions {
     /// honest answer from one that cannot.
     #[serde(default)]
     pub authoring_kinds: Vec<String>,
+    /// Issue #1540: the command this deck's New agent form last started, plain
+    /// or authoring, from any client — the value a form pre-fills Command with
+    /// when [`Self::default_command`] is absent. Absent when the deck has none
+    /// yet. Kept and persisted by the daemon ([`crate::last_command`]), so the
+    /// TUI and the desktop offer the same value, and it survives a restart of
+    /// either client or of the daemon.
+    ///
+    /// **An additive optional field**, like [`Self::default_dir`]: an older
+    /// client ignores it, and a daemon predating it omits it. A client tells
+    /// "this deck keeps no last command" (an older daemon) from "this deck has
+    /// none yet" by [`crate::daemon_protocol::CAP_LAST_COMMAND`], not by this
+    /// field's absence. Filled in by the dispatch from the daemon's store, not
+    /// by [`compose`], which leaves it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<String>,
 }
 
 /// One agent in [`NewAgentOptions::agents`].
@@ -206,6 +221,7 @@ pub fn compose(config: &DashboardConfig, experimental: bool) -> NewAgentOptions 
             .iter()
             .map(|kind| kind.as_str().to_string())
             .collect(),
+        last_command: None,
     }
 }
 
@@ -347,6 +363,46 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "agents": [], "experimental": false }))
                 .unwrap();
         assert_eq!(older.default_dir, None);
+    }
+
+    /// Scenario (issue #1540): the deck's last command is additive and
+    /// optional on the wire — omitted when the deck has none, carried verbatim
+    /// when it has one, and a reply from a daemon predating it reads as `None`.
+    #[test]
+    fn the_wire_shape_omits_an_absent_last_command_and_reads_one_from_an_older_daemon() {
+        let none = compose(&config_with(""), false);
+        assert_eq!(none.last_command, None, "compose never fills it");
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json.get("last_command").is_none(), "None is not serialised");
+
+        let older: NewAgentOptions = serde_json::from_value(serde_json::json!({
+            "default_command": "claude",
+            "agents": [],
+            "experimental": false,
+            "authoring_kinds": ["schedule"],
+        }))
+        .unwrap();
+        assert_eq!(older.last_command, None);
+        assert_eq!(older.default_command.as_deref(), Some("claude"));
+
+        let set = NewAgentOptions {
+            last_command: Some("codex --model gpt-5".to_string()),
+            ..none
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["last_command"], "codex --model gpt-5");
+        let back: NewAgentOptions = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, set);
+
+        // An older client's view of the reply: the same struct minus the field,
+        // which must still decode a reply that carries it.
+        #[derive(Deserialize)]
+        struct OlderClientView {
+            #[allow(dead_code)]
+            agents: Vec<AgentOption>,
+        }
+        serde_json::from_value::<OlderClientView>(json)
+            .expect("a client predating the field ignores it");
     }
 
     fn config_with(default_command: &str) -> DashboardConfig {

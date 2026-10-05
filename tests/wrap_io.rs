@@ -713,10 +713,10 @@ fn run_signal_case(
     );
 
     // The wrapper is our own child, so detect its exit by reaping it through the
-    // owned handle rather than probing by pid: common::process_running() cannot see
-    // a zombie on non-Linux (its kill(pid, 0) fallback treats an exited-but-unreaped
-    // pid as alive), so on macOS an exited-but-unreaped wrapper looks like it never
-    // exited. try_wait() reaps the wrapper and reports its exit portably.
+    // owned handle rather than probing by pid: try_wait() reaps the wrapper and
+    // reports its exit portably. Until issue #1565, common::process_running()
+    // could not see a zombie on macOS (its kill(pid, 0) fallback treated an
+    // exited-but-unreaped pid as alive), which is what this once misread.
     let wrapper_exited = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -851,10 +851,10 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     //    worst case is a few seconds; the budget sits far above that because the
     //    failure worth catching is "never exits".
     //
-    //    Detected by reaping through the owned `Child`, NEVER by
-    //    `common::process_running(wrapper_pid)` (issue #397). The wrapper is this
-    //    test's own child, so once it exits it stays a zombie until reaped, and
-    //    off Linux that helper's `kill(pid, 0)` fallback reports a zombie as
+    //    Detected by reaping through the owned `Child` (issue #397). The wrapper
+    //    is this test's own child, so once it exits it stays a zombie until
+    //    reaped, and until issue #1565 `common::process_running(wrapper_pid)`
+    //    fell back off Linux to a `kill(pid, 0)` probe that reports a zombie as
     //    alive. #396 asserted it that way, read the result on macOS as "the
     //    wrapper never exits", and dropped the assertion; it was the same misread
     //    `codex_wrap_004` had already been fixed for. Measured on a macOS runner

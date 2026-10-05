@@ -123,15 +123,17 @@ const LABEL_SHARING_LABELS: Record<string, string> = {
  * hint; the key is `RemoteResolver::run`'s `x-api-key` / `Authorization`
  * header, never read for a loopback endpoint; and what is decided on this
  * machine is `outcome::local_intercept` (an opener, a submit phrase said on
- * its own less edge politeness, the typing mode's on and off phrases, and a
- * close said on its own over the New agent dialog), `dictation_intercept`
+ * its own less edge politeness, the typing mode's on and off phrases, PRD
+ * #1541's interrupt / clear / scratch phrases said on their own on the agent
+ * screen, and a close said on its own over the New agent dialog),
+ * `dictation_intercept`
  * (everything while the typing mode is on) and `voice::choice::answer` (an
  * answer to a numbered choice, PRD #1261 — a non-answer closes the choice and
  * goes on to the endpoint like any other utterance). The same list as
  * `docs/desktop/voice.md`'s. A change to any of those owes this text an
  * update.
  */
-export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard, this app's fixed instructions and answer format, the model name and token limit, and this app's command list: every command's id, description, parameter names and kinds, whether it can run on the screen you are on, and the hint shown when it cannot. When the endpoint is not on this machine, the request also carries your Commands API key in its authentication header. Some utterances are decided on this machine and send nothing: a dictation that starts with a recognised opener (\u201ctype \u2026\u201d); a submit phrase such as \u201csend it\u201d said on its own, with a word such as \u201cokay\u201d or \u201cplease\u201d around it; \u201ctype on\u201d and \u201ctype off\u201d said on their own; while the New agent dialog is open, a way of closing it said on its own, such as \u201cclose\u201d; everything said while typing mode is on; and, while a numbered choice is on offer, an answer to it \u2014 its number, one of its names, or \u201ccancel\u201d. Anything else said while a choice is on offer closes it and is sent as usual.";
+export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard, this app's fixed instructions and answer format, the model name and token limit, and this app's command list: every command's id, description, parameter names and kinds, whether it can run on the screen you are on, and the hint shown when it cannot. When the endpoint is not on this machine, the request also carries your Commands API key in its authentication header. Some utterances are decided on this machine and send nothing: a dictation that starts with a recognised opener (\u201ctype \u2026\u201d); a submit phrase such as \u201csend it\u201d said on its own, with a word such as \u201cokay\u201d or \u201cplease\u201d around it; \u201ctype on\u201d and \u201ctype off\u201d said on their own; in an agent\u2019s pane, \u201cinterrupt\u201d, \u201cclear the prompt\u201d, \u201cscratch that\u201d and the other prompt commands said on their own, which outside typing mode only ask you to say \u201ctyping on\u201d first; while the New agent dialog is open, a way of closing it said on its own, such as \u201cclose\u201d; everything said while typing mode is on; and, while a numbered choice is on offer, an answer to it \u2014 its number, one of its names, or \u201ccancel\u201d. Anything else said while a choice is on offer closes it and is sent as usual.";
 
 /**
  * What Names = Shared adds — `prompt::state`, field by field. The narrow fact

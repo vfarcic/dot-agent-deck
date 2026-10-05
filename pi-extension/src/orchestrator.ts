@@ -134,6 +134,14 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 }
 
 /**
+ * The `agent-event` flag that declares this extension reports every prompt Pi
+ * submits (issue #1567). The deck counts a Pi pane as confirming its own
+ * prompts only while its reports carry this, so a pane running an extension
+ * that does not report them keeps being treated as one that cannot.
+ */
+export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
+
+/**
  * Build the argv for `dot-agent-deck agent-event`. Rejects any type the CLI
  * does not accept so a bogus `--type` can never reach it, and appends each
  * non-blank detail as its own flag in a fixed order. With no detail, a
@@ -144,13 +152,24 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
  * @example buildAgentEventArgv("tool-start", { toolName: "bash", toolDetail: "ls" })
  *   → ["agent-event", "--type", "tool-start", "--tool-name=bash", "--tool-detail=ls"]
  */
-export function buildAgentEventArgv(type: string, detail: AgentEventDetail = {}): string[] {
+export function buildAgentEventArgv(
+	type: string,
+	detail: AgentEventDetail = {},
+	declarePromptReports = false,
+): string[] {
 	if (!isAgentEventType(type)) {
 		throw new Error(
 			`dot-agent-deck agent-event: unknown type "${type}". Expected one of: ${AGENT_EVENT_TYPES.join(", ")}.`,
 		);
 	}
 	const argv = ["agent-event", "--type", type];
+	// Issue #1567: FIRST among the flags on purpose. A CLI that predates the
+	// declaration names the first argument it does not know in its usage
+	// error, so it reports this one, and the extension steps down one level
+	// (`REPORT_LEVELS`) instead of dropping straight to lifecycle-only.
+	if (declarePromptReports) {
+		argv.push(DECLARE_PROMPT_REPORTS_FLAG);
+	}
 	const flags: Array<[string, string | undefined]> = [
 		["--cwd", detail.cwd],
 		["--prompt", detail.prompt],
@@ -266,12 +285,18 @@ export function piEventToAgentState(eventName: string): AgentState | null {
 /**
  * The Pi events the extension subscribes to for card detail (issue #622), on
  * top of {@link STATUS_EVENTS}. Pi hands each handler what the card needs:
- * `before_agent_start` carries the submitted prompt before the agent loop
- * begins, `tool_execution_start` the tool name and its arguments, and
+ * `before_agent_start` carries a prompt submitted to an idle Pi before the
+ * agent loop begins, `input` one submitted while Pi is busy (issue #1567),
+ * `tool_execution_start` the tool name and its arguments, and
  * `tool_execution_end` marks the call finished; every handler's context
  * carries the session's `cwd`.
  */
-export const DETAIL_EVENTS = ["before_agent_start", "tool_execution_start", "tool_execution_end"] as const;
+export const DETAIL_EVENTS = [
+	"before_agent_start",
+	"input",
+	"tool_execution_start",
+	"tool_execution_end",
+] as const;
 export type DetailEvent = (typeof DETAIL_EVENTS)[number];
 
 /**
@@ -343,7 +368,8 @@ export interface AgentEventReport {
  * was created). Lifecycle events map through {@link piEventToAgentState}; the
  * detail events report the prompt, or the tool and its detail. A
  * `before_agent_start` with no usable prompt reports nothing — the
- * `agent_start` that follows still moves the card to Thinking.
+ * `agent_start` that follows still moves the card to Thinking — and so does an
+ * `input` Pi is not going to queue (see the `input` arm).
  */
 export function piEventReport(eventName: string, event: unknown, cwd: string | undefined): AgentEventReport | null {
 	const detail: AgentEventDetail = {};
@@ -359,6 +385,24 @@ export function piEventReport(eventName: string, event: unknown, cwd: string | u
 	switch (eventName) {
 		case "before_agent_start": {
 			const prompt = nonBlankString(payload.prompt);
+			if (prompt === undefined) {
+				return null;
+			}
+			detail.prompt = clip(prompt, MAX_PROMPT_CHARS);
+			return { type: "prompt", detail };
+		}
+		case "input": {
+			// Issue #1567: a prompt submitted while Pi is busy is QUEUED (Pi's
+			// steer / follow-up queue) rather than started, so it never reaches
+			// `before_agent_start`; measured on Pi 0.87.1, a prompt typed during
+			// a running tool was submitted, acted on, and never reported. Pi sets
+			// `streamingBehavior` on the `input` event exactly when it is busy, so
+			// that is the one `input` reported here. An idle submission is left to
+			// `before_agent_start`, which follows only once Pi has accepted it.
+			if (payload.streamingBehavior !== "steer" && payload.streamingBehavior !== "followUp") {
+				return null;
+			}
+			const prompt = nonBlankString(payload.text);
 			if (prompt === undefined) {
 				return null;
 			}
@@ -383,6 +427,96 @@ export function piEventReport(eventName: string, event: unknown, cwd: string | u
 		default:
 			return null;
 	}
+}
+
+/**
+ * How much an `agent-event` report carries, most first (issue #1567):
+ *
+ *   declared  — the detail plus {@link DECLARE_PROMPT_REPORTS_FLAG};
+ *   detail    — the detail alone (a deck from issue #622 up to #1567);
+ *   lifecycle — the bare `--type <state>` every deck accepts.
+ *
+ * The extension starts at `declared` and steps down only when the deck's CLI
+ * refused a flag as unknown ({@link isUnsupportedFlagFailure}).
+ */
+export const REPORT_LEVELS = ["declared", "detail", "lifecycle"] as const;
+export type ReportLevel = (typeof REPORT_LEVELS)[number];
+
+/**
+ * The argv for `report` at `level`, or `null` when that level has nothing to
+ * send for it — a detail report at `lifecycle`.
+ */
+export function reportArgvAt(report: AgentEventReport, level: ReportLevel): string[] | null {
+	switch (level) {
+		case "declared":
+			return buildAgentEventArgv(report.type, report.detail, true);
+		case "detail":
+			return buildAgentEventArgv(report.type, report.detail);
+		case "lifecycle":
+			return isAgentState(report.type) ? buildAgentEventArgv(report.type) : null;
+	}
+}
+
+/** The level below `level`, or `null` below `lifecycle`. */
+function levelBelow(level: ReportLevel): ReportLevel | null {
+	const index = REPORT_LEVELS.indexOf(level);
+	return index + 1 < REPORT_LEVELS.length ? REPORT_LEVELS[index + 1] : null;
+}
+
+/** A failed CLI run, keeping the exec result it came from. */
+export class DeckExecError extends Error {
+	readonly outcome: ExecOutcome;
+
+	constructor(message: string, outcome: ExecOutcome) {
+		super(message);
+		this.outcome = outcome;
+	}
+}
+
+/**
+ * Send card reports at the highest level the deck's CLI accepts, and remember
+ * it for the session. `run` shells the CLI and throws a {@link DeckExecError}
+ * on a non-zero exit.
+ *
+ * A report refused because the CLI does not know one of its flags is sent
+ * again one level down, and the session stays at the level that then got
+ * through — so a deck that predates the declaration still gets the prompt and
+ * tool detail it understands, and one that predates the detail still gets its
+ * status. Any other failure (no daemon, a transient socket error) leaves the
+ * level alone and retries a lifecycle report once, bare, so the card keeps its
+ * status. Every report is best-effort: nothing here throws. `signal` is handed
+ * to every `run` for that report.
+ */
+export function createReporter(run: (argv: string[], signal?: AbortSignal) => Promise<unknown>): {
+	send: (report: AgentEventReport, signal?: AbortSignal) => Promise<void>;
+	level: () => ReportLevel;
+} {
+	let level: ReportLevel = "declared";
+	const send = async (report: AgentEventReport, signal?: AbortSignal): Promise<void> => {
+		let tried: ReportLevel | null = level;
+		while (tried !== null) {
+			const argv = reportArgvAt(report, tried);
+			if (argv === null) {
+				return;
+			}
+			try {
+				await run(argv, signal);
+				level = tried;
+				return;
+			} catch (err) {
+				if (err instanceof DeckExecError && isUnsupportedFlagFailure(err.outcome)) {
+					tried = levelBelow(tried);
+					continue;
+				}
+				const fallback = legacyAgentEventArgv(report);
+				if (fallback && tried !== "lifecycle") {
+					await run(fallback, signal).catch(() => {});
+				}
+				return;
+			}
+		}
+	};
+	return { send, level: () => level };
 }
 
 /**

@@ -6,6 +6,7 @@ import { agentKey } from "./agentKey";
 import { getTerminal } from "./terminalRegistry";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
+import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
@@ -18,6 +19,7 @@ import type { HandoffEdge,
   AgentTarget,
   AgentStatus,
   AgentTab,
+  AgentTypeId,
   DaemonProjectListing,
   DaemonResolvedProject,
   DeckAction,
@@ -30,6 +32,7 @@ import type { HandoffEdge,
   EvidenceItem,
   NewAgentOptions,
   NewAgentOrchestrations,
+  PromptKeys,
   RuntimeMode,
   TerminalChunk,
   WorkflowStage,
@@ -224,7 +227,7 @@ export interface DesktopAgentDto {
   cwd?: string;
   rows: number;
   cols: number;
-  agentType: "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+  agentType: AgentTypeId;
   /**
    * The binary the agent registry says this type runs — `claude`, `opencode`,
    * `pi`, `codex`, `devin` (PRD #745). `agentType` above is the wire IDENTITY
@@ -291,6 +294,14 @@ export interface DesktopAgentDto {
    * provider said the limit resets, when it said.
    */
   blocked?: { kind: string; detectedAtMs: number; detail?: string; resetsAtMs?: number };
+  /**
+   * PRD #1541 — the keys the daemon says interrupt this agent's turn and edit
+   * its prompt (`AgentRecord.prompt_keys`), bounded by the desktop crate's
+   * `map_prompt_keys`. Absent when the deck has none for the agent (Devin, an
+   * unrecognised type), predates the field, or sent a set the crate refused;
+   * the voice surface then refuses the command rather than guessing.
+   */
+  promptKeys?: PromptKeys;
   /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
@@ -1528,6 +1539,17 @@ interface PendingTerminalAttachment {
   activated: boolean;
 }
 
+/**
+ * PRD #1541 — a terminal write whose precondition answered false when its
+ * turn came, so nothing was written (see {@link DeckBridge.sendTerminalInput}).
+ */
+export class TerminalInputCancelled extends Error {
+  constructor() {
+    super("Nothing was sent — the write was called off before it went out.");
+    this.name = "TerminalInputCancelled";
+  }
+}
+
 export interface DeckBridge {
   readonly mode: RuntimeMode;
   /**
@@ -1559,8 +1581,15 @@ export interface DeckBridge {
    * [#1116](https://github.com/vfarcic/dot-agent-deck/issues/1116)'s open item
    * 2. The target is matched BY VALUE (see {@link AgentTarget}); an
    * unattached target rejects rather than writing anywhere.
+   *
+   * PRD #1541 — `precondition`, when given, is asked once, immediately before
+   * the write is handed to the daemon (after every earlier write to the same
+   * terminal has settled). Answering false writes nothing and rejects with
+   * {@link TerminalInputCancelled}; later input to that terminal is not held
+   * up by it. Voice's prompt commands use it so a key accepted for a turn,
+   * a typing mode or a prompt that has since changed is never sent late.
    */
-  sendTerminalInput(target: AgentTarget, data: string): Promise<void>;
+  sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void>;
   /** This pane's measured grid, for the agent named by the composite identity. */
   resizeTerminal(target: AgentTarget, cols: number, rows: number): Promise<void>;
   /**
@@ -2038,6 +2067,13 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     // — the load-bearing part — it means there is no local table left to fall
     // back to, which is the whole point of the issue.
     cli: agent.cliName,
+    // PRD #1541 — what the voice surface needs to press keys at this agent:
+    // its type (for naming it in a refusal), whether it is mid-turn (the
+    // interrupt guard), and the deck's own keys for it. Copied through; no
+    // local table fills an absent `promptKeys` (the #856 principle).
+    agentType: agent.agentType,
+    turn: agentTurn(agent.status),
+    promptKeys: agent.promptKeys,
     model: UNREPORTED,
     status,
     task: taskLine(agent),
@@ -2604,7 +2640,8 @@ class FixtureDeckBridge implements DeckBridge {
    * the selected deck's key is the same wrong-producer stamp issue #1116's open
    * item 1 describes, reproduced in the fixture.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
+    if (precondition && !precondition()) throw new TerminalInputCancelled();
     this.terminalListeners.forEach((listener) => listener({ agentId: target.agentId, deckId: target.deckId, data: new TextEncoder().encode(data), stream: "output", operation: "append" }));
     await Promise.resolve();
   }
@@ -3074,8 +3111,9 @@ export class TauriDeckBridge implements DeckBridge {
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
   /**
-   * The tail of each terminal's input queue, by the same composite key as
-   * {@link sessions}. See {@link sendTerminalInput} for why input is queued.
+   * The tail of each terminal session's input queue, by the `sessionId` of the
+   * session the input was accepted for. See {@link sendTerminalInput} for why
+   * input is queued, and why per session rather than per agent.
    */
   private inputTails = new Map<string, Promise<void>>();
   /**
@@ -4466,22 +4504,36 @@ export class TauriDeckBridge implements DeckBridge {
    * waits and the pane reattaches, the chunk was typed into a terminal that no
    * longer exists, and it rejects as not attached rather than landing in the
    * replacement.
+   *
+   * PRD #1541 — the queue is the accepted SESSION's, not the agent's: a chunk
+   * waits only for earlier chunks accepted for the same session. A session
+   * whose last write never settles therefore holds back only the chunks typed
+   * into it — which reject as not attached once their turn comes — and never
+   * the session that replaced it. A re-attach that is handed the same
+   * `sessionId` back shares that session's queue, so its order is kept.
+   *
+   * PRD #1541 — a chunk with a `precondition` asks it when its turn comes,
+   * after the previous chunk settled and before `desktop_terminal_write` is
+   * invoked; a false answer rejects it with {@link TerminalInputCancelled} and
+   * writes nothing, and the chunks behind it go on as usual.
    */
-  async sendTerminalInput(target: AgentTarget, data: string): Promise<void> {
+  async sendTerminalInput(target: AgentTarget, data: string, precondition?: () => boolean): Promise<void> {
     const key = agentKey(target.deckId, target.agentId);
     const accepted = this.sessions.get(key);
     const notAttached = () => new Error(`Terminal for ${target.agentId} is not attached.`);
     if (!accepted) throw notAttached();
-    const previous = this.inputTails.get(key) ?? Promise.resolve();
+    const queue = accepted.result.sessionId;
+    const previous = this.inputTails.get(queue) ?? Promise.resolve();
     const write = previous.then(async () => {
       const invoke = await this.getInvoke();
       if (this.sessions.get(key) !== accepted) throw notAttached();
+      if (precondition && !precondition()) throw new TerminalInputCancelled();
       await invoke("desktop_terminal_write", { sessionId: accepted.result.sessionId, data: Array.from(new TextEncoder().encode(data)) });
     });
     const tail = write.catch(() => undefined);
-    this.inputTails.set(key, tail);
+    this.inputTails.set(queue, tail);
     void tail.then(() => {
-      if (this.inputTails.get(key) === tail) this.inputTails.delete(key);
+      if (this.inputTails.get(queue) === tail) this.inputTails.delete(queue);
     });
     return write;
   }

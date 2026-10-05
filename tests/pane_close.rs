@@ -332,6 +332,7 @@ async fn handle_connection(
                         live: None,
                         spawned_at_ms: None,
                         cli_name: None,
+                        prompt_keys: None,
                         crashed: None,
                         orchestrator_context_path: None,
                     }]

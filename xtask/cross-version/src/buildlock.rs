@@ -100,6 +100,13 @@ impl Drop for BuildLock {
         for (_, file) in &mut self.held {
             let _ = file.set_len(0);
         }
+        // Then release in the reverse of the order `acquire` took them. A
+        // `Vec` drops front to back, which let a run waiting on the first lock
+        // take it while this run still held the second — whose holder line is
+        // already cleared above — and record a second wait, on "a run that has
+        // not recorded itself yet", that was this run letting go
+        // (`a_brief_wait_is_still_recorded_with_the_holder`, red under load).
+        while self.held.pop().is_some() {}
     }
 }
 

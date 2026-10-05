@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", unix))]
 
 //! PTY-attached close-confirmation coverage for dashboard cards.
 
@@ -199,6 +199,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
 #[test]
 fn close_confirm_005_vanished_armed_session_closes_nothing() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 40)
         .with_continue_session("vanish-target", "cat")
         .launch_with_fixture("minimal");
@@ -248,6 +249,7 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
 #[test]
 fn close_confirm_009_stable_key_respawn_closes_nothing() {
     let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
         .with_pty_size(200, 40)
         .with_continue_session("stable-key-target", "cat")
         .launch_with_fixture("minimal");

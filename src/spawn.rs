@@ -389,31 +389,41 @@ pub fn decide_target_with_override(
                     dir.display()
                 )
             })?;
-            let orch = cfg
-                .orchestrations
-                .iter()
-                // Skip roleless entries: two entries can resolve to the SAME name
-                // (e.g. an unnamed `roles = []` plus a real one), and without this
-                // filter `find` could return the empty one and refuse a target the
-                // listing legitimately offered.
-                .filter(|o| !o.roles.is_empty())
-                .find(|o| resolve_orchestration_name(&o.name, dir) == *want)
-                .ok_or_else(|| {
+            // Roleless entries are skipped: two entries can resolve to the SAME
+            // name (e.g. an unnamed `roles = []` plus a real one), and matching
+            // the empty one would refuse a target the listing legitimately
+            // offered. Issue #1396 item 4: two ROLE-BEARING entries under one
+            // name are refused as ambiguous rather than resolved to the first —
+            // the rule `PrepareOrchestration` follows since #1233, through the
+            // same lookup, so a dispatch and a desktop launch of one config
+            // cannot answer the same name differently.
+            let orch = match crate::project_resolve::find_orchestration(cfg, want, dir) {
+                Ok(orch) => orch,
+                Err(crate::project_resolve::OrchestrationLookup::Ambiguous(count)) => {
+                    return Err(format!(
+                        "{}: {count} orchestrations with roles are named '{want}' in {}; \
+                         rename one to dispatch it",
+                        crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION,
+                        dir.display()
+                    ));
+                }
+                Err(crate::project_resolve::OrchestrationLookup::Missing) => {
                     let available: Vec<String> = cfg
                         .orchestrations
                         .iter()
                         .filter(|o| !o.roles.is_empty())
                         .map(|o| resolve_orchestration_name(&o.name, dir))
                         .collect();
-                    if available.is_empty() {
+                    return Err(if available.is_empty() {
                         format!("no orchestration named '{want}', and none are defined")
                     } else {
                         format!(
                             "no orchestration named '{want}'; available: {}",
                             available.join(", ")
                         )
-                    }
-                })?;
+                    });
+                }
+            };
             if orch.roles.is_empty() {
                 return Err(format!("orchestration '{want}' defines no roles"));
             }
@@ -989,6 +999,9 @@ pub async fn spawn(
                         identity.clone(),
                         Some(req.working_dir.as_str()),
                     );
+                    if let Some(tx) = event_tx {
+                        state.announce_unproven_evictions(tx);
+                    }
                     // Issue #1395: the orchestrator's own context file, for its
                     // `ListAgents` record and for removal when this ends.
                     if idx == orch_idx
@@ -3923,6 +3936,53 @@ mod tests {
         }
     }
 
+    /// Issue #1567: the daemon's provenance verdict a Pi report carries on its
+    /// broadcast.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PiReportProvenance {
+        /// Attested to the pane's own spawn token (`daemon_attested_owner`).
+        Attested,
+        /// An outside agent's frame, admitted to its own card
+        /// (`daemon_unproven`).
+        Unproven,
+        /// Neither stamp: a token-less frame for a deck pane admitted under
+        /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, or one relayed by a daemon
+        /// from before #318.
+        Unstamped,
+    }
+
+    /// Issue #1567: what a Pi report's metadata carries on the daemon's
+    /// broadcast — the extension's prompt-report declaration when `declared`,
+    /// and the daemon's provenance verdict.
+    fn mark_pi_report(
+        event: &mut AgentEvent,
+        agent_id: &str,
+        declared: bool,
+        provenance: PiReportProvenance,
+    ) {
+        if declared {
+            event.metadata.insert(
+                crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
+                crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
+            );
+        }
+        match provenance {
+            PiReportProvenance::Attested => {
+                event.metadata.insert(
+                    crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+                    agent_id.to_string(),
+                );
+            }
+            PiReportProvenance::Unproven => {
+                event.metadata.insert(
+                    crate::event::UNPROVEN_METADATA_KEY.to_string(),
+                    crate::event::UNPROVEN_METADATA_VALUE.to_string(),
+                );
+            }
+            PiReportProvenance::Unstamped => {}
+        }
+    }
+
     fn spawn_shell_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
         let command = crate::platform::shell::fixed_command_shell("/bin/sh");
         registry
@@ -4689,6 +4749,145 @@ mod tests {
             assert_eq!(
                 capability, !marked,
                 "marked={marked}: a drained frame's capability is the frame's own answer"
+            );
+        }
+    }
+
+    /// Issue #1567: a Pi frame is capability only when its producer declares
+    /// that it reports every prompt — the bundled extension from #1567 on — on
+    /// a frame the daemon's hook-provenance gate attested. The same frame from
+    /// an older extension, which declares nothing, is not; nor is a declaring
+    /// frame the gate did not attest — an outside agent's (stamped unproven),
+    /// or one carrying neither stamp (a token-less frame admitted under the
+    /// `warn` policy, or one relayed by a pre-#318 daemon).
+    #[test]
+    fn a_drained_pi_frame_is_capability_only_when_it_declares_prompt_reports() {
+        const PANE_ID: &str = "drain-1567-pane";
+        const AGENT_ID: &str = "drain-1567-agent";
+
+        use PiReportProvenance::{Attested, Unproven, Unstamped};
+        for (declared, provenance) in [
+            (false, Attested),
+            (true, Attested),
+            (true, Unproven),
+            (true, Unstamped),
+        ] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let mut event = typed_prompt_watch_event(
+                PANE_ID,
+                AGENT_ID,
+                &format!("{PANE_ID}-session"),
+                EventType::Idle,
+                AgentType::Pi,
+                false,
+            );
+            mark_pi_report(&mut event, AGENT_ID, declared, provenance);
+            let _ = tx.send(BroadcastMsg::Event(event));
+            let mut generation = None;
+            let mut capability = false;
+            let mut agent_start = None;
+            assert_eq!(
+                drain_pre_write_events(
+                    &mut rx,
+                    PANE_ID,
+                    AGENT_ID,
+                    &mut generation,
+                    &mut capability,
+                    &mut agent_start,
+                ),
+                None
+            );
+            assert_eq!(
+                capability,
+                declared && provenance == Attested,
+                "declared={declared} provenance={provenance:?}: a Pi frame's capability is \
+                 its extension's declaration on an attested frame"
+            );
+        }
+    }
+
+    /// Issue #1567: a pane the deck spawned as Pi, whose extension reports a
+    /// session start AFTER the prompt was written. Declaring prompt reports on
+    /// an attested frame, it is a producer that would have confirmed a
+    /// submitted prompt, so the unconfirmed write is re-submitted; declaring
+    /// nothing — an extension from before #1567 — it stays a producer that
+    /// cannot, and nothing is typed into it a second time; and a declaration on
+    /// a frame the hook-provenance gate did not attest, whether stamped
+    /// unproven or carrying neither stamp, grants nothing either.
+    #[serial_test::serial(prompt_confirmation_tasks)]
+    #[tokio::test]
+    async fn a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports() {
+        use PiReportProvenance::{Attested, Unproven, Unstamped};
+        let retry_lands = |declared: bool, provenance: PiReportProvenance| async move {
+            let pane_id = format!("pi-1567-{declared}-{provenance:?}");
+            let prompt = format!("PI-1567-RETRY-{declared}-{provenance:?}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let agent_id = spawn_typed_byte_target(&registry, &pane_id, Some(AgentType::Pi));
+            let (tx, rx) = broadcast::channel(8);
+            let confirmation = tokio::spawn(confirm_prompt_delivery(
+                registry.clone(),
+                rx,
+                ConfirmationTask {
+                    pane_id: pane_id.clone(),
+                    agent_id: agent_id.clone(),
+                    prompt: prompt.clone(),
+                    delivery_id: format!("pi-1567-{declared}-{provenance:?}"),
+                    generation: None,
+                    can_report_prompts: false,
+                    confirmation_floor: Duration::ZERO,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                },
+            ));
+            let mut event = typed_prompt_watch_event(
+                &pane_id,
+                &agent_id,
+                &format!("{pane_id}-session"),
+                EventType::Idle,
+                AgentType::Pi,
+                false,
+            );
+            mark_pi_report(&mut event, &agent_id, declared, provenance);
+            tx.send(BroadcastMsg::Event(event))
+                .expect("send the Pi extension's session-start report");
+            // As in the #559 pair above: the retrying case waits for the
+            // retry's own echo, and the other can only observe an absence, so
+            // its sleep IS the observation — with a zero floor the first window
+            // is 500 ms, so a retry that is going to land has landed by 750 ms.
+            let output = if declared && provenance == Attested {
+                wait_for_detached_payload_echo(&registry, &agent_id, &prompt).await
+            } else {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                registry.snapshot(&agent_id).expect("pi snapshot")
+            };
+            confirmation.abort();
+            let _ = confirmation.await;
+            drop(tx);
+            registry.shutdown_all();
+            (payload_echoes(&output, &prompt) > 0, output)
+        };
+        let (declared_retried, declared_output) = retry_lands(true, Attested).await;
+        assert!(
+            declared_retried,
+            "a deck-spawned Pi pane whose extension declares prompt reports must get the \
+             retry, or a prompt Pi never received is never re-submitted; output={:?}",
+            String::from_utf8_lossy(&declared_output)
+        );
+        let (legacy_retried, legacy_output) = retry_lands(false, Attested).await;
+        assert!(
+            !legacy_retried,
+            "a Pi pane whose extension declares nothing was retyped — that extension does \
+             not report every prompt it submits, so a delivered task can be submitted a \
+             second time; output={:?}",
+            String::from_utf8_lossy(&legacy_output)
+        );
+        for provenance in [Unproven, Unstamped] {
+            let (forged_retried, forged_output) = retry_lands(true, provenance).await;
+            assert!(
+                !forged_retried,
+                "a declaration on a frame the hook-provenance gate did not attest \
+                 ({provenance:?}) granted re-submission into a deck-spawned Pi pane; \
+                 output={:?}",
+                String::from_utf8_lossy(&forged_output)
             );
         }
     }
@@ -7296,6 +7495,52 @@ mod tests {
         );
     }
 
+    /// Issue #1396 item 4: two ROLE-BEARING declarations under the requested
+    /// name are refused as ambiguous rather than resolved to the first, as
+    /// `crate::project_resolve::find_orchestration` refuses them for
+    /// `PrepareOrchestration`. The control is a roleless namesake beside one
+    /// role-bearing entry, which is not ambiguous: it cannot launch anything,
+    /// so the role-bearing one is still the only target with that name.
+    #[test]
+    fn shape_override_refuses_a_name_two_role_bearing_orchestrations_share() {
+        let dir = Path::new("/tmp/x");
+        let ambiguous = parse_config(
+            "[[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        let err = decide_target_with_override(
+            Some(&ambiguous),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("dup".into()))),
+        )
+        .expect_err("a name two role-bearing orchestrations share must not resolve to the first");
+        assert!(
+            err.starts_with(crate::daemon_protocol::PROJECT_ERR_AMBIGUOUS_ORCHESTRATION),
+            "the refusal must carry the ambiguous-orchestration code: {err}"
+        );
+
+        let roleless_namesake = parse_config(
+            "[[orchestrations]]\nname = \"dup\"\nroles = []\n\n\
+             [[orchestrations]]\nname = \"dup\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        match decide_target_with_override(
+            Some(&roleless_namesake),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("dup".into()))),
+        ) {
+            Ok(SpawnTarget::Orchestration { name, roles, .. }) => {
+                assert_eq!(name, "dup");
+                assert_eq!(roles[0].role_name, "lead");
+            }
+            other => panic!("control: a roleless namesake is not ambiguous, got {other:?}"),
+        }
+    }
+
     /// A roleless `[[orchestrations]]` is skipped by `decide_target`, so naming it
     /// must error rather than spawn an empty team.
     #[test]
@@ -8311,6 +8556,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         }

@@ -756,9 +756,9 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Platform coverage:** mac+linux+windows.
 
 ##### status/agent-event/003 — A Pi pane reports running/waiting/finished HEADLESS/UNATTENDED via `agent-event` against the real `daemon serve`, with NO hook installed and no `~/.claude/settings.json` mutation (PRD #201 M2.2).
-- **Layer:** L2 (headless `daemon serve` via the `DaemonProc` harness — no PTY, no attached TUI; spawns the real binary, so the `e2e` tier). The Pi extension is stood in for by the real `dot-agent-deck agent-event --type <state>` CLI subprocess; status is observed via an unattended `SubscribeEvents` consumer and the badge derived locally through `AppState::apply_event` (the same seam the production TUI subscriber uses). Hits no LLM.
-- **Agent:** synthetic (the `agent-event` CLI reporting `AgentType::Pi` from a pane carrying the daemon's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID`).
-- **Asserts:** each `agent-event --type running|waiting|finished` exits 0 and is re-broadcast by the daemon as a bare `AgentEvent` carrying the Pi identity + injected ids + the mapped `EventType`; fed through `AppState::apply_event` the unattended badge moves `Thinking` → `WaitingForInput` → `Idle`; and a seeded sentinel `~/.claude/settings.json` (whose presence makes the hook-install guard pass) is byte-for-byte unchanged afterward and never gains a `dot-agent-deck` hook entry — proving the daemon/agent-event path installs no Claude hook.
+- **Layer:** L2 (headless `daemon serve` via the `DaemonProc` harness — no attached TUI; spawns the real binary, so the `e2e` tier). The Pi pane is a stand-in the daemon spawns itself, which runs the real `dot-agent-deck agent-event --type <state>` CLI from inside the pane for each state typed into it, so each report presents the pane's hook capability token (issue #318) as a real Pi pane's does; status is observed via an unattended `SubscribeEvents` consumer and the badge derived locally through `AppState::apply_event` (the same seam the production TUI subscriber uses). Hits no LLM.
+- **Agent:** synthetic (a daemon-spawned `sh` loop running the `agent-event` CLI, reporting `AgentType::Pi` with the daemon's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` / `DOT_AGENT_DECK_PANE_CAPABILITY`).
+- **Asserts:** under the default enforce policy, each in-pane `agent-event --type running|waiting|finished|prompt|tool-start|tool-end` is re-broadcast as a proven (not `daemon_unproven`) `AgentEvent` carrying the Pi identity and injected ids; fed through `AppState::apply_event` the lifecycle badge moves `Thinking` → `WaitingForInput` → `Idle`, and the dashboard card widget renders the submitted prompt, directory, active tool name/detail and completed-tool count. The same detail event types sent from outside with the pane's ids but no capability token never reach the subscriber within its bounded observation window and leave the rendered card unchanged without creating a duplicate card. A seeded sentinel `~/.claude/settings.json` is byte-for-byte unchanged afterward and gains no `dot-agent-deck` hook entry.
 - **Does not assert:** the real `pi` runtime + bundled extension end to end (real-`pi` e2e, M4.1); the daemon's own internal derived status over the wire (`AgentRecord` carries no status field; the broadcast is the observable).
 - **Platform coverage:** linux (headless daemon-serve harness).
 
@@ -783,6 +783,20 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
 - **Platform coverage:** mac+linux+windows.
 
+
+##### status/agent-event/007 — An ATTESTED Pi report declaring prompt reports (`agent-event --reports-prompts`) makes only its own pane one that confirms its prompts; an attested report that declares nothing leaves its pane non-confirming (issue #1567).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon via `common::spawn_inprocess_daemon`, two Pi-typed `cat` stand-ins spawned through its attach socket (each exports its per-spawn hook capability token via `common::capability_export_command`), and the REAL `dot-agent-deck agent-event` CLI run as a subprocess with that pane's token. The daemon's broadcast is applied to a client `AppState`, standing in for an attached TUI.
+- **Agent:** synthetic (stand-in panes; the reports come from the real CLI).
+- **Asserts:** each broadcast frame carries `daemon_attested_owner` naming its own spawn; the declaring pane's frame answers `declares_prompt_reports()` / `reports_submitted_prompt()` true, and the pane reads `ConfirmationCapability::Reports` in the daemon's state and in the client; the non-declaring pane's frame answers false and the pane reads `CannotReport` in both.
+- **Does not assert:** the real Pi extension sending the flag (lane 2: `scheduler/pi/002`, `chain-smoke/pi/003`); what a confirming pane's delivery then does (`spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`).
+- **Platform coverage:** mac+linux.
+
+##### status/agent-event/008 — A Pi prompt-report declaration the hook-provenance gate does NOT attest grants nothing: an outside pane's token-less report, the same with a forged `daemon_attested_owner`, and a token-less report claiming a deck-spawned Pi pane (issue #1567, PR #1559's gate).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon, the REAL `agent-event` CLI with no token, and one raw JSON line written straight to the daemon's hook socket. The daemon's broadcast is applied to a client `AppState`.
+- **Agent:** synthetic (an outside pane the daemon never spawned, and a Pi-typed `cat` stand-in it did).
+- **Asserts:** the outside pane's CLI frame is broadcast `daemon_unproven` with no attested owner and declares nothing; the raw forged frame arrives with the producer's `daemon_attested_owner` STRIPPED and declares nothing; neither makes the outside pane `Reports` in the client or the daemon, and the daemon's outside card never records `prompt_reports_declared`; the token-less frame naming the deck-spawned Pi pane is refused (no broadcast within 1.5 s) and that pane is not `Reports`. RED with the attestation requirement removed from `AgentEvent::declares_prompt_reports`.
+- **Does not assert:** the same-uid residual `docs/develop/hook-provenance.md` names (a process that reads a deck agent's own token can speak for that pane); `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, under which a token-less frame for a deck pane is admitted but carries no attestation stamp, so it declares nothing by the same rule.
+- **Platform coverage:** mac+linux.
 #### status/supersede
 
 ##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
@@ -1659,6 +1673,49 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** the seed path's hold (`ui::tests::a_seed_that_may_have_written_is_held_through_an_event_stream_outage`, and `prompt/pane-input/047`); a request still unanswered at the deadline, whose `not delivered (timed out)` wording predates #1520; the real subscriber (`session/live/018`, `session/live/019`).
 - **Platform coverage:** mac+linux.
 
+#### prompt/voice-keys
+
+The per-agent prompt keys the deck serves for voice control of the open agent's prompt (PRD #1541): interrupt the turn, clear the prompt, delete characters. Each test reads the keys from the daemon's own `ListAgents` answer (`AgentRecord::prompt_keys`) and writes them as raw `KIND_STREAM_IN` frames on an attach stream to the agent — the desktop's terminal-write path — rather than as keystrokes through the TUI. File: `tests/e2e_prompt_keys_live.rs` (lane 2).
+
+Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005). **Pi is not covered**: the harness's Pi path authenticates only through `ANTHROPIC_API_KEY` (there is no importer for Pi's own login into the per-test HOME), and that key was not set on the box that wrote these. **Devin carries no prompt keys** (PRD #1541 M1 decision 9), so there is nothing to exercise. Codex and OpenCode run on `common::codex_test_model()` / `common::opencode_test_model()`; with a ChatGPT-subscription login set `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` and `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna` (the defaults are refused by that login, and the preflights say so).
+
+Measured while writing these, against Claude Code 2.1.289 through this path, and worth knowing for whoever sends the clear key: **separate writes are not separate reads.** Two writes of 32 `Ctrl+U` sent back to back left Claude's prompt untouched, exactly as one write of 64 does (Claude ignores a read holding 64 or more); two 250 ms apart did too on a box at load 174; two 1 s apart cleared it; a single write of 32 always did. `DEL` × 100 in one write was exact, and on 2026-10-04 so were single writes of 400 and 800 `DEL`s against Claude Code 2.1.289, Codex 0.160.0 and OpenCode 1.18.34. The paste-collapse threshold applies to what the agent reads, not to one write: an 8-character write followed at once by an 800-character one was read by Claude as one 808-character paste and collapsed, so 003 writes its long dictation only once the prompt before it is on screen. An `Enter` written in the same burst as the text before it is taken as part of a paste and inserts a newline, so the tests let typed text settle before `Enter`.
+
+##### prompt/voice-keys/001 — The served interrupt key ends a REAL interactive Claude turn mid-task, keeps the agent running, and the agent answers the next prompt. [reel]
+- **Layer:** L2 PTY-attached (the real binary in the vt100 `TuiDeck` harness; records a cast), lane 2.
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, onboarding and project trust seeded, `--allowedTools Bash Read`; no `-p`.
+- **Asserts:** the daemon serves `prompt_keys` for the Claude pane and no interrupt step contains `0x03`; a directive long-list prompt written on the attach stream puts Claude visibly to work (`esc to interrupt`); writing the served interrupt steps (honouring each `pause_after_ms`) makes Claude show `Interrupted` with no working indicator, which stays away for 3 s; the agent record is still present and not `crashed`; and a follow-up prompt asking for the uniquely named fixture file `voicekeys_interrupt_sentinel_4e7b.txt` is answered with that name on screen.
+- **Does not assert:** the panel's repeat guard or its working-status check (`voiceActions` / `VoiceControlPanel` unit tests); the draft typed mid-turn surviving the interrupt; the exact wording Claude renders beyond `Interrupted`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/002 — The served clear key, pressed as the desktop presses it, empties a REAL interactive Claude prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Claude Code on Haiku, set up as in `prompt/voice-keys/001`. Nothing is submitted, so no tokens are spent on a turn.
+- **Asserts:** a draft written on the attach stream appears in Claude's input row; the served clear key is `per_wrapped_row`, so it is pressed 64 times in writes of at most the served `max_presses_per_write` (two writes of 32, the served `pause_between_writes_ms` — 1 s — apart; see the section note on why the gap); the input row then holds none of the draft, a word written after it is the input row's whole text, and the agent is still registered and not `crashed`.
+- **Does not assert:** Undo of a clear (panel unit tests); a multi-line draft typed with Shift+Enter.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/003 — The served delete key, once per character, removes exactly the last characters of a REAL interactive Claude prompt, a 500-character dictation included.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Claude Code on Haiku, set up as in `prompt/voice-keys/001`. Nothing is submitted.
+- **Asserts:** a kept word and a dictated tail (trailing space included, as voice writes it) appear in Claude's input row; one write of the served delete key repeated once per tail character, followed by a next word, leaves the input row reading the kept word, its space and the next word contiguously — so exactly the tail went, no more and no less; a 500-character dictation written after that settles without collapsing into a `[Pasted text]` placeholder, and one write of 500 deletes followed by a final word leaves the input row reading the earlier text and the final word contiguously; the agent is still registered and not `crashed`.
+- **Does not assert:** the scratch-that stack or its refusals (panel unit tests); paste collapse above 800 characters.
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/004 — A REAL interactive Codex honours the served delete, clear and interrupt keys, and answers the next prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive Codex on `common::codex_test_model()`, `--sandbox workspace-write --ask-for-approval never`, credentials imported.
+- **Asserts:** in one session, on the whole pane rather than a framed input row: one write of the served delete key per character of a dictated tail, then a next word, leaves the kept word, its space and the next word contiguous; the served clear key (`per_line`, 16 presses in one write) leaves nothing of the prompt; a long numbered-list prompt visibly streams, the served interrupt key stops the list growing (stable for 4 s, short of 600) with the agent still registered and not `crashed`; a follow-up prompt asking for `voicekeys_parity_sentinel_codex_3c8a.txt` is answered with that name on screen.
+- **Does not assert:** Codex's own interrupt wording; the idle-Esc hazard (the panel's guard, unit-tested).
+- **Platform coverage:** mac+linux.
+
+##### prompt/voice-keys/005 — A REAL interactive OpenCode honours the served delete, clear and two-step interrupt keys, and answers the next prompt.
+- **Layer:** L2 PTY-attached, lane 2.
+- **Agent:** REAL interactive OpenCode on `common::opencode_test_model()`, credentials imported.
+- **Asserts:** as `prompt/voice-keys/004`, with the sentinel `voicekeys_parity_sentinel_opencode_7f15.txt`, plus that the served interrupt is two steps (Esc, the served pause, Esc) — written in order with that pause.
+- **Does not assert:** OpenCode's own interrupt wording.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -1885,6 +1942,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Agent:** none (`claude`-named shell recorder that sends no `SessionStart`).
 - **Asserts:** the recorder starts, no seed reaches it before 10 seconds plus the 500 ms readiness buffer measured from before form submission, and exactly one seed reaches it through the fallback. Complements `/017`, which pins the earlier announced-agent path.
 - **Does not assert:** genuine agent interaction or the announced-agent readiness gate.
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/020 — The last command submitted through one TUI's New Agent form is offered by an independent TUI on the same daemon (issue #1540).
+- **Layer:** L2 PTY-attached, lane 1 (`e2e`, Unix).
+- **Agent:** none (a shell prints a sentinel and runs `cat`, with no LLM).
+- **Asserts:** the first form starts blank and its accepted command visibly runs; after detaching without reopening that form, an independent TUI with a different HOME and an empty `DOT_AGENT_DECK_SESSION` pre-fills the same command in its first form, before the originating client's session can seed the daemon on a form reopen. The surviving named pane confirms both clients use the same daemon. No `default_command` is configured.
+- **Does not assert:** desktop dialog wiring, daemon restart persistence, migration, older-daemon fallback, or isolation between different daemons.
 - **Platform coverage:** mac+linux.
 
 ### Focus / navigation
@@ -3761,6 +3825,13 @@ without depending on the config struct API.
 - **Does not assert:** a process whose ENTIRE environment, token included, is a still-live pane's — that process is indistinguishable from the pane's own, which is the same-uid residual `docs/develop/hook-provenance.md` decides to accept; how #712's environment went stale, which was never established.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell role).
 
+##### orchestration/provenance/003 — An outside raw status or SessionStart cannot drive a deck-spawned pane's card (issue #318).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_hook_provenance.rs`).
+- **Agent:** none; shell role commands run the real status CLI inside daemon-spawned panes. Synthetic, deliberately not reel-marked.
+- **Asserts:** the pane's own waiting/running/waiting statuses render Needs Input/Thinking/Needs Input; an outside token-less running CLI and forged SessionStart cannot change or retire that card or reach attach clients; its own later finished event still renders Idle. Uses the shipped enforce policy.
+- **Does not assert:** real-agent hook installation, credential propagation, or resistance to a same-uid sender stealing the capability.
+- **Platform coverage:** mac+linux (Unix PTY and hook socket).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
@@ -4643,16 +4714,16 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Platform coverage:** mac+linux.
 
 ##### session/live/018 — A TUI event subscriber that reconnects after its stream is torn down brings the client state back into agreement with the daemon (issue #1520).
-- **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`; the `ListAgents` reply is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
+- **Layer:** L1 (the production `event_subscriber::run` loop, as `main.rs` spawns it, against a scripted daemon on a real Unix socket that answers `SubscribeEvents` and `ListAgents`, and, run a second time as a daemon that advertises it (issue #1555), `Hello` and `SubscribeEventsWithSnapshot`; the snapshot is joined from a real daemon-side `AppState` by `attach_live_sessions`, as the real handler joins it; no PTY, no binary, no agent).
 - **Agent:** none (synthetic Claude Code hook events).
-- **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected. Before the fix it stayed on `(gen-a, Idle, 0)`.
-- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a `ListAgents` that fails once and is retried on a fresh subscription, and a card refreshed from a snapshot with no newer stamp.
+- **Asserts:** the first subscription delivers `gen-a`'s `SessionStart` and ends with `KIND_STREAM_END "lagged"`; the subscriber resubscribes (at least two subscriptions); its state then names `gen-b` as the pane's generation, shows the card `Working` from the daemon's snapshot, and counts one generation closure for `gen-a`, which ended while it was disconnected — against both kinds of daemon. Before the fix it stayed on `(gen-a, Idle, 0)`.
+- **Does not assert:** what a prompt delivery in flight does across the gap (`prompt/pane-input/047`); a daemon restart or a dropped connection rather than `lagged` (all three reach the same `Ok(None)`/`Err` arm); a card for a pane this TUI does not manage, which the resync never mints. Sibling unit tests in the same module cover a conversation that ended during the gap with no successor (cleared and counted when the reply shows the daemon reports generations, left alone when it does not), a snapshot that fails once and is retried on a fresh subscription, a card refreshed from a snapshot with no newer stamp, and (issue #1555, `events_the_snapshot_already_includes_are_not_replayed_over_it`) a conversation that rolls over between the resubscribe and the snapshot: through `SubscribeEventsWithSnapshot` the closure is counted once, and its control shows the older daemon's unordered resync replaying the window. That the real daemon opens the subscription and reads the snapshot under one `AppState` guard is `daemon_protocol::tests::an_ordered_subscription_never_carries_an_event_its_snapshot_includes`.
 - **Platform coverage:** mac+linux.
 
 ##### session/live/019 — A running TUI whose event stream breaks and reconnects shows the status it missed (issue #1520).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_reconnect_agent_type.rs`, `#![cfg(feature = "e2e")]`): a real `daemon serve` with a real `StartAgent` pane, the real binary attached through the vt100 `TuiDeck` harness, and the real `agent-event` CLI. The break is the `e2e`-build-only seam `e2e_subscriber_breaks` in `main.rs`, set through `DOT_AGENT_DECK_E2E_BREAK_STREAM_ON`: it drops the first matching event and tears the subscription down once, standing in for a lagged stream, which a PTY test cannot provoke on cue.
 - **Agent:** none (a `sh -c 'sleep 600'` pane declared `Pi`; the status comes from the real `agent-event --type running` CLI).
-- **Asserts:** the card, already on screen, shows `Thinking` after the one event that would have told the TUI so was lost with the stream; the daemon applied it, and the reconnect's resync carried it over.
+- **Asserts:** the card, already on screen, shows `Thinking` after the one event that would have told the TUI so was lost with the stream; the daemon applied it, and the reconnect's resync carried it over (through `SubscribeEventsWithSnapshot`, which the same build's daemon advertises, issue #1555).
 - **Does not assert:** a real lag or daemon restart (the seam stands in for both); a prompt delivery across the gap (`prompt/pane-input/047`); the generation and closure count (`session/live/018`).
 - **Platform coverage:** mac+linux.
 
@@ -5217,6 +5288,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
 
+##### chain-smoke/pi/003 — A delegate's task pointer TYPED into an idle real `pi` worker is confirmed by the worker's own prompt report, and submitted exactly once (issue #1567).
+- **Layer:** L2 (in-process daemon; a real pi worker PTY via `AgentPtyRegistry::spawn_agent` with the bundled extension staged into its HOME; the daemon's event stream read through `common::EventSub::subscribe` on the in-process attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. No role config, so `handle_delegate` does not respawn the worker: the pointer is typed into the running pane, not handed over natively. The orchestrator side is the deterministic synthetic `DelegateSignal`, as in `chain-smoke/pi/002`.
+- **Agent:** REAL `pi` worker (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the worker's session-start report (`Idle`) carries `prompt_reports_declared`; after the delegate, a declared `Pi` `Thinking` report whose `user_prompt` is the `worker-task-coder.md` pointer arrives within 50 s (the proof the in-place re-delivery waits for); the worker creates `pi_delegate_sentinel_6b1c.txt` (`PI_DELEGATE_SENTINEL_OK`) and signals work-done; and until 10 s past the first re-delivery — pinned at 60 s with `DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS`, so it was still pending when the report arrived — no second report of the pointer's delivery id appears, so the report stopped the re-delivery.
+- **Does not assert:** a delegate into a BUSY pi worker (queued by pi as a steering message; the extension's `input` report is pinned by its TS unit tests); the `clear = true` native path (`chain-smoke/pi/002`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one short Haiku worker turn (read a task file, create a file, work-done) — well under Decision 23's <$0.05/run bound.
+
 #### pane/drift
 
 ##### pane/drift/001 — A role grown into an already-open orchestration tab via `pane spawn` survives the next session snapshot flush (issue #868).
@@ -5331,6 +5410,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** none (`cat` stand-ins make the draft and task pointer visible in PTY snapshots).
 - **Asserts:** an unsent draft keeps the queued delegate pointer out of the old worker pane; `pane restart --force` succeeds within eight seconds, below the CLI's fourteen-second reply budget; the waiting delegate then reaches the replacement as a submitted line or produces an explicit delivery notice, without the old draft reaching the replacement.
 - **Does not assert:** the CLI/socket encoding of the reply, or a real agent's editor behavior.
+- **Platform coverage:** mac+linux (unix-only).
+
+##### pane/restart/016 — `pane restart` of a role a prepared launch started is refused as not a directory once the project directory is deleted, and does not start it in a directory put at the project's path afterwards (issue #1396 items 2 and 3).
+- **Layer:** L1/fast (in-process real restart handler; the worker is started through `AgentPtyRegistry::spawn_agent_in` with a `VerifiedProjectDir`, the way the daemon's `start-prepared-agent` arm starts it; no socket or LLM).
+- **Agent:** none (`cat` stand-ins; the role's configured restart command is `touch restarted-here && exec cat`, so where a restart ran is a file on disk).
+- **Asserts:** with the verified project directory renamed away and nothing at its path, `pane restart --force` is refused with an error saying the directory "is not a directory" (not the prepared-directory-changed one) and leaves the original worker in the pane; after a different directory with its own copy of the config is put at that path, `pane restart --force` of the worker is refused with an error, leaves the original worker in the pane, and leaves no marker in the replacement; once the verified directory is back at its path, the same restart succeeds and its marker lands there (the control).
+- **Does not assert:** the re-create leg, where the pane has no record left (`a_prepared_pane_is_not_re_created_in_a_replaced_directory` in `src/agent_pty.rs` covers it and is what pins the spawn-time check rather than the pre-check); a replacement made after the check, which on Linux the held descriptor makes harmless and elsewhere is the #1396 item 1 residual; the CLI/socket layer.
 - **Platform coverage:** mac+linux (unix-only).
 
 #### pane/spawn
@@ -6243,6 +6329,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap Haiku `-p` turn (and the status assertion resolves on boot, before the turn completes) — well under Decision 23's <$0.05/run bound.
 
+##### scheduler/pi/002 — A scheduled prompt the deck TYPES into an interactive real `pi` pane is confirmed by Pi's own prompt report, so a Pi pane is a prompt-confirming agent (issue #1567).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, `DOT_AGENT_DECK_SCHEDULES` pointing at a one-schedule fixture and `DOT_AGENT_DECK_LOG` at a file in the test's scratch dir; the fire is a `RunNow` over the attached deck's own attach socket). Lives in `tests/e2e_pi_prompt_confirmation.rs`, gated `all(feature = "e2e", feature = "e2e-live", unix)`. The schedule's `command` is an INTERACTIVE `pi --provider anthropic --model claude-haiku-4-5 --approve` (no prompt on the command line) and its `prompt` is the directive, so the prompt goes through the daemon's spawn-time PTY delivery (`crate::spawn`) rather than a native `get-seed` hand-off. The bundled extension comes from the daemon-startup auto-materialize. Records a `.cast`, but is not marked for the reel.
+- **Agent:** REAL `pi` (cheap Haiku turn). Lane 2 — runs on a developer's machine only. Runtime-skipped (Decision 26) when `pi`/`ANTHROPIC_API_KEY` are absent.
+- **Asserts:** the Pi pane's card on the attached TUI's grid shows `Prmt:` (the typed-in prompt, which only Pi's own report puts there); the deck log records `prompt delivery confirmed by the agent's submitted prompt` and never `delivery cannot be confirmed by this agent` (the delivery treated the Pi pane as confirming, and was confirmed); pi creates `pi_confirm_sentinel_3a7f.txt` with `PI_CONFIRM_SENTINEL_OK`. Prints the write → confirmation latency and the re-submission count from the log, as evidence for Pi's confirmation-latency floor.
+- **Does not assert:** whether the first write landed or a re-submission was needed (both end confirmed; the count is printed); the exact prompt text on the card (cut to the card's width); an older extension keeping the old behaviour (fast tier: `spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`, `tests/pi_agent_event_cli.rs`); a prompt queued while pi is busy (the extension's `input` report is pinned by its TS unit tests).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one short Haiku turn (create a file) — well under Decision 23's <$0.05/run bound.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).
@@ -6717,7 +6811,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 ##### project/launch/003 — A REAL interactive Haiku coordinator reads the context the DAEMON published and visibly acts on the task it found there (PRD #819, CLAUDE.md rule 4's real-usage bar). [reel]
 - **Layer:** L2 PTY-attached, lane 2 (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with its lazy daemon; records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180). Runtime-skipped when the `claude` CLI or credentials are absent. Runs on a developer's machine and **nowhere in CI** (rule 5): no e2e test that reaches a real agent runs on a runner, so this is the only thing that ever checks the claim.
 - **Agent:** one REAL fully interactive Claude Code pane pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read`, no `-p`, no `cat` stand-in), spawned by the daemon into the canonical project directory the daemon itself named. The `project-launch-real` fixture's `context-handoff` orchestration declares that one `coordinator` start role plus a committed sentinel file; `--allowedTools` is part of the role's own `command`, not a harness flag. Credentials are imported into the per-test HOME and `with_claude_trust_workdir()` pre-trusts BOTH the raw and canonicalised work dir, because the daemon canonicalises the project path and claude matches its per-folder trust key verbatim — a symlinked temp root would otherwise park the agent on an unanswered approval prompt until the harness timeout.
-- **Asserts:** driving the desktop's own sequence over the attach socket — `ResolveProject`, `PrepareWorkflow`, `StartAgent`, then guarded `WriteAndSubmit` of the daemon's returned unique-file pointer — the fixture sentinel `context_proof_9d4f2a.txt` appears in the real coordinator's pane. The sentinel is absent from the published context, so reporting it requires reading that file and running a tool. The coordinator remains visible in the attached TUI. Preconditions distinguish a missing publish from a failed agent read.
+- **Asserts:** driving the desktop's own sequence over the attach socket — `ResolveProject`, `PrepareWorkflow`, `StartAgent`, then guarded `WriteAndSubmit` of the daemon's returned unique-file pointer — the fixture sentinel `context_proof_9d4f2a.txt` appears in the real coordinator's pane, matched on the deck's rendered grid of that pane or, for a listing already scrolled off it, on the pane's raw scrollback (issue #1396: the raw route alone misses characters Claude Code's differential redraw skips with cursor moves, so it reported a sentinel the screen showed as absent). The sentinel is absent from the published context, so reporting it requires reading that file and running a tool. The coordinator remains visible in the attached TUI. Preconditions distinguish a missing publish from a failed agent read.
 - **Does not assert:** the publish contract itself — path, reply shape, the failed-preparation case (`project/launch/001`); canonical-spelling propagation as a property (`project/launch/002`); the wire shape or boundary refusals (`tests/project_projection.rs`, `tests/daemon_protocol.rs`); the `prep_token`, which rides on the separate `start-prepared-agent` verb and is not presented here; delegation or work-done routing (`orchestration/route/001`, `scheduler/dispatch/013`); the desktop GUI half, for which no harness exists (PRD #819 *Testing: what rule 4 means here*); the sentinel reaching the deck's own vt100 stream, which is logged best-effort because a claude TUI can hard-wrap a filename across a row boundary.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — the pane/attach helpers it drives are Unix-domain-socket only).
 
@@ -6939,6 +7033,17 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** an absent-path listing starts at the daemon's HOME; a child path copied verbatim from that reply browses into a fixture with no `.dot-agent-deck.toml` and `is_project: false`; the Claude registry entry's returned `default_command` forms the start command; `StartAgent` uses the second listing's canonical path; after readiness-gated prompt delivery, the unique on-disk filename omitted from the prompt appears in the real agent pane and on the attached TUI's rendered vt100 grid.
 - **Does not assert:** the real Tauri window or its form controls (no `tauri-driver` tier, #953); alternate agents or models; authoring and orchestration modes; desktop fallback against missing capabilities; model prose beyond the literal sentinel filename.
 - **Platform coverage:** mac+linux, developer machine only (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2 needs a developer's Claude credential and the harness uses Unix-domain sockets and Unix PTYs).
+
+### Test harness teardown (issue #1566)
+
+#### harness/teardown
+
+##### harness/teardown/001 — A test that panics with a live deck gets its failure dump but not a regenerated paired doc, so its process exits promptly instead of lingering until nextest's slow-timeout.
+- **Layer:** L2 lane 1, PTY-attached (the real `dot-agent-deck` binary on the `minimal` fixture, launched and panicked on a spawned thread named after the test so `TuiDeck`'s `Drop` runs its failure path).
+- **Agent:** none.
+- **Asserts:** the thread ends in the deliberate panic, not a launch or `wait_for_string` timeout, which would take the same failure path; the drop still writes the failure dump (`provenance.json` with `outcome: failed`, `final-grid.txt`); the paired `test.md` is not written. A `test.md` already in the recordings directory is set aside for the run and restored afterwards. Before the fix, the panicking drop called `regenerate_paired_doc`, which syn-parses every `#[spec]`-bearing source file and wrote this test's `test.md`; it took 8–24s on a loaded 16-core box and kept CI's `manager_016` alive past nextest's 180s timeout on starved 4-CPU runners.
+- **Does not assert:** a wall-clock bound on the drop (the observation is the skipped step, which does not depend on machine load); the record-on-success path (`DOT_AGENT_DECK_RECORD=1`), which still regenerates the doc; the content of any dumped artifact beyond the provenance outcome.
+- **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
 

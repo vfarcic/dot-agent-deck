@@ -571,3 +571,22 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 [[profile.default.overrides]]
 filter = 'test(delegate_049_a_delegate_to_a_worker_that_exited_on_its_own_is_not_reported_delivered)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Issue #1396 (met while verifying it): `project/launch/003` drives a REAL
+# interactive Haiku coordinator, and its own declared waits run far past the
+# default 3 x 60 s kill: up to 180 s for the agent's `SessionStart`, up to 180 s
+# for its pane to settle, 240 s for the sentinel report and 30 s for the soft
+# on-screen check — about 630 s before the deck's own launch. It passes in
+# ~20 s when the agent answers promptly (measured twice on 2026-10-04), and it
+# was killed at exactly 180 s twice in a row the same morning, once on a QUIET
+# box (`[load-context] … QUIET`), with nothing in its output saying which wait
+# it was in, because nextest's kill lands before any of the test's own
+# assertion messages can. 11 x 60 s covers the declared budget, so a slow agent
+# finishes inside it and a stalled one fails with the message that names the
+# phase that hung. The test pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`
+# to 720 s to match, since the harness default of 300 s would end the daemon
+# first. Tracks the TEST FUNCTION name; update it in lockstep with a rename, or
+# this silently stops applying.
+[[profile.default.overrides]]
+filter = 'test(project_launch_003_a_real_coordinator_reads_the_daemon_published_context)'
+slow-timeout = { period = "60s", terminate-after = 11 }

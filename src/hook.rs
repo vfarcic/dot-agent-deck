@@ -166,7 +166,10 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
-    let json = match serde_json::to_string(&event) {
+    // Issue #318: present this pane's hook capability token, so the daemon can
+    // tell this pane's own report from one naming it from outside.
+    let token = crate::hook_provenance::token_from_env();
+    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
@@ -839,6 +842,10 @@ pub struct AgentEventDetail {
     pub prompt: Option<String>,
     pub tool_name: Option<String>,
     pub tool_detail: Option<String>,
+    /// Issue #1567: the reporter declares that it reports every prompt the
+    /// agent submits (`--reports-prompts`), stamped on the event as
+    /// [`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`].
+    pub reports_prompts: bool,
 }
 
 /// Build the raw [`AgentEvent`] `dot-agent-deck agent-event` sends for a pane
@@ -855,6 +862,10 @@ pub struct AgentEventDetail {
 /// the tool detail keeps only its first line, cut to the same 120 bytes as
 /// [`extract_tool_detail`]'s shell arms. The daemon scrubs both tool strings on
 /// ingest regardless.
+///
+/// [`AgentEventDetail::reports_prompts`] becomes the declaration marker on the
+/// event's metadata (issue #1567), on every `--type`: the deck reads it from
+/// whichever report it sees first, the session-start one included.
 pub fn build_agent_event_cli(
     pane_id: String,
     agent_id: Option<String>,
@@ -865,6 +876,13 @@ pub fn build_agent_event_cli(
     let tool_detail = non_blank(detail.tool_detail)
         .map(|d| truncate(d.lines().next().unwrap_or(&d), 120))
         .filter(|d| !d.trim().is_empty());
+    let mut metadata = std::collections::HashMap::new();
+    if detail.reports_prompts {
+        metadata.insert(
+            crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY.to_string(),
+            crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE.to_string(),
+        );
+    }
     AgentEvent {
         session_id: format!("{pane_id}-session"),
         agent_type: AgentType::Pi,
@@ -874,7 +892,7 @@ pub fn build_agent_event_cli(
         cwd: non_blank(detail.cwd),
         timestamp: Utc::now(),
         user_prompt: non_blank(detail.prompt).map(|p| record_submitted_prompt(&p)),
-        metadata: Default::default(),
+        metadata,
         pane_id: Some(pane_id),
         agent_id,
         agent_version: None,
@@ -1821,6 +1839,7 @@ mod tests {
                 prompt: None,
                 tool_name: Some("bash".into()),
                 tool_detail: Some("touch a.txt\necho second line".into()),
+                reports_prompts: false,
             },
         );
         assert_eq!(event.session_id, "pane-7-session");
@@ -1864,6 +1883,7 @@ mod tests {
                 prompt: Some("".into()),
                 tool_name: Some("\t".into()),
                 tool_detail: Some("\nsecond".into()),
+                reports_prompts: false,
             },
         );
         assert!(event.cwd.is_none());
@@ -1883,6 +1903,43 @@ mod tests {
         );
         assert_eq!(long.tool_name, Some(truncate(&"t".repeat(300), 80)));
         assert_eq!(long.tool_detail, Some(truncate(&"d".repeat(300), 120)));
+    }
+
+    /// Issue #1567: `--reports-prompts` becomes the declaration marker on any
+    /// report; without it the frame declares nothing, as every report from an
+    /// older extension. The marker the CLI stamps is not yet standing: only
+    /// once the daemon's hook-provenance gate attests the frame
+    /// (`ATTESTED_OWNER_METADATA_KEY`) does a Pi pane count as confirming.
+    #[test]
+    fn agent_event_cli_declares_prompt_reports_only_when_asked() {
+        for reports_prompts in [false, true] {
+            let mut event = build_agent_event_cli(
+                "pane-7".into(),
+                Some("agent-7".into()),
+                EventType::Idle,
+                AgentEventDetail {
+                    reports_prompts,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                event
+                    .metadata
+                    .get(crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY)
+                    .map(String::as_str),
+                reports_prompts.then_some(crate::event::PROMPT_REPORTS_DECLARED_METADATA_VALUE)
+            );
+            assert!(
+                !event.declares_prompt_reports() && !event.reports_submitted_prompt(),
+                "reports_prompts={reports_prompts}: an unattested frame declares nothing"
+            );
+            event.metadata.insert(
+                crate::event::ATTESTED_OWNER_METADATA_KEY.to_string(),
+                "agent-7".to_string(),
+            );
+            assert_eq!(event.declares_prompt_reports(), reports_prompts);
+            assert_eq!(event.reports_submitted_prompt(), reports_prompts);
+        }
     }
 
     /// A lifecycle report with no detail is the frame it has always been.

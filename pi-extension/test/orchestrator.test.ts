@@ -24,9 +24,12 @@ import {
 	buildDelegateArgv,
 	buildGetSeedArgv,
 	buildWorkDoneArgv,
+	createReporter,
 	createSerialQueue,
 	DECK_BIN,
 	DECK_EXE_ENV,
+	DeckExecError,
+	DECLARE_PROMPT_REPORTS_FLAG,
 	execFailureMessage,
 	isAgentState,
 	isUnsupportedFlagFailure,
@@ -35,6 +38,8 @@ import {
 	piEventReport,
 	piEventToAgentState,
 	piToolDetail,
+	REPORT_LEVELS,
+	reportArgvAt,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
 	seedToDeliver,
@@ -177,6 +182,26 @@ describe("row 8: agent-event argv", () => {
 	test("a lifecycle report keeps its exact legacy argv when no detail is given", () => {
 		assert.deepEqual(buildAgentEventArgv("finished", {}), ["agent-event", "--type", "finished"]);
 	});
+
+	// Issue #1567: the declaration goes FIRST among the flags, so a CLI that
+	// predates it names it, and not `--cwd`, as the argument it does not know.
+	test("the prompt-report declaration is the first flag when asked for", () => {
+		assert.equal(DECLARE_PROMPT_REPORTS_FLAG, "--reports-prompts");
+		assert.deepEqual(buildAgentEventArgv("prompt", { cwd: "/w", prompt: "go" }, true), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--reports-prompts",
+			"--cwd=/w",
+			"--prompt=go",
+		]);
+		assert.deepEqual(buildAgentEventArgv("finished", {}, true), [
+			"agent-event",
+			"--type",
+			"finished",
+			"--reports-prompts",
+		]);
+	});
 });
 
 describe("issue #622: Pi tool detail", () => {
@@ -234,6 +259,41 @@ describe("issue #622: Pi event → agent-event report", () => {
 		assert.equal(report?.detail.prompt?.length, MAX_PROMPT_CHARS);
 	});
 
+	// Issue #1567, measured on Pi 0.87.1: a prompt submitted while Pi is busy is
+	// queued as a steering or follow-up message and never reaches
+	// `before_agent_start`. Pi raises `input` for it with `streamingBehavior`.
+	test("input reports a prompt Pi queues because it is busy", () => {
+		for (const streamingBehavior of ["steer", "followUp"]) {
+			assert.deepEqual(
+				piEventReport("input", { text: "also do this", source: "interactive", streamingBehavior }, "/w"),
+				{ type: "prompt", detail: { cwd: "/w", prompt: "also do this" } },
+				streamingBehavior,
+			);
+		}
+		assert.equal(
+			piEventReport(
+				"input",
+				{ text: "p".repeat(MAX_PROMPT_CHARS + 50), source: "extension", streamingBehavior: "followUp" },
+				"/w",
+			)?.detail.prompt?.length,
+			MAX_PROMPT_CHARS,
+		);
+	});
+
+	test("input leaves an idle submission to before_agent_start, so it is reported once", () => {
+		assert.equal(piEventReport("input", { text: "go", source: "interactive" }, "/w"), null);
+		assert.equal(
+			piEventReport("input", { text: "go", source: "interactive", streamingBehavior: undefined }, "/w"),
+			null,
+		);
+	});
+
+	test("input with no usable text reports nothing", () => {
+		assert.equal(piEventReport("input", { text: "  ", streamingBehavior: "steer" }, "/w"), null);
+		assert.equal(piEventReport("input", { streamingBehavior: "steer" }, "/w"), null);
+		assert.equal(piEventReport("input", undefined, "/w"), null);
+	});
+
 	test("a blank or missing prompt reports nothing (agent_start still reports the turn)", () => {
 		assert.equal(piEventReport("before_agent_start", { prompt: "   " }, "/w"), null);
 		assert.equal(piEventReport("before_agent_start", {}, "/w"), null);
@@ -267,6 +327,7 @@ describe("issue #622: Pi event → agent-event report", () => {
 	test("every subscribed event yields a report whose argv the CLI accepts", () => {
 		const payloads: Record<string, unknown> = {
 			before_agent_start: { prompt: "go" },
+			input: { text: "go", source: "interactive", streamingBehavior: "steer" },
 			tool_execution_start: { toolName: "bash", args: { command: "ls" } },
 			tool_execution_end: { toolName: "bash" },
 		};
@@ -481,6 +542,110 @@ describe("issue #622: falling back for a CLI older than the extension", () => {
 				stderr: "Failed to send agent-event for /work/error: unexpected argument '--x'",
 			}),
 		);
+	});
+});
+
+describe("issue #1567: report levels for decks of every age", () => {
+	const prompt = { type: "prompt" as const, detail: { cwd: "/w", prompt: "go" } };
+	const lifecycle = { type: "running" as const, detail: { cwd: "/w" } };
+
+	test("each level sends what it names, and a detail report has no lifecycle form", () => {
+		assert.deepEqual([...REPORT_LEVELS], ["declared", "detail", "lifecycle"]);
+		assert.deepEqual(reportArgvAt(prompt, "declared"), [
+			"agent-event",
+			"--type",
+			"prompt",
+			"--reports-prompts",
+			"--cwd=/w",
+			"--prompt=go",
+		]);
+		assert.deepEqual(reportArgvAt(prompt, "detail"), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
+		assert.equal(reportArgvAt(prompt, "lifecycle"), null);
+		assert.deepEqual(reportArgvAt(lifecycle, "lifecycle"), ["agent-event", "--type", "running"]);
+	});
+
+	/**
+	 * A fake deck CLI that knows only `known` flags and refuses the first
+	 * other one exactly as clap does (exit 2, `error: unexpected argument …`).
+	 * `down` makes every call fail the way an unreachable daemon does.
+	 */
+	function fakeCli(known: string[], options: { down?: boolean } = {}) {
+		const calls: string[][] = [];
+		const run = async (argv: string[]) => {
+			calls.push(argv);
+			const unknown = argv.slice(3).find((arg) => !known.includes(arg.split("=")[0]));
+			if (unknown !== undefined) {
+				const flag = unknown.split("=")[0];
+				throw new DeckExecError("refused", { code: 2, stderr: `error: unexpected argument '${flag}' found\n` });
+			}
+			if (options.down) {
+				throw new DeckExecError("down", { code: 1, stderr: "Failed to send agent-event to daemon socket." });
+			}
+			return { code: 0, stdout: "", stderr: "" };
+		};
+		return { calls, run };
+	}
+	const DETAIL_FLAGS = ["--cwd", "--prompt", "--tool-name", "--tool-detail"];
+
+	test("a current deck gets every report declared, first time", async () => {
+		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		await reporter.send(prompt);
+		assert.equal(reporter.level(), "declared");
+		assert.deepEqual(
+			cli.calls.map((argv) => argv.includes("--reports-prompts")),
+			[true, true],
+		);
+	});
+
+	test("a deck from #622 to #1567 keeps the detail and loses only the declaration", async () => {
+		const cli = fakeCli(DETAIL_FLAGS);
+		const reporter = createReporter(cli.run);
+		await reporter.send(prompt);
+		assert.equal(reporter.level(), "detail");
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "prompt", "--cwd=/w", "--prompt=go"]);
+		await reporter.send(lifecycle);
+		assert.deepEqual(cli.calls.at(-1), ["agent-event", "--type", "running", "--cwd=/w"]);
+		assert.equal(cli.calls.length, 3, "after the first refusal no report is spent on the declaration");
+	});
+
+	test("a deck from before #622 falls all the way to bare lifecycle reports", async () => {
+		const cli = fakeCli([]);
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "lifecycle");
+		assert.deepEqual(cli.calls, [
+			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "running", "--cwd=/w"],
+			["agent-event", "--type", "running"],
+		]);
+		await reporter.send(prompt);
+		assert.equal(cli.calls.length, 3, "a detail report has nothing to send to such a deck");
+	});
+
+	test("a transient failure keeps the level and retries a lifecycle report bare", async () => {
+		const cli = fakeCli([DECLARE_PROMPT_REPORTS_FLAG, ...DETAIL_FLAGS], { down: true });
+		const reporter = createReporter(cli.run);
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "declared");
+		assert.deepEqual(cli.calls, [
+			["agent-event", "--type", "running", "--reports-prompts", "--cwd=/w"],
+			["agent-event", "--type", "running"],
+		]);
+		await reporter.send(prompt);
+		assert.equal(cli.calls.length, 3, "a failed detail report is not retried");
+	});
+
+	test("a failure that is not a DeckExecError is treated as transient", async () => {
+		const calls: string[][] = [];
+		const reporter = createReporter(async (argv) => {
+			calls.push(argv);
+			throw new Error("spawn ENOENT");
+		});
+		await reporter.send(lifecycle);
+		assert.equal(reporter.level(), "declared");
+		assert.equal(calls.length, 2);
 	});
 });
 

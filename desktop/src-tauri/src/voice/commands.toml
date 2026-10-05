@@ -83,9 +83,11 @@
 #                    For a row whose action cannot be taken back, where an
 #                    unrelated occurrence of one ordinary word ("tell it to put
 #                    END after the report") must not be enough. Same own-words
-#                    rule. Four rows use it — `submit_prompt`,
-#                    `discard_new_agent`, and the dictation mode's pair, whose
-#                    switch changes how every later utterance is treated
+#                    rule. Seven rows use it — `submit_prompt`,
+#                    `discard_new_agent`, the dictation mode's pair, whose
+#                    switch changes how every later utterance is treated, and
+#                    PRD #1541's three typing-mode prompt commands, which it
+#                    keeps out of the model's reach (see above those rows)
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
 #   heard_as_whole_while
@@ -145,8 +147,11 @@
 # `voice_off` stops the microphone, `list_commands` opens an overlay,
 # `dictate_to_agent` types what it hears into the open agent's prompt and
 # `submit_prompt` presses Enter in it. What still holds is the narrower property
-# the old sentence was really protecting — **no row here STOPS anything, or
-# answers a permission prompt, BY ITSELF.** Two rows lead to a stop —
+# the old sentence was really protecting — **no row here STOPS an agent or an
+# orchestration, or answers a permission prompt, BY ITSELF.** (PRD #1541's
+# `interrupt_agent` ends the open agent's current TURN and keeps the agent
+# running; it is a typing-mode command the model never dispatches.) Two rows
+# lead to a stop —
 # `stop_agent` and `close_orchestration`, at the end of this file — and each
 # terminates at a `ConfirmDialog` the user answers by hand, never at a direct
 # dispatch: PRD #802 D5's confirm-before-acting step, satisfied in the FRONTEND
@@ -672,6 +677,81 @@ try_saying  = "send it"
 heard_as_whole = [
   "send it", "send", "submit it", "submit", "press enter", "enter", "go ahead", "end",
   "that is the end", "finished", "the prompt is finished",
+]
+
+# PRD #1541 — control of the open agent's PROMPT: interrupt its turn, clear
+# what is typed, scratch the last thing voice typed. Typing mode decides what a
+# word means (M1 decision 2), so all three are TYPING-MODE commands.
+#
+# **Reached only through the local typing-mode intercept, never through the
+# model**, and that is a property of the grounding rather than of a sentence
+# here: each row is `heard_as_whole` over exactly the phrases
+# `outcome::local_intercept` answers on the agent screen OUTSIDE typing mode
+# with "say typing on first" (`voice::dictation::INTERRUPT_PHRASES`,
+# `CLEAR_PROMPT_PHRASES`, `SCRATCH_PHRASES`). So every utterance whose words
+# could ground a model pick of one of these rows on the agent screen is
+# answered before any backend call, and on the other screens the row is not
+# callable and renders its hint. The bare "stop" forms
+# (`TYPING_STOP_PHRASES`) are deliberately NOT in `interrupt_agent`'s
+# grounding: outside typing mode a bare "stop" keeps the model's answer it has
+# today (issue #1402 owns it), and putting it here would let the model ground
+# an interrupt on it. As a second wall, `handle_utterance_with_dictation`
+# refuses a model dispatch of any of these rows with the same "typing on"
+# sentence. Inside typing mode `outcome::dictation_intercept` dispatches them
+# from the dictation lists, ahead of typing the utterance.
+#
+# The descriptions still name every phrase (linkage-check rule 14), which is
+# also what the discovery overlay shows the user.
+[[commands]]
+id          = "interrupt_agent"
+description = """Interrupt the open agent's turn: the app presses that agent's own interrupt
+key, which ends what it is working on and keeps the agent and its session running. A typing-mode
+command, answered by the app itself while typing mode is on, when the WHOLE utterance is
+"interrupt", "interrupt it", "interrupt that", "stop", "stop it" or "stop that". Outside typing
+mode a bare "stop" is never this command, and the app answers the others by asking the user to
+turn typing mode on first."""
+invoke      = "interruptAgent"
+screens     = ["agent"]
+unavailable_hint = "interrupting an agent works in its pane, in typing mode"
+report      = "Interrupted the agent."
+asks_to     = "interrupt the agent"
+try_saying  = "interrupt"
+heard_as_whole = ["interrupt", "interrupt it", "interrupt that"]
+
+[[commands]]
+id          = "clear_prompt"
+description = """Clear the open agent's prompt: the app deletes everything typed in it and sends
+nothing. A typing-mode command, answered by the app itself while typing mode is on, when the
+WHOLE utterance is "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything"
+or "delete everything". Outside typing mode the app answers these by asking the user to turn
+typing mode on first."""
+invoke      = "clearAgentPrompt"
+screens     = ["agent"]
+unavailable_hint = "clearing a prompt works in an agent's pane, in typing mode"
+report      = "Cleared the prompt."
+asks_to     = "clear the agent's prompt"
+try_saying  = "clear the prompt"
+heard_as_whole = [
+  "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything",
+  "delete everything",
+]
+
+[[commands]]
+id          = "scratch_that"
+description = """Scratch the last thing voice typed into the open agent's prompt: the app deletes
+exactly those words and leaves the rest. A typing-mode command, answered by the app itself while
+typing mode is on, when the WHOLE utterance is "scratch that", "scratch it", "scratch the last
+part", "scratch the last sentence", "scratch the last prompt", "delete that" or "undo that".
+Outside typing mode the app answers these by asking the user to turn typing mode on first."""
+invoke      = "scratchLastDictation"
+screens     = ["agent"]
+unavailable_hint = "scratching dictated words works in an agent's pane, in typing mode"
+report      = "Scratched the last dictation."
+asks_to     = "scratch the last dictation"
+try_saying  = "scratch that"
+heard_as_whole = [
+  "scratch that", "scratch it", "scratch the last part", "scratch the last sentence",
+  "scratch the last prompt", "delete that", "undo that",
 ]
 
 # PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.

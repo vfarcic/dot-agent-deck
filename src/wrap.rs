@@ -252,6 +252,9 @@ struct Emitter {
     session_id: String,
     pane_id: Option<String>,
     agent_id: Option<String>,
+    /// Issue #318: the hook capability token this wrapper inherited from its
+    /// pane, presented on every event it sends. `None` for a standalone wrap.
+    token: Option<String>,
     cwd: Option<String>,
     /// PRD #20 M3: the live-target descriptor every event this wrapper emits
     /// carries. A wrapped session is the first place the live/history-only
@@ -332,8 +335,10 @@ impl Emitter {
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             fact.origin().to_string(),
         );
-        let Ok(json) = serde_json::to_string(&self.build_event(EventType::SessionStart, metadata))
-        else {
+        let Ok(json) = crate::event::agent_event_line(
+            &self.build_event(EventType::SessionStart, metadata),
+            self.token.as_deref(),
+        ) else {
             return;
         };
         std::thread::spawn(move || {
@@ -343,7 +348,7 @@ impl Emitter {
 
     fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
         let event = self.build_event(event_type, metadata);
-        if let Ok(json) = serde_json::to_string(&event) {
+        if let Ok(json) = crate::event::agent_event_line(&event, self.token.as_deref()) {
             let _ = crate::hook::send_to_socket(&json);
         }
     }
@@ -2195,6 +2200,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         session_id,
         pane_id,
         agent_id,
+        token: crate::hook_provenance::token_from_env(),
         cwd,
         live_target,
         prompt_reports_unavailable,
