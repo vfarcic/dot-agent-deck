@@ -52,11 +52,19 @@ pub struct KnownEffect {
     /// `<field><pane>`; the pane must be the tell's
     /// [`subject_pane`](crate::report::Tell::subject_pane).
     pub pane_field: &'static str,
-    /// Where the daemon writes the signature and the pane field, as
-    /// `(source file, text in it)` — one pin per piece, so a reworded refusal
-    /// fails `every_known_effect_is_pinned_to_the_source` rather than quietly
-    /// turning a declared break back into a FAIL. A message split across source
-    /// lines is matched with its continuation escapes joined.
+    /// The one log call that writes the refusal, as `(source file, texts)`:
+    /// every text must appear inside the SAME `warn!(…);` call there — its
+    /// message and each field the signature and pane field read — so renaming
+    /// a field in that call fails `every_known_effect_is_pinned_to_the_source`
+    /// even while another log call still spells it the old way. A message split
+    /// across source lines is matched with its continuation escapes joined.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the source-pin guard test only")
+    )]
+    pub log_site: (&'static str, &'static [&'static str]),
+    /// Pins outside that call — where a field's value comes from — as
+    /// `(source file, text in it)`.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "read by the source-pin guard test only")
@@ -78,19 +86,19 @@ pub const KNOWN_EFFECTS: &[KnownEffect] = &[KnownEffect {
         "reason=\"missing_token\"",
     ],
     pane_field: "claimed_pane=",
-    source_pins: &[
-        (
-            "src/daemon.rs",
+    log_site: (
+        "src/daemon.rs",
+        &[
             "hook socket: refused a status event whose hook capability token",
-        ),
-        ("src/daemon.rs", "verb = \"agent_event\","),
-        ("src/daemon.rs", "reason = refusal.code(),"),
-        (
-            "src/hook_provenance.rs",
-            "Refusal::Missing => \"missing_token\",",
-        ),
-        ("src/daemon.rs", "claimed_pane = %escape_id_for_log("),
-    ],
+            "verb = \"agent_event\",",
+            "claimed_pane = %escape_id_for_log(",
+            "reason = refusal.code(),",
+        ],
+    ),
+    source_pins: &[(
+        "src/hook_provenance.rs",
+        "Refusal::Missing => \"missing_token\",",
+    )],
     why: "a daemon declaring it refuses a status report from a deck-spawned pane that carries \
           no hook capability token, and a CLI from a build that does not declare it sends \
           `agent-event` without one",
@@ -488,6 +496,31 @@ mod tests {
         out
     }
 
+    /// Whether one `<open>…);` call in `src` contains every text — so a field
+    /// that some OTHER call also spells does not satisfy the pin.
+    fn one_call_contains(src: &str, open: &str, texts: &[&str]) -> bool {
+        src.match_indices(open).any(|(i, _)| {
+            let call = &src[i..];
+            let call = &call[..call.find(");").unwrap_or(call.len())];
+            texts.iter().all(|t| call.contains(t))
+        })
+    }
+
+    #[test]
+    fn a_pin_spread_across_two_log_calls_does_not_hold() {
+        let src = "warn!(verb = \"agent_event\", \"refused a status event\");\n\
+                   warn!(claimed_pane = %escape_id_for_log(p), reason = refusal.code(), \"other\");";
+        let site = [
+            "refused a status event",
+            "verb = \"agent_event\",",
+            "claimed_pane = %escape_id_for_log(",
+        ];
+        assert!(!one_call_contains(src, "warn!(", &site));
+        let joined_call = "warn!(verb = \"agent_event\", claimed_pane = %escape_id_for_log(p), \
+                           \"refused a status event\");";
+        assert!(one_call_contains(joined_call, "warn!(", &site));
+    }
+
     /// Every known effect names an entry `CONTRACT_BREAKS` really carries and
     /// a tell the scenario records, and every one of its source pins is text
     /// the daemon's source really contains, so a renamed break or reworded
@@ -521,9 +554,16 @@ mod tests {
                 "`{}` names an unknown tell",
                 effect.id
             );
+            let (site_file, site) = effect.log_site;
             assert!(
-                effect.source_pins.len() > effect.log_signature.len(),
-                "`{}` pins fewer places than it has signature pieces and a pane field",
+                site.len() > effect.log_signature.len(),
+                "`{}` pins fewer texts in its log call than it has signature pieces and a \
+                 pane field",
+                effect.id
+            );
+            assert!(
+                one_call_contains(&source(site_file), "warn!(", site),
+                "`{}`: no single `warn!(…);` call in {site_file} contains all of {site:?}",
                 effect.id
             );
             for (file, text) in effect.source_pins {
