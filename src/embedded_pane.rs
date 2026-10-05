@@ -627,6 +627,69 @@ pub struct EmbeddedPaneController {
     any_scroll_notice_armed: Arc<AtomicBool>,
 }
 
+/// Issue #1540 — what the attached daemon said about the New agent form's
+/// last command: who keeps it, and the daemon's value when the daemon does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLastCommand {
+    pub keeper: crate::daemon_client::LastCommandKeeper,
+    /// `None` when the client keeps the value, or the daemon has none yet.
+    pub command: Option<String>,
+}
+
+/// Issue #1540 — the New agent form's view of its deck's remembered command,
+/// from [`EmbeddedPaneController::last_command_reader`].
+#[derive(Clone)]
+pub struct LastCommandReader {
+    client: DaemonClient,
+    runtime: tokio::runtime::Handle,
+}
+
+impl LastCommandReader {
+    /// Ask the daemon, blocking the calling (TUI) thread for at most
+    /// `timeout`. `None` when it does not answer in time or at all, which the
+    /// form treats exactly like a daemon that does not keep the value.
+    pub fn read(&self, timeout: Duration) -> Option<DaemonLastCommand> {
+        use crate::daemon_client::{GatedQuery, LastCommandKeeper};
+        let client = self.client.clone();
+        self.runtime.block_on(async move {
+            tokio::time::timeout(timeout, async move {
+                let keeper = client.last_command_keeper().await.ok()?;
+                let command = match keeper {
+                    LastCommandKeeper::Client => None,
+                    LastCommandKeeper::Daemon => match client.new_agent_options().await.ok()? {
+                        GatedQuery::Answered(options) => options.last_command,
+                        GatedQuery::Unsupported => {
+                            return Some(DaemonLastCommand {
+                                keeper: LastCommandKeeper::Client,
+                                command: None,
+                            });
+                        }
+                    },
+                };
+                Some(DaemonLastCommand { keeper, command })
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+    }
+
+    /// Offer `command` as the deck's last command if it has none yet
+    /// ([`DaemonClient::seed_last_command`]), without waiting: it runs on the
+    /// runtime, bounded by `timeout`, and a failure only means the value is
+    /// offered again next time.
+    pub fn seed(&self, command: String, timeout: Duration) {
+        let client = self.client.clone();
+        self.runtime.spawn(async move {
+            if let Ok(Err(e)) =
+                tokio::time::timeout(timeout, client.seed_last_command(&command)).await
+            {
+                tracing::debug!(error = %e, "seed-last-command failed");
+            }
+        });
+    }
+}
+
 impl EmbeddedPaneController {
     /// Build a controller whose panes are stream-backed against the daemon
     /// at `socket_path`. Caller is responsible for ensuring the daemon is
@@ -643,6 +706,16 @@ impl EmbeddedPaneController {
             stream_rejections: Arc::new(Mutex::new(Vec::new())),
             close_warnings: Arc::new(Mutex::new(Vec::new())),
             any_scroll_notice_armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Issue #1540: a handle the New agent form reads its pre-fill through —
+    /// on this controller's own client, so it asks the very daemon the TUI is
+    /// attached to, local or remote.
+    pub fn last_command_reader(&self) -> LastCommandReader {
+        LastCommandReader {
+            client: self.client.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -1230,6 +1303,10 @@ impl EmbeddedPaneController {
         // PRD #201: seed/prompt to stash daemon-side for native pull (Pi
         // orchestrator panes only); `None` keeps the unchanged inject path.
         seed: Option<String>,
+        // Issue #1540: a New agent form submit — start it through
+        // `DaemonClient::start_form_agent`, so a deck that keeps the last
+        // command records it once it has accepted the start.
+        remember_command: bool,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so daemon-spawned agents see
         // DOT_AGENT_DECK_PANE_ID and can emit hook events back to this
@@ -1290,11 +1367,17 @@ impl EmbeddedPaneController {
             .block_on(async move {
                 use crate::daemon_client::ClientError;
 
-                let id = match tokio::time::timeout(
-                    CREATE_PANE_START_TIMEOUT,
-                    client_for_calls.start_agent(opts),
-                )
-                .await
+                let start = async {
+                    if remember_command {
+                        client_for_calls
+                            .start_form_agent(opts)
+                            .await
+                            .map(|form| form.agent_id)
+                    } else {
+                        client_for_calls.start_agent(opts).await
+                    }
+                };
+                let id = match tokio::time::timeout(CREATE_PANE_START_TIMEOUT, start).await
                 {
                     Ok(Ok(id)) => id,
                     Ok(Err(e)) => return Err(e),
@@ -3712,6 +3795,7 @@ impl PaneController for EmbeddedPaneController {
             opts.rows,
             opts.cols,
             opts.seed,
+            opts.remember_command,
         );
         result.map(|id| (id, resolved))
     }

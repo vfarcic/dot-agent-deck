@@ -4,13 +4,13 @@ This page describes how changes reach `main`, who may approve them, and — beca
 
 ## The model
 
-`main` is protected by a repository ruleset named `main-protected`. Every change lands through a pull request with at least one approving review. A maintainer's own pull request is reviewed by another maintainer. The repository owner retains ownership and can override anything, either by holding the `admin` bypass or by disabling the ruleset outright.
+`main` is protected by a repository ruleset named `main-protected`. A change written by hand must reach `main` through a pull request with at least one approving review from an actor other than its author. That actor is normally the agent reviewer, `dot-agent-deck-reviewer[bot]` (see [The automated reviewer](#the-automated-reviewer)), and can be the other maintainer. Two automated lanes reach `main` with no approval: three CI workflows push to it directly under the admin bypass (next paragraph), and Renovate merges its automerge groups under a `pull_request`-mode bypass (see [Renovate and automerge](#renovate-and-automerge)). The repository owner retains ownership and can override anything, either by holding the `admin` bypass or by disabling the ruleset outright.
 
 Two properties of that arrangement are worth stating plainly rather than discovering later.
 
 **The admin bypass is what keeps releases alive, and it also softens the rule for the owner.** CI pushes to `main` directly — three commits per release since issue #1089, two before it — so *something* has to be allowed past the gate. Granting the bypass to the `admin` repository role covers CI's PAT and, unavoidably, covers the owner's own hands at the same time. Enforcement against the owner is therefore a matter of habit, not of mechanism. The stricter arrangement — no admin bypass, with a GitHub App token as the sole bypass actor — is available and is described under [Making the gate bind the owner too](#making-the-gate-bind-the-owner-too).
 
-**A gate needs two maintainers before it means anything.** Nobody can approve their own pull request. With a single collaborator, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below is sequenced around that fact.
+**A gate needs a second approving actor before it means anything.** Nobody can approve their own pull request. With a single collaborator and no other reviewer, "requires one approving review" means every pull request that person opens is unmergeable without a bypass, so every merge becomes a bypass and the rule decays into ceremony within a week. The rollout below was sequenced around that fact by onboarding a second maintainer first (step 3); the agent reviewer, added later by #966, is now what casts the routine approval.
 
 ## Who counts as a maintainer
 
@@ -133,7 +133,7 @@ The `required_review_thread_resolution` rule used to be no problem here in pract
 
 ## What is gated
 
-Everything that lands on `main`, uniformly: one approving review from a maintainer, all review threads resolved, no deletion, no force-push. There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
+A pull request into `main` needs one approving review from an actor other than its author (normally the agent reviewer — see [The model](#the-model)), all review threads resolved, and the five required checks `build`, `build-macos`, `build-windows`, `security` and `e2e-deterministic` passed. The ruleset also refuses deleting `main` and force-pushing to it. The two automated lanes in [The model](#the-model) get past these rules: the admin bypass, which the release workflows push under, is exempt from all of them, and Renovate's `pull_request`-mode bypass skips the approval and the checks (#510 under [Rollout](#rollout)). There is no path scoping — see [Who counts as a maintainer](#who-counts-as-a-maintainer) for why, and for the round-trip-on-a-typo cost that comes with it.
 
 The requirement that review threads resolve before merge is doing specific work. Greptile reviews every pull request **once, when it opens** — `greptile.json` sets `triggerOnUpdates: false`, so it does not re-review after you push fixes — while Qodo re-reviews on **every push** (`.pr_agent.toml`), so a fix push can bring new findings of its own. Either way, the findings that need an answer live in the inline comments rather than in a check-run or a summary: a green check has accompanied real P1 defects here before. See [The automated reviewer](#the-automated-reviewer). Thread resolution is what turns "read the inline comments" from a habit into something the merge button enforces.
 

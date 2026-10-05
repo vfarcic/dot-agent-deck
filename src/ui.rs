@@ -92,6 +92,7 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
+    Minimal,  // 3 rows: Dir only, used only when Compact cannot fit every card (issue #1568)
     Compact,  // 5 rows: 1 prompt, 1 tool
     Normal,   // 8 rows: 1 prompt, 3 tools
     Spacious, // 10 rows: 3 prompts, 3 tools
@@ -100,10 +101,11 @@ enum CardDensity {
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
+    ///   Dir (1) + prompts + [Normal/Spacious: blank separator] + tools, plus 2
     ///   rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    /// Resulting heights: Minimal 3, Compact 5, Normal 8, Spacious 10. Minimal
+    /// has no prompt or tool rows at all, so its one inner row is `Dir:`.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -116,32 +118,40 @@ impl CardDensity {
     fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
-        let separator = if matches!(self, CardDensity::Compact) {
-            0
-        } else {
-            1
-        };
+        let separator = u16::from(self.has_separator());
         (1 + prompts + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
             CardDensity::Compact => 1,
-            _ => 3,
+            CardDensity::Normal | CardDensity::Spacious => 3,
         }
     }
 
     fn max_prompts(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
+            CardDensity::Compact | CardDensity::Normal => 1,
             CardDensity::Spacious => 3,
-            _ => 1,
         }
+    }
+
+    /// Whether the card draws a blank row between its prompts and its tools.
+    fn has_separator(self) -> bool {
+        matches!(self, CardDensity::Normal | CardDensity::Spacious)
     }
 }
 
 /// The richest density that renders `total_cards` cards in `cols` columns
-/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// within `available_height` rows, or `None` when not even [`CardDensity::Minimal`]
 /// fits them all.
+///
+/// Minimal is the last tier, but this function alone does not decide when it is
+/// used: [`choose_grid_layout`] takes Minimal only once Compact has failed at
+/// every column count, so a deck that fits at Compact anywhere keeps the layout
+/// it had before Minimal existed (issue #1568).
 ///
 /// The `None` is the whole point (issue #588). The predecessor of this function
 /// — `choose_density` — returned `Compact` both when Compact fit and when
@@ -155,6 +165,7 @@ fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Op
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
+        CardDensity::Minimal,
     ]
     .into_iter()
     .find(|density| {
@@ -242,6 +253,13 @@ struct GridLayout {
 ///   columns with smaller cards") the way it suggests: prompt and tool lines are
 ///   the card's actual content, horizontal space is the cheaper sacrifice.
 ///
+/// Issue #1568 adds a second pass: only when no column count fits every card at
+/// Compact or richer does the search run again accepting the 3-row
+/// [`CardDensity::Minimal`] card, so Minimal replaces scrolling and never
+/// replaces Compact. Taking Minimal in the first pass would have changed decks
+/// that fit today: seven cards in 25 rows at 90 columns get two columns of
+/// Compact cards, and would instead have got one column of Minimal ones.
+///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
 /// every card is a real cost, paid here only for completeness; if completeness
@@ -254,9 +272,13 @@ fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> 
     // column it has today.
     let max_cols = max_columns_for_width(width).max(preferred_cols);
 
-    for cols in preferred_cols..=max_cols {
-        if let Some(density) = fitting_density(total_cards, cols, available_height) {
-            return GridLayout { cols, density };
+    for accept_minimal in [false, true] {
+        for cols in preferred_cols..=max_cols {
+            match fitting_density(total_cards, cols, available_height) {
+                Some(CardDensity::Minimal) if !accept_minimal => {}
+                Some(density) => return GridLayout { cols, density },
+                None => {}
+            }
         }
     }
 
@@ -2027,7 +2049,8 @@ struct PromptDelivery {
     /// observed to have a producer that can report a submitted prompt. Sticky
     /// once true — a `SessionEnd` must not disarm a delivery mid-flight — and it
     /// is what gates RE-SUBMISSION, so a slow launcher arms late and a Pi pane
-    /// never arms at all.
+    /// arms only once its extension declares that it reports every prompt
+    /// (issue #1567) — never, for an extension from an older deck.
     can_report_prompts: bool,
 }
 
@@ -2559,6 +2582,10 @@ struct UiState {
     /// those never overwrite the recorded value. Always (re)set right before each
     /// `Action::SpawnPane` dispatch, so a failed spawn never leaks a stale value.
     pending_last_command: Option<String>,
+    /// Issue #1540 — reads the attached daemon's remembered command for the
+    /// `Ctrl+n` form's pre-fill. `None` without a daemon-backed controller
+    /// (tests), and the form then seeds from [`Self::last_command`] as before.
+    last_command_reader: Option<crate::embedded_pane::LastCommandReader>,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -2709,6 +2736,7 @@ impl UiState {
             // the event loop; defaults to None so a fresh install seeds blank.
             last_command: None,
             pending_last_command: None,
+            last_command_reader: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -3010,21 +3038,86 @@ fn dashboard_restore_pane_dims(
     )
 }
 
+/// Order an orchestration tab's cards by role config order (`role_pane_ids`),
+/// not by creation order, so a recreated pane (a `clear = true` respawn, which
+/// gets a new, newer daemon agent id) keeps its original card position. The
+/// sort is stable, so cards sharing a position keep [`filter_sessions`]'s
+/// creation order.
+fn sort_by_role_order(sessions: &mut [(&String, &SessionState)], role_pane_ids: &[String]) {
+    sessions.sort_by_key(|(_, s)| {
+        s.pane_id
+            .as_ref()
+            .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
+            .unwrap_or(usize::MAX)
+    });
+}
+
+/// The dashboard's creation-order sort key for one session (issue #1507).
+///
+/// First the daemon's agent id, compared as a number. The daemon mints it from
+/// a monotonic counter for every spawn, whatever started it (the TUI, the
+/// desktop app, `dispatch`, a schedule, an orchestration), and sorts its own
+/// `ListAgents` reply by it, which is the order the desktop app renders its
+/// tiles in. The pane id cannot serve: only a TUI-created pane's is numeric,
+/// and every daemon-minted one (`desktop-<nonce>-<n>`, `sched-…-<n>`) used to
+/// tie and fall back to `HashMap` order.
+///
+/// The id comes from the session's own `agent_id` when it has one (a hydrated
+/// card, or any card whose agent has sent a hook), else from the id the
+/// daemon's card-surfacing `SessionStart` named for its pane
+/// ([`AppState::pane_surfaced_agent_seq`]) — a live-surfaced card before its
+/// agent's first hook, or a pane that never sends one.
+///
+/// Sessions with neither (a hook from outside any pane, a legacy hook script,
+/// a card surfaced by a daemon too old to name the id) come after every agent
+/// that has one, ordered as before: by numeric pane id, paned before paneless,
+/// then start time. The pane id and session id as strings close the key, so
+/// equal keys cannot occur and the order never depends on the map's iteration
+/// order.
+#[allow(clippy::type_complexity)]
+fn creation_order_key<'a>(
+    state: &AppState,
+    session_id: &'a str,
+    session: &'a SessionState,
+) -> (
+    (bool, u64),
+    bool,
+    (bool, u64),
+    DateTime<Utc>,
+    &'a str,
+    &'a str,
+) {
+    // `(is_none, value)`: a present number sorts by value, ahead of every
+    // absent one (a bare `Option` would put `None` first).
+    fn last_if_absent(n: Option<u64>) -> (bool, u64) {
+        match n {
+            Some(n) => (false, n),
+            None => (true, 0),
+        }
+    }
+    fn numeric(id: Option<&str>) -> Option<u64> {
+        id.and_then(|id| id.parse::<u64>().ok())
+    }
+    let agent_seq = numeric(session.agent_id.as_deref()).or_else(|| {
+        session
+            .pane_id
+            .as_deref()
+            .and_then(|pane| state.pane_surfaced_agent_seq(pane))
+    });
+    (
+        last_if_absent(agent_seq),
+        session.pane_id.is_none(),
+        last_if_absent(numeric(session.pane_id.as_deref())),
+        session.started_at,
+        session.pane_id.as_deref().unwrap_or(""),
+        session_id,
+    )
+}
+
 fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'a SessionState)> {
     let mut sessions: Vec<(&String, &SessionState)> = state.sessions.iter().collect();
-    sessions.sort_by(|(_, a), (_, b)| {
-        // Sort by pane ID (numeric creation order) when available,
-        // falling back to started_at for sessions without a pane.
-        match (&a.pane_id, &b.pane_id) {
-            (Some(pa), Some(pb)) => {
-                let na = pa.parse::<u64>().unwrap_or(u64::MAX);
-                let nb = pb.parse::<u64>().unwrap_or(u64::MAX);
-                na.cmp(&nb)
-            }
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.started_at.cmp(&b.started_at),
-        }
+    sessions.sort_by(|(a_id, a), (b_id, b)| {
+        creation_order_key(state, a_id, a).cmp(&creation_order_key(state, b_id, b))
     });
 
     if ui.filter_text.is_empty() {
@@ -4395,8 +4488,9 @@ fn apply_seed_send_outcome(
                 log_prompt_probe_submitted("seed", pane_id, delivery_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report
-                // a submitted prompt (Pi). Retrying could never be
+                // A recognized producer that cannot report a submitted
+                // prompt (a Pi extension declaring nothing, a wrapped Codex
+                // whose prompt hook is untrusted). Retrying could never be
                 // confirmed — only retyped — so the write is final.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
@@ -5802,9 +5896,10 @@ fn apply_orchestrator_send_outcome(
                 log_prompt_probe_submitted("orchestrator", start_pane_id, logged_id, attempt);
             }
             match capability {
-                // A recognized producer that structurally cannot report a
-                // submitted prompt (Pi). Retrying could never be confirmed —
-                // only retyped — so the write is final and the role finalizes.
+                // A recognized producer that cannot report a submitted prompt
+                // (a Pi extension declaring nothing, a wrapped Codex whose
+                // prompt hook is untrusted). Retrying could never be confirmed
+                // — only retyped — so the write is final and the role finalizes.
                 ConfirmationCapability::CannotReport => {
                     log_prompt_unconfirmable(
                         "orchestrator",
@@ -9876,10 +9971,11 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // PRD #196: seed via the fallback chain — explicit `default_command`
-            // (unchanged precedence) → recorded `last_command` → blank.
-            let command =
-                resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
+            // PRD #196 / issue #1540: seed via the fallback chain — explicit
+            // `default_command` (unchanged precedence) → the deck's last command
+            // (the daemon's, or this TUI's own against a daemon that keeps none)
+            // → blank.
+            let command = form_seed_command(ui);
             let orchestrations = match load_project_config(&dir) {
                 Ok(Some(config)) => {
                     if config.legacy_modes_declared {
@@ -9924,6 +10020,76 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
     ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// Issue #1540: the `Ctrl+n` form's Command pre-fill, read from the attached
+/// daemon when it keeps the deck's last command. Skips the daemon entirely when
+/// `default_command` is set, since that wins anyway. A daemon that keeps the
+/// value but has none yet is offered this TUI's own (`session.toml`) value —
+/// the migration, retried here so a daemon restarted since startup gets it too.
+/// A daemon that does not answer within [`FORM_SEED_TIMEOUT`] is treated like
+/// one that keeps nothing: the form opens on this TUI's own value.
+fn form_seed_command(ui: &UiState) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    let session = ui.last_command.as_deref();
+    let daemon = if ui.config.default_command.is_empty() {
+        ui.last_command_reader
+            .as_ref()
+            .and_then(|reader| reader.read(FORM_SEED_TIMEOUT))
+    } else {
+        None
+    };
+    let (keeper, daemon_command) = match &daemon {
+        Some(answer) => (answer.keeper, answer.command.as_deref()),
+        None => (LastCommandKeeper::Client, None),
+    };
+    if keeper == LastCommandKeeper::Daemon
+        && daemon_command.is_none_or(|c| c.trim().is_empty())
+        && let (Some(reader), Some(command)) = (
+            ui.last_command_reader.as_ref(),
+            session.filter(|c| !c.trim().is_empty()),
+        )
+    {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
+    resolve_form_seed_command(&ui.config.default_command, daemon_command, keeper, session)
+}
+
+/// Issue #1540: the budget for reading the daemon's last command when the
+/// `Ctrl+n` form opens. The same 500ms as [`CLOSE_PREVIEW_TIMEOUT`], the other
+/// interactive key path that waits on the daemon for what it shows, and larger
+/// than [`DAEMON_HINT_TIMEOUT`] because the answer is what the form shows rather
+/// than a hint beside it, so giving up early on a busy daemon would visibly show
+/// the wrong command. Still bounded, because the key press waits on it, and it
+/// fails open to this TUI's own value.
+const FORM_SEED_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Issue #1540: [`resolve_seed_command`] with the deck's last command chosen by
+/// who keeps it. A [`LastCommandKeeper::Daemon`] deck offers the daemon's value,
+/// and this TUI's own (`session`) only while the daemon has none — the value the
+/// migration is handing over. A [`LastCommandKeeper::Client`] deck (an older
+/// daemon) offers only this TUI's own, as before. Blank values are skipped;
+/// the chosen one is used verbatim.
+///
+/// [`LastCommandKeeper::Daemon`]: crate::daemon_client::LastCommandKeeper::Daemon
+/// [`LastCommandKeeper::Client`]: crate::daemon_client::LastCommandKeeper::Client
+fn resolve_form_seed_command(
+    default_command: &str,
+    daemon_last_command: Option<&str>,
+    keeper: crate::daemon_client::LastCommandKeeper,
+    session_last_command: Option<&str>,
+) -> String {
+    use crate::daemon_client::LastCommandKeeper;
+    fn nonblank(value: Option<&str>) -> Option<&str> {
+        value.filter(|s| !s.trim().is_empty())
+    }
+    let last = match keeper {
+        LastCommandKeeper::Daemon => {
+            nonblank(daemon_last_command).or(nonblank(session_last_command))
+        }
+        LastCommandKeeper::Client => nonblank(session_last_command),
+    };
+    resolve_seed_command(default_command, last)
 }
 
 /// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
@@ -11821,6 +11987,10 @@ fn dispatch_action(
                             // PRD #201: single-pane spawn, not a Pi
                             // orchestrator — no native seed.
                             seed: None,
+                            // Issue #1540: this IS a New agent form submit,
+                            // so a deck that keeps the last command records
+                            // it once it has accepted the start.
+                            remember_command: true,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -13234,6 +13404,20 @@ pub fn run_tui(
     // has to win over whichever landing tab they chose.
     let restored_session = config::SavedSession::load();
     ui.last_command = restored_session.last_command;
+    // Issue #1540: the form's pre-fill comes from the attached daemon when it
+    // keeps the deck's last command. Hand it the value this TUI kept before the
+    // daemon did; the daemon takes it only if it has none, so a newer command
+    // another client recorded is never overwritten.
+    ui.last_command_reader = pane
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>()
+        .map(EmbeddedPaneController::last_command_reader);
+    if let (Some(reader), Some(command)) = (
+        ui.last_command_reader.as_ref(),
+        ui.last_command.as_deref().filter(|c| !c.trim().is_empty()),
+    ) {
+        reader.seed(command.to_string(), DAEMON_REQUEST_TIMEOUT);
+    }
     let saved_focus = restored_session.focus;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
@@ -13884,6 +14068,8 @@ pub fn run_tui(
                     agent_type: agent_type.clone(),
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
+                    // Issue #1540: a restore is not a form submit.
+                    remember_command: false,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -14120,14 +14306,7 @@ pub fn run_tui(
                             .is_some_and(|pid| role_pane_ids.contains(pid))
                     })
                     .collect();
-                // Sort by role config order, not numeric pane ID, so recreated
-                // panes (clear=true) keep their original card position.
-                orch_filtered.sort_by_key(|(_, s)| {
-                    s.pane_id
-                        .as_ref()
-                        .and_then(|pid| role_pane_ids.iter().position(|p| p == pid))
-                        .unwrap_or(usize::MAX)
-                });
+                sort_by_role_order(&mut orch_filtered, role_pane_ids);
                 orch_filtered
             }
         };
@@ -20956,9 +21135,9 @@ fn render_session_card(
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
-    // survives every density, and ahead of the prompt/tool rows because it is
-    // the fact that explains why those rows keep advancing while the run has in
-    // fact stalled.
+    // survives every density (at Minimal it takes `Dir:`'s place), and ahead
+    // of the prompt/tool rows because it is the fact that explains why those
+    // rows keep advancing while the run has in fact stalled.
     if is_orphaned {
         status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis("Orphaned — delegation unavailable", w),
@@ -21005,7 +21184,9 @@ fn render_session_card(
         )));
     }
 
-    let prompts = if is_placeholder {
+    let prompts = if density.max_prompts() == 0 {
+        Vec::new()
+    } else if is_placeholder {
         vec!["Launch an agent to get started".to_string()]
     } else {
         collect_recent_prompts(session, density.max_prompts())
@@ -21017,7 +21198,7 @@ fn render_session_card(
         inner.height as usize,
         status_lines.len(),
         prompts.len(),
-        density != CardDensity::Compact,
+        density.has_separator(),
         tool_lines.len(),
     );
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -21069,6 +21250,12 @@ struct CardRowPlan {
 /// tool history are never shed here; the tool rows are what the card is for, and
 /// the status row is why the card needs attention. A card with no status row at
 /// its own density's height already fits, so its layout is unchanged.
+///
+/// At [`CardDensity::Minimal`] the budget is one row and there are no prompts or
+/// tools to shed, so a status row takes `Dir:`'s place outright (issue #1568):
+/// being Blocked or orphaned matters more than the directory. A card that is
+/// both shows the `Orphaned` row, the first status row; its title still carries
+/// the `orphaned` marker and the `Blocked` badge.
 fn fit_card_rows(
     budget: usize,
     status_rows: usize,
@@ -21233,6 +21420,7 @@ fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardDensityKind {
+    Minimal,
     Compact,
     Normal,
     Spacious,
@@ -21241,6 +21429,7 @@ pub enum CardDensityKind {
 impl From<CardDensityKind> for CardDensity {
     fn from(kind: CardDensityKind) -> Self {
         match kind {
+            CardDensityKind::Minimal => CardDensity::Minimal,
             CardDensityKind::Compact => CardDensity::Compact,
             CardDensityKind::Normal => CardDensity::Normal,
             CardDensityKind::Spacious => CardDensity::Spacious,
@@ -21863,8 +22052,9 @@ pub fn render_orchestration_frame_to_buffer(
     let role_names = &role_names[..role_names.len().min(RENDER_SEAM_ROLES_MAX)];
     let focused_role_index = focused_role_index.min(role_names.len() - 1);
 
-    // Numeric pane ids so `filter_sessions`' pane-id sort reproduces role order
-    // and the rendered card column is deterministic.
+    // Numeric pane ids so `filter_sessions`' pane-id fallback (these sessions
+    // carry no daemon agent id) reproduces role order and the rendered card
+    // column is deterministic.
     let pane_ids: Vec<String> = (0..role_names.len()).map(|i| i.to_string()).collect();
 
     // One inert pane per role, the focused one focused. The seed geometry is a
@@ -21918,6 +22108,7 @@ pub fn render_orchestration_frame_to_buffer(
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         // Two different maps: the sidebar card reads `display_names` (keyed by
@@ -22711,6 +22902,7 @@ pub fn observe_dashboard_geometry(width: u16, height: u16, card_count: usize) ->
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
     }
@@ -24108,6 +24300,136 @@ mod tests {
         );
     }
 
+    /// Assert on the Command row drawn by the production form renderer.
+    fn assert_form_command_seed(command: String, expected: &str) {
+        let form = NewPaneFormState::new(
+            PathBuf::from("/fixture"),
+            "seed-check".to_string(),
+            command,
+            vec![],
+        );
+        let grid = buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+            render_new_pane_form(frame, &form);
+        }));
+        let row = grid
+            .lines()
+            .find(|row| row.contains("Command:"))
+            .expect("the New Agent form must render its Command row");
+        let actual = row
+            .split_once("Command:")
+            .expect("Command label")
+            .1
+            .split('\u{2502}')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        assert_eq!(
+            actual, expected,
+            "New Agent Command pre-fill.\nGrid:\n{grid}"
+        );
+    }
+
+    /// Scenario: Open a New Agent form with different configured, daemon and
+    /// session commands. The rendered Command row prefers the configured default,
+    /// then the daemon's remembered command, then blank when neither has a value.
+    #[test]
+    fn resolve_form_seed_command_daemon_precedence() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                Some("daemon-command"),
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("configured-command", None, None, "configured-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "daemon-command",
+            ),
+            ("", Some("daemon-command"), None, "daemon-command"),
+            ("", None, None, ""),
+            ("", Some(""), None, ""),
+            ("", Some("   "), None, ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form against an older daemon that leaves the
+    /// client in charge of remembering commands. Its rendered Command row keeps
+    /// using the session value below the configured default and ignores daemon values.
+    #[test]
+    fn resolve_form_seed_command_older_daemon_session_fallback() {
+        use crate::daemon_client::LastCommandKeeper::Client;
+
+        for (default, daemon, session, expected) in [
+            (
+                "configured-command",
+                None,
+                Some("session-command"),
+                "configured-command",
+            ),
+            ("", None, Some("session-command"), "session-command"),
+            (
+                "",
+                Some("daemon-command"),
+                Some("session-command"),
+                "session-command",
+            ),
+            ("", Some("daemon-command"), None, ""),
+            ("", None, None, ""),
+            ("", None, Some(""), ""),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Client, session),
+                expected,
+            );
+        }
+    }
+
+    /// Scenario: Open a New Agent form after connecting to a capable daemon
+    /// with no remembered command and a session that remembers one. The rendered
+    /// Command row shows the migration value, while an existing daemon value wins.
+    #[test]
+    fn resolve_form_seed_command_migration_prefills_form() {
+        use crate::daemon_client::LastCommandKeeper::Daemon;
+
+        for (default, daemon, session, expected) in [
+            (
+                "",
+                None,
+                Some("migrated-session-command"),
+                "migrated-session-command",
+            ),
+            (
+                "configured-command",
+                None,
+                Some("migrated-session-command"),
+                "configured-command",
+            ),
+            (
+                "",
+                Some("daemon-command"),
+                Some("migrated-session-command"),
+                "daemon-command",
+            ),
+            ("", None, Some("   "), ""),
+        ] {
+            assert_form_command_seed(
+                resolve_form_seed_command(default, daemon, Daemon, session),
+                expected,
+            );
+        }
+    }
+
     /// PRD #196: the record decision fires for ANY non-empty form-submitted
     /// command regardless of mode — a plain interactive spawn AND an authoring-mode
     /// form (schedule / issue-dispatch) both record — and only an empty/whitespace
@@ -24838,6 +25160,7 @@ mod tests {
                 orchestration_orphaned: false,
                 subagent_wait: None,
                 prompt_reports_unavailable: false,
+                prompt_reports_declared: false,
             },
         );
         state
@@ -28325,6 +28648,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -31119,6 +31443,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -31911,6 +32236,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         }
     }
 
@@ -32198,6 +32524,7 @@ mod tests {
     /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
+        assert_eq!(CardDensity::Minimal.card_height(), 3);
         assert_eq!(CardDensity::Compact.card_height(), 5);
         assert_eq!(CardDensity::Normal.card_height(), 8);
         assert_eq!(CardDensity::Spacious.card_height(), 10);
@@ -32214,7 +32541,7 @@ mod tests {
                 budget,
                 status,
                 d.max_prompts(),
-                d != CardDensity::Compact,
+                d.has_separator(),
                 d.max_tools(),
             )
         };
@@ -32232,6 +32559,55 @@ mod tests {
         assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
         assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
         assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
+        // Issue #1568: Minimal's one inner row is `Dir:`, and a status row
+        // takes its place.
+        assert_eq!(plan(CardDensity::Minimal, 0), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Minimal, 1), row(false, 0, false));
+    }
+
+    /// Issue #1568: Minimal is taken only when Compact fails at EVERY column
+    /// count the width allows, so it replaces scrolling and never Compact.
+    #[test]
+    fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
+        // 90 columns allows two card columns. 25 rows: one column of Compact
+        // misses (35) but two fit (20). One column of Minimal (21) would fit too,
+        // and must not be preferred over the layout this deck already had.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 79 columns holds one card column. 23 rows: Compact needs 35, Minimal 21.
+        assert_eq!(
+            choose_grid_layout(7, 79, 23),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 90 columns, 14 rows: Compact needs 20 even at two columns; Minimal needs
+        // 21 at one column and 12 at two, so the deck widens to stay complete.
+        assert_eq!(
+            choose_grid_layout(7, 90, 14),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 79 columns, 20 rows: not even Minimal fits (21), so the deck scrolls at
+        // Compact exactly as it did before Minimal existed.
+        assert_eq!(
+            choose_grid_layout(7, 79, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset
@@ -32293,6 +32669,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         // Spacious: get all 3
@@ -32332,6 +32709,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -32362,6 +32740,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -43561,6 +43940,395 @@ mod tests {
             dot-agent-deck — 0/2 agent(s)
             No agents match filter.
             "
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1507 — the dashboard lists agents in creation order, whatever
+    // produced the pane id. The key is the daemon's agent id, a monotonic
+    // counter the daemon mints for every spawn and sorts its own `ListAgents`
+    // reply by, so the TUI and the desktop app agree on the order.
+    // -----------------------------------------------------------------------
+
+    /// Draw one full dashboard frame for `state` / `ui` into a `width` x
+    /// `height` `TestBackend` and return every row, right-trimmed.
+    fn order_frame_rows(
+        state: &AppState,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let filtered = filter_sessions(state, ui);
+        terminal
+            .draw(|frame| {
+                let noop = crate::embedded_pane::EmbeddedPaneController::for_render_only_tests();
+                let tab_view = ActiveTabView::Dashboard {
+                    exclude_pane_ids: vec![],
+                    zoomed: false,
+                };
+                let tab_bar = TabBarInfo {
+                    show: false,
+                    labels: vec!["Dashboard".into()],
+                    active_index: 0,
+                    orchestration_statuses: vec![],
+                };
+                let layout = compute_frame_layout(
+                    frame.area(),
+                    &tab_view,
+                    &tab_bar,
+                    &[],
+                    PaneLayout::Stacked,
+                    None,
+                    1,
+                );
+                render_frame(
+                    frame,
+                    state,
+                    ui,
+                    &filtered,
+                    0,
+                    false,
+                    &noop,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                )
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Seed one daemon agent the way the TUI's startup hydration does
+    /// (`seed_hydrated_session` with the daemon's agent id), and name its card.
+    fn order_seed_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+    ) {
+        state.register_pane(pane_id.to_string());
+        state.seed_hydrated_session(
+            pane_id.to_string(),
+            Some("/home/dev/dot-agent-deck".to_string()),
+            Some(AgentType::ClaudeCode),
+            Some(agent_id.to_string()),
+            None,
+        );
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the hydrated agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// The names in `expected`, in the top-to-bottom order the frame draws
+    /// their cards. Each name is matched on a card title row, so a name that
+    /// is missing from the frame fails loudly rather than being skipped.
+    fn order_drawn_names<'a>(rows: &[String], expected: &[&'a str]) -> Vec<&'a str> {
+        let mut found: Vec<(usize, &str)> = expected
+            .iter()
+            .map(|name| {
+                let row = rows
+                    .iter()
+                    .position(|row| row.contains(&format!(" {name} ")))
+                    .unwrap_or_else(|| {
+                        panic!("`{name}` has no card in the frame:\n{}", rows.join("\n"))
+                    });
+                (row, *name)
+            })
+            .collect();
+        found.sort_by_key(|(row, _)| *row);
+        found.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Scenario: Start the TUI against a daemon that already runs a dispatcher
+    /// created from the desktop app (`desktop-…-0`) and eleven units started by
+    /// `dispatch` (`sched-dispatch-…-N`), none of which has a numeric pane id,
+    /// then draw the dashboard. The cards must read top to bottom in the order
+    /// the daemon created the agents — dispatcher first — as the desktop does.
+    #[spec("dashboard/order/001")]
+    #[test]
+    fn order_001_daemon_spawned_agents_are_listed_in_creation_order() {
+        // In creation order: the daemon minted agent ids 1..=12 for them in
+        // this sequence. Twelve agents, so the old code's `HashMap` order
+        // matches this one with odds of 1 in 12! — the failure it reproduces is
+        // deterministic in practice.
+        let agents: [(&str, &str); 12] = [
+            ("desktop-9ff5ffc73955d0fe-0", "dispatcher"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            (
+                "sched-dispatch-issue-1492-dashboard-voice-scroll-13",
+                "unit-1492",
+            ),
+            ("sched-dispatch-issue-1493-a-14", "unit-1493"),
+            ("sched-dispatch-issue-1494-b-15", "unit-1494"),
+            ("sched-dispatch-issue-1495-c-16", "unit-1495"),
+            ("sched-dispatch-issue-1496-d-17", "unit-1496"),
+            ("sched-dispatch-issue-1498-e-18", "unit-1498"),
+            ("sched-dispatch-issue-1499-f-19", "unit-1499"),
+            ("sched-dispatch-issue-1500-g-20", "unit-1500"),
+            ("sched-dispatch-issue-1501-h-21", "unit-1501"),
+            ("sched-dispatch-issue-1502-i-22", "unit-1502"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // The TUI learns of them newest first, so the stamps it gives them
+        // itself (`started_at`) run against creation order: only the daemon's
+        // agent id can put them right.
+        for (index, (pane_id, name)) in agents.iter().enumerate().rev() {
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 120);
+        let drawn = order_drawn_names(&rows, &names);
+        insta::assert_snapshot!(drawn.join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        unit-1493
+        unit-1494
+        unit-1495
+        unit-1496
+        unit-1498
+        unit-1499
+        unit-1500
+        unit-1501
+        unit-1502
+        ");
+
+        // Stable across renders: the order is a function of the agents, not of
+        // the map they sit in.
+        let again = order_frame_rows(&state, &mut ui, 60, 120);
+        assert_eq!(order_drawn_names(&again, &names), drawn);
+    }
+
+    /// Scenario: Start the TUI against a daemon running agents created from
+    /// the TUI (numeric pane ids `0`, `1`), from the desktop app and by
+    /// `dispatch`, interleaved in time, then draw the dashboard. The cards must
+    /// follow creation order across all three, not put every TUI-created pane
+    /// first.
+    #[spec("dashboard/order/002")]
+    #[test]
+    fn order_002_mixed_numeric_and_daemon_pane_ids_follow_creation_order() {
+        // Agent ids 1..=5 in this sequence. Before the fix the two numeric
+        // panes sorted first (`tui-two` jumped ahead of `desktop-one`), which is
+        // wrong for any `HashMap` order — this case fails deterministically.
+        let agents: [(&str, &str); 5] = [
+            ("0", "tui-one"),
+            ("desktop-9ff5ffc73955d0fe-0", "desktop-one"),
+            ("1", "tui-two"),
+            (
+                "sched-dispatch-issue-1491-voice-all-daemons-12",
+                "unit-1491",
+            ),
+            ("desktop-9ff5ffc73955d0fe-1", "desktop-two"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        // Learned in an order that is not creation order, as above.
+        for index in [4, 1, 3, 0, 2] {
+            let (pane_id, name) = agents[index];
+            order_seed_agent(&mut state, &mut ui, pane_id, &(index + 1).to_string(), name);
+        }
+        let names: Vec<&str> = agents.iter().map(|(_, name)| *name).collect();
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        tui-one
+        desktop-one
+        tui-two
+        unit-1491
+        desktop-two
+        ");
+
+        // Agent ids compare as numbers, as the daemon's own list does: agent
+        // `10` was created after agent `9`, though it sorts first as a string.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-1", "10", "tenth");
+        order_seed_agent(&mut state, &mut ui, "desktop-aa-0", "9", "ninth");
+        let rows = order_frame_rows(&state, &mut ui, 60, 40);
+        assert_eq!(
+            order_drawn_names(&rows, &["ninth", "tenth"]),
+            ["ninth", "tenth"]
+        );
+    }
+
+    /// Surface one dashboard agent to an attached TUI exactly as the daemon
+    /// does after an attach-socket start (`spawn::surface_attach_started_agent`,
+    /// the real producer), and apply what it broadcasts to `state`.
+    fn order_surface_live_agent(
+        state: &mut AppState,
+        ui: &mut UiState,
+        pane_id: &str,
+        agent_id: &str,
+        name: &str,
+        strip_surfaced_id: bool,
+    ) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let record = crate::agent_pty::AgentRecord {
+            id: agent_id.to_string(),
+            pane_id_env: Some(pane_id.to_string()),
+            display_name: Some(name.to_string()),
+            cwd: Some("/home/dev/dot-agent-deck".to_string()),
+            tab_membership: None,
+            agent_type: Some(AgentType::ClaudeCode),
+            rows: 24,
+            cols: 80,
+            live: None,
+            spawned_at_ms: None,
+            cli_name: None,
+            crashed: None,
+            orchestrator_context_path: None,
+            prompt_keys: None,
+        };
+        crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));
+        let crate::event::BroadcastMsg::Event(mut event) =
+            rx.try_recv().expect("the daemon surfaces the card")
+        else {
+            panic!("expected the card-surfacing SessionStart");
+        };
+        assert!(event.is_card_surface_session_start());
+        assert_eq!(event.agent_id, None, "the surface names no agent identity");
+        if strip_surfaced_id {
+            // What an older daemon sends: no surfaced id at all.
+            event
+                .metadata
+                .remove(crate::event::SURFACED_AGENT_ID_METADATA_KEY);
+        }
+        state.register_pane(pane_id.to_string());
+        state.apply_event(event);
+        let session_id = state
+            .sessions
+            .iter()
+            .find(|(_, s)| s.pane_id.as_deref() == Some(pane_id))
+            .map(|(id, _)| id.clone())
+            .expect("the surfaced agent has a card");
+        ui.display_names.insert(session_id, name.to_string());
+    }
+
+    /// Scenario: A TUI is attached to a daemon running a desktop-created
+    /// dispatcher, then `dispatch` starts two units the daemon surfaces to the
+    /// TUI live (neither has sent a hook yet), then the user creates a pane in
+    /// the TUI. The cards must read dispatcher, unit, unit, TUI pane — creation
+    /// order — not put the units last for lacking an agent id of their own.
+    #[spec("dashboard/order/004")]
+    #[test]
+    fn order_004_live_surfaced_agents_take_their_creation_position() {
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            false,
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1492-b-13",
+            "3",
+            "unit-1492",
+            false,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let names = ["dispatcher", "unit-1491", "unit-1492", "tui-pane"];
+
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        insta::assert_snapshot!(order_drawn_names(&rows, &names).join("\n"), @r"
+        dispatcher
+        unit-1491
+        unit-1492
+        tui-pane
+        ");
+
+        // Control: the same live card surfaced by a daemon too old to name the
+        // id has nothing to order by, so it falls back after every card that
+        // has one — the documented limit, not a regression.
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        order_seed_agent(
+            &mut state,
+            &mut ui,
+            "desktop-9ff5ffc73955d0fe-0",
+            "1",
+            "dispatcher",
+        );
+        order_surface_live_agent(
+            &mut state,
+            &mut ui,
+            "sched-dispatch-issue-1491-a-12",
+            "2",
+            "unit-1491",
+            true,
+        );
+        order_seed_agent(&mut state, &mut ui, "0", "4", "tui-pane");
+        let rows = order_frame_rows(&state, &mut ui, 60, 60);
+        assert_eq!(
+            order_drawn_names(&rows, &["dispatcher", "unit-1491", "tui-pane"]),
+            ["dispatcher", "tui-pane", "unit-1491"]
+        );
+    }
+
+    /// Scenario: An orchestration whose orchestrator was respawned in place
+    /// (`clear = true`), so it now carries the NEWEST daemon agent id of its
+    /// three roles, is scoped to its tab the way the deck's main loop does it.
+    /// Its cards must stay in role config order — orchestrator first — rather
+    /// than following creation order.
+    #[spec("dashboard/order/003")]
+    #[test]
+    fn order_003_orchestration_roles_keep_role_order() {
+        let roles = [
+            ("sched-orch-7-r0", "orchestrator", "9"),
+            ("sched-orch-7-r1", "coder", "4"),
+            ("sched-orch-7-r2", "reviewer", "5"),
+        ];
+        let mut state = AppState::default();
+        let mut ui = default_ui();
+        for (pane_id, name, agent_id) in roles {
+            order_seed_agent(&mut state, &mut ui, pane_id, agent_id, name);
+        }
+        let role_pane_ids: Vec<String> =
+            roles.iter().map(|(pane, _, _)| pane.to_string()).collect();
+
+        let mut scoped = filter_sessions(&state, &ui);
+        // Precondition: creation order alone would put the orchestrator last,
+        // so the role-order sort is what this test is measuring.
+        assert_eq!(
+            scoped.last().and_then(|(_, s)| s.pane_id.as_deref()),
+            Some("sched-orch-7-r0"),
+            "the respawned orchestrator is the newest agent"
+        );
+        sort_by_role_order(&mut scoped, &role_pane_ids);
+        let order: Vec<&str> = scoped
+            .iter()
+            .filter_map(|(_, s)| s.pane_id.as_deref())
+            .collect();
+        assert_eq!(
+            order,
+            ["sched-orch-7-r0", "sched-orch-7-r1", "sched-orch-7-r2"]
         );
     }
 

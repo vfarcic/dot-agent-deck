@@ -128,7 +128,7 @@ dot-agent-deck schedule update --name morning-digest --shape single
 dot-agent-deck schedule update --name morning-digest --shape ""   # back to config-derived
 ```
 
-If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
+If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, more than one orchestration with roles uses that name, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
 
 ## Reuse one tab or open a new one per run
 

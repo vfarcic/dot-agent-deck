@@ -28,17 +28,19 @@ pub use unix::{
     set_create_mode_owner_only_readable, set_endpoint_mode_owner_only, set_file_owner_only,
     verify_endpoint_trusted, with_socket_umask,
 };
-// The Windows list carries three extras with no Unix counterpart to export —
+// The Windows list carries extras with no Unix counterpart to export —
 // `pipe_security_descriptor` / `OwnedSecurityDescriptor` /
 // `verify_object_owner_is_current_user`, which together close PRD #163's
 // [BLOCKER]. On Unix those same two properties *are* the socket's 0o600 mode and
-// `verify_endpoint_trusted`'s `stat`, so there is nothing to name.
+// `verify_endpoint_trusted`'s `stat`, so there is nothing to name. Likewise
+// `verify_file_owner_is_current_user`, whose Unix counterpart is a caller's own
+// `metadata.uid()` comparison.
 #[cfg(windows)]
 pub use windows::{
     OwnedSecurityDescriptor, create_owner_only_dir, ensure_owner_only_dir,
     pipe_security_descriptor, set_create_mode_owner_only, set_create_mode_owner_only_readable,
     set_endpoint_mode_owner_only, set_file_owner_only, verify_endpoint_trusted,
-    verify_object_owner_is_current_user, with_socket_umask,
+    verify_file_owner_is_current_user, verify_object_owner_is_current_user, with_socket_umask,
 };
 
 /// Decide whether an endpoint owned by `owner_sid` is trusted, given that we are
@@ -68,6 +70,43 @@ pub(crate) fn endpoint_owner_is_trusted(owner_sid: &str, our_sid: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Decide whether a **file the process created with a default security
+/// descriptor** is ours, given its owner SID, our user SID and our token's
+/// default owner SID (`TokenOwner`). All canonical SID strings.
+///
+/// [`endpoint_owner_is_trusted`] accepts only the user SID, which is right for
+/// the pipe and the spawn mutex because both are created with an explicit
+/// `O:<our-sid>`. A file written without one is owned by the token's default
+/// owner instead, and under an elevated administrator token that is
+/// `BUILTIN\Administrators`, so the user-SID rule refuses our own file. This
+/// accepts either SID and nothing else. It stays a real check because Windows
+/// lets a process set an object's owner only to its user SID or to a group its
+/// token marks as owner-assignable (an arbitrary owner needs
+/// `SeRestorePrivilege`). Administrators is owner-assignable only in an elevated
+/// administrator token, which already outranks the daemon's user. For an
+/// ordinary token the default owner *is* the user SID, so this is exactly
+/// [`endpoint_owner_is_trusted`].
+///
+/// Fails closed: an empty owner or user SID is refused, and an empty default
+/// owner adds nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn file_owner_is_trusted(
+    owner_sid: &str,
+    our_sid: &str,
+    default_owner_sid: &str,
+) -> Result<(), String> {
+    match endpoint_owner_is_trusted(owner_sid, our_sid) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if !default_owner_sid.is_empty()
+                && owner_sid.eq_ignore_ascii_case(default_owner_sid) =>
+        {
+            Ok(())
+        }
+        Err(reason) => Err(reason),
+    }
 }
 
 /// How a permission site upholds its security property on Windows.
@@ -301,5 +340,36 @@ mod tests {
         assert!(endpoint_owner_is_trusted("", SID).is_err());
         assert!(endpoint_owner_is_trusted(SID, "").is_err());
         assert!(endpoint_owner_is_trusted("", "").is_err());
+    }
+
+    /// `BUILTIN\Administrators`, the default owner of an elevated admin token.
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+
+    /// A file we created is owned by our user SID under an ordinary token and by
+    /// the token's default owner under an elevated one; both are ours.
+    #[test]
+    fn file_owner_trust_accepts_our_sid_or_our_token_default_owner() {
+        file_owner_is_trusted(SID, SID, SID).expect("an ordinary token's own file");
+        file_owner_is_trusted(ADMINISTRATORS, SID, ADMINISTRATORS)
+            .expect("an elevated token's own file is owned by its default owner");
+        file_owner_is_trusted(SID, SID, ADMINISTRATORS)
+            .expect("a file an unelevated run of the same user wrote");
+        file_owner_is_trusted(&ADMINISTRATORS.to_lowercase(), SID, ADMINISTRATORS)
+            .expect("case must not matter");
+    }
+
+    /// Anything else is refused: a foreign user's file, an Administrators-owned
+    /// file when our token does not default to Administrators, and every
+    /// missing value.
+    #[test]
+    fn file_owner_trust_refuses_any_other_owner() {
+        let err = file_owner_is_trusted(OTHER_SID, SID, ADMINISTRATORS)
+            .expect_err("a foreign user's file must fail");
+        assert!(err.contains(OTHER_SID), "{err}");
+        assert!(file_owner_is_trusted(ADMINISTRATORS, SID, SID).is_err());
+        assert!(file_owner_is_trusted("", SID, SID).is_err());
+        assert!(file_owner_is_trusted("", SID, "").is_err());
+        assert!(file_owner_is_trusted(SID, "", "").is_err());
+        assert!(file_owner_is_trusted(OTHER_SID, SID, "").is_err());
     }
 }

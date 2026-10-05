@@ -87,11 +87,12 @@
 //! daemon are forgeries nobody intended, and they are the ones that actually
 //! happen — which is what the per-spawn binding above keeps closing.
 //!
-//! Issues #543 and #401 do stay open: raw [`crate::event::AgentEvent`] traffic
-//! (the hook scripts installed into each agent's own config, plus the
-//! `agent-event` verb) is deliberately **out of scope** here — see the module
-//! docs on [`classify`] for why, and `docs/develop/hook-provenance.md` for the
-//! whole threat model.
+//! Raw [`crate::event::AgentEvent`] traffic — the hook scripts installed into
+//! each agent's own config, `wrap`, and the `agent-event` verb — is gated too
+//! since issue #318, through [`classify_event`]. The rule there differs from
+//! the `DaemonMessage` one in exactly one place, for a pane this daemon never
+//! issued a token for; [`classify_event`] has the reasoning, and
+//! `docs/develop/hook-provenance.md` the whole threat model.
 //!
 //! # Why not `SO_PEERCRED`
 //!
@@ -281,6 +282,27 @@ pub trait HookTokenDirectory {
     /// the live records would read that window as "never issued" and admit a
     /// token-less forgery into it.
     fn pane_was_issued_a_hook_token(&self, pane_id: &str) -> bool;
+
+    /// Issue #318: whether this daemon has **ever** issued a token to a spawn
+    /// with no pane id under the registry id `agent_id`.
+    ///
+    /// The paneless counterpart of [`Self::pane_was_issued_a_hook_token`], and
+    /// what lets [`classify_event`] hold a paneless event naming a daemon
+    /// agent to the token check. Registry ids are never reused within a daemon,
+    /// so the same "never forget" property applies.
+    fn paneless_agent_was_issued_a_hook_token(&self, agent_id: &str) -> bool;
+
+    /// Issue #318: may the generation `agent_id` — the spawn a token was minted
+    /// for — still speak for `pane_id`?
+    ///
+    /// Asked of an attested event that names NO agent. Such an event would
+    /// otherwise be judged by the pane alone, and a pane is a reusable slot: a
+    /// survivor holding a replaced generation's token could drop `agent_id` and
+    /// have its report credited to whichever generation holds the pane now. The
+    /// registry answers with the same generation rule it applies to a tagged
+    /// event, so a lone retiree with no successor still speaks for its pane
+    /// (its late final report must land) and a replaced one does not.
+    fn token_owner_speaks_for_pane(&self, agent_id: &str, pane_id: &str) -> bool;
 }
 
 /// Why a message was refused.
@@ -303,6 +325,19 @@ pub enum Refusal {
     },
     /// No token at all, for a pane that was issued one.
     Missing,
+    /// Issue #318: a token that attests the claimed pane, on an event whose
+    /// `agent_id` names a different agent than the spawn the token was minted
+    /// for. Only [`classify_event`] produces it. Every first-party producer
+    /// reads the agent id and the token from the same spawn's environment, so
+    /// a mismatch is a sender reusing one generation's token while naming
+    /// another generation of the same pane.
+    WrongAgent,
+    /// Issue #318: a token that attests the claimed pane, on an event that
+    /// names no agent, minted for a generation that no longer speaks for that
+    /// pane ([`HookTokenDirectory::token_owner_speaks_for_pane`]). Only
+    /// [`classify_event`] produces it. Without it, dropping `agent_id` would let
+    /// a replaced generation's token speak for its successor.
+    Superseded,
 }
 
 /// The verdict on one hook-socket message.
@@ -317,6 +352,11 @@ pub enum Provenance {
     /// This daemon has no record of the claimed pane at all, so there is nothing
     /// to check the message against.
     ///
+    /// For a raw event ([`classify_event`]) this is also the verdict for a pane
+    /// that was never issued a token whatever token the event presents, and the
+    /// daemon admits such an event only as an UNPROVEN one: it can draw and
+    /// update an outside agent's own card, never a card the daemon spawned.
+    ///
     /// Why this branch is not the obvious hole, stated because it is the branch
     /// a reader reaches for first. It is reached only for a pane id this daemon
     /// has **never** issued a token for — not merely one that has no record at
@@ -330,10 +370,12 @@ pub enum Provenance {
     /// its spawn returned `Ok`. Every spawn records its pane as issued before it
     /// forks. So no pane that lands here holds a role. That was checked by
     /// enumerating the write sites when this was written; a new writer of those
-    /// maps that does not go through a spawn would break it. The residual it
-    /// leaves is `AppState::apply_event`'s auto-registration of an unknown
-    /// `SessionStart`, which gives a CARD to a pane nobody spawned but no role,
-    /// and is issue #543's surface rather than this one's.
+    /// maps that does not go through a spawn would break it. What it still
+    /// grants is `AppState::apply_event`'s admission of an unknown
+    /// `SessionStart`: a CARD for a pane nobody spawned, but no role. Since
+    /// issue #601 that card is recorded as unproven rather than in
+    /// `AppState::managed_pane_ids`, and since #697 the unproven cards are
+    /// bounded (`crate::state::MAX_UNPROVEN_SESSIONS`).
     Unattested,
     /// Refused; the message must not be acted on.
     Refused(Refusal),
@@ -389,27 +431,12 @@ pub fn policy() -> Policy {
 ///
 /// `presented` is the token the message carried, `None` when it carried none.
 ///
-/// # Scope: `DaemonMessage` only
+/// # Scope
 ///
 /// Every variant of [`crate::event::DaemonMessage`] names a pane and every one
-/// of them goes through here. Raw [`crate::event::AgentEvent`] traffic — the
-/// other thing this socket accepts — does **not**, and that exclusion is
-/// deliberate rather than an oversight:
-///
-/// - An `AgentEvent` is a **published schema** (PRD #20's
-///   `AGENT_EVENT_SCHEMA_VERSION`) that third-party producers emit. Requiring a
-///   field on it breaks producers this project does not ship.
-/// - The events arrive from hook scripts already written into each agent's own
-///   configuration — `~/.claude/settings.json`, `~/.codex/config.toml` and the
-///   rest — by installations that predate this change. Refusing a token-less
-///   event would break every existing hook installation on upgrade.
-/// - `AppState::apply_event` auto-registers an unknown `SessionStart` to cover a
-///   startup race, so the blast radius of a refusal there is the whole card
-///   surface rather than one orchestration.
-///
-/// Issues #543 and #401 track that half and stay open. This function closes the
-/// verbs that **write into another pane, spawn, or consume a one-shot route**;
-/// it does not close status reporting.
+/// of them goes through here. Raw [`crate::event::AgentEvent`] traffic goes
+/// through [`classify_event`], which delegates here for a pane this daemon has
+/// issued a token for.
 pub fn classify(
     claimed_pane: &str,
     presented: Option<&str>,
@@ -438,6 +465,103 @@ pub fn classify(
     }
 }
 
+/// Issue #318: decide whether a raw [`crate::event::AgentEvent`] may be acted
+/// on.
+///
+/// `claimed_pane` and `claimed_agent` are the event's own `pane_id` and
+/// `agent_id`; `presented` is the token the line carried, `None` when it
+/// carried none.
+///
+/// Differs from [`classify`] in three ways, each deliberate:
+///
+/// - **A pane this daemon never issued a token for is [`Provenance::Unattested`]
+///   whatever the event presents** — no token, a malformed one, an unknown one,
+///   or one minted for another pane. Refusing there protects nothing, since the
+///   sender can drop the token and be `Unattested` anyway, and it would cost a
+///   real case: an agent that survived a daemon restart keeps posting with its
+///   OLD daemon's token, which this daemon never minted, and its events are the
+///   only way an attached client learns that its role is orphaned (issue #770).
+///   The strict matrix — [`Refusal::Malformed`], [`Refusal::UnknownToken`],
+///   [`Refusal::WrongPane`], [`Refusal::Missing`] — applies to issued panes,
+///   where it does protect a card. `DaemonMessage` keeps [`classify`]'s matrix
+///   unchanged, because there a refusal protects authority.
+/// - **A paneless event is covered too.** When it names an agent this daemon
+///   spawned without a pane
+///   ([`HookTokenDirectory::paneless_agent_was_issued_a_hook_token`]), it is
+///   held to the same matrix against that agent's token; otherwise it is
+///   `Unattested`.
+/// - **The token binds the agent as well as the pane.** An attested event whose
+///   `agent_id` names an agent other than the token's spawn is
+///   [`Refusal::WrongAgent`]. An event naming no agent is held to the token's
+///   own spawn instead: it is [`Refusal::Superseded`] when that generation no
+///   longer speaks for the pane
+///   ([`HookTokenDirectory::token_owner_speaks_for_pane`]).
+pub fn classify_event(
+    claimed_pane: Option<&str>,
+    claimed_agent: Option<&str>,
+    presented: Option<&str>,
+    directory: &impl HookTokenDirectory,
+) -> Provenance {
+    let verdict = match claimed_pane {
+        Some(pane) => {
+            if !directory.pane_was_issued_a_hook_token(pane) {
+                return Provenance::Unattested;
+            }
+            classify(pane, presented, directory)
+        }
+        None => {
+            let Some(agent) = claimed_agent
+                .filter(|agent| directory.paneless_agent_was_issued_a_hook_token(agent))
+            else {
+                return Provenance::Unattested;
+            };
+            classify_paneless(agent, presented, directory)
+        }
+    };
+    match verdict {
+        Provenance::Attested { ref agent_id }
+            if claimed_agent.is_some_and(|claimed| claimed != agent_id) =>
+        {
+            Provenance::Refused(Refusal::WrongAgent)
+        }
+        Provenance::Attested { ref agent_id }
+            if claimed_agent.is_none()
+                && claimed_pane
+                    .is_some_and(|pane| !directory.token_owner_speaks_for_pane(agent_id, pane)) =>
+        {
+            Provenance::Refused(Refusal::Superseded)
+        }
+        other => other,
+    }
+}
+
+/// [`classify`] for a paneless event naming `claimed_agent`, an agent this
+/// daemon issued a token to without a pane.
+fn classify_paneless(
+    claimed_agent: &str,
+    presented: Option<&str>,
+    directory: &impl HookTokenDirectory,
+) -> Provenance {
+    let Some(token) = presented else {
+        return Provenance::Refused(Refusal::Missing);
+    };
+    if !is_well_formed(token) {
+        return Provenance::Refused(Refusal::Malformed);
+    }
+    let Some(owner) = directory.owner_of_hook_token(token) else {
+        return Provenance::Refused(Refusal::UnknownToken);
+    };
+    match owner.pane_id {
+        None if owner.agent_id == claimed_agent => Provenance::Attested {
+            agent_id: owner.agent_id,
+        },
+        None => Provenance::Refused(Refusal::WrongAgent),
+        Some(pane) => Provenance::Refused(Refusal::WrongPane {
+            token_pane: Some(pane),
+        }),
+    }
+}
+
 /// Whether a [`Provenance`] permits the message to be acted on under `policy`,
 /// and the refusal to report when it does not.
 ///
@@ -461,6 +585,8 @@ impl Refusal {
             Refusal::UnknownToken => "unknown_token",
             Refusal::WrongPane { .. } => "token_names_another_pane",
             Refusal::Missing => "missing_token",
+            Refusal::WrongAgent => "token_names_another_agent",
+            Refusal::Superseded => "token_generation_replaced",
         }
     }
 
@@ -482,6 +608,16 @@ impl Refusal {
             Refusal::WrongPane { .. } => {
                 "refused: this pane's hook capability token was issued for a different pane, \
                  so the pane named by this message is not the one it came from."
+                    .to_string()
+            }
+            Refusal::WrongAgent => {
+                "refused: this pane's hook capability token was issued to a different agent \
+                 than the one this message names."
+                    .to_string()
+            }
+            Refusal::Superseded => {
+                "refused: this pane's hook capability token was issued to an agent that \
+                 has since been replaced in this pane."
                     .to_string()
             }
             Refusal::Missing => format!(
@@ -520,6 +656,8 @@ mod tests {
     /// exercised over a real socket in `crate::daemon`'s hook-loop tests.
     struct Stub {
         by_token: HashMap<String, (String, Option<String>)>,
+        /// Generations a successor has replaced on their pane.
+        replaced: std::collections::HashSet<String>,
     }
 
     impl Stub {
@@ -529,6 +667,7 @@ mod tests {
                     .iter()
                     .map(|(t, a, p)| ((*t).to_string(), ((*a).to_string(), p.map(str::to_string))))
                     .collect(),
+                replaced: std::collections::HashSet::new(),
             }
         }
     }
@@ -547,6 +686,16 @@ mod tests {
             self.by_token
                 .values()
                 .any(|(_, p)| p.as_deref() == Some(pane_id))
+        }
+
+        fn paneless_agent_was_issued_a_hook_token(&self, agent_id: &str) -> bool {
+            self.by_token
+                .values()
+                .any(|(a, p)| p.is_none() && a == agent_id)
+        }
+
+        fn token_owner_speaks_for_pane(&self, agent_id: &str, _pane_id: &str) -> bool {
+            !self.replaced.contains(agent_id)
         }
     }
 
@@ -765,6 +914,144 @@ mod tests {
                  secret-looking names from its shell tool would strip it"
             );
         }
+    }
+
+    /// Issue #318: for a raw event, a pane this daemon never issued a token for
+    /// is `Unattested` whatever the event presents — the orphaned survivor of a
+    /// daemon restart presents its old daemon's token and must still be heard.
+    #[test]
+    fn an_event_for_a_never_issued_pane_is_unattested_whatever_it_presents() {
+        for presented in [
+            None,
+            Some("not-a-token"),
+            Some(STRANGER),
+            Some(&*"aa".repeat(32)),
+        ] {
+            assert_eq!(
+                classify_event(Some("pane-nobody-has"), None, presented, &fixture()),
+                Provenance::Unattested,
+                "{presented:?}"
+            );
+        }
+    }
+
+    /// Issue #318: an issued pane keeps the whole matrix for raw events.
+    #[test]
+    fn an_event_for_an_issued_pane_gets_the_strict_matrix() {
+        let dir = fixture();
+        let own = "aa".repeat(32);
+        let sibling = "bb".repeat(32);
+        let pane = Some("pane-orchestrator");
+        assert_eq!(
+            classify_event(pane, Some("agent-1"), Some(&own), &dir),
+            Provenance::Attested {
+                agent_id: "agent-1".to_string()
+            }
+        );
+        assert_eq!(
+            classify_event(pane, None, Some(&own), &dir),
+            Provenance::Attested {
+                agent_id: "agent-1".to_string()
+            }
+        );
+        assert_eq!(
+            classify_event(pane, Some("agent-1"), None, &dir),
+            Provenance::Refused(Refusal::Missing)
+        );
+        assert_eq!(
+            classify_event(pane, Some("agent-1"), Some(&sibling), &dir),
+            Provenance::Refused(Refusal::WrongPane {
+                token_pane: Some("pane-worker".to_string())
+            })
+        );
+        assert_eq!(
+            classify_event(pane, Some("agent-1"), Some(STRANGER), &dir),
+            Provenance::Refused(Refusal::UnknownToken)
+        );
+        assert_eq!(
+            classify_event(pane, Some("agent-1"), Some("junk"), &dir),
+            Provenance::Refused(Refusal::Malformed)
+        );
+    }
+
+    /// Issue #318: the token binds the agent an event names, not only its pane.
+    #[test]
+    fn an_attested_event_naming_another_agent_is_refused() {
+        assert_eq!(
+            classify_event(
+                Some("pane-orchestrator"),
+                Some("agent-2"),
+                Some(&"aa".repeat(32)),
+                &fixture()
+            ),
+            Provenance::Refused(Refusal::WrongAgent)
+        );
+    }
+
+    /// Issue #318 (audit finding 2): an event naming no agent is held to the
+    /// token's own generation, so a replaced generation's token cannot speak
+    /// for its successor by dropping `agent_id` — while a generation that still
+    /// speaks for its pane (the lone retiree included) is attested as before.
+    #[test]
+    fn hook_provenance_audit_absent_identity_is_held_to_the_tokens_generation() {
+        let mut dir = fixture();
+        let own = "aa".repeat(32);
+        assert_eq!(
+            classify_event(Some("pane-orchestrator"), None, Some(&own), &dir),
+            Provenance::Attested {
+                agent_id: "agent-1".to_string()
+            },
+            "a generation that still speaks for its pane keeps the untagged shape"
+        );
+        dir.replaced.insert("agent-1".to_string());
+        assert_eq!(
+            classify_event(Some("pane-orchestrator"), None, Some(&own), &dir),
+            Provenance::Refused(Refusal::Superseded)
+        );
+        assert_eq!(
+            classify_event(Some("pane-orchestrator"), Some("agent-1"), Some(&own), &dir),
+            Provenance::Attested {
+                agent_id: "agent-1".to_string()
+            },
+            "a tagged event keeps its existing path: the state's generation \
+             check judges it, and an attached client reads the daemon's stamp"
+        );
+    }
+
+    /// Issue #318: a paneless event naming a paneless daemon agent is held to
+    /// that agent's token; one naming anything else is an outside agent's.
+    #[test]
+    fn a_paneless_event_is_checked_against_a_paneless_spawn() {
+        let dir = fixture();
+        let own = "cc".repeat(32);
+        assert_eq!(
+            classify_event(None, Some("agent-3"), Some(&own), &dir),
+            Provenance::Attested {
+                agent_id: "agent-3".to_string()
+            }
+        );
+        assert_eq!(
+            classify_event(None, Some("agent-3"), None, &dir),
+            Provenance::Refused(Refusal::Missing)
+        );
+        assert_eq!(
+            classify_event(None, Some("agent-3"), Some(&"aa".repeat(32)), &dir),
+            Provenance::Refused(Refusal::WrongPane {
+                token_pane: Some("pane-orchestrator".to_string())
+            })
+        );
+        assert_eq!(
+            classify_event(None, Some("agent-3"), Some(STRANGER), &dir),
+            Provenance::Refused(Refusal::UnknownToken)
+        );
+        assert_eq!(
+            classify_event(None, Some("external"), None, &dir),
+            Provenance::Unattested
+        );
+        assert_eq!(
+            classify_event(None, None, Some(&own), &dir),
+            Provenance::Unattested
+        );
     }
 
     #[test]

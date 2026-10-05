@@ -173,6 +173,79 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
+  /// Scenario: a keyboard write holds the real per-session input queue while a control key is accepted. Idle or Stop typing invalidates the control's precondition before the keyboard write settles, so no stale control reaches Tauri and later keyboard input still flows.
+  it.each([
+    { name: "interrupt after idle", control: "\x1b" },
+    { name: "interrupt after Stop typing", control: "\x1b" },
+    { name: "clear after Stop typing", control: "\x15".repeat(32) },
+  ])("cancels queued terminal input at the invoke boundary: $name", async ({ control }) => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+    let release!: () => void;
+    invoke.mockImplementation((command: string, args?: { data?: number[] }) => {
+      if (command === "desktop_terminal_write" && args?.data?.[0] === 107) {
+        return new Promise<void>((resolve) => { release = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const keyboard = bridge.sendTerminalInput(on("agent-1"), "k");
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    let allowed = true;
+    const precondition = vi.fn(() => allowed);
+    // The third argument is the proposed API; the cast keeps RED executable
+    // against the current two-argument implementation without production edits.
+    const guardedInput = bridge.sendTerminalInput.bind(bridge) as
+      (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
+    const queued = guardedInput(on("agent-1"), control, precondition).catch(() => undefined);
+    const laterKeyboard = bridge.sendTerminalInput(on("agent-1"), "z");
+    expect(precondition, "precondition must wait until the real input queue drains").not.toHaveBeenCalled();
+    expect(invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write")).toHaveLength(1);
+    allowed = false;
+    release();
+    await Promise.all([keyboard, queued, laterKeyboard]);
+    try {
+      const writes = invoke.mock.calls.filter(([command]) => command === "desktop_terminal_write").map(([, args]) => args.data);
+      expect(writes, "cancelled control must never invoke desktop_terminal_write").toEqual([[107], [122]]);
+      expect(precondition).toHaveBeenCalledTimes(1);
+    } finally {
+      await bridge.dispose();
+    }
+  });
+
+  /// Scenario: a valid guarded control waits behind a held keyboard write, then dispatches once the queue drains. The precondition is evaluated immediately before its own invoke and ordinary keyboard order remains intact.
+  it("delivers valid guarded input only after evaluating its precondition at invoke", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+    const events: string[] = [];
+    let release!: () => void;
+    invoke.mockImplementation((command: string, args?: { data?: number[] }) => {
+      if (command !== "desktop_terminal_write") return Promise.resolve({ ok: true });
+      events.push(`invoke:${args?.data?.join(",")}`);
+      if (args?.data?.[0] === 107) return new Promise<void>((resolve) => { release = resolve; });
+      return Promise.resolve();
+    });
+    const keyboard = bridge.sendTerminalInput(on("agent-1"), "k");
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const guardedInput = bridge.sendTerminalInput.bind(bridge) as
+      (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
+    const queued = guardedInput(on("agent-1"), "\x1b", () => { events.push("precondition"); return true; });
+    const laterKeyboard = bridge.sendTerminalInput(on("agent-1"), "z");
+    expect(events).toEqual(["invoke:107"]);
+    release();
+    await Promise.all([keyboard, queued, laterKeyboard]);
+    try {
+      expect(events).toEqual(["invoke:107", "precondition", "invoke:27", "invoke:122"]);
+    } finally {
+      await bridge.dispose();
+    }
+  });
+
   it("clears sessions synchronously so StrictMode replay can reattach while detach is pending", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
@@ -1123,6 +1196,38 @@ describe("TauriDeckBridge", () => {
     unnamed.agents[0].agentType = "claude_code";
     delete unnamed.agents[0].cliName;
     expect(mapDesktopSnapshot(unnamed).agents[0]?.cli).toBeUndefined();
+  });
+
+  /**
+   * PRD #1541. What the voice surface needs to press keys at an agent reaches
+   * the agent model: its type, whether it is mid-turn, and the DECK's prompt
+   * keys — copied through, and absent where the daemon sent none even for a
+   * type this app knows keys for (the #856 principle: no local table).
+   */
+  it("carries the agent type, turn and the deck's prompt keys, and absent keys as absent", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const keys = {
+      interrupt: [{ bytes: "\u001b", pauseAfterMs: 300 }, { bytes: "\u001b", pauseAfterMs: 0 }],
+      clear: { bytes: "\u0015", presses: "per_line" as const },
+      deleteChar: { bytes: "\u007f" },
+    };
+    const reported = structuredClone(snapshot);
+    reported.agents[0].agentType = "open_code";
+    reported.agents[0].status = "thinking";
+    reported.agents[0].promptKeys = keys;
+    const agent = mapDesktopSnapshot(reported).agents[0];
+    expect(agent?.agentType).toBe("open_code");
+    expect(agent?.turn).toBe("working");
+    expect(agent?.promptKeys).toEqual(keys);
+
+    const keyless = structuredClone(snapshot);
+    keyless.agents[0].agentType = "claude_code";
+    keyless.agents[0].status = "running";
+    delete keyless.agents[0].promptKeys;
+    const bare = mapDesktopSnapshot(keyless).agents[0];
+    expect(bare?.promptKeys).toBeUndefined();
+    // `running` is the crate's word for "no hook state": not evidence of a turn.
+    expect(bare?.turn).toBeUndefined();
   });
 
   /**
@@ -2454,13 +2559,11 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
-   * Scenario: a keystroke is still queued behind a slow write when the daemon
-   * ends that terminal's session, and the pane reattaches before the queue
-   * reaches it. The queued keystroke was typed into the OLD attachment and must
-   * never be written through the new one — it rejects as not attached, and the
-   * replacement session only ever receives what was typed after it existed.
-   * (Review finding on #953's input queue: it used to look the session up when
-   * the write ran rather than when the keystroke was accepted.)
+   * Scenario: a keyboard write and guarded Escape are queued behind an unresolved
+   * old-session write when the daemon ends that session and the pane reattaches.
+   * Fresh keyboard input invokes through the new session without waiting for the
+   * old acknowledgement. The obsolete keyboard write and control reject without
+   * crossing into the replacement, including after the old write finally settles.
    */
   it("never writes a keystroke queued for an ended session through the session that replaced it", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -2484,6 +2587,9 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     const slow = bridge.sendTerminalInput(on("agent-1"), "a");
     const queued = bridge.sendTerminalInput(on("agent-1"), "b");
     queued.catch(() => undefined);
+    const precondition = vi.fn(() => true);
+    const obsoleteControl = bridge.sendTerminalInput(on("agent-1"), "\x1b", precondition);
+    obsoleteControl.catch(() => undefined);
     await vi.waitFor(() => expect(release).toBeDefined());
 
     listeners.get("desktop://terminal-state")?.({
@@ -2494,14 +2600,26 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     await settle();
     const reattachGeneration = attachCalls().length;
 
-    release?.();
-    await slow;
-    await expect(queued).rejects.toThrow(/not attached/);
-    const writesToReplacement = invoke.mock.calls.filter(
-      ([command, args]) => command === "desktop_terminal_write" && args.sessionId === `session-agent-1-${reattachGeneration}`,
-    );
-    expect(writesToReplacement).toEqual([]);
-    await bridge.dispose();
+    const fresh = bridge.sendTerminalInput(on("agent-1"), "fresh");
+    try {
+      await settle();
+      const replacementWrites = () => invoke.mock.calls.filter(
+        ([command, args]) => command === "desktop_terminal_write" && args.sessionId === `session-agent-1-${reattachGeneration}`,
+      );
+      expect(replacementWrites(), "new session input must invoke without waiting for the old session's unresolved write").toEqual([
+        ["desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [102, 114, 101, 115, 104] }],
+      ]);
+      await fresh;
+      expect(precondition, "obsolete control must not evaluate its guard or cross into the replacement").not.toHaveBeenCalled();
+    } finally {
+      release?.();
+      await slow;
+      await expect(queued).rejects.toThrow(/not attached/);
+      await expect(obsoleteControl).rejects.toThrow(/not attached/);
+      await fresh;
+      expect(invoke.mock.calls.filter(([command, args]) => command === "desktop_terminal_write" && args.data.includes(27)), "obsolete queued Escape must never reach either session").toEqual([]);
+      await bridge.dispose();
+    }
   });
 
   /**

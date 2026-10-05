@@ -973,6 +973,9 @@ impl TabManager {
                 } else {
                     None
                 },
+                // Issue #1540: a role start never becomes the deck's last
+                // command.
+                remember_command: false,
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),

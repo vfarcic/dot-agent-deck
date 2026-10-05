@@ -106,6 +106,16 @@ const VOICE_OFF_LIST: &str = "VOICE_OFF_PHRASES";
 const DICTATION_ON_ROW: &str = "dictation_on";
 const DICTATION_OFF_ROW: &str = "dictation_off";
 const VOICE_OFF_ROW: &str = "voice_off";
+/// PRD #1541 — the typing-mode prompt commands' whole-utterance phrases, two
+/// lists backing `interrupt_agent` (the bare "stop" forms interrupt only in
+/// typing mode, so they are a list of their own).
+const INTERRUPT_LIST: &str = "INTERRUPT_PHRASES";
+const TYPING_STOP_LIST: &str = "TYPING_STOP_PHRASES";
+const CLEAR_PROMPT_LIST: &str = "CLEAR_PROMPT_PHRASES";
+const SCRATCH_LIST: &str = "SCRATCH_PHRASES";
+const INTERRUPT_ROW: &str = "interrupt_agent";
+const CLEAR_PROMPT_ROW: &str = "clear_prompt";
+const SCRATCH_ROW: &str = "scratch_that";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -314,6 +324,10 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         (DICTATION_ON_LIST, DICTATION_ON_ROW),
         (DICTATION_OFF_LIST, DICTATION_OFF_ROW),
         (VOICE_OFF_LIST, VOICE_OFF_ROW),
+        (INTERRUPT_LIST, INTERRUPT_ROW),
+        (TYPING_STOP_LIST, INTERRUPT_ROW),
+        (CLEAR_PROMPT_LIST, CLEAR_PROMPT_ROW),
+        (SCRATCH_LIST, SCRATCH_ROW),
     ]
     .into_iter()
     .map(|(name, row_id)| (name, list(name, findings), row_id))
@@ -1450,7 +1464,7 @@ mod tests {
         assert_reports(&empty, "yielded no phrases");
     }
 
-    /// Scenario: removing either local mode-switch list is a rule-14 finding,
+    /// Scenario: removing any local mode-switch or prompt-command list is a rule-14 finding,
     /// rather than a vacuous pass that silently stops checking those phrases.
     #[test]
     fn a_missing_dictation_mode_phrase_list_is_a_finding() {
@@ -1458,6 +1472,10 @@ mod tests {
             "DICTATION_ON_PHRASES",
             "DICTATION_OFF_PHRASES",
             "VOICE_OFF_PHRASES",
+            "INTERRUPT_PHRASES",
+            "TYPING_STOP_PHRASES",
+            "CLEAR_PROMPT_PHRASES",
+            "SCRATCH_PHRASES",
         ] {
             let mut sources = checked_in();
             let original = sources.dictation_rs.clone();
@@ -1511,6 +1529,20 @@ mod tests {
             "type on",
         );
         assert_reports(&check(&voice_off_overlap), "is in both");
+
+        // PRD #1541: a typing-mode stop phrase the interrupt row does not name,
+        // and a scratch phrase that is also a dictation opener.
+        let mut unnamed_stop = checked_in();
+        insert_phrase(
+            &mut unnamed_stop.dictation_rs,
+            "TYPING_STOP_PHRASES",
+            "halt right there",
+        );
+        assert_reports(&check(&unnamed_stop), "halt right there");
+
+        let mut opener_overlap = checked_in();
+        insert_phrase(&mut opener_overlap.dictation_rs, "SCRATCH_PHRASES", "say");
+        assert_reports(&check(&opener_overlap), "is in both");
     }
 
     /// The masker is what makes every scan above safe, so it is pinned

@@ -84,9 +84,10 @@ If the user has no preference, say which one you are taking and why (`mixed` is 
 
 ## Where this skill does not decide the shape
 
-Two dispatching skills in this repo carry a shape step of their own, and **inside them their own steps govern — the shape and which orchestration to name — not this skill**, so neither the criteria nor the `mixed` default above applies there:
+Three dispatching skills in this repo carry a shape step of their own, and **inside them their own steps govern — the shape and which orchestration to name — not this skill**, so neither the criteria nor the `mixed` default above applies there:
 
 - **`/prd-queue`** asks the shape once per PRD (its step 7), because there the shape also decides which of two task documents its step 8 writes — `/prd-full` for a single agent, the orchestrator role template for a team. It also asks the provider once per session, the first time a PRD wants a team (the same step), rather than defaulting to `mixed`. Issue #1425 left it unchanged on purpose; whether it should use this skill instead is an open question, not a settled one.
 - **`/pr-review-queue`** asks the shape once per PR (its step 2b), showing the `--list-targets` output, so the answer names the orchestration too. Issue #1425 did not revisit it.
+- **`/code-cleanup`** dispatches every unit `--single`, by the maintainer's decision (its step 4). One bounded area and one small PR is confined work, so the criteria above would choose the same; that skill fixes it rather than re-deciding it per unit.
 
 Everywhere else in this repo — an ad-hoc dispatch, `/issue-queue`, or a skill written later without a shape step of its own — this skill decides.
