@@ -90,9 +90,11 @@
 //!
 //! Decision 23 cost: one short cheap-model Codex turn (read a task file, run a
 //! single `printf`) — well under the <$0.05/run bound. Local-only (Decision 8 /
-//! CLAUDE.md rule 5): gated behind the `e2e` feature so CI's `cargo test-fast`
-//! never compiles it. Flaky-tolerant (real LLM) per rule 4 — run once, not
-//! looped. Decision 26 runtime-skip when the Codex CLI / credentials are absent.
+//! CLAUDE.md rule 5): gated behind BOTH the `e2e` and `e2e-live` features (line
+//! 1), so neither `cargo test-fast` nor CI's lane-1 `cargo test-e2e` runs it;
+//! a developer runs it with `cargo test-e2e-live`. Flaky-tolerant (real LLM)
+//! per rule 4 — run once, not looped. Decision 26 runtime-skip when the Codex
+//! CLI / credentials are absent.
 
 mod common;
 
@@ -318,9 +320,10 @@ fn open_orchestration(deck: &TuiDeck) {
 /// ~4s before the Codex TUI existed, the prompt was lost, and no sentinel ever
 /// appeared. The delegate must also be PROMPT (issue #243): the wrapper's
 /// interface-ready `SessionStart` for the replacement is captured as the anchor,
-/// and no more than ten seconds may pass between it and the pointer's submission
-/// — without that bound this test passes identically whether the gate released
-/// on the readiness signal or gave up after the 30 s fallback. Reel-eligible
+/// and no more than fifteen seconds (`READY_TO_SUBMIT_BUDGET`) may pass between
+/// it and the pointer's submission — without that bound this test passes
+/// identically whether the gate released on the readiness signal or gave up
+/// after the 30 s fallback. Reel-eligible
 /// (PTY-attached real agent, records a `full-stream.cast`); flaky-tolerant (real
 /// LLM) — run once, not looped.
 #[spec("orchestration/delegate/009")]
