@@ -92,6 +92,7 @@ const MOD_KEY: &str = "Ctrl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CardDensity {
+    Minimal,  // 3 rows: Dir only, used only when Compact cannot fit every card (issue #1568)
     Compact,  // 5 rows: 1 prompt, 1 tool
     Normal,   // 8 rows: 1 prompt, 3 tools
     Spacious, // 10 rows: 3 prompts, 3 tools
@@ -100,10 +101,11 @@ enum CardDensity {
 impl CardDensity {
     /// Card height in rows, derived from the exact lines `render_session_card`
     /// emits so reserved height never drifts from rendered content:
-    ///   Dir (1) + prompts + [non-compact: blank separator] + tools, plus 2
+    ///   Dir (1) + prompts + [Normal/Spacious: blank separator] + tools, plus 2
     ///   rows for the top/bottom border.
     ///
-    /// Resulting heights: Compact 5, Normal 8, Spacious 10.
+    /// Resulting heights: Minimal 3, Compact 5, Normal 8, Spacious 10. Minimal
+    /// has no prompt or tool rows at all, so its one inner row is `Dir:`.
     ///
     /// Height is a function of density ALONE — PRD #339 moved the `Last` /
     /// `Tools` counters onto the bottom border, deleting the card-width axis
@@ -116,32 +118,40 @@ impl CardDensity {
     fn card_height(self) -> u16 {
         let prompts = self.max_prompts() as u16;
         let tools = self.max_tools() as u16;
-        let separator = if matches!(self, CardDensity::Compact) {
-            0
-        } else {
-            1
-        };
+        let separator = u16::from(self.has_separator());
         (1 + prompts + separator + tools) + 2 // +2 top/bottom border
     }
 
     fn max_tools(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
             CardDensity::Compact => 1,
-            _ => 3,
+            CardDensity::Normal | CardDensity::Spacious => 3,
         }
     }
 
     fn max_prompts(self) -> usize {
         match self {
+            CardDensity::Minimal => 0,
+            CardDensity::Compact | CardDensity::Normal => 1,
             CardDensity::Spacious => 3,
-            _ => 1,
         }
+    }
+
+    /// Whether the card draws a blank row between its prompts and its tools.
+    fn has_separator(self) -> bool {
+        matches!(self, CardDensity::Normal | CardDensity::Spacious)
     }
 }
 
 /// The richest density that renders `total_cards` cards in `cols` columns
-/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// within `available_height` rows, or `None` when not even [`CardDensity::Minimal`]
 /// fits them all.
+///
+/// Minimal is the last tier, but this function alone does not decide when it is
+/// used: [`choose_grid_layout`] takes Minimal only once Compact has failed at
+/// every column count, so a deck that fits at Compact anywhere keeps the layout
+/// it had before Minimal existed (issue #1568).
 ///
 /// The `None` is the whole point (issue #588). The predecessor of this function
 /// — `choose_density` — returned `Compact` both when Compact fit and when
@@ -155,6 +165,7 @@ fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Op
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
+        CardDensity::Minimal,
     ]
     .into_iter()
     .find(|density| {
@@ -242,6 +253,13 @@ struct GridLayout {
 ///   columns with smaller cards") the way it suggests: prompt and tool lines are
 ///   the card's actual content, horizontal space is the cheaper sacrifice.
 ///
+/// Issue #1568 adds a second pass: only when no column count fits every card at
+/// Compact or richer does the search run again accepting the 3-row
+/// [`CardDensity::Minimal`] card, so Minimal replaces scrolling and never
+/// replaces Compact. Taking Minimal in the first pass would have changed decks
+/// that fit today: seven cards in 25 rows at 90 columns get two columns of
+/// Compact cards, and would instead have got one column of Minimal ones.
+///
 /// When nothing fits, the layout the deck has always used is returned rather
 /// than the widest one, and the caller is left to signal the overflow. Narrowing
 /// every card is a real cost, paid here only for completeness; if completeness
@@ -254,9 +272,13 @@ fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> 
     // column it has today.
     let max_cols = max_columns_for_width(width).max(preferred_cols);
 
-    for cols in preferred_cols..=max_cols {
-        if let Some(density) = fitting_density(total_cards, cols, available_height) {
-            return GridLayout { cols, density };
+    for accept_minimal in [false, true] {
+        for cols in preferred_cols..=max_cols {
+            match fitting_density(total_cards, cols, available_height) {
+                Some(CardDensity::Minimal) if !accept_minimal => {}
+                Some(density) => return GridLayout { cols, density },
+                None => {}
+            }
         }
     }
 
@@ -21113,9 +21135,9 @@ fn render_session_card(
 
     // Issue #770: say what the title badge means, in the one place a reader
     // looks when a card stops behaving. Placed directly under `Dir:` so it
-    // survives every density, and ahead of the prompt/tool rows because it is
-    // the fact that explains why those rows keep advancing while the run has in
-    // fact stalled.
+    // survives every density (at Minimal it takes `Dir:`'s place), and ahead
+    // of the prompt/tool rows because it is the fact that explains why those
+    // rows keep advancing while the run has in fact stalled.
     if is_orphaned {
         status_lines.push(Line::from(Span::styled(
             truncate_with_ellipsis("Orphaned — delegation unavailable", w),
@@ -21162,7 +21184,9 @@ fn render_session_card(
         )));
     }
 
-    let prompts = if is_placeholder {
+    let prompts = if density.max_prompts() == 0 {
+        Vec::new()
+    } else if is_placeholder {
         vec!["Launch an agent to get started".to_string()]
     } else {
         collect_recent_prompts(session, density.max_prompts())
@@ -21174,7 +21198,7 @@ fn render_session_card(
         inner.height as usize,
         status_lines.len(),
         prompts.len(),
-        density != CardDensity::Compact,
+        density.has_separator(),
         tool_lines.len(),
     );
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -21226,6 +21250,12 @@ struct CardRowPlan {
 /// tool history are never shed here; the tool rows are what the card is for, and
 /// the status row is why the card needs attention. A card with no status row at
 /// its own density's height already fits, so its layout is unchanged.
+///
+/// At [`CardDensity::Minimal`] the budget is one row and there are no prompts or
+/// tools to shed, so a status row takes `Dir:`'s place outright (issue #1568):
+/// being Blocked or orphaned matters more than the directory. A card that is
+/// both shows the `Orphaned` row, the first status row; its title still carries
+/// the `orphaned` marker and the `Blocked` badge.
 fn fit_card_rows(
     budget: usize,
     status_rows: usize,
@@ -21390,6 +21420,7 @@ fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardDensityKind {
+    Minimal,
     Compact,
     Normal,
     Spacious,
@@ -21398,6 +21429,7 @@ pub enum CardDensityKind {
 impl From<CardDensityKind> for CardDensity {
     fn from(kind: CardDensityKind) -> Self {
         match kind {
+            CardDensityKind::Minimal => CardDensity::Minimal,
             CardDensityKind::Compact => CardDensity::Compact,
             CardDensityKind::Normal => CardDensity::Normal,
             CardDensityKind::Spacious => CardDensity::Spacious,
@@ -32492,6 +32524,7 @@ mod tests {
     /// three density-derived values against future drift.
     #[test]
     fn card_height_001_content_derived_values() {
+        assert_eq!(CardDensity::Minimal.card_height(), 3);
         assert_eq!(CardDensity::Compact.card_height(), 5);
         assert_eq!(CardDensity::Normal.card_height(), 8);
         assert_eq!(CardDensity::Spacious.card_height(), 10);
@@ -32508,7 +32541,7 @@ mod tests {
                 budget,
                 status,
                 d.max_prompts(),
-                d != CardDensity::Compact,
+                d.has_separator(),
                 d.max_tools(),
             )
         };
@@ -32526,6 +32559,55 @@ mod tests {
         assert_eq!(plan(CardDensity::Normal, 2), row(true, 0, false));
         assert_eq!(plan(CardDensity::Spacious, 2), row(true, 2, false));
         assert_eq!(plan(CardDensity::Compact, 2), row(false, 0, false));
+        // Issue #1568: Minimal's one inner row is `Dir:`, and a status row
+        // takes its place.
+        assert_eq!(plan(CardDensity::Minimal, 0), row(true, 0, false));
+        assert_eq!(plan(CardDensity::Minimal, 1), row(false, 0, false));
+    }
+
+    /// Issue #1568: Minimal is taken only when Compact fails at EVERY column
+    /// count the width allows, so it replaces scrolling and never Compact.
+    #[test]
+    fn choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere() {
+        // 90 columns allows two card columns. 25 rows: one column of Compact
+        // misses (35) but two fit (20). One column of Minimal (21) would fit too,
+        // and must not be preferred over the layout this deck already had.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 79 columns holds one card column. 23 rows: Compact needs 35, Minimal 21.
+        assert_eq!(
+            choose_grid_layout(7, 79, 23),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 90 columns, 14 rows: Compact needs 20 even at two columns; Minimal needs
+        // 21 at one column and 12 at two, so the deck widens to stay complete.
+        assert_eq!(
+            choose_grid_layout(7, 90, 14),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Minimal
+            }
+        );
+
+        // 79 columns, 20 rows: not even Minimal fits (21), so the deck scrolls at
+        // Compact exactly as it did before Minimal existed.
+        assert_eq!(
+            choose_grid_layout(7, 79, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
     }
 
     /// Review finding S1: the card grid must re-clamp a stale scroll offset

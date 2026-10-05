@@ -163,7 +163,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/density/004 — A rendered card has no trailing blank rows below its content at any density tier (PRD #147).
 - **Layer:** L1 (ratatui `TestBackend`, buffer inspection).
 - **Agent:** none.
-- **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Compact, Normal, and Spacious — reserved card height equals rendered content height.
+- **Asserts:** a fully-populated session card (3 prompts + 3 tools) rendered at each tier's own `rendered_height` in an 80-column wide viewport has zero blank inner rows between its last content line and the bottom border on Minimal, Compact, Normal, and Spacious — reserved card height equals rendered content height.
 - **Does not assert:** the exact `card_height` value per tier (covered by `card_height_001_content_derived_values`); the mid-card blank separator line on Normal/Spacious (intentional content, not a trailing row).
 - **Platform coverage:** mac+linux+windows.
 
@@ -173,6 +173,34 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Asserts:** an `Idle` session rendered at Spacious density keeps its ordinary card content — prompt line, dir line, agent-type badge — and carries the `Idle` status badge whose leading dot is inked at the flash-on tick and blank at the flash-off tick, matching the indicator Normal renders for the same session. Pins the fallback that idle cards use in **every** density now that issue #519 removed the Spacious-only ASCII-art overlay, which used to `Clear` this content and paint generated frames over it.
 - **Does not assert:** the removed art path itself (deleted, with no seam left to drive); the flash period, covered by the `flash_dot` unit test.
 - **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/006 — When Compact cannot fit every card, the grid draws every card at the 3-row Minimal density instead of scrolling (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through the real `render_card_grid` via `render_card_grid_to_buffer`).
+- **Agent:** none (the seven synthetic idle role cards of `dashboard/grid/001`).
+- **Asserts:** control first — on a 79x37 deck (one card column, 35 rows for cards) the seven cards are each 5 rows tall, nothing is hidden, and the buffer matches a snapshot recorded before the Minimal tier existed. Then on a 79x25 deck, where seven Compact cards need 35 of the 23 card rows, all seven cards are drawn, each exactly 3 rows (heights measured from the drawn corners), the title carries no `↑`/`↓` marker, and every card has its status badge on the top border, `Dir:` as its one inner row, and `Last:` / `Tools:` on the bottom border.
+- **Does not assert:** the two-pass column search that keeps Minimal from displacing a wider Compact layout (`choose_grid_layout_takes_minimal_only_when_compact_fits_nowhere` unit test); status rows at Minimal (`dashboard/density/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/007 — At Minimal density a Blocked reason or `Orphaned` row takes the `Dir:` row's place (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through `render_card_grid_to_buffer`).
+- **Agent:** none (seven synthetic role cards; the second Blocked on depleted credits, the third orphaned).
+- **Asserts:** on the 79x25 deck every card is 3 rows; the Blocked card keeps its `Blocked` badge on the top border and shows its `⚠ Credits …` reason as its middle row with no `Dir:`; the orphaned card shows `Orphaned — delegation unavailable` as its middle row with no `Dir:`; the other five cards keep `Dir:`.
+- **Does not assert:** a card that is both Blocked and orphaned (at Minimal it shows the `Orphaned` row, the first status row — `fit_card_rows`' doc); Blocked text truncation or reset formatting (`status/badge/002`, `status/badge/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/008 — A deck too large even for Minimal scrolls at Compact exactly as before (issue #1568).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`, through `render_card_grid_to_buffer`).
+- **Agent:** none.
+- **Asserts:** seven role cards on a 79x20 deck, where even Minimal needs 21 of the 18 card rows, draw three 5-row Compact cards and a title carrying `(↓4)`; the buffer matches a snapshot recorded before the Minimal tier existed.
+- **Does not assert:** scrolling by selection (`dashboard/grid/003`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/density/009 — The real binary draws every card at Minimal when Compact cannot fit them (issue #1568).
+- **Layer:** L2 (PTY + vt100, real `dot-agent-deck` binary, `tests/e2e_card_density.rs`).
+- **Agent:** none — eight synthetic Claude Code `SessionStart` hook events written to the deck's hook socket.
+- **Asserts:** in a 79x30 terminal, which holds eight cards at the 3-row Minimal height but not at Compact's 5, all eight cards appear, each 3 rows tall (measured from the drawn corners), each with a `Dir:` row and a `Last:` counter, and the deck title carries no `↑`/`↓` marker.
+- **Does not assert:** a real agent's card content (density selection does not depend on what reports the session); status rows at Minimal (`dashboard/density/007`).
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, for the hook socket).
 
 #### dashboard/grid
 

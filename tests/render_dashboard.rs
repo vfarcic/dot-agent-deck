@@ -2280,7 +2280,7 @@ fn trailing_blank_inner_rows(buffer: &ratatui::buffer::Buffer) -> usize {
 }
 
 /// Scenario: Render a single fully-populated session card at each density tier
-/// (Compact, Normal, Spacious) in a wide 80-column viewport sized to the tier's
+/// (Minimal, Compact, Normal, Spacious) in a wide 80-column viewport sized to the tier's
 /// own `rendered_height`, then assert the card has zero trailing blank rows —
 /// the row directly above the bottom border carries rendered content on every
 /// tier. This locks in PRD #147's content-derived `card_height`: the reserved
@@ -2299,6 +2299,7 @@ fn density_004_no_trailing_blank_rows() {
     let session = filled_session();
     let width: u16 = 80;
     for (density, label) in [
+        (CardDensityKind::Minimal, "Minimal"),
         (CardDensityKind::Compact, "Compact"),
         (CardDensityKind::Normal, "Normal"),
         (CardDensityKind::Spacious, "Spacious"),
@@ -2429,9 +2430,10 @@ fn density_005_spacious_idle_shows_flashing_dot_over_card_content() {
     insta::assert_snapshot!(flash_on);
 }
 
-/// Replicate `choose_density`'s tier selection using the public
+/// Replicate the renderer's tier selection using the public
 /// `rendered_height` seam: pick the largest tier whose stacked card rows fit
-/// in `avail`, falling back to Compact. Mirrors `src/ui.rs::choose_density` so
+/// in `avail`, falling back to Compact. For a width that holds one card column this is what
+/// `src/ui.rs::choose_grid_layout` picks (issue #1568's Minimal tier included), so
 /// the orchestration capacity test tracks the same selection the renderer uses
 /// without depending on the private function.
 fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
@@ -2440,6 +2442,7 @@ fn pick_density(n_decks: usize, cols: usize, avail: u16) -> CardDensityKind {
         CardDensityKind::Spacious,
         CardDensityKind::Normal,
         CardDensityKind::Compact,
+        CardDensityKind::Minimal,
     ] {
         if rows * density.rendered_height() <= avail {
             return density;
@@ -3550,4 +3553,199 @@ fn grid_003_unavoidable_overflow_is_signalled() {
         "selecting the last card scrolls five cards above the window, and the \
          title must say so:\n{scrolled_title}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// dashboard/density — the 3-row Minimal tier (issue #1568)
+// ---------------------------------------------------------------------------
+
+/// The height of every card in a SINGLE-COLUMN grid, top to bottom, read off
+/// the drawn border corners: a card runs from a row whose first cell is a
+/// top-left corner (`┌`, or `┏` when selected) to the next row whose first cell
+/// is a bottom-left corner (`└` / `┗`). Measured from the buffer rather than
+/// asked of the layout code, like [`drawn_cards`].
+fn single_column_card_heights(rendered: &str) -> Vec<usize> {
+    let mut heights = Vec::new();
+    let mut top = None;
+    for (y, line) in rendered.lines().enumerate() {
+        match line.chars().next() {
+            Some('┌' | '┏') => top = Some(y),
+            Some('└' | '┗') => {
+                if let Some(t) = top.take() {
+                    heights.push(y - t + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    heights
+}
+
+/// The rendered card whose top border carries `name`, as its rows — so an
+/// assertion can talk about one card of a grid without depending on where in
+/// the buffer the layout put it.
+fn card_rows<'a>(rendered: &'a str, name: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let top = lines
+        .iter()
+        .position(|line| line.contains(name))
+        .unwrap_or_else(|| panic!("no card titled {name:?}:\n{rendered}"));
+    let bottom = lines[top..]
+        .iter()
+        .position(|line| line.starts_with('└') || line.starts_with('┗'))
+        .unwrap_or_else(|| panic!("card {name:?} has no bottom border:\n{rendered}"));
+    lines[top..=top + bottom].to_vec()
+}
+
+/// Scenario: Render the seven-role orchestration into a 79-column deck — one
+/// column, since 79 columns cannot hold two cards — that is 25 rows tall, too
+/// short for seven 5-row Compact cards. Every card is drawn at 3 rows with its
+/// name and status on the top border, its `Dir:` row, and `Last:` / `Tools:`
+/// counters on the bottom border, and nothing scrolls. A 37-row control deck,
+/// where Compact fits, still draws every card at Compact's 5 rows.
+#[spec("dashboard/density/006")]
+#[test]
+fn density_006_minimal_cards_replace_scrolling_when_compact_cannot_fit() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // Control first: 37 rows leaves 35 for cards, exactly seven Compact cards.
+    // The snapshot pins that a deck which fits at Compact renders exactly as it
+    // did before the Minimal tier existed.
+    let (control_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 37);
+    let control = buffer_to_text(&control_buffer);
+    assert_eq!(
+        single_column_card_heights(&control),
+        vec![5; REPORTED_ROLES.len()],
+        "control: a deck that fits at Compact keeps its 5-row cards:\n{control}"
+    );
+    assert!(
+        !control.lines().next().unwrap_or_default().contains('↓'),
+        "control: nothing is hidden:\n{control}"
+    );
+    insta::assert_snapshot!("density_006_compact_control", control);
+
+    // 25 rows leaves 23: seven Compact cards need 35, seven Minimal cards 21.
+    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert_eq!(probe.nav_columns, 1, "79 columns holds one card column");
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![3; REPORTED_ROLES.len()],
+        "every card must be drawn, each at the 3-row Minimal height:\n{rendered}"
+    );
+    assert!(
+        !title.contains('↓') && !title.contains('↑'),
+        "Minimal replaces scrolling, so no card may be hidden:\n{title}"
+    );
+    for role in REPORTED_ROLES {
+        let card = card_rows(&rendered, role);
+        assert_eq!(
+            card.len(),
+            3,
+            "{role}: a Minimal card is 3 rows:\n{rendered}"
+        );
+        assert!(
+            card[0].contains("Idle"),
+            "{role}: the top border keeps the status badge:\n{rendered}"
+        );
+        assert!(
+            card[1].contains("Dir:  dot-agent-deck"),
+            "{role}: the middle row is the Dir row:\n{rendered}"
+        );
+        assert!(
+            card[2].contains("Last:") && card[2].contains("Tools:"),
+            "{role}: the bottom border keeps its counters:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!("density_006_minimal", rendered);
+}
+
+/// Scenario: Render the seven-role deck at the Minimal height with the second
+/// role Blocked on depleted credits and the third orphaned. Each of those two
+/// cards shows its status row where the `Dir:` row would be, because a 3-row
+/// card has no spare row and the status matters more than the directory; the
+/// other five cards keep their `Dir:` row.
+#[spec("dashboard/density/007")]
+#[test]
+fn density_007_minimal_status_row_takes_the_dir_rows_place() {
+    let mut sessions = reported_role_sessions();
+    sessions[1].status = SessionStatus::Blocked;
+    sessions[1].blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: None,
+    });
+    sessions[2].orchestration_orphaned = true;
+    let cards = as_cards(&sessions);
+
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 25);
+    let rendered = buffer_to_text(&buffer);
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![3; REPORTED_ROLES.len()],
+        "the fixture must land in the Minimal tier:\n{rendered}"
+    );
+
+    let blocked = card_rows(&rendered, REPORTED_ROLES[1]);
+    assert!(
+        blocked[0].contains("Blocked"),
+        "the Blocked badge stays on the top border:\n{rendered}"
+    );
+    assert!(
+        blocked[1].contains('⚠') && blocked[1].contains("Credits"),
+        "a Minimal Blocked card shows its reason in the middle row:\n{rendered}"
+    );
+    assert!(
+        !blocked[1].contains("Dir:"),
+        "the Blocked reason takes the Dir row's place:\n{rendered}"
+    );
+
+    let orphaned = card_rows(&rendered, REPORTED_ROLES[2]);
+    assert!(
+        orphaned[1].contains("Orphaned — delegation unavailable"),
+        "a Minimal orphaned card shows its status in the middle row:\n{rendered}"
+    );
+    assert!(
+        !orphaned[1].contains("Dir:"),
+        "the Orphaned row takes the Dir row's place:\n{rendered}"
+    );
+
+    for role in [0, 3, 4, 5, 6].map(|i| REPORTED_ROLES[i]) {
+        assert!(
+            card_rows(&rendered, role)[1].contains("Dir:"),
+            "{role}: a card with no status row keeps its Dir row:\n{rendered}"
+        );
+    }
+    insta::assert_snapshot!(rendered);
+}
+
+/// Scenario: Render the seven-role deck into a 79x20 deck, too short for seven
+/// cards even at the 3-row Minimal height. The grid scrolls exactly as it did
+/// before Minimal existed: three 5-row Compact cards are drawn and the title
+/// counts the four below the window.
+#[spec("dashboard/density/008")]
+#[test]
+fn density_008_a_deck_too_large_for_minimal_scrolls_at_compact() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // 20 rows leaves 18: seven Minimal cards need 21.
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, render_now(), 79, 20);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert_eq!(
+        single_column_card_heights(&rendered),
+        vec![5; 3],
+        "an overflowing deck keeps Compact's 5-row cards, three of which fit:\n{rendered}"
+    );
+    assert!(
+        title.contains("(↓4)"),
+        "the title counts the cards below the window:\n{title}"
+    );
+    insta::assert_snapshot!(rendered);
 }
