@@ -1459,6 +1459,18 @@ fn resolve_param(
         // A recency word is an ORDER, settled below, not a fact an agent
         // has to account for (Qodo on PR #1529).
         Recency::said(&mut said);
+        // Nor is the daemon these agents are on, set aside the way
+        // `resolve_agent_ref_on` sets it aside ("the Codex agent on staging").
+        let sequence = word_sequence(&heard_facts);
+        for name in decks
+            .iter()
+            .filter(|deck| deck.holds_agents)
+            .flat_map(daemon_names)
+        {
+            if name.said_of(&sequence, agents, false) {
+                said.retain(|word| !name.words.contains(word));
+            }
+        }
         let content: BTreeSet<String> = content.intersection(&said).cloned().collect();
         agents
             .iter()
@@ -2880,7 +2892,16 @@ fn quotes_last_prompt(spoken: &str, agent: &DesktopAgent) -> bool {
     // #1529): every word but the last must match, the last may be cut short.
     // Only a quote that SAYS it was cut, with the ellipsis it was shown with:
     // otherwise "Fix the cat" would also reach "Fix the catalogue".
-    let cut = spoken.trim_end().ends_with('\u{2026}');
+    let cut = spoken.trim_end().ends_with('\u{2026}')
+        && agent.last_user_prompt.as_deref().is_some_and(|prompt| {
+            prompt
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .count()
+                > super::prompt::LAST_PROMPT_CHARS
+        });
     quoted.len() >= QUOTED_PROMPT_WORDS
         && prompt.len() >= quoted.len()
         && prompt.starts_with(whole)
@@ -3133,25 +3154,28 @@ enum Recency {
 }
 
 impl Recency {
-    const NEWEST: [&'static str; 6] = [
-        "newest", "latest", "youngest", "recent", "recently", "newer",
-    ];
+    /// Not "recent" or "recently" alone: "the one I recently asked to fix
+    /// the scroll" is a task, not an order (Qodo on PR #1529). "Most recent"
+    /// is read below.
+    const NEWEST: [&'static str; 4] = ["newest", "latest", "youngest", "newer"];
     const OLDEST: [&'static str; 3] = ["oldest", "earliest", "older"];
 
     /// The recency `said` asks for, with its words taken out of it ("most"
     /// too, from "most recent"). `None` when it asks for none, or for both.
     fn said(said: &mut BTreeSet<String>) -> Option<Self> {
-        let newest = Self::NEWEST.iter().any(|word| said.contains(*word));
+        let newest = Self::NEWEST.iter().any(|word| said.contains(*word))
+            || (said.contains("most") && said.contains("recent"));
         let oldest = Self::OLDEST.iter().any(|word| said.contains(*word));
         let recency = match (newest, oldest) {
             (true, false) => Self::Newest,
             (false, true) => Self::Oldest,
             _ => return None,
         };
+        let most_recent = said.contains("most") && said.contains("recent");
         said.retain(|word| {
             !Self::NEWEST.contains(&word.as_str())
                 && !Self::OLDEST.contains(&word.as_str())
-                && word != "most"
+                && !(most_recent && (word == "most" || word == "recent"))
         });
         Some(recency)
     }
@@ -4150,7 +4174,15 @@ pub(super) fn directory_name(path: &str) -> Option<&str> {
 /// or `_` spelled as a space — so `schedule: issues` is two words, and
 /// `deploy@build-box` three, the way they are said.
 fn spoken_text(value: &str) -> String {
-    value
+    // A control or bidi character is DROPPED, as the model is shown it
+    // (`prompt::shown`), not read as a word break — "qa\u{202e}runner" is shown
+    // as `qarunner` and must be named that way (Qodo on PR #1529). Whitespace
+    // is a break first, so a newline still separates two words.
+    let spaced: String = value
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    dot_agent_deck::untrusted_text::strip_control_and_bidi(&spaced, false)
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
@@ -7809,9 +7841,19 @@ mod tests {
 
         // Values the model was shown cut short resolve back: a last prompt
         // cut inside a word, and a long directory name cut with an ellipsis.
+        let mut long_task = agent("22", Some("Sigma"), "codex");
+        long_task.last_user_prompt = Some(
+            "Fix the scroll jump when the terminal pane resizes and keep the cursor where it was before"
+                .to_string(),
+        );
+        let with_task = vec![long_task, agent("23", Some("Upsilon"), "pi")];
         assert!(matches!(
-            resolve_agent_ref_on("Fix the scroll jump when the terminal pane resiz\u{2026}", &agents, &decks()),
-            AgentRefMatch::One { id, .. } if id == "agent-juno"
+            resolve_agent_ref_on(
+                "Fix the scroll jump when the terminal pane resizes and keep the cursor wh\u{2026}",
+                &with_task,
+                &decks()
+            ),
+            AgentRefMatch::One { id, .. } if id == "22"
         ));
         let mut long_named = agent("13", Some("Hydra"), "codex");
         long_named.cwd = Some(format!("/srv/{}", "x".repeat(120)));
@@ -7831,6 +7873,61 @@ mod tests {
             resolve_agent_ref_on("Fix the cat", &pets, &decks()),
             AgentRefMatch::One { id, .. } if id == "16"
         ));
+        // An ellipsis cuts a word only where the prompt shown WAS cut:
+        // "Fix the cat…" is the cat, never the catalogue.
+        assert!(matches!(
+            resolve_agent_ref_on("Fix the cat\u{2026}", &pets, &decks()),
+            AgentRefMatch::One { id, .. } if id == "16"
+        ));
+        // A control or bidi character is dropped as the model is shown it,
+        // not read as a word break.
+        let mut runner = agent("18", Some("Rho"), "codex");
+        runner.tab = DesktopTab::Mode {
+            name: "qa\u{202e}runner".to_string(),
+        };
+        assert!(matches!(
+            resolve_agent_ref_on("the qarunner agent", &[runner, agent("19", Some("Tau"), "pi")], &decks()),
+            AgentRefMatch::One { id, .. } if id == "18"
+        ));
+        // "recently" describes a task, not an order; "most recent" is one.
+        let mut heard: BTreeSet<String> = ["i", "recently", "asked"].map(str::to_string).into();
+        assert_eq!(Recency::said(&mut heard), None);
+        let mut heard: BTreeSet<String> =
+            ["the", "most", "recent", "one"].map(str::to_string).into();
+        assert_eq!(Recency::said(&mut heard), Some(Recency::Newest));
+        // The daemon these agents are on is not a fact either, even when a
+        // run here shares its name: "open the Codex agent on staging".
+        let staging_here = [VoiceDeck {
+            holds_agents: true,
+            ..deck("deck-staging", "ops@staging", false)
+        }];
+        let mut coder = agent("20", Some("Kappa"), "codex");
+        coder.cli_name = Some("codex".to_string());
+        let on_staging = vec![
+            coder,
+            in_titled_orchestration(role_agent("21", "reviewer"), "o3", "staging", "staging"),
+        ];
+        let said = "open the Codex agent on staging";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("open_agent").with_param("agent", "Codex"),
+        );
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &on_staging,
+            &staging_here,
+            None,
+            None,
+            Transcript::new(said),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "20"),
+            "{outcome:?}"
+        );
         // A recency word is an order, not a fact: beside an agent called
         // "newest", "open the newest agent in billing" still opens Juno.
         let mut with_newest = agents.clone();
