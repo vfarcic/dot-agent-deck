@@ -411,11 +411,15 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # (`selector_voice_decks` in `lib.rs`). A deck the New agent dialog disables is
 # still one the selector switches to — switching is how it becomes one a new
 # agent can start on — so this row alone ignores `VoiceDeck::unavailable`
-# (`outcome::SWITCH_DECK_ROW`). The model is shown only the decks a new agent
-# can start on (a disabled deck is withheld from every row, which this row
-# cannot change without a second list in the prompt), so the description tells
-# it that the deck may be one `decks` does not list; the app resolves the
-# user's words against the full list either way.
+# (`outcome::SWITCH_DECK_ROW`). The model is shown every deck, with the ones a
+# new agent cannot start on named in `decks_without_new_agent` (issue #1491),
+# and answers with the one the user meant, however the transcript spelled it.
+# Until #1491 it was shown only the decks a new agent can start on and told to
+# echo the user's words, and the app held those words against the transcript;
+# that refused every daemon the transcriber spelled differently ("mini PC" for
+# `minipc`, "InMotionDeck" for `inmotion`). A switch stops nothing and the
+# next switch undoes it, so the model's pick is trusted as it is for every
+# other reference.
 #
 # **All daemons is voice-reachable through THIS row (issue #1491).** It used to
 # be excluded as "a selection rather than a deck, and 'show every agent' is
@@ -424,8 +428,7 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # and no spoken command reached All daemons. It is one more entry of the
 # selector's list (`selector_voice_decks` appends it, labelled "All daemons"
 # and addressed to the `all` token), rather than a row of its own, because
-# that keeps the existing guards: the same resolver, the same two-sided
-# grounding of the deck against the transcript, the same report, the same
+# that keeps one path: the same resolver, the same report, the same
 # write as the click, and the open menu's numbers, which dispatch this row,
 # reach it with no second path. It carries a reason a new agent cannot start
 # on it, so the New agent dialog neither offers nor preselects it — the same mechanism
@@ -438,10 +441,10 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # `heard_as` carries `daemon` because the selector's own visible label is
 # "Daemon" (the label rule, `docs/develop/voice-first-design.md`; issue #1045
 # renamed it from "Deck"), and keeps `deck`, the older label a user may still
-# say, as `choose_deck` does. Switching is undone by one more switch and stops
-# nothing, so the residual every `heard_as` row carries — "daemon" or "deck"
-# said for another reason while a steered pick is in flight — reaches a
-# visible, reversible change.
+# say, as `choose_deck` does, and `demon`, how speech-to-text writes it.
+# Switching is undone by one more switch and stops nothing, so the residual
+# every `heard_as` row carries — "daemon" or "deck" said for another reason
+# while a steered pick is in flight — reaches a visible, reversible change.
 [[commands]]
 id          = "switch_deck"
 description = """Switch which daemon the app is showing — the Daemon selector at the top of the
@@ -449,13 +452,12 @@ Daemons screen and of the agent dashboard. Use for switch daemon to the build bo
 build box daemon, change the daemon to local, change daemon to ci, select the build box daemon, or
 choose daemon build box. Users who knew the selector by its older name say deck in the same places —
 switch deck to the build box, switch to the build box deck, change the deck to local, select the
-build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the words the user
-used for the daemon. It may name a configured daemon that `decks` does not list, because `decks`
-lists only the daemons a new agent can start on; answer with the user's words all the same. The
-selector's first entry, All daemons, shows every configured daemon at once, and THIS row switches to
-it too: for select all daemons, switch to all daemons, show all daemons or switch daemon to all, set
-`deck` to the user's words for it, such as "all daemons" or "all". Speech-to-text often writes daemon
-as demon ("select mini PC, demon"); demon means daemon here too. This is
+build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the daemon the
+user meant, exactly as listed in `decks`, which lists every daemon the selector shows, including the
+ones in `decks_without_new_agent`. The selector's first entry, All daemons, shows every configured
+daemon at once, and THIS row switches to it too: select all daemons, switch to all daemons, show all
+daemons or switch daemon to all. Speech-to-text often writes daemon as demon ("select mini PC,
+demon"); demon means daemon here too. This is
 not `open_deck`, which only moves from the agent dashboard to the Daemons screen without changing
 which daemon is shown, and it is not `open_overview`, which changes no selection. While the New agent dialog is open this cannot
 run: a request that names a daemon then means the dialog's Daemon field, which is `choose_deck`. It
@@ -880,8 +882,8 @@ description = """In the New agent dialog's directory browser, open one of the di
 on screen — go down into it. Use for open dir billing, open the billing folder, go into src, enter
 docs, cd into api — and when the user NAMES a listed directory with select, choose, pick, go to or
 navigate: select directory billing, choose the api folder, pick src, go to docs, navigate to tests.
-Set `dir` to the words the user used for the directory; it must be one of
-`directories.entries`, the directories on screen right now. This only moves the browser: it
+Set `dir` to the directory the user meant, exactly as listed in `directories.entries` — the
+directories on screen right now — however the transcript spelled it. This only moves the browser: it
 starts nothing and does not choose the directory for the agent (that is `use_this_directory`).
 A request to open a directory is THIS one even when `directories` is absent — the dialog is closed
 or has no listing yet — and the action is then `callable: false`: pick it anyway rather than
@@ -1096,10 +1098,10 @@ description = """In the New agent form, choose one of the Mode chips it offers, 
 plain agent), one NAMED orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher.
 Use for mode schedule, make it a dispatcher, use the billing orchestration, orchestration build,
 orch billing, plain agent, no mode — and for a chip's label read aloud as it is written: "No mode",
-"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the words the user used
-for the chip, copied as they said them — even when they name a chip that is NOT in
-`new_agent_form.modes`: the app then says that chip is not offered, so never answer with the
-nearest chip instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
+"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the chip the user meant,
+exactly as listed in `new_agent_form.modes` or `new_agent_form.modes_not_offered` — when it is one
+the form does NOT offer, the app then says so, so never answer with the nearest offered chip
+instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
 by its name. "Activate orchestration", "activate the orchestration", "start orchestration", "start
 the orchestration" and "start the run" are the Start button's words and mean `start_new_agent` —
 they never choose a chip. This only changes the Mode
@@ -1258,7 +1260,7 @@ the daemon to local, pick the remote daemon, put it on the local daemon, choose 
 daemon's own name said with the word daemon, like "Local daemon". Users who knew the field by its
 older name say deck in the same places — deck build box, use the local deck, pick the remote deck —
 and those mean THIS one too, as does demon, which is how speech-to-text often writes daemon. Set
-`deck` to the words the user used for the daemon; it must be one of `decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
+`deck` to the daemon the user meant, exactly as listed in `decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
 or Command. While the New agent dialog is open, a request that names WHICH daemon the new agent goes
 on is THIS one — never `open_deck`, which leaves the agent dashboard for the Daemons screen, and
 never `open_new_agent`, since the dialog is already open. It starts nothing, and never touches the
@@ -1483,7 +1485,7 @@ the voice form of its card's Close button, whose accessible name is "Close <titl
 The button's visible word is a bare "Close", and a bare "close" is NOT this row: it is `close`,
 which closes a view and stops nothing. Use for close the review orchestration, stop the
 billing run, shut down the whole orchestration, end every role of it, stop all roles, stop all the
-roles. Set `orchestration` to the words the user used for it; it must be one of `orchestrations`.
+roles. Set `orchestration` to the one the user meant, exactly as listed in `orchestrations`.
 The user must NAME the orchestration or the run — "close the agent" or "close the billing agent"
 is `close`, which closes a view and stops nothing. It never stops anything by itself: the app shows
 the same confirmation the Close button shows, naming every role it will stop, and the user

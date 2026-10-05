@@ -3655,8 +3655,8 @@ fn answer_declared_choice(
 /// labelled [`voice::ALL_DECKS_LABEL`] and mapped to the `all` token, so "select
 /// all daemons" switches to it through the same write a click makes. It is a
 /// selection rather than a deck, which is why it carries
-/// [`voice::DECK_IS_EVERY_DAEMON`]: the reason keeps it out of everything the
-/// New agent dialog is asked about — never shown to the model, never
+/// [`voice::DECK_IS_EVERY_DAEMON`]: the reason keeps it out of the New agent
+/// dialog — listed to the model as a deck a new agent cannot start on, never
 /// preselected, refused with that reason when named there — exactly as a deck
 /// the app is not connected to is. It is added past
 /// [`MAX_VOICE_SELECTOR_ROWS`] as well, since the selector always lists it.
@@ -5862,99 +5862,6 @@ mod tests {
             control.outcome
         );
 
-        // A remote daemon NAMED like the entry (Qodo on PR #1504) never takes
-        // the switch silently: "all daemons" still names All daemons, a bare
-        // "all" beside a daemon called `all` asks which (or switches nothing),
-        // and a daemon called `all-daemons` makes "all daemons" ask which.
-        let named = |name: &str| -> crate::settings::EndpointSettings {
-            serde_json::from_value(serde_json::json!({
-                "remote": [
-                    { "id": "rownamed", "host": "named-box", "port": 22, "socket": "/run/deck.sock", "name": name },
-                    { "id": "rowstage", "host": "staging-box", "port": 22, "socket": "/run/deck.sock" },
-                ],
-                "selection": "local",
-            }))
-            .expect("a slug name parses")
-        };
-        let offered = |result: &voice::VoiceResult| match &result.outcome {
-            voice::VoiceOutcome::ParamAmbiguous { candidates, .. } => {
-                let mut tokens: Vec<String> = candidates
-                    .iter()
-                    .map(|candidate| candidate.value.clone())
-                    .collect();
-                tokens.sort();
-                Some(tokens)
-            }
-            _ => None,
-        };
-        let called_all = named("all");
-        let result = resolve_with_section(
-            &called_all,
-            "select all daemons",
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
-        )
-        .await
-        .expect("resolves");
-        assert_eq!(
-            switched_to(&result).map(|(token, ..)| token),
-            Some("all".to_string()),
-            "{:?}",
-            result.outcome
-        );
-        let said = "switch daemon to all";
-        let result = resolve_with_section(
-            &called_all,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "all"),
-        )
-        .await
-        .expect("resolves");
-        assert_eq!(
-            offered(&result),
-            Some(vec!["all".to_string(), "rownamed".to_string()]),
-            "{:?}",
-            result.outcome
-        );
-        // The model completing the bare "all" to the entry's label is words the
-        // user did not say, so nothing switches either way.
-        let result = resolve_with_section(
-            &called_all,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
-        )
-        .await
-        .expect("resolves");
-        assert_eq!(switched_to(&result), None, "{:?}", result.outcome);
-        let result = resolve_with_section(
-            &named("all-daemons"),
-            "select all daemons",
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "all daemons"),
-        )
-        .await
-        .expect("resolves");
-        assert_eq!(
-            offered(&result),
-            Some(vec!["all".to_string(), "rownamed".to_string()]),
-            "{:?}",
-            result.outcome
-        );
-
-        // A daemon with "all" as one word of its name stays reachable by that
-        // name (Qodo on PR #1504): "all hands" names `all-hands` alone.
-        let result = resolve_with_section(
-            &named("all-hands"),
-            "switch daemon to all hands",
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "all hands"),
-        )
-        .await
-        .expect("resolves");
-        assert_eq!(
-            switched_to(&result).map(|(token, ..)| token),
-            Some("rownamed".to_string()),
-            "{:?}",
-            result.outcome
-        );
-
         // All daemons is a selection, not a daemon a new agent can start on:
         // named for the New agent dialog, it is refused with that reason.
         let mut decks = voice_decks(&[], None);
@@ -5985,18 +5892,20 @@ mod tests {
         );
     }
 
-    /// Scenario: a remote daemon is named `minipc`, and the transcriber writes
-    /// the user's "select minipc daemon" the way speech-to-text does — "Select
-    /// mini PC, Demon.": the one-word name split in two, a comma, and "daemon"
-    /// heard as its homophone. The model echoes "mini PC, Demon". The selector
-    /// switches to `minipc` all the same, and so it does for "Demon mini PC.",
-    /// where the homophone is the only word asking for a daemon. The control:
-    /// "switch daemon to minipc", said as configured, switches too.
+    /// Scenario: remote daemons are named `minipc` and `inmotion`, and the
+    /// transcriber writes what the user said the way speech-to-text does:
+    /// "Select mini PC, Demon." (the one-word name split in two, a comma, and
+    /// "daemon" heard as its homophone) and "Switch to InMotionDeck" (the word
+    /// "deck" glued onto the name). The model answers with the listed daemon
+    /// the user meant, and the selector switches to it — the user's words are
+    /// not held against that answer (issue #1491). The controls: each name
+    /// said as configured switches too.
     #[tokio::test]
-    async fn a_switch_reaches_a_daemon_named_as_one_word_when_heard_as_two() {
+    async fn a_switch_reaches_a_daemon_however_the_transcript_spells_its_name() {
         let section: crate::settings::EndpointSettings = serde_json::from_value(serde_json::json!({
             "remote": [
                 { "id": "rowminipc", "host": "10.0.0.7", "port": 22, "socket": "/run/deck.sock", "name": "minipc" },
+                { "id": "rowinmotion", "host": "10.0.0.8", "port": 22, "socket": "/run/deck.sock", "name": "inmotion" },
                 { "id": "rowbuild", "host": "build-box", "port": 22, "socket": "/run/deck.sock" },
             ],
             "selection": "local",
@@ -6008,10 +5917,13 @@ mod tests {
             }
             _ => None,
         };
-        for (said, deck) in [
-            ("Select mini PC, Demon.", "mini PC, Demon"),
-            ("Demon mini PC.", "mini PC"),
-            ("switch daemon to minipc", "minipc"),
+        for (said, deck, row) in [
+            ("Select mini PC, Demon.", "minipc", "rowminipc"),
+            ("Demon mini PC.", "minipc", "rowminipc"),
+            ("switch daemon to minipc", "minipc", "rowminipc"),
+            ("Switch to InMotionDeck", "inmotion", "rowinmotion"),
+            ("Switch to InMotionDaemon.", "inmotion", "rowinmotion"),
+            ("switch to the inmotion deck", "inmotion", "rowinmotion"),
         ] {
             let result = resolve_with_section(
                 &section,
@@ -6022,7 +5934,7 @@ mod tests {
             .expect("resolves");
             assert_eq!(
                 switched_to(&result).as_deref(),
-                Some("rowminipc"),
+                Some(row),
                 "{said:?}: {:?}",
                 result.outcome
             );
@@ -6030,7 +5942,8 @@ mod tests {
     }
 
     /// Scenario: the Deck selector lists a build box and a staging box, and
-    /// the user says "switch deck to build box or staging box". The tie is
+    /// the user says "switch deck to the box", which the model answers with
+    /// "box" — a name both decks answer to. The tie is
     /// offered with each deck's selector token; "two" answers it with the
     /// staging row, and once that row is gone from Settings the same answer
     /// is refused rather than switching to whatever the second deck is now.
@@ -6047,11 +5960,11 @@ mod tests {
             .expect("parses")
         };
         let both = section(&[("rowbuild", "build-box"), ("rowstage", "staging-box")]);
-        let said = "switch deck to build box or staging box";
+        let said = "switch deck to the box";
         let result = resolve_with_section(
             &both,
             said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
+            voice::IntentAnswer::new("switch_deck").with_param("deck", "box"),
         )
         .await
         .expect("resolves");
@@ -6157,70 +6070,6 @@ mod tests {
                 if params[0].value == "local"),
             "{:?}",
             result.outcome
-        );
-    }
-
-    /// Scenario: with that same oversized Deck selector, the user says "switch
-    /// decks, avoid the build box" — a row voice does not reach — and the model
-    /// answers with the build box. The switch is refused for the word "avoid",
-    /// as it would be with any selector, and the sentence still says so: it is
-    /// never replaced by advice to choose the build box in the Deck selector,
-    /// which is the deck the user just excluded (Qodo on PR #1340).
-    #[tokio::test]
-    async fn oversized_selector_section_keeps_a_contrast_refusal_its_own_sentence() {
-        let section = oversized_selector_section();
-        let said = "switch decks, avoid the build box";
-        let result = resolve_with_section(
-            &section,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "build box"),
-        )
-        .await
-        .expect("an oversized section does not fail the utterance");
-        let voice::VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &result.outcome
-        else {
-            panic!("a refusal: {:?}", result.outcome);
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("\u{201c}avoid\u{201d}")
-                && sentence.contains("say just the daemon you want")
-                && !sentence.contains("Daemon selector"),
-            "{sentence}"
-        );
-    }
-
-    /// Scenario: with that same oversized Deck selector, the user says "switch
-    /// deck to the build box" and the model answers with a deck the user never
-    /// said, "staging box", which no deck voice holds either. The refusal says
-    /// it did not catch which deck, as it would with any selector — it does
-    /// not quote the model's "staging box" back inside a sentence pointing at
-    /// the Deck selector (Qodo on PR #1340).
-    #[tokio::test]
-    async fn oversized_selector_section_keeps_a_not_said_refusal_its_own_sentence() {
-        let section = oversized_selector_section();
-        let said = "switch deck to the build box";
-        let result = resolve_with_section(
-            &section,
-            said,
-            voice::IntentAnswer::new("switch_deck").with_param("deck", "staging box"),
-        )
-        .await
-        .expect("an oversized section does not fail the utterance");
-        let voice::VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &result.outcome
-        else {
-            panic!("a refusal: {:?}", result.outcome);
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("I did not catch which daemon")
-                && !sentence.contains("staging box")
-                && !sentence.contains("Daemon selector"),
-            "{sentence}"
         );
     }
 

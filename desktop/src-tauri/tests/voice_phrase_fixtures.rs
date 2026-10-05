@@ -115,8 +115,9 @@ struct PhraseFixture {
     resolved_deck: Option<String>,
     /// The report must say the deck the user named cannot take a new agent
     /// (PRD #1223): the planted `ci@stale-box` cannot take one, so the New
-    /// agent dialog does not list it, it is never offered to the model and
-    /// never preselected, and naming it must be answered with its short reason.
+    /// agent dialog does not list it, the model is shown it only as one in
+    /// `decks_without_new_agent`, it is never preselected, and naming it must be
+    /// answered with its short reason.
     #[serde(default)]
     names_unavailable_deck: bool,
     /// Whether the New agent dialog's directory browser is showing the
@@ -440,8 +441,9 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
     .collect();
     // PRD #1223 — the fleet a `deck_ref` resolves against: this machine's deck
     // and one remote, labelled the way the overview labels them — plus a
-    // remote the New agent dialog shows DISABLED, which the model is never
-    // shown, so no fixture can preselect it (checked on every fixture below).
+    // remote the New agent dialog shows DISABLED, which the model sees only
+    // among `decks_without_new_agent` and no fixture may preselect (checked on
+    // every fixture below).
     // Issue #1491 — and the Daemon selector's All daemons entry, which the app
     // appends to every utterance's decks (`selector_voice_decks`) the same way:
     // switchable, and never offered to the New agent dialog.
@@ -482,6 +484,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
             id: "deck-minipc".to_string(),
             label: "minipc".to_string(),
             address: Some("ops@10.0.0.7".to_string()),
+            local: false,
+            unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
+        },
+        dot_agent_deck_desktop::voice::VoiceDeck {
+            id: "deck-inmotion".to_string(),
+            label: "inmotion".to_string(),
+            address: Some("ops@10.0.0.8".to_string()),
             local: false,
             unavailable: Some(dot_agent_deck_desktop::voice::DECK_NOT_CONNECTED.to_string()),
         },
