@@ -640,10 +640,10 @@ fn delegate_046_real_opencode_recovers_early_pointer_in_place() {
             DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS,
             default_retry_schedule(),
         )
-        // Above this test's 360 s nextest window (`.config/nextest.toml`), so
+        // Above this test's 420 s nextest window (`.config/nextest.toml`), so
         // a slow run fails on its own assertion instead of its daemon being
         // reaped at the 300 s harness default mid-wait (Qodo on PR #1523).
-        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "420")
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "480")
         .with_imported_opencode_credentials()
         .launch_with_fixture("minimal");
     let _preserve_log = PreserveDelegateLogOnFailure(daemon_log_path.clone());

@@ -243,7 +243,10 @@ filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
 # `/046`: the preflight (~60s), the delegate CLI (30s), the replacement's
-# record (20s) and the work-done report (240s): ~350s, so 7 x 60s.
+# record (20s) and the work-done report (240s): ~350s, so 7 x 60s. The test
+# pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 480s, above this
+# window, or its daemon and agents would be reaped at the 300s harness default
+# before the window could be used (Qodo on PR #1523).
 [[profile.default.overrides]]
 filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
 slow-timeout = { period = "60s", terminate-after = 7 }
@@ -565,21 +568,6 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 [[profile.default.overrides]]
 filter = 'test(voice_phrase_fixtures_match_the_default_backend)'
 slow-timeout = { period = "60s", terminate-after = 5 }
-
-# `orchestration/delegate/046` drives a REAL OpenCode worker through a
-# delegation whose first pointer lands during boot, and declares ~310s of its
-# own waits (worker record 20s, delegate CLI 30s, replacement record 20s,
-# work-done 240s) against the default 3 x 60s kill window. Alone it takes ~48s;
-# at load ~60 it was killed at 180s with no diagnostics (met on PR #1523).
-# 6 x 60s = 360s sits just above the declared budget, so a stuck run fails on
-# its own assertion, naming the stage; the test's waits are untouched. The test
-# pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 420s to match, or
-# the daemon and its agents would be reaped at the 300s harness default before
-# this window could be used (Qodo on PR #1523). The filter tracks the TEST
-# FUNCTION name and must follow any rename.
-[[profile.default.overrides]]
-filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
-slow-timeout = { period = "60s", terminate-after = 6 }
 
 # `codex/worker/001` drives a REAL Codex orchestration worker through a
 # delegated task and its `work-done`. Alone it takes 26-110s; beside other
