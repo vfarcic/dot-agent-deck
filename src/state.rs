@@ -11897,7 +11897,11 @@ impl AppState {
     ///
     /// Called with the new subscription already open and BEFORE any of its
     /// events are applied, so the reply was built after everything this state
-    /// holds and is the newer account of every pane it covers.
+    /// holds and is the newer account of every pane it covers. Issue #1555:
+    /// where the daemon offers `SubscribeEventsWithSnapshot`, the reply and the
+    /// subscription are one request, and the daemon opens the subscription at the
+    /// instant it reads the reply's live state, so none of the subscription's
+    /// events is one the reply already includes.
     ///
     /// For each record whose pane this state manages and which carries a live
     /// snapshot:
@@ -11924,11 +11928,13 @@ impl AppState {
     /// What it does NOT repair, deliberately. A record with no live snapshot, and
     /// a pane this state does not manage, are left as they are, and an agent the
     /// reply no longer lists keeps its card: a pane whose agent is gone is ended
-    /// by its own attach stream closing, not by this one. Events already queued
-    /// on the new subscription are applied after the snapshot and can replay a
-    /// transition it already includes, counting a closure twice or briefly
-    /// moving the generation back until the rest of the queue lands; telling
-    /// them apart needs a stream position the wire does not carry. None of these can mis-deliver a prompt:
+    /// by its own attach stream closing, not by this one. From a daemon that
+    /// predates `SubscribeEventsWithSnapshot`, which is resynchronized with
+    /// `SubscribeEvents` then `ListAgents`, events broadcast between those two
+    /// requests are queued on the new subscription AND included in the reply,
+    /// and are applied after it: they can replay a transition it already
+    /// includes, counting a closure twice or briefly moving the generation back
+    /// until the rest of the queue lands. None of these can mis-deliver a prompt:
     /// a delivery that may have written before the gap stops on the gap itself
     /// ([`Self::event_stream_gaps`], bumped here as well, so one written while
     /// the subscriber was disconnected stops too), and one that has not written
