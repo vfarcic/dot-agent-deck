@@ -110,9 +110,10 @@ pub struct VoiceDeck {
     /// preselect from the webview's fleet (`preselectedDeck` in
     /// `desktop/src/lib/newAgent.ts`), and a report that is to agree with the
     /// dialog has to be judged against the same list the dialog judges. A deck
-    /// with a reason is never shown to the model, so it cannot be picked, and
-    /// one resolved anyway from the user's own words is reported as unable to
-    /// take the agent rather than as preselected.
+    /// with a reason is shown to the model only among the decks a new agent
+    /// cannot start on (`decks_without_new_agent`, issue #1491), and one
+    /// resolved anyway for the New agent dialog is reported as unable to take
+    /// the agent rather than as preselected.
     pub unavailable: Option<String>,
 }
 
@@ -168,6 +169,25 @@ pub const DECK_NOT_CONNECTED: &str = "the app is not connected to it; switch to 
 /// The short reason class for a deck the Deck selector lists with no address
 /// yet — `DECK_SHORT_REASON.unconfigured` in `desktop/src/lib/newAgent.ts`.
 pub const DECK_NO_ADDRESS: &str = "it has no address yet";
+
+/// Issue #1491 — the key voice gives the Deck selector's **All daemons**
+/// entry among its decks. Never a fleet key: those are `deck-<16 hex>` or
+/// `unconfigured-<row id>`, so it cannot collide with a deck the app observes.
+/// A switch to it is addressed to the selector's `all` token
+/// (`crate::settings::ALL_SELECTION_TOKEN`) like any other switch.
+pub const ALL_DECKS_ID: &str = "all-daemons";
+
+/// What the Deck selector calls that entry (`deckChoices` in
+/// `desktop/src/lib/endpoints.ts`), so a report names it the way the screen
+/// does: "Showing All daemons."
+pub const ALL_DECKS_LABEL: &str = "All daemons";
+
+/// Why All daemons cannot take a new agent: it is a selection rather than one
+/// deck. It keeps it out of what the New agent dialog preselects — a deck
+/// with a reason is listed to the model as one a new agent cannot start on,
+/// and is never preselected — while `switch_deck`, which ignores the reason,
+/// switches to it.
+pub const DECK_IS_EVERY_DAEMON: &str = "it is every daemon at once; name one daemon";
 
 /// What the New agent dialog's directory browser is showing, as the webview
 /// DECLARED it for one utterance (PRD #1223) — the set a spoken
