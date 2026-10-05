@@ -3805,8 +3805,11 @@ impl SilentWorkerArm {
                 &self.event_tx,
             )
             .await;
+        // A precondition, so its wait returns the moment the pointer lands;
+        // 2 s was overrun twice on a starved box (I/O stalled) while the test
+        // passed 3/3 alone (met on PR #1523). Nothing here times the product.
         let delivered =
-            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(2)).await;
+            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(10)).await;
         assert!(
             delivered.windows(POINTER.len()).any(|w| w == POINTER),
             "silent-worker visibility control failed: the worker never received the delegate \
@@ -4299,11 +4302,13 @@ impl SilenceHarness {
             )
             .await;
         let armed = self.registry.pointer_delivery_epoch(WORKER_PANE);
+        // A precondition: returns as soon as the pointer lands. 2 s was overrun
+        // on a starved box while the test passed 3/3 alone (met on PR #1523).
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
             POINTER,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .await;
         assert!(
