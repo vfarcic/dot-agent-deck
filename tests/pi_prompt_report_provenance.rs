@@ -25,6 +25,8 @@ use tokio::sync::broadcast;
 
 mod common;
 
+use spec::spec;
+
 /// A deck-spawned Pi pane whose extension declares prompt reports.
 const DECLARING_PANE: &str = "pi-provenance-declaring-pane";
 /// A deck-spawned Pi pane whose extension declares nothing (an older one).
@@ -149,8 +151,9 @@ fn capability(state: &AppState, pane_id: &str) -> ConfirmationCapability {
 /// attests both frames to their spawns; only the declaring pane then counts as
 /// one that confirms its own prompts, in the daemon and in a client applying
 /// the broadcast frame, and the other stays one that cannot.
+#[spec("status/agent-event/007")]
 #[test]
-fn an_attested_declaration_makes_only_its_own_pi_pane_confirm_prompts() {
+fn agent_event_007_an_attested_declaration_makes_only_its_own_pi_pane_confirm_prompts() {
     runtime().block_on(async {
         let daemon = common::spawn_inprocess_daemon().await;
         let cwd = common::race_safe_tempdir();
@@ -209,8 +212,9 @@ fn an_attested_declaration_makes_only_its_own_pi_pane_confirm_prompts() {
 /// unproven card and grant nothing, in the daemon or in a client applying
 /// them; the third is refused outright, and the deck's pane stays one that
 /// cannot confirm.
+#[spec("status/agent-event/008")]
 #[test]
-fn an_unattested_declaration_grants_nothing() {
+fn agent_event_008_an_unattested_declaration_grants_nothing() {
     runtime().block_on(async {
         let daemon = common::spawn_inprocess_daemon().await;
         let cwd = common::race_safe_tempdir();

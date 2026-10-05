@@ -755,6 +755,20 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
 - **Platform coverage:** mac+linux+windows.
 
+
+##### status/agent-event/007 — An ATTESTED Pi report declaring prompt reports (`agent-event --reports-prompts`) makes only its own pane one that confirms its prompts; an attested report that declares nothing leaves its pane non-confirming (issue #1567).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon via `common::spawn_inprocess_daemon`, two Pi-typed `cat` stand-ins spawned through its attach socket (each exports its per-spawn hook capability token via `common::capability_export_command`), and the REAL `dot-agent-deck agent-event` CLI run as a subprocess with that pane's token. The daemon's broadcast is applied to a client `AppState`, standing in for an attached TUI.
+- **Agent:** synthetic (stand-in panes; the reports come from the real CLI).
+- **Asserts:** each broadcast frame carries `daemon_attested_owner` naming its own spawn; the declaring pane's frame answers `declares_prompt_reports()` / `reports_submitted_prompt()` true, and the pane reads `ConfirmationCapability::Reports` in the daemon's state and in the client; the non-declaring pane's frame answers false and the pane reads `CannotReport` in both.
+- **Does not assert:** the real Pi extension sending the flag (lane 2: `scheduler/pi/002`, `chain-smoke/pi/003`); what a confirming pane's delivery then does (`spawn::tests::a_spawned_pi_pane_is_resubmitted_only_when_its_extension_declares_prompt_reports`).
+- **Platform coverage:** mac+linux.
+
+##### status/agent-event/008 — A Pi prompt-report declaration the hook-provenance gate does NOT attest grants nothing: an outside pane's token-less report, the same with a forged `daemon_attested_owner`, and a token-less report claiming a deck-spawned Pi pane (issue #1567, PR #1559's gate).
+- **Layer:** fast tier (`tests/pi_prompt_report_provenance.rs`, `cfg(unix)`): an in-process daemon, the REAL `agent-event` CLI with no token, and one raw JSON line written straight to the daemon's hook socket. The daemon's broadcast is applied to a client `AppState`.
+- **Agent:** synthetic (an outside pane the daemon never spawned, and a Pi-typed `cat` stand-in it did).
+- **Asserts:** the outside pane's CLI frame is broadcast `daemon_unproven` with no attested owner and declares nothing; the raw forged frame arrives with the producer's `daemon_attested_owner` STRIPPED and declares nothing; neither makes the outside pane `Reports` in the client or the daemon, and the daemon's outside card never records `prompt_reports_declared`; the token-less frame naming the deck-spawned Pi pane is refused (no broadcast within 1.5 s) and that pane is not `Reports`. RED with the attestation requirement removed from `AgentEvent::declares_prompt_reports`.
+- **Does not assert:** the same-uid residual `docs/develop/hook-provenance.md` names (a process that reads a deck agent's own token can speak for that pane); `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`, under which a token-less frame for a deck pane is admitted but carries no attestation stamp, so it declares nothing by the same rule.
+- **Platform coverage:** mac+linux.
 #### status/supersede
 
 ##### status/supersede/001 — A real scheduler agent supersedes its friendly `No agent` placeholder without creating a duplicate card or losing the task name.
