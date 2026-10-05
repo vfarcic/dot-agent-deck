@@ -1617,6 +1617,13 @@ pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
     /// Remembers started_at per pane so a `/clear` restart keeps its position.
     pane_started_at: HashMap<String, DateTime<Utc>>,
+    /// Issue #1507: per pane, the daemon registry id its card-surfacing
+    /// `SessionStart` named ([`crate::event::SURFACED_AGENT_ID_METADATA_KEY`]),
+    /// as a number. Read by the dashboard's creation-order sort for a card
+    /// that has no `agent_id` of its own yet — a live-surfaced card before its
+    /// agent's first real hook, or a pane that never sends one. Order only:
+    /// nothing here is identity, and dropped with the pane.
+    pane_surfaced_agent_seq: HashMap<String, u64>,
     /// Set by the background version-check task when a newer release exists.
     pub update_available: Option<String>,
     /// Pane ids this process holds as its OWN: panes it registered itself
@@ -11509,6 +11516,9 @@ impl AppState {
         // comparing against it, enough to get the successor's card deleted by
         // the render-thread half. A pane id reused after a close is a new pane.
         self.pane_started_at.remove(pane_id);
+        // Issue #1507: likewise its surfaced creation order — a successor on a
+        // reused pane id surfaces with its own.
+        self.pane_surfaced_agent_seq.remove(pane_id);
         if !self
             .sessions
             .values()
@@ -12802,6 +12812,7 @@ impl AppState {
     /// identity for the pane goes with the entry regardless of variant.
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
+        self.pane_surfaced_agent_seq.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
@@ -12819,6 +12830,12 @@ impl AppState {
                 spawn_context_removal(path);
             }
         }
+    }
+
+    /// Issue #1507: the daemon registry id `pane_id`'s card-surfacing
+    /// `SessionStart` named, as a number — see `pane_surfaced_agent_seq`.
+    pub fn pane_surfaced_agent_seq(&self, pane_id: &str) -> Option<u64> {
+        self.pane_surfaced_agent_seq.get(pane_id).copied()
     }
 
     /// Drop EVERY session belonging to `pane_id`, returning how many went.
@@ -16163,6 +16180,22 @@ impl AppState {
             .and_then(|n| crate::untrusted_text::sanitize_display_name(n))
         {
             session.display_name = Some(name);
+        }
+
+        // Issue #1507: a daemon card-surfacing start names the registry id of
+        // the agent it draws, for creation order only — the session's own
+        // `agent_id` stays `None` so the agent's real `SessionStart` still
+        // supersedes it. Only the daemon's marked start is read: a hook cannot
+        // move a card by claiming an id. (The marker is producer-writable, so a
+        // forged one can reorder a card, which is all this key can do.)
+        if event.is_card_surface_session_start()
+            && let Some(pane_id) = event.pane_id.as_ref()
+            && let Some(seq) = event
+                .metadata
+                .get(crate::event::SURFACED_AGENT_ID_METADATA_KEY)
+                .and_then(|id| id.parse::<u64>().ok())
+        {
+            self.pane_surfaced_agent_seq.insert(pane_id.clone(), seq);
         }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {
