@@ -299,7 +299,10 @@ impl Emitter {
     /// the detector for it costs nothing. Inline otherwise — a socket write,
     /// which must not happen under the detector lock.
     fn send_classified(&self, event: &AgentEvent, det: std::sync::MutexGuard<'_, Detector>) {
-        let json = serde_json::to_string(event).ok();
+        // With the pane's capability token, as every other frame this wrapper
+        // sends (issue #318): without it the daemon reads the frame as
+        // unproven and it moves no card.
+        let json = crate::event::agent_event_line(event, self.token.as_deref()).ok();
         match (&self.classified_sender, json) {
             (Some(sender), Some(json)) => {
                 sender.post(json);
@@ -3195,6 +3198,7 @@ mod tests {
                 session_id: "wrap-test".to_string(),
                 pane_id: None,
                 agent_id: None,
+                token: None,
                 cwd: None,
                 live_target: LiveTarget {
                     kind: TargetKind::Process,

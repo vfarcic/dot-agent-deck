@@ -16273,7 +16273,7 @@ impl AppState {
         // arm reports for itself rather than being classified from outside,
         // because "does this event type write a status" is a property of the
         // arm's own conditional and drifts the moment one is edited.
-        let asserted_status = Self::apply_status_transition(session, &event);
+        let asserted_status = Self::apply_status_transition(session, &event, newest_before);
 
         // Issue #770: carry the daemon's orphaned-role verdict onto the card.
         // One-way: the marker only ever ARRIVES (see the field's doc comment for
@@ -16367,7 +16367,15 @@ impl AppState {
     /// event type but `SessionEnd`, which the caller handles first. Shared with
     /// [`Self::apply_orphan_survivor_report`], so the one card an orphaned role
     /// pane's report may reach follows exactly the status rules every card does.
-    fn apply_status_transition(session: &mut SessionState, event: &AgentEvent) -> bool {
+    ///
+    /// `newest_before` is the session's `last_activity` as it stood BEFORE this
+    /// frame advanced it: issue #1493's wrapper frames stamped older than it are
+    /// stale and assert nothing.
+    fn apply_status_transition(
+        session: &mut SessionState,
+        event: &AgentEvent,
+        newest_before: DateTime<Utc>,
+    ) -> bool {
         // Issue #714: a `Blocked` card is STICKY. The provider has refused the
         // agent, and the frames that typically trail that refusal — OpenCode's
         // `session.idle` after its `session.error`, Claude Code's `idle_prompt`
@@ -16782,6 +16790,7 @@ impl AppState {
         if event.is_orchestration_orphaned() {
             session.orchestration_orphaned = true;
         }
+        let newest_before = session.last_activity;
         if event.timestamp > session.last_activity {
             session.last_activity = event.timestamp;
         }
@@ -16793,7 +16802,7 @@ impl AppState {
             session.shell_synthetic_working = false;
             return AppliedEvent::StatusAsserted;
         }
-        let asserted = Self::apply_status_transition(session, &event);
+        let asserted = Self::apply_status_transition(session, &event, newest_before);
         event.session_id = card_id.to_string();
         // Qodo, PR #1559: the card's live target is not reporting state, so the
         // report carries the card's own — never one of its own, which would

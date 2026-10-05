@@ -427,7 +427,6 @@ fn process_is_gone(pid: u32) -> bool {
     rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-
 /// What [`backup_malformed`] did with the bytes it was handed, so
 /// [`preserved_phrase`] can say exactly that and nothing more.
 #[derive(Clone, Debug, PartialEq, Eq)]
