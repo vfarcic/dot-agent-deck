@@ -430,6 +430,25 @@ describe("the agent dashboard scrolls while voice is on", () => {
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
   });
 
+  /** Scenario: a fleet of 1,001 agents numbers its first 1,000 rows and leaves the last one unnumbered, since a numbered list voice can answer holds at most 1,000 items. */
+  it("numbers at most 1,000 dashboard rows", async () => {
+    const deck = runtime(microphone(), true);
+    const base = deck.snapshot;
+    const template = base.agents.find((agent) => agent.tab.kind === "dashboard")!;
+    deck.snapshot = {
+      ...base,
+      agents: Array.from({ length: 1001 }, (_, index) => ({ ...template, id: `bulk-${index + 1}`, displayName: `bulk ${index + 1}` })),
+      totalNodes: 1001,
+    };
+    deck.fleet = [deck.snapshot];
+    render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+    await turnOnVoice();
+    const rows = Array.from(document.querySelectorAll(".overview-row"));
+    expect(rows).toHaveLength(1001);
+    expect(rows[999]).toHaveAttribute("data-voice-number", "1000");
+    expect(rows[1000]).not.toHaveAttribute("data-voice-number");
+  });
+
   /** Scenario: with voice on, the dashboard's agent rows carry one continuous sequence of numbers across every daemon, 1 to the last row, with no number repeated. */
   it("numbers every dashboard row once, continuously across daemons", async () => {
     const deck = runtime(microphone(), true);

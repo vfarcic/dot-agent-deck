@@ -31,7 +31,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, DASHBOARD_COVERED } from "./components/AgentOverview";
+import { AgentOverview, DASHBOARD_COVERED, modalOpen } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -820,11 +820,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
       /* Issue #1492 — the dashboard's scroll, refused while anything is in
          front of it: a dialog layer (the open Daemon selector's menu), the
-         Settings sheet or a stop confirmation. Voice acts on what is in front,
+         Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
          and a dashboard moved behind an overlay is somewhere unexpected when
          the overlay closes. */
       ...(overviewVoiceContext.current?.scrollDashboard
-        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
         : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),

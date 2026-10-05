@@ -79,20 +79,29 @@ test.describe("scroll indicators", () => {
     await openDashboard(page, 420);
     const region = page.locator(".overview-body");
     const top = () => region.evaluate((element) => element.scrollTop);
+    // Page and Home/End scroll smoothly: the next key is pressed once the last one has finished moving it.
+    const settled = async () => {
+      let last = -1;
+      await expect.poll(async () => { const now = await top(); const still = now === last; last = now; return still; }, { intervals: [150] }).toBe(true);
+    };
     const room = await region.evaluate((element) => element.scrollHeight - element.clientHeight);
     expect(room).toBeGreaterThan(0);
 
     await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
     await page.keyboard.press("PageDown");
     await expect.poll(top).toBeGreaterThan(0);
+    await settled();
     await page.keyboard.press("End");
     await expect.poll(top).toBeGreaterThanOrEqual(room - 1);
+    await settled();
     await page.keyboard.press("Home");
     await expect.poll(top).toBe(0);
 
+    await settled();
     await page.getByTestId("overview-refresh").focus();
     await page.keyboard.press("PageDown");
     await expect.poll(top).toBeGreaterThan(0);
+    await settled();
     await page.keyboard.press("PageUp");
     await expect.poll(top).toBe(0);
 
@@ -101,8 +110,16 @@ test.describe("scroll indicators", () => {
     await expect.poll(top).toBeGreaterThan(0);
 
     // Settings leaves the dashboard's rows mounted, so this is the stand-down
-    // for keys pressed inside a dialog rather than the handler being absent.
+    // for an open dialog rather than the handler being absent. First with
+    // focus left on the rail button that opened it, outside the sheet.
     await page.getByTestId("open-settings").click();
+    await expect(page.getByTestId("open-settings")).toBeFocused();
+    await page.waitForTimeout(500);
+    const fromRail = await top();
+    await page.keyboard.press("End");
+    await page.keyboard.press("PageDown");
+    await page.waitForTimeout(500);
+    expect(await top()).toBe(fromRail);
     await page.getByRole("button", { name: "Close settings" }).focus();
     await page.waitForTimeout(500);
     const behindSettings = await top();

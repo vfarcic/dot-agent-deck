@@ -684,6 +684,24 @@ function dashboardKeyScroll(key: string, shift: boolean, nothingFocused: boolean
   return undefined;
 }
 
+/**
+ * Whether a modal is open over the dashboard — Settings, a confirmation, any
+ * sheet that declares itself one — wherever focus is. Opening Settings from
+ * the rail leaves focus on the rail button, outside the sheet, so where a key
+ * was pressed does not tell whether the dashboard is covered.
+ */
+export function modalOpen(): boolean {
+  return document.querySelector("[aria-modal='true']") !== null;
+}
+
+/**
+ * The most dashboard rows that carry a number: the most items a numbered list
+ * may declare to voice (`MAX_VOICE_NUMBERED_ENTRIES` in `src-tauri/src/lib.rs`,
+ * which refuses a longer list and with it every voice command on the screen).
+ * Rows past it are still listed and still chosen by name.
+ */
+const MAX_NUMBERED_ROWS = 1_000;
+
 /** Already at the bottom, for "scroll down". */
 export const DASHBOARD_AT_BOTTOM = "The dashboard is already at the bottom.";
 /** Already at the top, for "scroll up". */
@@ -1127,7 +1145,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const numberedAgents = useMemo(() => (
     !rowsShown
       ? undefined
-      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.groups.flatMap((group) => group.agents) : []))
+      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.groups.flatMap((group) => group.agents) : [])).slice(0, MAX_NUMBERED_ROWS)
   ), [decks, rowsShown]);
   const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
     kind: "agent",
@@ -1150,7 +1168,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   useEffect(() => {
     if (!rowsShown || confirm) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || modalOpen()) return;
       const target = event.target;
       const nothingFocused = !(target instanceof Element) || target === document.body || target === document.documentElement;
       if (!nothingFocused && target.closest(DASHBOARD_KEYS_STAY)) return;
