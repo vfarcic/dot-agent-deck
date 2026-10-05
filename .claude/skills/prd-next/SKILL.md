@@ -34,6 +34,7 @@ You are helping analyze an existing Product Requirements Document (PRD) to sugge
 - **Clear work context** - Discussion of specific features, tasks, or requirements for a known PRD
 
 **If context is clear:**
+- Locate it first if this conversation has not already: `bash .claude/skills/prd-start/prd-source.sh [issue-id]`, and stop on `SOURCE=none` as Step 1 says
 - Skip to Step 6 (Single Task Recommendation) using the known PRD 
 - Use conversation history to understand current state and recent progress
 - Proceed directly with task recommendation based on known PRD status

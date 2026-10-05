@@ -600,6 +600,30 @@ fn prd_skills_021_worktree_prd_looks_the_prd_up_even_with_a_title_supplied() {
     assert!(!sb.calls().contains("worktree add"), "{}", sb.calls());
 }
 
+/// `/prd-start <n>` must not bypass the lookup. A number passed as an
+/// argument used to jump from Step 0 straight to Step 2, skipping the
+/// `prd-source.sh` call that refuses a stub, closed or non-collaborator issue
+/// before anything is assigned or branched (#1592 review). So the lookup is
+/// its own step, and every shortcut to Step 2 routes through it.
+#[test]
+fn prd_skills_022_prd_start_never_skips_the_lookup() {
+    let text = fs::read_to_string(repo_root().join(".claude/skills/prd-start/SKILL.md"))
+        .expect("read prd-start/SKILL.md");
+    assert!(
+        text.contains("## Step 1b: Locate the PRD (Always)") && text.contains("prd-source.sh"),
+        "prd-start must keep its always-run lookup step"
+    );
+    let bypasses: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("to Step 2") && !l.contains("Step 1b"))
+        .collect();
+    assert!(
+        bypasses.is_empty(),
+        "these route to Step 2 without the Step 1b lookup:\n{}",
+        bypasses.join("\n")
+    );
+}
+
 /// The body template `issue-prd.md` documents, which `prd-create` writes, is
 /// one the script accepts — so the documented layout and the check that gates
 /// `prd-queue` cannot drift apart.

@@ -26,7 +26,7 @@ You are helping initiate active implementation work on a specific Product Requir
 **If `prdNumber` argument is provided ({{prdNumber}}):**
 - Skip context check and auto-detection
 - Use PRD #{{prdNumber}} directly
-- Proceed to Step 2 (PRD Readiness Validation)
+- Proceed to Step 1b (Locate the PRD), then Step 2 (PRD Readiness Validation)
 
 **If `prdNumber` argument is NOT provided:**
 - Continue to context awareness check below
@@ -42,7 +42,7 @@ You are helping initiate active implementation work on a specific Product Requir
 - **Clear work context** - Discussion of specific features, tasks, or requirements for a known PRD
 
 **If context is clear:**
-- Skip to Step 2 (PRD Readiness Validation) using the known PRD
+- Skip to Step 1b (Locate the PRD) using the known PRD, then Step 2
 
 **If context is unclear:**
 - Continue to Step 1 (PRD Detection)
@@ -87,7 +87,10 @@ Execute `/prds-get` to see all available PRDs organized by priority and readines
 **Your choice**: [Wait for user input]
 ```
 
-**Once PRD is identified, locate it:**
+## Step 1b: Locate the PRD (Always)
+
+**Every path reaches this step** — a number passed as an argument, a PRD clear from context, or one detected in Step 1. It is what refuses a number that is not a PRD (a stub issue, a closed one, one a non-collaborator opened) before anything is assigned or branched.
+
 ```bash
 bash .claude/skills/prd-start/prd-source.sh [issue-id]
 ```
