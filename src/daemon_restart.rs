@@ -537,20 +537,38 @@ pub fn restart_decision(
 ///   `InProgress`.
 /// - `successor` is the verified target, consumed by `run_daemon_with` after
 ///   the sockets are released.
+/// - `stopped` is set by every stop path (`StopDaemon`, `KIND_SHUTDOWN`, a
+///   termination signal) through [`Self::request_stop`]. It is written and
+///   read under `successor`'s lock, together with the successor itself, so a
+///   stop and an acceptance cannot interleave: a stop clears a successor
+///   already latched, and an acceptance after a stop latches nothing. A stop
+///   always wins over a restart (PRD #1487, Qodo 4201244680).
 #[derive(Debug)]
 pub struct RestartControl {
     lock: tokio::sync::Mutex<()>,
     accepted: AtomicBool,
     successor: StdMutex<Option<PathBuf>>,
+    stopped: AtomicBool,
     handed_off: AtomicBool,
     install: InstallRecord,
     /// The identity of the verified successor, for the re-check just before it
     /// is spawned (audit A5). `None` when nothing was verified.
     pinned: StdMutex<Option<VerifiedTarget>>,
-    /// A pause the restart handler takes just before it writes `Accepted`, so
-    /// a unit test can interleave work with a reservation it holds.
+    /// A pause the restart handler takes at one [`RestartPause`] point, so a
+    /// unit test can interleave work with a reservation it holds.
     #[cfg(test)]
-    checkpoint: StdMutex<Option<RestartCheckpoint>>,
+    checkpoint: StdMutex<Option<(RestartPause, RestartCheckpoint)>>,
+}
+
+/// Where the restart handler pauses for an armed [`RestartCheckpoint`] (test
+/// only).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartPause {
+    /// Every check passed; `Accepted` is not written yet.
+    BeforeAccepting,
+    /// `Accepted` is written; the successor is not latched yet.
+    AfterAccepting,
 }
 
 /// One pause in the restart handler (test only): it signals `reached`, then
@@ -568,6 +586,7 @@ impl RestartControl {
             lock: tokio::sync::Mutex::new(()),
             accepted: AtomicBool::new(false),
             successor: StdMutex::new(None),
+            stopped: AtomicBool::new(false),
             handed_off: AtomicBool::new(false),
             install,
             pinned: StdMutex::new(None),
@@ -579,15 +598,33 @@ impl RestartControl {
     /// Arm a one-shot pause before the next acceptance is written (test only).
     #[cfg(test)]
     pub(crate) fn pause_before_accepting(&self) -> RestartCheckpoint {
+        self.pause_at(RestartPause::BeforeAccepting)
+    }
+
+    /// Arm a one-shot pause at `at` (test only).
+    #[cfg(test)]
+    pub(crate) fn pause_at(&self, at: RestartPause) -> RestartCheckpoint {
         let checkpoint = RestartCheckpoint::default();
-        *self.checkpoint.lock().unwrap() = Some(checkpoint.clone());
+        *self.checkpoint.lock().unwrap() = Some((at, checkpoint.clone()));
         checkpoint
     }
 
-    /// Take the armed pause, if any (test only).
+    /// Whether a restart handler holds the lock (test only).
     #[cfg(test)]
-    pub(crate) async fn checkpoint(&self) {
-        let armed = self.checkpoint.lock().unwrap().take();
+    pub(crate) fn handler_busy(&self) -> bool {
+        self.lock.try_lock().is_err()
+    }
+
+    /// Take the pause armed for `at`, if any (test only).
+    #[cfg(test)]
+    pub(crate) async fn checkpoint(&self, at: RestartPause) {
+        let armed = {
+            let mut slot = self.checkpoint.lock().unwrap();
+            match slot.as_ref() {
+                Some((armed_at, _)) if *armed_at == at => slot.take().map(|(_, c)| c),
+                _ => None,
+            }
+        };
         if let Some(checkpoint) = armed {
             checkpoint.reached.notify_one();
             checkpoint.resume.notified().await;
@@ -602,32 +639,74 @@ impl RestartControl {
     /// Take the handler lock, or `None` when another restart holds it or one
     /// was already accepted.
     pub fn try_begin(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        if self.accepted.load(Ordering::SeqCst) {
+        if self.accepted.load(Ordering::SeqCst) || self.is_stop_requested() {
             return None;
         }
         let guard = self.lock.try_lock().ok()?;
         // Re-check under the lock: a request accepted between the load above
         // and the lock must still win.
-        if self.accepted.load(Ordering::SeqCst) {
+        if self.accepted.load(Ordering::SeqCst) || self.is_stop_requested() {
             return None;
         }
         Some(guard)
     }
 
     /// Latch the acceptance and record the successor to spawn (`None` in
-    /// `ClientSpawns` mode, where the client starts its own build).
-    pub fn mark_accepted(&self, successor: Option<PathBuf>) {
-        *self.successor.lock().unwrap_or_else(|p| p.into_inner()) = successor;
-        self.accepted.store(true, Ordering::SeqCst);
+    /// `ClientSpawns` mode, where the client starts its own build). Returns
+    /// `false`, latching nothing, when a stop was requested first: the daemon
+    /// then just stops.
+    pub fn mark_accepted(&self, successor: Option<PathBuf>) -> bool {
+        self.latch(successor, None)
     }
 
     /// [`Self::mark_accepted`] for a successor that was verified, keeping what
     /// was verified so [`Self::recheck_successor`] can tell whether the file at
     /// that path is still the one checked (audit A5).
-    pub fn mark_accepted_verified(&self, verified: VerifiedTarget) {
+    pub fn mark_accepted_verified(&self, verified: VerifiedTarget) -> bool {
         let path = verified.path.clone();
-        *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = Some(verified);
-        self.mark_accepted(Some(path));
+        self.latch(Some(path), Some(verified))
+    }
+
+    fn latch(&self, successor: Option<PathBuf>, verified: Option<VerifiedTarget>) -> bool {
+        let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        if verified.is_some() {
+            *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = verified;
+        }
+        *slot = successor;
+        self.accepted.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// A stop path is tearing this daemon down: no successor may start after
+    /// it. Clears a successor already latched and makes every later
+    /// [`Self::mark_accepted`] latch nothing. Returns whether a restart had
+    /// already been accepted, so the caller can say it was overridden.
+    pub fn request_stop(&self) -> bool {
+        let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        self.stopped.store(true, Ordering::SeqCst);
+        *slot = None;
+        *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    /// [`Self::request_stop`] for the stop path named by `via`, logging when it
+    /// overrides a restart that was already accepted.
+    pub fn stop_wins(&self, via: &str) {
+        if self.request_stop() {
+            tracing::warn!(
+                via,
+                "a stop arrived after a restart was accepted; the daemon stops without \
+                 starting a successor"
+            );
+        }
+    }
+
+    /// Whether a stop path has called [`Self::request_stop`].
+    pub fn is_stop_requested(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Just before `target` is spawned: whether it may be. Passes when nothing
@@ -1242,6 +1321,53 @@ mod tests {
             Some(PathBuf::from("/x/dot-agent-deck"))
         );
         assert_eq!(control.take_successor(), None, "consumed once");
+    }
+
+    /// Scenario: a restart is accepted with a successor latched, then a stop
+    /// arrives before the daemon exits. The stop clears the successor, so the
+    /// daemon just stops — under no supervisor it spawns nothing, and under a
+    /// service manager it exits cleanly instead of asking for a restart (PRD
+    /// #1487, Qodo 4201244680).
+    #[test]
+    fn a_stop_after_acceptance_clears_the_latched_successor() {
+        for supervisor in [Supervisor::None, Supervisor::Systemd] {
+            let control = RestartControl::new(InstallRecord {
+                startup_exe: PathBuf::from("/x/dot-agent-deck"),
+                supervisor,
+            });
+            assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+            assert!(
+                control.request_stop(),
+                "the stop reports it overrode a restart"
+            );
+            assert!(control.is_stop_requested());
+            assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+            assert!(!control.handed_to_supervisor());
+        }
+    }
+
+    /// Scenario: a stop arrives while a restart is still being checked. The
+    /// restart's later acceptance latches nothing, and no new restart may
+    /// begin (PRD #1487, Qodo 4201244680).
+    #[cfg(unix)]
+    #[test]
+    fn an_acceptance_after_a_stop_latches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(dir.path(), "dad", "echo 'dot-agent-deck 0.46.0'", 0o755);
+        let control = RestartControl::default();
+        let held = control.try_begin().expect("the restart takes the lock");
+        assert!(!control.request_stop(), "nothing was accepted yet");
+        assert!(!control.mark_accepted_verified(
+            verify_restart_target_pinned(&p, None, RESTART_VERIFY_TIMEOUT).unwrap(),
+        ));
+        drop(held);
+        assert!(!control.is_accepted());
+        assert_eq!(control.recheck_successor(&p), Ok(SuccessorCheck::NotPinned));
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(
+            control.try_begin().is_none(),
+            "no restart begins once a stop was requested"
+        );
     }
 
     // ---- supervision ----

@@ -247,7 +247,7 @@ impl UpgradeOutcome {
                 stage,
                 reason,
                 installed_version,
-                ..
+                old_daemon_gone,
             } => {
                 let doing = match stage {
                     UpgradeStage::Installing => "installing the new build",
@@ -268,6 +268,14 @@ impl UpgradeOutcome {
                     )),
                     (UpgradeStage::Installing, Some(v)) => text.push_str(&format!(
                         "\n{v} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Run `dot-agent-deck remote upgrade {deck}` again to finish."
+                    )),
+                    // Qodo 4201244671: a daemon that may have stopped is
+                    // never said to keep running.
+                    (_, Some(v)) if *old_daemon_gone => text.push_str(&format!(
+                        "\n{v} is installed. The daemon that was running may have stopped; `dot-agent-deck connect {deck}` shows what is answering now."
+                    )),
+                    (_, None) if *old_daemon_gone => text.push_str(&format!(
+                        "\nThe daemon that was running may have stopped; `dot-agent-deck connect {deck}` shows what is answering now."
                     )),
                     (_, Some(v)) => text.push_str(&format!(
                         "\n{v} is installed; the daemon that was running keeps running."
@@ -1732,6 +1740,51 @@ mod tests {
             !failed.to_lowercase().contains("nothing was changed"),
             "{failed}"
         );
+    }
+
+    /// Scenario: a restart fails after its reply was lost and the old daemon
+    /// no longer answers as itself. The summary does not claim the old daemon
+    /// keeps running: it says it may have stopped and that connecting shows
+    /// what answers now. A restart the old daemon refused still says it keeps
+    /// running (PRD #1487, Qodo 4201244671).
+    #[test]
+    fn a_restart_failure_with_the_old_daemon_gone_does_not_say_it_keeps_running() {
+        for installed_version in [Some("0.45.0".to_string()), None] {
+            let gone = UpgradeOutcome::Failed {
+                stage: UpgradeStage::Restarting,
+                reason: "the restart reply was lost".into(),
+                installed_version: installed_version.clone(),
+                old_daemon_gone: true,
+            }
+            .summary("box");
+            assert!(!gone.contains("keeps running"), "{gone}");
+            assert!(
+                gone.contains("The daemon that was running may have stopped"),
+                "{gone}"
+            );
+            assert!(
+                gone.contains("`dot-agent-deck connect box` shows what is answering now"),
+                "{gone}"
+            );
+            assert_eq!(
+                gone.contains("0.45.0 is installed"),
+                installed_version.is_some(),
+                "{gone}"
+            );
+
+            let refused = UpgradeOutcome::Failed {
+                stage: UpgradeStage::Restarting,
+                reason: "refused".into(),
+                installed_version,
+                old_daemon_gone: false,
+            }
+            .summary("box");
+            assert!(
+                refused.contains("the daemon that was running keeps running")
+                    || refused.contains("The daemon that was running keeps running"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

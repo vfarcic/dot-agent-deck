@@ -149,6 +149,38 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     expect(outcomeView(outcomes[10][1], "build-box", "upgrade").body[0]).toBe("It failed while checking the restarted daemon: the new daemon did not answer within 20s");
   });
 
+  /**
+   * Scenario: a restart fails after its reply was lost and the old daemon no
+   * longer answers as itself (`oldDaemonGone`). The dialog does not say the
+   * old daemon keeps running: it says it may have stopped and that Reconnect
+   * shows what answers now. A restart the old daemon refused still says it
+   * keeps running (Qodo 4201244671).
+   */
+  it("does not say a daemon that may have stopped keeps running", () => {
+    const restarting = (installedVersion: string | undefined, oldDaemonGone: boolean): UpgradeOutcome => ({
+      outcome: "failed",
+      stage: "restarting",
+      reason: "the restart reply was lost",
+      installedVersion,
+      oldDaemonGone,
+    });
+    expect(outcomeView(restarting("0.45.0", true), "build-box", "upgrade").body[1]).toBe(
+      "0.45.0 is installed. The daemon that was running may have stopped; Reconnect shows what is answering now.",
+    );
+    expect(outcomeView(restarting(undefined, true), "build-box", "upgrade").body[1]).toBe(
+      "The daemon that was running may have stopped; Reconnect shows what is answering now.",
+    );
+    expect(outcomeView(restarting(undefined, true), "this machine", "replace").body[1]).toBe(
+      "The daemon that was running may have stopped; Reconnect shows what is answering now.",
+    );
+    for (const kind of ["upgrade", "replace"] as const) {
+      expect(outcomeView(restarting("0.45.0", true), "build-box", kind).body.join(" ")).not.toMatch(/keeps running/);
+    }
+    expect(outcomeView(restarting("0.45.0", false), "build-box", "upgrade").body[1]).toBe(
+      "0.45.0 is installed; the daemon that was running keeps running.",
+    );
+  });
+
   it("says a replaced binary that failed its version check is in place, not that nothing changed", () => {
     const failed = (installedVersion: string): UpgradeOutcome => ({
       outcome: "failed",

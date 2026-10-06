@@ -78,10 +78,15 @@ const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
 /// the orchestration roles at stake before the drain empties both. The full
 /// argument, including the two shapes that were rejected, is in
 /// `docs/develop/daemon-teardown-paths.md`.
+///
+/// PRD #1487: `restart` is told first, so a stop wins over a restart under way
+/// or already accepted — no successor starts after a signal asked the daemon
+/// to stop.
 fn spawn_termination_signal_watch(
     shutdown: Arc<Notify>,
     registry: Arc<AgentPtyRegistry>,
     state: SharedState,
+    restart: Arc<crate::daemon_restart::RestartControl>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
@@ -113,6 +118,7 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            restart.stop_wins("signal");
             // Issue #1109: say WHICH, before the drain below empties the
             // registry this reads. Ordered ahead of the drain for that reason
             // and not merely for tidiness — `agent_records` filters to live
@@ -179,6 +185,7 @@ fn spawn_termination_signal_watch(
                 "daemon received termination signal; initiating graceful shutdown \
                  (every managed agent will be stopped)"
             );
+            restart.stop_wins("signal");
             // Issue #1109: same disclosure, same position, as the Unix arm
             // above; see its comment for why it precedes the drain.
             crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
@@ -884,8 +891,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Production termination watch: route SIGTERM/SIGINT through the same
     // `shutdown` notify. Armed unconditionally — unlike the two backstops
     // below, this is not test-only: `daemon stop` IS a SIGTERM.
-    let signal_handle =
-        spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone(), state.clone());
+    let signal_handle = spawn_termination_signal_watch(
+        shutdown.clone(),
+        pty_registry.clone(),
+        state.clone(),
+        restart_control.clone(),
+    );
 
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle

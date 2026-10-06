@@ -253,8 +253,16 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
       // A failed install can still have put the new version in place (the
       // hooks or the deck list failed after it landed), so "nothing changed"
       // is never claimed: the text says what is installed and what runs.
+      // A daemon that may have stopped (the restart's reply was lost and it no
+      // longer answers as itself) is never said to keep running (Qodo
+      // 4201244671).
+      const mayHaveStopped = "The daemon that was running may have stopped; Reconnect shows what is answering now.";
       const after = outcome.stage === "verifying"
         ? "The old daemon was asked to restart; Reconnect shows whatever is answering now."
+        : outcome.oldDaemonGone === true
+          ? outcome.installedVersion && kind !== "replace"
+            ? `${sentenceStart(outcome.installedVersion)} is installed. ${mayHaveStopped}`
+            : mayHaveStopped
         : outcome.installedVersion && kind !== "replace"
           ? outcome.stage === "installing"
             ? `${sentenceStart(outcome.installedVersion)} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.`
