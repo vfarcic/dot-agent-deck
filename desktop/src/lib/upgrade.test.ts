@@ -72,6 +72,8 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     ["failed restarting", { outcome: "failed", stage: "restarting", reason: "the installed build did not answer", installedVersion: "0.45.0" }],
     ["failed verifying", { outcome: "failed", stage: "verifying", reason: "the new daemon did not answer within 20s", installedVersion: "0.45.0" }],
     ["installed build too old", { outcome: "installed-not-restarted", installedVersion: "0.40.0", reason: { kind: "installed-build-too-old" } }],
+    ["older daemon busy", { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "older-daemon-busy", atStake: AT_STAKE } }],
+    ["failed after the build landed", { outcome: "failed", stage: "installing", reason: "0.45.0 was installed, but reinstalling the hooks failed: settings.json is not writable", installedVersion: "0.45.0" }],
   ];
 
   it.each(outcomes)("%s renders a title and at least one sentence, with no internals", (_name, outcome) => {
@@ -110,6 +112,17 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     expect(outcomeView(outcomes[2][1], "this machine", "replace").body.join(" ")).toContain("Press Replace daemon again");
   });
 
+  it("names what runs on an older daemon Replace would not stop, and how to finish", () => {
+    const view = outcomeView(outcomes[12][1], "this machine", "replace");
+    expect(view.tone).toBe("neutral");
+    expect(view.title).toBe("Daemon kept running");
+    expect(view.body).toEqual([
+      "The daemon keeps running 0.44.0. It is too old to restart itself, so it is replaced only when nothing is running on it, and these are running:",
+      "Stop them, or let them finish, then press Replace daemon again.",
+    ]);
+    expect(view.list).toEqual(stopSetLines(AT_STAKE));
+  });
+
   it("carries the crate's remedy for a daemon too old to restart itself", () => {
     const view = outcomeView(outcomes[7][1], "build-box", "upgrade");
     expect(view.body[0]).toContain("the daemon running there (0.30.0) is too old to be restarted from this app");
@@ -121,8 +134,17 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     expect(installing.tone).toBe("failure");
     expect(installing.body).toEqual([
       "It failed while installing the new version: ssh: connection timed out",
-      "Nothing was changed; the daemon that was running keeps running.",
+      "The daemon that was running keeps running.",
     ]);
+    expect(outcomeView(outcomes[13][1], "build-box", "upgrade").body).toEqual([
+      "It failed while installing the new version: 0.45.0 was installed, but reinstalling the hooks failed: settings.json is not writable",
+      "0.45.0 is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.",
+    ]);
+    for (const [, outcome] of outcomes) {
+      for (const kind of ["upgrade", "replace"] as const) {
+        expect(outcomeView(outcome, "build-box", kind).body.join(" ")).not.toMatch(/nothing was changed/i);
+      }
+    }
     expect(outcomeView(outcomes[9][1], "build-box", "upgrade").body[1]).toBe("0.45.0 is installed; the daemon that was running keeps running.");
     expect(outcomeView(outcomes[10][1], "build-box", "upgrade").body[0]).toBe("It failed while checking the restarted daemon: the new daemon did not answer within 20s");
   });

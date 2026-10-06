@@ -101,6 +101,10 @@ pub enum NotRestartedReason {
     /// daemon (an older release named with `--version`, or an older Homebrew
     /// tap release), so it could not ask the daemon anything.
     InstalledBuildTooOld,
+    /// The local daemon predates the restart request, so it can only be
+    /// stopped from outside — and that is done only while nothing runs on it.
+    /// These were running when it was checked, so it was not stopped.
+    OlderDaemonBusy { at_stake: RestartStopSet },
 }
 
 /// The stage an upgrade is in, for progress and for [`UpgradeOutcome::Failed`].
@@ -185,6 +189,10 @@ impl UpgradeOutcome {
                         "Installed {installed_version} on '{deck}'. The daemon was not restarted, because {installed_version} is too old to restart it from here; the daemon that was running keeps running. {}",
                         installed_too_old_remedy(deck, installed_version)
                     ),
+                    NotRestartedReason::OlderDaemonBusy { at_stake } => format!(
+                        "The daemon on '{deck}' was not replaced: it is too old to restart itself, and it is replaced only when nothing is running on it. Running on it:\n{}{running} Stop them, or let them finish, then try again.",
+                        describe_stop_set(at_stake)
+                    ),
                 }
             }
             Self::InstalledDaemonTooOld {
@@ -219,11 +227,14 @@ impl UpgradeOutcome {
                     (UpgradeStage::Verifying, Some(v)) => text.push_str(&format!(
                         "\n{v} is installed; the daemon was asked to restart onto it, and the next one to start runs it."
                     )),
+                    (UpgradeStage::Installing, Some(v)) => text.push_str(&format!(
+                        "\n{v} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Run `dot-agent-deck remote upgrade {deck}` again to finish."
+                    )),
                     (_, Some(v)) => text.push_str(&format!(
                         "\n{v} is installed; the daemon that was running keeps running."
                     )),
                     (_, None) => {
-                        text.push_str("\nNothing was changed; the daemon that was running keeps running.")
+                        text.push_str("\nThe daemon that was running keeps running.")
                     }
                 }
                 text
@@ -321,9 +332,28 @@ pub struct InstalledBuild {
     pub binary: String,
 }
 
-/// Puts a build in place. `Err` is a plain-language reason.
+/// Why an [`Installer`] did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallError {
+    /// In plain language, naming the step that failed.
+    pub reason: String,
+    /// Set when the new build was already in place and a step after it (the
+    /// hooks, the deck list) failed — the build is not rolled back.
+    pub installed_version: Option<String>,
+}
+
+impl From<String> for InstallError {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            installed_version: None,
+        }
+    }
+}
+
+/// Puts a build in place.
 pub trait Installer {
-    fn install(&self, version: &str) -> Result<InstalledBuild, String>;
+    fn install(&self, version: &str) -> Result<InstalledBuild, InstallError>;
 }
 
 /// Why a [`DaemonPort`] call — the probe or the restart request — got no
@@ -335,6 +365,10 @@ pub enum PortError {
     /// S1, so the restart path no longer blames the daemon). Not a failure of the upgrade — the build is in
     /// place — so it becomes [`NotRestartedReason::InstalledBuildTooOld`].
     InstalledBuildTooOld(String),
+    /// The restart request ran, but its reply could not be read (cut off,
+    /// empty, or not this build's JSON). The daemon may or may not have
+    /// restarted, so the upgrade checks before it says which.
+    ReplyUnreadable(String),
     /// Anything else, in plain language.
     Other(String),
 }
@@ -342,7 +376,9 @@ pub enum PortError {
 impl std::fmt::Display for PortError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InstalledBuildTooOld(reason) | Self::Other(reason) => f.write_str(reason),
+            Self::InstalledBuildTooOld(reason)
+            | Self::ReplyUnreadable(reason)
+            | Self::Other(reason) => f.write_str(reason),
         }
     }
 }
@@ -384,7 +420,9 @@ pub trait DaemonPort {
     }
     /// A fallback for a daemon without the restart request. `None` (the
     /// default, and every remote) gives [`UpgradeOutcome::InstalledDaemonTooOld`].
-    fn legacy_restart(&self, _decider: &dyn RestartDecider) -> Option<UpgradeOutcome> {
+    /// It asks no one: such a daemon cannot hold new starts while a question
+    /// is open, so it is restarted only when idle.
+    fn legacy_restart(&self) -> Option<UpgradeOutcome> {
         None
     }
 }
@@ -543,11 +581,14 @@ fn run_upgrade(
     });
     let installed = match installer.install(&plan.version) {
         Ok(build) => build,
-        Err(reason) => {
+        Err(InstallError {
+            reason,
+            installed_version,
+        }) => {
             return UpgradeOutcome::Failed {
                 stage: UpgradeStage::Installing,
                 reason,
-                installed_version: None,
+                installed_version,
             };
         }
     };
@@ -578,7 +619,9 @@ fn run_upgrade(
                 reason: NotRestartedReason::InstalledBuildTooOld,
             };
         }
-        Err(PortError::Other(reason)) => return restarting_failed(reason),
+        Err(PortError::Other(reason) | PortError::ReplyUnreadable(reason)) => {
+            return restarting_failed(reason);
+        }
     };
     let from_version = hello.daemon_version.clone();
     let from_build = hello.build_version.clone();
@@ -601,8 +644,41 @@ fn run_upgrade(
                 return not_restarted(NotRestartedReason::InstalledBuildTooOld);
             }
             Err(PortError::Other(reason)) => return restarting_failed(reason),
+            // The request may have been carried out: say so only if the
+            // daemon now runs the new build. Under the daemon's policy it
+            // accepted only an idle daemon or the set it was asked to confirm.
+            Err(PortError::ReplyUnreadable(reason))
+                if plan.successor == RestartSuccessor::Installed =>
+            {
+                progress(UpgradeProgress {
+                    stage: UpgradeStage::Verifying,
+                    detail: None,
+                });
+                let expected = Expect::Version(installed.version.clone());
+                return match wait_for_successor(
+                    daemon,
+                    &expected,
+                    from_build.as_deref(),
+                    false,
+                    timing,
+                ) {
+                    Ok(()) => UpgradeOutcome::Restarted {
+                        from_version: from_version
+                            .clone()
+                            .unwrap_or_else(|| "an unknown version".into()),
+                        to_version: installed.version.clone(),
+                        stopped: confirm.unwrap_or_default(),
+                    },
+                    Err(_) => restarting_failed(format!(
+                        "the restart reply could not be read ({reason}), and the daemon did not come back on {} within {}s",
+                        installed.version,
+                        timing.timeout.as_secs()
+                    )),
+                };
+            }
+            Err(PortError::ReplyUnreadable(reason)) => return restarting_failed(reason),
             Ok(GatedQuery::Unsupported) => {
-                return daemon.legacy_restart(decider).unwrap_or_else(|| {
+                return daemon.legacy_restart().unwrap_or_else(|| {
                     UpgradeOutcome::InstalledDaemonTooOld {
                         installed_version: installed.version.clone(),
                         daemon_version: from_version.clone(),
@@ -885,7 +961,7 @@ impl SshInstaller<SystemSshExecutor> {
 }
 
 impl<E: SshExecutor> Installer for SshInstaller<E> {
-    fn install(&self, version: &str) -> Result<InstalledBuild, String> {
+    fn install(&self, version: &str) -> Result<InstalledBuild, InstallError> {
         let opts = crate::remote::UpgradeOptions {
             name: self.name.clone(),
             version: version.to_string(),
@@ -899,7 +975,10 @@ impl<E: SshExecutor> Installer for SshInstaller<E> {
             &self.remotes_path,
             &mut *out,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| InstallError {
+            installed_version: e.installed_version().map(str::to_string),
+            reason: e.to_string(),
+        })?;
         let method = if entry.install.as_deref() == Some(crate::remote::INSTALL_HOMEBREW) {
             InstallMethod::Homebrew
         } else {
@@ -918,7 +997,7 @@ impl<E: SshExecutor> Installer for SshInstaller<E> {
 pub struct NoInstall;
 
 impl Installer for NoInstall {
-    fn install(&self, _version: &str) -> Result<InstalledBuild, String> {
+    fn install(&self, _version: &str) -> Result<InstalledBuild, InstallError> {
         let binary = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -967,12 +1046,18 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
             // The installed build is too old to drive the restart (Homebrew
             // can land an older tap release): the daemon was never asked, and
             // it is the installed build that is too old, not the daemon.
-            Err(RemoteDaemonError::Unsupported { .. } | RemoteDaemonError::Malformed(_)) => {
+            Err(RemoteDaemonError::Unsupported { .. }) => {
                 Err(PortError::InstalledBuildTooOld(format!(
                     "the installed build at {} is too old to ask the running daemon to restart",
                     self.binary()
                 )))
             }
+            // The same build just answered `daemon probe`, so it is new enough;
+            // the reply went bad after the request ran, and the remote may
+            // already have restarted.
+            Err(RemoteDaemonError::Malformed(reason)) => Err(PortError::ReplyUnreadable(format!(
+                "the restart reply could not be read: {reason}"
+            ))),
             Err(e) => Err(PortError::Other(e.to_string())),
         }
     }
@@ -1063,20 +1148,33 @@ impl DaemonPort for WireDaemonPort {
     }
 
     /// A local daemon without the restart request: the existing stop path,
-    /// after asking `decider` about the same agents and roles the request
-    /// would have named. Only for a local deck; a remote one gets `None`.
-    fn legacy_restart(&self, decider: &dyn RestartDecider) -> Option<UpgradeOutcome> {
+    /// for an idle daemon only. Only for a local deck; a remote one gets
+    /// `None`.
+    fn legacy_restart(&self) -> Option<UpgradeOutcome> {
         let local = self.local.clone()?;
-        Some(self.legacy_restart_local(&local, decider))
+        Some(self.legacy_restart_local(&local))
     }
 }
 
 impl WireDaemonPort {
-    fn legacy_restart_local(
-        &self,
-        local: &LocalEndpoint,
-        decider: &dyn RestartDecider,
-    ) -> UpgradeOutcome {
+    /// Replace a local daemon that predates the restart request — only when
+    /// nothing runs on it (PRD #1487 review).
+    ///
+    /// Such a daemon cannot be asked to hold new agent starts while someone
+    /// answers "these would stop; restart now?", so an answer could never
+    /// cover what the stop would actually take down: an agent started while
+    /// the question was open would be stopped unnamed. So no one is asked.
+    /// The unforced [`run_daemon_stop`](crate::daemon_stop::run_daemon_stop)
+    /// lists the daemon's agents and orchestration roles itself immediately
+    /// before it signals, and refuses if there are any; that refusal becomes
+    /// [`NotRestartedReason::OlderDaemonBusy`], naming them.
+    ///
+    /// **Residual window:** between that listing and the signal (one local
+    /// round trip, then the signal) an agent can still be started by another
+    /// client or a schedule, and it is stopped with the daemon. An older
+    /// daemon has no way to freeze new starts, so this narrows the window
+    /// from "while the user decides" to that gap; it does not close it.
+    fn legacy_restart_local(&self, local: &LocalEndpoint) -> UpgradeOutcome {
         use crate::daemon_stop::{StopError, StopOutcome, run_daemon_stop};
         let version = CLIENT_VERSION.to_string();
         let failed = |stage, reason: String| UpgradeOutcome::Failed {
@@ -1096,43 +1194,30 @@ impl WireDaemonPort {
             Err(reason) => return failed(UpgradeStage::Restarting, reason.to_string()),
         };
         let from_version = hello.daemon_version.clone();
-        // The unforced stop refuses while anything is live — the same refusal
-        // `daemon stop` gives — and stops an idle daemon outright.
-        let mut stopped = RestartStopSet::default();
-        let first = self.handle.block_on(run_daemon_stop(local, false));
-        let stop = match first {
-            Err(StopError::LiveAgents { .. } | StopError::LiveOrchestrations { .. }) => {
-                let agents = match self.handle.block_on(self.client.list_agents()) {
-                    Ok(agents) => agents,
-                    Err(e) => return failed(UpgradeStage::Restarting, e.to_string()),
-                };
-                let roles = match first {
-                    Err(StopError::LiveOrchestrations { roles }) => roles,
-                    _ => Vec::new(),
-                };
-                let at_stake = crate::daemon_restart::stop_set(&roles, &agents);
-                let not_restarted = |reason| UpgradeOutcome::InstalledNotRestarted {
-                    from_version: from_version.clone(),
-                    installed_version: version.clone(),
-                    reason,
-                };
-                match decider.decide("local", &at_stake, false) {
-                    RestartChoice::RestartNow => {}
-                    RestartChoice::KeepCurrent => {
-                        return not_restarted(NotRestartedReason::KeptByUser { at_stake });
-                    }
-                    RestartChoice::NoOneToAsk => {
-                        return not_restarted(NotRestartedReason::NoOneToAsk { at_stake });
-                    }
-                }
-                stopped = at_stake;
-                self.handle.block_on(run_daemon_stop(local, true))
-            }
-            other => other,
-        };
-        match stop {
+        match self.handle.block_on(run_daemon_stop(local, false)) {
             Ok(StopOutcome::NoDaemonRunning | StopOutcome::Stopped { .. })
             | Ok(StopOutcome::ForceKilled { .. }) => {}
+            Err(
+                refusal @ (StopError::LiveAgents { .. } | StopError::LiveOrchestrations { .. }),
+            ) => {
+                let roles = match refusal {
+                    StopError::LiveOrchestrations { roles } => roles,
+                    _ => Vec::new(),
+                };
+                // Naming the agents is best-effort: the stop already refused,
+                // so a failed listing changes only what the outcome names.
+                let agents = self
+                    .handle
+                    .block_on(self.client.list_agents())
+                    .unwrap_or_default();
+                return UpgradeOutcome::InstalledNotRestarted {
+                    from_version,
+                    installed_version: version,
+                    reason: NotRestartedReason::OlderDaemonBusy {
+                        at_stake: crate::daemon_restart::stop_set(&roles, &agents),
+                    },
+                };
+            }
             Err(e) => return failed(UpgradeStage::Restarting, e.to_string()),
         }
         if let Err(reason) = self.release_then_spawn() {
@@ -1143,7 +1228,7 @@ impl WireDaemonPort {
             Ok(()) => UpgradeOutcome::Restarted {
                 from_version: from_version.unwrap_or_else(|| "an unknown version".into()),
                 to_version: version,
-                stopped,
+                stopped: RestartStopSet::default(),
             },
             Err(reason) => failed(UpgradeStage::Verifying, reason),
         }
@@ -1165,7 +1250,7 @@ mod tests {
     };
 
     struct FakeInstaller {
-        result: Result<InstalledBuild, String>,
+        result: Result<InstalledBuild, InstallError>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -1185,14 +1270,24 @@ mod tests {
         }
         fn failing(reason: &str) -> Self {
             Self {
-                result: Err(reason.into()),
+                result: Err(reason.to_string().into()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+        /// The build landed, then a later install step failed.
+        fn partly(version: &str, reason: &str) -> Self {
+            Self {
+                result: Err(InstallError {
+                    reason: reason.into(),
+                    installed_version: Some(version.into()),
+                }),
                 calls: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl Installer for FakeInstaller {
-        fn install(&self, version: &str) -> Result<InstalledBuild, String> {
+        fn install(&self, version: &str) -> Result<InstalledBuild, InstallError> {
             self.calls.borrow_mut().push(version.into());
             self.result.clone()
         }
@@ -1256,7 +1351,7 @@ mod tests {
             self.spawned.set(self.spawned.get() + 1);
             self.spawn_result.clone()
         }
-        fn legacy_restart(&self, _decider: &dyn RestartDecider) -> Option<UpgradeOutcome> {
+        fn legacy_restart(&self) -> Option<UpgradeOutcome> {
             self.legacy.clone()
         }
     }
@@ -1407,6 +1502,65 @@ mod tests {
         assert_eq!(stages, [UpgradeStage::Installing]);
         assert!(port.requests.borrow().is_empty());
         assert!(port.installed.borrow().is_none());
+    }
+
+    /// PRD #1487 review: the build landed and a later install step (hooks,
+    /// deck list) failed. The failure keeps the installed version and the
+    /// step, touches no daemon, and its summary says the new build is
+    /// installed and how to finish — never that nothing was changed.
+    #[test]
+    fn a_partial_install_keeps_its_version_and_says_how_to_finish() {
+        let port = FakePort::new(vec![], vec![]);
+        let reason =
+            "0.2.0 was installed, but reinstalling the hooks failed: settings.json is not writable";
+        let (outcome, stages) = run(
+            &FakeInstaller::partly("0.2.0", reason),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::Failed {
+                stage: UpgradeStage::Installing,
+                reason: reason.into(),
+                installed_version: Some("0.2.0".into()),
+            }
+        );
+        assert_eq!(stages, [UpgradeStage::Installing]);
+        assert!(port.requests.borrow().is_empty());
+        let summary = outcome.summary("box");
+        assert!(
+            summary.contains("reinstalling the hooks failed"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "0.2.0 is installed, but the upgrade stopped before restarting the daemon"
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("dot-agent-deck remote upgrade box"),
+            "{summary}"
+        );
+        assert!(
+            !summary.to_lowercase().contains("nothing was changed"),
+            "{summary}"
+        );
+
+        // A failure before anything landed does not claim a version either.
+        let failed = UpgradeOutcome::Failed {
+            stage: UpgradeStage::Installing,
+            reason: "download refused".into(),
+            installed_version: None,
+        }
+        .summary("box");
+        assert!(!failed.contains("is installed"), "{failed}");
+        assert!(
+            !failed.to_lowercase().contains("nothing was changed"),
+            "{failed}"
+        );
     }
 
     #[test]
@@ -1662,6 +1816,131 @@ mod tests {
         assert_eq!(outcome, fallback);
     }
 
+    /// PRD #1487 review: Replace against a local daemon too old for the
+    /// restart request, with an agent and an orchestration role on it. No one
+    /// is asked — an older daemon cannot hold new starts while a question is
+    /// open, so an answer could not cover what a stop would take down — and
+    /// the daemon is not stopped: the outcome names what runs on it, and no
+    /// successor is started. (An idle older daemon is stopped by the same
+    /// unforced stop `daemon stop` runs; that half is not exercised here,
+    /// because an in-process fake daemon's peer is this test process.)
+    #[cfg(unix)]
+    #[test]
+    fn replace_leaves_a_busy_older_local_daemon_running_and_asks_no_one() {
+        use crate::daemon_client::LocalEndpoint;
+        use crate::daemon_protocol::{KIND_REQ, read_frame, write_resp};
+        use std::os::unix::fs::PermissionsExt;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
+        // Another test's bind can flip the umask while the tempdir is made.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("older.sock");
+        let listener = {
+            let _guard = rt.enter();
+            crate::daemon_protocol::bind_attach_listener(&path).expect("bind the older daemon")
+        };
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_ops = ops.clone();
+        rt.spawn(async move {
+            while let Ok(mut stream) = listener.accept().await {
+                let server_ops = server_ops.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await {
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let op = request["op"].as_str().unwrap_or_default().to_string();
+                        server_ops.lock().unwrap().push(op.clone());
+                        let response = if op == "hello" {
+                            // An older daemon: no `restart-daemon` advertised.
+                            let mut h = hello("0.30.0", "older-build");
+                            h.capabilities = Some(Vec::new());
+                            h
+                        } else {
+                            let mut r = AttachResponse::ok();
+                            r.agent_records = Some(vec![crate::agent_pty::AgentRecord {
+                                id: "a1".into(),
+                                pane_id_env: Some("7".into()),
+                                display_name: Some("coder".into()),
+                                cwd: Some("/work".into()),
+                                tab_membership: None,
+                                agent_type: None,
+                                rows: 24,
+                                cols: 80,
+                                live: None,
+                                spawned_at_ms: None,
+                                cli_name: None,
+                                prompt_keys: None,
+                                crashed: None,
+                                orchestrator_context_path: None,
+                            }]);
+                            r.orchestration_roles = Some(vec![OrchestrationRoleRecord {
+                                pane_id: "7".into(),
+                                role: "coder".into(),
+                                orchestration: "team".into(),
+                                is_orchestrator: false,
+                            }]);
+                            r
+                        };
+                        if write_resp(&mut stream, &response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_count = spawned.clone();
+        let port = WireDaemonPort::new(
+            &Endpoint::Local(LocalEndpoint::at(path)),
+            rt.handle().clone(),
+            Box::new(move || {
+                spawn_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        // No answers scripted: asking anything panics the test.
+        let decider = Scripted::new(&[]);
+        let plan = UpgradePlan {
+            version: CLIENT_VERSION.into(),
+            successor: RestartSuccessor::ClientSpawns,
+        };
+        let (outcome, _) = run(&NoInstall, &port, &decider, &plan);
+
+        let UpgradeOutcome::InstalledNotRestarted {
+            from_version,
+            reason: NotRestartedReason::OlderDaemonBusy { at_stake },
+            ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(from_version.as_deref(), Some("0.30.0"));
+        assert_eq!(at_stake.agents.len(), 1);
+        assert_eq!(at_stake.agents[0].label, "coder");
+        assert_eq!(at_stake.roles.len(), 1);
+        assert!(decider.asked.borrow().is_empty(), "no one is asked");
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!outcome.is_failure());
+        let summary = outcome.summary("local");
+        assert!(
+            summary.contains("Stop them, or let them finish"),
+            "{summary}"
+        );
+        assert!(summary.contains("coder"), "{summary}");
+        assert!(
+            !ops.lock().unwrap().iter().any(|op| op.contains("restart")),
+            "a daemon that does not advertise the request is never sent it"
+        );
+        drop(port);
+        rt.shutdown_background();
+    }
+
     /// `remote upgrade --version <older release>`: the freshly installed build
     /// predates `daemon probe`, so it cannot reach the daemon. That is not a
     /// failure — the build is installed and the daemon keeps running — and the
@@ -1844,6 +2123,118 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    /// PRD #1487 review: a `restart-installed` reply that cannot be read (cut
+    /// off, empty, not JSON) after a zero exit comes from a build that just
+    /// answered `daemon probe`, so it is never blamed on an old build. The
+    /// upgrade checks the daemon instead: if it now runs the new build the
+    /// outcome is `Restarted`; if not, a restarting failure that says the reply
+    /// was unreadable.
+    #[test]
+    fn an_unreadable_restart_reply_is_verified_not_blamed_on_an_old_build() {
+        use crate::daemon_restart::DaemonProbe;
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct GarbledRestart {
+            reply: &'static str,
+            restarts_take: bool,
+            restarted: Cell<bool>,
+        }
+        impl SshExecutor for GarbledRestart {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if command.ends_with("daemon probe --json") {
+                    let (version, build) = if self.restarted.get() {
+                        ("0.40.0", "new")
+                    } else {
+                        ("0.39.0", "old")
+                    };
+                    let probe = DaemonProbe {
+                        running: true,
+                        hello: Some(hello(version, build)),
+                    };
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: serde_json::to_string(&probe).unwrap(),
+                        stderr: String::new(),
+                    });
+                }
+                self.restarted.set(self.restarts_take);
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: self.reply.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let port = |reply, restarts_take| {
+            SshDaemonPort::new(
+                GarbledRestart {
+                    reply,
+                    restarts_take,
+                    restarted: Cell::new(false),
+                },
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            )
+        };
+
+        // The mapping itself: unreadable, never too old.
+        for reply in ["", "{\"running\": tr", "not json"] {
+            let restarted =
+                DaemonPort::restart(&port(reply, false), &RestartDaemonRequest::default());
+            assert!(
+                matches!(&restarted, Err(PortError::ReplyUnreadable(r)) if r.contains("the restart reply could not be read")),
+                "{reply:?} gave {restarted:?}"
+            );
+        }
+
+        // The daemon did restart: reported as restarted, through verification.
+        let (outcome, stages) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port("{\"running\": tr", true),
+            &NoDecider,
+            &remote_plan_for("0.40.0"),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::Restarted {
+                from_version: "0.39.0".into(),
+                to_version: "0.40.0".into(),
+                stopped: RestartStopSet::default(),
+            }
+        );
+        assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
+
+        // It did not: a restarting failure naming the unreadable reply.
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port("", false),
+            &NoDecider,
+            &remote_plan_for("0.40.0"),
+        );
+        let UpgradeOutcome::Failed {
+            stage,
+            reason,
+            installed_version,
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*stage, UpgradeStage::Restarting);
+        assert!(
+            reason.contains("the restart reply could not be read"),
+            "{reason}"
+        );
+        assert_eq!(installed_version.as_deref(), Some("0.40.0"));
+        assert!(!outcome.summary("box").contains("too old"));
+    }
+
+    fn remote_plan_for(version: &str) -> UpgradePlan {
+        UpgradePlan {
+            version: version.into(),
+            successor: RestartSuccessor::Installed,
+        }
     }
 
     #[test]

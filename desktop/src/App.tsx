@@ -1388,8 +1388,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
      or closes, exactly as the overview reports its own: the voice panel's gate
      refuses a pane write while one is open, and an opening one ends the
-     dictation mode. */
-  const confirmationOpen = confirm !== undefined;
+     dictation mode. The Upgrade / Replace daemon dialog counts as one: it
+     asks whether to stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);

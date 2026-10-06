@@ -87,6 +87,11 @@ pub struct SshDaemonPort<E: SshExecutor> {
     executor: E,
     target: SshTarget,
     binary: RefCell<String>,
+    /// The daemon's attach socket on the remote, when the deck-list row names
+    /// one (the desktop's "Daemon socket" field). Every command runs with it
+    /// as `DOT_AGENT_DECK_ATTACH_SOCKET`, so the probe and the restart reach
+    /// the daemon the tunnel reaches rather than the remote shell's default.
+    socket: Option<String>,
     probe_deadline: Duration,
     restart_deadline: Duration,
 }
@@ -97,6 +102,7 @@ impl<E: SshExecutor> SshDaemonPort<E> {
             executor,
             target,
             binary: RefCell::new(binary.into()),
+            socket: None,
             probe_deadline: REMOTE_PROBE_DEADLINE,
             restart_deadline: REMOTE_RESTART_DEADLINE,
         }
@@ -110,10 +116,18 @@ impl<E: SshExecutor> SshDaemonPort<E> {
         self
     }
 
-    /// The port for a deck-list row: its ssh target (jump host included) and
-    /// its recorded binary.
+    /// Reach the daemon at `socket` on the remote instead of that machine's
+    /// default attach endpoint.
+    pub fn with_socket(mut self, socket: Option<String>) -> Self {
+        self.socket = socket.filter(|s| !s.is_empty());
+        self
+    }
+
+    /// The port for a deck-list row: its ssh target (jump host included), its
+    /// recorded binary, and its recorded daemon socket.
     pub fn for_entry(executor: E, entry: &RemoteEntry) -> Self {
         Self::new(executor, entry.ssh_target(), entry.remote_binary())
+            .with_socket(entry.socket.clone())
     }
 
     /// Run later commands through `binary` instead.
@@ -172,8 +186,19 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     ) -> Result<T, RemoteDaemonError> {
         // The binary is a `RemoteBinaryPath` or the `~/.local/bin` constant,
         // both free of shell metacharacters, and left unquoted so the remote
-        // shell expands `~` (see `RemoteEntry::remote_binary`).
-        let command = format!("{} {args}", self.binary.borrow());
+        // shell expands `~` (see `RemoteEntry::remote_binary`). The socket is
+        // whatever the deck list holds, so it is quoted as one shell word.
+        let env = self
+            .socket
+            .as_deref()
+            .map(|socket| {
+                format!(
+                    "env DOT_AGENT_DECK_ATTACH_SOCKET={} ",
+                    crate::remote::shell_word(socket)
+                )
+            })
+            .unwrap_or_default();
+        let command = format!("{env}{} {args}", self.binary.borrow());
         let capped = self.executor.run_capped_within(
             &self.target,
             &command,
@@ -282,6 +307,65 @@ mod tests {
         assert!(matches!(p.probe(), Err(RemoteDaemonError::Malformed(_))));
         let p = port(0, "", "");
         assert!(matches!(p.probe(), Err(RemoteDaemonError::Malformed(_))));
+    }
+
+    /// PRD #1487 review: a deck-list row that names the daemon's socket (the
+    /// desktop's "Daemon socket" field) reaches that daemon — the probe and
+    /// the restart both run with it as `DOT_AGENT_DECK_ATTACH_SOCKET`, quoted
+    /// as one shell word — and a row without one runs the bare command.
+    #[test]
+    fn a_configured_daemon_socket_reaches_every_command() {
+        let report = RemoteRestartReport {
+            running: false,
+            reply: None,
+            unsupported: false,
+        };
+        let line = serde_json::to_string(&report).unwrap();
+        let mut entry = RemoteEntry {
+            name: "box".into(),
+            kind: "ssh".into(),
+            host: "u@h".into(),
+            port: 22,
+            key: None,
+            version: "0.46.0".into(),
+            added_at: String::new(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: Some("/run/deck dir/it's.sock".into()),
+        };
+        let scripted = || Scripted {
+            commands: RefCell::new(Vec::new()),
+            reply: SshOutput {
+                status: 0,
+                stdout: line.clone(),
+                stderr: String::new(),
+            },
+        };
+        let p = SshDaemonPort::for_entry(scripted(), &entry);
+        let _ = p.probe();
+        p.restart_installed(Some("0.46.0"), None).unwrap();
+        let commands = p.executor.commands.borrow().clone();
+        let prefix = "env DOT_AGENT_DECK_ATTACH_SOCKET='/run/deck dir/it'\\''s.sock' ~/.local/bin/dot-agent-deck daemon ";
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands.iter().all(|c| c.starts_with(prefix)),
+            "every command must carry the configured socket: {commands:?}"
+        );
+        assert!(commands[0].ends_with("daemon probe --json"));
+        assert!(commands[1].contains("daemon restart-installed --json"));
+
+        entry.socket = None;
+        let p = SshDaemonPort::for_entry(scripted(), &entry);
+        let _ = p.probe();
+        assert_eq!(
+            p.executor.commands.borrow().as_slice(),
+            ["~/.local/bin/dot-agent-deck daemon probe --json"]
+        );
     }
 
     #[test]

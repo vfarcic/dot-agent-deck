@@ -267,6 +267,10 @@ pub(crate) enum NotRestartedDto {
     AnotherRestartInProgress,
     NoDaemonRunning,
     InstalledBuildTooOld,
+    #[serde(rename_all = "camelCase")]
+    OlderDaemonBusy {
+        at_stake: StopSetDto,
+    },
 }
 
 /// [`UpgradeOutcome`], camelCase — what `desktop_upgrade_daemon` resolves with.
@@ -340,6 +344,11 @@ impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
                     NotRestartedReason::NoDaemonRunning => NotRestartedDto::NoDaemonRunning,
                     NotRestartedReason::InstalledBuildTooOld => {
                         NotRestartedDto::InstalledBuildTooOld
+                    }
+                    NotRestartedReason::OlderDaemonBusy { at_stake } => {
+                        NotRestartedDto::OlderDaemonBusy {
+                            at_stake: at_stake.into(),
+                        }
                     }
                 },
             },
@@ -690,6 +699,19 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(older_build["reason"]["kind"], "installed-build-too-old");
+
+        let busy = serde_json::to_value(UpgradeOutcomeDto::from(
+            &UpgradeOutcome::InstalledNotRestarted {
+                from_version: Some("0.44.0".into()),
+                installed_version: "0.45.0".into(),
+                reason: NotRestartedReason::OlderDaemonBusy {
+                    at_stake: stop_set(),
+                },
+            },
+        ))
+        .unwrap();
+        assert_eq!(busy["reason"]["kind"], "older-daemon-busy");
+        assert_eq!(busy["reason"]["atStake"]["agents"][0]["label"], "coder");
 
         let too_old = serde_json::to_value(UpgradeOutcomeDto::from(
             &UpgradeOutcome::InstalledDaemonTooOld {

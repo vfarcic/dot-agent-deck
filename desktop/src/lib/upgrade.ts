@@ -45,7 +45,8 @@ export type NotRestartedReason =
   | { kind: "stale-confirmation"; atStake: UpgradeStopSet }
   | { kind: "another-restart-in-progress" }
   | { kind: "no-daemon-running" }
-  | { kind: "installed-build-too-old" };
+  | { kind: "installed-build-too-old" }
+  | { kind: "older-daemon-busy"; atStake: UpgradeStopSet };
 
 /** `desktop_upgrade_daemon`'s answer — every arm of `UpgradeOutcome`. */
 export type UpgradeOutcome =
@@ -204,6 +205,16 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
               `To switch to ${outcome.installedVersion}, run \`dot-agent-deck connect ${deck}\` in a terminal: the TUI on that machine restarts the daemon onto it, asking first when agents are running.`,
             ],
           };
+        case "older-daemon-busy":
+          return {
+            tone: "neutral",
+            title: "Daemon kept running",
+            body: [
+              `${keeps}. It is too old to restart itself, so it is replaced only when nothing is running on it, and these are running:`,
+              `Stop them, or let them finish, then press ${kind === "replace" ? "Replace daemon" : "Upgrade"} again.`,
+            ],
+            list: stopSetLines(reason.atStake),
+          };
       }
       break;
     }
@@ -220,11 +231,18 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
       const doing = outcome.stage === "installing"
         ? (kind === "replace" ? "preparing this app's daemon" : "installing the new version")
         : outcome.stage === "restarting" ? "restarting the daemon" : "checking the restarted daemon";
+      // A failed install can still have put the new version in place (the
+      // hooks or the deck list failed after it landed), so "nothing changed"
+      // is never claimed: the text says what is installed and what runs.
       const after = outcome.stage === "verifying"
         ? "The old daemon was asked to restart; Reconnect shows whatever is answering now."
         : outcome.installedVersion && kind !== "replace"
-          ? `${outcome.installedVersion} is installed; the daemon that was running keeps running.`
-          : "Nothing was changed; the daemon that was running keeps running.";
+          ? outcome.stage === "installing"
+            ? `${outcome.installedVersion} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.`
+            : `${outcome.installedVersion} is installed; the daemon that was running keeps running.`
+          : kind === "replace" && outcome.stage === "restarting"
+            ? "Reconnect shows which daemon is answering now."
+            : "The daemon that was running keeps running.";
       return {
         tone: "failure",
         title: kind === "replace" ? "Replace daemon failed" : "Upgrade failed",

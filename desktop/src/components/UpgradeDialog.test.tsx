@@ -151,7 +151,8 @@ describe("UpgradeDialog", () => {
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrade failed");
     expect(screen.getByTestId("upgrade-outcome")).toHaveAttribute("data-tone", "failure");
     expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("It failed while installing the new version: ssh: connection timed out");
-    expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("Nothing was changed");
+    expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("The daemon that was running keeps running.");
+    expect(screen.getByTestId("upgrade-outcome")).not.toHaveTextContent("Nothing was changed");
   });
 
   /** Scenario: An upgrade that could not start (a second press, a deck not in the deck list) shows the reason. */

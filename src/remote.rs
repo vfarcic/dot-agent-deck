@@ -2560,6 +2560,29 @@ pub enum RemoteUpgradeError {
     /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
     #[error(transparent)]
     Inner(#[from] RemoteAddError),
+    /// The new build is already in place on the remote, and a step after it —
+    /// reinstalling the hooks, or recording it in the deck list — failed. The
+    /// binary is not rolled back; running the upgrade again finishes the rest.
+    #[error("{installed_version} was installed, but {step} failed: {source}")]
+    AfterInstall {
+        installed_version: String,
+        step: &'static str,
+        #[source]
+        source: Box<RemoteUpgradeError>,
+    },
+}
+
+impl RemoteUpgradeError {
+    /// The version already in place when this error happened, if the install
+    /// itself had finished.
+    pub fn installed_version(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall {
+                installed_version, ..
+            } => Some(installed_version),
+            _ => None,
+        }
+    }
 }
 
 impl From<SshError> for RemoteUpgradeError {
@@ -2649,8 +2672,18 @@ pub fn upgrade_reporting_to(
     //    otherwise `remote upgrade` reports success while leaving the remote
     //    on stale hooks. Mirrors the same step in `add()` so both paths stay
     //    in lockstep. Runs BEFORE the registry update so a hook-install failure
-    //    fails loud rather than persisting half-finished state.
-    install_remote_hooks(executor, &target, &installed, out)?;
+    //    fails loud rather than persisting half-finished state. The binary is
+    //    already in place by now, so a failure from here on says so.
+    let after_install = |step: &'static str| {
+        let installed_version = installed.version.clone();
+        move |source: RemoteUpgradeError| RemoteUpgradeError::AfterInstall {
+            installed_version,
+            step,
+            source: Box::new(source),
+        }
+    };
+    install_remote_hooks(executor, &target, &installed, out)
+        .map_err(|e| after_install("reinstalling the hooks")(e.into()))?;
 
     // 6. Update registry. `added_at` stays at the original registration
     //    timestamp; `upgraded_at` records the most recent upgrade so users
@@ -2668,9 +2701,12 @@ pub fn upgrade_reporting_to(
             entry.install = Some(installed.method.to_string());
             entry.binary = installed.binary.clone();
         },
-    )?
-    .ok_or_else(|| RemoteUpgradeError::UnknownName {
-        name: opts.name.clone(),
+    )
+    .map_err(|e| after_install("recording it in the deck list")(e.into()))?
+    .ok_or_else(|| {
+        after_install("recording it in the deck list")(RemoteUpgradeError::UnknownName {
+            name: opts.name.clone(),
+        })
     })?;
 
     let _ = writeln!(
@@ -4045,6 +4081,59 @@ mod homebrew_remote_tests {
                 "{brew_at:?}: `connect` must run the Homebrew binary from now on"
             );
         }
+    }
+
+    /// PRD #1487 review: the release lands and then `hooks install` fails. The
+    /// binary is not rolled back, so the error says the new version is
+    /// installed and which later step failed — never that nothing changed —
+    /// and the deck list still records the version it had.
+    #[test]
+    fn a_failure_after_the_binary_landed_names_the_installed_version_and_the_step() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        // The release that lands reports its version, but its hook install fails.
+        let landed = "#!/bin/sh\ncase \"$1\" in\n--version) echo \"dot-agent-deck 0.43.0\" ;;\nhooks) echo 'hooks: settings.json is not writable' >&2; exit 3 ;;\nesac\n";
+        write_script(
+            &remote.root.join("stubs/curl"),
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -o ]; then out=\"$2\"; fi\nshift\ndone\ncat > \"$out\" <<'EOF'\n{landed}EOF\n"
+            ),
+        );
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let err = result.expect_err("a failed hook install must fail the upgrade");
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::AfterInstall { step: "reinstalling the hooks", source, .. }
+                    if matches!(**source, RemoteUpgradeError::Inner(RemoteAddError::HooksInstallFailed { .. }))
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("0.43.0 was installed, but reinstalling the hooks failed:"),
+            "{msg}"
+        );
+        assert!(msg.contains("settings.json is not writable"), "{msg}");
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
+
+        // A failure before anything landed carries no installed version.
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
+        assert_eq!(
+            result.expect_err("version mismatch").installed_version(),
+            None
+        );
     }
 
     /// Control: a remote with no Homebrew install keeps today's behaviour —

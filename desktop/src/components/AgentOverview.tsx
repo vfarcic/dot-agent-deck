@@ -1201,7 +1201,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [confirm, numberedAgents, openAgent, rowNumbers]);
-  const confirmationOpen = confirm !== undefined;
+  /* The Upgrade dialog counts as a confirmation for voice: it asks whether to
+     stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);

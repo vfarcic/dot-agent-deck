@@ -570,7 +570,11 @@ pub async fn run_issue_dispatch(
 /// recorded; a removal that succeeds deletes it with the worktree. Marking and
 /// removing run under the per-repository worktree lock, so a reclaimer — which
 /// removes only under that lock — never sees the mark of a removal still in
-/// progress.
+/// progress. When that lock cannot be taken (it timed out, or the clone's lock
+/// path could not be resolved), nothing is removed: the worktree is only
+/// marked, and the issue reports a failure the next attempt recovers from by
+/// reclaiming it under the lock — so this removal can never overlap another
+/// dispatch's worktree operation.
 ///
 /// Any other failure: no agent will ever close to trigger cleanup, so the
 /// registry entry is dropped here. The worktree dir itself is left on disk —
@@ -589,9 +593,7 @@ async fn settle_failed_issue_spawn(
     let Some(entry) = take_worktree(worktrees, worktree_dir) else {
         return Ok(IssueOutcome::DeferredForRestart);
     };
-    // Best-effort, as for creation: a reclaimer that cannot take the lock
-    // removes nothing, so going ahead without it races no one into a deletion.
-    let _repo_lock = acquire_worktree_lock(&entry.clone_dir).await;
+    let repo_lock = acquire_worktree_lock(&entry.clone_dir).await;
     let marked = {
         let dir = worktree_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
@@ -600,6 +602,24 @@ async fn settle_failed_issue_spawn(
         .await
         .unwrap_or_else(|join| Err(join.to_string()))
     };
+    // No lock, no removal: marked only, it is left for a reclaimer, which
+    // removes under the lock.
+    if repo_lock.is_none() {
+        return Err(match marked {
+            Ok(_) => format!(
+                "the daemon is restarting, so no agent was started, and the repository's \
+                 worktree lock could not be taken to remove the issue's new worktree {} again; \
+                 the next attempt retries the removal",
+                worktree_dir.display()
+            ),
+            Err(why) => format!(
+                "the daemon is restarting, so no agent was started, and the issue's new worktree \
+                 {} could neither be removed again (the repository's worktree lock could not be \
+                 taken) nor marked for a retry ({why}); remove it by hand to release the issue",
+                worktree_dir.display()
+            ),
+        });
+    }
     if remove_worktree(worktree_dir, &entry.clone_dir, entry.policy)
         .await
         .is_none()
@@ -2652,6 +2672,57 @@ mod tests {
         .await;
         assert!(failed.is_err(), "a real failure is still reported");
         assert!(wt2.exists(), "and leaves its tree as before");
+    }
+
+    /// Scenario: a restart refuses the issue's spawn, and the repository's
+    /// worktree lock that guards removing its new worktree cannot be taken.
+    /// Nothing is removed: the worktree is marked as abandoned and the issue
+    /// reports a recoverable failure; the next attempt, which can take the
+    /// lock, reclaims it and frees the issue (PRD #1487 review).
+    #[tokio::test]
+    async fn a_restart_refusal_without_the_worktree_lock_keeps_the_worktree_for_a_retry() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let reg = new_worktree_registry();
+        // A clone whose lock path cannot be resolved: no lock can be taken.
+        record_worktree(
+            &reg,
+            &wt,
+            &tmp.path().join("no-such-clone"),
+            RemovalPolicy::Force,
+        );
+
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            creator(),
+        )
+        .await;
+        let message = outcome.expect_err("an unremoved worktree is not a clean deferral");
+        assert!(
+            message.contains("lock")
+                && message.contains(&wt.display().to_string())
+                && message.contains("retries"),
+            "the report names the lock, the leftover, and the retry: {message}"
+        );
+        assert!(wt.exists(), "nothing is removed without the lock");
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked for the retry"
+        );
+        assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
+
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, Vec::new).await,
+            Reclaim::Removed,
+            "the next attempt reclaims it under the lock"
+        );
+        assert!(!wt.exists());
     }
 
     /// Scenario: the same restart refusal, but `git worktree remove --force`

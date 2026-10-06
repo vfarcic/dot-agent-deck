@@ -2894,20 +2894,33 @@ impl DaemonClient {
     /// the endpoint gets replaced, so a set captured earlier may describe a
     /// different process.
     ///
-    /// The round trip is bounded by [`RESTART_REQUEST_TIMEOUT`]; running out is
-    /// [`ClientError::TimedOut`], because "unknown whether the daemon saw it" is
-    /// the honest reading. An `ok = false` reply with no `restart` field is
-    /// [`ClientError::Server`]. The cached capability set is dropped after any
-    /// answer, since an accepted restart replaces the daemon.
+    /// The whole call — the capability handshake and the restart round trip —
+    /// is bounded by one [`RESTART_REQUEST_TIMEOUT`] deadline, so a daemon that
+    /// accepts the connection and never answers `Hello` cannot hang an upgrade.
+    /// Running out is [`ClientError::TimedOut`], because "unknown whether the
+    /// daemon saw it" is the honest reading. An `ok = false` reply with no
+    /// `restart` field is [`ClientError::Server`]. The cached capability set is
+    /// dropped after any answer, since an accepted restart replaces the daemon.
     pub async fn restart_daemon(
         &self,
         req: RestartDaemonRequest,
     ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, ClientError> {
-        if !self
-            .fresh_capabilities()
-            .await?
-            .supports(crate::daemon_protocol::CAP_RESTART_DAEMON)
-        {
+        self.restart_daemon_within(req, RESTART_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::restart_daemon`] under a caller-chosen deadline, so tests can
+    /// prove the bound without waiting out the production one.
+    async fn restart_daemon_within(
+        &self,
+        req: RestartDaemonRequest,
+        limit: std::time::Duration,
+    ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, ClientError> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let capabilities = tokio::time::timeout_at(deadline, self.fresh_capabilities())
+            .await
+            .map_err(|_| ClientError::TimedOut(limit))??;
+        if !capabilities.supports(crate::daemon_protocol::CAP_RESTART_DAEMON) {
             return Ok(GatedQuery::Unsupported);
         }
         let frame = AttachRequest::RestartDaemon {
@@ -2919,9 +2932,9 @@ impl DaemonClient {
             let (mut rd, mut wr) = self.connect().await?;
             issue_command(&mut rd, &mut wr, &frame).await
         };
-        let resp = tokio::time::timeout(RESTART_REQUEST_TIMEOUT, exchange)
+        let resp = tokio::time::timeout_at(deadline, exchange)
             .await
-            .map_err(|_| ClientError::TimedOut(RESTART_REQUEST_TIMEOUT))??;
+            .map_err(|_| ClientError::TimedOut(limit))??;
         self.invalidate_capabilities();
         match resp.restart {
             Some(reply) => Ok(GatedQuery::Answered(reply)),
@@ -6105,6 +6118,44 @@ start = true
             client.cached_capabilities().is_none(),
             "an answered restart drops the cache, since the daemon is being replaced"
         );
+    }
+
+    /// PRD #1487: a daemon that accepts the connection but never answers its
+    /// `Hello` cannot hang a restart — the capability handshake runs under the
+    /// same deadline as the restart exchange, and running out is `TimedOut`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_times_out_on_a_daemon_that_never_answers_hello() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("silent.sock");
+            let listener = bind_attach_listener(&path).expect("bind silent daemon");
+            (dir, path, listener)
+        };
+        // Accept and hold every connection, reading nothing and writing nothing.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok(stream) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = DaemonClient::new(path);
+        let limit = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.restart_daemon_within(RestartDaemonRequest::default(), limit),
+        )
+        .await
+        .expect("restart_daemon must not hang on a silent daemon");
+        server.abort();
+        drop(dir);
+        assert!(
+            matches!(result, Err(ClientError::TimedOut(d)) if d == limit),
+            "a silent handshake is a timeout, got {result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     /// PRD #1487: `probe_running` reports "nothing running" for an endpoint
