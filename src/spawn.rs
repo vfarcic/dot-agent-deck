@@ -263,13 +263,14 @@ pub enum SpawnTarget {
     /// A single-agent card. `command` is the schedule's command; `None` =
     /// `$SHELL` (resolved by the spawn path, mirroring the new-deck dialog).
     ///
-    /// `agent_type` (issue #1602) is the agent the command runs when the caller
-    /// knows one the command cannot reveal — a `dispatch --single` unit started
-    /// with its dispatcher's `devbox run agent`. `None` derives it from the
-    /// command, which is all the scheduler and issue-dispatch paths ever do.
+    /// `inherited` (issue #1602) is `Some` when `command` is the command of the
+    /// pane that dispatched this unit, and says how that pane ran it. `None` —
+    /// all the scheduler and issue-dispatch paths ever pass — keeps the
+    /// single-agent policy: the type derived from the command, and `/bin/sh`
+    /// for a command line.
     SingleAgent {
         command: Option<String>,
-        agent_type: Option<AgentType>,
+        inherited: Option<InheritedLaunch>,
     },
     /// An orchestration tab rooted at the target dir.
     ///
@@ -283,6 +284,21 @@ pub enum SpawnTarget {
         roles: Vec<RoleSpawn>,
         config: Box<crate::project_config::OrchestrationConfig>,
     },
+}
+
+/// Issue #1602: how the pane a single unit copies its command from ran that
+/// command, so the unit runs it the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedLaunch {
+    /// The dispatcher's agent, when its spawn or its hooks said. `None` derives
+    /// it from the command.
+    pub agent_type: Option<AgentType>,
+    /// The `SHELL` wrapper-choice override the dispatcher's spawn carried.
+    /// `None` runs a command line under the daemon's default shell, as the
+    /// dispatcher's did, rather than under the `/bin/sh` a scheduled single
+    /// agent is pinned to — `source env.sh && claude` that works in the
+    /// dispatcher's bash must not fail in its unit's `sh`.
+    pub shell: Option<String>,
 }
 
 /// PRD #220: a caller's explicit choice of spawn shape, overriding what the
@@ -366,7 +382,7 @@ pub fn decide_target_with_override(
         None => Ok(decide_target(config, dir, schedule_command)),
         Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
             command: schedule_command.map(|c| c.to_string()),
-            agent_type: None,
+            inherited: None,
         }),
         Some(SpawnShapeOverride::Orchestration(None)) => {
             // THE default, resolved through the one shared rule
@@ -495,7 +511,7 @@ pub fn decide_target(
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
-        agent_type: None,
+        inherited: None,
     }
 }
 
@@ -614,10 +630,7 @@ pub async fn spawn(
 
     // 3. Spawn + deliver.
     match target {
-        SpawnTarget::SingleAgent {
-            command,
-            agent_type,
-        } => {
+        SpawnTarget::SingleAgent { command, inherited } => {
             let pane_id = next_pane_id(&req.task_name, None);
             // PRD #127 C2: only pin the `-c` wrapper shell to a deterministic
             // `/bin/sh` when the command ACTUALLY needs shell-wrapping (it has
@@ -625,7 +638,19 @@ pub async fn spawn(
             // directly (no shell), and an omitted command falls back to the
             // daemon's `$SHELL` (mirrors the new-deck dialog) — in neither case
             // do we pin (or leak) a SHELL override.
-            let pin_sh = command.as_deref().is_some_and(command_needs_shell_wrap);
+            //
+            // Issue #1602: a command inherited from a dispatcher runs under the
+            // shell the dispatcher's ran under instead.
+            let (agent_type, shell) = match inherited {
+                Some(InheritedLaunch { agent_type, shell }) => (agent_type, shell),
+                None => (
+                    None,
+                    command
+                        .as_deref()
+                        .is_some_and(command_needs_shell_wrap)
+                        .then(|| crate::platform::shell::fixed_command_shell("/bin/sh")),
+                ),
+            };
             // PRD #127 readiness gate: SUBSCRIBE before spawning so a
             // fast-booting agent's `SessionStart` can't land on the broadcast
             // before our receiver attaches (mirrors
@@ -645,7 +670,7 @@ pub async fn spawn(
                 // type (its dispatcher's, issue #1602); otherwise it is derived
                 // from the command exactly as before (issue #308).
                 agent_type.clone(),
-                pin_sh,
+                shell,
                 notifier,
             )?;
             // Issue #454: a single-agent spawn registers NOTHING in the
@@ -889,7 +914,7 @@ pub async fn spawn(
                     // orchestration wraps and badges a declared launcher role
                     // identically to the TUI path.
                     role.agent_type.clone(),
-                    false,
+                    None,
                     notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
@@ -1240,16 +1265,22 @@ fn spawn_one(
     // `None` means "derive it from the command", which is what a single-agent
     // schedule (no role config, so nothing to declare) always passes.
     agent_type: Option<AgentType>,
-    pin_sh: bool,
+    // The `SHELL` wrapper-choice override for a command line (see
+    // [`pane_env`]); `None` leaves it to the daemon's default shell.
+    shell: Option<String>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
+    let mut env = pane_env(pane_id, false);
+    if let Some(shell) = shell {
+        env.push(("SHELL".to_string(), shell));
+    }
     let opts = SpawnOptions {
         command,
         cwd: Some(cwd),
         display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
-        env: pane_env(pane_id, pin_sh),
+        env,
         tab_membership: membership,
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
@@ -7225,7 +7256,7 @@ mod tests {
                 .expect("single always resolves"),
             SpawnTarget::SingleAgent {
                 command: Some("mycmd".to_string()),
-                agent_type: None,
+                inherited: None,
             },
             "`single` must win over the dir's orchestrations AND carry the command"
         );
@@ -7239,7 +7270,7 @@ mod tests {
             t,
             SpawnTarget::SingleAgent {
                 command: Some("claude".to_string()),
-                agent_type: None,
+                inherited: None,
             }
         );
     }
@@ -7253,7 +7284,7 @@ mod tests {
             t,
             SpawnTarget::SingleAgent {
                 command: None,
-                agent_type: None,
+                inherited: None,
             }
         );
     }
@@ -7267,7 +7298,7 @@ mod tests {
             t,
             SpawnTarget::SingleAgent {
                 command: Some("cat".to_string()),
-                agent_type: None,
+                inherited: None,
             }
         );
     }
@@ -7440,7 +7471,7 @@ mod tests {
             ),
             Ok(SpawnTarget::SingleAgent {
                 command: Some("claude".to_string()),
-                agent_type: None,
+                inherited: None,
             })
         );
     }
@@ -8377,7 +8408,7 @@ mod tests {
         assert_eq!(
             kind_of_target(&SpawnTarget::SingleAgent {
                 command: Some("cat".into()),
-                agent_type: None,
+                inherited: None,
             }),
             SpawnKind::SingleAgent
         );

@@ -183,22 +183,16 @@ pub fn resolve_single_agent_command(configured: Option<&str>) -> String {
 /// Issue #1602: how the pane that asked for a dispatch was configured to run,
 /// read from the daemon's own record of that pane
 /// ([`AgentPtyRegistry::configured_launch_of`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatcherLaunch {
-    /// The command the pane was started with, before the spawn path wrapped it.
-    pub command: String,
-    /// The agent that command runs, when the pane's spawn or its own hooks
-    /// said. `devbox run agent` implies none on its own.
-    pub agent_type: Option<crate::event::AgentType>,
-}
+pub type DispatcherLaunch = crate::agent_pty::ConfiguredLaunch;
 
-/// What a single-agent unit is started with: a command and, when known, the
-/// agent it runs.
+/// What a single-agent unit is started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleUnitLaunch {
     pub command: String,
-    /// `None` leaves the spawn to derive the type from `command`, as before.
-    pub agent_type: Option<crate::event::AgentType>,
+    /// `Some` when `command` is the dispatcher's own, carrying how the
+    /// dispatcher ran it; `None` for the fallbacks, which the spawn starts the
+    /// way it always has.
+    pub inherited: Option<crate::spawn::InheritedLaunch>,
 }
 
 /// Issue #1602: the command a single-agent unit runs, and as which agent.
@@ -208,34 +202,138 @@ pub struct SingleUnitLaunch {
 /// 1. an explicit per-project single-unit command — not offered today; when it
 ///    is, it goes ABOVE the dispatcher's command, so a project can override
 ///    what every dispatcher in it would otherwise pass on;
-/// 2. the dispatching pane's configured command, with its agent type, so a
-///    dispatcher started as `devbox run agent` gets units started the same way
-///    (inside devbox, as Claude Code) rather than as bare `claude` under the
-///    daemon's environment;
+/// 2. the dispatching pane's configured command, with its agent type and its
+///    shell, so a dispatcher started as `devbox run agent` gets units started
+///    the same way (inside devbox, as Claude Code) rather than as bare
+///    `claude` under the daemon's environment;
 /// 3. the deck's `default_command`;
 /// 4. `claude`.
 ///
 /// `dispatcher` is `None` for a dispatch no pane asked for (the scheduler,
-/// unit tests) and for a pane started with no command, which skips step 2.
-/// Steps 3 and 4 carry no type: the spawn derives it from the command, which is
-/// what it always did.
+/// unit tests) and for a pane started with no command, which skips step 2. So
+/// does a dispatcher whose command only opens an interactive shell
+/// ([`opens_an_interactive_shell`]): its agent was started by hand inside that
+/// shell, so the command would give the unit a bare shell, into which the
+/// task would then be typed and run as shell input. Steps 3 and 4 carry
+/// nothing: the spawn derives the type from the command, as it always did.
 pub fn resolve_single_unit_launch(
     dispatcher: Option<&DispatcherLaunch>,
     default_command: Option<&str>,
 ) -> SingleUnitLaunch {
     if let Some(d) = dispatcher {
         let command = d.command.trim();
-        if !command.is_empty() {
+        if !command.is_empty() && !opens_an_interactive_shell(command) {
             return SingleUnitLaunch {
                 command: command.to_string(),
-                agent_type: d.agent_type.clone(),
+                inherited: Some(crate::spawn::InheritedLaunch {
+                    agent_type: d.agent_type.clone(),
+                    shell: d.shell.clone(),
+                }),
             };
         }
     }
     SingleUnitLaunch {
         command: resolve_single_agent_command(default_command),
-        agent_type: None,
+        inherited: None,
     }
+}
+
+/// The command's program and its arguments, past any leading `env` and
+/// `NAME=value` assignments. Whitespace-split: enough to name the program and
+/// spot a flag, which is all the two callers below ask.
+fn program_and_args(command: &str) -> (Option<&str>, Vec<&str>) {
+    let mut tokens = command.split_whitespace().peekable();
+    while let Some(token) = tokens.peek() {
+        let assignment = token
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'));
+        if *token == "env" || assignment {
+            tokens.next();
+        } else {
+            break;
+        }
+    }
+    let program = tokens.next();
+    (program, tokens.collect())
+}
+
+fn basename(program: &str) -> &str {
+    program.rsplit(['/', '\\']).next().unwrap_or(program)
+}
+
+/// Issue #1602 (PR #1603 review): whether `command` only opens an interactive
+/// shell — a shell with no script or `-c` to run (`bash`, `zsh -l`), or a
+/// project-environment shell (`devbox shell`, `nix develop`, `nix-shell`)
+/// without a command to run in it. Such a dispatcher's agent was started by
+/// hand inside the shell, so its command must not be handed to a unit.
+///
+/// A list, so it recognises the shells named in it and nothing else: a
+/// launcher it does not know (`tmux`, `ssh host`) is passed on as given.
+pub fn opens_an_interactive_shell(command: &str) -> bool {
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "ksh",
+        "mksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "elvish",
+        "xonsh",
+        "pwsh",
+        "pwsh.exe",
+        "powershell",
+        "powershell.exe",
+        "cmd",
+        "cmd.exe",
+    ];
+    let (Some(program), args) = program_and_args(command) else {
+        return false;
+    };
+    let name = basename(program);
+    if SHELLS.contains(&name) {
+        // `bash script.sh` runs a script and `bash -lc '…'` a command; only a
+        // shell given nothing but options is interactive. `cmd` takes `/c`.
+        let runs_something = if name.starts_with("cmd") {
+            args.iter()
+                .any(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+        } else {
+            args.iter().any(|arg| {
+                !arg.starts_with('-')
+                    || arg.eq_ignore_ascii_case("-command")
+                    || arg.eq_ignore_ascii_case("-file")
+                    || arg.strip_prefix('-').is_some_and(|rest| {
+                        rest.chars().all(|c| c.is_ascii_lowercase()) && rest.contains('c')
+                    })
+            })
+        };
+        return !runs_something;
+    }
+    let runs_flag = |flags: &[&str]| args.iter().any(|arg| flags.contains(arg));
+    match (name, args.first().copied()) {
+        ("devbox", Some("shell")) => true,
+        ("nix", Some("develop")) | ("nix", Some("shell")) => !runs_flag(&["-c", "--command"]),
+        ("nix-shell", _) => !runs_flag(&["--run", "--command"]),
+        _ => false,
+    }
+}
+
+/// Issue #1602 (PR #1603 review): whether `command` names its program by a
+/// path relative to the directory it starts in (`./agent.sh`, `tools/agent`).
+/// Such a command only resolves in a unit's worktree when the dispatcher was
+/// started at the repository root, which is where the unit starts.
+fn names_its_program_relatively(command: &str) -> bool {
+    let (Some(program), _) = program_and_args(command) else {
+        return false;
+    };
+    let program = program.trim_matches(['\'', '"']);
+    (program.contains('/') || program.contains('\\'))
+        && !std::path::Path::new(program).is_absolute()
+        && !program.starts_with('~')
+        && !program.starts_with('$')
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -326,6 +424,16 @@ async fn describe_dispatch_base(clone_dir: &Path) -> Option<String> {
         return Some(format!("detached HEAD at {sha}"));
     }
     Some(format!("{head} at {sha}"))
+}
+
+/// Whether `dir` is the top of its git working tree — where a unit cut from it
+/// starts. A probe that fails answers `false`, which only withholds the
+/// dispatcher's relative command from the unit.
+async fn starts_at_repository_root(dir: &Path) -> bool {
+    let dir = dir.to_string_lossy();
+    run_git_capture(&["-C", &dir, "rev-parse", "--show-prefix"])
+        .await
+        .is_ok_and(|prefix| prefix.trim().is_empty())
 }
 
 pub struct DispatchResult {
@@ -574,14 +682,24 @@ pub async fn handle_dispatch(
     // Read by the agent id the daemon captured for this caller, so a pane that
     // changed hands since then contributes nothing rather than its successor's
     // command.
-    let dispatcher_launch = ctx.caller.as_ref().and_then(|caller| {
-        ctx.registry
-            .configured_launch_of(&caller.agent_id)
-            .map(|(command, agent_type)| DispatcherLaunch {
-                command,
-                agent_type,
-            })
-    });
+    let mut dispatcher_launch = ctx
+        .caller
+        .as_ref()
+        .and_then(|caller| ctx.registry.configured_launch_of(&caller.agent_id));
+    // A unit starts at its worktree's root. A dispatcher started below its
+    // repository's root with `./agent.sh` would hand its unit a path that names
+    // nothing there, so such a command is not passed on.
+    if dispatcher_launch
+        .as_ref()
+        .is_some_and(|d| names_its_program_relatively(&d.command))
+        && !starts_at_repository_root(&clone_dir).await
+    {
+        tracing::debug!(
+            "dispatch: the caller's command names its program by a relative path from below \
+             the repository root, so the single unit falls back to the default command"
+        );
+        dispatcher_launch = None;
+    }
     let single_launch =
         resolve_single_unit_launch(dispatcher_launch.as_ref(), ctx.default_command.as_deref());
     let single_command = single_launch.command.clone();
@@ -611,7 +729,7 @@ pub async fn handle_dispatch(
         Ok(crate::spawn::SpawnTarget::SingleAgent { command, .. }) => {
             crate::spawn::SpawnTarget::SingleAgent {
                 command,
-                agent_type: single_launch.agent_type.clone(),
+                inherited: single_launch.inherited.clone(),
             }
         }
         Ok(t) => t,
@@ -1445,8 +1563,27 @@ mod tests {
         );
     }
 
+    fn dispatcher(command: &str, agent_type: Option<crate::event::AgentType>) -> DispatcherLaunch {
+        DispatcherLaunch {
+            command: command.to_string(),
+            agent_type,
+            shell: None,
+        }
+    }
+
+    fn inherited(
+        agent_type: Option<crate::event::AgentType>,
+        shell: Option<&str>,
+    ) -> Option<crate::spawn::InheritedLaunch> {
+        Some(crate::spawn::InheritedLaunch {
+            agent_type,
+            shell: shell.map(str::to_string),
+        })
+    }
+
     /// Issue #1602: a single unit runs its dispatcher's configured command, as
-    /// the dispatcher's agent, ahead of `default_command` and `claude`.
+    /// the dispatcher's agent and under the dispatcher's shell, ahead of
+    /// `default_command` and `claude`.
     ///
     /// Reported from real use: a dispatcher started as `devbox run agent` got
     /// every `--single` unit as bare `claude` under the daemon's environment,
@@ -1454,77 +1591,146 @@ mod tests {
     #[test]
     fn a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent() {
         use crate::event::AgentType;
-        let dispatcher = DispatcherLaunch {
-            command: "devbox run agent".to_string(),
-            agent_type: Some(AgentType::ClaudeCode),
-        };
         assert_eq!(
-            resolve_single_unit_launch(Some(&dispatcher), Some("opencode")),
+            resolve_single_unit_launch(
+                Some(&dispatcher("devbox run agent", Some(AgentType::ClaudeCode))),
+                Some("opencode")
+            ),
             SingleUnitLaunch {
                 command: "devbox run agent".to_string(),
-                agent_type: Some(AgentType::ClaudeCode),
+                inherited: inherited(Some(AgentType::ClaudeCode), None),
             },
             "the dispatcher's own command wins over default_command, and its type rides along"
         );
         // A non-Claude dispatcher gets units of its own agent type.
-        let codex = DispatcherLaunch {
-            command: "devbox run codex-big".to_string(),
-            agent_type: Some(AgentType::Codex),
-        };
         assert_eq!(
-            resolve_single_unit_launch(Some(&codex), None).agent_type,
-            Some(AgentType::Codex)
+            resolve_single_unit_launch(
+                Some(&dispatcher("devbox run codex-big", Some(AgentType::Codex))),
+                None
+            )
+            .inherited,
+            inherited(Some(AgentType::Codex), None)
+        );
+        // The dispatcher's shell choice rides along too (Greptile, PR #1603):
+        // `source` that works under its bash must not meet `/bin/sh` in the unit.
+        let mut sourced = dispatcher("source ./env.sh && claude", None);
+        sourced.shell = Some("/bin/bash".to_string());
+        assert_eq!(
+            resolve_single_unit_launch(Some(&sourced), None).inherited,
+            inherited(None, Some("/bin/bash"))
         );
         // A dispatcher whose type nobody knows still passes its command on; the
         // spawn then derives the type from it, as it always did.
-        let unknown = DispatcherLaunch {
-            command: "  ./my-agent  ".to_string(),
-            agent_type: None,
-        };
         assert_eq!(
-            resolve_single_unit_launch(Some(&unknown), Some("opencode")),
+            resolve_single_unit_launch(Some(&dispatcher("  ./my-agent  ", None)), Some("opencode")),
             SingleUnitLaunch {
                 command: "./my-agent".to_string(),
-                agent_type: None,
+                inherited: inherited(None, None),
             }
         );
     }
 
-    /// Issue #1602's controls: with no dispatching pane (the scheduler) or a
-    /// dispatcher whose command is blank, the unit falls back exactly as before
-    /// — `default_command`, then `claude` — and carries no type of its own.
+    /// Issue #1602's controls: with no dispatching pane (the scheduler), a
+    /// dispatcher whose command is blank, or one whose command only opens an
+    /// interactive shell, the unit falls back exactly as before —
+    /// `default_command`, then `claude` — and inherits nothing.
     #[test]
     fn a_single_unit_without_a_dispatcher_command_falls_back_to_default_then_claude() {
+        use crate::event::AgentType;
         let claude = crate::agent_registry::CLAUDE_CODE
             .default_command
             .unwrap_or("claude")
             .to_string();
-        assert_eq!(
-            resolve_single_unit_launch(None, Some("opencode")),
-            SingleUnitLaunch {
-                command: "opencode".to_string(),
-                agent_type: None,
-            }
-        );
-        assert_eq!(
-            resolve_single_unit_launch(None, None),
-            SingleUnitLaunch {
-                command: claude.clone(),
-                agent_type: None,
-            }
-        );
-        let blank = DispatcherLaunch {
-            command: "   ".to_string(),
-            agent_type: Some(crate::event::AgentType::Codex),
+        let fallback = |command: &str| SingleUnitLaunch {
+            command: command.to_string(),
+            inherited: None,
         };
         assert_eq!(
-            resolve_single_unit_launch(Some(&blank), None),
-            SingleUnitLaunch {
-                command: claude,
-                agent_type: None,
-            },
+            resolve_single_unit_launch(None, Some("opencode")),
+            fallback("opencode")
+        );
+        assert_eq!(resolve_single_unit_launch(None, None), fallback(&claude));
+        assert_eq!(
+            resolve_single_unit_launch(Some(&dispatcher("   ", Some(AgentType::Codex))), None),
+            fallback(&claude),
             "a blank dispatcher command must not carry its type onto the fallback"
         );
+        // Qodo, PR #1603: a dispatcher that is a shell the user started Claude
+        // in by hand. Its hooks say Claude Code, but its command is the shell —
+        // inheriting it would type the task into a bare shell and run it.
+        for shell in [
+            "bash",
+            "/bin/zsh -l",
+            "devbox shell",
+            "nix develop",
+            "nix-shell",
+        ] {
+            assert_eq!(
+                resolve_single_unit_launch(
+                    Some(&dispatcher(shell, Some(AgentType::ClaudeCode))),
+                    Some("opencode")
+                ),
+                fallback("opencode"),
+                "{shell:?} only opens a shell, so the unit must fall back"
+            );
+        }
+    }
+
+    /// The interactive-shell test recognises a shell given nothing to run, and
+    /// lets through a shell that runs a script or a command, and launchers.
+    #[test]
+    fn opens_an_interactive_shell_only_for_a_shell_with_nothing_to_run() {
+        for interactive in [
+            "bash",
+            "zsh -l",
+            "/usr/bin/fish",
+            "env FOO=1 bash -i",
+            "pwsh -NoLogo",
+            "cmd.exe",
+            "devbox shell",
+            "nix develop .#dev",
+            "nix shell nixpkgs#hello",
+            "nix-shell -p hello",
+        ] {
+            assert!(opens_an_interactive_shell(interactive), "{interactive:?}");
+        }
+        for runs in [
+            "devbox run agent",
+            "claude",
+            "sh /tmp/launcher.sh",
+            "bash -lc 'devbox run agent'",
+            "zsh ./agent.zsh",
+            "pwsh -Command claude",
+            "cmd /c claude",
+            "nix develop -c claude",
+            "nix-shell --run claude",
+            "FOO=1 claude --model opus",
+        ] {
+            assert!(!opens_an_interactive_shell(runs), "{runs:?}");
+        }
+    }
+
+    /// Greptile, PR #1603: a relatively-named launcher is recognised so it is
+    /// not handed on from a dispatcher started below the repository root.
+    #[test]
+    fn names_its_program_relatively_only_for_a_relative_path() {
+        for relative in [
+            "./agent.sh",
+            "../bin/agent",
+            "tools/agent --x",
+            "FOO=1 ./agent",
+        ] {
+            assert!(names_its_program_relatively(relative), "{relative:?}");
+        }
+        for not in [
+            "claude",
+            "devbox run agent",
+            "/opt/agent",
+            "~/bin/agent",
+            "$HOME/agent",
+        ] {
+            assert!(!names_its_program_relatively(not), "{not:?}");
+        }
     }
 
     /// A single-agent dispatch must run an AGENT, never `$SHELL`.
@@ -1638,7 +1844,7 @@ mod tests {
             "Verify PR #232 and report back.",
             &crate::spawn::SpawnTarget::SingleAgent {
                 command: None,
-                agent_type: None,
+                inherited: None,
             },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             None,
@@ -1692,7 +1898,7 @@ mod tests {
             "Verify PR #232 and report back.",
             &crate::spawn::SpawnTarget::SingleAgent {
                 command: None,
-                agent_type: None,
+                inherited: None,
             },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             Some(std::path::Path::new("/home/dev/myproject")),
@@ -1719,7 +1925,7 @@ mod tests {
             "Verify PR #232 and report back.",
             &crate::spawn::SpawnTarget::SingleAgent {
                 command: None,
-                agent_type: None,
+                inherited: None,
             },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             None,
