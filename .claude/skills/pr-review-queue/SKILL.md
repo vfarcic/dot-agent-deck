@@ -314,7 +314,7 @@ Every task states the same job:
 
 **A red the unit meets is a finding with two exits, not a retry.** CLAUDE.md rule 6 puts a red met while working on something else in scope by default, and `/verify-pr`'s Phase 5 already says so — but a unit reaches that phase only after its gates have run, and it reads the task text first. So the template carries the one sentence, keyed to this skill's push rules: the unit reports which exit each red needs (fixed in this PR, or quarantined with an owner, an expiry issue and the `#[ignore = "quarantined: <owner>, #<issue>"]` mark), and on its own PR asks for the fix or the quarantine through the pre-push gate and pushes it on a yes, since the push scope below bounds what it may push unasked — listing the red under what remains until then, so a proposal never reads as an exit taken. Reported on 2026-10-01: units `/issue-queue` dispatched met seven flaky tests between them, re-ran each until green, and only reported them.
 
-The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — rule 2's `fmt`/`clippy` gates before any commit, rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
+The feedback half needs **no skill of its own**: `CLAUDE.md` already governs it end to end — the gates `cargo xtask affected-checks --run` selects before any commit (rules 2 and 5), rule 8's requirement to respond to every finding (fix it, or say why not), thread resolution, and the stale-approval mechanics. `/verify-pr` is invoked for the verification half only, and **stays unchanged and read-only** by this skill: nothing here edits it, and the unit must not either.
 
 ### Check the closing references against what the PR actually does
 
@@ -402,9 +402,12 @@ WHAT TO DO
   reason. Never skip it silently.
 - ADDRESS OUTSTANDING FEEDBACK where there is any. Read every inline comment
   (`gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate`) and respond to
-  each finding: fix it, or say why not. CLAUDE.md governs this — rule 2's fmt and
-  clippy gates before any commit, rule 8's respond-to-every-finding, thread
-  resolution, and the stale-approval mechanics. Read CLAUDE.md first and follow it.
+  each finding: fix it, or say why not. CLAUDE.md governs this — rules 2 and
+  5's gates before any commit, run with `cargo xtask affected-checks --run`
+  (the full fmt, clippy and `cargo test-fast` gates for a change with any Rust,
+  build input or unmapped path in it; the tests that read the changed files
+  for a change that is only mapped text), rule 8's respond-to-every-finding,
+  thread resolution, and the stale-approval mechanics. Read CLAUDE.md first and follow it.
 - CHECK THE CLOSING REFERENCES against what the diff actually does. For each
   `Closes #N` / `Fixes #N` this PR declares, confirm the diff genuinely finishes
   issue N. Merging closes those issues automatically, so a reference that
@@ -451,10 +454,11 @@ EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
     dispatches it — take the run id from the URL it prints, because a listing
     on a branch with an open PR returns the PR's run, not yours. Reach for it
     when the box is loaded, when a change needs build-macos or build-windows,
-    or as a sweep after your fixes. It relieves no gate: rule 2's fmt+clippy
-    run before a commit exists, so they have already passed by the time there
-    is anything to dispatch. Never as a per-edit gate either, where a
-    9.5-minute median round trip would stand in for a warm clippy of ~9-15s.
+    or as a sweep after your fixes. It relieves no gate: the gates
+    `cargo xtask affected-checks --run` selects run before a commit exists, so
+    they have already passed by the time there is anything to dispatch. Never
+    as a per-edit gate either, where a 9.5-minute median round trip would
+    stand in for a warm clippy of ~9-15s.
     It covers neither lane 2 nor anything you have not pushed.
   <if authored by anyone else:>
     READ-ONLY. NEVER dispatch a workflow run against <login>'s branch and

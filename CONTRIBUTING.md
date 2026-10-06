@@ -39,6 +39,14 @@ cargo test-fast lifecycle_001     # filter to one test
 cargo test-fast                   # run the full fast tier
 ```
 
+Before every commit, run the gates your change needs (CLAUDE.md rules 2 and 5):
+
+```sh
+cargo xtask affected-checks --run
+```
+
+It prints and runs them, stopping at the first failure. For a change with any Rust, build input or unmapped path in it, that is `cargo fmt --check`, `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings` and `cargo test-fast`; for a change that is only mapped text (docs, skills, `changelog.d/`, `.github/`, PRDs, `CLAUDE.md` and the like), it is the xtask tests plus the root-package tests that read those files. Without `--run` it only prints the plan.
+
 E2e tier — two lanes since issue #502, split by whether a test reaches a **real agent** (CLAUDE.md rule 5):
 
 | Lane | Command | Contents | Runs |

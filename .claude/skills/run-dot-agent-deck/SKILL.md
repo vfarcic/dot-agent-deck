@@ -132,14 +132,21 @@ paths — most PRs that touch internals are verified by `cargo test`
 alone, not by the driver. The driver is for the TUI/CLI surface and
 the screenshot artifact.
 
-Also gate before commit (per `CLAUDE.md`):
+Also gate before commit (per `CLAUDE.md` rules 2 and 5):
+
+```bash
+cargo xtask affected-checks --run
+```
+
+It prints and runs what the change needs, stopping at the first failure. For a change with any Rust, build input or unmapped path in it, that is:
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
+cargo test-fast
 ```
 
-Every flag is load-bearing and CLAUDE.md rule 2 is the authority. `--all-targets --features e2e` per issue #407 and `e2e-live` per issue #502: without them the `tests/e2e_*.rs` files compile to empty crates (all of them without `e2e`, the real-agent ones without `e2e-live`), so clippy reports clean over code it never saw. `e2e-live` matters most of the four — it is the only thing in CI that type-checks the real-agent ones, because no test that reaches a real agent runs on a runner. `--workspace` per issue #436, or the `xtask/*` members are linted by no gate.
+and for a change that is only mapped text (docs, skills, `changelog.d/`, `.github/`, PRDs, `CLAUDE.md` and the like), it is the xtask tests plus the root-package tests that read those files. Every clippy flag is load-bearing and CLAUDE.md rule 2 is the authority. `--all-targets --features e2e` per issue #407 and `e2e-live` per issue #502: without them the `tests/e2e_*.rs` files compile to empty crates (all of them without `e2e`, the real-agent ones without `e2e-live`), so clippy reports clean over code it never saw. `e2e-live` matters most of the four — it is the only thing in CI that type-checks the real-agent ones, because no test that reaches a real agent runs on a runner. `--workspace` per issue #436, or the `xtask/*` members are linted by no gate.
 
 ## Gotchas
 
