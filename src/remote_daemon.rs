@@ -42,17 +42,28 @@ pub const REMOTE_PROBE_DEADLINE: Duration = PLUMBING_START_ALLOWANCE;
 
 /// Laptop-side wall-clock bound on one `daemon restart-installed --json`: the
 /// start allowance plus the whole restart round trip the remote client itself
-/// allows ([`crate::daemon_client::RESTART_REQUEST_TIMEOUT`]), which already
-/// covers the daemon checking the installed build
-/// ([`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`]). The drain happens after
-/// the daemon has answered, so it costs this command nothing.
+/// allows ([`crate::daemon_client::RESTART_REQUEST_TIMEOUT`]), which covers
+/// everything the daemon may do before it answers — checking the installed
+/// build ([`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`]) and waiting for
+/// respawns to settle ([`crate::agent_pty::RESPAWN_SETTLE_TIMEOUT`]) — plus a
+/// margin. The drain happens after the daemon has answered, so it costs this
+/// command nothing.
 pub const REMOTE_RESTART_DEADLINE: Duration =
     PLUMBING_START_ALLOWANCE.saturating_add(crate::daemon_client::RESTART_REQUEST_TIMEOUT);
 
-// The restart round trip must leave room for the check inside it.
+/// The daemon's worst case before it answers a restart request.
+const DAEMON_RESTART_WORST_CASE_MS: u128 = crate::daemon_restart::RESTART_VERIFY_TIMEOUT
+    .as_millis()
+    + crate::agent_pty::RESPAWN_SETTLE_TIMEOUT.as_millis();
+
+// Both bounds must outlast the daemon's worst case before it answers, or the
+// laptop gives up on a restart the daemon is about to accept (PRD #1487 review).
 const _: () = assert!(
-    crate::daemon_client::RESTART_REQUEST_TIMEOUT.as_secs()
-        > crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_secs()
+    crate::daemon_client::RESTART_REQUEST_TIMEOUT.as_millis() > DAEMON_RESTART_WORST_CASE_MS
+);
+const _: () = assert!(
+    REMOTE_RESTART_DEADLINE.as_millis()
+        > PLUMBING_START_ALLOWANCE.as_millis() + DAEMON_RESTART_WORST_CASE_MS
 );
 
 /// The exit code clap uses for a usage error — what a deck binary that predates

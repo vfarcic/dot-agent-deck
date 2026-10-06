@@ -3036,23 +3036,27 @@ async fn run_daemon_probe_cli(json: bool) -> ExitCode {
 /// withholds it from a daemon that does not advertise it. Prints one
 /// [`dot_agent_deck::daemon_restart::RemoteRestartReport`]: no daemon running,
 /// the daemon too old for the verb, or the daemon's reply (accepted, needs
-/// confirmation, refused) — all exit 0, because each is an answer. A transport
-/// failure or a timeout is a failure on stderr.
+/// confirmation, refused) — all exit 0, because each is an answer. A failure
+/// is on stderr, and its exit code says whether the request had been sent:
+/// [`dot_agent_deck::daemon_restart::RESTART_NOT_SENT_EXIT`] before it,
+/// [`dot_agent_deck::daemon_restart::RESTART_UNANSWERED_EXIT`] after it.
 #[tokio::main]
 async fn run_daemon_restart_installed_cli(
     json: bool,
     expect_version: Option<String>,
     confirm_hex: Option<String>,
 ) -> ExitCode {
-    use dot_agent_deck::daemon_client::{GatedQuery, RestartDaemonRequest};
+    use dot_agent_deck::daemon_client::{ClientError, GatedQuery, RestartDaemonRequest};
     use dot_agent_deck::daemon_protocol::{RestartDaemonReply, RestartSuccessor};
-    use dot_agent_deck::daemon_restart::{RemoteRestartReport, decode_stop_set_hex};
+    use dot_agent_deck::daemon_restart::{
+        RESTART_NOT_SENT_EXIT, RESTART_UNANSWERED_EXIT, RemoteRestartReport, decode_stop_set_hex,
+    };
 
     let confirm = match confirm_hex.as_deref().map(decode_stop_set_hex).transpose() {
         Ok(confirm) => confirm,
         Err(e) => {
             eprintln!("daemon restart-installed: --confirm-hex: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
         }
     };
     let client = DaemonClient::new(client_attach_socket_path());
@@ -3070,14 +3074,14 @@ async fn run_daemon_restart_installed_cli(
         }
         Ok(Err(e)) => {
             eprintln!("daemon restart-installed: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
         }
         Err(_elapsed) => {
             eprintln!(
                 "daemon restart-installed: no handshake within {}s",
                 ENDPOINT_RESOLVE_TIMEOUT.as_secs()
             );
-            return ExitCode::FAILURE;
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
         }
     }
     let request = RestartDaemonRequest {
@@ -3096,9 +3100,15 @@ async fn run_daemon_restart_installed_cli(
             reply: None,
             unsupported: true,
         },
+        // Sent, then no answer: the daemon may be restarting, which the
+        // caller has to be able to tell from a request that never went out.
+        Err(e @ ClientError::Unanswered(_)) => {
+            eprintln!("daemon restart-installed: {e}");
+            return ExitCode::from(RESTART_UNANSWERED_EXIT);
+        }
         Err(e) => {
             eprintln!("daemon restart-installed: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(RESTART_NOT_SENT_EXIT);
         }
     };
     if !json {
@@ -3122,7 +3132,12 @@ async fn run_daemon_restart_installed_cli(
         println!("{line}");
         return ExitCode::SUCCESS;
     }
-    print_restart_report(json, &report)
+    // The daemon has answered: a report that cannot be printed is a lost
+    // reply, not a request that was never sent.
+    match print_restart_report(json, &report) {
+        code if code == ExitCode::SUCCESS => code,
+        _ => ExitCode::from(RESTART_UNANSWERED_EXIT),
+    }
 }
 
 /// Print a [`dot_agent_deck::daemon_restart::RemoteRestartReport`] as one JSON

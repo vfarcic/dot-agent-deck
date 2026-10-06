@@ -48,11 +48,18 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
-    /// PRD #1487: a request that got no answer within its bound, where it is
-    /// unknown whether the daemon saw it — see
-    /// [`DaemonClient::restart_daemon`].
-    #[error("no answer from the daemon within {0:?}; unknown whether it acted on the request")]
+    /// PRD #1487: the daemon did not answer within the bound, before the
+    /// request itself was sent — see [`DaemonClient::restart_daemon`].
+    #[error("no answer from the daemon within {0:?}")]
     TimedOut(std::time::Duration),
+    /// PRD #1487: the request was sent, or may have been, and then no answer
+    /// was read — the connection broke, the reply was cut off, or the bound
+    /// ran out. Unknown whether the daemon acted on it, so a caller checks
+    /// before it says which — see [`DaemonClient::restart_daemon`].
+    #[error(
+        "no answer was read after the request was sent ({0}); unknown whether the daemon acted on it"
+    )]
+    Unanswered(String),
 }
 
 /// PRD #1487: what [`DaemonClient::restart_daemon`] asks for. Mirrors the
@@ -67,10 +74,29 @@ pub struct RestartDaemonRequest {
     pub successor: crate::daemon_protocol::RestartSuccessor,
 }
 
-/// PRD #1487: the bound on one `restart-daemon` round trip. The daemon may
-/// spend up to [`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`] checking the
-/// installed build before it answers, so this leaves that plus slack.
-pub const RESTART_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// PRD #1487: the bound on one `restart-daemon` round trip. Before it answers,
+/// the daemon may spend up to [`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`]
+/// checking the installed build and then up to
+/// [`crate::agent_pty::RESPAWN_SETTLE_TIMEOUT`] waiting for respawns to settle,
+/// so this is that sum plus [`RESTART_REPLY_MARGIN`] for the round trip itself
+/// — a reply sent in the daemon's worst case still arrives inside it.
+pub const RESTART_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_secs()
+        + crate::agent_pty::RESPAWN_SETTLE_TIMEOUT.as_secs()
+        + RESTART_REPLY_MARGIN.as_secs(),
+);
+
+/// What [`RESTART_REQUEST_TIMEOUT`] allows on top of the daemon's worst case
+/// before it answers: the handshake, the stop-set read and the reply itself.
+pub const RESTART_REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+// The bound must outlast everything the daemon may do before it answers, or
+// an accepted restart can be reported as a failure (PRD #1487 review).
+const _: () = assert!(
+    RESTART_REQUEST_TIMEOUT.as_millis()
+        > crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_millis()
+            + crate::agent_pty::RESPAWN_SETTLE_TIMEOUT.as_millis()
+);
 
 /// Where a daemon lives, from a client's point of view (PRD #741 M2).
 ///
@@ -2897,10 +2923,14 @@ impl DaemonClient {
     /// The whole call — the capability handshake and the restart round trip —
     /// is bounded by one [`RESTART_REQUEST_TIMEOUT`] deadline, so a daemon that
     /// accepts the connection and never answers `Hello` cannot hang an upgrade.
-    /// Running out is [`ClientError::TimedOut`], because "unknown whether the
-    /// daemon saw it" is the honest reading. An `ok = false` reply with no
-    /// `restart` field is [`ClientError::Server`]. The cached capability set is
-    /// dropped after any answer, since an accepted restart replaces the daemon.
+    /// What a failure means depends on when it happened. Up to and including
+    /// the connection the frame goes out on, the request was not sent: those
+    /// failures are themselves (running out is [`ClientError::TimedOut`]).
+    /// From the first byte of the frame on, the daemon may have acted on it, so
+    /// a broken connection, a cut-off or unreadable reply, and running out are
+    /// all [`ClientError::Unanswered`]. An `ok = false` reply with no `restart`
+    /// field is [`ClientError::Server`]. The cached capability set is dropped
+    /// after any answer, since an accepted restart replaces the daemon.
     pub async fn restart_daemon(
         &self,
         req: RestartDaemonRequest,
@@ -2928,13 +2958,23 @@ impl DaemonClient {
             expected_version: req.expected_version,
             successor: req.successor,
         };
-        let exchange = async {
-            let (mut rd, mut wr) = self.connect().await?;
-            issue_command(&mut rd, &mut wr, &frame).await
-        };
-        let resp = tokio::time::timeout_at(deadline, exchange)
+        let (mut rd, mut wr) = tokio::time::timeout_at(deadline, self.connect())
             .await
             .map_err(|_| ClientError::TimedOut(limit))??;
+        // From here on the daemon may act on the request whatever becomes of
+        // the reply, so no failure below says it did not.
+        let resp = match tokio::time::timeout_at(deadline, issue_command(&mut rd, &mut wr, &frame))
+            .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(ClientError::Unanswered(e.to_string())),
+            Err(_) => {
+                return Err(ClientError::Unanswered(format!(
+                    "no reply within {}s",
+                    limit.as_secs()
+                )));
+            }
+        };
         self.invalidate_capabilities();
         match resp.restart {
             Some(reply) => Ok(GatedQuery::Answered(reply)),
@@ -6156,6 +6196,80 @@ start = true
             "a silent handshake is a timeout, got {result:?}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): once the restart frame has gone
+    /// out, the daemon may act on it whatever becomes of the reply. A daemon
+    /// that reads the frame and closes the connection, and one that reads it
+    /// and never answers, are both `Unanswered` — never a plain failure.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_is_unanswered_when_the_reply_is_lost_after_the_send() {
+        for hold in [false, true] {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("lossy.sock");
+                let listener = bind_attach_listener(&path).expect("bind lossy daemon");
+                (dir, path, listener)
+            };
+            let restart_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = restart_seen.clone();
+            let server = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    if request["op"] == "hello" {
+                        let hello =
+                            hello_advertising(&[crate::daemon_protocol::CAP_RESTART_DAEMON]);
+                        crate::daemon_protocol::write_resp(&mut stream, &hello)
+                            .await
+                            .expect("write hello");
+                        continue;
+                    }
+                    seen.store(true, Ordering::SeqCst);
+                    if hold {
+                        held.push(stream);
+                    }
+                }
+            });
+            let client = DaemonClient::new(path);
+            let limit = std::time::Duration::from_millis(500);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.restart_daemon_within(RestartDaemonRequest::default(), limit),
+            )
+            .await
+            .expect("restart_daemon must not hang");
+            server.abort();
+            drop(dir);
+            assert!(
+                restart_seen.load(Ordering::SeqCst),
+                "the frame reached the daemon"
+            );
+            assert!(
+                matches!(result, Err(ClientError::Unanswered(_))),
+                "hold={hold}: a lost reply after the send is unanswered, got {result:?}"
+            );
+        }
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): with no daemon to connect to, the
+    /// request never went out, and the error says nothing about an unknown
+    /// outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_daemon_that_could_not_connect_is_not_unanswered() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(dir.path().join("absent.sock"));
+        let result = client.restart_daemon(RestartDaemonRequest::default()).await;
+        assert!(
+            matches!(&result, Err(e) if !matches!(e, ClientError::Unanswered(_))),
+            "{result:?}"
+        );
     }
 
     /// PRD #1487: `probe_running` reports "nothing running" for an endpoint

@@ -83,9 +83,9 @@ describe("UpgradeDialog", () => {
     const list = within(question).getByTestId("upgrade-at-stake");
     expect(list).toHaveTextContent("Agent coder (pane 2, in /work/app)");
     expect(list).toHaveTextContent("Role orchestrator of tdd, pane 1 (the orchestrator)");
-    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
     expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "restart-now");
-    // Back to the stages while the restart runs.
+    // Delivered: back to the stages while the restart runs.
     expect(screen.queryByTestId("upgrade-decision")).not.toBeInTheDocument();
     expect(screen.getByTestId("upgrade-stage-restarting")).toHaveAttribute("data-state", "active");
 
@@ -101,11 +101,73 @@ describe("UpgradeDialog", () => {
     render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
     fireEvent.click(screen.getByTestId("upgrade-start"));
     emit(decision);
-    fireEvent.click(screen.getByTestId("upgrade-keep-current"));
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-keep-current")); });
     expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
     await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon kept running");
     expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("0.45.0 is installed on build-box. The daemon keeps running 0.44.0, as you chose");
+  });
+
+  /** Scenario: Restart now is pressed while the answer is still on its way; the question stays on screen, a second press sends nothing more, and the stages come back once it has arrived. */
+  it("keeps the question until the answer has been delivered", async () => {
+    const { runtime, emit } = controlledRuntime();
+    let deliver!: () => void;
+    runtime.decideUpgrade.mockImplementationOnce(() => new Promise<undefined>((resolve) => { deliver = () => resolve(undefined); }));
+    const onClose = vi.fn();
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={onClose} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(progress("restarting"));
+    emit(decision);
+
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    expect(screen.getByTestId("upgrade-decision")).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(screen.getByTestId("upgrade-keep-current"));
+    // Escape while the answer is on its way does not send a second one.
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => deliver());
+    expect(screen.queryByTestId("upgrade-decision")).not.toBeInTheDocument();
+    expect(screen.getByTestId("upgrade-stage-restarting")).toHaveAttribute("data-state", "active");
+  });
+
+  /** Scenario: Restart now does not reach Agent Deck; the question stays with a plain message saying so, and pressing Restart now again delivers it. */
+  it("says so when an answer does not arrive, and lets it be sent again", async () => {
+    const { runtime, emit } = controlledRuntime();
+    runtime.decideUpgrade.mockImplementationOnce(() => Promise.reject(new Error("ipc: channel closed")));
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
+    expect(screen.getByTestId("upgrade-decision")).toBeInTheDocument();
+    const error = screen.getByTestId("upgrade-decision-error");
+    expect(error).toHaveTextContent("Your answer did not reach Agent Deck, so nothing has been stopped or restarted yet. Choose again to retry.");
+    expect(error).not.toHaveTextContent("ipc");
+    expect(screen.getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder");
+
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "restart-now");
+    expect(screen.queryByTestId("upgrade-decision")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("upgrade-decision-error")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: An answer fails to arrive, and the user then presses Escape; that still answers Keep current daemon and closes the dialog. */
+  it("still answers Keep current daemon when dismissed after a failed answer", async () => {
+    const { runtime, emit } = controlledRuntime();
+    runtime.decideUpgrade.mockImplementationOnce(() => Promise.reject(new Error("unreachable")));
+    const onClose = vi.fn();
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={onClose} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
+    expect(screen.getByTestId("upgrade-decision-error")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   /** Scenario: Escape or a click outside while the question is open answers Keep current daemon and closes the dialog. */

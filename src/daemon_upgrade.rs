@@ -32,12 +32,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon_client::{
-    DaemonClient, Endpoint, GatedQuery, LocalEndpoint, RestartDaemonRequest,
+    ClientError, DaemonClient, Endpoint, GatedQuery, LocalEndpoint, RestartDaemonRequest,
 };
 use crate::daemon_protocol::{
     AttachResponse, RestartDaemonReply, RestartRefusalReason, RestartStopSet, RestartSuccessor,
 };
-use crate::remote::{SshExecutor, SystemSshExecutor};
+use crate::remote::{SshError, SshExecutor, SystemSshExecutor};
 use crate::remote_daemon::{RemoteDaemonError, SshDaemonPort};
 use crate::untrusted_text::{
     REMOTE_MESSAGE_MAX_BYTES, REMOTE_NAME_MAX_BYTES, REMOTE_PATH_MAX_BYTES, display_line,
@@ -655,6 +655,8 @@ fn run_upgrade(
 
     let mut confirm: Option<RestartStopSet> = None;
     let mut stopped = None;
+    // Why the last request's answer was never read, when it was not.
+    let mut reply_lost: Option<String> = None;
     for round in 0..MAX_CONFIRM_ROUNDS {
         let request = RestartDaemonRequest {
             confirm: confirm.clone(),
@@ -666,33 +668,14 @@ fn run_upgrade(
                 return not_restarted(NotRestartedReason::InstalledBuildTooOld);
             }
             Err(PortError::Other(reason)) => return restarting_failed(reason),
-            // The request may have been carried out: say so only if the
-            // daemon now runs the new build. Under the daemon's policy it
-            // accepted only an idle daemon or the set it was asked to confirm.
-            Err(PortError::ReplyUnreadable(reason))
-                if plan.successor == RestartSuccessor::Installed =>
-            {
-                progress(UpgradeProgress {
-                    stage: UpgradeStage::Verifying,
-                    detail: None,
-                });
-                let expected = Expect::Version(installed.version.clone());
-                return match wait_for_successor(daemon, &expected, &from, false, timing) {
-                    Ok(()) => UpgradeOutcome::Restarted {
-                        from_version: from_version
-                            .clone()
-                            .unwrap_or_else(|| "an unknown version".into()),
-                        to_version: installed.version.clone(),
-                        stopped: confirm.unwrap_or_default(),
-                    },
-                    Err(_) => restarting_failed(format!(
-                        "the restart reply could not be read ({reason}), and the daemon did not come back on {} within {}s",
-                        installed.version,
-                        timing.timeout.as_secs()
-                    )),
-                };
+            // The request may have been carried out: the tail says so only if
+            // a successor now answers. Under the daemon's policy it accepted
+            // only an idle daemon or the set it was asked to confirm.
+            Err(PortError::ReplyUnreadable(reason)) => {
+                reply_lost = Some(reason);
+                stopped = Some(confirm.clone().unwrap_or_default());
+                break;
             }
-            Err(PortError::ReplyUnreadable(reason)) => return restarting_failed(reason),
             Ok(GatedQuery::Unsupported) => {
                 return daemon.legacy_restart().unwrap_or_else(|| {
                     UpgradeOutcome::InstalledDaemonTooOld {
@@ -740,8 +723,13 @@ fn run_upgrade(
 
     let mut endpoint_emptied = false;
     if plan.successor == RestartSuccessor::ClientSpawns {
+        // With the reply lost this is also the check: a daemon that did not
+        // accept keeps its endpoint, so nothing is spawned.
         if let Err(reason) = daemon.spawn_successor() {
-            return restarting_failed(reason);
+            return restarting_failed(match &reply_lost {
+                Some(lost) => format!("{lost}, and {reason}"),
+                None => reason,
+            });
         }
         // `spawn_successor` returns only after the old daemon released the
         // endpoint, so whatever answers now is the successor.
@@ -762,10 +750,26 @@ fn run_upgrade(
             to_version: installed.version,
             stopped,
         },
-        Err(reason) => UpgradeOutcome::Failed {
-            stage: UpgradeStage::Verifying,
-            reason,
-            installed_version: Some(installed.version),
+        Err(missing) => match reply_lost {
+            None => UpgradeOutcome::Failed {
+                stage: UpgradeStage::Verifying,
+                reason: missing.reason,
+                installed_version: Some(installed.version),
+            },
+            // Nothing says the daemon ever accepted, so this is not a
+            // successor that failed to start: it is a restart not known to
+            // have happened, and when the old daemon is still the one
+            // answering, one that did not.
+            Some(lost) if missing.old_still_answering => restarting_failed(format!(
+                "{lost}, and the daemon did not restart: the one that was asked is still running after {}s",
+                timing.timeout.as_secs()
+            )),
+            Some(lost) => restarting_failed(format!(
+                "{lost}, and the daemon did not come back on {} within {}s{}",
+                installed.version,
+                timing.timeout.as_secs(),
+                missing.seen
+            )),
         },
     }
 }
@@ -800,6 +804,16 @@ struct OldDaemon {
     instance: Option<String>,
 }
 
+/// [`wait_for_successor`] ran out: no successor answered.
+struct SuccessorMissing {
+    /// The whole sentence, for a restart the daemon accepted.
+    reason: String,
+    /// What last answered, as a parenthetical (empty when nothing did).
+    seen: String,
+    /// The last answer named the old daemon's own process: it is still running.
+    old_still_answering: bool,
+}
+
 /// Poll `daemon` until the successor answers as `expected`.
 ///
 /// An answer from the OLD daemon must not count: it keeps answering while it
@@ -820,7 +834,7 @@ fn wait_for_successor(
     from: &OldDaemon,
     mut endpoint_emptied: bool,
     timing: Timing,
-) -> Result<(), String> {
+) -> Result<(), SuccessorMissing> {
     let deadline = Instant::now() + timing.timeout;
     let mut matching_since: Option<Instant> = None;
     let mut last_seen: Option<String> = None;
@@ -875,10 +889,14 @@ fn wait_for_successor(
                 (Some(v), false) => format!(" (the daemon answering reports {v})"),
                 (None, _) => String::new(),
             };
-            return Err(format!(
-                "restarted, but the new daemon did not answer within {}s{seen}",
-                timing.timeout.as_secs()
-            ));
+            return Err(SuccessorMissing {
+                reason: format!(
+                    "restarted, but the new daemon did not answer within {}s{seen}",
+                    timing.timeout.as_secs()
+                ),
+                seen,
+                old_still_answering,
+            });
         }
         std::thread::sleep(timing.poll);
     }
@@ -1103,7 +1121,26 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
             Err(RemoteDaemonError::Malformed(reason)) => Err(PortError::ReplyUnreadable(format!(
                 "the restart reply could not be read: {reason}"
             ))),
-            Err(e) => Err(PortError::Other(e.to_string())),
+            // Failures from before the request was sent: ssh never got a
+            // session, or the remote binary said it did not send it.
+            Err(
+                e @ RemoteDaemonError::Ssh(
+                    SshError::ConnectionRefused { .. }
+                    | SshError::AuthFailed { .. }
+                    | SshError::HostKeyVerificationFailed { .. },
+                ),
+            ) => Err(PortError::Other(e.to_string())),
+            Err(e @ RemoteDaemonError::Failed { status, .. })
+                if status == i32::from(crate::daemon_restart::RESTART_NOT_SENT_EXIT) =>
+            {
+                Err(PortError::Other(e.to_string()))
+            }
+            // Anything else can happen after the request reached the daemon —
+            // the session dropping, the deadline kill, the remote binary
+            // timing out or losing the reply — so the daemon may be restarting.
+            Err(e) => Err(PortError::ReplyUnreadable(format!(
+                "no answer to the restart request was read: {e}"
+            ))),
         }
     }
 
@@ -1154,7 +1191,7 @@ impl WireDaemonPort {
         {
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "the old daemon was still running {}s after it agreed to stop",
+                    "the daemon that was asked to restart was still running {}s later",
                     LOCAL_RELEASE_TIMEOUT.as_secs()
                 ));
             }
@@ -1185,7 +1222,13 @@ impl DaemonPort for WireDaemonPort {
     ) -> Result<GatedQuery<RestartDaemonReply>, PortError> {
         self.handle
             .block_on(self.client.restart_daemon(req.clone()))
-            .map_err(|e| PortError::Other(e.to_string()))
+            .map_err(|e| match e {
+                // Sent, then no usable answer: the daemon may be restarting.
+                ClientError::Unanswered(_) | ClientError::Malformed(_) => {
+                    PortError::ReplyUnreadable(e.to_string())
+                }
+                e => PortError::Other(e.to_string()),
+            })
     }
 
     fn spawn_successor(&self) -> Result<(), String> {
@@ -1279,7 +1322,7 @@ impl WireDaemonPort {
                 to_version: version,
                 stopped: RestartStopSet::default(),
             },
-            Err(reason) => failed(UpgradeStage::Verifying, reason),
+            Err(missing) => failed(UpgradeStage::Verifying, missing.reason),
         }
     }
 }
@@ -2010,6 +2053,58 @@ mod tests {
         rt.shutdown_background();
     }
 
+    /// PRD #1487 review (Qodo 4200422524), the local port: a daemon that
+    /// reads the restart request and closes the connection without answering
+    /// may be restarting, so the port reports an unread reply for the upgrade
+    /// to verify, not a failure.
+    #[cfg(unix)]
+    #[test]
+    fn the_local_port_reports_a_reply_lost_after_the_send_as_unread() {
+        use crate::daemon_client::LocalEndpoint;
+        use crate::daemon_protocol::{CAP_RESTART_DAEMON, KIND_REQ, read_frame, write_resp};
+        use std::os::unix::fs::PermissionsExt;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("lossy.sock");
+        let listener = {
+            let _guard = rt.enter();
+            crate::daemon_protocol::bind_attach_listener(&path).expect("bind the daemon")
+        };
+        rt.spawn(async move {
+            while let Ok(mut stream) = listener.accept().await {
+                let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                if request["op"] == "hello" {
+                    let mut h = hello("0.30.0", "old");
+                    h.capabilities = Some(vec![CAP_RESTART_DAEMON.to_string()]);
+                    let _ = write_resp(&mut stream, &h).await;
+                }
+                // The restart request: dropped unanswered.
+            }
+        });
+        let port = WireDaemonPort::new(
+            &Endpoint::Local(LocalEndpoint::at(path)),
+            rt.handle().clone(),
+            Box::new(|| Ok(())),
+        )
+        .unwrap();
+        let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
+        assert!(
+            matches!(&restarted, Err(PortError::ReplyUnreadable(_))),
+            "{restarted:?}"
+        );
+        drop(port);
+        rt.shutdown_background();
+    }
+
     /// `remote upgrade --version <older release>`: the freshly installed build
     /// predates `daemon probe`, so it cannot reach the daemon. That is not a
     /// failure — the build is installed and the daemon keeps running — and the
@@ -2611,6 +2706,355 @@ mod tests {
             &remote_plan(),
         );
         assert_eq!(port.spawned.get(), 0);
+    }
+
+    fn lost(reason: &str) -> Restart {
+        Err(PortError::ReplyUnreadable(format!(
+            "no answer to the restart request was read: {reason}"
+        )))
+    }
+
+    fn local_plan() -> UpgradePlan {
+        UpgradePlan {
+            version: CLIENT_VERSION.into(),
+            successor: RestartSuccessor::ClientSpawns,
+        }
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): the restart request went out and
+    /// its reply never came back — the session dropped, a deadline ran out.
+    /// The daemon had accepted, so once a successor answers the outcome is
+    /// `Restarted`, for the remote successor and the client-spawned one, and
+    /// on a confirmed round it names the set that was confirmed. The request
+    /// is never re-sent.
+    #[test]
+    fn a_lost_reply_to_an_accepted_restart_is_restarted_after_verification() {
+        let port = FakePort::new(
+            vec![
+                Ok(Some(hello_from("0.1.0", "old", "old-process"))),
+                Ok(Some(hello_from("0.1.0", "old", "old-process"))),
+                Ok(None),
+                Ok(Some(hello_from("0.2.0", "new", "new-process"))),
+            ],
+            vec![lost("the remote command did not finish within 85s")],
+        );
+        let (outcome, stages) = run(
+            &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::Restarted {
+                from_version: "0.1.0".into(),
+                to_version: "0.2.0".into(),
+                stopped: RestartStopSet::default(),
+            }
+        );
+        assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
+        assert_eq!(
+            port.requests.borrow().len(),
+            1,
+            "a lost reply is not re-sent"
+        );
+
+        // Lost on the confirmed round: the confirmed set is what stopped.
+        let port = FakePort::new(
+            vec![
+                Ok(Some(hello_from("0.1.0", "old", "old-process"))),
+                Ok(Some(hello_from("0.2.0", "new", "new-process"))),
+            ],
+            vec![needs(live("worker"), false), lost("connection closed")],
+        );
+        let decider = Scripted::new(&[RestartChoice::RestartNow]);
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+            &port,
+            &decider,
+            &remote_plan(),
+        );
+        assert_eq!(
+            outcome,
+            UpgradeOutcome::Restarted {
+                from_version: "0.1.0".into(),
+                to_version: "0.2.0".into(),
+                stopped: live("worker"),
+            }
+        );
+
+        // The local Replace: the client starts its build once the old daemon
+        // has gone, then waits for it.
+        let local = crate::build_id::local_build_id();
+        let port = FakePort::new(
+            vec![
+                Ok(Some(hello_from("0.1.0", "old", "old-process"))),
+                Ok(Some(hello_from(CLIENT_VERSION, &local, "new-process"))),
+            ],
+            vec![lost("no reply within 40s")],
+        );
+        let (outcome, _) = run(&NoInstall, &port, &NoDecider, &local_plan());
+        assert!(
+            matches!(outcome, UpgradeOutcome::Restarted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(port.spawned.get(), 1);
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): the reply was lost and the daemon
+    /// did not restart — it is still the same process answering, or (local)
+    /// it never released its endpoint. A restarting failure that names both
+    /// the lost reply and that the daemon did not restart.
+    #[test]
+    fn a_lost_reply_from_a_daemon_that_did_not_restart_fails_saying_so() {
+        let port = FakePort::new(
+            vec![Ok(Some(hello_from("0.1.0", "old", "old-process")))],
+            vec![lost("ssh dropped the session")],
+        );
+        let (outcome, stages) = run(
+            &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        let UpgradeOutcome::Failed {
+            stage,
+            reason,
+            installed_version,
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*stage, UpgradeStage::Restarting);
+        assert!(reason.contains("ssh dropped the session"), "{reason}");
+        assert!(reason.contains("the daemon did not restart"), "{reason}");
+        assert_eq!(installed_version.as_deref(), Some("0.2.0"));
+        assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
+
+        let mut port = FakePort::new(
+            vec![Ok(Some(hello_from("0.1.0", "old", "old-process")))],
+            vec![lost("no reply within 40s")],
+        );
+        port.spawn_result =
+            Err("the daemon that was asked to restart was still running 15s later".into());
+        let (outcome, _) = run(&NoInstall, &port, &NoDecider, &local_plan());
+        let UpgradeOutcome::Failed { stage, reason, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(*stage, UpgradeStage::Restarting);
+        assert!(reason.contains("no reply within 40s"), "{reason}");
+        assert!(reason.contains("still running 15s later"), "{reason}");
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): a failure from before the request
+    /// was sent stays a plain restarting failure — nothing is verified and no
+    /// successor is started, since the daemon was never asked.
+    #[test]
+    fn a_failure_before_the_restart_request_was_sent_is_not_verified() {
+        for (plan, installer) in [
+            (
+                remote_plan(),
+                &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin) as &dyn Installer,
+            ),
+            (local_plan(), &NoInstall as &dyn Installer),
+        ] {
+            let port = FakePort::new(
+                vec![Ok(Some(hello_from("0.1.0", "old", "old-process")))],
+                vec![Err(PortError::Other("ssh: connection refused".into()))],
+            );
+            let (outcome, stages) = run(installer, &port, &NoDecider, &plan);
+            let UpgradeOutcome::Failed { stage, reason, .. } = &outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(*stage, UpgradeStage::Restarting);
+            assert_eq!(reason, "ssh: connection refused");
+            assert!(!stages.contains(&UpgradeStage::Verifying), "{stages:?}");
+            assert_eq!(port.spawned.get(), 0);
+        }
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): how the remote port classifies a
+    /// failed `restart-installed`. ssh never getting a session, and the remote
+    /// binary saying it did not send the request, are failures; anything that
+    /// can happen after the request reached the daemon — the session dropping,
+    /// the deadline kill, the remote binary losing the reply or crashing — is
+    /// an unconfirmed reply the upgrade verifies.
+    #[test]
+    fn remote_restart_failures_are_classified_by_whether_the_request_may_have_been_sent() {
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        type Outcome = fn() -> Result<SshOutput, SshError>;
+        struct Fails(Outcome);
+        impl SshExecutor for Fails {
+            fn run(&self, _target: &SshTarget, _command: &str) -> Result<SshOutput, SshError> {
+                (self.0)()
+            }
+        }
+        fn exit(status: i32) -> Result<SshOutput, SshError> {
+            Ok(SshOutput {
+                status,
+                stdout: String::new(),
+                stderr: "daemon restart-installed: something".into(),
+            })
+        }
+        let cases: [(&str, Outcome, bool); 9] = [
+            (
+                "connection refused",
+                || {
+                    Err(SshError::ConnectionRefused {
+                        host: "h".into(),
+                        port: 22,
+                        detail: "refused".into(),
+                    })
+                },
+                false,
+            ),
+            (
+                "authentication",
+                || {
+                    Err(SshError::AuthFailed {
+                        target: "u@h".into(),
+                        detail: "denied".into(),
+                    })
+                },
+                false,
+            ),
+            (
+                "host key",
+                || {
+                    Err(SshError::HostKeyVerificationFailed {
+                        target: "u@h".into(),
+                        remedy: "ssh u@h".into(),
+                    })
+                },
+                false,
+            ),
+            ("not sent", || exit(1), false),
+            (
+                "deadline kill",
+                || {
+                    Err(SshError::Other {
+                        target: "u@h".into(),
+                        detail: "the remote command did not finish within 85s, so it was stopped"
+                            .into(),
+                    })
+                },
+                true,
+            ),
+            (
+                "session dropped",
+                || {
+                    Err(SshError::Other {
+                        target: "u@h".into(),
+                        detail: "Connection to h closed by remote host.".into(),
+                    })
+                },
+                true,
+            ),
+            (
+                "local I/O",
+                || {
+                    Err(SshError::Io {
+                        target: "u@h".into(),
+                        source: std::io::Error::other("broken pipe"),
+                    })
+                },
+                true,
+            ),
+            ("sent, unanswered", || exit(3), true),
+            ("crashed", || exit(101), true),
+        ];
+        for (name, outcome, may_have_been_sent) in cases {
+            let port = SshDaemonPort::new(
+                Fails(outcome),
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            );
+            let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
+            if may_have_been_sent {
+                assert!(
+                    matches!(&restarted, Err(PortError::ReplyUnreadable(_))),
+                    "{name}: {restarted:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&restarted, Err(PortError::Other(_))),
+                    "{name}: {restarted:?}"
+                );
+            }
+        }
+        assert_eq!(crate::daemon_restart::RESTART_NOT_SENT_EXIT, 1);
+        assert_eq!(crate::daemon_restart::RESTART_UNANSWERED_EXIT, 3);
+    }
+
+    /// PRD #1487 review (Qodo 4200422524), end to end through the remote
+    /// port: the deadline killed `restart-installed` after the daemon had the
+    /// request. When the daemon restarted the upgrade says so; when it did
+    /// not, the failure says that.
+    #[test]
+    fn a_remote_restart_killed_at_its_deadline_is_verified() {
+        use crate::daemon_restart::DaemonProbe;
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct KilledAfterSend {
+            restarts_take: bool,
+            restarted: Cell<bool>,
+        }
+        impl SshExecutor for KilledAfterSend {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if command.ends_with("daemon probe --json") {
+                    let hello = if self.restarted.get() {
+                        hello_from("0.40.0", "new", "new-process")
+                    } else {
+                        hello_from("0.39.0", "old", "old-process")
+                    };
+                    let probe = DaemonProbe {
+                        running: true,
+                        hello: Some(hello),
+                    };
+                    return Ok(SshOutput {
+                        status: 0,
+                        stdout: serde_json::to_string(&probe).unwrap(),
+                        stderr: String::new(),
+                    });
+                }
+                self.restarted.set(self.restarts_take);
+                Err(SshError::Other {
+                    target: "u@h".into(),
+                    detail: "the remote command did not finish within 85s, so it was stopped"
+                        .into(),
+                })
+            }
+        }
+        for restarts_take in [true, false] {
+            let port = SshDaemonPort::new(
+                KilledAfterSend {
+                    restarts_take,
+                    restarted: Cell::new(false),
+                },
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            );
+            let (outcome, _) = run(
+                &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+                &port,
+                &NoDecider,
+                &remote_plan_for("0.40.0"),
+            );
+            if restarts_take {
+                assert!(
+                    matches!(outcome, UpgradeOutcome::Restarted { .. }),
+                    "{outcome:?}"
+                );
+            } else {
+                let UpgradeOutcome::Failed { stage, reason, .. } = &outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!(*stage, UpgradeStage::Restarting);
+                assert!(reason.contains("did not finish within 85s"), "{reason}");
+                assert!(reason.contains("the daemon did not restart"), "{reason}");
+            }
+        }
     }
 
     #[test]

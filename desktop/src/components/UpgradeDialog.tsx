@@ -30,7 +30,7 @@ export interface UpgradeTarget {
 type Phase =
   | { phase: "confirm" }
   | { phase: "running"; stage?: UpgradeStage }
-  | { phase: "deciding"; stage?: UpgradeStage; question: UpgradeDecisionEvent; answering: boolean }
+  | { phase: "deciding"; stage?: UpgradeStage; question: UpgradeDecisionEvent; answering: boolean; undelivered?: boolean }
   | { phase: "done"; outcome: UpgradeOutcome }
   | { phase: "error"; message: string };
 
@@ -44,6 +44,10 @@ type Phase =
  * Every way out of the question that is not **Restart now** keeps the current
  * daemon: Keep current daemon, Escape, a click outside, and the dialog going
  * away. Nothing is stopped without an explicit yes.
+ *
+ * An answer chosen with the buttons stays on screen until it has been
+ * delivered: the upgrade waits for it, so one that did not arrive is said so,
+ * with the question still there to answer again.
  */
 export function UpgradeDialog({ target, runtime, onClose }: {
   target: UpgradeTarget;
@@ -56,11 +60,16 @@ export function UpgradeDialog({ target, runtime, onClose }: {
   const deck = displayText(target.deckName, DISPLAY_LIMITS.name);
   const replace = target.kind === "replace";
 
+  const send = (upgradeId: string, choice: UpgradeChoice): Promise<void> => runtime.decideUpgrade
+    ? runtime.decideUpgrade(upgradeId, choice)
+    : Promise.reject(new Error("answering is not available"));
+
+  /** For a dialog on its way out: nothing is left to show a failure on. */
   const answer = (upgradeId: string, choice: UpgradeChoice) => {
     if (pendingQuestion.current === upgradeId) pendingQuestion.current = undefined;
     // A refusal means the question already closed (it timed out, or the run
     // ended); the outcome that follows says what happened.
-    void runtime.decideUpgrade?.(upgradeId, choice).catch(() => undefined);
+    void send(upgradeId, choice).catch(() => undefined);
   };
 
   // Unmounting with the question open is a Keep: the dialog went away.
@@ -94,14 +103,28 @@ export function UpgradeDialog({ target, runtime, onClose }: {
 
   const decide = (choice: UpgradeChoice) => {
     if (state.phase !== "deciding" || state.answering) return;
-    answer(state.question.upgradeId, choice);
-    setState({ phase: "running", stage: state.stage });
+    const { upgradeId } = state.question;
+    const asked = (current: Phase): current is Extract<Phase, { phase: "deciding" }> =>
+      current.phase === "deciding" && current.question.upgradeId === upgradeId;
+    setState({ ...state, answering: true, undelivered: false });
+    // The question stays until the answer has arrived; until then it is still
+    // the one an unmount answers.
+    send(upgradeId, choice).then(
+      () => {
+        if (pendingQuestion.current === upgradeId) pendingQuestion.current = undefined;
+        setState((current) => asked(current) ? { phase: "running", stage: current.stage } : current);
+      },
+      () => setState((current) => asked(current) ? { ...current, answering: false, undelivered: true } : current),
+    );
   };
 
   /** Escape, a click outside, or the dialog's own close. Never a restart. */
   const dismiss = () => {
     if (state.phase === "running") return; // nothing to answer, and it is still working
-    if (state.phase === "deciding") answer(state.question.upgradeId, "keep-current");
+    if (state.phase === "deciding") {
+      if (state.answering) return; // an answer is on its way; let it land
+      answer(state.question.upgradeId, "keep-current");
+    }
     onClose();
   };
 
@@ -135,7 +158,7 @@ export function UpgradeDialog({ target, runtime, onClose }: {
         <h2 id="upgrade-title">{title}</h2>
         {state.phase === "confirm" && <ConfirmBody target={target} deck={deck} onCancel={onClose} onStart={start} available={Boolean(runtime.upgradeDaemon)} />}
         {(state.phase === "running" || state.phase === "deciding") && <StageList stage={state.stage} kind={target.kind} />}
-        {state.phase === "deciding" && <DecisionBody question={state.question} deck={replace ? "this machine" : deck} kind={target.kind} onDecide={decide} />}
+        {state.phase === "deciding" && <DecisionBody question={state.question} deck={replace ? "this machine" : deck} kind={target.kind} answering={state.answering} undelivered={state.undelivered ?? false} onDecide={decide} />}
         {state.phase === "done" && <OutcomeBody outcome={state.outcome} deck={deck} kind={target.kind} onClose={onClose} />}
         {state.phase === "error" && (
           <>
@@ -182,15 +205,16 @@ function StageList({ stage, kind }: { stage?: UpgradeStage; kind: UpgradeKind })
   );
 }
 
-function DecisionBody({ question, deck, kind, onDecide }: { question: UpgradeDecisionEvent; deck: string; kind: UpgradeKind; onDecide: (choice: UpgradeChoice) => void }) {
+function DecisionBody({ question, deck, kind, answering, undelivered, onDecide }: { question: UpgradeDecisionEvent; deck: string; kind: UpgradeKind; answering: boolean; undelivered: boolean; onDecide: (choice: UpgradeChoice) => void }) {
   return (
-    <div data-testid="upgrade-decision">
+    <div data-testid="upgrade-decision" aria-busy={answering}>
       {question.stale && <p data-testid="upgrade-decision-stale">What is running changed since you were asked, so here is the list again.</p>}
       <p>Restarting the daemon on {deck} stops {stopSetCount(question.atStake)}:</p>
       <StopList lines={stopSetLines(question.atStake)} testId="upgrade-at-stake" />
       <p className="upgrade-hint">{kind === "replace"
         ? "Keep current daemon leaves them running on the daemon you have now."
         : "Keep current daemon leaves them running on the old version; the new version stays installed for its next restart."}</p>
+      {undelivered && <p role="alert" data-testid="upgrade-decision-error">Your answer did not reach Agent Deck, so nothing has been stopped or restarted yet. Choose again to retry.</p>}
       <div>
         <button className="button secondary" data-testid="upgrade-keep-current" autoFocus onClick={() => onDecide("keep-current")}>Keep current daemon</button>
         <button className="button danger" data-testid="upgrade-restart-now" onClick={() => onDecide("restart-now")}>Restart now</button>

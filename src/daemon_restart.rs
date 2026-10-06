@@ -713,6 +713,17 @@ pub struct RemoteRestartReport {
     pub unsupported: bool,
 }
 
+/// `restart-installed` exits with this when it failed before the restart
+/// request was sent: the daemon was not asked, so the caller can say so.
+pub const RESTART_NOT_SENT_EXIT: u8 = 1;
+
+/// `restart-installed` exits with this when the restart request was sent and
+/// then no answer was read ([`crate::daemon_client::ClientError::Unanswered`]):
+/// the daemon may be restarting, so the caller checks before it says which.
+/// The caller treats every non-zero exit other than [`RESTART_NOT_SENT_EXIT`]
+/// (and clap's usage error) the same way, a crash after the send included.
+pub const RESTART_UNANSWERED_EXIT: u8 = 3;
+
 /// Hex-encode a [`RestartStopSet`]'s JSON for `restart-installed
 /// --confirm-hex`. Hex keeps the argument free of shell metacharacters,
 /// because the ssh route takes one command string and no stdin.
