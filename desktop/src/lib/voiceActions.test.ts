@@ -176,6 +176,11 @@ describe("VOICE_ACTIONS", () => {
       // PR #1451 round 3, change 4: turning the page of a paged list.
       "nextPage",
       "previousPage",
+      // Issue #1492: scrolling the agent dashboard.
+      "scrollDown",
+      "scrollUp",
+      "scrollToTop",
+      "scrollToBottom",
       // PR #1451 round 4, D8: the New agent form's Command field.
       "setNewAgentCommand",
     ];

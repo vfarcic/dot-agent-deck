@@ -76,8 +76,40 @@ function numberWord(word: string): [number, boolean] | undefined {
   return digits ? [Number(digits[1]), false] : undefined;
 }
 
-/** `voice::choice::number_said`: one word, or a ten and a unit ("twenty three", "twenty third"). */
+/** `voice::choice::MAX_NUMBER_WORDS`: the most words one number is said in, "nine hundred and ninety nine". */
+export const MAX_NUMBER_WORDS = 5;
+
+/** `voice::choice::SCALES`: a scale's word, its value, and whether it is a count ("hundred") or a position ("hundredth"). */
+const SCALES: [string, number, boolean][] = [["hundred", 100, true], ["hundredth", 100, false], ["thousand", 1000, true], ["thousandth", 1000, false]];
+
+/**
+ * `voice::choice::number_said`: words as one number. Below a hundred, or past
+ * it (issue #1492): an optional "one" to "nine" or "a", "hundred", then an
+ * optional "and" and one to ninety-nine in words; a position ends in one
+ * ("hundredth", "one hundred and first"); and exactly one thousand.
+ */
 function numberSaid(words: string[]): [number, boolean] | undefined {
+  const at = words.findIndex((word) => SCALES.some(([scale]) => scale === word));
+  if (at === -1) return belowHundred(words);
+  const [, size, count] = SCALES.find(([scale]) => scale === words[at])!;
+  const lead = words.slice(0, at);
+  let times: number;
+  if (lead.length === 0 || (lead.length === 1 && lead[0] === "a")) times = 1;
+  else if (lead.length === 1 && CARDINALS.includes(lead[0])) times = CARDINALS.indexOf(lead[0]) + 1;
+  else return undefined;
+  let rest = words.slice(at + 1);
+  if (size === 1000) return times === 1 && rest.length === 0 ? [size, count] : undefined;
+  const base = times * size;
+  if (rest.length === 0) return [base, count];
+  if (!count) return undefined;
+  if (rest[0] === "and") rest = rest.slice(1);
+  if (rest.some((word) => /\d/.test(word))) return undefined;
+  const part = belowHundred(rest);
+  return part && part[0] >= 1 && part[0] <= 99 ? [base + part[0], part[1]] : undefined;
+}
+
+/** `voice::choice::below_hundred`: one word, or a ten and a unit ("twenty three", "twenty third"). */
+function belowHundred(words: string[]): [number, boolean] | undefined {
   if (words.length === 1) return numberWord(words[0]);
   if (words.length !== 2 || !TENS.includes(words[0])) return undefined;
   const tens = TENS.indexOf(words[0]) * 10 + 20;
@@ -86,16 +118,16 @@ function numberSaid(words: string[]): [number, boolean] | undefined {
   return undefined;
 }
 
-/** `voice::choice::count_said`: one word, or a ten and a unit, read as a number said as a count. */
+/** `voice::choice::count_said`: one number ({@link numberSaid}) read as a number said as a count. */
 export function countSaid(words: string[]): number | undefined {
   const said = numberSaid(words);
   return said?.[1] ? said[0] : undefined;
 }
 
 /**
- * `voice::choice::ordinal_words`: the one or two words an ordinal utterance
+ * `voice::choice::ordinal_words`: the words of one number an ordinal utterance
  * turns on, once a leading "the", an ordinal lead and a trailing filler "one"
- * after a position are set aside, or `undefined` when more than two are left.
+ * after a position are set aside, or `undefined` when more than `MAX_NUMBER_WORDS` are left.
  */
 function ordinalWords(words: string[]): string[] | undefined {
   let rest = words;
@@ -103,13 +135,13 @@ function ordinalWords(words: string[]): string[] | undefined {
   if (rest[0] !== undefined && ORDINAL_LEADS.includes(rest[0])) rest = rest.slice(1);
   const head = rest.slice(0, -1);
   if (rest.length >= 2 && rest.at(-1) === "one" && ((head.length === 1 && head[0] === "last") || numberSaid(head)?.[1] === false)) rest = head;
-  return rest.length >= 1 && rest.length <= 2 ? rest : undefined;
+  return rest.length >= 1 && rest.length <= MAX_NUMBER_WORDS ? rest : undefined;
 }
 
 /**
  * A whole-utterance ordinal, 1-based, `"last"`, or `undefined` for none
  * (`voice::choice::ordinal`): "two", "number twelve", "the twenty-first one",
- * "23rd", up to ninety-nine in words.
+ * "23rd", and past ninety-nine "one hundred thirty four" and "the hundredth" in words.
  */
 export function ordinal(words: string[]): number | "last" | undefined {
   const said = ordinalWords(words);

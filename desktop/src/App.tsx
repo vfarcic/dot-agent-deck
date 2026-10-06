@@ -31,7 +31,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview } from "./components/AgentOverview";
+import { AgentOverview, DASHBOARD_COVERED, modalOpen } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -63,7 +63,7 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
-import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
+import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
@@ -746,9 +746,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const paging = useMemo<VoicePaging>(() => ({
     publish: (layer, pager) => { pagerLayers.current[layer] = pager; },
   }), []);
+  /* Whether a dialog over the screen declares a numbered or paged list. */
+  const dialogLayerUp = useCallback(() => numberedLayers.current.dialog !== undefined || pagerLayers.current.dialog !== undefined, []);
   const readPager = useCallback((): VoicePager | undefined => (
-    numberedLayers.current.dialog !== undefined || pagerLayers.current.dialog !== undefined ? pagerLayers.current.dialog : pagerLayers.current.screen
-  ), []);
+    dialogLayerUp() ? pagerLayers.current.dialog : pagerLayers.current.screen
+  ), [dialogLayerUp]);
   const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
     const previous = view;
     /*
@@ -845,11 +847,23 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       closeOverlays: railContext.closeOverlays,
       /* Only while Settings is open, so `close` reads its presence (#1197). */
       ...(overlaysOpen.settings ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
+      /* Issue #1492 — the dashboard's scroll, refused while anything is in
+         front of it: a dialog layer (the open Daemon selector's menu), the
+         Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
+         and a dashboard moved behind an overlay is somewhere unexpected when
+         the overlay closes. */
+      ...(overviewVoiceContext.current?.scrollDashboard
+        ? { scrollDashboard: (move: DashboardScroll) => (dialogLayerUp() || confirmationOpen || overlaysOpen.settings || modalOpen() ? DASHBOARD_COVERED : overviewVoiceContext.current?.scrollDashboard?.(move)) }
+        : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
-      /* The page of whichever list on screen pages (PR #1451 round 3, change 4). */
+      /* The page of whichever list on screen pages (PR #1451 round 3, change 4).
+         The agent dashboard scrolls instead of paging (issue #1492), so with
+         nothing over it, a page turn there scrolls it by about a screen. */
       turnPage: (delta) => {
         const pager = readPager();
+        const scrollDashboard = context.scrollDashboard;
+        if (!pager && !dialogLayerUp() && scrollDashboard) return scrollDashboard(delta > 0 ? "down" : "up");
         const refused = pageTurnRefusal(pager, delta);
         if (refused === undefined) pager?.turn(delta);
         return refused;
@@ -864,8 +878,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
        dispatch the host cannot serve, so the report says nothing ran. */
     if (outcome.invoke === OPEN_DECK_INVOKE && !features.showDeck) return undefined;
     /* PR #1451 round 3, change 4 — voice acts only on what is on screen. An
-       answer naming an item a paged list shows on another page (an agent on
-       the dashboard's page 2, resolved by Rust against the whole deck) is
+       answer naming an item a paged list shows on another page (an agent
+       tile on the Daemons screen's page 2, resolved by Rust against the whole
+       deck) is
        refused with that page, and nothing runs. */
     const pager = readPager();
     const offPage = pager && offPageTarget(outcome.params, pager.elsewhere, selectedDeckId);
@@ -876,7 +891,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, overlaysOpen.settings, paneAgent, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

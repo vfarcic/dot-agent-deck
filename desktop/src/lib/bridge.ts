@@ -2806,6 +2806,9 @@ class FixtureDeckBridge implements DeckBridge {
   /** Whether the New agent dialog's live form was declared with it (PR #1451 round 4, D8). */
   private voiceNewAgentForm = false;
 
+  /** Whether the New agent dialog was declared open at all, which the scroll rows need closed (issue #1492). */
+  private voiceNewAgentDialog = false;
+
   /* The preview's directory rows (the Filter box's two) and its Command row
      need only to know a listing or a live form is showing; the rows
      themselves feed nothing here. */
@@ -2813,6 +2816,7 @@ class FixtureDeckBridge implements DeckBridge {
     this.voiceScreen = screen;
     this.voiceDirectoryListing = directories !== undefined;
     this.voiceNewAgentForm = newAgent?.form !== undefined;
+    this.voiceNewAgentDialog = newAgent !== undefined;
     this.voiceDictation = dictation;
   }
 
@@ -2826,7 +2830,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async resolveVoice(utterance: string): Promise<VoiceResultDto> {
     await Promise.resolve();
-    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm);
+    return resolveFixtureVoice(utterance, this.voiceScreen, this.voiceDictation !== undefined, this.voiceDirectoryListing, this.voiceNewAgentForm, this.voiceNewAgentDialog);
   }
 
   /** PRD #1261 — the preview has no Rust side, so the webview's own port answers. */
@@ -2851,7 +2855,7 @@ class FixtureDeckBridge implements DeckBridge {
    */
   async voiceCommands(screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto): Promise<VoiceCommandDto[]> {
     await Promise.resolve();
-    return fixtureVoiceCommands(screen, directories !== undefined, newAgent?.form !== undefined);
+    return fixtureVoiceCommands(screen, directories !== undefined, newAgent?.form !== undefined, newAgent !== undefined);
   }
 
   /**

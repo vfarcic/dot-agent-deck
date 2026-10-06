@@ -999,10 +999,12 @@ heard_as    = ["clear", "remove", "reset", "no filter", "show all"]
 # PR #1451 round 3, change 4 — turning the page of a list voice selects from.
 #
 # While voice is on, a list that does not fit on screen is split into pages
-# instead of scrolling — the agent dashboard's agents, the Daemons screen's
-# tiles, the New agent dialog's directories and its Mode row — so everything
-# voice can act on is visible, and a number or a name refers to the page
-# showing. These two rows turn it. Neither needs a declaration: which list
+# instead of scrolling — the Daemons screen's tiles, the New agent dialog's
+# directories and its Mode row — so everything voice can act on is visible, and
+# a number or a name refers to the page showing. These two rows turn it. The
+# agent dashboard is not paged (issue #1492): it scrolls, voice on or off, and
+# on it these two rows scroll it by about a screen, as `scroll_down` and
+# `scroll_up` below do, so "next page" keeps working there. Neither needs a declaration: which list
 # pages is the webview's to know, and it answers "nothing on screen has pages",
 # "this is the last page" and "this is the first page" itself, in the voice
 # report, without moving anything. Not callable over an agent's pane, where no
@@ -1013,25 +1015,27 @@ heard_as    = ["clear", "remove", "reset", "no filter", "show all"]
 # said with it means this row.
 [[commands]]
 id          = "next_page"
-description = """Show the next page of the list on screen that is split into pages — the agent
-dashboard's agents, the Daemons screen's agent tiles, or the New agent dialog's directories or Mode
-chips, which are shown a page at a time while voice is on. Use for next page, go to the next page,
-the next page, page forward, forward a page, more, or show more. It changes which items are showing
-and nothing else: it opens, chooses, starts and stops nothing."""
+description = """Show the next page of the list on screen that is split into pages — the Daemons
+screen's agent tiles, or the New agent dialog's directories or Mode chips, which are shown a page at
+a time while voice is on. On the agent dashboard, which scrolls instead of paging, it scrolls down by
+about one screen. Use for next page, go to the next page, the next page, page forward, forward a
+page, page down, more, or show more. It changes which items are showing and nothing else: it opens, chooses,
+starts and stops nothing."""
 invoke      = "nextPage"
 screens     = ["deck", "overview"]
 unavailable_hint = "turning a page works on the agent dashboard, the Daemons screen and the New agent dialog, once the agent's pane is closed"
 report      = "Next page."
 asks_to     = "show the next page"
 try_saying  = "next page"
-heard_as    = ["next", "forward", "more"]
+heard_as    = ["next", "forward", "more", "page down"]
 
 [[commands]]
 id          = "previous_page"
 description = """Show the previous page of the list on screen that is split into pages — the
-agent dashboard's agents, the Daemons screen's agent tiles, or the New agent dialog's directories or
-Mode chips, which are shown a page at a time while voice is on. Use for previous page, go to the
-previous page, go back a page, back a page, the page before, or page back. A "go back" that names a
+Daemons screen's agent tiles, or the New agent dialog's directories or Mode chips, which are shown a
+page at a time while voice is on. On the agent dashboard, which scrolls instead of paging, it scrolls
+up by about one screen. Use for previous page, go to the previous page, go back a page, back a page,
+the page before, page back, or page up. A "go back" that names a
 page means THIS one, not leaving the screen. It changes which items are showing and nothing else: it
 opens, chooses, starts and stops nothing."""
 invoke      = "previousPage"
@@ -1040,7 +1044,79 @@ unavailable_hint = "turning a page works on the agent dashboard, the Daemons scr
 report      = "Previous page."
 asks_to     = "show the previous page"
 try_saying  = "previous page"
-heard_as    = ["previous", "back", "before"]
+heard_as    = ["previous", "back", "before", "page up"]
+
+# Issue #1492 — scrolling the agent dashboard by voice. The dashboard used to
+# be split into pages while voice was on, and only the page showing was drawn,
+# so daemons and orchestrations on other pages were simply missing. It now
+# shows everything, voice on or off, and scrolls; these four rows move it. Each
+# is `overview`-only and needs the New agent dialog closed, because the
+# dashboard is what they scroll and the dialog covers it. The app answers "the
+# whole dashboard is on screen", "already at the bottom" and "already at the
+# top" itself, without moving anything. Like a page turn, a scroll moves the
+# view only and opens, chooses, starts and stops nothing.
+#
+# `scroll_up`'s "up" is also `go_to_parent`'s word; that row needs a directory
+# listing on screen, which only the New agent dialog shows, and these need the
+# dialog closed, so the two are never callable together.
+[[commands]]
+id          = "scroll_down"
+description = """Scroll the agent dashboard down by about one screen, to show the daemons, orchestrations
+and agents below what is on screen. Use for scroll down, scroll down a bit, go down, move down, or
+show what is below; "page down" is next page, which scrolls the dashboard the same way. It changes which part of the dashboard is showing and nothing else: it
+opens, chooses, starts and stops nothing."""
+invoke      = "scrollDown"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Scrolling down."
+asks_to     = "scroll the dashboard down"
+try_saying  = "scroll down"
+heard_as    = ["down", "below"]
+
+[[commands]]
+id          = "scroll_up"
+description = """Scroll the agent dashboard up by about one screen, to show the daemons, orchestrations
+and agents above what is on screen. Use for scroll up, scroll up a bit, go up, move up, or show what
+is above; "page up" is previous page, which scrolls the dashboard the same way. It changes which part of the dashboard is showing and nothing else: it opens,
+chooses, starts and stops nothing."""
+invoke      = "scrollUp"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Scrolling up."
+asks_to     = "scroll the dashboard up"
+try_saying  = "scroll up"
+heard_as    = ["up", "above"]
+
+[[commands]]
+id          = "scroll_to_top"
+description = """Scroll the agent dashboard all the way to its top, where the first daemon is. Use for
+scroll to the top, go to the top, back to the top, the top of the dashboard, or the beginning. It
+changes which part of the dashboard is showing and nothing else: it opens, chooses, starts and stops
+nothing."""
+invoke      = "scrollToTop"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Scrolled to the top."
+asks_to     = "scroll to the top of the dashboard"
+try_saying  = "scroll to the top"
+heard_as    = ["top", "beginning"]
+
+[[commands]]
+id          = "scroll_to_bottom"
+description = """Scroll the agent dashboard all the way to its bottom, where the last daemon is. Use
+for scroll to the bottom, go to the bottom, the bottom of the dashboard, or the end. It changes which
+part of the dashboard is showing and nothing else: it opens, chooses, starts and stops nothing."""
+invoke      = "scrollToBottom"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "scrolling works on the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Scrolled to the bottom."
+asks_to     = "scroll to the bottom of the dashboard"
+try_saying  = "scroll to the bottom"
+heard_as    = ["bottom", "the end"]
 
 # PRD #1223 — the rest of the New agent form by voice: Mode, the agent's
 # command, and Name — and since PR #1451 round 4 (decision D8), Command itself.

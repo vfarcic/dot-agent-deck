@@ -34,7 +34,7 @@
  * production answers with.
  */
 import type { VoiceOutcomeDto, VoiceResolvedParamDto } from "./bridge";
-import { countSaid, ordinal, saidAsCount, spokenWords, wholeUtterance } from "./voiceChoice";
+import { countSaid, MAX_NUMBER_WORDS, ordinal, saidAsCount, spokenWords, wholeUtterance } from "./voiceChoice";
 
 /** What a numbered item is, which decides what choosing it does (`voice::numbers::NumberedKind`). */
 export type VoiceNumberedKind = "agent" | "deck" | "deck_switch" | "directory" | "parent" | "mode";
@@ -138,9 +138,13 @@ function readSection(words: string[]): { section?: VoiceNumberedSectionKind; wor
   return verb === 0 ? { said: words } : undefined;
 }
 
-/** `voice::numbers::trailing_count`: the count a name ends in, its last two words when they are one number. */
+/** `voice::numbers::trailing_count`: the count a name ends in, the longest run of its last words that is one number. */
 function trailingCount(words: string[]): number | undefined {
-  return (words.length >= 2 ? countSaid(words.slice(-2)) : undefined) ?? (words.length > 0 ? countSaid(words.slice(-1)) : undefined);
+  for (let len = Math.min(MAX_NUMBER_WORDS, words.length); len >= 1; len -= 1) {
+    const count = countSaid(words.slice(-len));
+    if (count !== undefined) return count;
+  }
+  return undefined;
 }
 
 /** `voice::numbers::ends_in`: one of the entry's names is, or ends in, `number`. */
@@ -158,7 +162,7 @@ function indexOf(said: number | "last", len: number): number | undefined {
 function isNamed(entry: VoiceNumberedEntryDto, word: string, number: number): boolean {
   return [entry.label, ...entry.names].some((name) => {
     const words = spokenWords(name);
-    return (words.length === 2 || words.length === 3) && words[0] === word && countSaid(words.slice(1)) === number;
+    return words.length >= 2 && words.length <= MAX_NUMBER_WORDS + 1 && words[0] === word && countSaid(words.slice(1)) === number;
   });
 }
 
