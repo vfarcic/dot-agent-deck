@@ -38,7 +38,7 @@ Do not reverse the order, and do not skip to the fix because the cause looks obv
 
 7. **Watch the same test go green**, then prove each fix is load-bearing: revert one change at a time and confirm the test goes red again. If reverting a change leaves the test green, that change is not part of the fix — take it out or find what it is really doing.
 
-8. **Run the wider tier** before reporting done: `cargo test-fast`, plus the tests covering what you touched. There is no full-tier obligation before the PR — per CLAUDE.md rule 5, lane 1 runs in CI on every PR, so read that run rather than reproducing it. If your reproduction is an e2e test, run it and its module by filter (`cargo test-e2e <filter>`, or `cargo test-e2e-live <filter>` when the test reaches a real agent); do not run either alias unfiltered. A lane-2 test is worth running deliberately: nothing in CI runs one, so if you do not, nobody does.
+8. **Run the wider tier** before reporting done: `cargo xtask affected-checks --run` (for a code change that is `cargo fmt --check`, rule 2's clippy command and `cargo test-fast`), plus the tests covering what you touched. There is no full-tier obligation before the PR — per CLAUDE.md rule 5, lane 1 runs in CI on every PR, so read that run rather than reproducing it. If your reproduction is an e2e test, run it and its module by filter (`cargo test-e2e <filter>`, or `cargo test-e2e-live <filter>` when the test reaches a real agent); do not run either alias unfiltered. A lane-2 test is worth running deliberately: nothing in CI runs one, so if you do not, nobody does.
 
 ## The traps that have actually cost time here
 
