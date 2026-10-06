@@ -557,6 +557,58 @@ pub fn write_marker(
     Err(classify_write_failure(&path, message))
 }
 
+/// The file that marks a worktree the deck created for an agent it then never
+/// started — the issue-dispatch spawn was refused because the daemon is
+/// restarting — so that a FAILED removal of it stays recoverable (PRD #1487
+/// final audit F2).
+///
+/// Without it the leftover reads as "issue already claimed" to every later
+/// fire, with no agent in it to ever close and release it. It lives beside
+/// [`OWNER_MARKER_FILENAME`] in the worktree's own git metadata dir, for the
+/// same reasons: it leaves `git status` clean, and `git worktree remove`
+/// deletes it with the worktree, so it never outlives what it describes. On
+/// disk rather than in the daemon's memory because a restart that goes ahead
+/// leaves the leftover to the successor.
+pub const ABANDONED_SPAWN_FILENAME: &str = "dot-agent-deck-abandoned-spawn";
+
+/// The exact content [`mark_abandoned_spawn`] writes and
+/// [`is_abandoned_spawn_of`] requires: which creator abandoned the worktree.
+fn abandoned_spawn_body(creator: &Creator) -> String {
+    format!("{} {}\n", creator.kind, creator.subject)
+}
+
+/// Record that `creator` created `worktree_path` and never started an agent in
+/// it, so a later attempt by the same creator may remove it. Call it only for
+/// a worktree that attempt itself created: this is a claim on a deletion path.
+pub fn mark_abandoned_spawn(worktree_path: &Path, creator: &Creator) -> Result<PathBuf, String> {
+    let path = git_dir_of(worktree_path)
+        .ok_or_else(|| {
+            format!(
+                "could not resolve the git metadata dir of {}",
+                worktree_path.display()
+            )
+        })?
+        .join(ABANDONED_SPAWN_FILENAME);
+    std::fs::write(&path, abandoned_spawn_body(creator))
+        .map(|()| path.clone())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// Whether `worktree_path` is one `creator` created and abandoned before any
+/// agent ran in it: the deck's ownership marker is there ([`is_marked`]) AND
+/// the abandoned-spawn marker names exactly this creator. Unlike the ownership
+/// gate this one compares the content, because "abandoned by THIS task for
+/// THIS issue" is the whole claim; a torn or foreign file fails the comparison
+/// and reads as not abandoned, which is the fail-safe direction.
+pub fn is_abandoned_spawn_of(worktree_path: &Path, creator: &Creator) -> bool {
+    let Some(git_dir) = git_dir_of(worktree_path) else {
+        return false;
+    };
+    reads_as_claim(&git_dir.join(OWNER_MARKER_FILENAME))
+        && std::fs::read_to_string(git_dir.join(ABANDONED_SPAWN_FILENAME))
+            .is_ok_and(|body| body == abandoned_spawn_body(creator))
+}
+
 /// [`write_marker`], made best-effort and non-blocking for the async creation
 /// path: a failure warns and is dropped, because the cost of a missing marker
 /// is one confirmation prompt at reclaim time and the cost of propagating it

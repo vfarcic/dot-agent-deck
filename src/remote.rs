@@ -953,18 +953,21 @@ const FINAL_DRAIN_BYTES: usize = 1024 * 1024;
 ///   remote binary or wrapping shell could observe local input for up to the
 ///   deadline.
 /// - Pipes stdout/stderr and drains them concurrently in two helper threads
-///   while the main loop polls `child.try_wait()`. This is what
+///   while the main loop polls the child for exit. This is what
 ///   `Command::output()` does internally, and it's required for any child
 ///   producing more output than a single pipe buffer (~64 KiB on Linux):
 ///   without concurrent draining, the child blocks in `write(2)` before it
-///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
+///   can exit, the poll keeps reporting it running, and the wallclock fires
 ///   even though the child wasn't actually stalled.
 /// - Applies `max_capture_bytes` to *each* stream independently — stdout and
 ///   stderr are separate attack vectors, and a hostile peer that floods stderr
 ///   drives memory growth just as easily as one that floods stdout. A drainer
 ///   stops reading altogether at its cap and closes its pipe, so a child that
 ///   keeps writing dies of `SIGPIPE`/`EPIPE` or is reaped at the deadline.
-/// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
+/// - Polls the child every 50ms until the deadline — on Unix with
+///   `waitid(…, WNOWAIT)`, which observes the exit without reaping, so the
+///   child is reaped exactly once, after the last signal (see [`Leader`]).
+///   Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
 /// - **The deadline bounds the streams, not only the child** (PRD #1487
@@ -978,7 +981,7 @@ const FINAL_DRAIN_BYTES: usize = 1024 * 1024;
 ///   within a tick; elsewhere a reader still blocked after
 ///   [`READER_STOP_GRACE`] is abandoned rather than joined, and exits when the
 ///   last writer closes.
-/// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
+/// - On deadline: SIGKILL the child, then reap it, and
 ///   return `timed_out: true`. **Here the kill reaches the child only.**
 ///   `ssh -G` evaluates `Match exec`, so a config with `Match exec "sleep 30"`
 ///   has already forked a descendant that this does not signal; such a
@@ -1005,8 +1008,10 @@ pub fn run_local_bounded(
 /// still running: at the deadline, and when the child has exited but a stream
 /// is still held open past [`POST_EXIT_STREAM_GRACE`] — the shape of a
 /// `ProxyCommand` or jump-route helper outliving its `ssh`. The child itself is
-/// reaped here; a killed descendant is not our child and is reaped by whoever
-/// inherited it. A descendant that left the group (`setsid`, as a
+/// reaped here, and only after that signal: until then it is kept an unreaped
+/// zombie, so the group id it names cannot have been reused by the time the
+/// signal is sent ([`Leader`]). A killed descendant is not our child and is
+/// reaped by whoever inherited it. A descendant that left the group (`setsid`, as a
 /// `ControlPersist` master does) is not signalled, and the call still returns
 /// on time because its readers are cancelled rather than joined.
 ///
@@ -1040,14 +1045,22 @@ fn run_local_bounded_in(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn()?;
-    let group = OwnedGroup::of(&child, own_group);
+    let child = cmd.spawn()?;
+    let mut leader = Leader::new(child, own_group);
 
     // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
     // `None` so the uncapped install path reads without a byte limit.
     let cap = (max_capture_bytes != usize::MAX).then_some(max_capture_bytes);
-    let stdout = child.stdout.take().map(|s| PipeReader::spawn(s, cap));
-    let stderr = child.stderr.take().map(|s| PipeReader::spawn(s, cap));
+    let stdout = leader
+        .child
+        .stdout
+        .take()
+        .map(|s| PipeReader::spawn(s, cap));
+    let stderr = leader
+        .child
+        .stderr
+        .take()
+        .map(|s| PipeReader::spawn(s, cap));
     let readers: Vec<&PipeReader> = stdout.iter().chain(stderr.iter()).collect();
 
     let deadline = Instant::now()
@@ -1055,27 +1068,25 @@ fn run_local_bounded_in(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
     let poll_interval = Duration::from_millis(50);
 
-    let mut status = None;
+    // The child is observed here but never reaped: it stays a zombie, holding
+    // its pid — and so its group id — until `leader.reap()` below, which comes
+    // after the last signal this call sends (PRD #1487 final audit F1).
     let mut exited_at: Option<Instant> = None;
     let mut timed_out = false;
     loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => {
-                    status = Some(exit);
-                    exited_at = Some(Instant::now());
-                }
-                Ok(None) => {}
+        if exited_at.is_none() {
+            match leader.has_exited() {
+                Ok(true) => exited_at = Some(Instant::now()),
+                Ok(false) => {}
                 Err(source) => {
-                    group.kill(&mut child);
-                    let _ = child.wait();
+                    leader.abandon(&source);
                     PipeReader::stop_all(&readers);
                     return Err(source);
                 }
             }
         }
         let streams_closed = readers.iter().all(|r| r.is_done());
-        if status.is_some() && streams_closed {
+        if exited_at.is_some() && streams_closed {
             break;
         }
         let now = Instant::now();
@@ -1087,17 +1098,20 @@ fn run_local_bounded_in(
             // Something this call started may still be running: the child
             // itself, or a descendant holding one of its streams open. Best
             // effort, secondary errors ignored — SIGKILL is unblockable, so
-            // `wait` returns, and the readers are cancelled, never joined.
-            group.kill(&mut child);
-            if status.is_none() {
-                let _ = child.wait();
-                timed_out = true;
-            }
+            // the reap below returns, and the readers are cancelled, never
+            // joined.
+            leader.kill();
+            timed_out = exited_at.is_none();
             PipeReader::stop_all(&readers);
             break;
         }
         std::thread::sleep(poll_interval);
     }
+    // The only reap, after every signal: from here on the pid and the group id
+    // may belong to someone else, and `reap` consumes the leader so nothing
+    // can signal them.
+    let reaped = leader.reap();
+    let status = if timed_out { None } else { Some(reaped?) };
 
     let stdout = stdout.map(|r| r.take()).unwrap_or_default();
     let stderr = stderr.map(|r| r.take()).unwrap_or_default();
@@ -1160,43 +1174,176 @@ fn run_with_wallclock_kill(
     }
 }
 
-/// The process group [`run_local_bounded_owning_group`] put its child in, or
-/// none, in which case killing reaches the child alone.
-struct OwnedGroup {
+/// The child [`run_local_bounded_in`] spawned, and the process group it owns
+/// when the call is [`run_local_bounded_owning_group`].
+///
+/// The group id is the child's pid, so it names this call's group only while
+/// the kernel keeps that pid: while the child runs, and after it exits for as
+/// long as it stays an unreaped zombie. A group signal sent after the reap
+/// could reach a stranger's group once the number is reused, and a descendant
+/// that left the group with `setsid` while holding a stream keeps the call
+/// waiting through exactly that window, with no member left to hold the id
+/// (PRD #1487 final audit F1). So the child's exit is observed without reaping
+/// it (`waitid(…, WNOWAIT)`), every signal is sent before [`Leader::reap`], and
+/// `reap` consumes the value, so no signal can follow it.
+struct Leader {
+    child: std::process::Child,
     #[cfg(unix)]
     pgid: Option<libc::pid_t>,
 }
 
-impl OwnedGroup {
-    fn of(child: &std::process::Child, own_group: bool) -> Self {
+impl Leader {
+    fn new(child: std::process::Child, own_group: bool) -> Self {
         #[cfg(unix)]
         {
-            Self {
-                pgid: own_group
-                    .then(|| libc::pid_t::try_from(child.id()).ok())
-                    .flatten(),
-            }
+            let pgid = own_group
+                .then(|| libc::pid_t::try_from(child.id()).ok())
+                .flatten()
+                .filter(|&pgid| group_is_signalable(pgid));
+            Self { child, pgid }
         }
         #[cfg(not(unix))]
         {
-            let _ = (child, own_group);
-            Self {}
+            let _ = own_group;
+            Self { child }
         }
     }
 
-    /// SIGKILL the child, and the whole group when this call owns one. The
-    /// group id stays reserved while any member is alive, and the leader is
-    /// reaped only by this call, so the signal cannot reach a stranger's group
-    /// while it still matters.
-    fn kill(&self, child: &mut std::process::Child) {
+    /// Whether the child has exited. On Unix it is left unreaped, so its pid
+    /// and group id stay reserved until [`Leader::reap`].
+    fn has_exited(&mut self) -> std::io::Result<bool> {
         #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
+        {
+            exited_unreaped(self.child.id())
+        }
+        // No process groups here; std keeps the status for `reap` to return.
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().map(|status| status.is_some())
+        }
+    }
+
+    /// SIGKILL the child and, when this call owns one, its whole group. Safe
+    /// to aim at the group because the child has not been reaped: whether it
+    /// is running or a zombie, its pid — the group id — is still its own.
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.filter(|&pgid| group_is_signalable(pgid)) {
+            #[cfg(all(test, unix))]
+            leader_seam::record(leader_seam::Event::GroupSignal {
+                leader_unreaped: leader_seam::unreaped(self.child.id()),
+            });
             // SAFETY: killpg takes plain integers and has no memory effects.
             unsafe {
                 libc::killpg(pgid, libc::SIGKILL);
             }
         }
-        let _ = child.kill();
+        let _ = self.child.kill();
+    }
+
+    /// Give up after the child's exit could not be observed. No group signal:
+    /// the failure may mean something else reaped the child (a process that
+    /// ignores `SIGCHLD` has its children reaped automatically), and then
+    /// neither its pid nor its group id is ours any more. `ECHILD` says exactly
+    /// that, so nothing is signalled; any other failure kills the child alone
+    /// and reaps it, as before.
+    fn abandon(mut self, err: &std::io::Error) {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return;
+        }
+        let _ = err;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Reap the child — the last thing done with it. Consumes the leader, so
+    /// no signal can be sent after the pid and group id are released.
+    fn reap(mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(all(test, unix))]
+        leader_seam::record(leader_seam::Event::Reap);
+        self.child.wait()
+    }
+}
+
+/// Whether child `pid` has exited, observed without reaping it.
+#[cfg(unix)]
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+        // `waitid` writes no more than one. `WNOWAIT` leaves the child
+        // waitable, so this neither reaps it nor changes what a later wait
+        // sees; `WNOHANG` returns at once with `si_pid` still 0 when the child
+        // has not exited.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `waitid` filled `info` (or left it zeroed).
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Defence in depth for a group signal: `killpg(0)` would signal the caller's
+/// own group, `1` is init's, and a non-positive id is not a group at all.
+/// Whatever produced `pgid`, these are never this call's to kill.
+#[cfg(unix)]
+fn group_is_signalable(pgid: libc::pid_t) -> bool {
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    pgid > 1 && pgid != unsafe { libc::getpgrp() }
+}
+
+/// What [`Leader`] did, in order, so a test can assert that no group signal
+/// follows the reap, and that the kernel still held the child at the moment
+/// of each signal. Recording is per thread and off until a test turns it on.
+#[cfg(all(test, unix))]
+mod leader_seam {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Event {
+        /// The group was signalled; `leader_unreaped` is the kernel's answer,
+        /// at that moment, to whether the child was still waitable.
+        GroupSignal {
+            leader_unreaped: bool,
+        },
+        Reap,
+    }
+
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<Event>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(event: Event) {
+        EVENTS.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
+                events.push(event);
+            }
+        });
+    }
+
+    /// Run `f` with recording on, and return what it recorded.
+    pub(super) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
+        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let recorded = EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default());
+        (out, recorded)
+    }
+
+    /// Whether child `pid` is still waitable — running, or an unreaped zombie.
+    pub(super) fn unreaped(pid: u32) -> bool {
+        super::exited_unreaped(pid).is_ok()
     }
 }
 
@@ -3389,6 +3536,120 @@ mod tests {
         assert!(capture.status.is_some_and(|s| s.success()));
         assert!(!capture.timed_out && !capture.truncated);
         assert!(stdout.starts_with("pid="), "the line was lost: {stdout:?}");
+    }
+
+    /// Run `script` under `/bin/sh` through the group-owning runner with the
+    /// leader seam recording, and return the capture, what the runner did to
+    /// the leader, and the pid the script printed as `pid=<n>`, if any.
+    #[cfg(unix)]
+    fn run_owning_group_recorded(
+        script: &str,
+        secs: u64,
+    ) -> (LocalCapture, Vec<leader_seam::Event>, Option<libc::pid_t>) {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let (capture, events) =
+            leader_seam::capture(|| run_local_bounded_owning_group(&mut cmd, secs, 4096));
+        let capture = capture.unwrap();
+        let pid = String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("pid=")?.trim().parse().ok());
+        (capture, events, pid)
+    }
+
+    /// The order every group-owning run that signals must keep: one group
+    /// signal, sent while the kernel still held the child, then the one reap.
+    #[cfg(unix)]
+    fn assert_signalled_before_reaping(events: &[leader_seam::Event], label: &str) {
+        use leader_seam::Event;
+        assert_eq!(
+            events,
+            [
+                Event::GroupSignal {
+                    leader_unreaped: true
+                },
+                Event::Reap
+            ],
+            "{label}: the group must be signalled while the leader is unreaped, then reaped once"
+        );
+    }
+
+    /// Scenario: the escaped-writer interleaving from PRD #1487's final audit
+    /// (F1) — the child starts a descendant that leaves its process group with
+    /// `setsid` while keeping stdout open, prints a line and exits. The call
+    /// waits out the stream grace and signals the group; that signal must go
+    /// out while the exited child is still an unreaped zombie holding the
+    /// group id, and the child is reaped only afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owning_group_signals_an_escapees_old_group_only_before_reaping_its_leader() {
+        if Command::new("setsid")
+            .arg("true")
+            .status()
+            .map_or(true, |s| !s.success())
+        {
+            eprintln!("SKIP: no `setsid` on this host");
+            return;
+        }
+        let (capture, events, pid) =
+            run_owning_group_recorded("setsid sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // Out of reach of the group kill, so this test cleans it up.
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(pid.is_some(), "the line was lost: {:?}", capture.stdout);
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out);
+        assert_signalled_before_reaping(&events, "escapee");
+    }
+
+    /// Scenario: a descendant that stays in the group holds the streams after
+    /// the child exits, and, separately, a child that never exits. Both end
+    /// in a group signal; in both the signal precedes the only reap and finds
+    /// the child still unreaped.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_never_signals_after_reaping_its_leader() {
+        let (capture, events, pid) =
+            run_owning_group_recorded("sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // SAFETY: plain signal to the pid this test started; it is
+            // already dead if the group kill reached it.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert_signalled_before_reaping(&events, "held after exit");
+
+        let (capture, events, _) = run_owning_group_recorded("exec sleep 600", 1);
+        assert!(capture.timed_out && capture.status.is_none());
+        assert_signalled_before_reaping(&events, "deadline");
+    }
+
+    /// Scenario: a child that prints a line and exits with nothing left
+    /// holding its streams. Nothing could still be running, so the group is
+    /// not signalled at all; the child is reaped once and its status kept.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_reaps_a_clean_exit_without_signalling() {
+        let (capture, events, _) = run_owning_group_recorded("echo pid=0; exit 3", 60);
+        assert_eq!(capture.status.and_then(|s| s.code()), Some(3));
+        assert_eq!(events, [leader_seam::Event::Reap]);
+    }
+
+    /// Scenario: the defence-in-depth check on a group id. Zero (the caller's
+    /// own group to `killpg`), one (init's), a negative number, and the
+    /// caller's own group are refused; an ordinary other id is allowed.
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_refuses_ids_that_are_never_this_calls() {
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let own = unsafe { libc::getpgrp() };
+        for refused in [0, 1, -1, -own, own] {
+            assert!(!group_is_signalable(refused), "{refused} must be refused");
+        }
+        let other = if own == i32::MAX { own - 1 } else { own + 1 };
+        assert!(group_is_signalable(other.max(2)));
     }
 }
 

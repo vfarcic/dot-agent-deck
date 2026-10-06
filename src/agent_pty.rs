@@ -9608,10 +9608,15 @@ impl AgentPtyRegistry {
     /// Issue #542: `agent_id` has left the registry, so its launcher standing
     /// goes with it. Callers hold the registry lock, which is the order
     /// [`Self::note_launcher_handoff`] takes the two locks in.
+    ///
+    /// Tolerates a poisoned lock rather than panicking: it runs in the middle
+    /// of a respawn's removal, and a panic there would abandon the pane with
+    /// its record already lifted out (PRD #1487 final audit F3). Removing a
+    /// key is sound on a map a panicking holder left behind.
     fn forget_launcher_handoff(&self, agent_id: &str) {
         self.launcher_handoff_agents
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -12528,7 +12533,6 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
-            inner.respawns_in_flight += 1;
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
             // `spawn_agent` resets what a new occupant must not inherit. The
@@ -12536,6 +12540,14 @@ impl AgentPtyRegistry {
             // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
             removed.pane_retired.store(true, Ordering::SeqCst);
+            // LAST in this lock hold, and nothing that can fail comes between
+            // it and the ticket below (PRD #1487 final audit F3): a panic after
+            // the increment and before the ticket exists would leak the count,
+            // and every later restart would wait it out and give up. The ticket
+            // cannot be built here instead, at the increment: its drop takes
+            // this same lock, so an unwind with the guard still held would
+            // deadlock on it.
+            inner.respawns_in_flight += 1;
             break (removed, verified_dir);
         };
         // Counted in flight from the lock hold above until this function
@@ -27808,6 +27820,57 @@ mod spawn_tests {
         );
         let started = spawn_pane_worker(&registry, "after-pane");
         assert!(live_agent_for_pane(&registry, "after-pane") == Some(started));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: the launcher-handoff lock a respawn takes mid-removal has
+    /// been poisoned by a panic elsewhere. The respawn still completes, and it
+    /// leaves no respawn counted in flight, so a restart's reservation settles
+    /// at once instead of waiting out a count nothing will ever release
+    /// (PRD #1487 final audit F3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poisoned_lock_mid_respawn_leaks_no_in_flight_count() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn_pane_worker(&registry, "poisoned-pane");
+        let poisoner = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.launcher_handoff_agents.lock().unwrap();
+            panic!("poison the launcher-handoff lock");
+        })
+        .join();
+        assert!(registry.launcher_handoff_agents.is_poisoned());
+
+        let respawned = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .respawn_agent_for_pane("poisoned-pane", "cat")
+                    .await
+            })
+            .await
+        };
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .respawns_in_flight,
+            0,
+            "the respawn's in-flight count was released"
+        );
+        let reservation = registry
+            .freeze_admission_within(Duration::from_millis(500))
+            .await;
+        assert!(
+            reservation.is_ok(),
+            "a restart's reservation settles: nothing is left counted in flight"
+        );
+        drop(reservation);
+        let new = respawned
+            .expect("the respawn did not panic")
+            .expect("and it published the replacement");
+        assert_ne!(new, old);
         registry.shutdown_all();
     }
 

@@ -559,6 +559,16 @@ pub async fn run_issue_dispatch(
 /// every later fire with no agent in it — a permanent loss — so the fresh,
 /// empty worktree is removed again and the issue deferred.
 ///
+/// That removal can fail (a lock, permissions), and a failure must not read as
+/// a clean deferral (final audit F2). So before removing it the worktree is
+/// marked as abandoned by `creator` ([`crate::worktree_owner::mark_abandoned_spawn`]),
+/// and a failed removal is reported as this issue's failure, naming the
+/// directory. The mark is what lets the next attempt — this daemon's next
+/// fire, or the successor's — retry the removal ([`reclaim_abandoned_spawn`])
+/// instead of reading the leftover as the issue already being claimed. The
+/// mark is written only here, for the worktree this attempt created and
+/// recorded; a removal that succeeds deletes it with the worktree.
+///
 /// Any other failure: no agent will ever close to trigger cleanup, so the
 /// registry entry is dropped here. The worktree dir itself is left on disk —
 /// the next fire's worktree-exists idempotency signal reclaims the issue.
@@ -566,15 +576,102 @@ async fn settle_failed_issue_spawn(
     e: crate::spawn::SpawnError,
     worktrees: &WorktreeRegistry,
     worktree_dir: &Path,
+    creator: Creator,
 ) -> Result<IssueOutcome, String> {
-    if matches!(e, crate::spawn::SpawnError::DaemonRestarting) {
-        if let Some(entry) = take_worktree(worktrees, worktree_dir) {
-            remove_worktree(worktree_dir, &entry.clone_dir, entry.policy).await;
-        }
+    if !matches!(e, crate::spawn::SpawnError::DaemonRestarting) {
+        take_worktree(worktrees, worktree_dir);
+        return Err(e.to_string());
+    }
+    // Only a worktree this attempt recorded is ours to remove.
+    let Some(entry) = take_worktree(worktrees, worktree_dir) else {
+        return Ok(IssueOutcome::DeferredForRestart);
+    };
+    let marked = {
+        let dir = worktree_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree_owner::mark_abandoned_spawn(&dir, &creator)
+        })
+        .await
+        .unwrap_or_else(|join| Err(join.to_string()))
+    };
+    if remove_worktree(worktree_dir, &entry.clone_dir, entry.policy)
+        .await
+        .is_none()
+    {
         return Ok(IssueOutcome::DeferredForRestart);
     }
-    take_worktree(worktrees, worktree_dir);
-    Err(e.to_string())
+    Err(match marked {
+        Ok(_) => format!(
+            "the daemon is restarting, so no agent was started, and the issue's new worktree \
+             {} could not be removed again; the next attempt retries the removal",
+            worktree_dir.display()
+        ),
+        Err(why) => format!(
+            "the daemon is restarting, so no agent was started, and the issue's new worktree \
+             {} could not be removed again or marked for a retry ({why}); remove it by hand \
+             to release the issue",
+            worktree_dir.display()
+        ),
+    })
+}
+
+/// What [`reclaim_abandoned_spawn`] found at an issue's existing worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum Reclaim {
+    /// Not a worktree this task abandoned for this issue, or something is
+    /// using it: the issue stays claimed.
+    NotAbandoned,
+    /// It was, and it has been removed: the issue can be dispatched now.
+    Removed,
+    /// It was, and removing it failed again: the issue's failure to report.
+    Failed(String),
+}
+
+/// Retry the removal [`settle_failed_issue_spawn`] could not finish, before the
+/// worktree-exists idempotency check reads the leftover as a claim (PRD #1487
+/// final audit F2).
+///
+/// Removes nothing it cannot attribute to that failed spawn: the worktree must
+/// carry the deck's ownership marker and an abandoned-spawn marker naming this
+/// task and issue, must not be recorded by a live dispatch in `worktrees`, and
+/// must have no agent rooted in it.
+async fn reclaim_abandoned_spawn(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    creator: Creator,
+    worktrees: &WorktreeRegistry,
+    records: &[AgentRecord],
+) -> Reclaim {
+    let recorded = worktrees
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(worktree_dir);
+    if recorded || worktree_still_in_use(records, worktree_dir) {
+        return Reclaim::NotAbandoned;
+    }
+    let dir = worktree_dir.to_path_buf();
+    let abandoned = tokio::task::spawn_blocking(move || {
+        crate::worktree_owner::is_abandoned_spawn_of(&dir, &creator)
+    })
+    .await
+    .unwrap_or(false);
+    if !abandoned {
+        return Reclaim::NotAbandoned;
+    }
+    match remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await {
+        None => {
+            tracing::info!(
+                worktree = %worktree_dir.display(),
+                "issue-dispatch: removed a worktree left by a spawn refused during a restart"
+            );
+            Reclaim::Removed
+        }
+        Some(_) => Reclaim::Failed(format!(
+            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
+             and removing it failed again; the next attempt retries",
+            worktree_dir.display()
+        )),
+    }
 }
 
 /// What [`dispatch_one_issue`] did with an issue it did not fail on.
@@ -633,10 +730,33 @@ async fn dispatch_one_issue(
     // check) and a correctness hazard: a transient `gh pr list` failure would,
     // via the per-issue error boundary, turn this clean SKIP into a spurious
     // IssueDispatchFailed notification.
-    let worktree_exists = paths.worktree_dir.exists();
+    //
+    // Except for a leftover this task abandoned for this issue when its spawn
+    // was refused during a restart and the removal failed: that is retried
+    // here first, and only a worktree that is still there afterwards claims
+    // the issue (PRD #1487 final audit F2).
+    let mut worktree_exists = paths.worktree_dir.exists();
     if worktree_exists {
-        notify_skip();
-        return Ok(IssueOutcome::Handled);
+        match reclaim_abandoned_spawn(
+            &paths.worktree_dir,
+            clone_dir,
+            Creator::issue_dispatch(task_name, issue),
+            worktrees,
+            &registry.agent_records(),
+        )
+        .await
+        {
+            Reclaim::NotAbandoned => {
+                notify_skip();
+                return Ok(IssueOutcome::Handled);
+            }
+            Reclaim::Failed(message) => return Err(message),
+            Reclaim::Removed => worktree_exists = paths.worktree_dir.exists(),
+        }
+        if worktree_exists {
+            notify_skip();
+            return Ok(IssueOutcome::Handled);
+        }
     }
 
     // SECONDARY — reached ONLY when the worktree is absent: an open PR whose
@@ -720,7 +840,13 @@ async fn dispatch_one_issue(
         compose_orchestrator_context: None,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
-        return settle_failed_issue_spawn(e, worktrees, &paths.worktree_dir).await;
+        return settle_failed_issue_spawn(
+            e,
+            worktrees,
+            &paths.worktree_dir,
+            Creator::issue_dispatch(task_name, issue),
+        )
+        .await;
     }
 
     // M1.3 — surface the per-issue dispatch success.
@@ -2419,8 +2545,13 @@ mod tests {
         let reg = new_worktree_registry();
         record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
 
-        let outcome =
-            settle_failed_issue_spawn(crate::spawn::SpawnError::DaemonRestarting, &reg, &wt).await;
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            Creator::issue_dispatch("nightly", 7),
+        )
+        .await;
         assert_eq!(outcome, Ok(IssueOutcome::DeferredForRestart));
         assert!(
             !wt.exists(),
@@ -2443,10 +2574,116 @@ mod tests {
             crate::spawn::SpawnError::Agent("no such command".into()),
             &reg,
             &wt2,
+            Creator::issue_dispatch("nightly", 8),
         )
         .await;
         assert!(failed.is_err(), "a real failure is still reported");
         assert!(wt2.exists(), "and leaves its tree as before");
+    }
+
+    /// Scenario: the same restart refusal, but `git worktree remove --force`
+    /// fails (the worktree is locked). The issue is reported as failed — not a
+    /// clean deferral — and the leftover stays recoverable: the next attempt
+    /// retries the removal before the worktree-exists check can read it as a
+    /// claim, refusing while an agent is rooted there, a live dispatch records
+    /// it, or the mark names another issue; and once the lock is gone the
+    /// retry removes it and frees the issue (PRD #1487 final audit F2).
+    #[tokio::test]
+    async fn a_failed_removal_after_a_restart_refusal_is_reported_and_retried_next_attempt() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        // What `create_worktree`'s success arm leaves: the deck's own claim.
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        // A locked worktree refuses a single `--force`.
+        git(&["worktree", "lock", &wt.to_string_lossy()]);
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+
+        let outcome = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::DaemonRestarting,
+            &reg,
+            &wt,
+            creator(),
+        )
+        .await;
+        let message = outcome.expect_err("a failed removal is not a clean deferral");
+        assert!(
+            message.contains(&wt.display().to_string()) && message.contains("retries"),
+            "the report names the leftover and says it will be retried: {message}"
+        );
+        assert!(wt.exists(), "the removal really did fail");
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked as abandoned by this task for this issue"
+        );
+
+        // Still locked: the retry runs, fails again, and says so.
+        assert!(matches!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &[]).await,
+            Reclaim::Failed(_)
+        ));
+        git(&["worktree", "unlock", &wt.to_string_lossy()]);
+
+        // Never someone else's: an agent rooted in it, a live dispatch's
+        // record, or a mark naming another issue each keep the claim.
+        let rooted = [pane_in("pane-1", &wt)];
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &rooted).await,
+            Reclaim::NotAbandoned
+        );
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &[]).await,
+            Reclaim::NotAbandoned
+        );
+        take_worktree(&reg, &wt);
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, Creator::issue_dispatch("nightly", 8), &reg, &[])
+                .await,
+            Reclaim::NotAbandoned
+        );
+        assert!(wt.exists(), "none of those removed anything");
+
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &[]).await,
+            Reclaim::Removed
+        );
+        assert!(!wt.exists(), "the retry removed the leftover");
+        assert_eq!(
+            dispatch_decision(wt.exists(), false),
+            DispatchDecision::Dispatch,
+            "so the issue is dispatched rather than skipped as claimed"
+        );
+    }
+
+    /// Scenario: a worktree the deck created and an agent is (or was) using
+    /// carries the ownership marker but no abandoned-spawn mark. The retry
+    /// path leaves it alone, so the worktree-exists check still reads it as
+    /// the issue being claimed (PRD #1487 final audit F2).
+    #[tokio::test]
+    async fn the_abandoned_spawn_retry_never_removes_a_worktree_no_failed_spawn_left() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator).unwrap();
+        let reg = new_worktree_registry();
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator, &reg, &[]).await,
+            Reclaim::NotAbandoned
+        );
+        assert!(wt.exists());
     }
 
     #[tokio::test]
