@@ -3085,6 +3085,20 @@ pub struct RunningAgent {
     /// is deterministic for the same command and so reproduces the same exec
     /// line.
     pub spawn_agent_type: Option<AgentType>,
+    /// Issue #1602: the command this generation was started with, exactly as
+    /// the spawn's caller supplied it in [`SpawnOptions::command`] — the
+    /// CONFIGURED command (`devbox run agent`, a role's `command`), before
+    /// [`spawn`] wraps it in `$SHELL -c` or `dot-agent-deck wrap`. `None` for a
+    /// `$SHELL` pane, and for a blank or whitespace-only command.
+    ///
+    /// It is what a `dispatch --single` unit reuses so it runs the way the pane
+    /// that dispatched it runs (see
+    /// [`AgentPtyRegistry::configured_launch_of`]). Nothing session-specific
+    /// rides in it: the deck delivers a pane's seed and task after readiness
+    /// rather than on its command line, so this holds no resume id, seed or
+    /// dispatcher-mode flag. Daemon-local, like `spawn_env` — not projected
+    /// onto [`AgentRecord`], so the wire is unchanged.
+    pub spawn_command: Option<String>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -9569,6 +9583,35 @@ impl AgentPtyRegistry {
             .and_then(|agent| agent.spawn_agent_type.clone())
     }
 
+    /// Issue #1602: how `agent_id` was configured to run — its
+    /// [`RunningAgent::spawn_command`] and the agent type to carry with it — so
+    /// a `dispatch --single` unit can be started the same way as the pane that
+    /// dispatched it. `None` when the agent is unknown or was started with no
+    /// command (a `$SHELL` pane), which leaves the unit to the fallbacks.
+    ///
+    /// The type is the frozen [`RunningAgent::spawn_agent_type`] when the spawn
+    /// declared or derived one, else the observed [`RunningAgent::agent_type`]
+    /// a hook event taught the registry. The fallback is what makes a launcher
+    /// pane usable here at all: `devbox run agent` implies no type, so its
+    /// spawn identity is `None`, and only the pane's own hooks have said it is
+    /// Claude Code. Using that badge as a NEW pane's spawn identity is not the
+    /// respawn hazard [`RunningAgent::spawn_agent_type`] guards against — that
+    /// is one pane changing launch shape between generations; this is a new
+    /// pane launched the way a role declaring `agent = "…"` beside a launcher
+    /// `command` is. A hook can teach the badge only from inside the pane
+    /// ([`crate::hook_provenance`]), so the producer that can set it is the
+    /// dispatching agent itself, which chooses the unit's task anyway.
+    pub fn configured_launch_of(&self, agent_id: &str) -> Option<(String, Option<AgentType>)> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.agents.get(agent_id)?;
+        let command = agent.spawn_command.clone()?;
+        // `AgentType::None` is the "no recognized agent" placeholder, not a
+        // type: it must not shadow the badge, nor be carried as one.
+        let known = |t: &Option<AgentType>| t.clone().filter(|t| *t != AgentType::None);
+        let agent_type = known(&agent.spawn_agent_type).or_else(|| known(&agent.agent_type));
+        Some((command, agent_type))
+    }
+
     /// Issue #243 (audit F1): did THIS DAEMON spawn `agent_id` under
     /// `dot-agent-deck wrap` — i.e. is the frozen launch-shape identity an agent
     /// whose registry strategy is [`crate::agent_registry::IntegrationStrategy::Wrapper`]?
@@ -10180,6 +10223,12 @@ impl AgentPtyRegistry {
         // capture site keeps the on-wire value consistent with the
         // kernel's actual TIOCGWINSZ).
         let captured_env = opts.env.clone();
+        // Issue #1602: the configured command, before `spawn` wraps it.
+        let spawn_command = opts
+            .command
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
         let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
@@ -10381,6 +10430,7 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type,
             spawn_agent_type,
+            spawn_command,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -12267,6 +12317,9 @@ impl AgentPtyRegistry {
             // `spawn`'s wrapper decision — only `spawn_agent_type` does.
             agent_type: observed_agent_type,
             spawn_agent_type,
+            // Issue #1602: the fresh generation records the command it is
+            // actually launched with, which is the one passed in here.
+            spawn_command: _,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
             // deliberately dropped, not carried over. A token names one spawn,
@@ -14600,6 +14653,7 @@ impl AgentPtyRegistry {
                 tab_membership: None,
                 agent_type: None,
                 spawn_agent_type: None,
+                spawn_command: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real
@@ -16706,6 +16760,65 @@ mod spawn_tests {
             let err = registry.resize(&id, rows, cols).unwrap_err();
             assert!(matches!(err, AgentPtyError::Resize(_)));
         }
+        registry.shutdown_all();
+    }
+
+    /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
+    /// as the caller gave it, before `spawn` wraps it in `$SHELL -c` — so a
+    /// `dispatch --single` unit can be started the same way. The type is the
+    /// spawn's own when it had one, else what the pane's hooks taught it, and a
+    /// `$SHELL` pane offers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn configured_launch_of_reports_the_configured_command_and_its_agent() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let launcher = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("  sh -c 'exec cat'  "),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-launcher".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the launcher-shaped pane");
+        assert_eq!(
+            registry.configured_launch_of(&launcher),
+            Some(("sh -c 'exec cat'".to_string(), None)),
+            "a launcher command implies no type until the pane says"
+        );
+        registry.set_agent_type("pane-launcher", &AgentType::ClaudeCode);
+        assert_eq!(
+            registry.configured_launch_of(&launcher),
+            Some(("sh -c 'exec cat'".to_string(), Some(AgentType::ClaudeCode))),
+            "the type the pane's own hooks reported is carried"
+        );
+
+        let declared = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                agent_type: Some(AgentType::ClaudeCode),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-declared".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the declared pane");
+        registry.set_agent_type("pane-declared", &AgentType::OpenCode);
+        assert_eq!(
+            registry
+                .configured_launch_of(&declared)
+                .and_then(|(_, agent_type)| agent_type),
+            Some(AgentType::ClaudeCode),
+            "the spawn's own identity wins over a hook-learned badge"
+        );
+
+        let shell = registry
+            .spawn_agent(SpawnOptions::default())
+            .expect("spawn a $SHELL pane");
+        assert_eq!(registry.configured_launch_of(&shell), None);
+        assert_eq!(registry.configured_launch_of("no-such-agent"), None);
         registry.shutdown_all();
     }
 

@@ -262,7 +262,15 @@ pub struct RoleSpawn {
 pub enum SpawnTarget {
     /// A single-agent card. `command` is the schedule's command; `None` =
     /// `$SHELL` (resolved by the spawn path, mirroring the new-deck dialog).
-    SingleAgent { command: Option<String> },
+    ///
+    /// `agent_type` (issue #1602) is the agent the command runs when the caller
+    /// knows one the command cannot reveal — a `dispatch --single` unit started
+    /// with its dispatcher's `devbox run agent`. `None` derives it from the
+    /// command, which is all the scheduler and issue-dispatch paths ever do.
+    SingleAgent {
+        command: Option<String>,
+        agent_type: Option<AgentType>,
+    },
     /// An orchestration tab rooted at the target dir.
     ///
     /// `config` is the CHOSEN orchestration's own config, carried through so the
@@ -358,6 +366,7 @@ pub fn decide_target_with_override(
         None => Ok(decide_target(config, dir, schedule_command)),
         Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
             command: schedule_command.map(|c| c.to_string()),
+            agent_type: None,
         }),
         Some(SpawnShapeOverride::Orchestration(None)) => {
             // THE default, resolved through the one shared rule
@@ -486,6 +495,7 @@ pub fn decide_target(
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
+        agent_type: None,
     }
 }
 
@@ -604,7 +614,10 @@ pub async fn spawn(
 
     // 3. Spawn + deliver.
     match target {
-        SpawnTarget::SingleAgent { command } => {
+        SpawnTarget::SingleAgent {
+            command,
+            agent_type,
+        } => {
             let pane_id = next_pane_id(&req.task_name, None);
             // PRD #127 C2: only pin the `-c` wrapper shell to a deterministic
             // `/bin/sh` when the command ACTUALLY needs shell-wrapping (it has
@@ -628,9 +641,10 @@ pub async fn spawn(
                 // A single-agent spawn has no role, so its card keeps the task
                 // name it always had.
                 None,
-                // …and no role config either, so nothing declares its agent:
-                // derive it from the command exactly as before (issue #308).
-                None,
+                // …and no role config either. Only a dispatched unit carries a
+                // type (its dispatcher's, issue #1602); otherwise it is derived
+                // from the command exactly as before (issue #308).
+                agent_type.clone(),
                 pin_sh,
                 notifier,
             )?;
@@ -667,9 +681,9 @@ pub async fn spawn(
                     &pane_id,
                     &req.working_dir,
                     command.as_deref(),
-                    // No role config on a single-agent spawn, so nothing to
-                    // declare (issue #308).
-                    None,
+                    // The same identity the registry was given above, so the
+                    // live card is badged as that agent from its first frame.
+                    agent_type,
                     Some(&req.task_name),
                     &id,
                 );
@@ -7210,7 +7224,8 @@ mod tests {
             decide_target_with_override(cfg.as_ref(), dir.path(), Some("mycmd"), Some(&over))
                 .expect("single always resolves"),
             SpawnTarget::SingleAgent {
-                command: Some("mycmd".to_string())
+                command: Some("mycmd".to_string()),
+                agent_type: None,
             },
             "`single` must win over the dir's orchestrations AND carry the command"
         );
@@ -7223,7 +7238,8 @@ mod tests {
         assert_eq!(
             t,
             SpawnTarget::SingleAgent {
-                command: Some("claude".to_string())
+                command: Some("claude".to_string()),
+                agent_type: None,
             }
         );
     }
@@ -7233,7 +7249,13 @@ mod tests {
         // `None` command flows through to the spawn path's `$SHELL` fallback.
         let dir = Path::new("/tmp/x");
         let t = decide_target(None, dir, None);
-        assert_eq!(t, SpawnTarget::SingleAgent { command: None });
+        assert_eq!(
+            t,
+            SpawnTarget::SingleAgent {
+                command: None,
+                agent_type: None,
+            }
+        );
     }
 
     #[test]
@@ -7244,7 +7266,8 @@ mod tests {
         assert_eq!(
             t,
             SpawnTarget::SingleAgent {
-                command: Some("cat".to_string())
+                command: Some("cat".to_string()),
+                agent_type: None,
             }
         );
     }
@@ -7416,7 +7439,8 @@ mod tests {
                 Some(&SpawnShapeOverride::SingleAgent)
             ),
             Ok(SpawnTarget::SingleAgent {
-                command: Some("claude".to_string())
+                command: Some("claude".to_string()),
+                agent_type: None,
             })
         );
     }
@@ -8352,7 +8376,8 @@ mod tests {
     fn kind_of_target_reads_the_targets_shape() {
         assert_eq!(
             kind_of_target(&SpawnTarget::SingleAgent {
-                command: Some("cat".into())
+                command: Some("cat".into()),
+                agent_type: None,
             }),
             SpawnKind::SingleAgent
         );

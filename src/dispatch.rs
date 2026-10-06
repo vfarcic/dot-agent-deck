@@ -180,6 +180,64 @@ pub fn resolve_single_agent_command(configured: Option<&str>) -> String {
     }
 }
 
+/// Issue #1602: how the pane that asked for a dispatch was configured to run,
+/// read from the daemon's own record of that pane
+/// ([`AgentPtyRegistry::configured_launch_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatcherLaunch {
+    /// The command the pane was started with, before the spawn path wrapped it.
+    pub command: String,
+    /// The agent that command runs, when the pane's spawn or its own hooks
+    /// said. `devbox run agent` implies none on its own.
+    pub agent_type: Option<crate::event::AgentType>,
+}
+
+/// What a single-agent unit is started with: a command and, when known, the
+/// agent it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleUnitLaunch {
+    pub command: String,
+    /// `None` leaves the spawn to derive the type from `command`, as before.
+    pub agent_type: Option<crate::event::AgentType>,
+}
+
+/// Issue #1602: the command a single-agent unit runs, and as which agent.
+///
+/// Precedence, first match wins:
+///
+/// 1. an explicit per-project single-unit command — not offered today; when it
+///    is, it goes ABOVE the dispatcher's command, so a project can override
+///    what every dispatcher in it would otherwise pass on;
+/// 2. the dispatching pane's configured command, with its agent type, so a
+///    dispatcher started as `devbox run agent` gets units started the same way
+///    (inside devbox, as Claude Code) rather than as bare `claude` under the
+///    daemon's environment;
+/// 3. the deck's `default_command`;
+/// 4. `claude`.
+///
+/// `dispatcher` is `None` for a dispatch no pane asked for (the scheduler,
+/// unit tests) and for a pane started with no command, which skips step 2.
+/// Steps 3 and 4 carry no type: the spawn derives it from the command, which is
+/// what it always did.
+pub fn resolve_single_unit_launch(
+    dispatcher: Option<&DispatcherLaunch>,
+    default_command: Option<&str>,
+) -> SingleUnitLaunch {
+    if let Some(d) = dispatcher {
+        let command = d.command.trim();
+        if !command.is_empty() {
+            return SingleUnitLaunch {
+                command: command.to_string(),
+                agent_type: d.agent_type.clone(),
+            };
+        }
+    }
+    SingleUnitLaunch {
+        command: resolve_single_agent_command(default_command),
+        agent_type: None,
+    }
+}
+
 fn sanitize_name(name: &str) -> String {
     let slug_chars: String = name
         .replace("..", "_")
@@ -512,7 +570,21 @@ pub async fn handle_dispatch(
     // inside `spawn` meant a typo'd `--orchestration` created a worktree and branch,
     // rolled them back, and reported "failed to spawn agent" for what is a plain
     // validation error.
-    let single_command = resolve_single_agent_command(ctx.default_command.as_deref());
+    // Issue #1602: a single unit runs the way the pane that dispatched it runs.
+    // Read by the agent id the daemon captured for this caller, so a pane that
+    // changed hands since then contributes nothing rather than its successor's
+    // command.
+    let dispatcher_launch = ctx.caller.as_ref().and_then(|caller| {
+        ctx.registry
+            .configured_launch_of(&caller.agent_id)
+            .map(|(command, agent_type)| DispatcherLaunch {
+                command,
+                agent_type,
+            })
+    });
+    let single_launch =
+        resolve_single_unit_launch(dispatcher_launch.as_ref(), ctx.default_command.as_deref());
+    let single_command = single_launch.command.clone();
     let caller_config = crate::spawn::load_config_for_dir(&clone_dir);
     // Issue #704: when the caller named no orchestration and the config left the
     // choice to file order, the reply says which one was opened and what else was
@@ -534,6 +606,14 @@ pub async fn handle_dispatch(
         Some(single_command.as_str()),
         shape_override_of(shape).as_ref(),
     ) {
+        // The resolver above already settled the agent a single unit runs; an
+        // orchestration's roles carry their own.
+        Ok(crate::spawn::SpawnTarget::SingleAgent { command, .. }) => {
+            crate::spawn::SpawnTarget::SingleAgent {
+                command,
+                agent_type: single_launch.agent_type.clone(),
+            }
+        }
         Ok(t) => t,
         Err(e) => {
             return DispatchResult {
@@ -619,7 +699,7 @@ pub async fn handle_dispatch(
     let req = SpawnRequest {
         task_name: format!("dispatch-{name}"),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
-        // A real agent command, never `None` — see `resolve_single_agent_command`.
+        // A real agent command, never `None` — see `resolve_single_unit_launch`.
         // Ignored when the dispatch starts an orchestration (role commands win).
         command: Some(single_command),
         prompt,
@@ -1365,6 +1445,88 @@ mod tests {
         );
     }
 
+    /// Issue #1602: a single unit runs its dispatcher's configured command, as
+    /// the dispatcher's agent, ahead of `default_command` and `claude`.
+    ///
+    /// Reported from real use: a dispatcher started as `devbox run agent` got
+    /// every `--single` unit as bare `claude` under the daemon's environment,
+    /// outside devbox, so the unit's builds failed on a missing `pkg-config`.
+    #[test]
+    fn a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent() {
+        use crate::event::AgentType;
+        let dispatcher = DispatcherLaunch {
+            command: "devbox run agent".to_string(),
+            agent_type: Some(AgentType::ClaudeCode),
+        };
+        assert_eq!(
+            resolve_single_unit_launch(Some(&dispatcher), Some("opencode")),
+            SingleUnitLaunch {
+                command: "devbox run agent".to_string(),
+                agent_type: Some(AgentType::ClaudeCode),
+            },
+            "the dispatcher's own command wins over default_command, and its type rides along"
+        );
+        // A non-Claude dispatcher gets units of its own agent type.
+        let codex = DispatcherLaunch {
+            command: "devbox run codex-big".to_string(),
+            agent_type: Some(AgentType::Codex),
+        };
+        assert_eq!(
+            resolve_single_unit_launch(Some(&codex), None).agent_type,
+            Some(AgentType::Codex)
+        );
+        // A dispatcher whose type nobody knows still passes its command on; the
+        // spawn then derives the type from it, as it always did.
+        let unknown = DispatcherLaunch {
+            command: "  ./my-agent  ".to_string(),
+            agent_type: None,
+        };
+        assert_eq!(
+            resolve_single_unit_launch(Some(&unknown), Some("opencode")),
+            SingleUnitLaunch {
+                command: "./my-agent".to_string(),
+                agent_type: None,
+            }
+        );
+    }
+
+    /// Issue #1602's controls: with no dispatching pane (the scheduler) or a
+    /// dispatcher whose command is blank, the unit falls back exactly as before
+    /// — `default_command`, then `claude` — and carries no type of its own.
+    #[test]
+    fn a_single_unit_without_a_dispatcher_command_falls_back_to_default_then_claude() {
+        let claude = crate::agent_registry::CLAUDE_CODE
+            .default_command
+            .unwrap_or("claude")
+            .to_string();
+        assert_eq!(
+            resolve_single_unit_launch(None, Some("opencode")),
+            SingleUnitLaunch {
+                command: "opencode".to_string(),
+                agent_type: None,
+            }
+        );
+        assert_eq!(
+            resolve_single_unit_launch(None, None),
+            SingleUnitLaunch {
+                command: claude.clone(),
+                agent_type: None,
+            }
+        );
+        let blank = DispatcherLaunch {
+            command: "   ".to_string(),
+            agent_type: Some(crate::event::AgentType::Codex),
+        };
+        assert_eq!(
+            resolve_single_unit_launch(Some(&blank), None),
+            SingleUnitLaunch {
+                command: claude,
+                agent_type: None,
+            },
+            "a blank dispatcher command must not carry its type onto the fallback"
+        );
+    }
+
     /// A single-agent dispatch must run an AGENT, never `$SHELL`.
     ///
     /// `SpawnRequest.command: None` means `$SHELL` in the spawn path, so the
@@ -1474,7 +1636,10 @@ mod tests {
         let bin = crate::platform::paths::binary_name();
         let prompt = dispatch_prompt(
             "Verify PR #232 and report back.",
-            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                agent_type: None,
+            },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             None,
         );
@@ -1525,7 +1690,10 @@ mod tests {
     fn a_single_dispatch_prompt_names_the_main_checkout_as_a_literal_path() {
         let prompt = dispatch_prompt(
             "Verify PR #232 and report back.",
-            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                agent_type: None,
+            },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             Some(std::path::Path::new("/home/dev/myproject")),
         );
@@ -1549,7 +1717,10 @@ mod tests {
     fn a_single_dispatch_prompt_says_nothing_when_the_checkout_is_unresolvable() {
         let prompt = dispatch_prompt(
             "Verify PR #232 and report back.",
-            &crate::spawn::SpawnTarget::SingleAgent { command: None },
+            &crate::spawn::SpawnTarget::SingleAgent {
+                command: None,
+                agent_type: None,
+            },
             ".dot-agent-deck/dispatch-report-verify-pr-99990000.md",
             None,
         );
