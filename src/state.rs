@@ -16511,14 +16511,17 @@ impl AppState {
                 session.active_tool = None;
                 true
             }
-            // Issue #1493: the wrapper's interface start for a Codex pane is
-            // sent from a thread of its own, so it can arrive after frames it
-            // predates — a classified Thinking, or the first native hook. Stamped
-            // older than anything the card has already seen, it is a boot
-            // observation the card has moved past, and asserts nothing.
+            // Issue #1493: a wrapper start for a Codex pane — the fork-time one
+            // or the interface one — can be handled after frames it predates (a
+            // classified Thinking, or the first native hook): the interface
+            // start is sent from a thread of its own, and the daemon handles
+            // each hook connection in its own task. Stamped older than anything
+            // the card has already seen, it is a boot observation the card has
+            // moved past, and asserts nothing. Codex's native `SessionStart`
+            // carries no wrapper origin and is not affected.
             EventType::SessionStart
                 if event.agent_type == AgentType::Codex
-                    && event.is_wrapper_interface_session_start()
+                    && event.is_wrapper_session_start()
                     && event.timestamp < newest_before =>
             {
                 false
@@ -26189,6 +26192,19 @@ while True:
         state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
         state.apply_event(codex_status_frame(EventType::Thinking, false, 5));
         state.apply_event(late_start(4));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        // The same for the wrapper's fork-time start, which the daemon can
+        // also handle after a frame sent later (Qodo on PR #1523).
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(codex_wrapper_frame(EventType::Thinking, true, 5));
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, true, 1));
+        assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
+        let mut state = AppState::default();
+        state.register_pane("pane-x".to_string());
+        state.apply_event(late_start(2));
+        state.apply_event(codex_status_frame(EventType::Thinking, false, 5));
+        state.apply_event(codex_wrapper_frame(EventType::SessionStart, false, 1));
         assert_eq!(pane_x_card(&state).status, SessionStatus::Thinking);
 
         // A detached command's Working (the shell monitor's) still ends with
