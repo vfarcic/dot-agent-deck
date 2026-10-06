@@ -4121,9 +4121,12 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
     // (`prompt::state`), and so how it may answer. A whole name, so it counts
     // only when both words were said: the parent alone names nothing.
     //
-    // And with only the parent's LAST words, down to one, because a long
-    // parent is shown cut from its start (`prompt::directory_labels`), and
-    // the model may answer with the words it was shown.
+    // And with only the parent's LAST words, down to one — every such form,
+    // because a long parent is shown cut from its start by CHARACTERS
+    // (`prompt::directory_labels`), so the words left can be any number of
+    // them, and the model may answer with the words it was shown. A cap on
+    // the count here once left a shown word unregistered (the agent reviewer
+    // and Qodo on PR #1529).
     if let Some(path) = agent.cwd.as_deref()
         && let Some(name) = directory_name(path)
     {
@@ -4131,7 +4134,7 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
         if let Some(parent) = directory_name(&parent[..parent.len() - name.len()]) {
             add(&format!("{parent}/{name}"));
             let parent_words = word_sequence(parent);
-            for kept in 1..parent_words.len().min(PARENT_WORDS_KEPT + 1) {
+            for kept in 1..parent_words.len() {
                 let tail = parent_words[parent_words.len() - kept..].join(" ");
                 add(&format!("{tail}/{name}"));
             }
@@ -4139,10 +4142,6 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
     }
     facets
 }
-
-/// The most trailing words of a directory's parent [`agent_facets`] registers
-/// as a shortened `parent/name` form.
-const PARENT_WORDS_KEPT: usize = 8;
 
 /// An agent type the way people say it, first the way the registry labels it
 /// — `claude_code` is "Claude Code", or just "Claude". Empty for a type with no

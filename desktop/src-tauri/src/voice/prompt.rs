@@ -1376,6 +1376,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn voice_prompt_state_resolves_a_shown_parent_of_more_than_eight_words() {
+        // The agent reviewer and Qodo on PR #1529: two parents whose shown
+        // labels differ only at their 10th word from the end — `alpha` for
+        // one, `beta` for the other — and which each contain BOTH words, the
+        // other one before a long word the cut removes. Only the words shown
+        // tell them apart, so the label as shown must resolve to its own
+        // agent however many of the parent's words it carries.
+        let commands = commands();
+        let common = "a-b-c-d-e-f-g-h-i";
+        let long = "z".repeat(60);
+        let mut one = dashboard_agent("1", Some("Atlas"), "codex");
+        one.cwd = Some(format!("/srv/beta-{long}-alpha-{common}/api"));
+        let mut two = dashboard_agent("2", Some("Boreas"), "codex");
+        two.cwd = Some(format!("/srv/alpha-{long}-beta-{common}/api"));
+        let agents = vec![one, two];
+        let transcript = Transcript::new("open the one in api");
+        let state = state(&request(&transcript, &commands, &agents));
+        for (index, id) in [(0, "1"), (1, "2")] {
+            let label = state["agents_on_screen"][index]["directory"]
+                .as_str()
+                .expect("a directory")
+                .to_string();
+            assert!(label.starts_with('\u{2026}'), "{label}");
+            let (kept, cut) = if id == "1" {
+                ("alpha", "beta")
+            } else {
+                ("beta", "alpha")
+            };
+            assert!(
+                label.contains(kept) && !label.contains(cut),
+                "the shown label keeps only the word that tells them apart: {label}"
+            );
+            assert!(
+                matches!(crate::voice::outcome::resolve_agent_ref(&label, &agents),
+                    crate::voice::outcome::AgentRefMatch::One { id: found, .. } if found == id),
+                "{label} → {:?}",
+                crate::voice::outcome::resolve_agent_ref(&label, &agents)
+            );
+        }
+    }
+
+    #[test]
     fn voice_prompt_state_says_where_two_directories_of_one_name_are() {
         // Two agents in `api`, in different places: the name alone would tell
         // the model nothing, so each gets the directory above it as well. A
