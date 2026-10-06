@@ -555,19 +555,23 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'test(orchestration_012_real_agent_reflows_across_a_zoom_round_trip)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
-# Issue #1491: `voice_phrase_fixtures_match_the_default_backend` (desktop crate)
-# sends every fixture in `phrase_fixtures.toml` to the real Commands backend one
-# after another, at about a second each, so its wall clock grows with the
-# manifest. With 168 fixtures, three local runs took 166s, past 180s (killed by
-# the default 3 x 60s window, which cost that run its per-fixture summary) and
-# 181s for an all-green run the default window would also have killed. It reaches a model only with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and
-# a developer's key; otherwise it validates the manifest and returns at once.
-# 5 x 60s leaves room for the manifest to grow and is still bounded.
+# Issues #1491 and #1492: `voice_phrase_fixtures_match_the_default_backend`
+# (desktop crate, `desktop/src-tauri/tests/voice_phrase_fixtures.rs`) is ONE
+# test that sends every fixture in `phrase_fixtures.toml` to the real Commands
+# backend one after another, at about a second each, so its wall clock grows
+# with the manifest. Both issues met the default 3 x 60s killing it, which cost
+# the run its per-fixture summary: #1491 at 168 fixtures (166s and 181s locally)
+# and #1492 at 177 (188.7s with plain `cargo test`, ~1.07s a fixture). The
+# manifest held 246 when the two met, so ~263s before any slow answer, each of
+# which can add the backend's own 15s timeout. It reaches a model only with
+# `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and a developer's key; otherwise it
+# validates the manifest and returns at once. 8 x 60s = 480s is still bounded,
+# so a backend that hangs on every fixture is killed.
 #
 # The filter tracks the TEST FUNCTION name, so a rename must update it.
 [[profile.default.overrides]]
 filter = 'test(voice_phrase_fixtures_match_the_default_backend)'
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 8 }
 
 # `codex/worker/001` drives a REAL Codex orchestration worker through a
 # delegated task and its `work-done`. Alone it takes 26-110s; beside other

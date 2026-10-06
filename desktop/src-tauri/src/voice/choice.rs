@@ -195,7 +195,10 @@ impl Ordinal {
 /// "2", "number two", "option 2", "the second", "the second one", "2nd", "the
 /// last one" — and, past nine (PR #1451 round 3, change 4, where a page can
 /// show more numbers than that), "twelve", "number twenty-three", "the
-/// twelfth", "twentieth", "the twenty-first one", up to ninety-nine. "Zero"
+/// twelfth", "twentieth", "the twenty-first one" — and, past ninety-nine
+/// (issue #1492, where the dashboard numbers every row, up to 1,000), "one
+/// hundred thirty four", "a hundred and five", "the hundredth", "one
+/// thousand" ([`number_said`]). "Zero"
 /// and "number 0" are `Nth(0)`, and digits too many for a `usize` are
 /// `Nth(usize::MAX)`, so each is a number no list shows rather than not a
 /// number (Qodo #16 on PR #1451). Whole-utterance, so "open the second tab"
@@ -221,8 +224,8 @@ pub(crate) fn said_as_count(words: &[String]) -> bool {
         .is_some_and(|(_, count)| count)
 }
 
-/// `words` — one, or a ten and a unit — read as a number said as a count
-/// ("twenty three", "23"), or `None` for a position or anything else. What
+/// `words` — one number, [`number_said`] — read as a number said as a count
+/// ("twenty three", "23", "one hundred and five"), or `None` for a position or anything else. What
 /// `voice::numbers` reads off the end of a name to see whether a spoken count
 /// collides with it.
 pub(crate) fn count_said(words: &[String]) -> Option<usize> {
@@ -329,9 +332,70 @@ fn digits_value(digits: &str) -> usize {
     digits.parse().unwrap_or(usize::MAX)
 }
 
-/// One or two words as a number: one word ([`number_word`]), or a ten
-/// followed by a unit — "twenty three" (a count), "twenty third" (a position).
+/// The most words one number is said in: "nine hundred and ninety nine".
+pub(crate) const MAX_NUMBER_WORDS: usize = 5;
+
+/// The scales a number past ninety-nine is said with: the word, its value,
+/// and whether it is a count ("hundred") or a position ("hundredth").
+const SCALES: [(&str, usize, bool); 4] = [
+    ("hundred", 100, true),
+    ("hundredth", 100, false),
+    ("thousand", 1000, true),
+    ("thousandth", 1000, false),
+];
+
+/// Words as one number, or `None`: below a hundred ([`below_hundred`]), or
+/// past it (issue #1492) — an optional "one" to "nine" or "a", then
+/// "hundred", then an optional "and" and one to ninety-nine in words: "one
+/// hundred", "a hundred and five", "nine hundred ninety nine". A position
+/// ends in one: "hundredth", "one hundred and first". And exactly one
+/// thousand, "one thousand" or "the thousandth", the most rows the dashboard
+/// numbers. Digits after a scale ("one hundred 5") are not one number.
 fn number_said(words: &[String]) -> Option<(usize, bool)> {
+    let Some(at) = words
+        .iter()
+        .position(|word| SCALES.iter().any(|(scale, ..)| word == scale))
+    else {
+        return below_hundred(words);
+    };
+    let &(_, size, count) = SCALES.iter().find(|(scale, ..)| words[at] == *scale)?;
+    let times = match &words[..at] {
+        [] => 1,
+        [word] if word == "a" => 1,
+        [word] => CARDINALS.iter().position(|entry| entry == word)? + 1,
+        _ => return None,
+    };
+    let rest = &words[at + 1..];
+    if size == 1000 {
+        return (times == 1 && rest.is_empty()).then_some((size, count));
+    }
+    let base = times * size;
+    if rest.is_empty() {
+        return Some((base, count));
+    }
+    if !count {
+        return None;
+    }
+    let rest = match rest {
+        [and, tail @ ..] if and == "and" => tail,
+        _ => rest,
+    };
+    if rest
+        .iter()
+        .any(|word| word.bytes().any(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (part, part_count) = below_hundred(rest)?;
+    (1..=99)
+        .contains(&part)
+        .then_some((base + part, part_count))
+}
+
+/// One or two words as a number below a hundred: one word
+/// ([`number_word`]), or a ten followed by a unit — "twenty three" (a count),
+/// "twenty third" (a position).
+fn below_hundred(words: &[String]) -> Option<(usize, bool)> {
     match words {
         [word] => number_word(word),
         [tens, unit] => {
@@ -348,11 +412,12 @@ fn number_said(words: &[String]) -> Option<(usize, bool)> {
     }
 }
 
-/// The words an ordinal utterance turns on — one, or a ten and a unit —
+/// The words an ordinal utterance turns on — one number, up to
+/// [`MAX_NUMBER_WORDS`] words —
 /// once a leading "the", one of [`ORDINAL_LEADS`] and a trailing filler
 /// "one" after a position are set aside: "three" in "number three", "third"
 /// in "the third one", "twenty first" in "the twenty-first one". `None` when
-/// more than two words are left. [`ordinal`] reads them.
+/// more than [`MAX_NUMBER_WORDS`] words are left. [`ordinal`] reads them.
 fn ordinal_words(words: &[String]) -> Option<&[String]> {
     let mut rest: &[String] = words;
     if rest.first().is_some_and(|word| word == "the") {
@@ -374,7 +439,7 @@ fn ordinal_words(words: &[String]) -> Option<&[String]> {
     {
         rest = head;
     }
-    (!rest.is_empty() && rest.len() <= 2).then_some(rest)
+    (!rest.is_empty() && rest.len() <= MAX_NUMBER_WORDS).then_some(rest)
 }
 
 /// The name half of [`answer`]: the utterance resolved among the offered

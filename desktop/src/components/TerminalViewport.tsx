@@ -181,6 +181,13 @@ export function TerminalViewport({
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.open(host);
+    /* Issue #1492 — whether the buffer holds more than the rows on screen,
+       on the host, so CSS keeps xterm's scrollbar shown at rest while it does
+       (xterm 6 fades it out unless hovered or scrolled, with no option to
+       change that). Re-read on every scroll, write, resize and switch to or
+       from the alternate screen, which has no scrollback. */
+    const markScrollback = () => host.classList.toggle("has-scrollback", terminal.buffer.active.baseY > 0);
+    const scrollbackListeners = [terminal.onScroll(markScrollback), terminal.onWriteParsed(markScrollback), terminal.onResize(markScrollback), terminal.buffer.onBufferChange(markScrollback)];
     // GPU rendering. Without it xterm falls back to the DOM renderer, which
     // cannot keep up with several agents streaming output at once. Loading it
     // must happen after open(); a lost WebGL context degrades to the DOM
@@ -347,6 +354,7 @@ export function TerminalViewport({
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       inputDisposable.dispose();
+      for (const listener of scrollbackListeners) listener.dispose();
       selectionKeeper.dispose();
       wrapper?.removeEventListener("keydown", onCopyKey, true);
       wrapper?.removeEventListener("mousedown", onPress, true);
