@@ -1,12 +1,14 @@
 ---
-name: dot-ai-prd-close
+name: prd-close
 description: Close a PRD that is already implemented or no longer needed
 user-invocable: true
 ---
 
 # Close PRD
 
-Close a PRD that is already implemented (in previous work or external projects) or is no longer needed. This workflow updates the PRD status, archives it, updates the GitHub issue, and commits directly to main without triggering CI.
+Close a PRD that is already implemented (in previous work or external projects) or is no longer needed. This workflow records why, closes the GitHub issue, and — for an older PRD that has a file — archives the file.
+
+**Where the PRD lives.** Since issue #1591 a new PRD is its GitHub issue, and closing it is closing the issue with a closing comment: **no file move and no commit**. An older PRD keeps its `prds/<n>-*.md` file, and archiving that file is a commit — which here goes through a PR, because `main` is protected (CLAUDE.md rule 8): a direct push is refused with `GH013` (or, for an admin, silently bypasses the review). `bash .claude/skills/prd-start/prd-source.sh <n>` says which case you are in, and [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md) has the issue conventions.
 
 ## When to Use This Command
 
@@ -31,7 +33,7 @@ Close a PRD that is already implemented (in previous work or external projects) 
 /prd-close 20
 
 # With PRD number and reason
-/prd-close 20 "Already implemented by dot-ai-controller"
+/prd-close 20 "Already implemented by PRs #<a> and #<b>"
 ```
 
 **Note**: If any `gh` command fails with "command not found", inform the user that GitHub CLI is required and provide the installation link: https://cli.github.com/
@@ -58,10 +60,10 @@ Close a PRD that is already implemented (in previous work or external projects) 
 
 ### Step 2: Read and Validate PRD
 
-Read the current PRD file from `prds/[number]-*.md`:
+Locate it with `bash .claude/skills/prd-start/prd-source.sh [number]`, then read it: the file it names for `SOURCE=file`, or the issue body and its collaborator comments for `SOURCE=issue`. For `SOURCE=none` the issue carries no PRD; closing it is then an ordinary issue close, which this skill can still do through the issue path below, but say so to the user.
 
 **Validation checks:**
-- [ ] PRD file exists and is readable
+- [ ] PRD exists and is readable (its file, or its issue)
 - [ ] Confirm with user that this PRD should be closed
 - [ ] Verify closure reason makes sense given PRD content
 - [ ] Ask user for implementation evidence (if "already implemented")
@@ -80,7 +82,22 @@ Read the current PRD file from `prds/[number]-*.md`:
 Proceed with closure? (yes/no)
 ```
 
-### Step 3: Update PRD File
+### Step 3: Close It — Issue PRD (`SOURCE=issue`, or `none`)
+
+No file, no branch, no commit.
+
+1. **Post the closure comment** — the Step F4 template below, headed `### PRD closed — [YYYY-MM-DD]` instead, and with its `### Files` section replaced by "**PRD**: this issue's body". Write it to `.dot-agent-deck/prd-[number]-comment.md` with your file-writing tool and post it with `gh issue comment [number] --body-file .dot-agent-deck/prd-[number]-comment.md` ([`../prd-start/issue-prd.md`](../prd-start/issue-prd.md), "Comments").
+2. **Close the issue with the reason that matches**:
+   ```bash
+   gh issue close [number] --reason completed          # Already Implemented
+   gh issue close [number] --reason "not planned"      # No Longer Needed / Deferred
+   gh issue close [number] --duplicate-of [other]      # Duplicate
+   ```
+3. Leave the body as it is. It is the PRD as it stood when it closed, and the closing comment says why.
+
+### Step 4: Close It — File PRD (`SOURCE=file`)
+
+#### F1: Update PRD File
 
 Update the PRD metadata:
 
@@ -91,9 +108,9 @@ Update the PRD metadata:
 **Completed**: [Current Date] [or] **Closed**: [Current Date]
 ```
 
-### Step 4: Move PRD to Archive
+#### F2: Move PRD to Archive
 
-Move the PRD file to the done directory and update roadmap:
+Work on a branch, never on `main` (CLAUDE.md rule 1 says to ask whether the user wants a worktree or a branch). Move the PRD file to the done directory and update roadmap:
 
 ```bash
 git mv prds/[number]-[name].md prds/done/
@@ -107,14 +124,9 @@ git mv prds/[number]-[name].md prds/done/
 - [ ] Remove the entire line that references this PRD
 - [ ] Closed PRDs should not appear in future roadmap as they're no longer being worked on
 
-### Step 5: Update GitHub Issue
+#### F3: Update GitHub Issue
 
-**Reopen issue temporarily to update:**
-```bash
-gh issue reopen [number]
-```
-
-**Update issue description with new PRD path and status:**
+**Update issue description with new PRD path and status** (the link resolves once the PR merges):
 ```bash
 gh issue edit [number] --body "$(cat <<'EOF'
 ## PRD: [Title]
@@ -132,12 +144,12 @@ EOF
 )"
 ```
 
-### Step 6: Close GitHub Issue
+#### F4: Record the Closure on the Issue
 
-Close the issue with comprehensive closure comment:
+Post the comprehensive closure comment now, but do **not** close the issue here: the PR's `Closes #[number]` closes it when the archival merges, so the issue and the file cannot disagree about whether the PRD is closed.
 
 ```bash
-gh issue close [number] --comment "$(cat <<'EOF'
+gh issue comment [number] --body "$(cat <<'EOF'
 ## ✅ PRD #[number] Closed - [Reason Category]
 
 [Detailed explanation of why PRD is being closed]
@@ -175,62 +187,49 @@ EOF
 )"
 ```
 
-### Step 7: Commit and Push
+#### F5: Commit on a Branch and Open a PR
 
-**Commit changes directly to main with skip CI:**
+Run the gates CLAUDE.md rule 2 names before committing, then:
 
 ```bash
-# Stage all changes
-git add .
+git add prds/
+git status   # only the moved PRD and its in-repo link fixes
 
-# Verify what will be committed
-git status
-
-# Commit with skip CI flag
-git commit -m "docs(prd-[number]): close PRD #[number] - [brief reason] [skip ci]
+git commit -m "docs(prd-[number]): close PRD #[number] - [brief reason]
 
 - Moved PRD to prds/done/ directory
 - Updated PRD status to [Complete/Closed]
-- Updated GitHub issue description with new path
 - [Implementation details or reason]
 
 Closes #[number]"
-
-# Pull latest and push to remote
-git pull --rebase origin main && git push origin main
 ```
 
-**Important**:
-- Always use `[skip ci]` flag to avoid unnecessary CI runs for documentation changes
-- Include issue reference (`Closes #[number]`) to link commit to issue
+Then run `/pr-create`, with `Closes #[number]` in the PR body. No `[skip ci]`: the required checks have to report for the PR to merge.
 
 ## Example Scenarios
 
-### Example 1: Already Implemented in External Project
+### Example 1: Already Implemented by Earlier Work
 
 ```bash
-/prd-close 20 "Implemented by dot-ai-controller"
+/prd-close 20 "Implemented by PRs #<a> and #<b>"
 ```
 
 **Closure Comment:**
 ```markdown
 ## ✅ PRD #20 Closed - Already Implemented
 
-This PRD requested proactive Kubernetes cluster monitoring with AI-powered remediation.
-**Core functionality (60-80%) is already implemented** by the separate
-[dot-ai-controller](https://github.com/vfarcic/dot-ai-controller) project.
+This PRD requested exporting a session's history so it can be shared or archived.
+**All core requirements are already implemented** by work that shipped under other
+issues, in PRs #<a> and #<b>.
 
 | Requirement | Implementation | Status |
 |-------------|----------------|--------|
-| Continuous health checks | Event-based monitoring via K8s events | ✅ Complete |
-| Intelligent alerting | Slack notifications with AI analysis | ✅ Complete |
-| Automated remediation | Automatic/manual modes with confidence thresholds | ✅ Complete |
-| Anomaly detection | AI-powered event analysis | ✅ Complete |
+| Export a session's history | PR #<a> | ✅ Complete |
+| Choose the export format | PR #<a> | ✅ Complete |
+| Export from the desktop app | PR #<b> | ✅ Complete |
 
-**Not Implemented** (advanced features, may be future PRD):
-- Continuous metrics monitoring (Prometheus-style)
-- Predictive analytics with baseline learning
-- Multi-channel alerting (email, PagerDuty)
+**Not Implemented** (deferred, may be a future PRD):
+- Scheduled automatic exports
 ```
 
 ### Example 2: Duplicate PRD
@@ -267,17 +266,21 @@ Requirements have evolved and this PRD is out of scope.
 
 ## Success Criteria
 
+**Issue PRD:**
+✅ **Closure comment posted** on the issue
+✅ **GitHub issue closed** with the matching reason
+✅ **Nothing committed**
+
+**File PRD:**
 ✅ **PRD file updated** with completion/closure metadata
-✅ **PRD archived** to `prds/done/` directory
-✅ **GitHub issue updated** with new PRD path
-✅ **GitHub issue closed** with comprehensive closure comment
-✅ **Changes committed to main** with skip CI flag
-✅ **Changes pushed to remote** repository
+✅ **PRD archived** to `prds/done/` directory, on a branch
+✅ **GitHub issue updated** with new PRD path and the closure comment
+✅ **PR opened** with `Closes #[number]`, so the merge closes the issue
 
 ## Notes
 
-- **No PR required**: This workflow commits directly to main for documentation-only changes
-- **Skip CI**: Always include `[skip ci]` to avoid unnecessary CI runs
+- **No PR for an issue PRD**: closing one is two `gh` calls and touches nothing in the repository
+- **A PR for a file PRD**: archiving the file is a commit, and `main` takes commits only through an approved PR (CLAUDE.md rule 8)
 - **Comprehensive documentation**: Ensure issue comment clearly explains closure reason
 - **Implementation references**: Link to external projects, repos, or PRs where functionality exists
 - **Gap acknowledgment**: Be honest about what's implemented vs. what's missing

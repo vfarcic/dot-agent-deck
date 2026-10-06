@@ -168,6 +168,12 @@ mod pin_lockstep;
 /// here under `python3`.
 #[cfg(test)]
 mod pr_review_verdict;
+/// Issue #1591: where a PRD lives — its `prds/` file when one exists, else its
+/// issue body — is decided by `.claude/skills/prd-start/prd-source.sh`, and
+/// each PRD skill fork replaced its `dot-ai` mirror. Tests only, and Unix only:
+/// the scripts are driven under `bash` against offline `gh` and `git` stand-ins.
+#[cfg(all(test, unix))]
+mod prd_skills;
 /// Issue #1019 review: `scripts/reap-orphans.sh` SIGKILLs processes selected by
 /// parsing `/proc`, and every property that makes that safe — the never-kill
 /// list, the two-part MCP identification, the stat-field arithmetic past a comm

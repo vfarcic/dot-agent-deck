@@ -1,5 +1,5 @@
 ---
-name: dot-ai-prds-get
+name: prds-get
 description: "Fetch all open GitHub issues from this project that have the 'PRD' label"
 user-invocable: true
 ---
@@ -7,6 +7,8 @@ user-invocable: true
 # Get All PRDs
 
 Fetch all open GitHub issues from this project that have the 'PRD' label.
+
+Since issue #1591 a new PRD is its GitHub issue (the body is the PRD) and an older one keeps its `prds/<n>-*.md` file — see [`../prd-start/issue-prd.md`](../prd-start/issue-prd.md).
 
 **Note**: If any `gh` command fails with "command not found", inform the user that GitHub CLI is required and provide the installation link: https://cli.github.com/
 
@@ -22,7 +24,7 @@ Fetch all open GitHub issues from this project that have the 'PRD' label.
    - Creation and last update dates  
    - Current assignees (if any)
    - Direct link to the issue
-   - PRD file link (if available in issue description)
+   - Where the PRD lives: `bash .claude/skills/prd-start/prd-source.sh <number>` prints `SOURCE=file` (with `FILE=`), `SOURCE=issue`, or `SOURCE=none` with the `REASON=` the issue is not a PRD yet. Show `none` rows as "no PRD yet — `/prd-create <number>`" rather than dropping them; a stub issue is still a planned PRD
 
 3. **Meaningful Categorization**: Group PRDs by their actual purpose and impact, not generic labels:
    - **Architecture & Infrastructure**: Core system changes, API designs, major refactors
