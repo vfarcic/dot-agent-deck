@@ -104,7 +104,7 @@ Each unit also appears on your deck like any other work: a card for a single age
 
 If the unit's agent does not report submitting its task within about a minute, the deck puts a notice on **the unit's own card** saying the task may never have arrived. The notice is not sent to the dispatcher. Not every lost task leaves a notice:
 
-- A **Pi** unit does not report submitted prompts, so there is nothing to check and no notice.
+- A **Pi** unit is checked only when its Pi loaded the extension that comes with this version of the deck or a later one. A Pi that was already running when you upgraded the deck keeps its older extension until it restarts; that Pi is not checked and never gets a notice.
 - A **Codex** unit whose prompt hook the deck knows will not run gets no notice either. That happens when you switched the hook off in Codex's `/hooks` list, or when `codex` is reachable only inside a launcher (such as `devbox run codex-big`) and not on the deck's own `PATH`; see [Codex events not showing](troubleshooting.md#codex-events-not-showing).
 - If the unit's pane went away, or its agent was replaced, before the task was typed in, the deck records that in its log and not on the card.
 
@@ -155,6 +155,7 @@ dot-agent-deck worktree reclaim     # remove the worktrees marked "remove": deck
 |---|---|---|
 | `dispatch: branch agent/dispatch-<name> already exists from an earlier dispatch …` | A unit with this name ran before; its branch was kept. | Use another name, or delete the branch with the `git … branch -D` command the message gives. |
 | A `dispatch:` failure naming an orchestration and listing the available ones | `--orchestration` named an orchestration the project does not define (names are matched exactly). | Run `dispatch --list-targets` and use a listed name. Nothing was created. |
+| `dispatch: ambiguous-orchestration: …` | The project's `.dot-agent-deck.toml` declares more than one orchestration with roles under that name, so the deck cannot tell which one you meant. | Rename one of them (`dot-agent-deck validate` reports the duplicate as a warning), then dispatch again. Nothing was created. |
 | `--list-targets` exits non-zero and prints a parse error | The project's `.dot-agent-deck.toml` cannot be read. | Fix it (`dot-agent-deck validate`), or dispatch with `--single`, which needs no config. |
 | `Error: the daemon did not answer list-targets …` | No daemon, or one that does not support the listing. | Start the deck, or dispatch with `--single` or `--orchestration <name>`. |
 | A dispatched orchestration is refused because of `.dot-agent-deck` | The project's `.dot-agent-deck` is a symlink or writable by group or other. | See [The orchestrator does not know its workers, or a dispatched orchestration is refused](orchestration.md#the-orchestrator-does-not-know-its-workers-or-a-dispatched-orchestration-is-refused). |

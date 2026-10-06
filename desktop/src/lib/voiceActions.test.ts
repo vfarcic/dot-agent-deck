@@ -161,6 +161,9 @@ describe("VOICE_ACTIONS", () => {
       "showVoiceCommands",
       "dictateToAgent",
       "submitAgentPrompt",
+      "interruptAgent",
+      "clearAgentPrompt",
+      "scratchLastDictation",
       // PRD #1223: the `open_new_agent` row.
       "openNewAgent",
       // PRD #1223: the directory browser's rows.
@@ -204,6 +207,20 @@ describe("VOICE_ACTIONS", () => {
       ).toBe(false);
     }
   });
+
+  /** Scenario: inspect the three prompt-control entries that the typing-mode command rows invoke. Each declares its panel callable as a required capability. */
+  it.each(["interruptAgent", "clearAgentPrompt", "scratchLastDictation"])(
+    "declares the %s prompt-control callable in needs",
+    async (actionId) => {
+      const { VOICE_ACTIONS } = await vi.importActual<{
+        VOICE_ACTIONS: Record<string, RegistryEntry & { needs: string[] }>;
+      }>("./voiceActions");
+      expect(VOICE_ACTIONS).toHaveProperty(actionId);
+      expect(VOICE_ACTIONS[actionId].needs).toEqual([actionId]);
+      expect(typeof VOICE_ACTIONS[actionId].run).toBe("function");
+      expect(VOICE_ACTIONS[actionId].voice).toBe(true);
+    },
+  );
 
   /**
    * Scenario: choose a configured remote daemon in the header selector. The

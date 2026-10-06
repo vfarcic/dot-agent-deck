@@ -217,6 +217,17 @@ export type VoiceActionContext = {
    * prompt. The voice surface's, for {@link startDictation}'s reason. */
   stopDictation: () => void;
   /**
+   * PRD #1541 — interrupt the open agent's turn with the deck's own interrupt
+   * key, clear its prompt, or remove the last dictated words. The voice
+   * surface's, because what they need — the words voice typed into the
+   * prompt since it was last sent, whether anything else was typed there, and
+   * when the agent was last interrupted — is state only the surface keeps.
+   * Reached only from typing mode's local intercept.
+   */
+  interruptAgent: (target: VoiceDispatchTarget) => void;
+  clearAgentPrompt: (target: VoiceDispatchTarget) => void;
+  scratchLastDictation: (target: VoiceDispatchTarget) => void;
+  /**
    * Close the voice surface's own overlay.
    *
    * **Published only while that overlay is OPEN**, and that is the whole
@@ -510,6 +521,29 @@ export const VOICE_ACTIONS = {
     voice: true,
     needs: ["stopDictation"],
     run: (context: Pick<VoiceActionContext, "stopDictation">) => context.stopDictation(),
+  },
+
+  interruptAgent: {
+    label: "Interrupt the open agent's turn",
+    voice: true,
+    needs: ["interruptAgent"],
+    /** Presses the deck's interrupt key for the agent — never `Ctrl+C` — and
+        only while the agent is working. */
+    run: (context: Pick<VoiceActionContext, "interruptAgent">, target: VoiceDispatchTarget) => context.interruptAgent(target),
+  },
+
+  clearAgentPrompt: {
+    label: "Clear the open agent's prompt",
+    voice: true,
+    needs: ["clearAgentPrompt"],
+    run: (context: Pick<VoiceActionContext, "clearAgentPrompt">, target: VoiceDispatchTarget) => context.clearAgentPrompt(target),
+  },
+
+  scratchLastDictation: {
+    label: "Remove the words last typed by voice from the open agent's prompt",
+    voice: true,
+    needs: ["scratchLastDictation"],
+    run: (context: Pick<VoiceActionContext, "scratchLastDictation">, target: VoiceDispatchTarget) => context.scratchLastDictation(target),
   },
 
   closeTopmost: {
@@ -1206,7 +1240,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

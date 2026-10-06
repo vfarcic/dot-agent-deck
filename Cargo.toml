@@ -251,3 +251,14 @@ path = "examples/render_config_gen_prompt.rs"
 [[example]]
 name = "diff_config"
 path = "examples/diff_config.rs"
+
+# Issue #1450: the desktop's voice check (`desktop/src-tauri/src/voice/human_voice.rs`)
+# runs `earshot`, a small neural network, over every utterance before it is
+# transcribed. Unoptimised it scores 30 s of audio in about 4 s, which in a
+# `tauri dev` build is latency added to every spoken command and in
+# `cargo test-fast` is seconds per test; optimised it is milliseconds. This
+# optimises that one dependency in debug builds and changes nothing else —
+# release builds are optimised already, and this crate's own code still builds
+# at the dev profile's settings.
+[profile.dev.package.earshot]
+opt-level = 3

@@ -118,25 +118,31 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     `tool` is what it is running right now. A user refers to an agent by state as \
     readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
     resolve such a reference against those fields and answer with that agent's \
-    `label`. For a reference the user made by name, answer with the words the user \
-    used and let the app resolve them. `decks` lists every daemon a new agent \
-    can be started on, named the way the screen names it; a `deck_ref` param is a \
-    reference to one of those daemons — \"local\" means this machine's, and a user \
-    may still call a daemon a deck — and is \
-    answered with the words the user used for it, never with an agent. \
-    `switch_deck`'s `deck_ref` is the one exception to \"one of those daemons\": it may \
-    name any daemon the user has configured, listed there or not, and is answered with \
-    the user's words all the same. A param marked \
+    `label`. A param that names an entry of a list below — a daemon, a \
+    directory, a Mode chip, an agent type or an orchestration — is answered, \
+    when the user named the entry, with its name exactly as listed, even when \
+    the transcript spells it differently: split or run together (\"mini PC\" for \
+    `minipc`, \"InMotionDeck\" for `inmotion`), with punctuation, or misheard \
+    (\"demon\" for daemon). When their words fit more than one entry, or none, \
+    or the list is not shown, answer that param with the words the user used \
+    for it, and the app asks which or says so. Every other param follows its \
+    own description. \
+    `decks` lists every daemon the Daemon selector shows, named the way the \
+    screen names it, and `decks_without_new_agent` the ones among them a new \
+    agent cannot be started on; a `deck_ref` param is a reference to one of \
+    those daemons — \"local\" means this machine's, and a user may still call a \
+    daemon a deck — never to an agent. When the user names a daemon in \
+    `decks_without_new_agent` for a new agent, still answer with it: the app \
+    tells them why a new agent cannot start there. A param marked \
     `optional` is left out when the user named nothing for it. `directories`, \
     when present, is the New agent dialog's directory browser: `entries` are the \
-    directories on screen, and a `dir_ref` param names one of THOSE, answered with \
-    the words the user used for it. `new_agent_form`, when present, is the New \
+    directories on screen, and a `dir_ref` param names one of THOSE. \
+    `new_agent_form`, when present, is the New \
     agent dialog's form: `modes` are the Mode chips it offers and `agent_types` \
     the agents whose default command it can put in Command, and a `mode_ref` or `agent_type_ref` param \
-    names one of THOSE, answered with the words the user used for it. \
+    names one of THOSE. \
     `orchestrations` lists the orchestrations among those agents by `title`, with \
-    their roles; an `orchestration_ref` param names one of them, answered with the \
-    words the user used for it. When the user refers to a daemon, a directory or an \
+    their roles; an `orchestration_ref` param names one of them. When the user refers to a daemon, a directory or an \
     orchestration by its position or by what kind of thing it is rather than by a \
     word of its name — \"the first one\", \"the remote daemon\", \"the other run\" — \
     answer with that entry's name exactly as listed. When the user's words could mean closing a VIEW \
@@ -144,7 +150,8 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     action that stops nothing, and pick a stop only for words that can only mean \
     stopping. An action that stops something only ASKS: the app shows a \
     confirmation and the user confirms by hand, so pick it whenever the user \
-    asked to stop, however urgently. Write no prose; the app writes what the \
+    asked to stop, however urgently. Words that start something — launch, start, \
+    create, run — never ask to stop, however urgently they are said. Write no prose; the app writes what the \
     user reads.";
 
 /// One row as the model sees it, with its availability on the screen the
@@ -354,6 +361,9 @@ mod tests {
                 "dictation_on".to_string(),
                 "dictation_off".to_string(),
                 "submit_prompt".to_string(),
+                "interrupt_agent".to_string(),
+                "clear_prompt".to_string(),
+                "scratch_that".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),
@@ -436,6 +446,9 @@ mod tests {
                 "dictation_on",
                 "dictation_off",
                 "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",
@@ -630,6 +643,9 @@ mod tests {
                 ("dictation_on".to_string(), false),
                 ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("interrupt_agent".to_string(), false),
+                ("clear_prompt".to_string(), false),
+                ("scratch_that".to_string(), false),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -676,6 +692,9 @@ mod tests {
                 ("dictation_on".to_string(), false),
                 ("dictation_off".to_string(), false),
                 ("submit_prompt".to_string(), false),
+                ("interrupt_agent".to_string(), false),
+                ("clear_prompt".to_string(), false),
+                ("scratch_that".to_string(), false),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),
@@ -721,6 +740,9 @@ mod tests {
                 ("dictation_on".to_string(), true),
                 ("dictation_off".to_string(), true),
                 ("submit_prompt".to_string(), true),
+                ("interrupt_agent".to_string(), true),
+                ("clear_prompt".to_string(), true),
+                ("scratch_that".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
                 ("open_dir".to_string(), false),

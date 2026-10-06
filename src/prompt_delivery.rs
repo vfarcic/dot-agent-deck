@@ -17,14 +17,16 @@
 //! its identity and its retry armed, and re-submits under a bounded backoff.
 //!
 //! **Not every producer can do that**, which is why re-submission is gated on
-//! [`agent_reports_submitted_prompt`] rather than on "some event carrying this
-//! agent's id arrived". Reporting a LIFECYCLE and reporting SUBMITTED PROMPT
-//! TEXT are separate capabilities: Pi's extension emits `agent-event` status
-//! frames with the right pane and agent ids but hardcodes `user_prompt: None`
-//! (`crate::main`'s `agent-event` subcommand), so treating any own-id event as
-//! confirmation capability would arm a retry loop that is structurally unable
-//! to ever confirm — retyping the prompt until the deadline. That is worse than
-//! the bug being fixed, so the two capabilities are modelled apart.
+//! [`producer_reports_submitted_prompt`] rather than on "some event carrying
+//! this agent's id arrived". Reporting a LIFECYCLE and reporting SUBMITTED
+//! PROMPT TEXT are separate capabilities: a Pi extension from before issue #622
+//! emits `agent-event` status frames with the right pane and agent ids and
+//! never a prompt, so treating any own-id event as confirmation capability
+//! would arm a retry loop that is structurally unable to ever confirm —
+//! retyping the prompt until the deadline. That is worse than the bug being
+//! fixed, so the two capabilities are modelled apart, and a Pi producer counts
+//! only once it declares that it reports every prompt (issue #1567, see
+//! [`agent_prompt_reporting`]).
 //!
 //! Three independent delivery implementations consume this module, which is why
 //! the policy lives here rather than in any one of them:
@@ -119,7 +121,8 @@ const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
 ///   `true` is the unsafe direction: it would authorize re-writing a dispatch
 ///   task the agent has already accepted. Flip it when measured, in this one
 ///   place.
-/// * Pi — never arms anything ([`ConfirmationCapability::CannotReport`]).
+/// * Pi — emits no `SessionStart` at all (its extension reports a session's
+///   start as `Idle`), so there is no start to arm on.
 /// * [`AgentType::None`] — the `#[serde(other)]` forward-compat landing pad; an
 ///   unknown producer has proved nothing.
 ///
@@ -939,43 +942,140 @@ pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
     false
 }
 
-/// Whether an agent of this type can report SUBMITTED PROMPT TEXT — the
-/// capability the whole confirmation design rests on, as distinct from merely
-/// reporting a lifecycle.
+/// Issue #1567: how a producer of this agent type comes to report SUBMITTED
+/// PROMPT TEXT — the capability the whole confirmation design rests on, as
+/// distinct from merely reporting a lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptReporting {
+    /// Every producer of this type reports one: the agent's own hook engine or
+    /// plugin posts the submission whatever the deck's version.
+    Always,
+    /// Only a producer that DECLARES it on its own events
+    /// ([`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`]) — the agent's
+    /// reporting is an extension the deck ships, and an extension from an older
+    /// deck does not report every submitted prompt.
+    WhenDeclared,
+    /// No producer of this type reports one.
+    Never,
+}
+
+/// How an agent of this type comes to report submitted prompt text.
 ///
 /// Reviewer finding B4. Claude Code, Devin and Codex post `UserPromptSubmit`
 /// through their native hook engines, and OpenCode forwards `session.prompt` —
-/// all four land as an event carrying `user_prompt` (`crate::hook`). **Pi
-/// cannot**: its extension reaches the
-/// daemon through the `agent-event` subcommand, which hardcodes
-/// `user_prompt: None`, so a Pi pane emits perfectly well-formed status frames
-/// carrying the right pane and agent ids and never a single submitted prompt.
-/// Arming re-submission off those frames retypes the prompt until the deadline
-/// into an agent that may already be working on it.
+/// all four land as an event carrying `user_prompt` (`crate::hook`), so they are
+/// [`PromptReporting::Always`].
+///
+/// **Pi is [`PromptReporting::WhenDeclared`]** (issue #1567). Its card is driven
+/// by the bundled extension through the `agent-event` subcommand, and which
+/// prompts that extension reports depends on its version:
+///
+/// * before issue #622 it reported none — `agent-event` hardcoded
+///   `user_prompt: None`, so arming re-submission off those frames retyped the
+///   prompt until the deadline into an agent that may already be working on it;
+/// * from #622 it reported the prompt Pi's `before_agent_start` hands it, which
+///   is only a prompt submitted while Pi is IDLE. Measured on Pi 0.87.1: a
+///   prompt typed while Pi was running a tool was queued as a steering message,
+///   submitted, acted on — and never reported, because Pi starts no new agent
+///   run for it;
+/// * from #1567 it also reports a prompt submitted while Pi is busy (Pi's
+///   `input` event, which carries `streamingBehavior` exactly then), and says so
+///   on every report it sends.
+///
+/// A pane still running an extension from before #1567 — a Pi process that
+/// loaded it before the deck was upgraded, or a deck older than the CLI it
+/// reports through — therefore keeps the answer Pi always had: it cannot
+/// confirm, and nothing typed into it is typed again.
 ///
 /// **This answers for the AGENT, and a type is not always the agent speaking.**
 /// Issue #559: `dot-agent-deck wrap`'s own events declare `AgentType::Codex` on
 /// the agent's behalf while never carrying a submitted prompt — the wrapper's
 /// emitter hardcodes `user_prompt: None`, and its stdout classifier reads every
-/// printed line as `Thinking`. For Codex the `true` below is therefore a claim
+/// printed line as `Thinking`. For Codex the `Always` below is therefore a claim
 /// about Codex's NATIVE hooks, which report only once the wrapper has recorded
 /// trust for them. When that step fails the wrapper says so on every event it
-/// emits ([`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`]), and
-/// the capability reads — [`crate::event::AgentEvent::reports_submitted_prompt`]
-/// per event, [`pane_confirmation_capability`] per pane — withdraw the answer
-/// this function gives for the type. Call one of those rather than this
-/// wherever the question is about a specific producer.
+/// emits ([`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`]).
+/// Both declarations are read per producer by
+/// [`producer_reports_submitted_prompt`], which every capability read goes
+/// through — [`crate::event::AgentEvent::reports_submitted_prompt`] per event,
+/// [`pane_confirmation_capability`] per pane.
 ///
 /// [`AgentType::None`] is BOTH "unrecognized binary" and the `#[serde(other)]`
 /// forward-compat landing pad for an agent type this build has never heard of,
-/// so it is answered `false`: an unknown producer has not proved the
+/// so it is [`PromptReporting::Never`]: an unknown producer has not proved the
 /// capability, and the conservative answer only ever costs a retry we were not
-/// entitled to make. The match is exhaustive on purpose — a new agent type must
-/// answer this question rather than inherit a default.
-pub fn agent_reports_submitted_prompt(agent_type: &AgentType) -> bool {
+/// entitled to make. A declaration does not change that — the marker grants
+/// nothing to a type that is not [`PromptReporting::WhenDeclared`]. The match
+/// is exhaustive on purpose — a new agent type must answer this question rather
+/// than inherit a default.
+pub fn agent_prompt_reporting(agent_type: &AgentType) -> PromptReporting {
     match agent_type {
-        AgentType::ClaudeCode | AgentType::OpenCode | AgentType::Codex | AgentType::Devin => true,
-        AgentType::Pi | AgentType::None => false,
+        AgentType::ClaudeCode | AgentType::OpenCode | AgentType::Codex | AgentType::Devin => {
+            PromptReporting::Always
+        }
+        AgentType::Pi => PromptReporting::WhenDeclared,
+        AgentType::None => PromptReporting::Never,
+    }
+}
+
+/// Whether an agent of this type CAN report submitted prompt text — some
+/// producer of it does ([`agent_prompt_reporting`] is not
+/// [`PromptReporting::Never`]).
+///
+/// A statement about the type, not about any one pane: for Pi it is true while
+/// a given Pi pane may still be one that cannot (its extension declares
+/// nothing). So it answers questions about what a pane COULD turn out to be —
+/// whether the deck spawning an agent of this type gives it standing to accept
+/// a reporting producer that announces itself after the write
+/// ([`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_reporting_agent`]),
+/// which confirmation latency to plan for ([`confirmation_latency_floor`]). Where
+/// the question is whether a specific producer reports, call
+/// [`producer_reports_submitted_prompt`].
+pub fn agent_reports_submitted_prompt(agent_type: &AgentType) -> bool {
+    agent_prompt_reporting(agent_type) != PromptReporting::Never
+}
+
+/// One candidate confirmation producer: a declared agent type, and what the
+/// producer declared about its prompt reports on its own events.
+///
+/// Built per pane session by [`crate::state::SessionState::confirmation_producer`]
+/// and per event by [`crate::event::AgentEvent::reports_submitted_prompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmationProducer<'a> {
+    pub agent_type: &'a AgentType,
+    /// Issue #1567: the producer declared it reports every prompt it submits
+    /// ([`crate::event::PROMPT_REPORTS_DECLARED_METADATA_KEY`]). Grants the
+    /// capability only to a [`PromptReporting::WhenDeclared`] type.
+    pub prompt_reports_declared: bool,
+    /// Issue #559: the producer declared that no submitted-prompt report will
+    /// come from it ([`crate::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY`]).
+    /// Withdraws the capability from every type, and wins over a declaration
+    /// that it reports.
+    pub prompt_reports_unavailable: bool,
+}
+
+impl<'a> ConfirmationProducer<'a> {
+    /// A producer known only by its type: it declared nothing either way.
+    pub fn undeclared(agent_type: &'a AgentType) -> Self {
+        Self {
+            agent_type,
+            prompt_reports_declared: false,
+            prompt_reports_unavailable: false,
+        }
+    }
+}
+
+/// Whether THIS producer reports submitted prompt text: its type always does,
+/// or its type does when declared and it declared — and in either case it did
+/// not declare that it cannot.
+pub fn producer_reports_submitted_prompt(producer: ConfirmationProducer<'_>) -> bool {
+    if producer.prompt_reports_unavailable {
+        return false;
+    }
+    match agent_prompt_reporting(producer.agent_type) {
+        PromptReporting::Always => true,
+        PromptReporting::WhenDeclared => producer.prompt_reports_declared,
+        PromptReporting::Never => false,
     }
 }
 
@@ -997,7 +1097,9 @@ pub enum ConfirmationCapability {
     /// A producer that reports submitted prompt text owns this pane. An
     /// unconfirmed write may be re-submitted.
     Reports,
-    /// A recognized producer that structurally cannot report one (Pi). The
+    /// A recognized producer that cannot report one — a Pi pane whose
+    /// extension does not declare that it reports prompts (issue #1567), or a
+    /// wrapped Codex whose native prompt hook is untrusted (issue #559). The
     /// write is final: retrying could never be confirmed, only retyped.
     CannotReport,
     /// Nothing on this pane has identified itself yet — a bare shell, `cat`, a
@@ -1029,28 +1131,29 @@ pub enum ConfirmationCapability {
 }
 
 /// Resolve [`ConfirmationCapability`] from one pane's sessions, each given as
-/// its declared agent type and whether its producer DECLARED that it cannot
-/// report a submitted prompt
-/// ([`crate::state::SessionState::confirmation_producer`]). Any reporting
-/// producer wins; otherwise a recognized non-reporting one settles it; otherwise
-/// the answer is not yet known.
+/// a [`ConfirmationProducer`] ([`crate::state::SessionState::confirmation_producer`]).
+/// Any reporting producer ([`producer_reports_submitted_prompt`]) wins;
+/// otherwise a recognized non-reporting one settles it; otherwise the answer is
+/// not yet known.
 ///
 /// Issue #559: a session whose producer declared itself unable to report is a
-/// RECOGNIZED producer that cannot — `CannotReport`, the Pi answer — whatever
-/// its type says. That is a wrapped Codex whose native hooks the wrapper could
-/// not get trusted: the pane's only producer is then the wrapper, whose events
-/// name Codex and never carry a prompt. Only the declaration moves the answer,
-/// and only toward the safe side; a session that declares nothing is answered
-/// from its type exactly as before.
+/// RECOGNIZED producer that cannot — `CannotReport` — whatever its type says.
+/// That is a wrapped Codex whose native hooks the wrapper could not get
+/// trusted: the pane's only producer is then the wrapper, whose events name
+/// Codex and never carry a prompt.
+///
+/// Issue #1567: a Pi session is a recognized producer either way, and reports
+/// only once it declared it does. So a Pi pane whose extension declares nothing
+/// — one from before #1567 — stays `CannotReport`, exactly as every Pi pane was.
 pub fn pane_confirmation_capability<'a>(
-    producers: impl Iterator<Item = (&'a AgentType, bool)>,
+    producers: impl Iterator<Item = ConfirmationProducer<'a>>,
 ) -> ConfirmationCapability {
     let mut capability = ConfirmationCapability::Unknown;
-    for (agent_type, prompt_reports_unavailable) in producers {
-        if agent_reports_submitted_prompt(agent_type) && !prompt_reports_unavailable {
+    for producer in producers {
+        if producer_reports_submitted_prompt(producer) {
             return ConfirmationCapability::Reports;
         }
-        if *agent_type != AgentType::None {
+        if *producer.agent_type != AgentType::None {
             capability = ConfirmationCapability::CannotReport;
         }
     }
@@ -1152,8 +1255,17 @@ pub fn submission_is_after_watermark(
 /// * OpenCode, Devin — [`SLOW_CONFIRMATION_LATENCY`] because neither has been
 ///   measured. An unverified short answer is the unsafe direction: it is exactly
 ///   the double submit above. Flip one when it is measured, in this one place.
-/// * Pi, [`AgentType::None`] — never arm a retry
-///   ([`agent_reports_submitted_prompt`] is false), so they are not consulted by
+/// * Pi — [`SLOW_CONFIRMATION_LATENCY`], although its ordinary report is fast.
+///   Measured for issue #1567 on Pi 0.87.1 and Haiku: 40 ms from the deck's
+///   write to the confirmation on a scheduled prompt (`scheduler/pi/002`), and
+///   a prompt submitted mid-tool reported within milliseconds. But a prompt
+///   submitted while Pi is COMPACTING its context is held in Pi's own queue and
+///   reported only when the compaction ends — 4.4 s on a 10k-token context —
+///   and a larger context compacts for longer. The fast 2 s floor would type a
+///   second copy behind that one. A deck-typed prompt into a fresh pane meets no
+///   compaction, so the slow floor costs only recovery latency there.
+/// * [`AgentType::None`] — never arms a retry
+///   ([`agent_reports_submitted_prompt`] is false), so it is not consulted by
 ///   [`confirmation_latency_floor`]; answered with the slow value so a caller
 ///   that asks anyway gets the conservative one.
 ///
@@ -1183,9 +1295,10 @@ pub const SLOW_CONFIRMATION_LATENCY: std::time::Duration = std::time::Duration::
 /// delivery whose producer is one of `producers` — the SLOWEST reporting one,
 /// since a confirmation from any of them may be the one in flight.
 ///
-/// Only producers that can report a submitted prompt are consulted: a Pi status
-/// frame on the same pane says nothing about how long a confirmation takes,
-/// because Pi never sends one. With no reporting producer known the answer is
+/// Only types that can report a submitted prompt are consulted
+/// ([`agent_reports_submitted_prompt`]): an unrecognized producer's frame on the
+/// same pane says nothing about how long a confirmation takes, because it never
+/// sends one. With no reporting producer known the answer is
 /// [`SLOW_CONFIRMATION_LATENCY`] — the delivery has no basis for a shorter one.
 pub fn confirmation_latency_floor<'a>(
     producers: impl IntoIterator<Item = &'a AgentType>,
@@ -1452,9 +1565,9 @@ pub fn log_prompt_confirmed(
 /// Info-level record that this delivery has no confirmation channel at all, so
 /// the write is final and no retry will be attempted. Emitted for a target that
 /// cannot report submitted prompt text — no hook-event bus at all, or a
-/// producer [`agent_reports_submitted_prompt`] answers `false` for. Such an
-/// agent reports no submitted prompts, so retrying would only type the prompt
-/// into it repeatedly and then abandon it.
+/// producer [`producer_reports_submitted_prompt`] answers `false` for. Such a
+/// producer does not report every submitted prompt, so retrying could type the
+/// prompt into it again after it already took it, and then abandon it.
 ///
 /// Deliberately NOT emitted merely because a readiness signal has not arrived
 /// yet (reviewer finding B3): "no `SessionStart` after 10 s" is equally the
@@ -2285,7 +2398,7 @@ mod tests {
         );
         assert!(
             !agent_start_precedes_first_prompt(&AgentType::Pi),
-            "Pi is ConfirmationCapability::CannotReport and arms nothing, ever"
+            "Pi emits no SessionStart at all, so there is no start to arm on"
         );
         assert!(
             !agent_start_precedes_first_prompt(&AgentType::None),
@@ -2295,22 +2408,108 @@ mod tests {
     }
 
     /// Reviewer finding B4: reporting a lifecycle and reporting submitted
-    /// prompt text are different capabilities, and Pi is the shipped
-    /// counterexample that proves it.
+    /// prompt text are different capabilities. Issue #1567: Pi has both only
+    /// when its extension says so, because an extension from an older deck
+    /// reports no prompt (before #622) or not every one (#622 to #1567).
     #[test]
     fn only_producers_that_can_report_a_prompt_arm_retries() {
-        assert!(agent_reports_submitted_prompt(&AgentType::ClaudeCode));
-        assert!(agent_reports_submitted_prompt(&AgentType::Codex));
-        assert!(agent_reports_submitted_prompt(&AgentType::OpenCode));
-        assert!(agent_reports_submitted_prompt(&AgentType::Devin));
+        for always in [
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::OpenCode,
+            AgentType::Devin,
+        ] {
+            assert_eq!(agent_prompt_reporting(&always), PromptReporting::Always);
+            assert!(agent_reports_submitted_prompt(&always));
+            assert!(producer_reports_submitted_prompt(
+                ConfirmationProducer::undeclared(&always)
+            ));
+        }
+        assert_eq!(
+            agent_prompt_reporting(&AgentType::Pi),
+            PromptReporting::WhenDeclared
+        );
         assert!(
-            !agent_reports_submitted_prompt(&AgentType::Pi),
-            "Pi's agent-event frames hardcode user_prompt: None, so a Pi \
-             delivery can never be confirmed and must never arm a retry"
+            agent_reports_submitted_prompt(&AgentType::Pi),
+            "a Pi pane CAN turn out to report — the standing a deck-spawned Pi pane needs"
+        );
+        assert!(
+            !producer_reports_submitted_prompt(ConfirmationProducer::undeclared(&AgentType::Pi)),
+            "a Pi extension that declares nothing is one from before #1567, which does not \
+             report every prompt it submits; arming a retry on it can retype a delivered task"
+        );
+        assert!(producer_reports_submitted_prompt(ConfirmationProducer {
+            agent_type: &AgentType::Pi,
+            prompt_reports_declared: true,
+            prompt_reports_unavailable: false,
+        }));
+        assert_eq!(
+            agent_prompt_reporting(&AgentType::None),
+            PromptReporting::Never
         );
         assert!(
             !agent_reports_submitted_prompt(&AgentType::None),
             "an unrecognized or future producer has not proved the capability"
+        );
+        assert!(
+            !producer_reports_submitted_prompt(ConfirmationProducer {
+                agent_type: &AgentType::None,
+                prompt_reports_declared: true,
+                prompt_reports_unavailable: false,
+            }),
+            "the declaration grants nothing to a type that does not report when declared"
+        );
+    }
+
+    /// Issue #1567: the two declarations meet in one producer, and the one that
+    /// withdraws wins — whatever the type.
+    #[test]
+    fn a_declared_inability_to_report_outranks_a_declaration_that_it_does() {
+        for agent_type in [AgentType::Pi, AgentType::Codex, AgentType::ClaudeCode] {
+            assert!(
+                !producer_reports_submitted_prompt(ConfirmationProducer {
+                    agent_type: &agent_type,
+                    prompt_reports_declared: true,
+                    prompt_reports_unavailable: true,
+                }),
+                "{agent_type:?}"
+            );
+        }
+    }
+
+    /// Issue #1567: a Pi pane's capability follows its extension. One that
+    /// declares nothing is a recognized producer that cannot report —
+    /// exactly what every Pi pane was before — and one that declares it reports.
+    #[test]
+    fn a_pi_pane_reports_only_once_its_extension_declares_it() {
+        let pi = AgentType::Pi;
+        assert_eq!(
+            pane_confirmation_capability([ConfirmationProducer::undeclared(&pi)].into_iter()),
+            ConfirmationCapability::CannotReport
+        );
+        assert_eq!(
+            pane_confirmation_capability(
+                [ConfirmationProducer {
+                    agent_type: &pi,
+                    prompt_reports_declared: true,
+                    prompt_reports_unavailable: false,
+                }]
+                .into_iter()
+            ),
+            ConfirmationCapability::Reports
+        );
+        let none = AgentType::None;
+        assert_eq!(
+            pane_confirmation_capability(
+                [ConfirmationProducer {
+                    agent_type: &none,
+                    prompt_reports_declared: true,
+                    prompt_reports_unavailable: false,
+                }]
+                .into_iter()
+            ),
+            ConfirmationCapability::Unknown,
+            "a declaration on an unidentified producer identifies nothing"
         );
     }
 
@@ -2591,9 +2790,15 @@ mod tests {
             );
         }
         assert_eq!(
-            confirmation_latency_floor([&AgentType::Pi, &AgentType::ClaudeCode]),
+            confirmation_latency_floor([&AgentType::None, &AgentType::ClaudeCode]),
             FAST_CONFIRMATION_LATENCY,
             "a producer that never confirms must not set the floor"
+        );
+        assert_eq!(
+            confirmation_latency_floor([&AgentType::Pi]),
+            SLOW_CONFIRMATION_LATENCY,
+            "issue #1567: Pi holds a prompt submitted during compaction until the \
+             compaction ends (4.4 s measured), so its confirmation can be slow"
         );
         assert_eq!(
             confirmation_latency_floor(std::iter::empty()),

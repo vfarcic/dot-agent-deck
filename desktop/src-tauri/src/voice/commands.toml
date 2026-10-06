@@ -83,9 +83,11 @@
 #                    For a row whose action cannot be taken back, where an
 #                    unrelated occurrence of one ordinary word ("tell it to put
 #                    END after the report") must not be enough. Same own-words
-#                    rule. Four rows use it — `submit_prompt`,
-#                    `discard_new_agent`, and the dictation mode's pair, whose
-#                    switch changes how every later utterance is treated
+#                    rule. Seven rows use it — `submit_prompt`,
+#                    `discard_new_agent`, the dictation mode's pair, whose
+#                    switch changes how every later utterance is treated, and
+#                    PRD #1541's three typing-mode prompt commands, which it
+#                    keeps out of the model's reach (see above those rows)
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
 #   heard_as_whole_while
@@ -145,8 +147,11 @@
 # `voice_off` stops the microphone, `list_commands` opens an overlay,
 # `dictate_to_agent` types what it hears into the open agent's prompt and
 # `submit_prompt` presses Enter in it. What still holds is the narrower property
-# the old sentence was really protecting — **no row here STOPS anything, or
-# answers a permission prompt, BY ITSELF.** Two rows lead to a stop —
+# the old sentence was really protecting — **no row here STOPS an agent or an
+# orchestration, or answers a permission prompt, BY ITSELF.** (PRD #1541's
+# `interrupt_agent` ends the open agent's current TURN and keeps the agent
+# running; it is a typing-mode command the model never dispatches.) Two rows
+# lead to a stop —
 # `stop_agent` and `close_orchestration`, at the end of this file — and each
 # terminates at a `ConfirmDialog` the user answers by hand, never at a direct
 # dispatch: PRD #802 D5's confirm-before-acting step, satisfied in the FRONTEND
@@ -184,8 +189,10 @@ heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch
 
 [[commands]]
 id          = "open_overview"
-description = """Leave the Daemons screen and show the agent dashboard: every agent across every
-connected daemon in one list, with each one's status and activity. Use when the user asks to see
+description = """Leave the Daemons screen and show the agent dashboard: every agent of the daemons
+the Daemon selector is showing, in one list, with each one's status and activity. It changes no
+selection — with the selector on one daemon it shows that daemon's agents only — so a request to
+select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
 button) or the overview, or asks which agents are running or what needs attention."""
 invoke      = "openOverview"
@@ -404,13 +411,28 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # (`selector_voice_decks` in `lib.rs`). A deck the New agent dialog disables is
 # still one the selector switches to — switching is how it becomes one a new
 # agent can start on — so this row alone ignores `VoiceDeck::unavailable`
-# (`outcome::SWITCH_DECK_ROW`). The model is shown only the decks a new agent
-# can start on (a disabled deck is withheld from every row, which this row
-# cannot change without a second list in the prompt), so the description tells
-# it that the deck may be one `decks` does not list; the app resolves the
-# user's words against the full list either way. **All Decks is not
-# voice-reachable**: it is a selection rather than a deck, and "show every
-# agent" is `open_overview`'s.
+# (`outcome::SWITCH_DECK_ROW`). The model is shown every deck, with the ones a
+# new agent cannot start on named in `decks_without_new_agent` (issue #1491),
+# and answers with the one the user meant, however the transcript spelled it.
+# Until #1491 it was shown only the decks a new agent can start on and told to
+# echo the user's words, and the app held those words against the transcript;
+# that refused every daemon the transcriber spelled differently ("mini PC" for
+# `minipc`, "InMotionDeck" for `inmotion`). A switch stops nothing and the
+# next switch undoes it, so the model's pick is trusted as it is for every
+# other reference.
+#
+# **All daemons is voice-reachable through THIS row (issue #1491).** It used to
+# be excluded as "a selection rather than a deck, and 'show every agent' is
+# `open_overview`'s" — but `open_overview` only navigates and never changes the
+# selection, so under This machine "show everything" still showed one daemon
+# and no spoken command reached All daemons. It is one more entry of the
+# selector's list (`selector_voice_decks` appends it, labelled "All daemons"
+# and addressed to the `all` token), rather than a row of its own, because
+# that keeps one path: the same resolver, the same report, the same
+# write as the click, and the open menu's numbers, which dispatch this row,
+# reach it with no second path. It carries a reason a new agent cannot start
+# on it, so the New agent dialog neither offers nor preselects it — the same mechanism
+# that keeps a disconnected deck out of the dialog.
 #
 # **Switching to the deck already shown is a no-op with the same report**,
 # which is still true — it IS showing that deck — and no settings write
@@ -419,10 +441,10 @@ heard_as    = ["settings", "preferences", "options", "configuration", "api key"]
 # `heard_as` carries `daemon` because the selector's own visible label is
 # "Daemon" (the label rule, `docs/develop/voice-first-design.md`; issue #1045
 # renamed it from "Deck"), and keeps `deck`, the older label a user may still
-# say, as `choose_deck` does. Switching is undone by one more switch and stops
-# nothing, so the residual every `heard_as` row carries — "daemon" or "deck"
-# said for another reason while a steered pick is in flight — reaches a
-# visible, reversible change.
+# say, as `choose_deck` does, and `demon`, how speech-to-text writes it.
+# Switching is undone by one more switch and stops nothing, so the residual
+# every `heard_as` row carries — "daemon" or "deck" said for another reason
+# while a steered pick is in flight — reaches a visible, reversible change.
 [[commands]]
 id          = "switch_deck"
 description = """Switch which daemon the app is showing — the Daemon selector at the top of the
@@ -430,11 +452,14 @@ Daemons screen and of the agent dashboard. Use for switch daemon to the build bo
 build box daemon, change the daemon to local, change daemon to ci, select the build box daemon, or
 choose daemon build box. Users who knew the selector by its older name say deck in the same places —
 switch deck to the build box, switch to the build box deck, change the deck to local, select the
-build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the words the user
-used for the daemon. It may name a configured daemon that `decks` does not list, because `decks`
-lists only the daemons a new agent can start on; answer with the user's words all the same. This is
+build box deck, choose deck build box — and those mean THIS one too. Set `deck` to the daemon the
+user meant, exactly as listed in `decks`, which lists every daemon the selector shows, including the
+ones in `decks_without_new_agent`. The selector's first entry, All daemons, shows every configured
+daemon at once, and THIS row switches to it too: select all daemons, switch to all daemons, show all
+daemons or switch daemon to all. Speech-to-text often writes daemon as demon ("select mini PC,
+demon"); demon means daemon here too. This is
 not `open_deck`, which only moves from the agent dashboard to the Daemons screen without changing
-which daemon is shown, and it is not `open_overview`. While the New agent dialog is open this cannot
+which daemon is shown, and it is not `open_overview`, which changes no selection. While the New agent dialog is open this cannot
 run: a request that names a daemon then means the dialog's Daemon field, which is `choose_deck`. It
 changes which daemon is shown and nothing else — it starts, stops and closes nothing."""
 invoke      = "switchDeck"
@@ -444,7 +469,7 @@ unavailable_hint = "switching daemon works from the Daemons screen or the agent 
 report      = "Showing {deck}."
 asks_to     = "switch daemon"
 try_saying  = "switch daemon to {deck}"
-heard_as    = ["switch", "daemon", "deck", "change", "select", "choose"]
+heard_as    = ["switch", "daemon", "deck", "demon", "change", "select", "choose"]
 unavailable_redirects = "choose_deck"
 
   [[commands.params]]
@@ -597,7 +622,8 @@ heard_as    = ["type", "write", "say", "dictate", "tell", "ask", "want", "prompt
 id          = "dictation_on"
 description = """Start typing mode for the open agent: from now on everything the user says is
 typed into that agent's prompt until they stop it. Use only when the WHOLE utterance is "type on",
-"typing on", "start typing", "dictation on", "start dictation" or "keep typing". Nothing is sent
+"typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on",
+"start talking", "speaking on", "start speaking" or "dictate on". Nothing is sent
 while typing — sending is `submit_prompt`. A request to type particular words is
 `dictate_to_agent`, not this."""
 invoke      = "startDictation"
@@ -606,20 +632,27 @@ unavailable_hint = "typing mode needs an agent's pane open — open one first"
 report      = "Typing to the agent."
 asks_to     = "start typing to the agent"
 try_saying  = "type on"
-heard_as_whole = ["type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing"]
+heard_as_whole = [
+  "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
+  "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+]
 
 [[commands]]
 id          = "dictation_off"
 description = """Stop typing mode, so utterances are commands again. Use only when the WHOLE
-utterance is "type off", "typing off", "stop typing", "dictation off", "stop dictation" or
-"done typing". It sends nothing: whatever was typed stays in the agent's prompt."""
+utterance is "type off", "typing off", "stop typing", "dictation off", "stop dictation",
+"done typing", "talking off", "stop talking", "speaking off", "stop speaking" or "dictate off". It
+sends nothing: whatever was typed stays in the agent's prompt."""
 invoke      = "stopDictation"
 screens     = ["agent"]
 unavailable_hint = "typing mode is only on in an agent's pane"
 report      = "Stopped typing."
 asks_to     = "stop typing to the agent"
 try_saying  = "type off"
-heard_as_whole = ["type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing"]
+heard_as_whole = [
+  "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
+  "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+]
 
 # PRD #802 D6 — press Enter in the open agent's prompt.
 #
@@ -664,6 +697,81 @@ try_saying  = "send it"
 heard_as_whole = [
   "send it", "send", "submit it", "submit", "press enter", "enter", "go ahead", "end",
   "that is the end", "finished", "the prompt is finished",
+]
+
+# PRD #1541 — control of the open agent's PROMPT: interrupt its turn, clear
+# what is typed, scratch the last thing voice typed. Typing mode decides what a
+# word means (M1 decision 2), so all three are TYPING-MODE commands.
+#
+# **Reached only through the local typing-mode intercept, never through the
+# model**, and that is a property of the grounding rather than of a sentence
+# here: each row is `heard_as_whole` over exactly the phrases
+# `outcome::local_intercept` answers on the agent screen OUTSIDE typing mode
+# with "say typing on first" (`voice::dictation::INTERRUPT_PHRASES`,
+# `CLEAR_PROMPT_PHRASES`, `SCRATCH_PHRASES`). So every utterance whose words
+# could ground a model pick of one of these rows on the agent screen is
+# answered before any backend call, and on the other screens the row is not
+# callable and renders its hint. The bare "stop" forms
+# (`TYPING_STOP_PHRASES`) are deliberately NOT in `interrupt_agent`'s
+# grounding: outside typing mode a bare "stop" keeps the model's answer it has
+# today (issue #1402 owns it), and putting it here would let the model ground
+# an interrupt on it. As a second wall, `handle_utterance_with_dictation`
+# refuses a model dispatch of any of these rows with the same "typing on"
+# sentence. Inside typing mode `outcome::dictation_intercept` dispatches them
+# from the dictation lists, ahead of typing the utterance.
+#
+# The descriptions still name every phrase (linkage-check rule 14), which is
+# also what the discovery overlay shows the user.
+[[commands]]
+id          = "interrupt_agent"
+description = """Interrupt the open agent's turn: the app presses that agent's own interrupt
+key, which ends what it is working on and keeps the agent and its session running. A typing-mode
+command, answered by the app itself while typing mode is on, when the WHOLE utterance is
+"interrupt", "interrupt it", "interrupt that", "stop", "stop it" or "stop that". Outside typing
+mode a bare "stop" is never this command, and the app answers the others by asking the user to
+turn typing mode on first."""
+invoke      = "interruptAgent"
+screens     = ["agent"]
+unavailable_hint = "interrupting an agent works in its pane, in typing mode"
+report      = "Interrupted the agent."
+asks_to     = "interrupt the agent"
+try_saying  = "interrupt"
+heard_as_whole = ["interrupt", "interrupt it", "interrupt that"]
+
+[[commands]]
+id          = "clear_prompt"
+description = """Clear the open agent's prompt: the app deletes everything typed in it and sends
+nothing. A typing-mode command, answered by the app itself while typing mode is on, when the
+WHOLE utterance is "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything"
+or "delete everything". Outside typing mode the app answers these by asking the user to turn
+typing mode on first."""
+invoke      = "clearAgentPrompt"
+screens     = ["agent"]
+unavailable_hint = "clearing a prompt works in an agent's pane, in typing mode"
+report      = "Cleared the prompt."
+asks_to     = "clear the agent's prompt"
+try_saying  = "clear the prompt"
+heard_as_whole = [
+  "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything",
+  "delete everything",
+]
+
+[[commands]]
+id          = "scratch_that"
+description = """Scratch the last thing voice typed into the open agent's prompt: the app deletes
+exactly those words and leaves the rest. A typing-mode command, answered by the app itself while
+typing mode is on, when the WHOLE utterance is "scratch that", "scratch it", "scratch the last
+part", "scratch the last sentence", "scratch the last prompt", "delete that" or "undo that".
+Outside typing mode the app answers these by asking the user to turn typing mode on first."""
+invoke      = "scratchLastDictation"
+screens     = ["agent"]
+unavailable_hint = "scratching dictated words works in an agent's pane, in typing mode"
+report      = "Scratched the last dictation."
+asks_to     = "scratch the last dictation"
+try_saying  = "scratch that"
+heard_as_whole = [
+  "scratch that", "scratch it", "scratch the last part", "scratch the last sentence",
+  "scratch the last prompt", "delete that", "undo that",
 ]
 
 # PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
@@ -774,8 +882,8 @@ description = """In the New agent dialog's directory browser, open one of the di
 on screen — go down into it. Use for open dir billing, open the billing folder, go into src, enter
 docs, cd into api — and when the user NAMES a listed directory with select, choose, pick, go to or
 navigate: select directory billing, choose the api folder, pick src, go to docs, navigate to tests.
-Set `dir` to the words the user used for the directory; it must be one of
-`directories.entries`, the directories on screen right now. This only moves the browser: it
+Set `dir` to the directory the user meant, exactly as listed in `directories.entries` — the
+directories on screen right now — however the transcript spelled it. This only moves the browser: it
 starts nothing and does not choose the directory for the agent (that is `use_this_directory`).
 A request to open a directory is THIS one even when `directories` is absent — the dialog is closed
 or has no listing yet — and the action is then `callable: false`: pick it anyway rather than
@@ -1066,10 +1174,10 @@ description = """In the New agent form, choose one of the Mode chips it offers, 
 plain agent), one NAMED orchestration (`Orch: <name>`), schedule, schedule: issues, or dispatcher.
 Use for mode schedule, make it a dispatcher, use the billing orchestration, orchestration build,
 orch billing, plain agent, no mode — and for a chip's label read aloud as it is written: "No mode",
-"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the words the user used
-for the chip, copied as they said them — even when they name a chip that is NOT in
-`new_agent_form.modes`: the app then says that chip is not offered, so never answer with the
-nearest chip instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
+"Orch billing", "schedule", "schedule issues", "dispatcher". Set `mode` to the chip the user meant,
+exactly as listed in `new_agent_form.modes` or `new_agent_form.modes_not_offered` — when it is one
+the form does NOT offer, the app then says so, so never answer with the nearest offered chip
+instead. The bare word "orchestration" names NO chip: an orchestration chip is chosen
 by its name. "Activate orchestration", "activate the orchestration", "start orchestration", "start
 the orchestration" and "start the run" are the Start button's words and mean `start_new_agent` —
 they never choose a chip. This only changes the Mode
@@ -1207,6 +1315,11 @@ heard_as    = ["command"]
 # (`docs/develop/voice-first-design.md`, section 6), and what it reaches is
 # another deck on screen, visibly, with the typed fields kept.
 #
+# **"demon" is the same word, as speech-to-text writes it** ("Select mini PC,
+# Demon."), so it grounds this row and `switch_deck` as "daemon" does and is
+# dropped from a reference like it. It widens the vocabulary by a homophone,
+# not by a verb, so the user still has to have talked about a daemon.
+#
 # **The grounding word is not a deck name.** "daemon" is also a word of the
 # local deck's label, "Local daemon", so `resolve_deck_ref` drops "daemon",
 # "deck" and articles from the reference before matching: a bare "daemon" —
@@ -1222,8 +1335,8 @@ Daemon field. Use for daemon build box, use the local daemon, switch to the buil
 the daemon to local, pick the remote daemon, put it on the local daemon, choose daemon ci — and for a
 daemon's own name said with the word daemon, like "Local daemon". Users who knew the field by its
 older name say deck in the same places — deck build box, use the local deck, pick the remote deck —
-and those mean THIS one too. Set `deck` to the words the user used for the daemon; it must be one of
-`decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
+and those mean THIS one too, as does demon, which is how speech-to-text often writes daemon. Set
+`deck` to the daemon the user meant, exactly as listed in `decks`. Choosing a different daemon clears the chosen directory and the Mode and keeps a typed Name
 or Command. While the New agent dialog is open, a request that names WHICH daemon the new agent goes
 on is THIS one — never `open_deck`, which leaves the agent dashboard for the Daemons screen, and
 never `open_new_agent`, since the dialog is already open. It starts nothing, and never touches the
@@ -1235,7 +1348,7 @@ unavailable_hint = "choosing the daemon this way works while the New agent dialo
 report      = "Daemon: {deck}."
 asks_to     = "choose the new agent's daemon"
 try_saying  = "daemon {deck}"
-heard_as    = ["daemon", "deck"]
+heard_as    = ["daemon", "deck", "demon"]
 
   [[commands.params]]
   name = "deck"
@@ -1448,7 +1561,7 @@ the voice form of its card's Close button, whose accessible name is "Close <titl
 The button's visible word is a bare "Close", and a bare "close" is NOT this row: it is `close`,
 which closes a view and stops nothing. Use for close the review orchestration, stop the
 billing run, shut down the whole orchestration, end every role of it, stop all roles, stop all the
-roles. Set `orchestration` to the words the user used for it; it must be one of `orchestrations`.
+roles. Set `orchestration` to the one the user meant, exactly as listed in `orchestrations`.
 The user must NAME the orchestration or the run — "close the agent" or "close the billing agent"
 is `close`, which closes a view and stops nothing. It never stops anything by itself: the app shows
 the same confirmation the Close button shows, naming every role it will stop, and the user

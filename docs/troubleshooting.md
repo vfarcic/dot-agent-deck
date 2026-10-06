@@ -121,7 +121,7 @@ Hooks are how an agent tells the deck what it is doing: prompts, tool use, waiti
 | Devin | `devin` is on the `PATH` | a `"hooks"` object in `$XDG_CONFIG_HOME/devin/config.json` (when `XDG_CONFIG_HOME` is an absolute path), else `~/.config/devin/config.json` |
 | Pi | `pi` is on the `PATH` | no hooks; the daemon writes the deck's Pi extension to `$PI_CODING_AGENT_DIR/extensions/dot-agent-deck` (default `~/.pi/agent/extensions/dot-agent-deck`) when it starts. `dot-agent-deck orchestrator setup` does the same on demand |
 
-Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
+Each hook command runs `<path to dot-agent-deck> hook --agent <agent>`. Only the deck's own entries are added, changed or removed; your other settings and your own hooks are kept, including a hook of yours that shares a rule with a deck entry. For Claude Code, an install also removes the deck's entries from hook types it no longer installs, such as `StopFailure` after Claude Code is downgraded below 2.1.78. The startup install is silent: a problem is written to the log (see [Enabling Debug Logs](#enabling-debug-logs)) and does not stop the deck. Run the install by hand ([Manual Management](#manual-management)) to see errors on your terminal.
 
 On Windows, `$HOME` is usually unset, so Codex hooks are installed only when `CODEX_HOME` is set.
 
@@ -181,7 +181,7 @@ A hook command whose binary still **exists** is left alone, even when it names a
 
 `dot-agent-deck hooks install` or `hooks uninstall` fails with one of:
 
-- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. Fix the syntax and run the install again. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
+- `<path> is not valid JSON (left unchanged, original preserved at <path>.bak): …` — the config (for example `~/.claude/settings.json`) does not parse; one trailing comma is enough. The deck leaves the file as it is and copies it to `<name>.bak` beside it. If a `<name>.bak` already exists, for example a copy you made before editing, the deck leaves it alone and the message says `original not copied: <path>.bak already exists and was left as it was` instead. Fix the syntax and run the install again; the command exits with a non-zero status until it succeeds. Devin documents its config as JSON with comments; the deck cannot edit a Devin config that contains comments, so remove them or add the hooks by hand.
 - `<path> is a symlink (left unchanged): …` — the config is a symbolic link, as in a dotfiles setup. The deck neither replaces the link nor writes through it. Point it at a regular file, or add the deck's hooks to the linked file yourself.
 
 At startup the same problems are logged instead of printed, and the hooks are not installed.
@@ -339,6 +339,20 @@ DOT_AGENT_DECK_HOOK_PROVENANCE=warn dot-agent-deck
 ```
 
 An accepted `work-done` or `dispatch` means the daemon admitted the message, not that the work behind it succeeded.
+
+### An agent's card stops updating, and the daemon log says `refused a status event`
+
+An agent the deck started keeps working in its pane, but its card stays on an old status, and the daemon's log ([Enabling Debug Logs](#enabling-debug-logs) says how to turn it on) has a line like:
+
+```text
+hook socket: refused a status event whose hook capability token does not attest the pane it names … reason="missing_token"
+```
+
+The status updates that drive a card carry the same token as the commands in the entry above, and the daemon refuses an update that names a pane it started without that pane's token. The reasons and fixes are the ones in that table: `missing_token` almost always means the `dot-agent-deck` on the pane's `PATH` is older than the daemon, so [recycle the daemon](#recycling-the-daemon) from the binary on your `PATH`, or start the daemon with `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` to accept the updates with a warning. `token_names_another_agent` means the update carried this pane's token but named a different agent than the one the deck started there; run the agent with the environment the deck gave it. `token_generation_replaced` means the update named no agent and carried the token of an agent the deck has since replaced in that pane, usually a leftover process of the previous agent that is still running; the card keeps following the current agent, and stopping the leftover process ends the log lines.
+
+If an agent was restarted in its pane and its card keeps showing the previous agent, with no such line in the log, the new agent's updates are not saying which agent sent them: make sure `DOT_AGENT_DECK_AGENT_ID` is still set in the agent's environment (a wrapper script that resets the environment drops it), or detach and reattach the deck (in the desktop app, reconnect to the daemon) to refresh its cards.
+
+Agents you start yourself, outside the deck, need no token: their updates are accepted and, in the TUI, they get a card of their own. The desktop app lists only the agents the deck started, so such an agent has no card there (see [Agents the deck did not start](session-management.md#agents-the-deck-did-not-start)).
 
 ### An orchestration stops being able to delegate: "the daemon holds no orchestration role for pane …"
 

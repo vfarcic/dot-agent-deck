@@ -466,6 +466,20 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// the capability is the desktop, which bounds its preparation call against a
 /// deck naming it and keeps waiting an older one out.
 ///
+/// **Issue #1445 contributes no bump for
+/// [`AttachRequest::RecordOrchestratorContext`]**, for the reason `focus-gained`
+/// needed none: its one sender,
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`], withholds
+/// it unless [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is advertised, and the residual
+/// pairing — a cached capability set that outlived a daemon replaced by an older
+/// build — fails closed: that daemon refuses the unknown variant and records
+/// nothing, which is exactly the pre-#1445 behaviour. No existing field changed
+/// meaning: [`crate::agent_pty::AgentRecord::orchestrator_context_path`] still
+/// names the coordinator's own context file, now the newest one rather than the
+/// first, and its one reader, the TUI, already takes it as "this tab's own
+/// file". So no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -660,6 +674,25 @@ pub const CAP_STOP_DAEMON: &str = "stop-daemon";
 /// Unix-only carve-out of [`CAP_PREPARE_ORCHESTRATION`].
 pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 
+/// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
+/// #1445).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::record_orchestrator_context`] holds the
+/// check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated, and the two reads it makes go through
+/// the same bounded context-file read the TUI's re-arm uses on every platform.
+pub const CAP_RECORD_ORCHESTRATOR_CONTEXT: &str = "record-orchestrator-context";
+
+/// Capability string for [`AttachRequest::SubscribeEventsWithSnapshot`] (issue
+/// #1555).
+///
+/// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
+/// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`] holds
+/// the check, so no call site repeats it. Advertised on every platform: the
+/// dispatch arm is not `#[cfg]`-gated.
+pub const CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT: &str = "subscribe-events-with-snapshot";
+
 /// Capability string for [`AttachRequest::ListDirectories`] (PRD #1223 M1).
 ///
 /// Same convention as the PRD #819 verbs: the string is the variant's `op`, and
@@ -750,6 +783,24 @@ pub const CAP_AUTHORING_KIND: &str = "authoring-kind";
 /// platforms is not one it can honour there.
 pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 
+/// Capability string for the deck's shared last command (issue #1540): the
+/// [`crate::new_agent_options::NewAgentOptions::last_command`] answer field,
+/// [`AttachRequest::StartAgent`]'s `remember_command` marker, and the
+/// [`AttachRequest::SeedLastCommand`] verb — one feature, so one string.
+///
+/// Names a FEATURE rather than a single verb's `op`, because two of its three
+/// parts are fields: an older daemon drops `remember_command` silently and
+/// omits `last_command`, so neither can be detected from the reply, and a
+/// client that wants to know whether this deck keeps the last command — and so
+/// whether to keep its own copy — has only this to ask. Held by
+/// [`crate::daemon_client::DaemonClient::start_form_agent`],
+/// [`crate::daemon_client::DaemonClient::start_form_authoring_agent`] and
+/// [`crate::daemon_client::DaemonClient::seed_last_command`], so no call site
+/// checks it itself. Advertised on every platform: none of the three arms is
+/// `#[cfg]`-gated, and the store is an owner-only file under the state
+/// directory on every platform this builds for.
+pub const CAP_LAST_COMMAND: &str = "last-command";
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -819,11 +870,15 @@ fn invalid_client_id_message() -> String {
 /// every platform this builds for. PRD #1223's [`CAP_LIST_DIRECTORIES`],
 /// [`CAP_NEW_AGENT_OPTIONS`] and [`CAP_AUTHORING_KIND`] are on both lists for the
 /// same reason: none of their dispatch arms is `#[cfg]`-gated — and so is issue
-/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first.
+/// #1240's [`CAP_LIST_DIRECTORIES_OPTIONS`], a field of the first, and issue
+/// #1540's [`CAP_LAST_COMMAND`].
 /// [`CAP_PREPARED_ROLE_COMMAND`] is on the Unix list only, beside
 /// [`CAP_START_PREPARED_AGENT`] — it names a field of that verb — and so is
 /// issue #1233's [`CAP_PREPARE_DEADLINE`], which qualifies
-/// [`CAP_PREPARE_ORCHESTRATION`].
+/// [`CAP_PREPARE_ORCHESTRATION`]. Issue #1445's
+/// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
+/// not `#[cfg]`-gated, and neither is issue #1555's
+/// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`].
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -839,6 +894,9 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARED_ROLE_COMMAND,
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_PREPARE_DEADLINE,
+    CAP_LAST_COMMAND,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -850,6 +908,9 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_NEW_AGENT_OPTIONS,
     CAP_AUTHORING_KIND,
     CAP_LIST_DIRECTORIES_OPTIONS,
+    CAP_LAST_COMMAND,
+    CAP_RECORD_ORCHESTRATOR_CONTEXT,
+    CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1091,34 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // orchestrator instruction or script matching the old words stops matching.
     // It takes effect when the daemon starts on the new build.
     "505-unsolicited-work-done-label-reworded",
+    // Issue #1396, at 10 without moving it -- the #555 shape. A `StartAgent`
+    // whose `cwd` is not a directory used to start the agent in `$HOME`
+    // (portable-pty's silent fallback) while recording the requested path; a
+    // newer daemon refuses it with `START_ERR_CWD_NOT_A_DIRECTORY` before the PTY
+    // opens. Every other spawn path shares the refusal, so a respawn or
+    // `pane restart` into a deleted directory is refused too, and a pane a
+    // prepared start created is respawned only into the directory object that
+    // start verified. The request and the refusal channel are unchanged on the
+    // wire. What changed is which starts are refused.
+    "1396-start-refuses-non-directory-cwd",
+    // Issue #1396, at 10 without moving it -- the #580 shape, on the hook
+    // socket. `dispatch --orchestration <name>` (and a schedule's
+    // `shape = "orchestration:<name>"`) naming an orchestration the repo declares
+    // more than once, with roles each time, used to start the FIRST declaration;
+    // a newer daemon refuses it with `PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`, as
+    // `PrepareOrchestration` has since #1233. The `DispatchSignal` and its reply
+    // are unchanged on the wire. What changed is which dispatches are refused.
+    "1396-dispatch-refuses-ambiguous-orchestration",
+    // Issue #318, at 10 without moving it -- #1077's shape, extended from the
+    // `DaemonMessage` verbs to raw hook events. A status event naming a pane the
+    // daemon issued a hook capability token for must now present that token;
+    // a newer daemon refuses one that arrives without it, or with a token
+    // issued for another pane or agent, before it reaches any card or any
+    // attached client. `token` is an optional key an older daemon ignores, and
+    // the hook socket is not what PROTOCOL_VERSION versions. What changed is
+    // which events a NEWER daemon refuses, which a version number cannot
+    // express.
+    "318-hook-event-capability-token",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1281,6 +1370,14 @@ pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 /// put the new-pane form back with its collision warning rather than reporting
 /// a generic pane-spawn failure; any other client just shows the sentence.
 pub const START_ERR_ORCHESTRATION_TITLE_IN_USE: &str = "orchestration-title-in-use";
+
+/// Issue #1396 item 2: the stable prefix of the [`AttachRequest::StartAgent`]
+/// refusal a start earns when its `cwd` is not a directory — it does not exist,
+/// or names a file. A daemon before #1396 started such an agent in `$HOME`
+/// instead (portable-pty's fallback) while recording the requested path, which
+/// is why this is declared as a contract break (`1396-start-refuses-non-directory-cwd`
+/// in [`CONTRACT_BREAKS`]): a request an older daemon served is now refused.
+pub const START_ERR_CWD_NOT_A_DIRECTORY: &str = "cwd-not-a-directory";
 
 /// PRD #819 audit fix: [`AttachRequest::PrepareOrchestration`] (in either
 /// spelling) is refused on this platform because the publish cannot deliver the owner-only guarantee it
@@ -1551,6 +1648,31 @@ pub enum AttachRequest {
         /// `DOT_AGENT_DECK_PANE_ID` for the delivery to route by.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        /// Issue #1540: this start was submitted from a **New agent form** (the
+        /// TUI's `Ctrl+n`, the desktop's New agent dialog), plain or authoring,
+        /// so once the daemon has ACCEPTED it — the spawn succeeded — `command`
+        /// becomes the deck's last command
+        /// ([`crate::last_command::LastCommandStore::remember`]). A start that is
+        /// refused records nothing, and so does one with no `command` (the
+        /// default shell) or a command [`crate::last_command::is_recordable`]
+        /// rejects.
+        ///
+        /// **Ignored, not refused, on an orchestration role start** — one
+        /// presenting a preparation token (`start-prepared-agent`) or carrying a
+        /// [`TabMembership::Orchestration`] — so a role start can never
+        /// overwrite the value whatever a client sends. Scheduled runs and
+        /// `dispatch` do not come through this verb with it set: neither is a
+        /// form, and the one production sender of `true` is
+        /// [`crate::daemon_client::DaemonClient`]'s form-start methods.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`].** An
+        /// older daemon drops the key and starts the agent unchanged, so sending
+        /// it would be harmless; it is gated anyway so the capability is the one
+        /// thing a client reads to know whether this deck keeps the value. No
+        /// `PROTOCOL_VERSION` bump: an additive optional field, omitted when
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remember_command: bool,
     },
     StopAgent {
         id: String,
@@ -1679,6 +1801,33 @@ pub enum AttachRequest {
     /// `AppState` mirrors the daemon's view of live agent activity (agent
     /// type, tool counts, prompts, last-activity timestamps).
     SubscribeEvents,
+    /// Issue #1555: [`Self::SubscribeEvents`], answered with the daemon's agents
+    /// as of the instant the subscription opened — the OK `RESP` carries the
+    /// same [`AttachResponse::agent_records`] a [`Self::ListAgents`] reply does,
+    /// and the `KIND_EVENT` frames that follow it are the broadcasts made after
+    /// that instant.
+    ///
+    /// What a resubscribing client needs, and what `SubscribeEvents` followed by
+    /// `ListAgents` cannot give it: between those two requests the daemon keeps
+    /// broadcasting, so an event sent in that window is queued on the new
+    /// subscription AND already reflected in the listing, and the client
+    /// replays it over the snapshot (a conversation that rolled over comes back
+    /// for a moment and its closure is counted twice). Here the daemon opens the
+    /// subscription and builds the listing under one read of its `AppState`
+    /// lock, and the hook-event ingest path broadcasts and applies each event
+    /// under that lock's write guard, so such an event is on exactly one side:
+    /// in the listing and not on the stream, or the other way round. That
+    /// holds for a broadcast made under the same guard as the state change it
+    /// reports, which is how every hook event the daemon receives, a
+    /// conversation's start and end included, reaches both; see
+    /// `handle_subscribe_events_with_snapshot`.
+    ///
+    /// **Withheld unless the daemon advertises
+    /// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`]**, by
+    /// [`crate::daemon_client::DaemonClient::subscribe_events_with_snapshot`],
+    /// which a client falls back from to `SubscribeEvents` plus `ListAgents`.
+    /// An older daemon refuses the unknown variant and opens nothing.
+    SubscribeEventsWithSnapshot,
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
@@ -1992,6 +2141,50 @@ pub enum AttachRequest {
         /// an invalid one is refused and changes no state.
         client_id: String,
     },
+    /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
+    /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
+    /// per-publish context file for that coordinator
+    /// (`orchestrator_context::reassert_orchestrator_prompt`).
+    ///
+    /// The daemon records the context file each orchestration's coordinator
+    /// was started with and hands it to every TUI that later hydrates the tab
+    /// (`AgentRecord::orchestrator_context_path`), and deletes it when the
+    /// orchestration ends. A re-arm writes a new file the daemon would
+    /// otherwise never hear of, so a reattached tab was handed the startup file
+    /// — gone once the retention sweep reached it, after which the next re-arm
+    /// carried no task — and the re-arm files outlived the orchestration. This
+    /// moves the record to the reported file and keeps the one it replaces for
+    /// deletion at the end.
+    ///
+    /// **The daemon follows only a report it can check**, and otherwise leaves
+    /// the record as it was — answering `ok: true` for a report older than the
+    /// recorded file (it lost a race with a later one, so the record is already
+    /// where it should be; the file is still deleted when the orchestration
+    /// ends) and `ok: false` for every other refusal: `pane_id` must be the
+    /// registered orchestrator seat of an orchestration the daemon records a
+    /// file for; `context_path` must be `orchestrator-context-<32 hex>.md`
+    /// directly in that recorded file's own `.dot-agent-deck`, recorded by no
+    /// other orchestration; and it must carry the recorded file's brief — the
+    /// same `## Your task` section and attendance — and not be older than it
+    /// (`orchestrator_context::compare_rearmed_context`). So a report can never
+    /// point an orchestration at another one's brief, nor move its record back
+    /// to an older file when reports arrive out of order. A
+    /// refusal is not an error the TUI acts on: its own tab keeps the file it
+    /// published either way.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_RECORD_ORCHESTRATOR_CONTEXT`]**,
+    /// by [`crate::daemon_client::DaemonClient::record_orchestrator_context`].
+    /// An older daemon has no such variant and would answer `malformed
+    /// request: …`, changing nothing.
+    ///
+    /// Its own short-lived connection: one request, one response, close.
+    RecordOrchestratorContext {
+        /// The coordinator's pane, as the daemon knows it
+        /// ([`crate::agent_pty::AgentRecord::pane_id_env`]).
+        pane_id: String,
+        /// The absolute path of the context file the re-arm published.
+        context_path: String,
+    },
     /// Issue #1049: ask the daemon to stop ITSELF, and the first wire verb that
     /// does. The rest of this enum acts on agents; the `Stop` half of the
     /// Ctrl+C dialog reaches the deck via the header-only [`KIND_SHUTDOWN`]
@@ -2106,6 +2299,20 @@ pub enum AttachRequest {
     /// **Withheld unless the daemon advertises [`CAP_NEW_AGENT_OPTIONS`]**, on
     /// the same no-bump basis as [`Self::ListDirectories`].
     NewAgentOptions {},
+    /// Issue #1540: offer `command` as the deck's last command **only if the
+    /// daemon has none yet** ([`crate::last_command::LastCommandStore::remember_if_empty`]) —
+    /// how a client hands over a value it kept before the daemon owned one
+    /// (the TUI's `session.toml`) without overwriting a newer command another
+    /// client already recorded. Answers `ok` whether or not the value was
+    /// taken; a blank or over-long `command` is simply not taken.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_LAST_COMMAND`]**, on the
+    /// same no-bump basis as [`Self::FocusGained`]: an older daemon has no such
+    /// variant and refuses it with the generic `malformed request: …`, changing
+    /// nothing.
+    SeedLastCommand {
+        command: String,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -3352,8 +3559,8 @@ async fn compute_write_and_submit_reply(
                         // this from looping.
                         //
                         // Issue #621: and it now recovers when the caller's event
-                        // stream DROPPED the generation too. `spawn_event_subscriber`
-                        // (`main.rs`) resubscribes after a lagged or errored
+                        // stream DROPPED the generation too. The TUI's event
+                        // subscriber resubscribed after a lagged or errored
                         // stream WITHOUT replaying what it missed, so a
                         // `SessionStart` dropped in that window was never applied
                         // to the client `AppState`: every retry went out unnamed,
@@ -3370,12 +3577,18 @@ async fn compute_write_and_submit_reply(
                         // are about to enter and claims nothing retroactively.
                         // A delivery that already wrote into a pane with no
                         // generation and then missed the start still cannot
-                        // bind from a refusal, and is still abandoned at the
-                        // deadline: from a point-in-time answer it cannot tell
-                        // the conversation it wrote into from a successor whose
-                        // predecessor ended unseen. Resynchronizing client state
-                        // after a reconnect would close that too, and is the
-                        // more general remedy the issue names.
+                        // bind from a refusal: from a point-in-time answer it
+                        // cannot tell the conversation it wrote into from a
+                        // successor whose predecessor ended unseen. Since issue
+                        // #1520 the TUI's subscriber (`crate::event_subscriber`)
+                        // records the gap that dropped the start and
+                        // resynchronizes its state when it reconnects, and such a
+                        // delivery stops when its next retry falls due after the
+                        // gap (`crate::ui`'s `delivery_outlived_event_gap`) rather
+                        // than being retried until the deadline; a retry that
+                        // falls due while the stream is still down waits, bounded
+                        // by that deadline. Stopping writes nothing more, so
+                        // nothing here needs to change for it.
                         //
                         // Issue #608 audit, finding 5(b): this arm refuses on the
                         // SESSION evidence alone, with no `has_live_attach`
@@ -3572,6 +3785,124 @@ impl OrchestrationSpawnMeta {
     }
 }
 
+/// Issue #1445: [`AttachRequest::RecordOrchestratorContext`]'s handling — check
+/// the report and, if it holds, move the orchestration's recorded context file
+/// to the one the re-arm published.
+///
+/// Three steps, so no file is read under the state lock: the lexical checks
+/// and the recorded file come from a read lock
+/// ([`crate::state::AppState::rearmed_context_target`]); the two files are
+/// compared on a blocking thread — same brief, and the report not older than
+/// the recorded file ([`crate::orchestrator_context::compare_rearmed_context`]);
+/// and the write lock re-runs the lexical checks and records only if the
+/// recorded file is still the one compared against
+/// ([`crate::state::AppState::record_rearmed_orchestration_context`]),
+/// otherwise the three steps run again against the new file. A report older
+/// than the recorded file answers `ok`: it lost a race with a later one, and
+/// the record already names the newer file. Its file is kept for deletion at
+/// the end under the same write-lock checks
+/// ([`crate::state::AppState::keep_older_rearmed_orchestration_context`]),
+/// without moving the record. The refusal never echoes the path:
+/// it is the client's value, and it failed a check.
+async fn record_rearmed_context(
+    state: &SharedState,
+    pane_id: &str,
+    context_path: &str,
+) -> Result<(), String> {
+    use crate::orchestrator_context::RearmComparison;
+    use crate::state::RearmedContextRefusal;
+    if !crate::agent_pty::is_valid_pane_id_env(pane_id)
+        || !crate::agent_pty::is_valid_orchestration_cwd(context_path)
+    {
+        return Err("record-orchestrator-context: invalid pane id or context path".into());
+    }
+    let reported = std::path::PathBuf::from(context_path);
+    // An orchestration the daemon holds no file for — every one a TUI opened
+    // with `Ctrl+n` — is the routine refusal, so it is not worth a warning.
+    let refused = |reason: &dyn std::fmt::Display, routine: bool| {
+        if routine {
+            tracing::debug!(pane_id, reason = %reason, "not following a re-arm publication");
+        } else {
+            tracing::warn!(pane_id, reason = %reason, "not following a re-arm publication");
+        }
+        format!("record-orchestrator-context: {reason}")
+    };
+    // Each pass compares against the file recorded when it started; a record
+    // that moves during the comparison sends it round again, against the new
+    // file. Bounded, since every move is a report or a start that won.
+    for _ in 0..REARM_RECORD_ATTEMPTS {
+        let current = state
+            .read()
+            .await
+            .rearmed_context_target(pane_id, &reported)
+            .map_err(|r| refused(&r, r == RearmedContextRefusal::NoRecordedContext))?;
+        let mut older = false;
+        if current != reported {
+            let (compared, candidate) = (current.clone(), reported.clone());
+            let comparison = tokio::task::spawn_blocking(move || {
+                crate::orchestrator_context::compare_rearmed_context(&compared, &candidate)
+            })
+            .await;
+            match comparison {
+                Ok(Ok(RearmComparison::Follows)) => {}
+                Ok(Ok(RearmComparison::DifferentBrief)) => {
+                    return Err(refused(&"the file carries a different brief", false));
+                }
+                // A report that lost a race with a later one: the record
+                // already names a newer file, which is the outcome wanted, but
+                // this file is still the orchestration's own and goes with it
+                // at the end (Qodo on PR #1554).
+                Ok(Ok(RearmComparison::Older)) => older = true,
+                Ok(Err(e)) => {
+                    return Err(refused(&format!("could not compare the files: {e}"), false));
+                }
+                Err(e) => {
+                    return Err(refused(
+                        &format!("the comparison did not finish: {e}"),
+                        false,
+                    ));
+                }
+            }
+        }
+        if older {
+            match state
+                .write()
+                .await
+                .keep_older_rearmed_orchestration_context(pane_id, &reported, &current)
+            {
+                Ok(_) => {
+                    refused(&"a newer file is already recorded", true);
+                    return Ok(());
+                }
+                Err(RearmedContextRefusal::RecordMoved) => continue,
+                Err(r) => return Err(refused(&r, false)),
+            }
+        }
+        match state
+            .write()
+            .await
+            .record_rearmed_orchestration_context(pane_id, &reported, &current)
+        {
+            Ok(changed) => {
+                if changed {
+                    tracing::info!(
+                        pane_id,
+                        "the orchestrator's recorded context followed a re-arm"
+                    );
+                }
+                return Ok(());
+            }
+            Err(RearmedContextRefusal::RecordMoved) => continue,
+            Err(r) => return Err(refused(&r, false)),
+        }
+    }
+    Err(refused(&RearmedContextRefusal::RecordMoved, false))
+}
+
+/// Issue #1445: how many times [`record_rearmed_context`] compares again after
+/// the record moved under it before giving up on the report.
+const REARM_RECORD_ATTEMPTS: usize = 4;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -3752,6 +4083,9 @@ async fn handle_connection(
                     // PRD #1223 M7: an orchestration role is not an authoring
                     // agent, and `start-prepared-agent` has no such field.
                     authoring_kind: None,
+                    // Issue #1540: a role start is not a form start, so it
+                    // never records the deck's last command.
+                    remember_command: false,
                 },
                 Some(prep_token),
                 use_configured_command,
@@ -3809,6 +4143,10 @@ async fn handle_connection(
             // resolve from the registry's spawn-time type while the record
             // travels with the live one beside it.
             crate::agent_pty::attach_cli_names(&mut records);
+            // PRD #1541: the keys that interrupt and edit each agent's prompt,
+            // from the same registry and the same reported identity, after the
+            // live join for the same reason.
+            crate::agent_pty::attach_prompt_keys(&mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -3903,6 +4241,7 @@ async fn handle_connection(
             agent_type,
             seed,
             authoring_kind,
+            remember_command,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -4172,6 +4511,16 @@ async fn handle_connection(
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
+            // Issue #1540: whether an accepted start becomes the deck's last
+            // command. Decided here, from the request as it stands, because
+            // `tab_membership` moves into the spawn. A role start — a prepared
+            // one, or one carrying an orchestration membership — never records,
+            // whatever the marker says (see `StartAgent::remember_command`).
+            let last_command_to_record: Option<String> = (remember_command
+                && prepared_token.is_none()
+                && !matches!(tab_membership, Some(TabMembership::Orchestration { .. })))
+            .then(|| command.clone())
+            .flatten();
 
             // PRD #1223 M7: an authoring start's seed is composed — and its
             // preconditions checked — before anything spawns, so a refusal
@@ -4402,21 +4751,21 @@ async fn handle_connection(
                     //   Unchanged by round 2 and stated because it is the
                     //   residual;
                     // * the pane was explicitly registered by this process (an
-                    //   orchestration role below, or the auto-registration in
-                    //   the next line). Registration is pane-scoped by design —
-                    //   the registrant is asserting the pane, not a generation.
+                    //   orchestration role below). Registration is pane-scoped
+                    //   by design — the registrant is asserting the pane, not a
+                    //   generation.
                     //
                     // A `SessionStart` is weaker on purpose — `apply_event`
-                    // auto-registers a pane id it names, unless the id is the
-                    // synthetic `__dead-slot__-…` shape or the registry already
-                    // holds a generation for that pane — to cover the TUI
-                    // startup race where the hook beats `register_pane`. So a
-                    // same-uid process CAN mint a card for a pane NOBODY
-                    // spawned by forging one. That is pre-existing, it is not a
-                    // cross-user escalation (both sockets are owner-only and
-                    // an attach peer can already write to agents directly),
-                    // and closing it is tracked separately; it is stated here
-                    // rather than papered over.
+                    // admits one naming a pane id the registry holds no
+                    // generation for, unless the id is the synthetic
+                    // `__dead-slot__-…` shape, so an outside agent still gets a
+                    // card. So a same-uid process CAN mint a card for a pane
+                    // NOBODY spawned by forging one. Since issue #601 that card
+                    // is recorded as UNPROVEN, never in `managed_pane_ids`, so
+                    // it confers no ownership of the pane, and since #697 such
+                    // cards are bounded (`MAX_UNPROVEN_SESSIONS`). A pane this
+                    // daemon DID spawn cannot be named that way at all: the hook
+                    // gate refuses a token-less event for it (#318).
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -4442,6 +4791,9 @@ async fn handle_connection(
                             identity.clone(),
                             cwd_for_state.as_deref(),
                         );
+                        // Issue #697: outside cards the registration dropped
+                        // leave every attached client's view too.
+                        state.announce_unproven_evictions(&event_tx);
                         // Issue #555: the registered pane holds the title from
                         // here on, so this start's in-flight claim ends — under
                         // the same guard, so there is no instant in which
@@ -4478,6 +4830,15 @@ async fn handle_connection(
                             command.as_deref(),
                         );
                     }
+                    // Issue #1540: the start is accepted, so a form start's
+                    // command becomes the deck's last command — in memory
+                    // before the reply, so a form that reopens on the reply
+                    // already sees it, and on disk after, on a detached task,
+                    // so the reply never waits for the state directory. A
+                    // failed write is logged and does not fail the start.
+                    if let Some(command) = last_command_to_record {
+                        record_last_command(&state, &command).await;
+                    }
                     write_resp(&mut stream, &AttachResponse::with_id(id)).await?
                 }
                 Err(e) => {
@@ -4500,6 +4861,11 @@ async fn handle_connection(
                                  changed before the spawn"
                             );
                             crate::project_resolve::stale_preparation_refusal()
+                        }
+                        // Issue #1396 item 2: a plain start whose cwd is not a
+                        // directory, refused before the PTY was opened.
+                        crate::agent_pty::AgentPtyError::CwdNotADirectory(_) => {
+                            format!("{START_ERR_CWD_NOT_A_DIRECTORY}: {e}. Nothing was started.")
                         }
                         _ => e.to_string(),
                     };
@@ -4882,6 +5248,16 @@ async fn handle_connection(
                 .await?
             }
         }
+        AttachRequest::RecordOrchestratorContext {
+            pane_id,
+            context_path,
+        } => {
+            let resp = match record_rearmed_context(&state, &pane_id, &context_path).await {
+                Ok(()) => AttachResponse::ok(),
+                Err(refusal) => AttachResponse::err(refusal),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         AttachRequest::WriteAndSubmit { pane_id, text } => {
             // PRD #20 M3: deliver input honestly. A dashboard-visible session is
             // not necessarily a live, writable target (a wrapped Codex session
@@ -5037,6 +5413,9 @@ async fn handle_connection(
         }
         AttachRequest::SubscribeEvents => {
             handle_subscribe_events(stream, event_tx).await?;
+        }
+        AttachRequest::SubscribeEventsWithSnapshot => {
+            handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
         }
         AttachRequest::Hello {
             client_version: _,
@@ -5435,7 +5814,14 @@ async fn handle_connection(
             )
             .await
             {
-                Ok(options) => {
+                Ok(mut options) => {
+                    // Issue #1540: the deck's last command, from the daemon's
+                    // in-memory snapshot — `get` takes no lock a writer holds
+                    // across disk I/O, so it is read here rather than inside
+                    // the blocking query. The store is bound first so the
+                    // `AppState` guard is released before it is read.
+                    let store = state.read().await.last_command_store();
+                    options.last_command = store.and_then(|store| store.get());
                     let mut resp = AttachResponse::ok();
                     resp.new_agent_options = Some(options);
                     resp
@@ -5452,8 +5838,53 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        // Issue #1540: set the deck's last command only if it has none. `ok`
+        // whether or not it was taken — the caller has nothing to do either way.
+        AttachRequest::SeedLastCommand { command } => {
+            // Bound in its own statement so the `AppState` read guard is
+            // dropped before the store is used. The value is taken in memory
+            // and written on a detached task, so the answer never waits for
+            // the disk — the same shape as a form start's record.
+            let store = state.read().await.last_command_store();
+            if let Some(store) = store
+                && store.remember_if_empty(&command) == crate::last_command::StoreOutcome::Set
+            {
+                persist_last_command(store, "seed-last-command");
+            }
+            write_resp(&mut stream, &AttachResponse::ok()).await?
+        }
     }
     Ok(())
+}
+
+/// Issue #1540: make `command` the deck's last command in memory — no I/O, so
+/// the caller may reply straight after — and write it to disk on a detached
+/// blocking task ([`persist_last_command`]). A daemon with no store installed —
+/// a test harness — records nothing. Never fails the caller: the start it
+/// follows has already been accepted.
+async fn record_last_command(state: &SharedState, command: &str) {
+    // `let … else` drops the `AppState` read guard at the end of this
+    // statement.
+    let Some(store) = state.read().await.last_command_store() else {
+        return;
+    };
+    if store.remember(command) == crate::last_command::StoreOutcome::Set {
+        persist_last_command(store, "start-agent");
+    }
+}
+
+/// Issue #1540: write the store's current value to disk on a detached blocking
+/// task, so no reply waits for the state directory. The store writes whatever
+/// value is newest when the task runs and skips one already on disk, so tasks
+/// finishing out of order cannot leave an older command on disk. A failure is
+/// logged under `verb` with the store's error, which names a path and never the
+/// command.
+fn persist_last_command(store: Arc<crate::last_command::LastCommandStore>, verb: &'static str) {
+    drop(tokio::task::spawn_blocking(move || {
+        if let Err(error) = store.persist() {
+            warn!(verb, %error, "could not persist the last command");
+        }
+    }));
 }
 
 /// PRD #819 M3: the daemon's enumeration seeds, gathered from state it already
@@ -5706,7 +6137,9 @@ pub async fn write_resp<W: AsyncWrite + Unpin>(w: &mut W, resp: &AttachResponse)
 /// so a wedged client can't pin this task forever. A lagged receiver
 /// (the client fell further behind than the broadcast capacity) closes
 /// the connection with `KIND_STREAM_END` carrying `"lagged"`; the
-/// TUI's reconnect path drains a `list_agents` snapshot to recover.
+/// TUI's reconnect path resynchronizes from a snapshot of the daemon's agents
+/// to recover — [`AttachRequest::SubscribeEventsWithSnapshot`] where the daemon
+/// offers it (issue #1555), `ListAgents` otherwise.
 /// Client disconnect is detected by racing a one-byte read against
 /// `rx.recv()` so the broadcast `Receiver` is dropped promptly when
 /// the client goes away between messages — otherwise the
@@ -5725,9 +6158,60 @@ async fn handle_subscribe_events(
     stream: IpcStream,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> io::Result<()> {
-    let mut rx = event_tx.subscribe();
+    let rx = event_tx.subscribe();
+    forward_event_stream(stream, rx, &AttachResponse::ok()).await
+}
+
+/// Issue #1555: [`AttachRequest::SubscribeEventsWithSnapshot`]. The receiver is
+/// opened and the listing's live state is read under ONE read guard of the
+/// daemon's `AppState`, so no broadcast made under that state's write guard can
+/// fall between them. `crate::daemon::ingest_event` broadcasts and applies every
+/// hook event under its write guard, and the daemon's delivery notices are
+/// broadcast and applied under one too, so each such event is either already in
+/// the listing (sent before the receiver existed, so not on this stream) or on
+/// this stream (sent after the listing was read, so not in it) — never both.
+///
+/// The registry's records are read under the same guard, AFTER the receiver is
+/// open (Greptile and Qodo on #1577). A spawn registers its agent before it
+/// broadcasts the agent's card, and a stop removes the agent before it
+/// broadcasts the pane's end, so an agent whose broadcast came before the
+/// receiver is already in, or already gone from, the records, and one whose
+/// broadcast came after it is on the stream. Reading the records first left a
+/// window in which an agent registered between the two reads was in neither.
+/// Taking the registry's lock inside the `AppState` guard is the nesting
+/// `AppState::apply_event`'s ownership check already takes under the write
+/// guard on every event, so it adds no new lock order.
+///
+/// Otherwise the listing is the [`AttachRequest::ListAgents`] reply's records,
+/// built by the same calls.
+async fn handle_subscribe_events_with_snapshot(
+    stream: IpcStream,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+) -> io::Result<()> {
+    let (rx, mut records) = {
+        let guard = state.read().await;
+        let rx = event_tx.subscribe();
+        let mut records = registry.agent_records();
+        guard.attach_live_sessions(&mut records);
+        guard.attach_orchestrator_context_paths(&mut records);
+        (rx, records)
+    };
+    crate::agent_pty::attach_cli_names(&mut records);
+    forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
+}
+
+/// The forwarding loop both subscribe handlers share: confirm with `resp`, then
+/// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
+/// ends. See [`handle_subscribe_events`].
+async fn forward_event_stream(
+    stream: IpcStream,
+    mut rx: broadcast::Receiver<BroadcastMsg>,
+    resp: &AttachResponse,
+) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
-    write_resp(&mut wr, &AttachResponse::ok()).await?;
+    write_resp(&mut wr, resp).await?;
 
     loop {
         tokio::select! {
@@ -6034,7 +6518,6 @@ async fn handle_attach_stream(
     loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
-                use std::io::Write;
                 // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
                 // just in the UI. If the focused session became non-live (a
                 // wrapped Codex pane that declared `history-only`, or a
@@ -6089,7 +6572,7 @@ async fn handle_attach_stream(
                     enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
-                let mut w = writer.lock().await;
+                let w = writer.lock().await;
                 // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
                 // immediately before writing. A close/respawn (registry removal),
                 // a liveness transition, or a rebind can land WHILE this frame
@@ -6160,10 +6643,12 @@ async fn handle_attach_stream(
                     payload = %escape_bytes_for_log(&bytes),
                     "STREAM_IN forwarded to PTY writer"
                 );
-                if w.write_all(&bytes).is_err() {
+                // Issue #525: awaited, not written inline — the PTY is written
+                // by the pane writer's own thread, so a pane whose agent has
+                // stopped reading holds this task, never a runtime worker.
+                if w.write_user(&bytes).await.is_err() {
                     break;
                 }
-                let _ = w.flush();
                 // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
                 // stamp the pane's deliver-on-idle debounce clock so a
                 // concurrent scheduled reuse fire queues its prompt instead of
@@ -6171,7 +6656,7 @@ async fn handle_attach_stream(
                 // key the reuse path delivers to).
                 //
                 // Issue #424 H1 (both reviewers): stamped BEFORE the writer is
-                // released, and the `write_all` above stamps it too (the pane
+                // released, and the `write_user` above stamps it too (the pane
                 // writer observes every non-daemon byte — see
                 // `crate::agent_pty::PaneWriter`). This used to drop the writer
                 // first and stamp afterwards, and a guarded automatic sender
@@ -6218,6 +6703,97 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #1445 (Qodo on PR #1554): two re-arm reports that reach the
+    /// daemon in reverse publication order leave the record on the newer file,
+    /// and the older one is still deleted when the orchestration ends rather
+    /// than waiting for the retention sweep.
+    #[tokio::test]
+    async fn an_out_of_order_rearm_report_is_still_removed_when_the_orchestration_ends() {
+        use crate::orchestrator_context::{
+            Attendance, prepare_orchestrator_prompt, reassert_orchestrator_prompt,
+        };
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::state::{AppState, OrchestrationIdentity};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let config = OrchestrationConfig {
+            default: false,
+            name: "loop".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                agent: None,
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            }],
+        };
+        let startup =
+            prepare_orchestrator_prompt(&config, &cwd, Some("TASK-ALPHA"), Attendance::Unattended)
+                .expect("published")
+                .context_path;
+        let rearm = |known: &std::path::Path| {
+            reassert_orchestrator_prompt(&config, &cwd, Some(known))
+                .expect("re-armed")
+                .context_path
+        };
+        let first = rearm(&startup);
+        let second = rearm(&first);
+        // Three publishes in one test can share a timestamp tick; date the
+        // earlier two back so their publication order is unambiguous.
+        for (path, age) in [(&startup, 120), (&first, 60)] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| {
+                    f.set_modified(
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(age),
+                    )
+                })
+                .expect("date the file back");
+        }
+
+        let identity = OrchestrationIdentity::Instance {
+            id: "a".to_string(),
+            name: "loop".to_string(),
+        };
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        {
+            let mut s = state.write().await;
+            s.orchestrator_pane_ids.insert("a0".to_string());
+            s.pane_orchestration_map
+                .insert("a0".to_string(), identity.clone());
+            s.record_orchestration_context(&identity, startup.clone());
+        }
+
+        // The second re-arm's report wins the race; the first arrives after it.
+        record_rearmed_context(&state, "a0", second.to_str().unwrap())
+            .await
+            .expect("the newer report is followed");
+        record_rearmed_context(&state, "a0", first.to_str().unwrap())
+            .await
+            .expect("an older report is answered ok");
+
+        let mut s = state.write().await;
+        assert_eq!(
+            s.orchestration_context_paths.get(&identity),
+            Some(&second),
+            "an older report must not move the record back"
+        );
+        s.pane_orchestration_map.remove("a0");
+        let mut ended = s.take_ended_orchestration_context(&identity);
+        ended.sort();
+        let mut expected = vec![startup, first, second];
+        expected.sort();
+        assert_eq!(
+            ended, expected,
+            "ending the orchestration must remove every file its re-arms published, \
+             including one whose report arrived out of order"
+        );
+    }
 
     /// PRD #819 audit fix: `PrepareOrchestration` is available exactly where the
     /// publish can deliver its owner-only guarantee, and the capability list
@@ -6607,6 +7183,190 @@ mod tests {
             assert_eq!(session.agent_id.as_deref(), Some(agent_id.as_str()));
             assert_eq!(session.status, crate::state::SessionStatus::Thinking);
         }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Issue #1555: a `SubscribeEventsWithSnapshot` reply never carries an event
+    /// on its stream that its snapshot already includes, even when the
+    /// conversation rolls over while the request is in flight.
+    ///
+    /// The test sends the request itself, raw, while holding the daemon's
+    /// `AppState` write guard, and under that guard broadcasts and applies a
+    /// rollover — `gen-a` ends and `gen-b` starts — exactly as
+    /// `crate::daemon::ingest_event` does. Whichever side of the guard the
+    /// handler lands on, the rollover must be in the snapshot or on the stream,
+    /// not both. Here it lands after (the guard is held until the rollover is
+    /// done), so the snapshot must name `gen-b` and the stream's first event
+    /// must be the next one ingested. A handler that opened its receiver before
+    /// taking the guard would get the rollover on the stream as well, which is
+    /// the replay the TUI cannot tell apart.
+    ///
+    /// Greptile on #1577: such a handler must have opened its receiver before
+    /// the rollover is sent, or this would pass it. So the request goes out raw,
+    /// with no `Hello` round trip in front of it, and the rollover waits until a
+    /// new receiver appears or a second passes. A correct handler never opens one
+    /// while the guard is held, so for it the wait is the whole second; a wrong
+    /// one is a single buffered frame away from opening it.
+    ///
+    /// The same window carries an agent started while the request is in flight,
+    /// whose announcement is broadcast before the receiver opens: it must be in
+    /// the snapshot, since the stream cannot carry it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordered_subscription_never_carries_an_event_its_snapshot_includes() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+        use crate::event::EventType;
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "ordered-pane-1555";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn a pane through the attach socket");
+        let event = |session: &str, event_type: EventType| crate::event::AgentEvent {
+            session_id: session.to_string(),
+            event_type,
+            agent_type: crate::event::AgentType::ClaudeCode,
+            ..thinking_event_454(pane_id, &agent_id)
+        };
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-a", EventType::SessionStart),
+        )
+        .await;
+
+        let (mut rd, mut wr) = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect for the ordered subscription")
+            .into_split();
+        let mut guard = state.write().await;
+        let receivers = event_tx.receiver_count();
+        let request = serde_json::to_vec(&AttachRequest::SubscribeEventsWithSnapshot).unwrap();
+        write_frame(&mut wr, KIND_REQ, &request)
+            .await
+            .expect("send the request");
+        let opened_by = tokio::time::Instant::now() + Duration::from_secs(1);
+        while event_tx.receiver_count() == receivers && tokio::time::Instant::now() < opened_by {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for ev in [
+            event("gen-a", EventType::SessionEnd),
+            event("gen-b", EventType::SessionStart),
+        ] {
+            let _ = event_tx.send(BroadcastMsg::Event(ev.clone()));
+            guard.apply_event(ev);
+        }
+        // Greptile and Qodo on #1577: an agent started while the request is in
+        // flight, registered and then announced the way a spawn does it. Its
+        // announcement goes out before the receiver exists, so the snapshot
+        // must carry it; a handler that read the registry before taking the
+        // guard would have it in neither.
+        let late_pane = "ordered-pane-1555-late";
+        let late_agent = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(dir.path().to_str().expect("a UTF-8 tempdir")),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), late_pane.to_string())],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("spawn the late pane");
+        let _ = event_tx.send(BroadcastMsg::Event(thinking_event_454(
+            late_pane,
+            &late_agent,
+        )));
+        drop(guard);
+
+        async fn read(rd: &mut tokio::net::unix::OwnedReadHalf) -> (u8, Vec<u8>) {
+            tokio::time::timeout(Duration::from_secs(5), read_frame(rd))
+                .await
+                .expect("the daemon answers within 5 s")
+                .expect("the frame reads")
+                .expect("the stream is open")
+        }
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_RESP);
+        let resp: AttachResponse = serde_json::from_slice(&payload).expect("a response");
+        assert!(resp.ok, "the ordered subscription opens: {:?}", resp.error);
+        let records = resp.agent_records.expect("the reply carries the snapshot");
+        assert!(
+            records
+                .iter()
+                .any(|r| r.id == late_agent && r.pane_id_env.as_deref() == Some(late_pane)),
+            "an agent announced before the receiver opened must be in the snapshot, or the \
+             client learns of it nowhere"
+        );
+        let generation = records
+            .iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+            .and_then(|r| r.live.as_ref())
+            .and_then(|live| live.hook_generation.as_ref())
+            .map(|generation| generation.session_id.clone());
+        assert_eq!(
+            generation.as_deref(),
+            Some("gen-b"),
+            "the snapshot was read after the rollover, so it must name gen-b"
+        );
+
+        crate::daemon::ingest_event(
+            &state,
+            &event_tx,
+            &registry,
+            event("gen-b", EventType::Thinking),
+        )
+        .await;
+        let (kind, payload) = read(&mut rd).await;
+        assert_eq!(kind, KIND_EVENT);
+        let first: BroadcastMsg = serde_json::from_slice(&payload).expect("a broadcast");
+        let BroadcastMsg::Event(first) = first else {
+            panic!("expected an event, got {first:?}");
+        };
+        assert_eq!(
+            (first.session_id.as_str(), first.event_type),
+            ("gen-b", EventType::Thinking),
+            "the stream must start after the snapshot: the rollover it includes must not \
+             follow it"
+        );
 
         registry.shutdown_all();
         server.abort();
@@ -7600,9 +8360,11 @@ mod tests {
     /// FORGES for a pane it invented cannot witness against a victim agent that
     /// sits on a different pane.
     ///
-    /// The chain this closes, and every step of it is reachable over the
-    /// unauthenticated hook socket: a `SessionStart` for an invented pane id no
-    /// registry claims auto-registers that pane into `managed_pane_ids`
+    /// The chain this closes, as it stood before issue #601 (a daemon now
+    /// records an invented pane as an outside agent's, never in
+    /// `managed_pane_ids`, but the registry check pinned here is what holds in
+    /// every process, so it stays): a `SessionStart` for an invented pane id no
+    /// registry claims auto-registered that pane into `managed_pane_ids`
     /// (`AppState::apply_event`'s startup-race escape hatch); `managed_pane_ids`
     /// is permanent, so the NEXT event for that pane is admitted by the
     /// pane-scoped ground without the generation check looking at who sent it;
@@ -7676,8 +8438,9 @@ mod tests {
             .expect("spawn the victim agent");
 
         // Step 1: the forger establishes a pane nothing owns. This is admitted
-        // (the startup-race hatch) and is the pre-existing shape the fix does
-        // not try to close.
+        // as an outside agent's card (issue #601: recorded as unproven, never
+        // in `managed_pane_ids`) and is the shape the fix does not try to
+        // close.
         state.write().await.apply_event(frame(
             invented_pane,
             "forged-generation",
@@ -7714,11 +8477,14 @@ mod tests {
                  pane's generation — this test is about what it may WITNESS, not about \
                  admission"
             );
+            // Issue #697: the invented pane is an outside agent's, and its
+            // per-pane state is forgotten once its last card is gone — so the
+            // pane-local counter no longer even keeps the forger's own count.
             assert_eq!(
                 guard.pane_generation_closures(invented_pane),
-                1,
-                "precondition: the pane-keyed counter still counts it, on the forger's own \
-                 invented pane, which is where a pane-local poison stays"
+                0,
+                "an outside pane left with no card keeps no per-pane state, so a pane-local \
+                 poison does not stay on it either"
             );
             assert!(
                 !guard.agent_generation_ended(&victim),
@@ -7839,6 +8605,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -7875,6 +8642,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -7916,6 +8684,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -7957,6 +8726,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            remember_command: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -8010,6 +8780,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8032,6 +8803,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8204,6 +8976,7 @@ mod tests {
             }),
             spawned_at_ms: None,
             cli_name: None,
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8278,6 +9051,7 @@ mod tests {
             orchestration_orphaned: false,
             subagent_wait: None,
             prompt_reports_unavailable: false,
+            prompt_reports_declared: false,
         };
         let snap = session.live_snapshot();
         assert_eq!(
@@ -8564,6 +9338,7 @@ mod tests {
             live: None,
             spawned_at_ms: None,
             cli_name: Some("claude".into()),
+            prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
         };
@@ -8596,6 +9371,41 @@ mod tests {
             serde_json::from_str(newer).expect("a newer peer's record must decode");
         assert_eq!(forward.cli_name.as_deref(), Some("claude-next"));
         assert_eq!(forward.pane_id_env.as_deref(), Some("pane-6"));
+    }
+
+    /// PRD #1541: `AgentRecord.prompt_keys` is additive and optional in both
+    /// directions — the basis of the no-`PROTOCOL_VERSION`-bump decision, proven
+    /// the way `cli_name` above is. Absent means NO KEY on the wire, and an
+    /// older peer's record without it decodes to `None`, which a client reads as
+    /// "this deck sent no keys" and refuses on.
+    #[test]
+    fn prompt_keys_are_additive_and_optional_in_both_directions() {
+        let keys = crate::agent_registry::spec(&AgentType::OpenCode)
+            .prompt_keys
+            .clone()
+            .expect("OpenCode carries prompt keys");
+        let mut rec: AgentRecord =
+            serde_json::from_str(r#"{"id": "3", "pane_id_env": "pane-3"}"#).expect("decodes");
+        rec.prompt_keys = Some(keys.clone());
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.prompt_keys, Some(keys));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert_eq!(value["prompt_keys"]["interrupt"][0]["pause_after_ms"], 300);
+
+        rec.prompt_keys = None;
+        let json = serde_json::to_string(&rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("prompt_keys").is_none(),
+            "no keys must mean no key at all; got {json}"
+        );
+
+        let legacy = r#"{"id": "5", "pane_id_env": "pane-5", "cli_name": "claude"}"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(old.prompt_keys.is_none());
+        assert_eq!(old.cli_name.as_deref(), Some("claude"));
     }
 
     /// Issue #887: `AttachResponse.schedule_revision` is additive and optional
@@ -9273,6 +10083,17 @@ mod tests {
         assert!(resp.server_version.is_none());
     }
 
+    /// Issue #1555 — the ordered subscription is advertised on every platform,
+    /// under its variant's `op`, per PRD #819's convention.
+    #[test]
+    fn the_ordered_subscription_is_advertised_under_its_op_name() {
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT));
+        assert_eq!(
+            serde_json::to_value(AttachRequest::SubscribeEventsWithSnapshot).unwrap()["op"],
+            CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT
+        );
+    }
+
     /// PRD #1223 — both new-agent queries are advertised on every platform, and
     /// each capability string is its variant's `op`, per PRD #819's convention:
     /// two spellings could drift, and a client would then withhold a verb the
@@ -9322,6 +10143,7 @@ mod tests {
             agent_type: None,
             seed: None,
             authoring_kind,
+            remember_command: false,
         };
         let plain = serde_json::to_value(start(None)).unwrap();
         assert!(
@@ -9712,5 +10534,222 @@ mod tests {
         );
         let neither: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         assert_eq!(neither.into_prepared_orchestration(), None);
+    }
+
+    /// Issue #1540: the daemon records the deck's last command from a New
+    /// agent form start once it has accepted it, answers it on the options
+    /// query, and records nothing for any other start — a plain (non-form)
+    /// start, a form-marked orchestration role start, or a refused form start.
+    /// A seed only fills an empty store.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_accepted_form_start_records_the_last_command() {
+        use crate::daemon_client::{
+            DaemonClient, GatedQuery, LastCommandKeeper, StartAgentOptions,
+        };
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        // The options query reads through the shared new-agent pool; see the
+        // guard's doc for why tests that use it serialise.
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join("state").join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock.clone());
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let last_command = || async {
+            match client.new_agent_options().await.expect("options query") {
+                GatedQuery::Answered(options) => options.last_command,
+                GatedQuery::Unsupported => panic!("this build advertises the options query"),
+            }
+        };
+        let start = |command: &str, pane: &str| StartAgentOptions {
+            command: Some(command.to_string()),
+            cwd: Some(cwd.clone()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+            ..StartAgentOptions::default()
+        };
+
+        assert_eq!(last_command().await, None, "a fresh deck has none");
+        assert_eq!(
+            client.last_command_keeper().await.unwrap(),
+            LastCommandKeeper::Daemon
+        );
+
+        // A non-form start — what `dispatch` and the CLI send — records nothing.
+        client
+            .start_agent(start("cat", "plain-1540"))
+            .await
+            .expect("plain start");
+        assert_eq!(last_command().await, None, "a non-form start never records");
+
+        // A form start records once accepted, and the next options query has it.
+        let form = client
+            .start_form_agent(start("cat -u", "form-1540"))
+            .await
+            .expect("form start");
+        assert_eq!(form.last_command, LastCommandKeeper::Daemon);
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+        // The disk write runs after the reply, on a detached task, so wait for
+        // it — bounded, since it is a small local file.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("cat -u") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recorded command never reached disk, so it would not survive a \
+                 daemon restart"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // A form-marked ORCHESTRATION role start is ignored, whatever the marker.
+        let role = StartAgentOptions {
+            tab_membership: Some(TabMembership::Orchestration {
+                name: "tdd-1540".into(),
+                role_index: 0,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd: Some(cwd.clone()),
+                display_title: None,
+                orchestration_id: None,
+            }),
+            ..start("cat -v", "role-1540")
+        };
+        client
+            .start_form_agent(role)
+            .await
+            .expect("role start is accepted");
+        assert_eq!(
+            last_command().await.as_deref(),
+            Some("cat -u"),
+            "an orchestration role start never overwrites the last command"
+        );
+
+        // A REFUSED form start (an authoring start naming no directory) records
+        // nothing.
+        let refused = client
+            .start_form_authoring_agent(
+                StartAgentOptions {
+                    cwd: None,
+                    ..start("cat -e", "refused-1540")
+                },
+                crate::authoring_seeds::AuthoringKind::Schedule,
+            )
+            .await;
+        assert!(refused.is_err(), "precondition: the start is refused");
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        // A seed does not overwrite a recorded value.
+        assert_eq!(
+            client.seed_last_command("from-session-toml").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(last_command().await.as_deref(), Some("cat -u"));
+
+        server.abort();
+        for record in registry.agent_records() {
+            let _ = registry.close_agent(&record.id);
+        }
+    }
+
+    /// Issue #1540: a seed fills an empty store, through the real dispatch.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_fills_an_empty_deck_through_the_dispatch() {
+        use crate::daemon_client::{DaemonClient, GatedQuery};
+        use crate::last_command::{LAST_COMMAND_FILE, LastCommandStore};
+
+        let _serial = crate::new_agent_options::POOL_TEST_GUARD.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let store_path = dir.path().join(LAST_COMMAND_FILE);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state
+            .write()
+            .await
+            .set_last_command_store(Arc::new(LastCommandStore::load(store_path.clone())));
+        let server = {
+            let sock = sock.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = DaemonClient::new(sock);
+        assert_eq!(
+            client.seed_last_command("   ").await.unwrap(),
+            GatedQuery::Answered(())
+        );
+        assert_eq!(
+            LastCommandStore::load(store_path.clone()).get(),
+            None,
+            "blank is not taken"
+        );
+        client.seed_last_command("claude").await.unwrap();
+        let GatedQuery::Answered(options) = client.new_agent_options().await.unwrap() else {
+            panic!("this build advertises the options query");
+        };
+        assert_eq!(options.last_command.as_deref(), Some("claude"));
+        // Persisted after the answer, on a detached task: wait for it, bounded.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while LastCommandStore::load(store_path.clone()).get().as_deref() != Some("claude") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the seeded command never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
     }
 }

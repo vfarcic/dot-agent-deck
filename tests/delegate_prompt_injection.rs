@@ -336,7 +336,7 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
 #[cfg(unix)]
 fn clear_true_config(command: &str) -> String {
     format!(
-        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"{command}\"\nclear = true\n"
+        "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )
 }
 
@@ -483,7 +483,7 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let cwd = common::race_safe_tempdir();
     let stub = cwd.path().join("slow-readiness-agent.py");
     write_slow_readiness_stub(&stub);
-    let command = stub.to_string_lossy().into_owned();
+    let command = common::capability_export_command(&stub.to_string_lossy());
     tokio::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         clear_true_config(&command),
@@ -544,7 +544,13 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize slow-stub SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize slow-stub SessionStart"),
     )
     .expect("write slow-stub SessionStart");
     // Issue #709: NOT a boot wait — the stub has already printed — but still a
@@ -934,7 +940,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let cwd = common::race_safe_tempdir();
     let bin_dir = cwd.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create synthetic Codex bin dir");
-    write_executable(&bin_dir.join("codex"), "#!/bin/sh\nexec cat\n");
+    write_executable(
+        &bin_dir.join("codex"),
+        &format!(
+            "#!/bin/sh\n{}\n",
+            common::capability_export_command("exec cat")
+        ),
+    );
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
         "[[orchestrations]]\nname = \"test-orchestration\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"true\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = \"codex\"\nclear = true\n",
@@ -995,7 +1007,13 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     let native = session_start_event(AgentType::Codex, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&native).expect("serialize native Codex SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &native,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize native Codex SessionStart"),
     )
     .expect("write native Codex SessionStart");
     let after_native = wait_for_snapshot_needle(
@@ -1120,7 +1138,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write observed-readiness orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -1158,7 +1176,13 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&event).expect("serialize matching SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &event,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize matching SessionStart"),
     )
     .expect("write matching SessionStart");
     // MEASURE the hold rather than racing it (issue #243).
@@ -2959,7 +2983,7 @@ async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate and be priced as an ORDINARY readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
+/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then authenticate its `SessionStart` while forging the wrapper's strong `wrapper_interface_ready` metadata marker. The marker must release the gate and be priced as an ordinary readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
 #[spec("orchestration/delegate/028")]
 #[test]
 #[cfg(unix)]
@@ -2988,7 +3012,7 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
-        clear_true_config("cat"),
+        clear_true_config(&common::capability_export_command("cat")),
     )
     .expect("write forged-marker orchestration config");
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -3040,10 +3064,9 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     let posted_at = Instant::now();
     // THE FORGERY. One JSON line on the daemon's hook socket, carrying the
     // wrapper's strong interface marker for a pane no wrapper is running on.
-    // #243's audit reproduced exactly this from a bare `python3` with no deck
-    // environment at all: `metadata` is free-form by contract and the socket
-    // authenticates nobody, so the marker is producer-writable and the daemon
-    // must not grant a privilege on it alone.
+    // Authenticate this ordinary pane with its own capability so admission
+    // reaches the metadata-trust check: a producer's interface marker alone
+    // must not grant the wrapper's readiness privilege.
     let forged = session_start_event_with_origin(
         AgentType::None,
         WORKER_PANE,
@@ -3052,7 +3075,13 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     );
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&forged).expect("serialize forged interface SessionStart"),
+        &dot_agent_deck::event::agent_event_line(
+            &forged,
+            common::recorded_hook_capability(cwd.path(), &new_agent_id)
+                .await
+                .as_deref(),
+        )
+        .expect("serialize forged interface SessionStart"),
     )
     .expect("write forged interface SessionStart");
 
@@ -4237,7 +4266,11 @@ impl SilenceHarness {
         }
     }
 
-    async fn delegate_and_wait_for_pointer(&self) {
+    /// Returns the worker pane's pointer delivery epoch as it stood the moment
+    /// `handle_delegate` returned — before the dispatch it spawned has run, so
+    /// before the delivered pointer is confirmed and moves it. See
+    /// [`Self::wait_until_pointer_confirmed`].
+    async fn delegate_and_wait_for_pointer(&self) -> Option<u64> {
         self.state
             .handle_delegate(
                 DelegateSignal {
@@ -4252,6 +4285,7 @@ impl SilenceHarness {
                 &self.event_tx,
             )
             .await;
+        let armed = self.registry.pointer_delivery_epoch(WORKER_PANE);
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
@@ -4264,6 +4298,30 @@ impl SilenceHarness {
             "silence-watch precondition failed: worker never received pointer; snapshot = {:?}",
             String::from_utf8_lossy(&delivered)
         );
+        armed
+    }
+
+    /// Drive the runtime, without moving a paused clock, until the pointer
+    /// write has returned and been confirmed delivered — which is what arms
+    /// the silent-worker watch — and the watch's task has been polled once,
+    /// so its window is counted from the clock as it stands now.
+    ///
+    /// The pointer being VISIBLE is not that moment: its CR follows the
+    /// payload, and the PTY writes it on the pane writer's own thread (issue
+    /// #525), so the confirmation lands a runtime turn after the bytes do. A
+    /// test that pauses the clock as soon as the pointer shows and then
+    /// advances it can otherwise arm the watch after the advance.
+    async fn wait_until_pointer_confirmed(&self, armed: Option<u64>) {
+        assert!(
+            poll_until_after_time_advance(Duration::from_secs(5), || {
+                self.registry.pointer_delivery_epoch(WORKER_PANE) != armed
+            })
+            .await,
+            "the delivered pointer was never confirmed, so the silent-worker watch never armed"
+        );
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn start_draft_delegate(&self, supersede: bool) {
@@ -5045,6 +5103,150 @@ fn idle_worker_029_waiting_silence_report_is_dropped_after_work_done() {
     run_stale_response_notice_after_work_done(ResponseWatch::Silence);
 }
 
+/// Scenario: A worker's first pointer lands, and the orchestrator delegates to
+/// it again with `--supersede` while the test holds that newer dispatch on the
+/// worker pane's dispatch lock, so the first delegation's "went quiet" report
+/// fires and waits on an unsent draft in the orchestrator's pane. The test then
+/// releases the lock, the newer pointer lands, and the orchestrator's draft is
+/// sent. The stale report about the first delegation must not arrive, while the
+/// newer delegation's own report still must.
+#[spec("scheduler/idle-worker/031")]
+#[test]
+#[cfg(unix)]
+fn idle_worker_031_a_waiting_went_quiet_report_is_dropped_when_a_newer_pointer_lands() {
+    // Scaled for a contended machine (issue #1526 was met on starved CI
+    // runners): the setup must fit inside the first window, and the waits
+    // below are measured in windows.
+    let window = common::load_scaled(Duration::from_millis(2000));
+    let window_ms = window.as_millis().to_string();
+    const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, window_ms.as_str()),
+        (DRAFT_DEFER_CAP_ENV, "60000"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build displaced-silence-report runtime")
+        .block_on(async {
+            const ORCHESTRATOR_DRAFT: &[u8] = b"orchestrator-draft-1526";
+            let harness = SilenceHarness::new(64).await;
+            harness.delegate_and_wait_for_pointer().await;
+            let first_delivered = Instant::now();
+
+            // Inside the first delegation's window: the newer delegate's
+            // dispatch is held on the worker pane's dispatch lock, so its
+            // pointer cannot land until the test lets it.
+            let dispatch_lock = harness.registry.pane_dispatch_lock(WORKER_PANE);
+            let held = dispatch_lock.lock().await;
+            let pointers_before = harness
+                .registry
+                .snapshot(&harness.worker_agent_id)
+                .unwrap_or_default()
+                .windows(POINTER.len())
+                .filter(|window| *window == POINTER)
+                .count();
+            let delivery_before = harness.registry.pointer_delivery_epoch(WORKER_PANE);
+            harness.start_draft_delegate(true).await;
+            harness
+                .send_orchestrator_user_bytes(ORCHESTRATOR_DRAFT)
+                .await;
+            let typed = wait_for_snapshot_needle(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                ORCHESTRATOR_DRAFT,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&typed, ORCHESTRATOR_DRAFT),
+                "orchestrator draft never reached its PTY: {:?}",
+                String::from_utf8_lossy(&typed)
+            );
+            assert!(
+                first_delivered.elapsed() < window,
+                "precondition: the setup outlasted the first delegation's window, so its report \
+                 may have fired before the newer delegate was armed"
+            );
+
+            // Past the first window: its report has fired and waits on the
+            // orchestrator's draft.
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1000))).await;
+            let waiting = harness.orchestrator_snapshot();
+            assert!(
+                !String::from_utf8_lossy(&waiting).contains(SILENCE_NEEDLE),
+                "the went-quiet report did not wait for the orchestrator's draft: {:?}",
+                String::from_utf8_lossy(&waiting)
+            );
+
+            // The newer pointer lands while the report about the first
+            // delegation still waits.
+            drop(held);
+            let landed = wait_for_snapshot_where(
+                &harness.registry,
+                &harness.worker_agent_id,
+                Duration::from_secs(5),
+                |snapshot| {
+                    snapshot
+                        .windows(POINTER.len())
+                        .filter(|window| *window == POINTER)
+                        .count()
+                        > pointers_before
+                },
+            )
+            .await;
+            assert!(
+                landed
+                    .windows(POINTER.len())
+                    .filter(|window| *window == POINTER)
+                    .count()
+                    > pointers_before,
+                "the newer pointer never landed once its dispatch was released: {:?}",
+                String::from_utf8_lossy(&landed)
+            );
+            assert!(
+                poll_until_after_time_advance(Duration::from_secs(5), || {
+                    harness.registry.pointer_delivery_epoch(WORKER_PANE) != delivery_before
+                })
+                .await,
+                "the newer pointer's delivery was never confirmed"
+            );
+
+            harness.send_orchestrator_user_bytes(b"\r").await;
+            // The newer delegation's own report, armed when its pointer landed,
+            // is still owed and must arrive.
+            let reported = wait_for_silence_notice(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                window + common::load_scaled(Duration::from_secs(5)),
+            )
+            .await;
+            assert!(
+                snapshot_has_silence_notice(&reported),
+                "the newer delegation's went-quiet report never arrived: {:?}",
+                String::from_utf8_lossy(&reported)
+            );
+            // Every chance for a second report to land before counting: the
+            // newer delegation's own report fires a whole window after its
+            // pointer, so whichever arrived first, the other is due within one.
+            tokio::time::sleep(window + common::load_scaled(Duration::from_millis(1500))).await;
+            let after = harness.orchestrator_snapshot();
+            let text = String::from_utf8_lossy(&after);
+            assert_eq!(
+                text.matches(SILENCE_NEEDLE).count(),
+                1,
+                "a went-quiet report about a delegation whose question a newer pointer had \
+                 already answered was delivered once the orchestrator's draft was sent \
+                 (Qodo, PR #1502): {text:?}"
+            );
+        });
+}
+
 /// Scenario: Clear an unsent worker draft with Ctrl+U while a production
 /// delegate waits. The pointer must then arrive without submitting that draft.
 #[test]
@@ -5521,12 +5723,10 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
 
             window.repoint(Some("18446744073709551616"));
             let harness = SilenceHarness::new(64).await;
-            harness.delegate_and_wait_for_pointer().await;
+            let armed = harness.delegate_and_wait_for_pointer().await;
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(1)).await;
-            for _ in 0..3 {
-                tokio::task::yield_now().await;
-            }
+            harness.wait_until_pointer_confirmed(armed).await;
             std::thread::sleep(Duration::from_millis(50));
             let early = harness.orchestrator_snapshot();
             assert!(

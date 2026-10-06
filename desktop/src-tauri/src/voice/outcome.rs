@@ -45,8 +45,9 @@ use serde::{Deserialize, Serialize};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
-    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    TRAILING_SEND_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
+    CLEAR_PROMPT_PHRASES, DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS,
+    INTERRUPT_PHRASES, SCRATCH_PHRASES, SUBMIT_PHRASES, TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES,
+    VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
@@ -86,6 +87,20 @@ const CLOSE_ROW: &str = "close";
 const DICTATION_ON_ROW: &str = "dictation_on";
 const DICTATION_OFF_ROW: &str = "dictation_off";
 const VOICE_OFF_ROW: &str = "voice_off";
+/// PRD #1541 — the typing-mode prompt commands: interrupt the open agent's
+/// turn, clear its prompt, scratch the last thing voice typed. Dispatched only
+/// by [`dictation_intercept`]; outside typing mode their phrases are answered
+/// with [`TYPING_MODE_FIRST_HINT`] ([`local_intercept`]), and a model pick of
+/// one is refused with it too ([`handle_utterance_with_dictation`]).
+const INTERRUPT_ROW: &str = "interrupt_agent";
+const CLEAR_PROMPT_ROW: &str = "clear_prompt";
+const SCRATCH_ROW: &str = "scratch_that";
+const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_ROW];
+/// What a typing-mode prompt command said OUTSIDE typing mode is answered with
+/// (PRD #1541 M1 decision 4): nothing runs, and the row says how to reach it.
+/// A fragment, like a row's `unavailable_hint`; the sentence capitalises it.
+pub const TYPING_MODE_FIRST_HINT: &str = "say “typing on” first — interrupting, clearing and \
+    scratching work in typing mode";
 /// The New agent dialog's Start — the one row a spoken command line keeps
 /// from grounding at all, wherever its start word is ([`heard_outside_command`]).
 const START_ROW: &str = "start_new_agent";
@@ -261,9 +276,7 @@ pub enum VoiceOutcome {
         sentence: String,
         /// Whether the refusal's cause is that nothing live matches `spoken` —
         /// the one cause [`refuse_switch_beyond_selector`] may re-word. Every
-        /// other cause, a safety refusal about what the user said above all
-        /// (`Unmet::Contrast`, `Unmet::NotSaid`, `Unmet::NamedOther`), keeps its
-        /// own sentence. Desktop-internal: never serialized, so the webview's
+        /// other cause keeps its own sentence. Desktop-internal: never serialized, so the webview's
         /// shape is unchanged.
         #[serde(skip)]
         nothing_matched: bool,
@@ -494,6 +507,26 @@ impl VoiceOutcome {
             sentence: format!("Not here — {DECK_HIDDEN_HINT}."),
             action: row.id.clone(),
             hint: DECK_HIDDEN_HINT.to_string(),
+            transcript,
+        }
+    }
+
+    /// PRD #1541 — a typing-mode prompt command asked for outside typing mode:
+    /// [`VoiceOutcome::unavailable`]'s shape with [`TYPING_MODE_FIRST_HINT`]
+    /// in place of the row's own hint, and a sentence that is not "Not here",
+    /// because the screen is the right one and the mode is not.
+    fn typing_mode_first(transcript: Transcript, row: &CommandRow) -> Self {
+        let mut sentence = String::with_capacity(TYPING_MODE_FIRST_HINT.len() + 1);
+        let mut chars = TYPING_MODE_FIRST_HINT.chars();
+        if let Some(first) = chars.next() {
+            sentence.extend(first.to_uppercase());
+            sentence.push_str(chars.as_str());
+        }
+        sentence.push('.');
+        Self::Unavailable {
+            sentence,
+            action: row.id.clone(),
+            hint: TYPING_MODE_FIRST_HINT.to_string(),
             transcript,
         }
     }
@@ -734,17 +767,13 @@ pub async fn handle_utterance_with_dictation(
     }
 
     let commands = annotate_for(table, screen, directories, new_agent, labels, show_deck);
-    // Only the decks the New agent dialog could preselect (PRD #1223): a deck
-    // that cannot take one is not offered, so the model cannot pick one. The
-    // full fleet is still what a supplied deck resolves against, so a deck the
-    // user NAMED that cannot take an agent is reported as that, with its short
-    // reason,
-    // rather than as a deck that does not exist.
-    let offered: Vec<VoiceDeck> = decks
-        .iter()
-        .filter(|deck| deck.eligible())
-        .cloned()
-        .collect();
+    // Every deck, including the ones a new agent cannot start on (issue
+    // #1491): the Daemon selector switches to any of them, so the model has
+    // to see them all to answer `switch_deck` with the one the user meant.
+    // The state marks the ones a new agent cannot start on
+    // (`decks_without_new_agent`, [`super::prompt::state`]), and a pick of one
+    // for the New agent dialog is still answered with its short reason, never
+    // preselected ([`deck_unavailable`]).
     let started = std::time::Instant::now();
     // With labels withheld the backend is shown none of them — see this
     // function's doc comment.
@@ -753,7 +782,7 @@ pub async fn handle_utterance_with_dictation(
             transcript: &transcript,
             commands: &commands,
             agents: if withheld { &[] } else { agents },
-            decks: if withheld { &[] } else { &offered },
+            decks: if withheld { &[] } else { decks },
             directories: directories.filter(|_| !withheld),
             new_agent: new_agent.filter(|_| !withheld),
         })
@@ -862,6 +891,14 @@ pub async fn handle_utterance_with_dictation(
             });
         }
     };
+    // PRD #1541: the typing-mode prompt commands are dispatched only by
+    // `dictation_intercept`. Their grounding already keeps a model pick of one
+    // from getting here on the agent screen — every utterance it accepts was
+    // answered by `local_intercept` first — and this is the second wall, so a
+    // future grounding edit cannot quietly hand them to the model.
+    if TYPING_MODE_ROWS.contains(&row.id.as_str()) {
+        return finish(VoiceOutcome::typing_mode_first(transcript, row));
+    }
     if withheld && needs_labels(row) {
         return finish(VoiceOutcome::labels_withheld(transcript, row));
     }
@@ -988,7 +1025,13 @@ pub async fn handle_utterance_with_dictation(
             // ([`implied_param`]) — the report says what the dialog shows.
             Err(unmet) if spec.optional => {
                 let implied = implied_param(spec, decks);
-                notes.push(unmet.dropped_note(spec.kind, spoken, &transcript, implied.as_ref()));
+                notes.push(unmet.dropped_note(
+                    spec.kind,
+                    spoken,
+                    &transcript,
+                    implied.as_ref(),
+                    decks,
+                ));
                 resolved.extend(implied);
             }
             Err(unmet) => {
@@ -1048,30 +1091,6 @@ enum Unmet {
     /// short reason class the webview declared for it
     /// ([`VoiceDeck::unavailable`]).
     DeckUnavailable { label: String, reason: String },
-    /// The user did not say the reference the model supplied — held only for
-    /// [`SWITCH_DECK_ROW`]'s deck (see [`resolve_param`]). Never quoted back:
-    /// the value is the model's, not the user's.
-    NotSaid,
-    /// The transcript names more than one deck — "the build box, not the
-    /// staging box", "X or Y", or two decks whose names overlap — so which one
-    /// the user meant is not something the model's pick can settle
-    /// ([`switch_target`]). Each deck's key and the label the screen shows for
-    /// it, in the fleet's order (PRD #1261).
-    NamedSeveral(Vec<Candidate>),
-    /// The transcript names exactly one deck, by this label, and the model's
-    /// value resolves to a different one ([`switch_target`]).
-    NamedOther(String),
-    /// The user's `words` match several decks, and the model's unsaid value
-    /// was one of them ([`switch_target`]'s rule 3): the tie those words make,
-    /// asked about in those words — never in the model's.
-    AmbiguousAsSaid {
-        words: String,
-        candidates: Vec<Candidate>,
-    },
-    /// The transcript carries this [`CONTRAST_MARKERS`] entry — "not",
-    /// "instead", "from" — so it may exclude a deck as well as name one, and
-    /// the model is not trusted to have honoured which ([`switch_target`]).
-    Contrast(String),
     /// What it names is on another page of a list split into pages while
     /// voice is on (PR #1451 round 3, change 4): `label` is the name the list
     /// shows, `page` the page it is on, `current` the page showing. Voice acts
@@ -1122,70 +1141,7 @@ impl Unmet {
                 }
                 .with_reports(row)
             }
-            Unmet::AmbiguousAsSaid { words, candidates } => {
-                let matches = labels_of(&candidates);
-                VoiceOutcome::ParamAmbiguous {
-                    sentence: heard(&transcript, &spec.kind.ambiguous_phrase(&words, &matches)),
-                    transcript,
-                    action: row.id.clone(),
-                    invoke: row.invoke.clone(),
-                    param: spec.name.clone(),
-                    spoken: words.clone(),
-                    matches,
-                    candidates: offered(spec, &words, &candidates),
-                    params: Vec::new(),
-                    reports: Vec::new(),
-                }
-                .with_reports(row)
-            }
             Unmet::LabelsWithheld => VoiceOutcome::labels_withheld(transcript, row),
-            Unmet::NotSaid => unresolved(format!("I did not catch which {}", spec.kind.noun())),
-            // `ParamAmbiguous` rather than `ParamUnresolved`: it is the outcome
-            // that carries the candidates and renders them as a list to choose
-            // from, which is the question to put back. The sentence says the
-            // USER named them, and never quotes the model's value, which here
-            // is only one of them — `"staging box" matches more than one deck`
-            // would be false.
-            //
-            // It offers a choice among the decks named (PRD #1261), which is
-            // safe where the model's pick was not: the user picks one of the
-            // decks they themselves named, and an explicit answer is exactly
-            // what settles which one they meant.
-            Unmet::NamedSeveral(candidates) => {
-                let matches = labels_of(&candidates);
-                VoiceOutcome::ParamAmbiguous {
-                    sentence: heard(
-                        &transcript,
-                        &format!(
-                            "you named more than one {}: {}",
-                            spec.kind.noun(),
-                            listed(&matches)
-                        ),
-                    ),
-                    transcript,
-                    action: row.id.clone(),
-                    invoke: row.invoke.clone(),
-                    param: spec.name.clone(),
-                    spoken: spoken.to_string(),
-                    matches,
-                    candidates: offered(spec, spoken, &candidates),
-                    params: Vec::new(),
-                    reports: Vec::new(),
-                }
-                .with_reports(row)
-            }
-            Unmet::NamedOther(label) => unresolved(format!(
-                "you named {}, but I resolved a different {}",
-                safe_message(&label),
-                spec.kind.noun()
-            )),
-            // The marker is the user's own word from a closed list, so it is
-            // quoted back: it is what they have to leave out.
-            Unmet::Contrast(marker) => unresolved(format!(
-                "\u{201c}{marker}\u{201d} could mean a {noun} you do not want, so I \
-                 did not switch; say just the {noun} you want",
-                noun = spec.kind.noun()
-            )),
             Unmet::DeckUnavailable { label, reason } => {
                 unresolved(deck_unavailable(&label, &reason))
             }
@@ -1217,9 +1173,18 @@ impl Unmet {
         spoken: &str,
         transcript: &Transcript,
         implied: Option<&ResolvedParam>,
+        decks: &[VoiceDeck],
     ) -> String {
         let noun = kind.noun();
-        let (head, detail) = if !said(spoken, transcript.text()) {
+        // Issue #1491: the model answers a deck with its listed label
+        // (`ci@stale-box` for "the stale box"), whose words the user did not
+        // all say. A deck that cannot take a new agent is still named back
+        // with its reason when the user said a word of its name that no other
+        // deck's name has; a deck they did not single out is the model's
+        // guess, and is not attributed to them.
+        let mentioned = matches!(self, Unmet::DeckUnavailable { label, .. }
+            if mentioned(label, transcript.text(), decks));
+        let (head, detail) = if !said(spoken, transcript.text()) && !mentioned {
             (format!("I did not catch which {noun}"), None)
         } else {
             match self {
@@ -1237,33 +1202,6 @@ impl Unmet {
                     None,
                 ),
                 Unmet::DeckUnavailable { label, reason } => (deck_unavailable(label, reason), None),
-                // Produced only when `said` failed, so the branch above has
-                // it; spelled out rather than left to a wildcard.
-                Unmet::NotSaid => (format!("I did not catch which {noun}"), None),
-                // Produced only for SWITCH_DECK_ROW's deck, which is required
-                // and so never dropped; spelled out for the same reason.
-                Unmet::NamedSeveral(matches) => (
-                    format!("You named more than one {noun}"),
-                    Some(listed(&labels_of(matches))),
-                ),
-                Unmet::AmbiguousAsSaid { words, candidates } => (
-                    format!(
-                        "\u{201c}{}\u{201d} matches more than one {noun}",
-                        safe_message(words)
-                    ),
-                    Some(listed(&labels_of(candidates))),
-                ),
-                Unmet::NamedOther(label) => (
-                    format!(
-                        "You named {}, but I resolved a different {noun}",
-                        safe_message(label)
-                    ),
-                    None,
-                ),
-                Unmet::Contrast(marker) => (
-                    format!("\u{201c}{marker}\u{201d} could mean a {noun} you do not want"),
-                    None,
-                ),
                 // Produced only for the directory and Mode params, which are
                 // required and so never dropped; spelled out for the same
                 // reason.
@@ -1352,361 +1290,29 @@ fn preselected_note(param: &ResolvedParam) -> String {
     )
 }
 
+/// Whether the transcript carries a content word of the deck labelled
+/// `label` ([`content_words`]) that no other deck's spoken names hold —
+/// "stale" of `ci@stale-box` beside `ops@build-box`, but not their shared
+/// "box".
+fn mentioned(label: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
+    let heard = Heard::new(transcript);
+    let elsewhere: BTreeSet<String> = decks
+        .iter()
+        .filter(|deck| deck.label != label)
+        .flat_map(deck_spoken_names)
+        .flat_map(|name| content_words(&name))
+        .collect();
+    content_words(label)
+        .iter()
+        .any(|word| !elsewhere.contains(word) && heard.word(word))
+}
+
 /// Whether the user SAID `spoken`: it has a content word ([`content_words`])
 /// and every one of them is [`Heard`] in the transcript.
 fn said(spoken: &str, transcript: &str) -> bool {
     let words = content_words(spoken);
     let heard = Heard::new(transcript);
     !words.is_empty() && words.iter().all(|word| heard.word(word))
-}
-
-/// [`SWITCH_DECK_ROW`]'s deck, grounded from BOTH sides (PRD #1195): the key
-/// and label to dispatch, or why nothing switches.
-///
-/// # Why the model's value alone is not enough
-///
-/// [`said`] asks only whether each content word of the model's value occurs
-/// somewhere in the transcript — a bag of words. That lets through every shape
-/// in which the user mentions a deck they do NOT want, and a switch reaches
-/// that machine at once, with no confirmation:
-///
-/// - **negation and alternatives**: "switch to the build box, not the staging
-///   box" answered with `deck="staging box"` — every word of it was said;
-/// - **overlapping names**: with `build.example.com` and
-///   `build-box.example.com` both configured, "switch deck to build box"
-///   answered with `deck="build"` resolves EXACTLY to the first;
-/// - **a partial name beside a complete one** (the audit of `fabb83d`): with
-///   `build-box` and `staging` configured, "switch deck to build, not staging"
-///   answered with `deck="staging"`. Reading the transcript by complete names
-///   only, "build" named nothing and "staging" named the excluded deck — so
-///   the one deck "named" was the wrong one.
-///
-/// The third was the third patch on one class, which is why the transcript is
-/// now read with the resolver's OWN matching rather than a stricter one of its
-/// own: a run of the user's words that would reach a deck if the model
-/// returned it as the value names that deck.
-///
-/// # The rule
-///
-/// 1. **The decks the transcript names** ([`decks_named`]): every deck that
-///    some contiguous run of the transcript's content words — its
-///    [`spoken_words`] less [`NAMELESS_WORDS`] — resolves to on its own under
-///    [`resolve_deck_ref`], exact or loose — or, in a transcript with no
-///    content word, a deck whose own name is nameless, said whole
-///    ([`decks_named`]). More than one →
-///    [`Unmet::NamedSeveral`], whatever the model picked; negation, "X or Y",
-///    "from X to Y" and overlapping names all land here.
-/// 2. **A contrast word** ([`contrast_marker`]) anywhere in the transcript →
-///    [`Unmet::Contrast`], asking for just the deck wanted. Defence in depth
-///    for a transcript that excludes something rule 1 cannot see as a deck:
-///    "switch to the build box, not staging" with no staging deck configured,
-///    or "switch away from the build box".
-/// 3. **The model's value is not [`said`]** → [`Unmet::NotSaid`] — unless it
-///    resolves to exactly the one deck rule 1 found named, which is the model
-///    quoting that deck's full label rather than the user's words for it
-///    (`deploy@build-box` for "the build box"). That adds no deck rule 4 would
-///    not dispatch anyway. And when the user's words named no deck alone
-///    because they name a tie ("the box" beside two box decks) that includes
-///    the deck the value resolves to → [`Unmet::AmbiguousAsSaid`], the tie
-///    the user's own words would have produced, asked in those words.
-/// 4. **The model's value resolves to one deck** → dispatched only when the
-///    transcript named exactly that deck; [`Unmet::NamedOther`] when it named
-///    a different one; [`Unmet::NotSaid`] when it named none.
-/// 5. **It resolves to none or several** → the resolver's own
-///    [`Unmet::NoMatch`] / [`Unmet::Ambiguous`], which quote a value the user
-///    did say.
-///
-/// So a switch dispatches only when the transcript carries no contrast word,
-/// names exactly one deck, AND that is the deck the model's value resolves to.
-/// A partial name ("switch to build" beside `build-box` and `staging`) names
-/// one deck and switches to it.
-///
-/// # What it is not
-///
-/// **It refuses conservatively; it does not understand language.** It never
-/// works out which of two named decks was meant, or what a negation applies
-/// to — it refuses, because a false refusal costs one more utterance and a
-/// false switch opens a connection to a machine the user excluded. Its bounds,
-/// stated rather than implied:
-///
-/// - a run of words that resolves to SEVERAL decks names none of them —
-///   otherwise "the build box" would name every deck whose host holds "box",
-///   and the positive case could never switch. A deck mentioned only that
-///   way is invisible to rule 1, and rule 2 is what stands behind it;
-/// - rule 2 is a closed list of words, not a grammar: a contrast phrased
-///   without one of them ("switch to the build box, staging is broken") is
-///   not seen as one, and then only rule 1 guards it;
-/// - a contrast word is excused only where it is part of the one named deck's
-///   name as said ([`contrast_marker`]), so a deck called `no-backup` stays
-///   reachable by voice while the "no" of "no build box" still refuses beside
-///   it.
-///
-/// # The bound
-///
-/// What this guarantees: a DIRECT voice switch goes only to a deck that the
-/// user's own words, read with the resolver's matching, named and named alone
-/// — and only when the model's value resolves to that same deck (words the
-/// user said, or that deck's own label). Where the words named several decks
-/// ([`Unmet::NamedSeveral`]) or a tie that includes the model's pick
-/// ([`Unmet::AmbiguousAsSaid`]), nothing switches: a numbered choice is offered
-/// among the decks the user's words named (PRD #1261), and only the user's
-/// explicit answer picks one. So neither the model nor text injected into what
-/// it reads can choose a deck the user did not name.
-///
-/// What remains, deliberately: the user names one deck while EXCLUDING it in
-/// words outside [`CONTRAST_MARKERS`] ("switch to the build box, it's broken,
-/// go elsewhere"), and the model misreads that as a request for it. The
-/// consequence is a switch to one of the user's own configured decks — the one
-/// they named — which one more utterance or a click on the Deck selector
-/// switches back from. Further exclusion vocabulary is not chased: exclusion
-/// in natural language is unbounded, and the uniquely-named rule, not the
-/// marker list, is the security property.
-fn switch_target(
-    spoken: &str,
-    transcript: &Transcript,
-    decks: &[VoiceDeck],
-) -> Result<(String, String), Unmet> {
-    let named = decks_named(transcript.text(), decks);
-    if named.len() > 1 {
-        return Err(Unmet::NamedSeveral(
-            named
-                .iter()
-                .map(|deck| Candidate::new(&deck.id, &deck.label))
-                .collect(),
-        ));
-    }
-    if let Some(marker) = contrast_marker(transcript.text(), decks, &named) {
-        return Err(Unmet::Contrast(marker));
-    }
-    let resolved = resolve_deck_ref(spoken, decks);
-    // Rule 3's one exception: a value the user did not say word for word that
-    // resolves to exactly the one deck their own words named — the model
-    // quoting that deck's full label ("deploy@build-box") for "the build box".
-    // It adds no deck: rule 4 would dispatch the same one had the model echoed
-    // the user's words instead.
-    let names_the_named = matches!(
-        (&resolved, named.as_slice()),
-        (DeckRefMatch::One { id, .. }, [deck]) if deck.id == *id
-    );
-    if !names_the_named
-        && !said(spoken, transcript.text())
-        && !said_as_a_name(spoken, transcript.text(), decks)
-    {
-        // Its second: the user's words named no deck alone because they name
-        // a TIE ("the box" beside `build-box` and `stale-box`), and the model
-        // completed that to one of the tied decks' full labels. Echoing the
-        // user's words would have been the tie; so is this, quoting those
-        // words — a choice among decks the user named, which switches nothing
-        // until they pick one.
-        if let (DeckRefMatch::One { id, .. }, []) = (&resolved, named.as_slice())
-            && let Some((words, candidates)) = tie_named_with(transcript.text(), decks, id)
-        {
-            return Err(Unmet::AmbiguousAsSaid { words, candidates });
-        }
-        return Err(Unmet::NotSaid);
-    }
-    match resolved {
-        DeckRefMatch::One { id, label } => match named.first() {
-            Some(deck) if deck.id == id => Ok((id, label)),
-            Some(deck) => Err(Unmet::NamedOther(deck.label.clone())),
-            None => Err(Unmet::NotSaid),
-        },
-        DeckRefMatch::None => Err(Unmet::NoMatch),
-        DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
-    }
-}
-
-/// The decks `transcript` names, in `decks` order: each one that some
-/// contiguous run of its content words resolves to on its own under
-/// [`resolve_deck_ref`] — the same exact-then-loose rule a model value is
-/// resolved by, so words of the user's that would reach one deck as the
-/// model's value name that deck. A run that resolves to several decks names
-/// none (see [`switch_target`] for why, and what that costs).
-///
-/// Every run, not only single words: "build box" can resolve to one deck while
-/// "build" and "box" are each ambiguous. A voice utterance is a few seconds of
-/// speech, so the quadratic count of runs is small.
-///
-/// **A deck whose name is itself nameless** — `ops@daemon`, whose host is the
-/// category word "daemon" — is invisible to the content words, so it is looked
-/// for among ALL the transcript's words, by [`decks_called`] alone, only when
-/// the transcript has no content word at all, and only in the destination
-/// slot — the run of words the utterance ENDS with. "switch daemon to daemon"
-/// and "switch deck to daemon" name it; in "switch daemon to deck" the
-/// "daemon" is the selector's heading and names nothing, and in "switch daemon
-/// to staging" the deck named is staging's, or none. A trailing "please"
-/// therefore refuses too, which costs one more utterance.
-fn decks_named<'a>(transcript: &str, decks: &'a [VoiceDeck]) -> Vec<&'a VoiceDeck> {
-    let all = spoken_words(transcript);
-    let content = deck_content_words(&all);
-    let mut named: BTreeSet<String> = BTreeSet::new();
-    for start in 0..content.len() {
-        for end in start + 1..=content.len() {
-            if let DeckRefMatch::One { id, .. } =
-                resolve_deck_ref(&content[start..end].join(" "), decks)
-            {
-                named.insert(id);
-            }
-        }
-    }
-    if content.is_empty() {
-        for start in 0..all.len() {
-            if let [deck] = decks_called(&all[start..].join(" "), decks)[..] {
-                named.insert(deck.id.clone());
-            }
-        }
-    }
-    decks
-        .iter()
-        .filter(|deck| named.contains(&deck.id))
-        .collect()
-}
-
-/// The [`spoken_words`] that can name a deck: all but [`NAMELESS_WORDS`].
-fn deck_content_words(all: &[String]) -> Vec<String> {
-    all.iter()
-        .filter(|word| !NAMELESS_WORDS.contains(&word.as_str()))
-        .cloned()
-        .collect()
-}
-
-/// The tie the transcript's own words make that includes the deck `id` —
-/// the run of its content words that [`resolve_deck_ref`] resolves to
-/// several decks, `id` among them, with the fewest — and those words, for
-/// [`switch_target`]'s rule 3. `None` when no run of the user's words reaches
-/// `id` at all, so a label the user never approached is still refused.
-fn tie_named_with(
-    transcript: &str,
-    decks: &[VoiceDeck],
-    id: &str,
-) -> Option<(String, Vec<Candidate>)> {
-    let content = deck_content_words(&spoken_words(transcript));
-    let mut best: Option<(String, Vec<Candidate>)> = None;
-    for start in 0..content.len() {
-        for end in start + 1..=content.len() {
-            let words = content[start..end].join(" ");
-            if let DeckRefMatch::Ambiguous(candidates) = resolve_deck_ref(&words, decks)
-                && candidates.iter().any(|candidate| candidate.value == id)
-                && best
-                    .as_ref()
-                    .is_none_or(|(_, fewest)| candidates.len() < fewest.len())
-            {
-                best = Some((words, candidates));
-            }
-        }
-    }
-    best
-}
-
-/// [`said`] for a value with no content word: whether `spoken` is a deck's
-/// configured name ([`decks_called`]) that the transcript says verbatim, as a
-/// run of its [`spoken_words`]. What lets "switch daemon to daemon" ground
-/// `deck="daemon"` when `ops@daemon` is configured; [`decks_named`] still
-/// decides which deck that was.
-fn said_as_a_name(spoken: &str, transcript: &str, decks: &[VoiceDeck]) -> bool {
-    let wanted = spoken_words(spoken);
-    !wanted.is_empty()
-        && !decks_called(spoken, decks).is_empty()
-        && spoken_words(transcript)
-            .windows(wanted.len())
-            .any(|run| run == wanted.as_slice())
-}
-
-/// Words and phrases that turn a mention of a deck into an EXCLUSION of one —
-/// "not staging", "instead of the build box", "rather than local", "away from
-/// staging", "from local to the build box", "the build box or staging", "skip
-/// the build box", "anything without staging", "the other one" — for
-/// [`switch_target`]'s rule 2. A closed list, deliberately small, matched as
-/// whole [`spoken_words`] runs — so "don't" is heard as the two words `don t`
-/// a transcriber's apostrophe splits it into, and is quoted back as written
-/// here.
-///
-/// **Closed on purpose, and not chased further.** Natural-language exclusion
-/// is unbounded, so no list catches every way to say it; what this list buys
-/// is refusing the common phrasings outright. The security property does not
-/// rest on it — it rests on rule 1 and rule 4, which keep a direct switch to a
-/// deck the user's own words named on their own, and a choice to the decks
-/// they named (see [`switch_target`]'s bound).
-const CONTRAST_MARKERS: [&str; 27] = [
-    "not",
-    "no",
-    "nor",
-    "never",
-    "don't",
-    "dont",
-    "doesn't",
-    "isn't",
-    "except",
-    "but",
-    "or",
-    "instead",
-    "rather",
-    "than",
-    "from",
-    "skip",
-    "skipping",
-    "avoid",
-    "avoiding",
-    "leave",
-    "leaving",
-    "without",
-    "exclude",
-    "excluding",
-    "besides",
-    "other",
-    "away",
-];
-
-/// The first [`CONTRAST_MARKERS`] entry, in the list's order, with an
-/// occurrence in `transcript` that is not part of a deck's name.
-///
-/// An occurrence is part of a name — and so excused — only when it lies
-/// inside a run of the transcript's words that resolves on its own to one of
-/// `named` (the decks [`decks_named`] counted) AND every word of which is a
-/// word of one of that deck's names. So `no-backup.example.com` does not
-/// refuse "switch to no backup", while the "no" of "switch deck, no build
-/// box" still refuses beside `no-backup` and `no-cache`: no run holding that
-/// "no" is a name of the one deck named. The excuse is per occurrence, never
-/// per word: a marker that is a word of some configured deck's name counts
-/// wherever it is not inside that deck's name as said.
-fn contrast_marker(transcript: &str, decks: &[VoiceDeck], named: &[&VoiceDeck]) -> Option<String> {
-    let words = spoken_words(transcript);
-    CONTRAST_MARKERS.iter().find_map(|marker| {
-        let wanted = spoken_words(marker);
-        let unexcused = (0..words.len())
-            .filter(|&at| words[at..].starts_with(&wanted))
-            .any(|at| !inside_a_named_deck(&words, at, at + wanted.len(), decks, named));
-        unexcused.then(|| marker.to_string())
-    })
-}
-
-/// Whether `words[from..to]` lies inside a run of `words` that is one of
-/// `named`'s names as said: the run resolves to that deck alone under
-/// [`resolve_deck_ref`], and every word of it is a word of one name the deck
-/// answers to ([`deck_spoken_names`]). The second half is what keeps a run
-/// that merely CONTAINS a name — "from build box", which the resolver's loose
-/// pass reaches `build-box` by — from excusing the word in front of it.
-fn inside_a_named_deck(
-    words: &[String],
-    from: usize,
-    to: usize,
-    decks: &[VoiceDeck],
-    named: &[&VoiceDeck],
-) -> bool {
-    (0..=from).any(|start| {
-        (to..=words.len()).any(|end| {
-            let run = &words[start..end];
-            let DeckRefMatch::One { id, .. } = resolve_deck_ref(&run.join(" "), decks) else {
-                return false;
-            };
-            named.iter().filter(|deck| deck.id == id).any(|deck| {
-                deck_spoken_names(deck).iter().any(|name| {
-                    let name_words = spoken_words(name);
-                    run.iter().all(|word| name_words.contains(word))
-                })
-            })
-        })
-    })
 }
 
 /// `text` with its first character upper-cased, for a refusal's situation
@@ -1753,24 +1359,14 @@ fn capitalised(text: &str) -> String {
 /// - **everything else is undone by one more utterance** — opening a
 ///   directory, preselecting a deck, setting a chip or the Command field.
 ///
-/// **One exception: [`SWITCH_DECK_ROW`]'s deck IS held against the transcript
-/// (PRD #1195).** Switching to a remote deck opens an SSH connection to it, at
-/// once and with no confirmation, so "switch deck to local" answered with
-/// `deck="build box"` would reach a machine the user did not ask for. Its
-/// reference is grounded from both sides ([`switch_target`]): the transcript,
-/// read with [`resolve_deck_ref`]'s own matching, must name exactly one deck
-/// and carry no contrast word ("not", "instead", "from" — [`CONTRAST_MARKERS`]),
-/// and the model's value — itself words the user [`said`] — must resolve to
-/// that deck. Naming several (negation, "X or Y", overlapping names, a partial
-/// name beside a complete one) is refused with the decks named; a contrast
-/// word asks for just the deck wanted; naming none is [`Unmet::NotSaid`].
-/// That is a name the
-/// user says the way the screen shows it, not the word-for-word title match
-/// the 2026-09-24 removal was about: "the build box" reaches
-/// `deploy@build-box.example.com` and "this machine" the local deck exactly
-/// as before. `choose_deck` and
-/// `open_new_agent` stay ungrounded — they preselect in a dialog the user then
-/// confirms, which is the undo-by-one-utterance case above.
+/// **[`SWITCH_DECK_ROW`]'s deck is no exception (issue #1491).** It used to be
+/// held against the transcript from both sides (PRD #1195), on the grounds
+/// that a switch opens an SSH connection at once. That refused every daemon
+/// whose name the transcriber spelled differently — "mini PC" for `minipc`,
+/// "InMotionDeck" for `inmotion` — and the user's answer was that a switch is
+/// not destructive: it stops, closes and starts nothing, it reaches only a
+/// daemon the user configured, and the next switch undoes it. So the model
+/// answers with the listed daemon the user meant, as for every other kind.
 ///
 /// The ACTION is still held against the transcript, for every row, before this
 /// runs ([`action_grounded`]) — that is a different question, and it is what
@@ -1849,11 +1445,11 @@ fn resolve_param(
         // ([`VoiceDeck::unavailable`], [`deck_unavailable`]). Only for the dialog: the
         // Deck selector switches to a disabled deck as readily as to any other
         // (PRD #1195, [`SWITCH_DECK_ROW`]).
-        // Checked before resolving, so a deck the model invented is never
-        // quoted back as "no deck matches …" either.
-        ParamKind::DeckRef if !for_new_agent => {
-            switch_target(spoken, transcript, decks).map(|(id, label)| param(id, label))
-        }
+        ParamKind::DeckRef if !for_new_agent => match resolve_deck_ref(spoken, decks) {
+            DeckRefMatch::One { id, label } => Ok(param(id, label)),
+            DeckRefMatch::None => Err(Unmet::NoMatch),
+            DeckRefMatch::Ambiguous(labels) => Err(Unmet::Ambiguous(labels)),
+        },
         ParamKind::DeckRef => match resolve_new_agent_deck_ref(spoken, decks) {
             DeckRefMatch::One { id, label } => {
                 // Reached only for the New agent dialog: the guard above
@@ -2065,6 +1661,17 @@ fn local_intercept(
         }
     }
 
+    // PRD #1541: the typing-mode prompt commands, said with typing mode OFF on
+    // the agent screen, run nothing and say how to reach them. Only there —
+    // on another screen these words are the model's to answer, which renders
+    // the row's own hint — and never for a bare "stop" (`TYPING_STOP_PHRASES`
+    // is not consulted here), which keeps today's model answer (issue #1402).
+    if screen == Screen::Agent
+        && let Some(row) = typing_mode_row(table, transcript.text(), false)
+    {
+        return Some(VoiceOutcome::typing_mode_first(transcript.clone(), row));
+    }
+
     // Less an edge politeness word, as `heard_as_whole` grounding and the
     // dictation mode compare: "okay, send it please" is the same request as
     // "send it", and answering it here decides it without a model on every
@@ -2132,6 +1739,38 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
             .any(|phrase| spoken_words(phrase) == said)
 }
 
+/// The typing-mode prompt command (PRD #1541) whose phrase list the whole
+/// utterance is, less an edge politeness word — or `None`. `in_typing_mode`
+/// adds the bare "stop" forms ([`TYPING_STOP_PHRASES`]) to interrupt's list,
+/// which they belong to only while the mode is on. `None` too for a table
+/// without the row, which then falls through as it did before the rows existed.
+fn typing_mode_row<'t>(
+    table: &'t CommandTable,
+    text: &str,
+    in_typing_mode: bool,
+) -> Option<&'t CommandRow> {
+    let stops: &[&str] = if in_typing_mode {
+        &TYPING_STOP_PHRASES
+    } else {
+        &[]
+    };
+    [
+        (
+            INTERRUPT_ROW,
+            INTERRUPT_PHRASES
+                .iter()
+                .chain(stops)
+                .copied()
+                .collect::<Vec<_>>(),
+        ),
+        (CLEAR_PROMPT_ROW, CLEAR_PROMPT_PHRASES.to_vec()),
+        (SCRATCH_ROW, SCRATCH_PHRASES.to_vec()),
+    ]
+    .into_iter()
+    .find(|(_, phrases)| said_whole(text, phrases.iter().copied()))
+    .and_then(|(row_id, _)| table.row(row_id))
+}
+
 /// One utterance while the dictation mode is on (PRD #1260), decided with no
 /// backend call at all.
 ///
@@ -2141,12 +1780,16 @@ fn said_whole<'a>(transcript: &str, phrases: impl IntoIterator<Item = &'a str>) 
 /// 2. [`DICTATION_OFF_PHRASES`] — end the mode;
 /// 3. a submit — [`SUBMIT_PHRASES`] or one of `submit_prompt`'s own
 ///    `heard_as_whole` entries ("go ahead");
-/// 4. a trailing send — the utterance ends with a separate sentence that is
+/// 4. a prompt command (PRD #1541) — [`INTERRUPT_PHRASES`] or
+///    [`TYPING_STOP_PHRASES`] interrupt the agent's turn,
+///    [`CLEAR_PROMPT_PHRASES`] clear its prompt, [`SCRATCH_PHRASES`] remove
+///    the last thing voice typed ([`typing_mode_row`]);
+/// 5. a trailing send — the utterance ends with a separate sentence that is
 ///    one of [`TRAILING_SEND_PHRASES`] ([`trailing_send`]): what precedes it
 ///    is typed and the dispatch asks for a send after it (`then_submit`);
-/// 5. anything else is typed, whole.
+/// 6. anything else is typed, whole.
 ///
-/// Each of the first three is a whole-utterance comparison, and the fourth a
+/// Each of the first four is a whole-utterance comparison, and the fifth a
 /// whole-SENTENCE one, so a phrase said inside a longer sentence is typed. The lists are disjoint (linkage-check
 /// rule 14), so the order decides nothing; it is #802's decided one — the
 /// bigger stop first — so a future overlap cannot leave a live microphone
@@ -2197,6 +1840,11 @@ fn dictation_intercept(
         if submits {
             return Some(dispatch(row, Vec::new()));
         }
+    }
+    // PRD #1541: interrupt, clear, scratch — with the bare "stop" forms
+    // interrupting here, and only here.
+    if let Some(row) = typing_mode_row(table, text, true) {
+        return Some(dispatch(row, Vec::new()));
     }
 
     let row = table.row(DICTATE_ROW)?;
@@ -2282,13 +1930,10 @@ fn millis(elapsed: std::time::Duration) -> u32 {
 /// dispatcher mode") and the verbs a command is made of ("open", "use") — and
 /// so are no evidence, on their own, that the user SAID a particular value.
 ///
-/// Read in two places: [`said`] (through [`content_words`]), which decides
-/// whether a dropped optional value is quoted back or reported as not caught,
-/// and — with [`decks_named`] — grounds [`SWITCH_DECK_ROW`]'s deck, the one
-/// reference still held against the transcript ([`switch_target`]). It used
+/// Read by [`said`] (through [`content_words`]), which decides whether a
+/// dropped optional value is quoted back or reported as not caught. It used
 /// to be the filler list of reference grounding for every row, removed on
-/// 2026-09-24 (see [`resolve_param`]); `switch_deck` is the only dispatch it
-/// gates now.
+/// 2026-09-24 (see [`resolve_param`]), and for `switch_deck` until issue #1491.
 const NAMELESS_WORDS: [&str; 53] = [
     "a",
     "an",
@@ -3032,15 +2677,16 @@ pub fn resolve_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
 /// remote deck a new agent can start on (#1260).
 ///
 /// The instructions tell the model to answer such a reference with the listed
-/// name, and the list it is shown is exactly the eligible decks; after #1045
+/// name, and the list it is shown marks the decks a new agent cannot start
+/// on (`decks_without_new_agent`); after #1045
 /// the default model answered "new agent on the remote deck" with the user's
 /// own words in every measured run instead, which named no deck. This is that
 /// same rule decided here, over the same list: consulted only once
 /// [`resolve_deck_ref`] has found nothing — so a host that really is called
 /// `remote` still wins — and only for a reference that is "remote" and
 /// category words. Several eligible remote decks are asked about; none is no
-/// match. Not used for [`SWITCH_DECK_ROW`], whose reference must name its deck
-/// ([`switch_target`]).
+/// match. Not used for [`SWITCH_DECK_ROW`], where "the remote daemon" would
+/// switch to one of several the user did not name.
 fn resolve_new_agent_deck_ref(spoken: &str, decks: &[VoiceDeck]) -> DeckRefMatch {
     let matched = resolve_deck_ref(spoken, decks);
     if matched != DeckRefMatch::None || deck_reference(spoken) != "remote" {
@@ -3724,8 +3370,13 @@ fn choice_subset(reference_words: &BTreeSet<String>, name: &str) -> bool {
 }
 
 /// The words that say a reference IS to a deck without saying which one: the
-/// field's name, before and since issue #1045, and the articles around it.
-const DECK_CATEGORY_WORDS: [&str; 7] = ["daemon", "daemons", "deck", "decks", "the", "a", "an"];
+/// field's name, before and since issue #1045, the articles around it, and
+/// "demon", how speech-to-text writes "daemon" (issue #1491), for a model that
+/// echoes the user's words — with Names withheld, or when nothing it was
+/// shown fits.
+const DECK_CATEGORY_WORDS: [&str; 9] = [
+    "daemon", "daemons", "deck", "decks", "demon", "demons", "the", "a", "an",
+];
 
 /// `spoken`, normalised, less [`DECK_CATEGORY_WORDS`] — empty for a reference
 /// that names no deck.
@@ -3984,9 +3635,9 @@ mod tests {
     // -- deck_ref (PRD #1223) ---------------------------------------------
 
     /// Scenario: switch to the named remote deck, the local deck called
-    /// "local" or "this machine", an ambiguous name, or a missing deck.
-    /// A model-supplied remote name that the transcript did not say is refused
-    /// as an unresolved required deck reference, even when that deck exists.
+    /// "local" or "this machine", an ambiguous name, or a missing deck. The
+    /// model's value is resolved as given, like every other reference
+    /// (issue #1491).
     #[tokio::test]
     async fn voice_outcome_switch_deck_resolves_or_reports_the_deck_reference() {
         let cases = [
@@ -3996,7 +3647,6 @@ mod tests {
             ("switch daemon to the build box", "build box"),
             ("switch deck to local", "local"),
             ("switch deck to this machine", "this machine"),
-            ("switch deck to local", "build box"),
             ("switch deck to build", "build"),
             ("switch deck to the ghost box", "ghost box"),
         ];
@@ -4034,11 +3684,6 @@ mod tests {
                         if params[0].value == "deck-local"),
                     "{outcome:?}"
                 ),
-                ("switch deck to local", "build box") => assert!(
-                    matches!(&outcome, VoiceOutcome::ParamUnresolved { action, param, .. }
-                        if action == "switch_deck" && param == "deck"),
-                    "a deck absent from the transcript must be refused: {outcome:?}"
-                ),
                 (_, "build") => assert!(
                     matches!(&outcome, VoiceOutcome::ParamAmbiguous { action, sentence, .. }
                         if action == "switch_deck" && sentence.contains("matches more than one daemon")),
@@ -4052,6 +3697,31 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Scenario (issue #1491): speech-to-text writes "daemon" as "demon". A
+    /// model that echoes the user's words — with Names withheld, or when
+    /// nothing it was shown fits — hands over "all demons" or a bare "demon",
+    /// and each resolves exactly as "all daemons" and "daemon" do.
+    #[test]
+    fn voice_outcome_deck_ref_reads_demon_as_daemon() {
+        let mut decks = decks();
+        decks.push(VoiceDeck {
+            id: crate::voice::ALL_DECKS_ID.to_string(),
+            label: crate::voice::ALL_DECKS_LABEL.to_string(),
+            address: None,
+            local: false,
+            unavailable: Some(crate::voice::DECK_IS_EVERY_DAEMON.to_string()),
+        });
+        assert!(matches!(
+            resolve_deck_ref("all demons", &decks),
+            DeckRefMatch::One { id, .. } if id == crate::voice::ALL_DECKS_ID
+        ));
+        assert_eq!(
+            resolve_deck_ref("demon", &decks),
+            resolve_deck_ref("daemon", &decks)
+        );
+        assert_eq!(resolve_deck_ref("demon", &decks), DeckRefMatch::None);
     }
 
     #[test]
@@ -5613,8 +5283,10 @@ mod tests {
 
     /// Scenario: the New agent dialog does not list a deck — here the build
     /// box, which is not connected — and the user says "new agent on the build
-    /// box". The model was never shown that deck, and when its answer names it
-    /// anyway the report says in one line that it can't take a new agent, with
+    /// box". The model is shown that deck among every daemon, marked as one a
+    /// new agent cannot start on (it is still one the Daemon selector switches
+    /// to, issue #1491), and when its answer names it the report says in one
+    /// line that it can't take a new agent, with
     /// the short reason class the webview declared for it (PR #1451 round 3,
     /// change 6), instead of "Preselected daemon:" for a deck the dialog will
     /// not preselect. A deck the user did not name
@@ -5639,12 +5311,14 @@ mod tests {
         )
         .await;
         assert!(
-            data.contains("Local deck") && data.contains("ci@build-farm"),
-            "the decks that can take an agent are offered: {data}"
+            data.contains(
+                r#""decks":["Local deck","deploy@build-box.example.com:2222","ci@build-farm"]"#
+            ),
+            "every daemon is shown, so a switch can name any of them: {data}"
         );
         assert!(
-            !data.contains("build-box"),
-            "a deck the dialog disables is not offered at all: {data}"
+            data.contains(r#""decks_without_new_agent":["deploy@build-box.example.com:2222"]"#),
+            "a deck the dialog disables is marked as one: {data}"
         );
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params.is_empty()),
@@ -5654,6 +5328,42 @@ mod tests {
             outcome.sentence(),
             "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
              can't take a new agent: it is not connected, so none is preselected."
+        );
+
+        // Answered with its full label, which the user did not say word for
+        // word (issue #1491), it is still named back with its reason: the
+        // user said words of its name.
+        let (outcome, _) = open_new_agent_over(
+            &fleet,
+            IntentAnswer::new("open_new_agent")
+                .with_param("deck", "deploy@build-box.example.com:2222"),
+            "new agent on the build box",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. \u{201c}deploy@build-box.example.com:2222\u{201d} \
+             can't take a new agent: it is not connected, so none is preselected."
+        );
+
+        // Qodo on PR #1504: beside another deck that cannot take one and shares
+        // "box", the user's "build box" does not single out the stale box the
+        // model guessed, so that deck is not named back as if they had.
+        let two_boxes = [
+            deck("deck-local", "Local deck", true),
+            unavailable_deck("deck-build", "ops@build-box", false, NOT_CONNECTED),
+            unavailable_deck("deck-stale", "ci@stale-box", false, NOT_CONNECTED),
+        ];
+        let (outcome, _) = open_new_agent_over(
+            &two_boxes,
+            IntentAnswer::new("open_new_agent").with_param("deck", "ci@stale-box"),
+            "new agent on the build box",
+        )
+        .await;
+        assert_eq!(
+            outcome.sentence(),
+            "Opening the New agent dialog. I did not catch which daemon. \
+             Preselected daemon: Local deck."
         );
 
         // The model's own invention of it is not caught, like any invented deck.
@@ -8108,7 +7818,9 @@ mod tests {
     }
 
     /// Scenario: the two spoken mode switches are answered locally before the
-    /// one-shot `type` opener can turn their last word into prompt text.
+    /// one-shot `type` opener can turn their last word into prompt text, for
+    /// every phrasing of either switch (#1544 added talking, speaking and
+    /// dictate). A sentence that merely contains one reaches the model instead.
     #[tokio::test]
     async fn voice_outcome_type_on_and_off_switch_mode_without_typing_or_resolving() {
         for (said, action) in [
@@ -8116,6 +7828,16 @@ mod tests {
             ("okay, type on please", "dictation_on"),
             ("type off", "dictation_off"),
             ("please type off now", "dictation_off"),
+            ("talking on", "dictation_on"),
+            ("Start talking.", "dictation_on"),
+            ("speaking on", "dictation_on"),
+            ("start speaking", "dictation_on"),
+            ("dictate on", "dictation_on"),
+            ("talking off", "dictation_off"),
+            ("stop talking", "dictation_off"),
+            ("speaking off", "dictation_off"),
+            ("Stop speaking.", "dictation_off"),
+            ("dictate off", "dictation_off"),
         ] {
             let resolver = NoCommandsResolver;
             let answer = handle_utterance(
@@ -8137,6 +7859,32 @@ mod tests {
             );
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
         }
+        // The control: a switch phrase said in passing is not a switch, in
+        // either direction. It is the model's to answer like any sentence.
+        for said in [
+            "I was talking on the phone",
+            "we should stop talking about the release",
+        ] {
+            let resolver = CountingResolver::default();
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                !matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. }
+                if action == "dictation_on" || action == "dictation_off"),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(resolver.calls(), 1, "{said} was answered locally");
+        }
     }
 
     /// Scenario: a declared dictation target keeps every utterance local to
@@ -8152,6 +7900,21 @@ mod tests {
         for (said, action, text) in [
             ("voice off", "voice_off", None),
             ("type off", "dictation_off", None),
+            ("talking off", "dictation_off", None),
+            ("Stop talking.", "dictation_off", None),
+            ("speaking off", "dictation_off", None),
+            ("stop speaking", "dictation_off", None),
+            ("dictate off", "dictation_off", None),
+            (
+                "I was talking on the phone",
+                "dictate_to_agent",
+                Some("I was talking on the phone"),
+            ),
+            (
+                "we should stop talking about the release",
+                "dictate_to_agent",
+                Some("we should stop talking about the release"),
+            ),
             ("send it", "submit_prompt", None),
             ("go ahead", "submit_prompt", None),
             ("finished", "submit_prompt", None),
@@ -8221,6 +7984,276 @@ mod tests {
                 assert_eq!(typed(&answer.outcome), text, "{said}");
             }
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    // -- PRD #1541: the typing-mode prompt commands --------------------------
+
+    /// Every phrase of each prompt-command list and the row it dispatches in
+    /// typing mode — the bare "stop" forms included, interrupting.
+    fn prompt_command_phrases() -> Vec<(&'static str, &'static str)> {
+        INTERRUPT_PHRASES
+            .iter()
+            .chain(TYPING_STOP_PHRASES.iter())
+            .map(|phrase| (*phrase, INTERRUPT_ROW))
+            .chain(
+                CLEAR_PROMPT_PHRASES
+                    .iter()
+                    .map(|phrase| (*phrase, CLEAR_PROMPT_ROW)),
+            )
+            .chain(SCRATCH_PHRASES.iter().map(|phrase| (*phrase, SCRATCH_ROW)))
+            .collect()
+    }
+
+    fn typing_target() -> VoiceDictationTarget {
+        VoiceDictationTarget {
+            deck_id: "deck-one".to_string(),
+            agent_id: "tester".to_string(),
+        }
+    }
+
+    async fn in_typing_mode(said: &str) -> VoiceResult {
+        handle_utterance_with_dictation(
+            &NoCommandsResolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Some(&typing_target()),
+            Transcript::new(said),
+            LabelSharing::Shared,
+            true,
+        )
+        .await
+    }
+
+    /// Scenario: with typing mode on in an agent's pane, the user says each
+    /// interrupt, clear and scratch phrase alone — bare, with transcription
+    /// punctuation, and wrapped in an edge politeness word. Each dispatches its
+    /// own row with no params and nothing is typed or sent to the model.
+    #[tokio::test]
+    async fn voice_outcome_dictating_prompt_commands_dispatch_their_rows_without_resolving() {
+        for (phrase, row_id) in prompt_command_phrases() {
+            let capitalised = format!("{}{}.", phrase[..1].to_uppercase(), &phrase[1..]);
+            for said in [
+                phrase.to_string(),
+                capitalised,
+                format!("okay, {phrase}"),
+                format!("{phrase} please"),
+                format!("Okay, {phrase} now."),
+            ] {
+                let answer = in_typing_mode(&said).await;
+                let row = table().row(row_id).expect("a shipped row");
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, then_submit, .. }
+                        if action == row_id && *invoke == row.invoke && params.is_empty() && !then_submit),
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode on, a sentence that merely contains an
+    /// interrupt, clear or scratch word, or a phrase introduced by a dictation
+    /// opener ("type scratch that", "say stop"), is typed into the prompt whole
+    /// rather than run as a command.
+    #[tokio::test]
+    async fn voice_outcome_dictating_a_prompt_word_in_a_sentence_or_after_an_opener_is_typed() {
+        let mut typed_whole: Vec<String> = [
+            "we should work on the scratch feature",
+            "stop the build when tests fail",
+            "clear the cache please and then run it",
+            "interrupt the build if a test fails",
+            "delete that file and undo that change",
+            "please stop it from logging so much",
+            "scratch that idea and start over",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for (phrase, _) in prompt_command_phrases() {
+            for opener in DICTATION_OPENERS {
+                typed_whole.push(format!("{opener} {phrase}"));
+            }
+        }
+        for said in typed_whole {
+            let answer = in_typing_mode(&said).await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, .. } if action == DICTATE_ROW),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(typed(&answer.outcome), said, "{said}");
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, the user says an
+    /// interrupt, clear or scratch phrase (politely or not). Nothing runs, no
+    /// model is asked, and the row tells them to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_outside_typing_mode_say_typing_on_first() {
+        let outside: Vec<(&str, &str)> = prompt_command_phrases()
+            .into_iter()
+            .filter(|(phrase, _)| !TYPING_STOP_PHRASES.contains(phrase))
+            .collect();
+        assert_eq!(outside.len(), 16, "every phrase but the bare stops");
+        for (phrase, row_id) in outside {
+            for said in [phrase.to_string(), format!("okay, {phrase} please")] {
+                let answer = handle_utterance(
+                    &NoCommandsResolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(&said),
+                )
+                .await;
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::Unavailable {
+                        transcript: Transcript::new(&said),
+                        action: row_id.to_string(),
+                        hint: TYPING_MODE_FIRST_HINT.to_string(),
+                        sentence: "Say “typing on” first — interrupting, clearing and scratching \
+                                   work in typing mode."
+                            .to_string(),
+                    },
+                    "{said}"
+                );
+                assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+            }
+        }
+    }
+
+    /// Scenario: with typing mode OFF in an agent's pane, a bare "stop",
+    /// "stop it" or "stop that" is not intercepted: it reaches the model as it
+    /// did before, whose `stop_agent` answer is refused as not available here.
+    #[tokio::test]
+    async fn voice_outcome_a_bare_stop_outside_typing_mode_keeps_the_model_answer() {
+        for said in TYPING_STOP_PHRASES {
+            let resolver = CountingResolver::answering(IntentAnswer::new("stop_agent"));
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert_eq!(resolver.calls(), 1, "{said} was not asked of the model");
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                    if action == "stop_agent" && hint != TYPING_MODE_FIRST_HINT),
+                "{said}: {:?}",
+                answer.outcome
+            );
+        }
+    }
+
+    /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
+    /// or scratch phrase is not intercepted locally; it goes to the model,
+    /// and a pick of the row is refused with the row's own hint.
+    #[tokio::test]
+    async fn voice_outcome_prompt_commands_on_other_screens_are_the_model_s_to_answer() {
+        for screen in [Screen::Deck, Screen::Overview] {
+            for (said, row_id) in [
+                ("interrupt", INTERRUPT_ROW),
+                ("clear the prompt", CLEAR_PROMPT_ROW),
+                ("scratch that", SCRATCH_ROW),
+            ] {
+                let resolver = CountingResolver::answering(IntentAnswer::new(row_id));
+                let answer = handle_utterance(
+                    &resolver,
+                    table(),
+                    screen,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(said),
+                )
+                .await;
+                assert_eq!(resolver.calls(), 1, "{said} on {screen:?}");
+                let row = table().row(row_id).expect("a shipped row");
+                assert_eq!(
+                    answer.outcome,
+                    VoiceOutcome::unavailable(Transcript::new(said), row),
+                    "{said} on {screen:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a table whose interrupt row grounds on a word the local list
+    /// does not hold, so the model can pick it in an agent's pane. The pick is
+    /// still not dispatched: the user is told to say "typing on" first.
+    #[tokio::test]
+    async fn voice_outcome_a_model_pick_of_a_typing_mode_row_is_never_dispatched() {
+        let source = "[[commands]]\n\
+                      id = \"interrupt_agent\"\n\
+                      invoke = \"interruptAgent\"\n\
+                      description = \"Interrupt or halt the open agent\"\n\
+                      screens = [\"agent\"]\n\
+                      unavailable_hint = \"open a pane first\"\n\
+                      report = \"Interrupted.\"\n\
+                      asks_to = \"interrupt the agent\"\n\
+                      try_saying = \"halt\"\n\
+                      heard_as = [\"halt\"]\n";
+        let parsed = CommandTable::parse(source).expect("a valid table");
+        let resolver = StubResolver::new().answering("halt", IntentAnswer::new(INTERRUPT_ROW));
+        let answer = handle_utterance(
+            &resolver,
+            &parsed,
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Transcript::new("halt"),
+        )
+        .await;
+        assert!(
+            matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                if action == INTERRUPT_ROW && hint == TYPING_MODE_FIRST_HINT),
+            "{:?}",
+            answer.outcome
+        );
+    }
+
+    /// The local paths answer exactly the rows' whole-utterance vocabularies
+    /// outside typing mode, so every utterance that could ground a model pick
+    /// of a prompt command on the agent screen is answered before the model.
+    #[test]
+    fn voice_outcome_prompt_command_grounding_is_the_local_list() {
+        for (row_id, phrases) in [
+            (INTERRUPT_ROW, &INTERRUPT_PHRASES[..]),
+            (CLEAR_PROMPT_ROW, &CLEAR_PROMPT_PHRASES[..]),
+            (SCRATCH_ROW, &SCRATCH_PHRASES[..]),
+        ] {
+            let row = table().row(row_id).expect("a shipped row");
+            assert_eq!(
+                row.grounding,
+                ActionGrounding::HeardAsWhole(phrases.iter().map(|s| s.to_string()).collect()),
+                "{row_id}"
+            );
+            assert_eq!(row.screens, vec![Screen::Agent], "{row_id}");
+            assert!(row.params.is_empty(), "{row_id}");
+        }
+        // The bare stops ground nothing: a model pick of `interrupt_agent` for
+        // "stop" outside typing mode is refused rather than dispatched.
+        let interrupt = table().row(INTERRUPT_ROW).expect("a shipped row");
+        for said in TYPING_STOP_PHRASES {
+            assert!(!action_grounded(interrupt, said, None, None), "{said}");
         }
     }
 
@@ -9536,8 +9569,8 @@ mod tests {
     /// Scenario: a `switch_deck` dispatch leaves the pipeline carrying the
     /// fleet key it resolved; the app swaps in the Deck selector's token, and
     /// a key with no token becomes empty rather than passing through. The row's
-    /// Scenario: "switch to build or staging" names two decks and is offered
-    /// as a choice. Each candidate is addressed with the Deck selector's token
+    /// Scenario: "switch to the box" is answered with "box", which matches two
+    /// decks, and is offered as a choice. Each candidate is addressed with the Deck selector's token
     /// and its row's address, like a dispatch; a tie holding a deck the
     /// selector has no token for offers no choice at all, and keeps its
     /// sentence.
@@ -9566,7 +9599,7 @@ mod tests {
             }),
             _ => None,
         };
-        let mut named = switched_over(&pair, "switch to build or staging", "build").await;
+        let mut named = switched_over(&pair, "switch to the box", "box").await;
         address_deck_switch(&mut named, token);
         let VoiceOutcome::ParamAmbiguous {
             candidates,
@@ -9587,7 +9620,7 @@ mod tests {
         );
         assert_eq!(reports.len(), 2);
 
-        let mut unknown = switched_over(&pair, "switch to build or staging", "build").await;
+        let mut unknown = switched_over(&pair, "switch to the box", "box").await;
         address_deck_switch(&mut unknown, |key| {
             (key == "deck-build").then(|| VoiceDeckSelection {
                 token: "row-build".to_string(),
@@ -9753,15 +9786,15 @@ mod tests {
         .outcome
     }
 
-    /// Scenario: naming two decks for a required switch offers exactly those
-    /// deck values. Safety refusals are not ties and never carry candidates.
+    /// Scenario: a required switch whose value matches two decks offers
+    /// exactly those deck values. Safety refusals are not ties and never carry candidates.
     #[tokio::test]
     async fn voice_outcome_only_a_required_genuine_tie_offers_a_choice() {
         let pair = [
             deck("deck-build", "ops@build-box", false),
             deck("deck-staging", "ops@staging-box", false),
         ];
-        let named = switched_over(&pair, "switch to build or staging", "build").await;
+        let named = switched_over(&pair, "switch to the box", "box").await;
         let VoiceOutcome::ParamAmbiguous {
             candidates,
             matches,
@@ -9787,9 +9820,6 @@ mod tests {
             .expect("required deck param");
         assert!(!spec.optional);
         for unmet in [
-            Unmet::Contrast("not".to_string()),
-            Unmet::NotSaid,
-            Unmet::NamedOther("ops@build-box".to_string()),
             Unmet::WithheldChoice("hidden".to_string()),
             Unmet::DeckUnavailable {
                 label: "ops@build-box".to_string(),
@@ -9823,239 +9853,6 @@ mod tests {
                 .get("candidates")
                 .is_none()
         );
-    }
-
-    /// Scenario: the switch target is grounded from the transcript's side too
-    /// (PRD #1195, audit of `d57cf7d`). "Switch to the build box, not the
-    /// staging box" answered with the staging box, "the build box or the
-    /// staging box", and — with both `build` and `build-box` configured —
-    /// "switch deck to build box" answered with `build` all name more than one
-    /// deck, so each is refused with the decks named and nothing switches.
-    /// Naming exactly one deck while the model picked another is refused too.
-    /// The positive controls — the build box, "local", "this machine" — still
-    /// switch.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_dispatches_only_the_one_deck_the_transcript_names() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build", "deploy@build-box.example.com:2222", false),
-            deck("deck-staging", "deploy@staging-box.example.com", false),
-        ];
-        let overlapping = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-bare", "ops@build.example.com", false),
-            deck("deck-box", "ops@build-box.example.com", false),
-        ];
-        // Two hosts whose first components hold the same words in the other
-        // order: the model's words are all in the transcript, in the wrong
-        // order, and resolve exactly to the deck the user did NOT name.
-        let reordered = [
-            deck("deck-staging-box", "ops@staging-box.example.com", false),
-            deck("deck-box-staging", "ops@box-staging.example.com", false),
-        ];
-
-        let refused_as_several = |outcome: &VoiceOutcome, labels: &[&str]| {
-            let VoiceOutcome::ParamAmbiguous {
-                action,
-                param,
-                matches,
-                sentence,
-                ..
-            } = outcome
-            else {
-                panic!("expected a refusal naming the decks, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert_eq!(param, "deck");
-            assert_eq!(matches, &labels.to_vec(), "{sentence}");
-            assert!(
-                sentence.contains("you named more than one daemon"),
-                "{sentence}"
-            );
-        };
-
-        let negated = switched_over(
-            &staged,
-            "switch to the build box, not the staging box",
-            "staging box",
-        )
-        .await;
-        refused_as_several(
-            &negated,
-            &[
-                "deploy@build-box.example.com:2222",
-                "deploy@staging-box.example.com",
-            ],
-        );
-
-        let either = switched_over(
-            &staged,
-            "switch deck to the build box or the staging box",
-            "build box",
-        )
-        .await;
-        refused_as_several(
-            &either,
-            &[
-                "deploy@build-box.example.com:2222",
-                "deploy@staging-box.example.com",
-            ],
-        );
-
-        for spoken in ["build", "build box"] {
-            let overlap = switched_over(&overlapping, "switch deck to build box", spoken).await;
-            refused_as_several(
-                &overlap,
-                &["ops@build.example.com", "ops@build-box.example.com"],
-            );
-        }
-
-        let other =
-            switched_over(&reordered, "switch deck to the staging box", "box staging").await;
-        let VoiceOutcome::ParamUnresolved {
-            action, sentence, ..
-        } = &other
-        else {
-            panic!("the model's pick is not the deck the user named: {other:?}");
-        };
-        assert_eq!(action, "switch_deck");
-        assert!(
-            sentence.contains("you named ops@staging-box.example.com"),
-            "{sentence}"
-        );
-        assert!(!sentence.contains("box staging"), "{sentence}");
-
-        for (decks, said, spoken, expected) in [
-            (
-                &staged[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build",
-            ),
-            (&staged[..], "switch deck to local", "local", "deck-local"),
-            (
-                &staged[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-            (
-                &overlapping[..],
-                "switch deck to local",
-                "local",
-                "deck-local",
-            ),
-            (
-                &reordered[..],
-                "switch deck to the staging box",
-                "staging box",
-                "deck-staging-box",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
-    /// Scenario: "switch deck to the build box" answered with the deck's full
-    /// label, `deploy@build-box.example.com:2222`, rather than the words said —
-    /// what the shipping model returns about half the time (the
-    /// `switch-deck-build-box` phrase fixture, 2026-09-29). The user's own
-    /// words named exactly that deck, so it switches. A full label for a deck
-    /// the transcript did NOT name is still refused, whether the transcript
-    /// named another deck or none.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_accepts_the_full_label_of_the_one_deck_named() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build", "deploy@build-box.example.com:2222", false),
-            deck("deck-staging", "deploy@staging-box.example.com", false),
-        ];
-        let labelled = switched_over(
-            &staged,
-            "switch deck to the build box",
-            "deploy@build-box.example.com:2222",
-        )
-        .await;
-        assert!(
-            matches!(&labelled, VoiceOutcome::Dispatch { params, .. }
-                if params[0].value == "deck-build"),
-            "{labelled:?}"
-        );
-
-        for (said, spoken) in [
-            (
-                "switch deck to the build box",
-                "deploy@staging-box.example.com",
-            ),
-            ("switch deck", "deploy@build-box.example.com:2222"),
-        ] {
-            let refused = switched_over(&staged, said, spoken).await;
-            assert!(
-                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
-                "{said} / {spoken}: {refused:?}"
-            );
-        }
-    }
-
-    /// Scenario: "switch deck to the box" with two box decks configured,
-    /// answered with one of them's full label, `deploy@build-box` — what the
-    /// shipping model returned in 12 of 20 runs of the
-    /// `switch-deck-ambiguous-box` phrase fixture (2026-09-30), which was then
-    /// refused as "I did not catch which daemon". The user's words name both
-    /// box decks, so the app asks which of the two — quoting "box", never the
-    /// model's label — exactly as it does when the model echoes "the box".
-    /// A label outside that tie, or one for a transcript that names no deck
-    /// at all, is still refused.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_asks_the_users_tie_for_a_completed_label() {
-        let staged = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box", false),
-            deck("deck-stale-box", "ci@stale-box", false),
-        ];
-        let echoed = switched_over(&staged, "switch deck to the box", "the box").await;
-        let completed = switched_over(&staged, "switch deck to the box", "deploy@build-box").await;
-        for outcome in [&echoed, &completed] {
-            let VoiceOutcome::ParamAmbiguous {
-                candidates,
-                sentence,
-                ..
-            } = outcome
-            else {
-                panic!("a tie: {outcome:?}");
-            };
-            let mut values: Vec<&str> = candidates
-                .iter()
-                .map(|candidate| candidate.value.as_str())
-                .collect();
-            values.sort_unstable();
-            assert_eq!(values, ["deck-build-box", "deck-stale-box"]);
-            assert!(!sentence.contains("deploy@build-box\u{201d}"), "{sentence}");
-        }
-        let VoiceOutcome::ParamAmbiguous {
-            sentence, spoken, ..
-        } = &completed
-        else {
-            unreachable!()
-        };
-        assert_eq!(spoken, "box");
-        assert!(sentence.contains("\u{201c}box\u{201d}"), "{sentence}");
-
-        for (said, spoken) in [
-            ("switch deck to the box", "Local deck"),
-            ("switch deck", "deploy@build-box"),
-        ] {
-            let refused = switched_over(&staged, said, spoken).await;
-            assert!(
-                matches!(&refused, VoiceOutcome::ParamUnresolved { .. }),
-                "{said} / {spoken}: {refused:?}"
-            );
-        }
     }
 
     /// A remote deck called by its name in the shared deck list (issue #1426),
@@ -10154,245 +9951,6 @@ mod tests {
         }
     }
 
-    /// Scenario: the audit of `fabb83d` — with `build-box` and `staging`
-    /// configured, "switch deck to build, not staging" answered with
-    /// `staging`. "build" is only part of the build box's names, so a
-    /// complete-phrase reading of the transcript saw one deck named, the
-    /// excluded one, and switched to it. Read with the resolver's own loose
-    /// matching the transcript names both, and every contrast-shaped request
-    /// is refused; one naming a single deck beside a contrast word ("not",
-    /// "rather than", "away from") is refused too, asking for just the deck.
-    /// A partial name with no contrast ("switch to build") still switches,
-    /// as do the plain controls and a deck whose own name holds "no".
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_refuses_a_contrast_or_a_loosely_named_second_deck() {
-        let pair = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box.example.com", false),
-            deck("deck-staging", "deploy@staging.example.com", false),
-        ];
-        let single = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-build-box", "deploy@build-box.example.com", false),
-        ];
-        // A contrast word inside a configured deck's own name is that name.
-        let named_no = [
-            deck("deck-local", "Local deck", true),
-            deck("deck-no-backup", "ops@no-backup.example.com", false),
-        ];
-        let both = [
-            "deploy@build-box.example.com".to_string(),
-            "deploy@staging.example.com".to_string(),
-        ];
-
-        for (said, spoken) in [
-            ("switch deck to build, not staging", "staging"),
-            ("switch to build not staging", "build"),
-            ("switch to staging instead of build", "staging"),
-            ("switch to staging instead of build", "build"),
-        ] {
-            let outcome = switched_over(&pair, said, spoken).await;
-            let VoiceOutcome::ParamAmbiguous {
-                action,
-                matches,
-                sentence,
-                ..
-            } = &outcome
-            else {
-                panic!("{said} / {spoken}: expected the decks named, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert_eq!(matches, &both.to_vec(), "{said}: {sentence}");
-            assert!(
-                sentence.contains("you named more than one daemon"),
-                "{sentence}"
-            );
-        }
-
-        for (said, spoken, marker) in [
-            ("switch to build, not staging", "build", "not"),
-            (
-                "switch deck to the build box rather than this one",
-                "build box",
-                "rather",
-            ),
-            ("switch away from the build box", "build box", "from"),
-            ("don't switch to the build box", "build box", "don't"),
-        ] {
-            let outcome = switched_over(&single, said, spoken).await;
-            let VoiceOutcome::ParamUnresolved {
-                action, sentence, ..
-            } = &outcome
-            else {
-                panic!("{said}: a contrast must refuse, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert!(
-                sentence.contains("say just the daemon you want"),
-                "{said}: {sentence}"
-            );
-            assert!(
-                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
-                "{said}: {sentence}"
-            );
-        }
-
-        for (decks, said, spoken, expected) in [
-            (&pair[..], "switch to build", "build", "deck-build-box"),
-            (
-                &pair[..],
-                "switch deck to staging",
-                "staging",
-                "deck-staging",
-            ),
-            (
-                &pair[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build-box",
-            ),
-            (&pair[..], "switch deck to local", "local", "deck-local"),
-            (
-                &named_no[..],
-                "switch deck to no backup",
-                "no backup",
-                "deck-no-backup",
-            ),
-            (
-                &single[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
-    /// Scenario: the audit of `a465eac` — a contrast word used to be excused
-    /// everywhere once ANY configured deck's name held it. With `no-backup`
-    /// and `no-cache` configured, "switch deck, no build box" answered with
-    /// `build box` switched to the excluded deck, and with `from-prod`
-    /// configured "switch from the build box" switched to the deck being
-    /// left. Each is refused now, as are the exclusion verbs the closed list
-    /// gained ("skip", "avoid", "leave", "without"). A contrast word inside
-    /// the one deck the user named — "no backup", "from prod" — is that
-    /// deck's name and still switches, as do the plain controls.
-    #[tokio::test]
-    async fn voice_outcome_switch_deck_excuses_a_contrast_word_only_inside_the_deck_named() {
-        let local = deck("deck-local", "Local deck", true);
-        let build = deck("deck-build-box", "deploy@build-box.example.com", false);
-        let no_backups = [
-            local.clone(),
-            build.clone(),
-            deck("deck-no-backup", "ops@no-backup.example.com", false),
-            deck("deck-no-cache", "ops@no-cache.example.com", false),
-        ];
-        let from_prod = [
-            local.clone(),
-            build.clone(),
-            deck("deck-from-prod", "ops@from-prod.example.com", false),
-        ];
-        let single = [local.clone(), build.clone()];
-
-        for (decks, said, spoken, marker) in [
-            (
-                &no_backups[..],
-                "switch deck, no build box",
-                "build box",
-                "no",
-            ),
-            (
-                &from_prod[..],
-                "switch from the build box",
-                "build box",
-                "from",
-            ),
-            (
-                &single[..],
-                "switch decks, skip the build box",
-                "build box",
-                "skip",
-            ),
-            (
-                &single[..],
-                "switch deck, avoid the build box",
-                "build box",
-                "avoid",
-            ),
-            (
-                &single[..],
-                "switch decks and leave the build box",
-                "build box",
-                "leave",
-            ),
-            (
-                &single[..],
-                "switch to anything without the build box",
-                "build box",
-                "without",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            let VoiceOutcome::ParamUnresolved {
-                action, sentence, ..
-            } = &outcome
-            else {
-                panic!("{said}: a contrast must refuse, got {outcome:?}");
-            };
-            assert_eq!(action, "switch_deck");
-            assert!(
-                sentence.contains(&format!("\u{201c}{marker}\u{201d}")),
-                "{said}: {sentence}"
-            );
-        }
-
-        for (decks, said, spoken, expected) in [
-            (
-                &no_backups[..],
-                "switch to no backup",
-                "no backup",
-                "deck-no-backup",
-            ),
-            (
-                &from_prod[..],
-                "switch to from prod",
-                "from prod",
-                "deck-from-prod",
-            ),
-            (
-                &no_backups[..],
-                "switch deck to the build box",
-                "build box",
-                "deck-build-box",
-            ),
-            (
-                &from_prod[..],
-                "switch deck to local",
-                "local",
-                "deck-local",
-            ),
-            (
-                &single[..],
-                "switch deck to this machine",
-                "this machine",
-                "deck-local",
-            ),
-        ] {
-            let outcome = switched_over(decks, said, spoken).await;
-            assert!(
-                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
-                    if params[0].value == expected),
-                "{said}: {outcome:?}"
-            );
-        }
-    }
-
     // -- the deck field and Discard (#1263, #1247) ---------------------------
 
     /// Scenario: the New agent dialog is open — with no directory chosen yet,
@@ -10428,6 +9986,69 @@ mod tests {
             matches!(&closed, VoiceOutcome::Unavailable { action, .. } if action == "choose_deck"),
             "{closed:?}"
         );
+    }
+
+    /// Scenario: the New agent dialog is open on a fleet with remote daemons
+    /// named `minipc` and `inmotion`, and the transcriber writes the user's
+    /// words the way speech-to-text does: "Daemon mini PC." (the one-word name
+    /// split in two), "Select mini PC, Demon." (a comma, and "daemon" heard as
+    /// its homophone), which the model answers with the app's selector row,
+    /// and "Daemon InMotionDeck." (the word "deck" glued onto the name). The
+    /// model answers with the listed daemon the user meant, and each chooses
+    /// it in the dialog's Daemon field.
+    #[tokio::test]
+    async fn voice_outcome_the_dialog_chooses_a_daemon_however_the_transcript_spells_its_name() {
+        let mut decks = decks();
+        for (id, label, address) in [
+            ("deck-minipc", "minipc", "ops@10.0.0.7"),
+            ("deck-inmotion", "inmotion", "ops@10.0.0.8"),
+        ] {
+            decks.push(VoiceDeck {
+                id: id.to_string(),
+                label: label.to_string(),
+                address: Some(address.to_string()),
+                local: false,
+                unavailable: None,
+            });
+        }
+        for declared in [VoiceNewAgent { form: None }, new_agent_form()] {
+            for (said, answer, id) in [
+                (
+                    "Daemon mini PC.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "minipc"),
+                    "deck-minipc",
+                ),
+                (
+                    "Select mini PC, Demon.",
+                    IntentAnswer::new("switch_deck").with_param("deck", "minipc"),
+                    "deck-minipc",
+                ),
+                (
+                    "Daemon InMotionDeck.",
+                    IntentAnswer::new("choose_deck").with_param("deck", "inmotion"),
+                    "deck-inmotion",
+                ),
+            ] {
+                let resolver = StubResolver::new().answering(said, answer);
+                let outcome = handle_utterance(
+                    &resolver,
+                    table(),
+                    Screen::Overview,
+                    &fleet(),
+                    &decks,
+                    None,
+                    Some(&declared),
+                    Transcript::new(said),
+                )
+                .await
+                .outcome;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { invoke, params, .. }
+                        if invoke == "chooseNewAgentDeck" && params[0].value == id),
+                    "{said}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: the New agent dialog is open and the user says "use the build
@@ -11042,33 +10663,6 @@ mod tests {
             matches!(&destination, VoiceOutcome::Dispatch { invoke, params, .. }
                 if invoke == "switchDeck" && params[0].value == "deck-daemon"),
             "{destination:?}"
-        );
-        // Control: said as the selector's heading, before a destination that
-        // names no daemon, it is not the destination — a model reading it as
-        // the deck is refused.
-        let heading = ask(
-            "switch daemon to deck",
-            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
-            Screen::Deck,
-            false,
-        )
-        .await;
-        assert!(
-            !matches!(&heading, VoiceOutcome::Dispatch { .. }),
-            "{heading:?}"
-        );
-        // Control: beside another word that could be a name, "daemon" is the
-        // selector's heading, so a model reading it as the deck is refused.
-        let other = ask(
-            "switch daemon to the ghost box",
-            IntentAnswer::new("switch_deck").with_param("deck", "daemon"),
-            Screen::Deck,
-            false,
-        )
-        .await;
-        assert!(
-            !matches!(&other, VoiceOutcome::Dispatch { .. }),
-            "{other:?}"
         );
         // Control: the category phrase is not the host's name said whole.
         let vague = ask(

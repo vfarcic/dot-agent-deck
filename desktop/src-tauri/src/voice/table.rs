@@ -526,8 +526,9 @@ pub enum ActionGrounding {
     /// merely occurs in it (PRD #1223, closing audit G1). Drawn from the row's own
     /// words under the same rule as [`ActionGrounding::HeardAs`].
     ///
-    /// **For a row whose action cannot be taken back**, and today that is
-    /// exactly `submit_prompt`. Token presence is evidence that the user
+    /// **First, for a row whose action cannot be taken back** — `submit_prompt`
+    /// was the first; every row using it, and why, is pinned by
+    /// `voice_table_whole_utterance_rows_are_the_deliberate_set`. Token presence is evidence that the user
     /// talked ABOUT a thing, and for most rows that is enough: a wrong
     /// navigation is one more utterance to undo. A prompt submitted to an
     /// agent cannot be recalled once the agent has it, and this row's
@@ -1356,6 +1357,11 @@ mod tests {
                 ("dictation_on", "startDictation", vec!["agent"]),
                 ("dictation_off", "stopDictation", vec!["agent"]),
                 ("submit_prompt", "submitAgentPrompt", vec!["agent"]),
+                // PRD #1541's typing-mode prompt commands, dispatched only by
+                // the dictation mode's local intercept.
+                ("interrupt_agent", "interruptAgent", vec!["agent"]),
+                ("clear_prompt", "clearAgentPrompt", vec!["agent"]),
+                ("scratch_that", "scratchLastDictation", vec!["agent"]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
                 // The directory browser inside that dialog — `overview`, plus
@@ -1972,12 +1978,18 @@ mod tests {
         // be taken back, and "discard" is an ordinary word. The dictation
         // mode's pair (PRD #1260) because a switch changes how every later
         // utterance is treated, so it must not ground on words said in passing.
+        // PRD #1541's three prompt commands because their whole-utterance
+        // vocabulary is exactly what the agent screen answers locally outside
+        // typing mode, which is what keeps the model from ever dispatching them.
         assert_eq!(
             whole,
             vec![
                 "dictation_on",
                 "dictation_off",
                 "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that",
                 "discard_new_agent"
             ]
         );
@@ -2436,7 +2448,10 @@ mod tests {
                 "dictate_to_agent",
                 "dictation_on",
                 "dictation_off",
-                "submit_prompt"
+                "submit_prompt",
+                "interrupt_agent",
+                "clear_prompt",
+                "scratch_that"
             ]
         );
     }
@@ -2458,6 +2473,11 @@ mod tests {
                     "dictation on",
                     "start dictation",
                     "keep typing",
+                    "talking on",
+                    "start talking",
+                    "speaking on",
+                    "start speaking",
+                    "dictate on",
                 ],
             ),
             (
@@ -2470,6 +2490,11 @@ mod tests {
                     "dictation off",
                     "stop dictation",
                     "done typing",
+                    "talking off",
+                    "stop talking",
+                    "speaking off",
+                    "stop speaking",
+                    "dictate off",
                 ],
             ),
         ] {
@@ -3169,12 +3194,17 @@ mod tests {
                 "{id}"
             );
         }
-        // Grounded by the word "daemon" (or "deck", its name before #1045)
-        // alone — no shared verb — so a steered pick needs the user to have
-        // talked about a daemon (see commands.toml).
+        // Grounded by the word "daemon" (or "deck", its name before #1045,
+        // or "demon", how speech-to-text writes it) alone — no shared verb —
+        // so a steered pick needs the user to have talked about a daemon (see
+        // commands.toml).
         assert_eq!(
             table.row("choose_deck").expect("present").grounding,
-            ActionGrounding::HeardAs(vec!["daemon".to_string(), "deck".to_string()])
+            ActionGrounding::HeardAs(vec![
+                "daemon".to_string(),
+                "deck".to_string(),
+                "demon".to_string()
+            ])
         );
     }
 

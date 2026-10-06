@@ -62,7 +62,7 @@ If a project defines two orchestrations with the same name, both chips are shown
 
 **Name** names the agent, or the orchestration run. It is pre-filled with the directory's name. For an orchestration, a name a live orchestration already uses on that daemon is refused, and if the directory already runs an orchestration on that daemon you are warned that the two share its role files and working tree.
 
-**Command** is what the agent runs, typically `claude`, `opencode`, `pi`, `codex` or `devin`. It is pre-filled from the chosen daemon's [`default_command`](../configuration.md#set-the-command-new-agents-start-with) when one is set, otherwise from the command this app last started a plain agent with on that daemon since the app was opened. Left empty:
+**Command** is what the agent runs, typically `claude`, `opencode`, `pi`, `codex` or `devin`. It is pre-filled from the chosen daemon's [`default_command`](../configuration.md#set-the-command-new-agents-start-with) when one is set, otherwise from the last command started from a New agent form on that daemon, in this app or in the TUI. Each daemon remembers its own, so it survives restarting the app or the daemon. A daemon from a release before this one does not remember it: there the field is pre-filled with the command this app last started an agent with on that daemon since the app was opened. Left empty:
 
 - with **No mode**, it starts the daemon's default shell;
 - with **schedule**, **schedule: issues** or **dispatcher**, it starts the daemon's `default_command`, or `claude` when none is set. The field's placeholder names the command.

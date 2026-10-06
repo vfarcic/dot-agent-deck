@@ -374,6 +374,11 @@ pub struct AgentSpawnOptions<'a> {
     /// into the PTY. Set only for a Pi start-role (orchestrator) pane; `None`
     /// for every other pane, which keeps the unchanged PTY-injection path.
     pub seed: Option<String>,
+    /// Issue #1540: this start was submitted from the New agent form, so the
+    /// deck may remember its command as the form's next pre-fill. `false` for
+    /// every other start — orchestration roles, restores and anything else —
+    /// so none of them ever becomes the deck's last command.
+    pub remember_command: bool,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -388,6 +393,7 @@ impl Default for AgentSpawnOptions<'_> {
             cols: 80,
             agent_type: None,
             seed: None,
+            remember_command: false,
         }
     }
 }
@@ -637,6 +643,17 @@ pub trait PaneController: Send + Sync {
             delivery_id,
         ))
     }
+    /// Issue #1445: tell the daemon that the orchestrator in `pane_id` has just
+    /// been re-armed from `context_path`, so the context file it records for
+    /// that orchestration — the one a TUI attaching later is handed, and the
+    /// ones it deletes when the orchestration ends — follows the re-arm.
+    ///
+    /// Fire-and-forget, for a caller on the TUI's render thread: nothing the
+    /// tab holds depends on the answer, since the tab already points at the
+    /// file it published. The default does nothing — correct for controllers
+    /// with no daemon behind them. The daemon-backed `EmbeddedPaneController`
+    /// overrides it to send the report on its runtime.
+    fn report_orchestrator_context(&self, _pane_id: &str, _context_path: &std::path::Path) {}
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

@@ -69,6 +69,7 @@ fn seed_orchestration(daemon: &DaemonProc, cwd: &str) {
                 agent_type: AgentType::from_command(Some("sleep 600")),
                 seed: None,
                 authoring_kind: None,
+                remember_command: false,
             })
             .expect("StartAgent over the attach socket");
         assert!(

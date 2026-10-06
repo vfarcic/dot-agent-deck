@@ -1721,6 +1721,45 @@ impl TuiDeck {
         }
     }
 
+    /// Wait for `needle` on this deck's rendered grid, or in the daemon-side
+    /// scrollback of pane `agent_id` (wrap-insensitively, as
+    /// [`wait_for_pane_text_on`]) for an agent whose output has already scrolled
+    /// off the screen. Returns `true` as soon as either holds, `false` if
+    /// `timeout` elapses.
+    ///
+    /// The grid is the screen a user is looking at, and it is the route that
+    /// matters for an agent that redraws differentially (Claude Code moves the
+    /// cursor over characters already on screen instead of rewriting them, so
+    /// stripping the escapes out of its raw scrollback can drop characters —
+    /// issue #1396). Decision 21: the polling lives here, never in an
+    /// `e2e_*.rs` body. The grid is read every 50 ms; the scrollback, which
+    /// pulls the pane's whole ring across the attach socket, at most every
+    /// 750 ms.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn wait_for_grid_or_pane_text_within(
+        &self,
+        socket: &Path,
+        agent_id: &str,
+        needle: &str,
+        timeout: Duration,
+    ) -> bool {
+        const PANE_READ_EVERY: Duration = Duration::from_millis(750);
+        let key = search_key(needle);
+        let next_pane_read = std::cell::Cell::new(Instant::now());
+        self.wait_for_grid_predicate_within(timeout, |grid| {
+            if grid.contains(needle) {
+                return true;
+            }
+            let now = Instant::now();
+            if now < next_pane_read.get() {
+                return false;
+            }
+            next_pane_read.set(now + PANE_READ_EVERY);
+            pane_search_key_on(socket, agent_id).contains(&key)
+        })
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///
@@ -2471,11 +2510,24 @@ impl Drop for TuiDeck {
             // PRD #77 Decision 30 / M4: regenerate the paired `.md`
             // for this test so a `DOT_AGENT_DECK_RECORD=1` run keeps
             // the doc next to the freshly-written cast in sync with
-            // the test source. Cheap (~3 files to parse today);
-            // best-effort — a generator error is surfaced to stderr
-            // but does NOT poison the test result, because rule 7
-            // already catches drift in CI.
-            regenerate_paired_doc(&self.test_name);
+            // the test source. Best-effort — a generator error is
+            // surfaced to stderr but does NOT poison the test result,
+            // because rule 7 already catches drift in CI.
+            //
+            // Issue #1566: NOT on the panic path. The generator
+            // syn-parses every `#[spec]`-bearing source file in a debug
+            // build, measured at 8–24s on a loaded 16-core box
+            // (2026-10-04) against 0.4s for the dump above, and on CI's
+            // starved 4-CPU runners it kept a test that panicked 5s in
+            // alive past nextest's 180s timeout, so the run reported a
+            // timeout instead of the panic. Nothing that reads a failure
+            // needs the doc: CI uploads no recordings, the demo-reel
+            // adapter refuses a recording whose provenance is not
+            // `passed`, and `cargo xtask docs --tests` rebuilds it on
+            // demand. `harness/teardown/001` pins this.
+            if !panicking {
+                regenerate_paired_doc(&self.test_name);
+            }
         }
     }
 }
@@ -5438,9 +5490,9 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// mentions usage limits — would silently delete real coverage. A host
 /// capability question belongs in a preflight, and this is the preflight.
 ///
-/// Two tests pay the probe — `orchestration/delegate/015` and
-/// `opencode_auto_submits_daemon_injected_prompt` (the only two callers) — each
-/// in its own nextest process, so the cost is two cheap turns per lane-2 run.
+/// Every test gated on this function pays the probe, each in its own nextest
+/// process, so the cost is one cheap turn per gated test that a lane-2 run
+/// selects (`grep -rn 'check_opencode_available()' tests/` lists them).
 /// [`check_devin_available`] documents the case where that trade goes the other
 /// way.
 pub fn check_opencode_available() -> Result<(), String> {
@@ -5481,7 +5533,7 @@ pub fn check_opencode_available() -> Result<(), String> {
 /// but a probe whose pass condition survives only while that stays true is a
 /// probe that can silently become vacuous, and a vacuous availability gate is
 /// strictly worse than none: it converts every skip into a confusing failure.
-const OPENCODE_PROBE_PROMPT: &str =
+pub(crate) const OPENCODE_PROBE_PROMPT: &str =
     "Reply with only the number equal to 4000 plus 444. Do not use tools.";
 const OPENCODE_PROBE_ANSWER: &str = "4444";
 
@@ -5494,10 +5546,11 @@ const OPENCODE_PROBE_ANSWER: &str = "4444";
 ///
 /// FINITE, which the sibling [`check_codex_available`] probe is not. An
 /// unbounded probe that wedges spends the test's entire nextest kill window
-/// (3 x 60 s by default here, and neither of the two callers has an override),
-/// after which the process is SIGKILLed — producing no skip, no failure message
-/// and no diagnostics whatever. 60 s leaves two thirds of that window for the
-/// scenario the probe is only the gate for.
+/// (3 x 60 s by default here; some callers widen theirs in
+/// `.config/nextest.toml`), after which the process is SIGKILLed — producing
+/// no skip, no failure message and no diagnostics whatever. 60 s leaves two
+/// thirds of the default window for the scenario the probe is only the gate
+/// for.
 const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One bounded, minimal turn against [`opencode_test_model`], so a model these
@@ -5554,16 +5607,35 @@ fn opencode_model_probe() -> Result<(), String> {
         Some(s) if !s.success() => format!("exited unsuccessfully ({s})"),
         Some(_) => format!("exited 0 but never answered {OPENCODE_PROBE_ANSWER:?}"),
     };
-    Err(format!(
+    Err(opencode_probe_failure_message(
+        model,
+        &observed,
+        &redact_credentials_for_output(text.trim()),
+    ))
+}
+
+/// The SKIP reason [`opencode_model_probe`] returns, split out so its advice
+/// can be unit-tested without spawning `opencode`. `probe_output` must already
+/// be redacted.
+pub(crate) fn opencode_probe_failure_message(
+    model: &str,
+    observed: &str,
+    probe_output: &str,
+) -> String {
+    format!(
         "OpenCode cannot reach model `{model}` with this host's credentials: the probe \
          {observed}. An exhausted subscription quota, a login for a different provider, and \
-         a retired model id all land here — read the probe output below. Point \
-         {OPENCODE_TEST_MODEL_ENV} at a model these credentials can reach (e.g. \
-         `openai/gpt-5.4-mini` for a ChatGPT-subscription `opencode auth login`, or an \
-         `openrouter/…` id for an OpenRouter key), or authorise the default with \
-         {ANTHROPIC_API_KEY_ENV} or `opencode auth login`.\nProbe output:\n{}",
-        redact_credentials_for_output(text.trim())
-    ))
+         a retired model id all land here — read the probe output below. Authorise the \
+         default with {ANTHROPIC_API_KEY_ENV} or `opencode auth login`, or point \
+         {OPENCODE_TEST_MODEL_ENV} at a model these credentials can reach. To find one, \
+         list candidates with `opencode models <provider>` (`openai` for a \
+         ChatGPT-subscription `opencode auth login`, `openrouter` for an OpenRouter key). \
+         A login can still reject a listed id (ChatGPT logins answer \"not supported when \
+         using Codex with a ChatGPT account\"), so try each candidate with this check's own \
+         probe, with MODEL_ID replaced by an id from that listing, and keep one that \
+         answers {OPENCODE_PROBE_ANSWER}: \
+         `opencode run --model MODEL_ID \"{OPENCODE_PROBE_PROMPT}\"`.\nProbe output:\n{probe_output}"
+    )
 }
 
 /// Whether an ambient `ANTHROPIC_API_KEY` is enough to run the OpenCode tests —
@@ -5607,10 +5679,12 @@ pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 /// came up on it).
 ///
 /// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
-/// same day and **also still works**, by both routes. It is named here rather
-/// than silently dropped because the swap is a refresh of a dated claim, not the
-/// retirement of a dead model id: if you are already exporting it, nothing is
-/// wrong. (The probe that appeared to condemn it was measuring its own defect —
+/// same day and still worked then, by both routes. **It no longer does on a
+/// ChatGPT login:** on 2026-10-04 codex-cli 0.160.0 answered `The
+/// 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
+/// account` while `gpt-5.6-luna` answered (issue #1564), so a host still
+/// exporting it now fails [`check_codex_available`]'s probe. (The 2026-08-26 probe
+/// that appeared to condemn it was measuring its own defect —
 /// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
 /// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
 /// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
@@ -5695,9 +5769,16 @@ pub fn codex_test_model() -> &'static str {
 ///   surfaces as a `SKIP:` naming the model (a hard failure under
 ///   `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
 ///
-/// **A subscription host keeps its old behaviour by exporting
-/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini`** — verified
-/// reachable on 2026-09-08, so this is a live route and not a historical note.
+/// **A subscription host with no Anthropic key exports an `openai/…`
+/// override its login accepts**, e.g.
+/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.6-luna`. Which ids those
+/// are changes on OpenAI's schedule: `openai/gpt-5.4-mini`, verified here on
+/// 2026-09-08, was rejected for a ChatGPT login on 2026-10-04 (OpenCode
+/// 1.18.34: "not supported when using Codex with a ChatGPT account", as were
+/// `openai/gpt-5.4` and `openai/gpt-5.3-codex-spark`) while
+/// `openai/gpt-5.6-luna` passed (issue #1564). So the probe's SKIP reason
+/// ([`opencode_probe_failure_message`]) says how to find an accepted id
+/// rather than naming one.
 ///
 /// Nothing OpenCode-specific is lost by the provider move. What these two tests
 /// assert is OpenCode's own surface — its composer paint, its auto-submit, its
@@ -5715,10 +5796,10 @@ pub(crate) const OPENCODE_TEST_MODEL_DEFAULT: &str = "anthropic/claude-haiku-4-5
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
 /// credentials cannot reach the default — e.g. one holding a
 /// ChatGPT-subscription `opencode auth` login and no Anthropic key, which
-/// exports `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openai/gpt-5.4-mini` (the
-/// default until issue #922; still reachable, see
-/// [`OPENCODE_TEST_MODEL_DEFAULT`]), or one authenticated to OpenRouter alone,
-/// which exports `openrouter/openai/gpt-4o-mini`.
+/// exports an `openai/…` id that login accepts (`openai/gpt-5.6-luna` on
+/// 2026-10-04; see [`OPENCODE_TEST_MODEL_DEFAULT`] for why no id is pinned
+/// here), or one authenticated to OpenRouter alone, which exports
+/// `openrouter/openai/gpt-4o-mini`.
 pub const OPENCODE_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_MODEL";
 
 /// Cheap provider-qualified model used by real-agent OpenCode e2e coverage —
@@ -7411,6 +7492,12 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
 // import is reproduced here.
 
 use std::sync::OnceLock;
+
+#[cfg(unix)]
+mod hook_capability;
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use hook_capability::{capability_export_command, recorded_hook_capability};
 
 #[allow(dead_code)]
 static LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -9680,6 +9767,9 @@ impl DaemonProc {
             cmd.env(k, v);
         }
         cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
+        // This helper sends from outside the pane. Never replay an ambient
+        // capability belonging to the pane running the test suite.
+        cmd.env_remove("DOT_AGENT_DECK_PANE_CAPABILITY");
         if let Some(id) = agent_id {
             cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
         }
@@ -9713,6 +9803,14 @@ pub struct EventSub {
 #[cfg(unix)]
 #[allow(dead_code)]
 impl EventSub {
+    /// Open a `SubscribeEvents` stream against any daemon's attach socket — an
+    /// in-process one ([`InProcDaemon::attach_path`]) as well as a
+    /// `daemon serve`, whose [`DaemonProc::subscribe_events`] is this. Returns
+    /// once the subscription is provably live, like that one.
+    pub fn subscribe(attach_socket: &Path) -> Self {
+        Self::open(attach_socket).expect("open SubscribeEvents stream")
+    }
+
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
     /// (so the daemon's per-connection broadcast receiver exists before we
     /// return — nothing broadcast afterward can be missed), then spawn a reader
@@ -11130,10 +11228,14 @@ pub fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
     cond()
 }
 
-/// Whether `pid` is still a live (non-exited) process. A reaped pid is gone; a
-/// reparented-then-exited pid may briefly be a zombie — treat state `Z` as
-/// exited so the check isn't fooled by an unreaped zombie under a sub-reaper.
-/// Uses `/proc` on Linux and falls back to a `kill(pid, 0)` probe elsewhere.
+/// Whether `pid` is still a live (non-exited) process. A reaped pid is gone,
+/// and so is a zombie: an exited pid nobody has reaped yet — under a
+/// sub-reaper, or the caller's own child before it calls `Child::wait` — reads
+/// as exited, so a test may poll its own child with this. Linux reads the
+/// state from `/proc`, macOS from `proc_pidinfo` (issue #1565: a bare
+/// `kill(pid, 0)` succeeds on a zombie, which is how #397's wrapper read as
+/// alive 15 s after it exited). Other Unixes still fall back to that
+/// zombie-blind `kill(pid, 0)` probe; the test suite runs on neither.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn process_running(pid: i32) -> bool {
@@ -11149,12 +11251,46 @@ pub fn process_running(pid: i32) -> bool {
             if Path::new("/proc").is_dir() {
                 false // Linux: no /proc entry → the pid is gone.
             } else {
-                // SAFETY: kill(pid, 0) only probes existence/permission.
-                unsafe { libc::kill(pid, 0) == 0 }
+                process_running_without_proc(pid)
             }
         }
         Err(_) => true,
     }
+}
+
+/// [`process_running`] where there is no `/proc`. On macOS `proc_pidinfo`
+/// reports the BSD process status, so a zombie (`SZOMB`) reads as exited.
+/// Passing `1` as its `arg` asks xnu to look zombies up as well; if it does
+/// not find one, `ESRCH` is the answer for a zombie and a reaped pid alike.
+#[cfg(target_os = "macos")]
+fn process_running_without_proc(pid: i32) -> bool {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: a zeroed `proc_bsdinfo` is a valid out-buffer of `size` bytes.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if filled == size {
+        return info.pbi_status != libc::SZOMB;
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return false;
+    }
+    // Any other refusal says nothing about the pid's state; keep the old probe.
+    // SAFETY: kill(pid, 0) only probes existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_running_without_proc(pid: i32) -> bool {
+    // SAFETY: kill(pid, 0) only probes existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -11479,3 +11615,121 @@ impl BroadcastEventLog {
 // executions — 75.4% of everything `cargo test-e2e` selects. Add a new
 // harness unit test to that file, not to this one; the note at its head has
 // the reasoning and the rule for what belongs there.
+
+/// Raw input to one agent the way a client that is NOT the TUI writes it — the
+/// desktop's terminal bridge (`desktop/src-tauri/src/terminal.rs` `write`):
+/// one long-lived attach stream, one `KIND_STREAM_IN` frame per write, bytes
+/// untranslated (PRD #1541). Output is drained on a thread so the daemon
+/// never stalls on this client. Unlike [`TuiDeck::send_keys`] nothing passes
+/// through the TUI's own key handling.
+///
+/// The timed writes live here rather than in an `e2e_*.rs` body because a
+/// pause between two writes is part of what is being written — an agent's
+/// served interrupt carries one between its steps — and Decision 21 keeps
+/// every sleep in `common`.
+///
+/// Dropping it closes the connection and joins the drain thread, so a test
+/// that attaches leaves neither a thread nor a daemon-side connection behind.
+#[cfg(unix)]
+pub struct AttachInput {
+    stream: std::os::unix::net::UnixStream,
+    stop: Arc<AtomicBool>,
+    drain: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl AttachInput {
+    pub fn attach(socket: &Path, agent_id: &str) -> Self {
+        use dot_agent_deck::daemon_protocol::{AttachRequest, KIND_REQ};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(socket).expect("connect to the attach socket");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+        let request = AttachRequest::AttachStream {
+            id: agent_id.to_string(),
+            rows: None,
+            cols: None,
+            geometry_updates: false,
+            client_id: None,
+        };
+        let payload = serde_json::to_vec(&request).expect("serialize AttachStream");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        stream
+            .write_all(&header)
+            .expect("write AttachStream header");
+        stream
+            .write_all(&payload)
+            .expect("write AttachStream payload");
+        stream.flush().expect("flush AttachStream");
+        let mut reader = stream.try_clone().expect("clone the attach stream");
+        // `shutdown` in `Drop` is what ends this read; the timeout only bounds
+        // the join should a platform not wake a blocked read on shutdown.
+        reader
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let drain = std::thread::spawn(move || {
+            let mut sink = [0u8; 8192];
+            while !stop_reader.load(Ordering::Relaxed) {
+                match reader.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            stream,
+            stop,
+            drain: Some(drain),
+        }
+    }
+
+    /// One `KIND_STREAM_IN` frame carrying `bytes`.
+    pub fn write(&mut self, bytes: &str) {
+        use dot_agent_deck::daemon_protocol::KIND_STREAM_IN;
+        let mut header = [0u8; 5];
+        header[0] = KIND_STREAM_IN;
+        header[1..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+        self.stream
+            .write_all(&header)
+            .expect("write STREAM_IN header");
+        self.stream
+            .write_all(bytes.as_bytes())
+            .expect("write STREAM_IN payload");
+        self.stream.flush().expect("flush STREAM_IN");
+    }
+
+    /// Each `(bytes, pause)` as its own write, in order, waiting `pause` after
+    /// it before the next.
+    pub fn write_steps<'a>(&mut self, steps: impl IntoIterator<Item = (&'a str, Duration)>) {
+        for (bytes, pause) in steps {
+            self.write(bytes);
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AttachInput {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Shutting the socket down, not just dropping this half, is what
+        // closes it: the drain thread holds a clone of the same socket.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+    }
+}

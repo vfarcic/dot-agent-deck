@@ -43,6 +43,7 @@ import { SettingsSheet } from "./components/SettingsSheet";
 import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPanel";
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
+import { voicePaneAgent } from "./lib/promptKeys";
 import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "./lib/connectionRemedy";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
@@ -72,7 +73,7 @@ import { LaunchCleanupError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
-import type { AgentSession, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
+import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
 
@@ -196,6 +197,28 @@ export default function App() {
  */
 const PaneDictation = createContext<{ agentId: string; label: string } | undefined>(undefined);
 
+/**
+ * PRD #1541 — told about every write the user makes into an agent's terminal
+ * by hand, so the voice panel knows when a prompt holds words it did not type
+ * ("scratch that" and a clear's Undo refuse then). Absent outside the shell,
+ * where no voice panel listens.
+ */
+const KeyboardInput = createContext<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
+
+/**
+ * A terminal's `onTerminalInput`: the write, then — in the same tick, before
+ * any of its bytes can reach the daemon — telling {@link KeyboardInput} about
+ * it, with the promise that settles when it has been written.
+ */
+function useKeyboardInput(send: DeckRuntimeState["sendTerminalInput"]): DeckRuntimeState["sendTerminalInput"] {
+  const note = useContext(KeyboardInput);
+  return useCallback((target, data) => {
+    const sent = send(target, data);
+    note?.(target, data, sent);
+    return sent;
+  }, [note, send]);
+}
+
 export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = { kind: "overview" } }: { runtime: DeckRuntimeState; orchestrationPlatformIssue?: string; initialView?: DeckView }) {
   const [requestedView, setView] = useState<DeckView>(initialView);
   /**
@@ -259,6 +282,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * what `voice_off` needs and what neither the deck nor this shell can offer.
    */
   const panelVoiceContext = useRef<VoicePanelContext | undefined>(undefined);
+  /** PRD #1541 — where the voice panel listens for keyboard writes ({@link KeyboardInput}). */
+  const panelKeyboard = useRef<((target: AgentTarget, data: string, sent: Promise<void>) => void) | undefined>(undefined);
+  const noteKeyboard = useCallback((target: AgentTarget, data: string, sent: Promise<void>) => panelKeyboard.current?.(target, data, sent), []);
   /**
    * PRD #1223 U5 — the OVERVIEW's half, published while it is mounted:
    * `closeNewAgent` while the New agent dialog is open, so `close` can close
@@ -612,6 +638,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         ? (paneInput.notice ?? "its terminal cannot take input.")
         : (!paneDeckAttachable || heldPaneAgent ? "its deck is not answering." : undefined),
       terminalHidden: paneTab !== "terminal" || undefined,
+      /* PRD #1541 — the agent's type, turn and the deck's prompt keys, for
+         the interrupt / clear / scratch commands. */
+      ...voicePaneAgent(paneShownAgent),
     }
     : undefined), [agentView, heldPaneAgent, paneDeckAttachable, paneInput, paneShownAgent, paneTab]);
   /**
@@ -985,11 +1014,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       <DialogNumbered.Provider value={dialogNumbered}>
       <VoiceChoiceOpen.Provider value={choiceOpen}>
       <PaneDictation.Provider value={paneDictation}>
+      <KeyboardInput.Provider value={noteKeyboard}>
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} />
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
+      </KeyboardInput.Provider>
       </PaneDictation.Provider>
       </VoiceChoiceOpen.Provider>
       </DialogNumbered.Provider>
@@ -1067,6 +1098,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  */
 function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
+  const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
   const tabShown = useRef(onTabShown);
   tabShown.current = onTabShown;
@@ -1117,7 +1149,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
       inputResult={runtime.terminalInputResults?.[agentKey(view.deckId, agent.id)]}
       onSelect={() => undefined}
       onTabChange={setTab}
-      onTerminalInput={runtime.sendTerminalInput}
+      onTerminalInput={keyboardInput}
       onTerminalResize={runtime.resizeTerminal}
       appliedGeometry={runtime.appliedGeometry?.[agentKey(view.deckId, agent.id)]}
       /* The evidence drawer is the deck's, and no screen is mounted here that
@@ -1247,6 +1279,7 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
 
 export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void }) {
   const { mode, setShownTerminals } = runtime;
+  const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
   // "Select a deck" and renders nothing of the local deck the selection
   // resolves to underneath — see `deckScreenSnapshot`. Two sources, either of
@@ -2138,7 +2171,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   onSelect={() => VOICE_ACTIONS.focusAgent.run(voiceContext, { agentId: agent.id })}
                   // voice-registry-exempt: a tile's own tab strip, a control inside one tile; `focusTerminal` writes the same map only to show the terminal it focuses
                   onTabChange={(tab) => setTabs((current) => ({ ...current, [agent.id]: tab }))}
-                  onTerminalInput={runtime.sendTerminalInput}
+                  onTerminalInput={keyboardInput}
                   onTerminalResize={runtime.resizeTerminal}
                   appliedGeometry={runtime.appliedGeometry?.[agentKey(agent.daemonId, agent.id)]}
                   onEvidenceSelect={(id) => { setSelectedEvidenceId(id); VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext, { open: true }); }}

@@ -251,10 +251,14 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 ///
 /// # Decks are LABELS and nothing else (PRD #1223)
 ///
-/// `decks` names each observed deck the way the overview does — "Local deck",
-/// or `user@host[:port]` — so a model can tell that "the build box" is a deck
-/// rather than an agent, and answer a `deck_ref` param with the user's own
-/// words. No id, for the agents' reason: the app resolves, the model refers.
+/// `decks` names every daemon the Daemon selector lists, the way the overview
+/// does — "Local deck", a daemon's name, or `user@host[:port]` — so a model
+/// can tell that "the build box" is a deck rather than an agent, and answer a
+/// `deck_ref` param with the listed daemon the user meant, however the
+/// transcriber spelled it (issue #1491). `decks_without_new_agent`, present
+/// only when there are some, names the ones a new agent cannot start on: the
+/// Daemon selector switches to them, the New agent dialog does not offer them.
+/// No id, for the agents' reason: the app resolves, the model refers.
 ///
 /// # Directories are NAMES, only while the browser shows them (PRD #1223)
 ///
@@ -302,6 +306,18 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
             .map(|deck| deck.label.clone())
             .collect::<Vec<_>>(),
     });
+    // Issue #1491: every daemon the Daemon selector lists is in `decks`, so the
+    // ones a new agent cannot start on are named here, and only when there
+    // are some.
+    let without_new_agent: Vec<String> = request
+        .decks
+        .iter()
+        .filter(|deck| !deck.eligible())
+        .map(|deck| deck.label.clone())
+        .collect();
+    if !without_new_agent.is_empty() {
+        state["decks_without_new_agent"] = json!(without_new_agent);
+    }
     if let Some(directories) = request.directories {
         state["directories"] = json!({
             "entries": directories
@@ -505,6 +521,9 @@ pub(crate) mod tests {
                 "dictation_on".to_string(),
                 "dictation_off".to_string(),
                 "submit_prompt".to_string(),
+                "interrupt_agent".to_string(),
+                "clear_prompt".to_string(),
+                "scratch_that".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),

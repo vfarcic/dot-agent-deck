@@ -41,7 +41,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE, SetNamedSecurityInfoW,
+    SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
@@ -333,6 +334,27 @@ pub fn verify_object_owner_is_current_user(handle: HANDLE) -> Result<(), String>
     super::endpoint_owner_is_trusted(&owner, &ours)
 }
 
+/// Verify that the **file** behind `handle` is one this process could have
+/// created with a default security descriptor: its owner SID is our user SID
+/// or our token's default owner SID ([`super::file_owner_is_trusted`] has the
+/// rule and why it is sound).
+///
+/// [`verify_object_owner_is_current_user`] is the wrong check for such a file:
+/// it relies on the object having been created with an explicit `O:<our-sid>`,
+/// and a file written without one is owned by `BUILTIN\Administrators` under an
+/// elevated administrator token, so our own file would be refused. The handle
+/// needs `READ_CONTROL`, which a file opened for reading holds (`GENERIC_READ`
+/// includes it).
+pub fn verify_file_owner_is_current_user(handle: HANDLE) -> Result<(), String> {
+    let owner = object_owner_sid_of(handle, SE_FILE_OBJECT)
+        .map_err(|err| format!("cannot read the owner SID: {err}"))?;
+    let ours =
+        current_user_sid().map_err(|err| format!("cannot read the current user's SID: {err}"))?;
+    let default_owner = crate::platform::paths::token_default_owner_sid()
+        .map_err(|err| format!("cannot read the token's default owner SID: {err}"))?;
+    super::file_owner_is_trusted(&owner, &ours, &default_owner)
+}
+
 /// Owner SID of the kernel object behind `handle`, in canonical string form.
 ///
 /// `SE_KERNEL_OBJECT` (not `SE_FILE_OBJECT`): both callers hold kernel objects (a
@@ -344,6 +366,12 @@ pub fn verify_object_owner_is_current_user(handle: HANDLE) -> Result<(), String>
 /// `GENERIC_READ` expands to `STANDARD_RIGHTS_READ | …`, `STANDARD_RIGHTS_READ`
 /// *is* `READ_CONTROL`, and `MUTEX_ALL_ACCESS` includes it too.
 fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
+    object_owner_sid_of(handle, SE_KERNEL_OBJECT)
+}
+
+/// [`object_owner_sid`] for an object of type `object_type` — `SE_FILE_OBJECT`
+/// for a file handle.
+fn object_owner_sid_of(handle: HANDLE, object_type: SE_OBJECT_TYPE) -> io::Result<String> {
     let mut owner: PSID = ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `handle` is a live pipe handle owned by the caller for this call.
@@ -354,7 +382,7 @@ fn object_owner_sid(handle: HANDLE) -> io::Result<String> {
     let rc = unsafe {
         GetSecurityInfo(
             handle,
-            SE_KERNEL_OBJECT,
+            object_type,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
             ptr::null_mut(),

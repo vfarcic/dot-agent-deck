@@ -44,6 +44,7 @@ pub mod endpoint_resolve;
 pub mod env_override;
 pub mod error;
 pub mod event;
+pub mod event_subscriber;
 pub mod features;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
 // throttled input).
@@ -59,6 +60,8 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
+// Issue #1540: the deck's last New-agent-form command, owned by the daemon.
+pub mod last_command;
 pub mod lifetime_tag;
 pub mod logging;
 pub mod login_shell;
@@ -97,6 +100,9 @@ pub mod submit_echo;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_hangup;
+// Issue #1537: the DEC private-mode parser shared by the TUI's mouse-mode scan
+// and the daemon's output ring, which restores those modes on replay.
+pub(crate) mod terminal_modes;
 pub mod terminal_widget;
 // Issue #322: test-only, and never part of the shipped library. Unit tests in
 // this crate do not link `tests/common/`, so before this they allocated scratch

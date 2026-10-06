@@ -440,7 +440,7 @@ A role "reaches no worker" when it is not in the file, when it is the orchestrat
 
 ### One task per worker at a time
 
-A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a card can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy.
+A worker that has been given a task is busy until it sends `work-done`, and until then `delegate` refuses to give it another. What counts is whether the worker has reported, not its status: a worker's card (TUI) or row (desktop) can read idle while the worker still owes a `work-done`. A worker whose agent exited without reporting is still busy, until a different agent takes over its pane: a task the exited agent had received does not make the new agent busy.
 
 When the earlier task is not coming back:
 
@@ -513,7 +513,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts | What the orchestrator is told: its `prompt_template`, the available workers, and how to delegate. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |
@@ -680,6 +680,14 @@ The report names the worker's pane; the daemon log names the role and, for a fai
 ### `pane restart` says "has not crashed; pass --force to restart a healthy pane"
 
 Without `--force`, `pane restart` restarts only a worker whose agent has exited. An agent that is running but hung has not exited, so it is refused the same way. Look at the worker's pane; if it is stuck, run `dot-agent-deck pane restart <role> --force`. The orchestrator can use `--force` when it sees this message; if you want force-restarts to stay your decision, say so in its `prompt_template`.
+
+### `pane restart` says the worker's working directory "is not a directory"
+
+The directory the worker runs in has been deleted, or a file now has its path. Nothing was restarted and the running worker was left as it was. Put the directory back, or close the orchestration and start it again from a directory that exists.
+
+### `pane restart` says the prepared working directory "was replaced"
+
+The role was started from the desktop app's New agent dialog or Runs screen, and the directory at its path is no longer the one that launch checked: the project was moved away and another directory put in its place. Nothing was restarted and the running worker was left as it was. Move the original directory back, or start the orchestration again from the desktop app.
 
 ### `pane spawn` says the role "is already running in this orchestration"
 
