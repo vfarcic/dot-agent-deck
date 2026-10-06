@@ -301,14 +301,30 @@ pub fn opens_an_interactive_shell(command: &str) -> bool {
             args.iter()
                 .any(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
         } else {
-            args.iter().any(|arg| {
-                !arg.starts_with('-')
+            // Options that take a value (`--rcfile <file>`, `-o vi`) consume
+            // the next word, which is therefore not a script (Qodo, PR #1603).
+            const TAKES_A_VALUE: &[&str] = &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"];
+            let mut runs = false;
+            let mut skip_value = false;
+            for arg in &args {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                let is_option = arg.starts_with('-') || arg.starts_with('+');
+                if !is_option
                     || arg.eq_ignore_ascii_case("-command")
                     || arg.eq_ignore_ascii_case("-file")
                     || arg.strip_prefix('-').is_some_and(|rest| {
                         rest.chars().all(|c| c.is_ascii_lowercase()) && rest.contains('c')
                     })
-            })
+                {
+                    runs = true;
+                    break;
+                }
+                skip_value = TAKES_A_VALUE.contains(arg);
+            }
+            runs
         };
         return !runs_something;
     }
@@ -332,6 +348,9 @@ fn names_its_program_relatively(command: &str) -> bool {
     let program = program.trim_matches(['\'', '"']);
     (program.contains('/') || program.contains('\\'))
         && !std::path::Path::new(program).is_absolute()
+        // Rooted without a drive (`/opt/agent` on Windows) is not relative to
+        // the directory it starts in either.
+        && !program.starts_with(['/', '\\'])
         && !program.starts_with('~')
         && !program.starts_with('$')
 }
@@ -1691,6 +1710,9 @@ mod tests {
             "nix develop .#dev",
             "nix shell nixpkgs#hello",
             "nix-shell -p hello",
+            "bash --rcfile /tmp/rc",
+            "bash -o vi",
+            "zsh +o nomatch -i",
         ] {
             assert!(opens_an_interactive_shell(interactive), "{interactive:?}");
         }
@@ -1705,6 +1727,8 @@ mod tests {
             "nix develop -c claude",
             "nix-shell --run claude",
             "FOO=1 claude --model opus",
+            "bash --rcfile /tmp/rc ./agent.sh",
+            "bash /opt/launch-agent.sh",
         ] {
             assert!(!opens_an_interactive_shell(runs), "{runs:?}");
         }

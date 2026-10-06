@@ -12362,7 +12362,7 @@ impl AgentPtyRegistry {
             // actually launched with, which is the one passed in here; the old
             // one only says whether the restored badge below still fits it.
             spawn_command: previous_command,
-            badge_predates_command: _,
+            badge_predates_command: previous_badge_stale,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
             // deliberately dropped, not carried over. A token names one spawn,
@@ -12568,7 +12568,10 @@ impl AgentPtyRegistry {
             self.set_agent_type(pane_id_env, &observed);
             // Issue #1602: a badge learned under another command is display
             // only from here on — see `RunningAgent::badge_predates_command`.
-            if previous_command.as_deref() != Some(command.trim())
+            // Sticky: a badge already stale stays stale when the command is
+            // later restored, since it was never learned under that command
+            // either (Qodo, PR #1603: A → B → B).
+            if (previous_badge_stale || previous_command.as_deref() != Some(command.trim()))
                 && let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&new_agent_id)
             {
                 agent.badge_predates_command = true;
@@ -16943,6 +16946,19 @@ mod spawn_tests {
         assert_eq!(
             launch.agent_type, None,
             "a badge learned under the previous command must not be carried"
+        );
+
+        // A → B → B: the badge restored again is still the one learned under A.
+        let again = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat >/dev/null'")
+            .await
+            .expect("respawn again under the edited command");
+        assert_eq!(
+            registry
+                .configured_launch_of(&again)
+                .and_then(|l| l.agent_type),
+            None,
+            "a stale badge stays stale across a later respawn under the same command"
         );
         registry.shutdown_all();
     }
