@@ -323,8 +323,9 @@ mod tests {
     /// PRD #1487 audit A1: the production executor shape — the upgrade path's
     /// keepalive-only [`crate::daemon_upgrade::upgrade_ssh_executor`], which
     /// imposes no wall-clock kill of its own — with `ssh` swapped for a stand-in
-    /// that behaves like a hostile or broken remote. Each stand-in `exec`s one
-    /// process, as `ssh` itself is one process.
+    /// that behaves like a hostile or broken remote. Most stand-ins `exec` one
+    /// process, as `ssh` itself is one process; the descendant cases start a
+    /// second that inherits the streams, as a `ProxyCommand` does.
     #[cfg(unix)]
     mod production_executor_bounds {
         use super::*;
@@ -435,6 +436,146 @@ mod tests {
             .unwrap();
             let p = port_running(dir.path(), &format!("printf '%s\\n' '{line}'"));
             assert!(!p.probe().unwrap().running);
+        }
+
+        /// The pid a stand-in recorded for the descendant it started.
+        fn recorded_pid(path: &std::path::Path) -> libc::pid_t {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(pid) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "no pid recorded at {path:?}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Whether `pid` has stopped running: gone, or a zombie its new parent
+        /// has not reaped yet.
+        fn exited(pid: libc::pid_t) -> bool {
+            // SAFETY: signal 0 only checks that the pid exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+        }
+
+        fn assert_cleaned_up(pid: libc::pid_t) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !exited(pid) {
+                if Instant::now() >= deadline {
+                    // SAFETY: plain signal to the pid this test started.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    panic!("the descendant {pid} was left running");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Scenario: the stand-in starts a quiet descendant that inherits its
+        /// streams — a `ProxyCommand` or jump-route helper — prints a
+        /// well-formed reply and exits. The descendant never writes and never
+        /// closes the streams, yet the reply is parsed promptly and the
+        /// descendant is killed with the session's process group (PRD #1487
+        /// re-check R1, parent-exits case).
+        #[test]
+        fn a_quiet_descendant_holding_the_streams_cannot_outlive_a_finished_command() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let pidfile = dir.path().join("descendant.pid");
+            let line = serde_json::to_string(&DaemonProbe {
+                running: false,
+                hello: None,
+            })
+            .unwrap();
+            let p = port_running(
+                dir.path(),
+                &format!(
+                    "sleep 600 &\necho $! > '{}'\nprintf '%s\\n' '{line}'",
+                    pidfile.display()
+                ),
+            );
+            let started = Instant::now();
+            let probe = p.probe();
+            let elapsed = started.elapsed();
+            let pid = recorded_pid(&pidfile);
+            assert_cleaned_up(pid);
+            assert!(
+                elapsed < MUST_RETURN_WITHIN,
+                "the call waited on the descendant: {elapsed:?}"
+            );
+            assert!(!probe.unwrap().running);
+        }
+
+        /// Scenario: the same quiet descendant, under a command that never
+        /// finishes. At the deadline the whole group is killed — the command
+        /// and the descendant still holding its streams — and the call returns
+        /// instead of waiting for streams nobody will close (parent-killed
+        /// case).
+        #[test]
+        fn a_quiet_descendant_holding_the_streams_is_killed_with_a_stopped_command() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let pidfile = dir.path().join("descendant.pid");
+            let p = port_running(
+                dir.path(),
+                &format!(
+                    "sleep 600 &\necho $! > '{}'\nexec sleep 600",
+                    pidfile.display()
+                ),
+            );
+            let started = Instant::now();
+            let result = p.restart_installed(Some("0.46.0"), None);
+            let pid = recorded_pid(&pidfile);
+            assert_cleaned_up(pid);
+            assert_stopped_at_deadline(started, result);
+        }
+
+        /// Scenario: a descendant that leaves the session's process group
+        /// (`setsid`, as a `ControlPersist` master does) cannot be killed with
+        /// it, and still cannot hold the call past its deadline: its streams
+        /// are abandoned rather than waited on, whether the command exits or
+        /// is stopped.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_descendant_that_left_the_group_still_cannot_hold_the_call() {
+            if std::process::Command::new("setsid")
+                .arg("true")
+                .status()
+                .map_or(true, |s| !s.success())
+            {
+                eprintln!("SKIP: no `setsid` on this host");
+                return;
+            }
+            for tail in ["exit 0", "exec sleep 600"] {
+                let dir = crate::test_temp::tempdir().unwrap();
+                let pidfile = dir.path().join("descendant.pid");
+                let p = port_running(
+                    dir.path(),
+                    &format!(
+                        "setsid sleep 600 &\necho $! > '{}'\n{tail}",
+                        pidfile.display()
+                    ),
+                );
+                let started = Instant::now();
+                let result = p.probe();
+                let elapsed = started.elapsed();
+                let pid = recorded_pid(&pidfile);
+                // Out of reach of the group kill, so this test cleans it up.
+                // SAFETY: plain signal to the pid this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                assert!(
+                    elapsed < DEADLINE + Duration::from_secs(5),
+                    "`{tail}`: the call waited on an escaped descendant: {elapsed:?}"
+                );
+                if tail == "exec sleep 600" {
+                    assert_stopped_at_deadline(started, result);
+                }
+            }
         }
     }
 

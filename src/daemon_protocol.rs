@@ -4152,18 +4152,24 @@ fn restart_refusal(reason: RestartRefusalReason, message: String) -> AttachRespo
 ///    and nothing has been touched — before the live-set check, so nobody is
 ///    asked to confirm a restart that cannot happen.
 /// 3. Reserve, then snapshot what is at stake from the same sources
-///    `StopDaemon` reads (audit A2). The reservation is the `AppState` write
-///    guard, which holds every role-map change until it is released, plus the
-///    registry's [admission freeze](AgentPtyRegistry::freeze_admission), which
-///    refuses every new agent — a spawn still forking included — so nothing
-///    can join what the snapshot names.
+///    `StopDaemon` reads (audit A2). The reservation is the registry's
+///    [admission freeze](AgentPtyRegistry::freeze_admission), which refuses
+///    every new agent — a spawn still forking included — refuses a respawn
+///    before it touches the pane it would replace, and waits for respawns
+///    already refilling a pane, so nothing can join what the snapshot names
+///    (re-check R2). A respawn stuck past the freeze's wait is `InProgress`.
+///    The snapshot is one read of the role maps beside the registry; the
+///    `AppState` guard is released straight after it, never held across a
+///    network write (re-check, reviewer R1). A role registered later can only
+///    name an agent the snapshot already names, because registration follows
+///    the agent's publication and no agent publishes past the freeze.
 /// 4. Apply [`crate::daemon_restart::restart_decision`]; ask if it says so.
 ///    Asking releases the reservation first: what changes while the user
 ///    decides makes their confirmation stale, and they are asked again.
 /// 5. Write `Accepted` — a failed write aborts the restart (`?`), and the
 ///    reservation is released with nothing stopped.
 /// 6. Latch acceptance and record the successor; keep the admission freeze
-///    (the drain follows), release the role maps and the lock.
+///    (the drain follows), release the lock.
 /// 7. Disclose (#1109): the teardown inventory, then one line naming the target.
 /// 8. Drain, then signal shutdown. `run_daemon_with` spawns the successor once
 ///    the sockets are released.
@@ -4241,17 +4247,36 @@ async fn handle_restart_daemon(
         RestartSuccessor::ClientSpawns => (None, expected_version.clone()),
     };
 
-    // 3. Role maps first, so the admission freeze is held no longer than the
-    // snapshot and the reply need it.
-    let role_maps = state.write().await;
-    let admission = registry.freeze_admission();
-    let roles = role_maps.live_orchestration_roles(registry);
-    let at_stake = stop_set(&roles, &registry.agent_records());
+    // 3. The freeze first: it waits for respawns already refilling a pane
+    // (re-check R2), and nothing may be read before they have. Then one
+    // consistent read of the role maps and the registry, released at once —
+    // the snapshot is a value from here on, and no role-map change after it
+    // can put a role on an agent outside it (re-check, reviewer R1): every
+    // role registration follows its agent's publication, and none can publish
+    // past the freeze.
+    let admission = match registry.freeze_admission().await {
+        Ok(admission) => admission,
+        Err(crate::agent_pty::RespawnsInFlight) => {
+            let message = "an agent of this daemon is being restarted and did not finish in time; \
+                           try again once it is back"
+                .to_string();
+            warn!("RestartDaemon refused: {message}");
+            return write_resp(
+                stream,
+                &restart_refusal(RestartRefusalReason::InProgress, message),
+            )
+            .await;
+        }
+    };
+    let at_stake = {
+        let role_maps = state.read().await;
+        let roles = role_maps.live_orchestration_roles(registry);
+        stop_set(&roles, &registry.agent_records())
+    };
 
     // 4.
     if let Some(reply) = restart_decision(&at_stake, confirm.as_ref()) {
         drop(admission);
-        drop(role_maps);
         let stale = matches!(
             reply,
             RestartDaemonReply::NeedsConfirmation { stale: true, .. }
@@ -4302,7 +4327,6 @@ async fn handle_restart_daemon(
         None => restart.mark_accepted(None),
     }
     admission.keep();
-    drop(role_maps);
     drop(guard);
 
     // 7.
@@ -11388,6 +11412,103 @@ mod tests {
             fx.registry.is_admission_frozen(),
             "an accepted restart keeps refusing starts until the daemon exits"
         );
+    }
+
+    /// Scenario: a `clear = true` delegate is respawning a worker — its old
+    /// record already lifted out, the replacement not yet published — when a
+    /// client confirms a restart naming the old worker. The restart waits for
+    /// the respawn instead of snapshotting an empty pane, sees the replacement,
+    /// and asks again naming it; confirming that set is accepted with the
+    /// pane's new worker in the named set, so nothing it stops is unnamed and
+    /// no replacement is stranded (PRD #1487 re-check R2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_respawn_mid_window_is_named_by_the_restart_or_it_asks_again() {
+        let fx = RestartFixture::start().await;
+        let old = fx
+            .registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "respawning-pane".to_string(),
+                )],
+                ..crate::agent_pty::SpawnOptions::default()
+            })
+            .expect("the worker starts");
+        let confirm = crate::daemon_restart::stop_set(&[], &fx.registry.agent_records());
+
+        let (reached, release) = fx.registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = fx.registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .respawn_agent_for_pane("respawning-pane", "cat")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("the respawn reached its window")
+            .unwrap();
+
+        let restarting = {
+            let client = fx.client();
+            let request = RestartFixture::request(Some(confirm));
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !restarting.is_finished(),
+            "the restart must not answer while a pane is between workers"
+        );
+        release.send(()).unwrap();
+        let new = tokio::time::timeout(Duration::from_secs(30), respawn)
+            .await
+            .expect("the respawn finishes")
+            .unwrap()
+            .expect("the admitted respawn publishes its replacement");
+        assert_ne!(new, old);
+
+        let reply = tokio::time::timeout(Duration::from_secs(30), restarting)
+            .await
+            .expect("the restart answered")
+            .unwrap();
+        let at_stake = match reply {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                RestartDaemonReply::NeedsConfirmation {
+                    at_stake,
+                    stale: true,
+                },
+            )) => at_stake,
+            other => panic!("expected a fresh confirmation naming the replacement, got {other:?}"),
+        };
+        assert_eq!(
+            stop_set_ids(&at_stake),
+            std::collections::BTreeSet::from([new.clone()]),
+            "the question names the pane's replacement"
+        );
+        assert!(
+            !fx.registry.is_admission_frozen(),
+            "asking released the reservation"
+        );
+
+        match fx.restart(Some(at_stake)).await {
+            RestartDaemonReply::Accepted { stopping, .. } => {
+                assert_eq!(
+                    stop_set_ids(&stopping),
+                    std::collections::BTreeSet::from([new])
+                );
+                assert!(
+                    stopping
+                        .agents
+                        .iter()
+                        .any(|a| a.pane_id.as_deref() == Some("respawning-pane")),
+                    "the respawned pane is in the named set"
+                );
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        }
     }
 
     /// Scenario: the client that asked for the restart goes away while the

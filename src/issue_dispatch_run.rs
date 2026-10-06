@@ -502,36 +502,97 @@ pub async fn run_issue_dispatch(
     // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
     // today's run only picks up slots yesterday's run vacated).
     for issue in issues.into_iter().take(cfg.max_per_run) {
-        // M3.2 — per-issue error boundary: one failure never aborts the rest.
-        if let Err(message) = dispatch_one_issue(
-            task_name,
-            &workspace,
-            prompt_template,
-            cfg,
-            default_command.as_deref(),
-            issue,
-            &clone_dir,
-            registry,
-            worktrees,
-            notifier,
-            event_tx,
-            state,
-        )
-        .await
-        {
-            notifier.notify(NotifyEvent::IssueDispatchFailed {
-                task: task_name.to_string(),
-                repo: cfg.repo.clone(),
+        loop {
+            // M3.2 — per-issue error boundary: one failure never aborts the rest.
+            match dispatch_one_issue(
+                task_name,
+                &workspace,
+                prompt_template,
+                cfg,
+                default_command.as_deref(),
                 issue,
-                message,
-            });
+                &clone_dir,
+                registry,
+                worktrees,
+                notifier,
+                event_tx,
+                state,
+            )
+            .await
+            {
+                Ok(IssueOutcome::Handled) => break,
+                Err(message) => {
+                    notifier.notify(NotifyEvent::IssueDispatchFailed {
+                        task: task_name.to_string(),
+                        repo: cfg.repo.clone(),
+                        issue,
+                        message,
+                    });
+                    break;
+                }
+                // PRD #1487 re-check, reviewer R3: not reported as a failure.
+                // Retried once the restart is called off; if it goes ahead, this
+                // issue and the rest of the run are the successor's next fire.
+                Ok(IssueOutcome::DeferredForRestart) => {
+                    tracing::info!(
+                        task = task_name,
+                        issue,
+                        "issue dispatch deferred: the daemon is restarting"
+                    );
+                    if !registry.wait_for_admission().await {
+                        tracing::info!(
+                            task = task_name,
+                            "the daemon is going down; the rest of this run is left to its successor"
+                        );
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
-/// Process one candidate issue. `Ok(())` means it was dispatched OR skipped (a
-/// skip is surfaced here, not treated as an error); `Err` is a per-issue failure
-/// for the caller to surface through the notifier (M3.2).
+/// What happens to an issue's freshly created worktree when its spawn fails.
+///
+/// PRD #1487 re-check, reviewer R3: a restart's admission freeze is not a
+/// failure of this issue. A worktree left on disk would claim the issue on
+/// every later fire with no agent in it — a permanent loss — so the fresh,
+/// empty worktree is removed again and the issue deferred.
+///
+/// Any other failure: no agent will ever close to trigger cleanup, so the
+/// registry entry is dropped here. The worktree dir itself is left on disk —
+/// the next fire's worktree-exists idempotency signal reclaims the issue.
+async fn settle_failed_issue_spawn(
+    e: crate::spawn::SpawnError,
+    worktrees: &WorktreeRegistry,
+    worktree_dir: &Path,
+) -> Result<IssueOutcome, String> {
+    if matches!(e, crate::spawn::SpawnError::DaemonRestarting) {
+        if let Some(entry) = take_worktree(worktrees, worktree_dir) {
+            remove_worktree(worktree_dir, &entry.clone_dir, entry.policy).await;
+        }
+        return Ok(IssueOutcome::DeferredForRestart);
+    }
+    take_worktree(worktrees, worktree_dir);
+    Err(e.to_string())
+}
+
+/// What [`dispatch_one_issue`] did with an issue it did not fail on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueOutcome {
+    /// Dispatched, or skipped as already claimed (the skip is surfaced there).
+    Handled,
+    /// PRD #1487 re-check, reviewer R3: refused because the daemon is
+    /// restarting. The issue's worktree was removed again, so the slot stays
+    /// open for the next attempt — this daemon's, if the restart is called
+    /// off, or the successor's next fire.
+    DeferredForRestart,
+}
+
+/// Process one candidate issue. `Ok(Handled)` means it was dispatched OR
+/// skipped (a skip is surfaced here, not treated as an error), and
+/// `Ok(DeferredForRestart)` that the daemon refused the agent for now; `Err` is
+/// a per-issue failure for the caller to surface through the notifier (M3.2).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_issue(
     task_name: &str,
@@ -549,7 +610,7 @@ async fn dispatch_one_issue(
     // the daemon's delegate-routing maps — see
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
-) -> Result<(), String> {
+) -> Result<IssueOutcome, String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
     let notify_skip = || {
@@ -575,7 +636,7 @@ async fn dispatch_one_issue(
     let worktree_exists = paths.worktree_dir.exists();
     if worktree_exists {
         notify_skip();
-        return Ok(());
+        return Ok(IssueOutcome::Handled);
     }
 
     // SECONDARY — reached ONLY when the worktree is absent: an open PR whose
@@ -584,7 +645,7 @@ async fn dispatch_one_issue(
     let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
     if dispatch_decision(worktree_exists, open_pr) == DispatchDecision::Skip {
         notify_skip();
-        return Ok(());
+        return Ok(IssueOutcome::Handled);
     }
 
     // M2.2 — create the per-issue worktree on `agent/issue-<n>`. A concurrent
@@ -613,7 +674,7 @@ async fn dispatch_one_issue(
                 issue,
                 branch: paths.branch.clone(),
             });
-            return Ok(());
+            return Ok(IssueOutcome::Handled);
         }
     }
 
@@ -659,12 +720,7 @@ async fn dispatch_one_issue(
         compose_orchestrator_context: None,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
-        // The spawn failed after the worktree was created/recorded: no agent
-        // will ever close to trigger cleanup, so drop the registry entry here.
-        // The worktree dir itself is left on disk — the next fire's
-        // worktree-exists idempotency signal reclaims the issue.
-        take_worktree(worktrees, &paths.worktree_dir);
-        return Err(e.to_string());
+        return settle_failed_issue_spawn(e, worktrees, &paths.worktree_dir).await;
     }
 
     // M1.3 — surface the per-issue dispatch success.
@@ -673,7 +729,7 @@ async fn dispatch_one_issue(
         repo: cfg.repo.clone(),
         issue,
     });
-    Ok(())
+    Ok(IssueOutcome::Handled)
 }
 
 /// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
@@ -2347,6 +2403,51 @@ mod tests {
     }
 
     const PROBE: Duration = Duration::from_secs(5);
+
+    /// Scenario: an issue's worktree has just been created when its agent is
+    /// refused because the daemon is restarting. The worktree is removed again
+    /// and the issue deferred — not failed — so the next fire, here or on the
+    /// successor, does not find the issue claimed by an empty worktree. Any
+    /// other spawn failure keeps the old behaviour: reported, tree left on disk
+    /// (PRD #1487 re-check, reviewer R3).
+    #[tokio::test]
+    async fn a_restart_refusal_releases_the_issue_worktree_instead_of_claiming_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+
+        let outcome =
+            settle_failed_issue_spawn(crate::spawn::SpawnError::DaemonRestarting, &reg, &wt).await;
+        assert_eq!(outcome, Ok(IssueOutcome::DeferredForRestart));
+        assert!(
+            !wt.exists(),
+            "the refused issue's worktree was removed again"
+        );
+        assert_eq!(take_worktree(&reg, &wt), None, "and its record dropped");
+        assert_eq!(
+            dispatch_decision(wt.exists(), false),
+            DispatchDecision::Dispatch,
+            "so the next fire dispatches the issue"
+        );
+
+        let wt2 = tmp.path().join("repo-issue-8");
+        crate::git_env::fixture_git(&repo, tmp.path())
+            .args(["worktree", "add", "-q", "-b", "wt2", &wt2.to_string_lossy()])
+            .output()
+            .expect("git available");
+        record_worktree(&reg, &wt2, &repo, RemovalPolicy::Force);
+        let failed = settle_failed_issue_spawn(
+            crate::spawn::SpawnError::Agent("no such command".into()),
+            &reg,
+            &wt2,
+        )
+        .await;
+        assert!(failed.is_err(), "a real failure is still reported");
+        assert!(wt2.exists(), "and leaves its tree as before");
+    }
 
     #[tokio::test]
     async fn kept_worktree_preview_reports_a_dirty_keep_if_dirty_tree_with_its_path() {

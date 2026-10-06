@@ -1411,20 +1411,45 @@ fn make_schedule_callback(
                 }
             }
             let debounce = crate::spawn::reuse_debounce();
-            if let Err(e) = crate::spawn::spawn_or_reuse(
-                req,
-                new_tab_per_fire,
-                &registry,
-                &reuse,
-                &notifier,
-                debounce,
-                Some(&event_tx),
-                Some(&state),
-            )
-            .await
-            {
-                // Already surfaced via the notifier; log for the operator.
-                warn!(error = %e, "scheduled spawn failed");
+            loop {
+                match crate::spawn::spawn_or_reuse(
+                    req.clone(),
+                    new_tab_per_fire,
+                    &registry,
+                    &reuse,
+                    &notifier,
+                    debounce,
+                    Some(&event_tx),
+                    Some(&state),
+                )
+                .await
+                {
+                    Ok(()) => break,
+                    // PRD #1487 re-check, reviewer R3: refused because a restart
+                    // holds the admission freeze. Not a failure of this task, so
+                    // it is not reported as one: retried if the restart is called
+                    // off, and left to the successor daemon's next fire if it
+                    // goes ahead.
+                    Err(crate::spawn::SpawnError::DaemonRestarting) => {
+                        info!(
+                            task = %req.task_name,
+                            "scheduled fire deferred: the daemon is restarting"
+                        );
+                        if !registry.wait_for_admission().await {
+                            info!(
+                                task = %req.task_name,
+                                "the daemon is going down; this fire is left to its successor"
+                            );
+                            break;
+                        }
+                        info!(task = %req.task_name, "restart called off; firing again");
+                    }
+                    Err(e) => {
+                        // Already surfaced via the notifier; log for the operator.
+                        warn!(error = %e, "scheduled spawn failed");
+                        break;
+                    }
+                }
             }
         })
     })

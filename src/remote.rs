@@ -866,12 +866,14 @@ impl SshExecutor for SystemSshExecutor {
             secs = secs.min(own);
         }
         let mut cmd = self.build_command(target, command);
-        let capture = run_local_bounded(&mut cmd, secs, max_capture_bytes).map_err(|source| {
-            SshError::Io {
+        // Its own process group: a `ProxyCommand` or jump-route helper that
+        // outlives the session is killed with it (PRD #1487 re-check R1).
+        let capture = run_local_bounded_owning_group(&mut cmd, secs, max_capture_bytes).map_err(
+            |source| SshError::Io {
                 target: target.user_host(),
                 source,
-            }
-        })?;
+            },
+        )?;
         let Some(status) = capture.status else {
             return Err(SshError::Other {
                 target: target.user_host(),
@@ -917,6 +919,24 @@ pub struct LocalCapture {
     pub timed_out: bool,
 }
 
+/// How long a stream may stay open after the child [`run_local_bounded`]
+/// spawned has exited. A process that exited has said everything it will say —
+/// what it wrote is already in the pipe — so a stream still open past this is
+/// held by a descendant that inherited it (a `ProxyCommand`, a jump-route
+/// helper, a wrapper, a `ControlPersist` master started with `-v`), and waiting
+/// on it would put that descendant's lifetime in charge of the call's.
+const POST_EXIT_STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a cancelled stream reader gets to drain what is already buffered
+/// and close its pipe. On Unix the reader is non-blocking and stops within one
+/// poll tick; where it cannot be made non-blocking it is abandoned after this.
+const READER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// After a cancel, a reader keeps reading only what the kernel already holds
+/// — at most a pipe buffer, which Linux caps at 1 MiB — so a descendant that
+/// keeps writing cannot keep a cancelled reader alive.
+const FINAL_DRAIN_BYTES: usize = 1024 * 1024;
+
 /// Spawn `cmd`, enforce a laptop-side wallclock kill at `secs` seconds, and
 /// bound the in-memory capture of each stream at `max_capture_bytes`.
 ///
@@ -942,18 +962,30 @@ pub struct LocalCapture {
 /// - Applies `max_capture_bytes` to *each* stream independently — stdout and
 ///   stderr are separate attack vectors, and a hostile peer that floods stderr
 ///   drives memory growth just as easily as one that floods stdout. A drainer
-///   stops reading altogether at its cap; if the child keeps writing it fills
-///   the kernel pipe buffer, blocks in `write(2)`, and the deadline reaps it.
+///   stops reading altogether at its cap and closes its pipe, so a child that
+///   keeps writing dies of `SIGPIPE`/`EPIPE` or is reaped at the deadline.
 /// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
+/// - **The deadline bounds the streams, not only the child** (PRD #1487
+///   re-check R1). A descendant that inherited a stream keeps its write end
+///   open after the child exits or is killed, so "wait for EOF" can outlive any
+///   deadline. The call therefore never joins a reader unconditionally: once
+///   the child has exited, a stream still open after
+///   [`POST_EXIT_STREAM_GRACE`] is cancelled, and at the deadline both are.
+///   A cancelled reader drains what is already buffered and closes its pipe —
+///   on Unix it reads non-blocking under `poll(2)`, so it notices the cancel
+///   within a tick; elsewhere a reader still blocked after
+///   [`READER_STOP_GRACE`] is abandoned rather than joined, and exits when the
+///   last writer closes.
 /// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
-///   return `timed_out: true`. **The kill reaches the child only.** `ssh -G`
-///   evaluates `Match exec`, so a config with `Match exec "sleep 30"` has
-///   already forked a descendant that this does not signal; such a descendant
-///   is orphaned and reaped by init when it exits on its own. The bound this
-///   helper offers is on *our* wait and *our* memory, not on what the user's
-///   own configuration chose to spawn.
+///   return `timed_out: true`. **Here the kill reaches the child only.**
+///   `ssh -G` evaluates `Match exec`, so a config with `Match exec "sleep 30"`
+///   has already forked a descendant that this does not signal; such a
+///   descendant is orphaned and reaped by init when it exits on its own. The
+///   bound this helper offers is on *our* wait and *our* memory, not on what
+///   the user's own configuration chose to spawn.
+///   [`run_local_bounded_owning_group`] is the variant that also kills them.
 /// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
 ///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
 ///   loop and leak the child — probe callers already clamp to a sane upper
@@ -963,98 +995,125 @@ pub fn run_local_bounded(
     secs: u64,
     max_capture_bytes: usize,
 ) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, false)
+}
+
+/// [`run_local_bounded`], with the child started in a process group of its own
+/// on Unix, so that whatever it spawns into that group is killed with it.
+///
+/// The group is sent `SIGKILL` whenever the call ends with any of it possibly
+/// still running: at the deadline, and when the child has exited but a stream
+/// is still held open past [`POST_EXIT_STREAM_GRACE`] — the shape of a
+/// `ProxyCommand` or jump-route helper outliving its `ssh`. The child itself is
+/// reaped here; a killed descendant is not our child and is reaped by whoever
+/// inherited it. A descendant that left the group (`setsid`, as a
+/// `ControlPersist` master does) is not signalled, and the call still returns
+/// on time because its readers are cancelled rather than joined.
+///
+/// Not the default, because a child in its own group no longer receives the
+/// terminal's `Ctrl+C`: this is for short plumbing commands whose lifetime the
+/// caller owns outright (PRD #1487's remote upgrade), not for the
+/// user-interruptible install pipeline. On non-Unix hosts it is
+/// [`run_local_bounded`].
+pub fn run_local_bounded_owning_group(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, true)
+}
+
+fn run_local_bounded_in(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+    own_group: bool,
+) -> std::io::Result<LocalCapture> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if own_group {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn()?;
+    let group = OwnedGroup::of(&child, own_group);
 
     // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
-    // `None` so the uncapped install path keeps its plain `read_to_end`
-    // instead of looping through the chunked capped drainer for nothing.
+    // `None` so the uncapped install path reads without a byte limit.
     let cap = (max_capture_bytes != usize::MAX).then_some(max_capture_bytes);
-    let stdout_handle = child
-        .stdout
-        .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
-    let stderr_handle = child
-        .stderr
-        .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
+    let stdout = child.stdout.take().map(|s| PipeReader::spawn(s, cap));
+    let stderr = child.stderr.take().map(|s| PipeReader::spawn(s, cap));
+    let readers: Vec<&PipeReader> = stdout.iter().chain(stderr.iter()).collect();
 
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(secs))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
     let poll_interval = Duration::from_millis(50);
 
-    let join_pipes = |stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
-                      stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>|
-     -> (Vec<u8>, Vec<u8>) {
-        let stdout = stdout_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        (stdout, stderr)
-    };
+    let mut status = None;
+    let mut exited_at: Option<Instant> = None;
+    let mut timed_out = false;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    exited_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(source) => {
+                    group.kill(&mut child);
+                    let _ = child.wait();
+                    PipeReader::stop_all(&readers);
+                    return Err(source);
+                }
+            }
+        }
+        let streams_closed = readers.iter().all(|r| r.is_done());
+        if status.is_some() && streams_closed {
+            break;
+        }
+        let now = Instant::now();
+        let held_after_exit = exited_at.is_some_and(|at| {
+            at.checked_add(POST_EXIT_STREAM_GRACE)
+                .is_none_or(|limit| now >= limit)
+        });
+        if now >= deadline || held_after_exit {
+            // Something this call started may still be running: the child
+            // itself, or a descendant holding one of its streams open. Best
+            // effort, secondary errors ignored — SIGKILL is unblockable, so
+            // `wait` returns, and the readers are cancelled, never joined.
+            group.kill(&mut child);
+            if status.is_none() {
+                let _ = child.wait();
+                timed_out = true;
+            }
+            PipeReader::stop_all(&readers);
+            break;
+        }
+        std::thread::sleep(poll_interval);
+    }
 
+    let stdout = stdout.map(|r| r.take()).unwrap_or_default();
+    let stderr = stderr.map(|r| r.take()).unwrap_or_default();
     // A drainer stops exactly AT its cap, so a stream that reached it is a
     // prefix of what the child wanted to say. An output that happens to be
     // exactly `max_capture_bytes` long is reported truncated too; that errs
     // toward "I could not read all of it", which is the safe direction for
     // every caller here.
-    let truncated = |stdout: &[u8], stderr: &[u8]| {
-        stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child already exited; close the pipes by joining the
-                // drain threads (they will see EOF once the kernel reaps
-                // the writers).
-                let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                let truncated = truncated(&stdout, &stderr);
-                return Ok(LocalCapture {
-                    status: Some(status),
-                    stdout,
-                    stderr,
-                    truncated,
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best-effort cleanup: ignore secondary errors. SIGKILL
-                    // is unblockable so the child is guaranteed to be
-                    // reaped, and `wait` collects the zombie. Joining the
-                    // drain threads after kill ensures their pipe handles
-                    // don't outlive this function.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                    let truncated = truncated(&stdout, &stderr);
-                    return Ok(LocalCapture {
-                        status: None,
-                        stdout,
-                        stderr,
-                        truncated,
-                        timed_out: true,
-                    });
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_pipes(stdout_handle, stderr_handle);
-                return Err(source);
-            }
-        }
-    }
+    let truncated = stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes;
+    Ok(LocalCapture {
+        status,
+        stdout,
+        stderr,
+        truncated,
+        timed_out,
+    })
 }
 
 /// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds,
@@ -1101,40 +1160,209 @@ fn run_with_wallclock_kill(
     }
 }
 
-/// Drain a child-process pipe into a `Vec<u8>`, optionally capping how much
-/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
-/// the helper returns immediately once that bound is hit — no further `read`
-/// syscalls are issued. If the child keeps writing it will fill the kernel
-/// pipe buffer and then block in `write(2)`; the surrounding wallclock kill
-/// is the documented fallback that reaps such children. Errors are
-/// swallowed: a half-read pipe still returns the bytes that did land,
-/// matching the behavior `Command::output()` exhibits when the kernel closes
-/// the writer.
-fn drain_pipe<R: std::io::Read>(mut reader: R, cap: Option<usize>) -> Vec<u8> {
-    match cap {
-        None => {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        }
-        Some(cap) => {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                if buf.len() >= cap {
-                    break;
-                }
-                let needed = cap - buf.len();
-                let take = chunk.len().min(needed);
-                match reader.read(&mut chunk[..take]) {
-                    Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
+/// The process group [`run_local_bounded_owning_group`] put its child in, or
+/// none, in which case killing reaches the child alone.
+struct OwnedGroup {
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+}
+
+impl OwnedGroup {
+    fn of(child: &std::process::Child, own_group: bool) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: own_group
+                    .then(|| libc::pid_t::try_from(child.id()).ok())
+                    .flatten(),
             }
-            buf
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (child, own_group);
+            Self {}
         }
     }
+
+    /// SIGKILL the child, and the whole group when this call owns one. The
+    /// group id stays reserved while any member is alive, and the leader is
+    /// reaped only by this call, so the signal cannot reach a stranger's group
+    /// while it still matters.
+    fn kill(&self, child: &mut std::process::Child) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: killpg takes plain integers and has no memory effects.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+    }
+}
+
+/// One stream's drainer: a helper thread that reads the pipe into a shared
+/// buffer, so the caller can stop waiting for it — and still keep what it
+/// read — without joining the thread.
+struct PipeReader {
+    shared: std::sync::Arc<PipeShared>,
+}
+
+#[derive(Default)]
+struct PipeShared {
+    buf: std::sync::Mutex<Vec<u8>>,
+    /// Set by the reader once it has stopped and closed its pipe.
+    done: std::sync::atomic::AtomicBool,
+    /// Set by the caller to ask the reader to drain what is buffered and stop.
+    cancel: std::sync::atomic::AtomicBool,
+}
+
+impl PipeReader {
+    fn spawn<R>(pipe: R, cap: Option<usize>) -> Self
+    where
+        R: std::io::Read + PipeFd + Send + 'static,
+    {
+        let shared = std::sync::Arc::new(PipeShared::default());
+        let thread_shared = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            drain_pipe(pipe, cap, &thread_shared);
+            thread_shared
+                .done
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+        Self { shared }
+    }
+
+    fn is_done(&self) -> bool {
+        self.shared.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Cancel every reader, then give them [`READER_STOP_GRACE`] together to
+    /// drain and close. A reader still running after that is abandoned: it
+    /// owns nothing but its pipe and its share of the buffer.
+    fn stop_all(readers: &[&PipeReader]) {
+        for reader in readers {
+            reader
+                .shared
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let until = std::time::Instant::now() + READER_STOP_GRACE;
+        while !readers.iter().all(|r| r.is_done()) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// What this stream delivered so far.
+    fn take(self) -> Vec<u8> {
+        let mut buf = self
+            .shared
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *buf)
+    }
+}
+
+/// Drain a child-process pipe into `shared.buf`, optionally capping how much
+/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
+/// the helper stops — closing the pipe — once that bound is hit. Errors end
+/// the drain: a half-read pipe still keeps the bytes that did land, matching
+/// the behavior `Command::output()` exhibits when the kernel closes the writer.
+///
+/// On Unix the pipe is read non-blocking under `poll(2)`, so a cancel is
+/// noticed within a tick even while a quiet descendant holds the write end;
+/// after a cancel the reader takes what the kernel already holds (at most
+/// [`FINAL_DRAIN_BYTES`]) and stops. Elsewhere the read blocks, and a cancel
+/// is only noticed between reads.
+fn drain_pipe<R: std::io::Read + PipeFd>(mut pipe: R, cap: Option<usize>, shared: &PipeShared) {
+    use std::sync::atomic::Ordering;
+
+    let nonblocking = pipe.set_nonblocking();
+    let mut chunk = [0u8; 8192];
+    let mut after_cancel = 0usize;
+    let mut len = 0usize;
+    loop {
+        let cancelled = shared.cancel.load(Ordering::Acquire);
+        if cancelled && (!nonblocking || after_cancel >= FINAL_DRAIN_BYTES) {
+            break;
+        }
+        let room = cap.map_or(chunk.len(), |cap| cap.saturating_sub(len));
+        if room == 0 {
+            break;
+        }
+        let take = chunk.len().min(room);
+        match pipe.read(&mut chunk[..take]) {
+            Ok(0) => break,
+            Ok(n) => {
+                shared
+                    .buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+                len += n;
+                if cancelled {
+                    after_cancel += n;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancelled {
+                    // Everything the kernel held has been read.
+                    break;
+                }
+                pipe.wait_readable(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(pipe);
+}
+
+/// The two things [`drain_pipe`] needs from a pipe beyond `Read`, which only
+/// Unix can provide; elsewhere both are no-ops and the read blocks.
+trait PipeFd {
+    /// Switch the read end to non-blocking. `false` when that failed or is
+    /// not supported, in which case reads block.
+    fn set_nonblocking(&self) -> bool;
+    /// Wait up to `timeout` for the pipe to become readable (or closed).
+    fn wait_readable(&self, timeout: std::time::Duration);
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        let fd = self.as_raw_fd();
+        // SAFETY: fcntl on a descriptor this value owns; F_GETFL/F_SETFL have
+        // no memory effects. O_NONBLOCK is per open file description, and the
+        // child's write end is a different one, so the child is unaffected.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        }
+    }
+
+    fn wait_readable(&self, timeout: std::time::Duration) {
+        let mut pfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid pollfd, count 1; an EINTR return is just an early
+        // wake-up, and the caller reads again either way.
+        unsafe {
+            libc::poll(&mut pfd, 1, millis);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl<T> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        false
+    }
+
+    fn wait_readable(&self, _timeout: std::time::Duration) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -3130,6 +3358,37 @@ mod tests {
                 "{label}: expected the stripped residue in {msg:?}"
             );
         }
+    }
+
+    /// Scenario: a child that starts a quiet descendant inheriting its
+    /// streams, prints one line and exits. The plain runner does not own the
+    /// descendant, so it does not kill it — but it stops waiting for the
+    /// streams shortly after the child exits instead of until the descendant
+    /// does, and keeps the line (PRD #1487 re-check R1).
+    #[cfg(unix)]
+    #[test]
+    fn run_local_bounded_does_not_wait_on_a_descendant_after_the_child_exits() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 600 & echo \"pid=$!\""]);
+        let capture = run_local_bounded(&mut cmd, 60, 4096).unwrap();
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8(capture.stdout).unwrap();
+        if let Some(pid) = stdout
+            .trim()
+            .strip_prefix("pid=")
+            .and_then(|p| p.parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the call waited on the descendant: {elapsed:?}"
+        );
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out && !capture.truncated);
+        assert!(stdout.starts_with("pid="), "the line was lost: {stdout:?}");
     }
 }
 

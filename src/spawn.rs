@@ -169,6 +169,14 @@ pub enum SpawnError {
     /// available on the same value.
     #[error("refused to start the orchestration: {0}")]
     OrchestratorContext(crate::orchestrator_context::ContextPublishError),
+    /// PRD #1487 re-check, reviewer R3: a restart of the daemon holds its
+    /// admission freeze, so the agent was refused for now — not a failure of
+    /// this spawn. Nothing was left running (an orchestration rolled back what
+    /// it had started), and no `SpawnFailed` was raised: an unattended caller
+    /// defers instead — retrying if the restart is called off, and leaving the
+    /// work to the next fire of the successor daemon if it goes ahead.
+    #[error("failed to spawn agent: {}", crate::agent_pty::ADMISSION_FROZEN_REASON)]
+    DaemonRestarting,
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -1297,6 +1305,9 @@ fn spawn_one(
         agent_type: agent_type.or_else(|| AgentType::from_command(command)),
     };
     registry.spawn_agent(opts).map_err(|e| {
+        if e.is_admission_frozen() {
+            return SpawnError::DaemonRestarting;
+        }
         notifier.notify(NotifyEvent::SpawnFailed {
             task: task_name.to_string(),
             message: e.to_string(),
@@ -7923,6 +7934,101 @@ mod tests {
         fn notify(&self, event: NotifyEvent) {
             self.0.lock().expect("notifier mutex").push(event);
         }
+    }
+
+    /// Scenario: a scheduled single-agent fire lands while a daemon restart
+    /// holds its admission freeze. The spawn comes back as "the daemon is
+    /// restarting" — not as a failed spawn: no `SpawnFailed` is announced and
+    /// nothing is started — and once the restart is called off the same fire
+    /// starts its agent (PRD #1487 re-check, reviewer R3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fire_refused_by_a_restart_is_deferred_not_failed() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the fire's cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = RecordingNotifier::default();
+        let request = || SpawnRequest {
+            task_name: "deferred-1487".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            command: Some("cat".to_string()),
+            prompt: "unused".to_string(),
+            resolved_target: Some(SpawnTarget::SingleAgent {
+                command: Some("cat".to_string()),
+            }),
+            compose_orchestrator_context: None,
+        };
+
+        let reservation = registry
+            .freeze_admission()
+            .await
+            .expect("nothing in flight");
+        let err = match spawn(request(), &registry, &notifier, None, true, None).await {
+            Ok(_) => panic!("a spawn under a restart's reservation must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SpawnError::DaemonRestarting),
+            "the refusal is classified as a restart, not a failure: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("the daemon is restarting"),
+            "and still says why: {err}"
+        );
+        let seen = notifier.0.lock().expect("notifier mutex").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, NotifyEvent::SpawnFailed { .. })),
+            "a deferred fire is not announced as a failed spawn: {seen:?}"
+        );
+        assert!(registry.agent_records().is_empty(), "nothing was started");
+
+        // The restart is called off: the waiter says so, and the fire starts.
+        let waiter = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.wait_for_admission().await })
+        };
+        drop(reservation);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+                .await
+                .expect("the waiter resolves")
+                .unwrap(),
+            "a released freeze re-admits"
+        );
+        if spawn(request(), &registry, &notifier, None, true, None)
+            .await
+            .is_err()
+        {
+            panic!("the retried fire starts its agent");
+        }
+        assert_eq!(registry.agent_records().len(), 1);
+
+        // A restart that goes ahead: the waiter reports the daemon going down.
+        registry
+            .freeze_admission()
+            .await
+            .expect("nothing in flight")
+            .keep();
+        let waiter = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.wait_for_admission().await })
+        };
+        {
+            let registry = registry.clone();
+            tokio::task::spawn_blocking(move || {
+                registry.shutdown_all_graceful(std::time::Duration::from_millis(200))
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+                .await
+                .expect("the waiter resolves")
+                .unwrap(),
+            "an accepted restart leaves the fire to the successor"
+        );
     }
 
     /// Issue #1065: an orchestration whose coordinator context cannot be

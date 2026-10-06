@@ -669,12 +669,11 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         // still regenerated either way, so a template change still lands; only
         // the pinned path is carried over.
         //
-        // `pin_is_repairable`, not a bare existence probe: a legacy plugin
-        // pinning the BARE `"dot-agent-deck"` would otherwise be preserved
-        // whenever the process cwd happened to hold a file of that name, and
-        // Node's `execFileSync` then resolves that persisted bare name through
-        // the AGENT's `$PATH` (PRD #381 audit, MEDIUM-1 — issue #536's own
-        // vector).
+        // Not a bare existence probe: a legacy plugin pinning the BARE
+        // `"dot-agent-deck"` would otherwise be preserved whenever the process
+        // cwd happened to hold a file of that name, and Node's `execFileSync`
+        // then resolves that persisted bare name through the AGENT's `$PATH`
+        // (PRD #381 audit, MEDIUM-1 — issue #536's own vector).
         //
         // PRD #1487: a plugin pinning ANOTHER live, durable install is not
         // regenerated at all. Two installs of the deck each resolve to
@@ -682,14 +681,21 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         // otherwise be rewritten by whichever started last, every start. The
         // pinned install refreshes its own template when it starts; `hooks
         // install --agent opencode` is how a user picks a different one.
+        //
+        // PRD #1487 re-check R3: kept only on POSITIVE liveness — the rule the
+        // Claude, Codex and Devin automatic installs follow. Anything that is
+        // not established to be a live, durable install (bare or relative,
+        // missing, a path whose existence cannot be read, not executable, cargo
+        // build output) is replaced by the installing binary. This path used to
+        // fall back to `pin_is_repairable` here, which leaves an unstatable pin
+        // alone, so an inaccessible install stayed pinned for OpenCode alone.
         let (pinned, repairing) = match existing_binary_path(root) {
-            Some(existing)
-                if crate::agent_hook_config::auto_install_keeps(&existing)
-                    && !crate::agent_hook_config::executables_match(&existing, binary_path) =>
-            {
-                continue;
-            }
-            Some(existing) if !crate::platform::paths::pin_is_repairable(&existing) => {
+            Some(existing) if crate::agent_hook_config::auto_install_keeps(&existing) => {
+                if !crate::agent_hook_config::executables_match(&existing, binary_path) {
+                    continue;
+                }
+                // This very install: refresh the template, keep the pin's
+                // spelling.
                 (existing, false)
             }
             Some(_) => (binary_path.to_string(), true),
@@ -1547,6 +1553,47 @@ pub(crate) mod tests {
             before,
             std::fs::read(plugin_file(&dead_root)).expect("read again"),
             "a second auto-install pass changed the repaired plugin"
+        );
+    }
+
+    /// Scenario: an OpenCode plugin pins an absolute install inside a directory
+    /// the deck cannot search, so whether that install exists cannot be read.
+    /// The startup auto-install does not keep a pin it cannot establish is
+    /// live: it repoints the plugin at the installing binary, as the Claude,
+    /// Codex and Devin automatic installs do (PRD #1487 re-check R3). Skipped
+    /// where permissions do not bind, e.g. as root.
+    #[cfg(unix)]
+    #[test]
+    fn auto_install_replaces_a_pin_whose_existence_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let (artifact, durable) = artifact_and_durable(tmp.path());
+        let home = tmp.path().join("home");
+        let resolved =
+            crate::platform::paths::durable_binary_path_with(Ok(artifact.clone()), &home, None)
+                .expect("resolve durable");
+
+        let locked = tmp.path().join("locked");
+        let hidden = locked.join("bin").join("dot-agent-deck");
+        write_executable(&hidden);
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        write_plugin(&root, hidden.to_str().expect("UTF-8")).expect("seed plugin");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let undeterminable = hidden.try_exists().is_err();
+        if undeterminable {
+            auto_install_to(std::slice::from_ref(&root), &resolved);
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !undeterminable {
+            eprintln!("SKIP: permissions do not hide the pin on this host");
+            return;
+        }
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            durable.to_str(),
+            "a pin whose existence cannot be read must be replaced by the installing binary"
         );
     }
 
