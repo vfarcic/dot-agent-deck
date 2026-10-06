@@ -2665,6 +2665,38 @@ async fn hello_advertises_the_project_capabilities() {
     );
 }
 
+/// PRD #1487: the live `Hello` reply names the daemon process, the same on
+/// every connection to it — an upgrade tells the old daemon from its
+/// successor by it.
+#[tokio::test]
+async fn hello_names_the_daemon_process() {
+    let server = start_server().await;
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::Hello {
+                client_version: PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(resp.ok);
+        seen.push(
+            resp.instance_id
+                .expect("Hello must name the daemon process"),
+        );
+    }
+    assert_eq!(seen[0], seen[1], "one process, one identity");
+    assert_eq!(seen[0].len(), 32, "{:?}", seen[0]);
+    assert_eq!(
+        Some(seen[0].as_str()),
+        dot_agent_deck::daemon_protocol::daemon_instance_id()
+    );
+}
+
 #[tokio::test]
 async fn wrong_first_frame_kind_returns_err() {
     let server = start_server().await;

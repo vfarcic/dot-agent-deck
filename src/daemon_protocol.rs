@@ -490,6 +490,8 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The residual is the usual
 /// one — a raw sender that skips the check gets an older daemon's
 /// `malformed request` refusal and nothing is stopped — and it fails closed.
+/// Its [`AttachResponse::instance_id`] on the live `Hello` reply is the first
+/// rung, an additive optional field, so it contributes no bump either.
 ///
 /// # Where this constant is enforced
 ///
@@ -2997,6 +2999,36 @@ pub struct AttachResponse {
     /// capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart: Option<RestartDaemonReply>,
+    /// PRD #1487: a random identity minted once per daemon process
+    /// ([`daemon_instance_id`]), on the live daemon's `Hello` reply only — the
+    /// static `daemon hello` probe and the plain [`Self::hello`] constructor
+    /// leave it `None`, because they are not a running daemon.
+    ///
+    /// An upgrade records it before asking the daemon to restart and accepts a
+    /// successor only when the identity has changed, so the old daemon still
+    /// answering with the same build is never mistaken for its replacement.
+    /// Equal identities mean the same process; it carries no other meaning and
+    /// is not an authenticator. `None` is a daemon that predates the field (or
+    /// could not read OS randomness), and the upgrade then falls back to its
+    /// older rule. Additive and optional, so no [`PROTOCOL_VERSION`] bump: an
+    /// older client ignores the key and an older daemon omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+}
+
+/// PRD #1487: this daemon process's identity for [`AttachResponse::instance_id`]
+/// — 16 bytes of OS randomness, hex-encoded, minted on first use and fixed for
+/// the life of the process (an `exec` into a successor mints a new one).
+/// `None` when OS randomness is unavailable, which a client reads as a daemon
+/// that does not say.
+pub fn daemon_instance_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).ok()?;
+        Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    })
+    .as_deref()
 }
 
 /// Issue #1045: which spelling of the prepare verb a request used, or a client
@@ -3222,6 +3254,14 @@ impl AttachResponse {
     /// `None`, which a client reads as "withhold" — see [`Self::capabilities`].
     pub fn with_capabilities(mut self) -> Self {
         self.capabilities = Some(DAEMON_CAPABILITIES.iter().map(|c| c.to_string()).collect());
+        self
+    }
+
+    /// PRD #1487: name this daemon process on a handshake reply
+    /// ([`Self::instance_id`]). Only the live daemon's `Hello` handler calls
+    /// it.
+    pub fn with_instance_id(mut self) -> Self {
+        self.instance_id = daemon_instance_id().map(str::to_string);
         self
     }
 }
@@ -5973,9 +6013,12 @@ async fn handle_connection(
             // client asks a stable question ("do you know this op?") instead
             // of string-matching serde's `unknown variant` message. Absence
             // means withhold — see `AttachResponse::capabilities`.
+            // PRD #1487: and name this process, so an upgrade can tell its
+            // successor from it.
             let mut resp = AttachResponse::hello(advertised_protocol_version())
                 .with_guarded_send()
-                .with_capabilities();
+                .with_capabilities()
+                .with_instance_id();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -10524,6 +10567,34 @@ mod tests {
         assert!(back.ok);
         assert_eq!(back.server_version, Some(PROTOCOL_VERSION));
         assert_eq!(back.build_version.as_deref(), Some(env!("DAD_BUILD_ID")));
+    }
+
+    /// PRD #1487: `instance_id` is an additive optional field — the plain
+    /// `hello()` (what the static `daemon hello` probe prints) leaves it off
+    /// the wire, a reply from a daemon predating it decodes as `None`, and the
+    /// live handler's `with_instance_id` sets this process's identity.
+    #[test]
+    fn instance_id_is_additive_and_names_this_process() {
+        let plain = serde_json::to_value(AttachResponse::hello(PROTOCOL_VERSION)).unwrap();
+        assert!(
+            !plain.as_object().unwrap().contains_key("instance_id"),
+            "{plain}"
+        );
+        let legacy: AttachResponse =
+            serde_json::from_str(r#"{"ok":true,"server_version":10}"#).unwrap();
+        assert!(legacy.instance_id.is_none());
+
+        let live = AttachResponse::hello(PROTOCOL_VERSION).with_instance_id();
+        let id = live
+            .instance_id
+            .clone()
+            .expect("this process has an identity");
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        assert_eq!(daemon_instance_id(), Some(id.as_str()));
+        let back: AttachResponse =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(back.instance_id, Some(id));
     }
 
     #[test]

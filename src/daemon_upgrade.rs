@@ -129,6 +129,15 @@ fn shown_version(raw: &str) -> String {
     display_line(raw, REMOTE_NAME_MAX_BYTES)
 }
 
+/// `text` with its first character upper-cased, to open a sentence.
+fn sentence_start(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 impl UpgradeOutcome {
     /// Plain-language rendering for a person; the CLI prints it. Clients with
     /// their own surface may build their own from the fields instead.
@@ -221,7 +230,12 @@ impl UpgradeOutcome {
                     UpgradeStage::Verifying => "checking the restarted daemon",
                 };
                 let reason = display_message(reason, REMOTE_MESSAGE_MAX_BYTES);
-                let installed_version = installed_version.as_deref().map(shown_version);
+                // Starts a sentence below, and may be prose rather than a
+                // version ("an unverified build", when the check after the
+                // binary was replaced read none).
+                let installed_version = installed_version
+                    .as_deref()
+                    .map(|v| sentence_start(&shown_version(v)));
                 let mut text = format!("Upgrade of '{deck}' failed while {doing}: {reason}");
                 match (stage, installed_version) {
                     (UpgradeStage::Verifying, Some(v)) => text.push_str(&format!(
@@ -338,7 +352,10 @@ pub struct InstallError {
     /// In plain language, naming the step that failed.
     pub reason: String,
     /// Set when the new build was already in place and a step after it (the
-    /// hooks, the deck list) failed — the build is not rolled back.
+    /// hooks, the deck list) failed — the build is not rolled back. Also set
+    /// when the binary had been replaced and the version check after it
+    /// failed: then it is the version that check read, or
+    /// [`crate::remote::UNVERIFIED_BUILD`] when it read none.
     pub installed_version: Option<String>,
 }
 
@@ -514,10 +531,12 @@ pub const MAX_CONFIRM_ROUNDS: usize = 3;
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often to ask while waiting.
 pub const VERIFY_POLL: Duration = Duration::from_millis(250);
-/// When the new build is the same build as the old (a reinstall), its answer
-/// cannot be told from the old daemon's. If the endpoint was never seen empty,
-/// a matching answer is accepted once it has held this long — longer than the
-/// old daemon's whole drain (3s) plus margin, so it is not the old daemon.
+/// The fallback for an old daemon that does not name its process
+/// ([`AttachResponse::instance_id`], which predates it). When the new build is
+/// the same build as the old (a reinstall), its answer cannot be told from the
+/// old daemon's. If the endpoint was never seen empty, a matching answer is
+/// accepted once it has held this long — longer than the old daemon's whole
+/// drain (3s) plus margin, so it is taken not to be the old daemon.
 pub const VERIFY_SETTLE: Duration = Duration::from_secs(6);
 
 /// The waits [`upgrade_daemon`] uses, injectable so unit tests do not sleep.
@@ -624,7 +643,10 @@ fn run_upgrade(
         }
     };
     let from_version = hello.daemon_version.clone();
-    let from_build = hello.build_version.clone();
+    let from = OldDaemon {
+        build: hello.build_version.clone(),
+        instance: hello.instance_id.clone(),
+    };
     let not_restarted = |reason: NotRestartedReason| UpgradeOutcome::InstalledNotRestarted {
         from_version: from_version.clone(),
         installed_version: installed.version.clone(),
@@ -655,13 +677,7 @@ fn run_upgrade(
                     detail: None,
                 });
                 let expected = Expect::Version(installed.version.clone());
-                return match wait_for_successor(
-                    daemon,
-                    &expected,
-                    from_build.as_deref(),
-                    false,
-                    timing,
-                ) {
+                return match wait_for_successor(daemon, &expected, &from, false, timing) {
                     Ok(()) => UpgradeOutcome::Restarted {
                         from_version: from_version
                             .clone()
@@ -740,13 +756,7 @@ fn run_upgrade(
         RestartSuccessor::Installed => Expect::Version(installed.version.clone()),
         RestartSuccessor::ClientSpawns => Expect::Build(crate::build_id::local_build_id()),
     };
-    match wait_for_successor(
-        daemon,
-        &expected,
-        from_build.as_deref(),
-        endpoint_emptied,
-        timing,
-    ) {
+    match wait_for_successor(daemon, &expected, &from, endpoint_emptied, timing) {
         Ok(()) => UpgradeOutcome::Restarted {
             from_version: from_version.unwrap_or_else(|| "an unknown version".into()),
             to_version: installed.version,
@@ -782,27 +792,47 @@ enum Expect {
     Build(String),
 }
 
+/// What the daemon that was asked to restart said about itself, read from its
+/// `Hello` before the request.
+struct OldDaemon {
+    build: Option<String>,
+    /// [`AttachResponse::instance_id`]; `None` from a daemon that predates it.
+    instance: Option<String>,
+}
+
 /// Poll `daemon` until the successor answers as `expected`.
 ///
 /// An answer from the OLD daemon must not count: it keeps answering while it
-/// drains. A matching answer is the successor's when the endpoint was seen
+/// drains, and may go on answering if it never stops. When the old daemon
+/// named its process ([`AttachResponse::instance_id`]), a matching answer is
+/// the successor's only when it names a different one — the positive identity
+/// PRD #1487's review asked for, so the old daemon answering with the same
+/// build is never taken for its replacement however long it answers.
+///
+/// A daemon that predates the field names nothing, and then the older rule
+/// applies: a matching answer is the successor's when the endpoint was seen
 /// empty in between, or its build differs from the old daemon's, or (a
-/// reinstall of the very same build) it has kept matching for `settle`.
+/// reinstall of the very same build) it has kept matching for `settle` — longer
+/// than the old daemon's drain, which is an inference, not a proof.
 fn wait_for_successor(
     daemon: &dyn DaemonPort,
     expected: &Expect,
-    from_build: Option<&str>,
+    from: &OldDaemon,
     mut endpoint_emptied: bool,
     timing: Timing,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timing.timeout;
     let mut matching_since: Option<Instant> = None;
     let mut last_seen: Option<String> = None;
+    // Whether the last answer named the old daemon's process: it never
+    // stopped, which the failure then says rather than blaming a successor.
+    let mut old_still_answering = false;
     loop {
         match daemon.probe() {
             Ok(None) => {
                 endpoint_emptied = true;
                 matching_since = None;
+                old_still_answering = false;
             }
             Ok(Some(hello)) => {
                 let matches = match expected {
@@ -810,14 +840,25 @@ fn wait_for_successor(
                     Expect::Build(b) => hello.build_version.as_deref() == Some(b.as_str()),
                 };
                 last_seen = hello.daemon_version.clone().or(hello.build_version.clone());
+                old_still_answering = from.instance.is_some() && hello.instance_id == from.instance;
                 if matches {
-                    let replaced = endpoint_emptied || hello.build_version.as_deref() != from_build;
-                    if replaced {
-                        return Ok(());
-                    }
-                    let since = *matching_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= timing.settle {
-                        return Ok(());
+                    if let Some(old) = from.instance.as_deref() {
+                        // The identity decides: a different one (or none, from
+                        // a successor that predates the field) is another
+                        // process; the same one is the old daemon.
+                        if hello.instance_id.as_deref() != Some(old) {
+                            return Ok(());
+                        }
+                    } else {
+                        let replaced = endpoint_emptied
+                            || hello.build_version.as_deref() != from.build.as_deref();
+                        if replaced {
+                            return Ok(());
+                        }
+                        let since = *matching_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= timing.settle {
+                            return Ok(());
+                        }
                     }
                 } else {
                     matching_since = None;
@@ -827,9 +868,13 @@ fn wait_for_successor(
             Err(_) => {}
         }
         if Instant::now() >= deadline {
-            let seen = last_seen
-                .map(|v| format!(" (the daemon answering reports {v})"))
-                .unwrap_or_default();
+            let seen = match (last_seen, old_still_answering) {
+                (Some(v), true) => format!(
+                    " (the daemon answering reports {v}, and it is still the daemon that was asked to restart)"
+                ),
+                (Some(v), false) => format!(" (the daemon answering reports {v})"),
+                (None, _) => String::new(),
+            };
             return Err(format!(
                 "restarted, but the new daemon did not answer within {}s{seen}",
                 timing.timeout.as_secs()
@@ -1194,6 +1239,10 @@ impl WireDaemonPort {
             Err(reason) => return failed(UpgradeStage::Restarting, reason.to_string()),
         };
         let from_version = hello.daemon_version.clone();
+        let from = OldDaemon {
+            build: None,
+            instance: hello.instance_id.clone(),
+        };
         match self.handle.block_on(run_daemon_stop(local, false)) {
             Ok(StopOutcome::NoDaemonRunning | StopOutcome::Stopped { .. })
             | Ok(StopOutcome::ForceKilled { .. }) => {}
@@ -1224,7 +1273,7 @@ impl WireDaemonPort {
             return failed(UpgradeStage::Restarting, reason);
         }
         let expected = Expect::Build(crate::build_id::local_build_id());
-        match wait_for_successor(self, &expected, None, true, PRODUCTION_TIMING) {
+        match wait_for_successor(self, &expected, &from, true, PRODUCTION_TIMING) {
             Ok(()) => UpgradeOutcome::Restarted {
                 from_version: from_version.unwrap_or_else(|| "an unknown version".into()),
                 to_version: version,
@@ -1547,6 +1596,26 @@ mod tests {
         assert!(
             !summary.to_lowercase().contains("nothing was changed"),
             "{summary}"
+        );
+
+        // The binary was replaced but its version check read nothing (PRD
+        // #1487 review, Qodo 4200041523): it is named as an unverified build,
+        // opening its sentence, not as nothing having changed.
+        let unverified = UpgradeOutcome::Failed {
+            stage: UpgradeStage::Installing,
+            reason: "~/.local/bin/dot-agent-deck on the remote was replaced, but the new binary did not pass its version check".into(),
+            installed_version: Some(crate::remote::UNVERIFIED_BUILD.into()),
+        }
+        .summary("box");
+        assert!(
+            unverified.contains(
+                "\nAn unverified build is installed, but the upgrade stopped before restarting the daemon"
+            ),
+            "{unverified}"
+        );
+        assert!(
+            unverified.contains("dot-agent-deck remote upgrade box"),
+            "{unverified}"
         );
 
         // A failure before anything landed does not claim a version either.
@@ -2299,10 +2368,177 @@ mod tests {
         assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
     }
 
+    /// `hello`, from a daemon process that names itself `instance`.
+    fn hello_from(version: &str, build: &str, instance: &str) -> AttachResponse {
+        AttachResponse {
+            instance_id: Some(instance.into()),
+            ..hello(version, build)
+        }
+    }
+
+    #[test]
+    fn the_old_daemon_naming_itself_is_never_the_successor_however_long_it_answers() {
+        // PRD #1487 review (Qodo 4200041516): a reinstall of the same build
+        // whose old daemon accepted the restart and then kept answering. It
+        // names the same process throughout, so even well past the settle
+        // period it is not reported as restarted.
+        let port = FakePort::new(
+            vec![Ok(Some(hello_from("0.2.0", "same", "old-process")))],
+            vec![accepted(RestartStopSet::default())],
+        );
+        let (outcome, stages) = run(
+            &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan(),
+        );
+        assert!(FAST.timeout > FAST.settle * 2);
+        let UpgradeOutcome::Failed { stage, reason, .. } = &outcome else {
+            panic!("the old daemon was taken for its successor: {outcome:?}");
+        };
+        assert_eq!(*stage, UpgradeStage::Verifying);
+        assert!(
+            reason.ends_with(
+                "(the daemon answering reports 0.2.0, and it is still the daemon that was asked to restart)"
+            ),
+            "{reason}"
+        );
+        assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
+    }
+
+    /// The identity survives the remote route: `daemon probe --json` on the
+    /// remote passes the daemon's `Hello` through, so an old daemon that keeps
+    /// answering with the same build and the same identity after accepting the
+    /// restart is still not reported as restarted.
+    #[test]
+    fn the_ssh_port_carries_the_identity_that_tells_the_old_daemon_apart() {
+        use crate::daemon_protocol::RestartSuccessor;
+        use crate::daemon_restart::{DaemonProbe, RemoteRestartReport};
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct SameBuild {
+            successor_instance: &'static str,
+            restarted: Cell<bool>,
+        }
+        impl SshExecutor for SameBuild {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                let stdout = if command.ends_with("daemon probe --json") {
+                    let instance = if self.restarted.get() {
+                        self.successor_instance
+                    } else {
+                        "old-process"
+                    };
+                    serde_json::to_string(&DaemonProbe {
+                        running: true,
+                        hello: Some(hello_from("0.40.0", "same", instance)),
+                    })
+                } else {
+                    self.restarted.set(true);
+                    serde_json::to_string(&RemoteRestartReport {
+                        running: true,
+                        reply: Some(RestartDaemonReply::Accepted {
+                            from_version: "0.40.0".into(),
+                            to_version: Some("0.40.0".into()),
+                            successor: RestartSuccessor::Installed,
+                            stopping: RestartStopSet::default(),
+                        }),
+                        unsupported: false,
+                    })
+                };
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: stdout.unwrap(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let port = |successor_instance| {
+            SshDaemonPort::new(
+                SameBuild {
+                    successor_instance,
+                    restarted: Cell::new(false),
+                },
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            )
+        };
+        let install = FakeInstaller::ok("0.40.0", InstallMethod::LocalBin);
+
+        let (outcome, _) = run(
+            &install,
+            &port("old-process"),
+            &NoDecider,
+            &remote_plan_for("0.40.0"),
+        );
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::Failed {
+                    stage: UpgradeStage::Verifying,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let (outcome, _) = run(
+            &install,
+            &port("new-process"),
+            &NoDecider,
+            &remote_plan_for("0.40.0"),
+        );
+        assert!(
+            matches!(outcome, UpgradeOutcome::Restarted { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_successor_naming_a_new_process_is_the_successor_at_once() {
+        // The same build, the endpoint never seen empty — the case the settle
+        // fallback exists for — but the answer names a different process, so
+        // it counts straight away. A settle longer than the timeout makes the
+        // fallback unable to accept, so a `Restarted` here is the identity's.
+        let timing = Timing {
+            timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+            settle: Duration::from_secs(60),
+        };
+        for successor in [
+            Some(hello_from("0.2.0", "same", "new-process")),
+            // A successor that predates the field is another process too: the
+            // old one named itself.
+            Some(hello("0.2.0", "same")),
+        ] {
+            let port = FakePort::new(
+                vec![
+                    Ok(Some(hello_from("0.2.0", "same", "old-process"))),
+                    Ok(Some(hello_from("0.2.0", "same", "old-process"))),
+                    Ok(successor),
+                ],
+                vec![accepted(RestartStopSet::default())],
+            );
+            let outcome = run_upgrade(
+                "box",
+                &remote_plan(),
+                &FakeInstaller::ok("0.2.0", InstallMethod::LocalBin),
+                &port,
+                &NoDecider,
+                &mut |_| {},
+                timing,
+            );
+            assert!(
+                matches!(outcome, UpgradeOutcome::Restarted { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_old_daemon_answering_the_same_build_is_not_the_successor_until_settled() {
-        // A reinstall of the same build: the endpoint is never seen empty and
-        // the build does not change, so the answer only counts once it has held
+        // The fallback for a daemon that predates `instance_id`, so names no
+        // process: a reinstall of the same build, the endpoint never seen empty
+        // and the build unchanged, so the answer only counts once it has held
         // for the settle period — which FAST makes shorter than its timeout.
         let port = FakePort::new(
             vec![Ok(Some(hello("0.2.0", "same")))],

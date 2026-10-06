@@ -1806,6 +1806,21 @@ pub enum RemoteAddError {
     },
     #[error("Installed binary reports `{actual}` but expected `{expected}`.")]
     VersionMismatch { actual: String, expected: String },
+    /// The install had already put a build at `binary` — the download moved
+    /// into place, or `brew upgrade` succeeded — when the version check that
+    /// follows failed (`source`). Nothing is rolled back, so the binary is no
+    /// longer the one that was there before (PRD #1487 review). `on_disk` is
+    /// the version the check read, when it read one, and otherwise
+    /// [`UNVERIFIED_BUILD`].
+    #[error(
+        "{binary} on the remote was replaced, but the new binary did not pass its version check: {source} What is installed there now is {on_disk}. Run the install again; if the check keeps failing, run `{binary} --version` on the remote to see what it reports."
+    )]
+    ReplacedButUnverified {
+        binary: String,
+        on_disk: String,
+        #[source]
+        source: Box<RemoteAddError>,
+    },
     #[error("`dot-agent-deck hooks install` on remote failed (exit {status}): {stderr}")]
     HooksInstallFailed { status: i32, stderr: String },
     #[error(
@@ -1947,21 +1962,38 @@ fn install_and_verify(
             ),
         });
     }
-    let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
-    if v.status != 0 {
-        return Err(RemoteAddError::VersionMismatch {
-            actual: format!("(exit {}) {}", v.status, scrub_remote_text(&v.stderr)),
-            expected: version.to_string(),
-        });
+    // The download is in place from here on: a failed check no longer means
+    // "nothing changed", so it says what replaced the binary.
+    remote_binary_version(executor, target, REMOTE_INSTALL_PATH, version)
+        .and_then(|actual| {
+            if actual == version {
+                Ok(())
+            } else {
+                Err(RemoteAddError::VersionMismatch {
+                    actual,
+                    expected: version.to_string(),
+                })
+            }
+        })
+        .map_err(|e| replaced_but_unverified(REMOTE_INSTALL_PATH, e))
+}
+
+/// What a remote's binary is called once a build replaced it and its version
+/// check failed without reading a version.
+pub const UNVERIFIED_BUILD: &str = "an unverified build";
+
+/// Wrap a version-check failure that came after the install put a new binary at
+/// `binary`, keeping the version the check read when it read a valid one.
+fn replaced_but_unverified(binary: &str, check: RemoteAddError) -> RemoteAddError {
+    let on_disk = match &check {
+        RemoteAddError::VersionMismatch { actual, .. } => validate_version_string(actual).ok(),
+        _ => None,
+    };
+    RemoteAddError::ReplacedButUnverified {
+        binary: binary.to_string(),
+        on_disk: on_disk.unwrap_or_else(|| UNVERIFIED_BUILD.to_string()),
+        source: Box::new(check),
     }
-    let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-    if actual != version {
-        return Err(RemoteAddError::VersionMismatch {
-            actual: scrub_remote_text(&actual),
-            expected: version.to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// How the deck is installed on a remote, as [`detect_install`] found it.
@@ -2214,7 +2246,16 @@ fn install_or_upgrade(
         }
     }
 
-    let landed = remote_binary_version(executor, target, binary.as_str(), version)?;
+    // After a `brew upgrade` that succeeded, Homebrew may have replaced the
+    // binary, so a failed check says so; without one nothing changed.
+    let landed =
+        remote_binary_version(executor, target, binary.as_str(), version).map_err(|e| {
+            if run_brew_upgrade {
+                replaced_but_unverified(binary.as_str(), e)
+            } else {
+                e
+            }
+        })?;
     // `--no-install` is a pre-flight that the remote already runs the
     // requested version, on this path as on the `~/.local/bin` one; it is
     // only when this command installs through Homebrew that a different
@@ -2573,13 +2614,16 @@ pub enum RemoteUpgradeError {
 }
 
 impl RemoteUpgradeError {
-    /// The version already in place when this error happened, if the install
-    /// itself had finished.
+    /// What is in place when this error happened, if the install had already
+    /// replaced the binary: the version it finished with, or — when the check
+    /// after the replacement failed — the version that check read, or
+    /// [`UNVERIFIED_BUILD`].
     pub fn installed_version(&self) -> Option<&str> {
         match self {
             Self::AfterInstall {
                 installed_version, ..
             } => Some(installed_version),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { on_disk, .. }) => Some(on_disk),
             _ => None,
         }
     }
@@ -3401,6 +3445,104 @@ mod tests {
             msg.contains(HOSTILE_SCRUBBED),
             "expected the stripped residue in {msg:?}"
         );
+    }
+
+    /// A check that read no version after the binary moved — it exited
+    /// non-zero — reports an unverified build rather than a version, on both
+    /// the download path and after a `brew upgrade`. Under `--no-install`, and
+    /// on `remote add`'s Homebrew path, nothing was replaced, so the plain
+    /// mismatch stands and no version is claimed.
+    #[test]
+    fn a_replaced_binary_that_reads_no_version_is_an_unverified_build() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let version_fails = || SshOutput {
+            status: 126,
+            stdout: String::new(),
+            stderr: "cannot execute binary file".to_string(),
+        };
+
+        let executor = ScriptedSsh::new([ssh_ok(""), version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+        )
+        .expect_err("a failed version check must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == REMOTE_INSTALL_PATH && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+        let upgrade_err = RemoteUpgradeError::Inner(err);
+        assert_eq!(upgrade_err.installed_version(), Some(UNVERIFIED_BUILD));
+        let msg = upgrade_err.to_string();
+        assert!(msg.contains("cannot execute binary file"), "{msg}");
+        assert!(msg.contains("an unverified build"), "{msg}");
+
+        let brew_probe = || ssh_ok("local-bin=\nhomebrew=/opt/homebrew\nformula=dot-agent-deck\n");
+        let executor = ScriptedSsh::new([brew_probe(), ssh_ok(""), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            true,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check after brew upgrade must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == "/opt/homebrew/bin/dot-agent-deck" && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([brew_probe(), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("a failed --no-install check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(RemoteUpgradeError::Inner(err).installed_version(), None);
     }
 
     /// Issue #1350: `remote add` refuses an unsafe address with the rules the
@@ -4359,6 +4501,51 @@ mod homebrew_remote_tests {
         let entry = remote.entry();
         assert_eq!(entry.version, "0.40.0");
         assert_eq!(entry.install, None);
+    }
+
+    /// PRD #1487 review (Qodo 4200041523): the download moved into place and
+    /// then failed its version check. The binary is not rolled back, so the
+    /// error says it was replaced and carries the version the check read —
+    /// which the upgrade outcome reports as installed — and the registry is
+    /// left as it was.
+    #[test]
+    fn a_download_that_lands_the_wrong_version_says_the_binary_was_replaced() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", false);
+        let err = result.expect_err("a version check that fails must fail the command");
+        let msg = err.to_string();
+
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::Inner(RemoteAddError::ReplacedButUnverified { on_disk, source, .. })
+                    if on_disk == "0.43.0"
+                        && matches!(**source, RemoteAddError::VersionMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert!(msg.contains("was replaced"), "{msg}");
+        assert!(
+            msg.contains("reports `0.43.0` but expected `0.44.0`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("What is installed there now is 0.43.0"),
+            "{msg}"
+        );
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
     }
 
     /// An entry written before #1372 has neither field and runs

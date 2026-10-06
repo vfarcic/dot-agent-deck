@@ -139,6 +139,15 @@ export interface OutcomeView {
 }
 
 /**
+ * `text` with its first letter upper-cased, to open a sentence: a failed
+ * install's `installedVersion` can be prose ("an unverified build", when the
+ * check after the binary was replaced read no version) rather than a number.
+ */
+function sentenceStart(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/**
  * The outcome in plain words (CLAUDE.md rule 21): what happened, what is
  * running now, and what the user can do — for every arm, so no result renders
  * as a blank dialog.
@@ -238,8 +247,8 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
         ? "The old daemon was asked to restart; Reconnect shows whatever is answering now."
         : outcome.installedVersion && kind !== "replace"
           ? outcome.stage === "installing"
-            ? `${outcome.installedVersion} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.`
-            : `${outcome.installedVersion} is installed; the daemon that was running keeps running.`
+            ? `${sentenceStart(outcome.installedVersion)} is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.`
+            : `${sentenceStart(outcome.installedVersion)} is installed; the daemon that was running keeps running.`
           : kind === "replace" && outcome.stage === "restarting"
             ? "Reconnect shows which daemon is answering now."
             : "The daemon that was running keeps running.";

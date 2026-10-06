@@ -148,6 +148,19 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     expect(outcomeView(outcomes[9][1], "build-box", "upgrade").body[1]).toBe("0.45.0 is installed; the daemon that was running keeps running.");
     expect(outcomeView(outcomes[10][1], "build-box", "upgrade").body[0]).toBe("It failed while checking the restarted daemon: the new daemon did not answer within 20s");
   });
+
+  it("says a replaced binary that failed its version check is in place, not that nothing changed", () => {
+    const failed = (installedVersion: string): UpgradeOutcome => ({
+      outcome: "failed",
+      stage: "installing",
+      reason: "~/.local/bin/dot-agent-deck on the remote was replaced, but the new binary did not pass its version check",
+      installedVersion,
+    });
+    expect(outcomeView(failed("an unverified build"), "build-box", "upgrade").body[1]).toBe(
+      "An unverified build is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.",
+    );
+    expect(outcomeView(failed("0.44.0"), "build-box", "upgrade").body[1]).toMatch(/^0\.44\.0 is installed, but the upgrade stopped/);
+  });
 });
 
 describe("incompatibleRemedy (PRD #1487 D9, D10)", () => {
