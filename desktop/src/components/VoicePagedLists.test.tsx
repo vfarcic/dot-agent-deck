@@ -430,6 +430,36 @@ describe("the agent dashboard scrolls while voice is on", () => {
     expect(screen.queryByText(/Page \d+ of \d+/i)).toBeNull();
   });
 
+  /** Scenario: on a dashboard of 140 agents, saying “one hundred thirty four” in words opens the agent on the row numbered 134, scrolled into view. */
+  it("opens a row past ninety-nine by its number in words", async () => {
+    const voice = microphone();
+    const deck = runtime(voice, true);
+    const base = deck.snapshot;
+    const template = base.agents.find((agent) => agent.tab.kind === "dashboard")!;
+    const letters = (at: number) => `${String.fromCharCode(97 + (at % 26))}${String.fromCharCode(97 + Math.floor(at / 26))}`;
+    deck.snapshot = {
+      ...base,
+      agents: Array.from({ length: 140 }, (_, index) => ({ ...template, id: `bulk-${index + 1}`, displayName: `bulk ${letters(index)}` })),
+      totalNodes: 140,
+    };
+    deck.fleet = [deck.snapshot];
+    const revealed: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) { revealed.push(this); });
+    try {
+      render(<DeckShell runtime={deck} initialView={{ kind: "overview" }} />);
+      await turnOnVoice();
+      const row = document.querySelector(".overview-row[data-voice-number='134']");
+      expect(row).not.toBeNull();
+      const agentId = decodeURIComponent(row!.getAttribute("data-testid")!.split(":").at(-1)!);
+      await speak(voice, "one hundred thirty four");
+      expect(screen.queryByTestId("agent-pane-overlay"), screen.getByTestId("voice-report").textContent ?? "no voice report").not.toBeNull();
+      expect(screen.getByTestId(`terminal-${agentId}`)).toBeInTheDocument();
+      expect(revealed).toContain(row);
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
   /** Scenario: a fleet of 1,001 agents numbers its first 1,000 rows and leaves the last one unnumbered, since a numbered list voice can answer holds at most 1,000 items. */
   it("numbers at most 1,000 dashboard rows", async () => {
     const deck = runtime(microphone(), true);

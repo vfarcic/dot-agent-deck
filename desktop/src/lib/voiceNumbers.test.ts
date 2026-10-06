@@ -89,6 +89,33 @@ describe("answerNumberLocally", () => {
     expect(answerNumberLocally("agent three", heard, 7)).toEqual({ kind: "selected", section: "agent", number: 3 });
   });
 
+  /* Issue #1492 — `voice::numbers`' tests of the same name: the dashboard numbers every row, up to 1,000. */
+  it.each([
+    ["one hundred", 100], ["a hundred", 100], ["hundred", 100], ["one hundred and five", 105], ["a hundred five", 105], ["one hundred one", 101],
+    ["one hundred thirty four", 134], ["one hundred and thirty-four", 134], ["number one hundred thirty four", 134], ["agent one hundred thirty four", 134],
+    ["select agent a hundred and twelve", 112], ["134", 134], ["two hundred", 200], ["nine hundred ninety nine", 999], ["Nine hundred and ninety-nine.", 999],
+    ["hundredth", 100], ["the hundredth one", 100], ["one hundred and first", 101], ["the one hundred thirty fourth one", 134], ["three hundredth", 300],
+    ["one thousand", 1000], ["a thousand", 1000], ["the thousandth", 1000],
+  ] as const)("understands %s as %i past ninety-nine", (said, number) => {
+    const heard = agents(...Array.from({ length: 1000 }, (_, at) => `Task ${String.fromCharCode(97 + (at % 26))}${String.fromCharCode(97 + Math.floor(at / 26) % 26)}`));
+    expect(answerNumberLocally(said, heard, 7)).toEqual({ kind: "selected", section: "agent", number });
+  });
+
+  it.each(["one hundred agents", "hundred and", "one hundred and", "one hundred zero", "one hundred 5", "hundred hundred", "ten hundred", "two thousand", "one thousand and one", "hundredth first", "twenty hundred"])("leaves %s, which is not one number, to the resolver", (said) => {
+    expect(answerNumberLocally(said, agents("Plan"), 7)).toEqual({ kind: "not_number" });
+  });
+
+  it("collides a count past ninety-nine with a name ending in it", () => {
+    const labels = Array.from({ length: 140 }, (_, at) => `Task ${String.fromCharCode(97 + (at % 26))}${String.fromCharCode(97 + Math.floor(at / 26))}`);
+    labels[139] = "worker 134";
+    const both = { kind: "ambiguous", choices: [{ section: "agent", number: 134 }, { section: "agent", number: 140 }] };
+    expect(answerNumberLocally("one hundred thirty four", agents(...labels), 7)).toEqual(both);
+    expect(answerNumberLocally("the one hundred thirty fourth", agents(...labels), 7)).toEqual({ kind: "selected", section: "agent", number: 134 });
+    labels[139] = "worker one hundred and thirty four";
+    expect(answerNumberLocally("134", agents(...labels), 7)).toEqual(both);
+    expect(answerNumberLocally("agent 134", agents(...labels), 7)).toEqual({ kind: "selected", section: "agent", number: 134 });
+  });
+
   it("finds a numbered item by its section, or the first section showing it", () => {
     expect(numberedEntry(DIALOG, "mode", 3)?.label).toBe("Dispatcher");
     expect(numberedEntry(DIALOG, undefined, 3)?.label).toBe("scratch");
