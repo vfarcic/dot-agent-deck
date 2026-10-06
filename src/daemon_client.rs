@@ -2929,7 +2929,10 @@ impl DaemonClient {
     /// From the first byte of the frame on, the daemon may have acted on it, so
     /// a broken connection, a cut-off or unreadable reply, and running out are
     /// all [`ClientError::Unanswered`]. An `ok = false` reply with no `restart`
-    /// field is [`ClientError::Server`]. The cached capability set is dropped
+    /// field is [`GatedQuery::Unsupported`] when the daemon then holding the
+    /// endpoint does not advertise the capability — the endpoint changed to an
+    /// older daemon after the `Hello`, and it refused the frame unparsed — and
+    /// [`ClientError::Server`] otherwise. The cached capability set is dropped
     /// after any answer, since an accepted restart replaces the daemon.
     pub async fn restart_daemon(
         &self,
@@ -2978,9 +2981,27 @@ impl DaemonClient {
         self.invalidate_capabilities();
         match resp.restart {
             Some(reply) => Ok(GatedQuery::Answered(reply)),
-            None if !resp.ok => Err(ClientError::Server(
-                resp.error.unwrap_or_else(|| "restart-daemon failed".into()),
-            )),
+            None if !resp.ok => {
+                // A daemon with the verb answers every request it parsed with a
+                // `restart` field, so a bare refusal is either a daemon that
+                // could not parse the frame — one that replaced the capable
+                // daemon after the `Hello` above (Qodo 4200693865) — or a fault.
+                // The daemon reads one frame per connection, so the check and
+                // the frame cannot share one, and serde's `unknown variant`
+                // text is not a contract this client matches. Ask whoever holds
+                // the endpoint now instead: if it does not advertise the verb,
+                // the frame was refused unparsed and nothing acted on it, which
+                // is `Unsupported`, so the caller's older-daemon path applies.
+                let now = tokio::time::timeout_at(deadline, self.fresh_capabilities()).await;
+                if let Ok(Ok(now)) = now
+                    && !now.supports(crate::daemon_protocol::CAP_RESTART_DAEMON)
+                {
+                    return Ok(GatedQuery::Unsupported);
+                }
+                Err(ClientError::Server(
+                    resp.error.unwrap_or_else(|| "restart-daemon failed".into()),
+                ))
+            }
             None => Err(ClientError::Malformed(
                 "restart-daemon ok but no restart reply".into(),
             )),
@@ -6254,6 +6275,86 @@ start = true
                 matches!(result, Err(ClientError::Unanswered(_))),
                 "hold={hold}: a lost reply after the send is unanswered, got {result:?}"
             );
+        }
+    }
+
+    /// Scenario: the daemon that answers the first `Hello` advertises
+    /// `restart-daemon`, but by the time the frame arrives an older daemon holds
+    /// the endpoint: it refuses the frame as an unknown variant and its own
+    /// `Hello` names no such capability. The restart is `Unsupported`, so the
+    /// caller's older-daemon fallback applies. A daemon that still advertises the
+    /// verb after a bare refusal stays a plain failure (PRD #1487, Qodo
+    /// 4200693865).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_refused_unparsed_by_a_swapped_in_older_daemon_is_unsupported() {
+        for still_capable in [false, true] {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("swapped.sock");
+                let listener = bind_attach_listener(&path).expect("bind swapped daemon");
+                (dir, path, listener)
+            };
+            let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let server_ops = ops.clone();
+            let server = tokio::spawn(async move {
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let op = request["op"].as_str().unwrap_or_default().to_string();
+                    let hellos_before = server_ops
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|o| *o == "hello")
+                        .count();
+                    server_ops.lock().unwrap().push(op.clone());
+                    let response = if op == "hello" {
+                        if hellos_before == 0 || still_capable {
+                            hello_advertising(&[crate::daemon_protocol::CAP_RESTART_DAEMON])
+                        } else {
+                            hello_advertising(&[crate::daemon_protocol::CAP_STOP_DAEMON])
+                        }
+                    } else {
+                        AttachResponse::err("malformed request: unknown variant `restart-daemon`")
+                    };
+                    crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .expect("write response");
+                }
+            });
+            let client = DaemonClient::new(path);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.restart_daemon(RestartDaemonRequest::default()),
+            )
+            .await
+            .expect("restart_daemon must not hang");
+            server.abort();
+            drop(dir);
+            assert_eq!(
+                *ops.lock().unwrap(),
+                vec![
+                    "hello".to_string(),
+                    "restart-daemon".to_string(),
+                    "hello".to_string()
+                ],
+                "still_capable={still_capable}: the endpoint is re-probed after a bare refusal"
+            );
+            if still_capable {
+                assert!(
+                    matches!(result, Err(ClientError::Server(_))),
+                    "a daemon still advertising the verb refused it: a failure, got {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("an older daemon's refusal is an outcome"),
+                    GatedQuery::Unsupported
+                );
+            }
         }
     }
 

@@ -11582,6 +11582,53 @@ mod tests {
         }
     }
 
+    /// Scenario: one restart is held at its acceptance barrier — the handler
+    /// lock taken, the `Accepted` write not yet done — and a second client asks
+    /// for a restart. It is refused `InProgress` at once, without waiting for
+    /// the first request's write: the lock is only ever tried, never awaited
+    /// (PRD #1487, Qodo 4200693855).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_restart_is_refused_at_once_while_the_first_holds_the_lock() {
+        let fx = RestartFixture::start().await;
+        let checkpoint = fx.restart.pause_before_accepting();
+        let first = {
+            let client = fx.client();
+            let request = RestartFixture::request(None);
+            tokio::spawn(async move { client.restart_daemon(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), checkpoint.reached.notified())
+            .await
+            .expect("the first handler reached its acceptance barrier");
+
+        // The first handler holds the lock and has not written its answer.
+        let second = tokio::time::timeout(Duration::from_secs(5), fx.restart(None))
+            .await
+            .expect("the second request is answered while the first still holds the lock");
+        match second {
+            RestartDaemonReply::Refused { reason, .. } => {
+                assert_eq!(reason, RestartRefusalReason::InProgress)
+            }
+            other => panic!("expected Refused(InProgress), got {other:?}"),
+        }
+        assert!(!fx.restart.is_accepted(), "the first is still unanswered");
+
+        checkpoint.resume.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(30), first)
+            .await
+            .expect("the first restart answered")
+            .unwrap();
+        assert!(
+            matches!(
+                reply,
+                Ok(crate::daemon_client::GatedQuery::Answered(
+                    RestartDaemonReply::Accepted { .. }
+                ))
+            ),
+            "the first request is accepted: {reply:?}"
+        );
+    }
+
     /// Scenario: the client that asked for the restart goes away while the
     /// handler is at its acceptance barrier, so the acceptance cannot be
     /// delivered. Nothing is stopped, no restart is latched, and agents can

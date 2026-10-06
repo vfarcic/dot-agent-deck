@@ -4999,6 +4999,7 @@ async fn desktop_upgrade_daemon(
                             stage: dot_agent_deck::daemon_upgrade::UpgradeStage::Restarting,
                             reason,
                             installed_version: None,
+                            old_daemon_gone: false,
                         };
                     }
                 };
@@ -5020,9 +5021,11 @@ async fn desktop_upgrade_daemon(
     // daemon that is gone or replaced: drop it, and let the deck's watcher
     // and the snapshot below re-establish against whatever answers now.
     state.daemon.invalidate(&endpoint).await;
-    if matches!(outcome, UpgradeOutcome::Restarted { .. }) {
-        // The old daemon's terminals ended with it. This deck's only — the
-        // other decks were not touched.
+    if upgrade::ends_deck_sessions(&outcome) {
+        // The old daemon's terminals ended with it — restarted, or accepted
+        // and not verified, or gone after a lost reply. This deck's only — the
+        // other decks were not touched. A daemon still answering as itself
+        // keeps them.
         terminal::detach_deck(&state, &endpoint).await;
     }
     state.request_refetch(&endpoint.identity());

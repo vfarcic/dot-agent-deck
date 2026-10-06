@@ -948,6 +948,7 @@ impl RemoteUpgrader for SystemRemoteUpgrader {
                     stage: UpgradeStage::Installing,
                     reason: e.to_string(),
                     installed_version: None,
+                    old_daemon_gone: false,
                 };
             }
         };
@@ -2419,6 +2420,7 @@ mod tests {
                     stage: crate::daemon_upgrade::UpgradeStage::Installing,
                     reason: "install failed: download 404".into(),
                     installed_version: None,
+                    old_daemon_gone: false,
                 },
                 ..Self::new()
             }

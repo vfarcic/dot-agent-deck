@@ -2530,6 +2530,44 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
+   * Scenario (PRD #1487, Qodo 4200693875): show a terminal on the deck, then
+   * upgrade its daemon three times. A failure that left the old daemon
+   * answering keeps the session usable; a restart that failed verifying after
+   * the old daemon accepted (`oldDaemonGone`) forgets it, as a restart does, so
+   * input no longer reaches the gone daemon and the next snapshot re-attaches.
+   */
+  it("forgets the deck's terminal sessions after any upgrade whose old daemon may be gone", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    await bridge.setShownTerminals([on("agent-1")]);
+    await settle();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
+
+    const base = invoke.getMockImplementation()!;
+    let outcome: unknown;
+    invoke.mockImplementation(async (command: string, args?: { agentId?: string }) =>
+      command === "desktop_upgrade_daemon" ? outcome : base(command, args),
+    );
+    const deckId = on("agent-1").deckId;
+
+    outcome = { outcome: "failed", stage: "restarting", reason: "refused", installedVersion: "0.45.0", oldDaemonGone: false };
+    await bridge.upgradeDaemon(deckId, () => {});
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
+
+    outcome = { outcome: "failed", stage: "verifying", reason: "the new daemon did not answer", installedVersion: "0.45.0", oldDaemonGone: true };
+    await bridge.upgradeDaemon(deckId, () => {});
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
+
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+    await vi.waitFor(() => expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(2));
+    await settle();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: show one terminal, let its attach land, then have the daemon end
    * that session while the pane is still on screen — `handleTerminalState`
    * drops it, so input stops reaching the daemon — and fire a

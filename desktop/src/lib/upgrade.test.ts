@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ConnectionView } from "../types";
 import { incompatibleRemedy } from "./connectionRemedy";
-import { outcomeView, stageLabel, stopSetCount, stopSetLines, upgradeOffered, type UpgradeOffer, type UpgradeOutcome, type UpgradeStopSet } from "./upgrade";
+import { outcomeView, stageLabel, stopSetCount, stopSetLines, upgradeEndedDeckSessions, upgradeOffered, type UpgradeOffer, type UpgradeOutcome, type UpgradeStopSet } from "./upgrade";
 
 const AT_STAKE: UpgradeStopSet = {
   agents: [
@@ -160,6 +160,27 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
       "An unverified build is installed, but the upgrade stopped before restarting the daemon, so the daemon that was running keeps running. Press Upgrade again to finish.",
     );
     expect(outcomeView(failed("0.44.0"), "build-box", "upgrade").body[1]).toMatch(/^0\.44\.0 is installed, but the upgrade stopped/);
+  });
+});
+
+describe("upgradeEndedDeckSessions (Qodo 4200693875)", () => {
+  /**
+   * Scenario: each outcome the crate can return is asked whether the deck's
+   * terminal sessions ended with the old daemon. A restart and a failure the
+   * crate marks `oldDaemonGone` say yes; a failure that left the old daemon
+   * answering, one from a crate that sent no mark, and every not-restarted
+   * outcome say no.
+   */
+  it.each<[string, UpgradeOutcome, boolean]>([
+    ["restarted", { outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: AT_STAKE }, true],
+    ["failed verifying, old daemon gone", { outcome: "failed", stage: "verifying", reason: "r", installedVersion: "0.45.0", oldDaemonGone: true }, true],
+    ["failed restarting after a lost reply, old daemon gone", { outcome: "failed", stage: "restarting", reason: "r", installedVersion: "0.45.0", oldDaemonGone: true }, true],
+    ["failed restarting, old daemon still answering", { outcome: "failed", stage: "restarting", reason: "r", installedVersion: "0.45.0", oldDaemonGone: false }, false],
+    ["failed with no mark", { outcome: "failed", stage: "installing", reason: "r" }, false],
+    ["not restarted", { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } }, false],
+    ["daemon too old", { outcome: "installed-daemon-too-old", installedVersion: "0.45.0", remedy: "r" }, false],
+  ])("%s", (_, outcome, ended) => {
+    expect(upgradeEndedDeckSessions(outcome)).toBe(ended);
   });
 });
 

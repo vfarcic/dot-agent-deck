@@ -53,7 +53,17 @@ export type UpgradeOutcome =
   | { outcome: "restarted"; fromVersion: string; toVersion: string; stopped: UpgradeStopSet }
   | { outcome: "installed-not-restarted"; fromVersion?: string; installedVersion: string; reason: NotRestartedReason }
   | { outcome: "installed-daemon-too-old"; installedVersion: string; daemonVersion?: string; remedy: string }
-  | { outcome: "failed"; stage: UpgradeStage; reason: string; installedVersion?: string };
+  | { outcome: "failed"; stage: UpgradeStage; reason: string; installedVersion?: string; oldDaemonGone?: boolean };
+
+/**
+ * Whether an upgrade ended the deck's terminal sessions with the daemon that
+ * was running — after a restart, and after a failure the crate marks
+ * `oldDaemonGone` (the old daemon accepted, or stopped answering as itself).
+ * The crate detaches them on the same answer (`ends_deck_sessions`).
+ */
+export function upgradeEndedDeckSessions(outcome: UpgradeOutcome): boolean {
+  return outcome.outcome === "restarted" || (outcome.outcome === "failed" && outcome.oldDaemonGone === true);
+}
 
 /** `desktop://upgrade-progress`. */
 export interface UpgradeProgressEvent {

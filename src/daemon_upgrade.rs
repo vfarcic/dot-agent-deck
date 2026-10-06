@@ -76,10 +76,20 @@ pub enum UpgradeOutcome {
     },
     /// A stage failed. `installed_version` is set when the install had already
     /// succeeded.
+    ///
+    /// `old_daemon_gone` says whether the daemon that was asked may no longer
+    /// be serving what it had: it accepted the restart (and so stopped its
+    /// agents), or it was stopped from outside, or its reply was lost and
+    /// afterwards the endpoint did not answer as that daemon. `false` when it
+    /// was never asked, refused, or is known to be the one still answering. A
+    /// client holding that daemon's terminal sessions drops them when this is
+    /// set, as it does after [`Self::Restarted`] (Qodo 4200693875).
     Failed {
         stage: UpgradeStage,
         reason: String,
         installed_version: Option<String>,
+        #[serde(default)]
+        old_daemon_gone: bool,
     },
 }
 
@@ -139,6 +149,20 @@ fn sentence_start(text: &str) -> String {
 }
 
 impl UpgradeOutcome {
+    /// Whether the daemon that was running before the upgrade may be gone, so
+    /// what a client held from it — its terminal sessions — is stale: after a
+    /// restart, and after a failure that came after it accepted or may have
+    /// ([`Self::Failed`]'s `old_daemon_gone`).
+    pub fn old_daemon_gone(&self) -> bool {
+        match self {
+            Self::Restarted { .. } => true,
+            Self::Failed {
+                old_daemon_gone, ..
+            } => *old_daemon_gone,
+            Self::InstalledNotRestarted { .. } | Self::InstalledDaemonTooOld { .. } => false,
+        }
+    }
+
     /// Plain-language rendering for a person; the CLI prints it. Clients with
     /// their own surface may build their own from the fields instead.
     ///
@@ -223,6 +247,7 @@ impl UpgradeOutcome {
                 stage,
                 reason,
                 installed_version,
+                ..
             } => {
                 let doing = match stage {
                     UpgradeStage::Installing => "installing the new build",
@@ -608,15 +633,20 @@ fn run_upgrade(
                 stage: UpgradeStage::Installing,
                 reason,
                 installed_version,
+                old_daemon_gone: false,
             };
         }
     };
     daemon.installed(&installed);
-    let restarting_failed = |reason: String| UpgradeOutcome::Failed {
-        stage: UpgradeStage::Restarting,
-        reason,
-        installed_version: Some(installed.version.clone()),
-    };
+    let failed_at =
+        |stage: UpgradeStage, reason: String, old_daemon_gone: bool| UpgradeOutcome::Failed {
+            stage,
+            reason,
+            installed_version: Some(installed.version.clone()),
+            old_daemon_gone,
+        };
+    // Before the daemon accepted: it refused, or was never reached.
+    let restarting_failed = |reason: String| failed_at(UpgradeStage::Restarting, reason, false);
 
     progress(UpgradeProgress {
         stage: UpgradeStage::Restarting,
@@ -726,10 +756,17 @@ fn run_upgrade(
         // With the reply lost this is also the check: a daemon that did not
         // accept keeps its endpoint, so nothing is spawned.
         if let Err(reason) = daemon.spawn_successor() {
-            return restarting_failed(match &reply_lost {
-                Some(lost) => format!("{lost}, and {reason}"),
-                None => reason,
-            });
+            // An accepted restart stopped the old daemon's agents. With the
+            // reply lost, whoever answers now says whether it went.
+            let gone = reply_lost.is_none() || !old_daemon_answers(daemon, &from);
+            return failed_at(
+                UpgradeStage::Restarting,
+                match &reply_lost {
+                    Some(lost) => format!("{lost}, and {reason}"),
+                    None => reason,
+                },
+                gone,
+            );
         }
         // `spawn_successor` returns only after the old daemon released the
         // endpoint, so whatever answers now is the successor.
@@ -751,11 +788,9 @@ fn run_upgrade(
             stopped,
         },
         Err(missing) => match reply_lost {
-            None => UpgradeOutcome::Failed {
-                stage: UpgradeStage::Verifying,
-                reason: missing.reason,
-                installed_version: Some(installed.version),
-            },
+            // It accepted, so its agents were stopped whether or not it is
+            // still the one answering.
+            None => failed_at(UpgradeStage::Verifying, missing.reason, true),
             // Nothing says the daemon ever accepted, so this is not a
             // successor that failed to start: it is a restart not known to
             // have happened, and when the old daemon is still the one
@@ -764,13 +799,31 @@ fn run_upgrade(
                 "{lost}, and the daemon did not restart: the one that was asked is still running after {}s",
                 timing.timeout.as_secs()
             )),
-            Some(lost) => restarting_failed(format!(
-                "{lost}, and the daemon did not come back on {} within {}s{}",
-                installed.version,
-                timing.timeout.as_secs(),
-                missing.seen
-            )),
+            // Not the old daemon answering: gone, or replaced by something
+            // that is not the expected successor.
+            Some(lost) => failed_at(
+                UpgradeStage::Restarting,
+                format!(
+                    "{lost}, and the daemon did not come back on {} within {}s{}",
+                    installed.version,
+                    timing.timeout.as_secs(),
+                    missing.seen
+                ),
+                true,
+            ),
         },
+    }
+}
+
+/// Whether the daemon answering `daemon` now is `from`'s own process — the
+/// positive identity [`wait_for_successor`] uses. `false` when nothing
+/// answers, when what answers is another process, or when `from` named no
+/// identity to compare (an older daemon), since it cannot then be shown to be
+/// the one still running.
+fn old_daemon_answers(daemon: &dyn DaemonPort, from: &OldDaemon) -> bool {
+    match daemon.probe() {
+        Ok(Some(hello)) => from.instance.is_some() && hello.instance_id == from.instance,
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -1265,10 +1318,11 @@ impl WireDaemonPort {
     fn legacy_restart_local(&self, local: &LocalEndpoint) -> UpgradeOutcome {
         use crate::daemon_stop::{StopError, StopOutcome, run_daemon_stop};
         let version = CLIENT_VERSION.to_string();
-        let failed = |stage, reason: String| UpgradeOutcome::Failed {
+        let failed = |stage, reason: String, old_daemon_gone| UpgradeOutcome::Failed {
             stage,
             reason,
             installed_version: Some(version.clone()),
+            old_daemon_gone,
         };
         let hello = match DaemonPort::probe(self) {
             Ok(Some(hello)) => hello,
@@ -1279,7 +1333,7 @@ impl WireDaemonPort {
                     reason: NotRestartedReason::NoDaemonRunning,
                 };
             }
-            Err(reason) => return failed(UpgradeStage::Restarting, reason.to_string()),
+            Err(reason) => return failed(UpgradeStage::Restarting, reason.to_string(), false),
         };
         let from_version = hello.daemon_version.clone();
         let from = OldDaemon {
@@ -1310,10 +1364,11 @@ impl WireDaemonPort {
                     },
                 };
             }
-            Err(e) => return failed(UpgradeStage::Restarting, e.to_string()),
+            Err(e) => return failed(UpgradeStage::Restarting, e.to_string(), false),
         }
+        // From here the old daemon was stopped.
         if let Err(reason) = self.release_then_spawn() {
-            return failed(UpgradeStage::Restarting, reason);
+            return failed(UpgradeStage::Restarting, reason, true);
         }
         let expected = Expect::Build(crate::build_id::local_build_id());
         match wait_for_successor(self, &expected, &from, true, PRODUCTION_TIMING) {
@@ -1322,7 +1377,7 @@ impl WireDaemonPort {
                 to_version: version,
                 stopped: RestartStopSet::default(),
             },
-            Err(missing) => failed(UpgradeStage::Verifying, missing.reason),
+            Err(missing) => failed(UpgradeStage::Verifying, missing.reason, true),
         }
     }
 }
@@ -1588,6 +1643,7 @@ mod tests {
                 stage: UpgradeStage::Installing,
                 reason: "download refused".into(),
                 installed_version: None,
+                old_daemon_gone: false,
             }
         );
         assert!(outcome.is_failure());
@@ -1617,6 +1673,7 @@ mod tests {
                 stage: UpgradeStage::Installing,
                 reason: reason.into(),
                 installed_version: Some("0.2.0".into()),
+                old_daemon_gone: false,
             }
         );
         assert_eq!(stages, [UpgradeStage::Installing]);
@@ -1648,6 +1705,7 @@ mod tests {
             stage: UpgradeStage::Installing,
             reason: "~/.local/bin/dot-agent-deck on the remote was replaced, but the new binary did not pass its version check".into(),
             installed_version: Some(crate::remote::UNVERIFIED_BUILD.into()),
+            old_daemon_gone: false,
         }
         .summary("box");
         assert!(
@@ -1666,6 +1724,7 @@ mod tests {
             stage: UpgradeStage::Installing,
             reason: "download refused".into(),
             installed_version: None,
+            old_daemon_gone: false,
         }
         .summary("box");
         assert!(!failed.contains("is installed"), "{failed}");
@@ -1878,6 +1937,7 @@ mod tests {
                     stage: UpgradeStage::Restarting,
                     reason: format!("refused: {reason:?}"),
                     installed_version: Some("0.2.0".into()),
+                    old_daemon_gone: false,
                 }
             );
         }
@@ -2381,6 +2441,7 @@ mod tests {
             stage,
             reason,
             installed_version,
+            ..
         } = &outcome
         else {
             panic!("{outcome:?}");
@@ -2453,11 +2514,17 @@ mod tests {
             stage,
             reason,
             installed_version,
+            old_daemon_gone,
         } = &outcome
         else {
             panic!("{outcome:?}");
         };
         assert_eq!(*stage, UpgradeStage::Verifying);
+        assert!(
+            *old_daemon_gone,
+            "it accepted, so the agents it had are stopped even while it answers"
+        );
+        assert!(outcome.old_daemon_gone());
         assert!(reason.starts_with("restarted, but the new daemon did not answer"));
         assert_eq!(installed_version.as_deref(), Some("0.2.0"));
         assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
@@ -2821,11 +2888,16 @@ mod tests {
             stage,
             reason,
             installed_version,
+            old_daemon_gone,
         } = &outcome
         else {
             panic!("{outcome:?}");
         };
         assert_eq!(*stage, UpgradeStage::Restarting);
+        assert!(
+            !*old_daemon_gone,
+            "the old daemon still answers as itself: its sessions are kept"
+        );
         assert!(reason.contains("ssh dropped the session"), "{reason}");
         assert!(reason.contains("the daemon did not restart"), "{reason}");
         assert_eq!(installed_version.as_deref(), Some("0.2.0"));
@@ -2844,6 +2916,10 @@ mod tests {
         assert_eq!(*stage, UpgradeStage::Restarting);
         assert!(reason.contains("no reply within 40s"), "{reason}");
         assert!(reason.contains("still running 15s later"), "{reason}");
+        assert!(
+            !outcome.old_daemon_gone(),
+            "the endpoint still answers as the old process"
+        );
     }
 
     /// PRD #1487 review (Qodo 4200422524): a failure from before the request
@@ -3230,6 +3306,7 @@ mod tests {
                 stage: UpgradeStage::Restarting,
                 reason: evil_reason.clone(),
                 installed_version: Some(evil_version.into()),
+                old_daemon_gone: false,
             },
         ];
         for outcome in outcomes {
@@ -3247,6 +3324,7 @@ mod tests {
             stage: UpgradeStage::Restarting,
             reason: evil_reason,
             installed_version: None,
+            old_daemon_gone: false,
         }
         .summary("box");
         assert!(failed.contains("refused[31m\n2Jxxx"), "{failed}");
@@ -3302,6 +3380,7 @@ mod tests {
             stage: UpgradeStage::Installing,
             reason: "download refused".into(),
             installed_version: None,
+            old_daemon_gone: false,
         }
         .summary("box");
         assert!(failed.contains("failed while installing") && failed.contains("download refused"));
@@ -3323,6 +3402,7 @@ mod tests {
             stage: UpgradeStage::Installing,
             reason: "x".into(),
             installed_version: None,
+            old_daemon_gone: false,
         })
         .unwrap();
         assert_eq!(value["outcome"], "failed");

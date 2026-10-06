@@ -365,9 +365,17 @@ fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path
 /// install is kept rather than replaced (PRD #1487 —
 /// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
 /// no such entry gets the first kept install's command rather than this
-/// binary's, so the file keeps naming one install. Returns the binary the
-/// installed events now name, which is what the trust write has to be about.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: InstallMode) -> String {
+/// binary's. Returns every binary the installed events now name — the first
+/// kept install's first, then any other an event kept for itself — which is
+/// what the trust write has to be about: events that already named different
+/// live installs keep them, and each of those commands needs its own grant
+/// (Qodo 4200693859).
+fn install_impl(
+    root: &mut Value,
+    command: &str,
+    binary_path: &str,
+    mode: InstallMode,
+) -> Vec<String> {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -434,6 +442,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
                 .and_then(|rules| kept(rules))
         }),
     };
+    let mut named = vec![KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)];
     for &event in CODEX_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
@@ -444,6 +453,11 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
             InstallMode::Explicit => None,
             InstallMode::Automatic => kept(arr),
         };
+        let named_here =
+            KeptDeckEntry::named_binary(kept_here.as_ref().or(keeper.as_ref()), binary_path);
+        if !named.contains(&named_here) {
+            named.push(named_here);
+        }
         let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
         let entry = json!({
             "hooks": [ { "type": "command", "command": command } ]
@@ -477,7 +491,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
             arr.push(entry);
         }
     }
-    KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)
+    named
 }
 
 /// Reject a structurally-incompatible existing `hooks.json` shape without
@@ -527,11 +541,11 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
 /// The automatic install's seam: [`install_to`] under
 /// [`InstallMode::Automatic`], which keeps another live durable install's entry
 /// rather than replacing it (PRD #1487). Returns whether the file changed and
-/// the binary its entries now name.
+/// every binary its entries now name, the first kept install's first.
 pub(crate) fn auto_install_to(
     codex_home: &Path,
     binary_path: &str,
-) -> std::io::Result<(bool, String)> {
+) -> std::io::Result<(bool, Vec<String>)> {
     install_to_reporting(codex_home, binary_path, InstallMode::Automatic)
 }
 
@@ -543,7 +557,7 @@ fn install_to_reporting(
     codex_home: &Path,
     binary_path: &str,
     mode: InstallMode,
-) -> std::io::Result<(bool, String)> {
+) -> std::io::Result<(bool, Vec<String>)> {
     let path = codex_home.join("hooks.json");
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
@@ -688,13 +702,14 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// `auto_install`): a missing home or unwritable dir degrades to the coarse
 /// stdout fallback rather than blocking the spawn.
 ///
-/// Returns the binary the deck's definitions name afterwards, or `None` if the
-/// install failed. That is this process's durable path unless another live,
+/// Returns every binary the deck's definitions name afterwards, or `None` if
+/// the install failed. That is this process's durable path unless another live,
 /// durable install's entry was already there — an automatic install keeps that
-/// one rather than replacing it (PRD #1487). The caller needs it to build the expected command
-/// [`trust_deck_hooks_in`] compares against (issue #730) — the SAME value, so
-/// install and trust can never be about two different binaries.
-pub fn auto_install() -> Option<String> {
+/// one rather than replacing it (PRD #1487), and keeps each event's own when
+/// events name different live installs. The caller needs them to build the
+/// expected commands [`trust_deck_hooks_for`] compares against (issue #730) —
+/// the SAME values, so install and trust can never be about different binaries.
+pub fn auto_install() -> Option<Vec<String>> {
     let home = codex_home()?;
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
@@ -715,7 +730,7 @@ pub fn auto_install() -> Option<String> {
                 crate::agent_hook_config::log_auto_install_change(
                     "codex",
                     &home.join("hooks.json"),
-                    &named,
+                    &named.join(", "),
                     "codex auto-install",
                 );
             }
@@ -1588,10 +1603,35 @@ pub fn trust_deck_hooks_in(
     cwd: &Path,
     binary_path: &str,
 ) -> std::io::Result<TrustOutcome> {
-    let expected = expected_hook_command(binary_path);
+    trust_deck_hooks_for(home, cwd, &[binary_path.to_string()])
+}
+
+/// [`trust_deck_hooks_in`] for every binary an automatic install left the
+/// deck's definitions naming ([`auto_install`]): each listed entry is matched
+/// [`DeckCommandMatch::Exact`] against one of their expected commands, so the
+/// grant is exactly as narrow as for one binary — never a signature match, never
+/// a foreign handler — and no event an earlier install kept is left untrusted
+/// because a different event kept a different install (Qodo 4200693859).
+/// `binary_paths` must be non-empty; the first is the one a zero-trust warning
+/// is reported against.
+pub fn trust_deck_hooks_for(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+) -> std::io::Result<TrustOutcome> {
+    let mut expected_commands: Vec<String> = Vec::new();
+    for binary_path in binary_paths {
+        let command = expected_hook_command(binary_path);
+        if !expected_commands.contains(&command) {
+            expected_commands.push(command);
+        }
+    }
+    let Some(expected) = expected_commands.first().cloned() else {
+        return Ok(TrustOutcome::NothingListed);
+    };
     let listing = list_hooks_in(home, cwd)?;
     let entries = &listing.entries;
-    let eligible = deck_owned_entries(entries, home, DeckCommandMatch::Exact(&expected));
+    let eligible = trust_eligible(entries, home, &expected_commands);
     // Issue #559: taken from the same eligible set the records are, so it can
     // only name an entry this call is about to trust.
     let reports_prompts = eligible.iter().any(|entry| entry.is_enabled_prompt_hook());
@@ -1671,6 +1711,20 @@ pub fn trust_deck_hooks_in(
         reports_prompts,
         turned_off,
     })
+}
+
+/// The listed entries a trust write grants: those [`deck_owned_entries`] keeps
+/// under [`DeckCommandMatch::Exact`] for one of `expected_commands`, so a grant
+/// for several installs is the union of single-install grants and nothing wider.
+fn trust_eligible<'a>(
+    entries: &'a [CodexHookEntry],
+    home: &Path,
+    expected_commands: &[String],
+) -> Vec<&'a CodexHookEntry> {
+    expected_commands
+        .iter()
+        .flat_map(|command| deck_owned_entries(entries, home, DeckCommandMatch::Exact(command)))
+        .collect()
 }
 
 /// The name a user sees for a Codex event, from the `<event_snake>` segment of
@@ -2166,12 +2220,12 @@ pub fn auto_install_and_trust_at_startup() {
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
-    let Some(binary_path) = auto_install() else {
+    let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
         return;
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    match trust_deck_hooks_in(&home, &cwd, &binary_path) {
+    match trust_deck_hooks_for(&home, &cwd, &binary_paths) {
         Ok(outcome) => {
             // The `Unrecognised` case has already warned from inside; this path
             // has no user watching, so the count is all it needs.
@@ -2361,6 +2415,85 @@ mod tests {
             .flat_map(crate::agent_hook_config::rule_commands)
             .map(str::to_string)
             .collect()
+    }
+
+    /// Scenario: two events already name two different live installs (A and
+    /// B) and a third install auto-installs. Each event keeps its own install,
+    /// the install reports both A and B, and the trust grant covers both
+    /// events' exact commands while a foreign handler and a lookalike stay
+    /// ungranted (PRD #1487, Qodo 4200693859).
+    #[cfg(unix)]
+    #[test]
+    fn an_auto_install_keeping_two_live_installs_trusts_both() {
+        let fixture = crate::test_temp::tempdir().expect("codex fixture tempdir");
+        let a = seed_executable(&fixture.path().join("install-a").join("dot-agent-deck"));
+        let b = seed_executable(&fixture.path().join("install-b").join("dot-agent-deck"));
+        let c = seed_executable(&fixture.path().join("install-c").join("dot-agent-deck"));
+        let home = fixture.path().join("codex-home");
+        std::fs::create_dir_all(&home).expect("create codex home");
+        install_to(&home, &a).expect("explicit install from A");
+        // Point one event at B, as a second live install would have left it.
+        let mut root = read_back(&home);
+        root["hooks"]["Stop"][0]["hooks"][0]["command"] = json!(expected_hook_command(&b));
+        std::fs::write(
+            home.join("hooks.json"),
+            serde_json::to_vec_pretty(&root).unwrap(),
+        )
+        .unwrap();
+
+        let (_, named) = auto_install_to(&home, &c).expect("automatic install from C");
+        assert_eq!(named, vec![a.clone(), b.clone()], "A first, then B");
+
+        let root = read_back(&home);
+        let command_of = |event: &str| {
+            root["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} has a deck command"))
+                .to_string()
+        };
+        assert_eq!(
+            command_of("Stop"),
+            expected_hook_command(&b),
+            "Stop keeps B"
+        );
+        assert_eq!(
+            command_of("SessionStart"),
+            expected_hook_command(&a),
+            "SessionStart keeps A"
+        );
+
+        let source = home.join("hooks.json");
+        let entry = |command: String, event: &str| CodexHookEntry {
+            key: format!("{}:{event}:0:0", source.display()),
+            command,
+            source_path: source.clone(),
+            current_hash: format!("sha256:{event}"),
+            trust_status: "untrusted".to_string(),
+            is_managed: Some(false),
+            enabled: None,
+        };
+        let entries = vec![
+            entry(command_of("SessionStart"), "session_start"),
+            entry(command_of("Stop"), "stop"),
+            entry(expected_hook_command(&c), "pre_tool_use"),
+            entry("/usr/local/bin/my-audit.sh".to_string(), "post_tool_use"),
+        ];
+        let granted: Vec<&str> = trust_eligible(
+            &entries,
+            &home,
+            &[
+                expected_hook_command(&named[0]),
+                expected_hook_command(&named[1]),
+            ],
+        )
+        .into_iter()
+        .map(|e| e.key.rsplit(':').nth(2).unwrap())
+        .collect();
+        assert_eq!(
+            granted,
+            vec!["session_start", "stop"],
+            "both kept installs' events are granted; C's lookalike and the foreign hook are not"
+        );
     }
 
     /// The retired-event sweep clears THIS install's leftovers under an event

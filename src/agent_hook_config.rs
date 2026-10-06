@@ -1642,11 +1642,11 @@ mod tests {
     #[cfg(unix)]
     fn auto_install_config(agent: &str, home: &Path, binary: &str) -> Option<String> {
         match agent {
-            "codex" => Some(
-                crate::codex_hooks_manage::auto_install_to(home, binary)
-                    .unwrap()
-                    .1,
-            ),
+            "codex" => crate::codex_hooks_manage::auto_install_to(home, binary)
+                .unwrap()
+                .1
+                .into_iter()
+                .next(),
             "claude-code" => {
                 crate::hooks_manage::auto_install_to(&home.join("settings.json"), || {
                     Ok(binary.to_string())

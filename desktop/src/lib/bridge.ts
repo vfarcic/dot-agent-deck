@@ -10,7 +10,7 @@ import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
-import type { UpgradeChoice, UpgradeEvent, UpgradeOffer, UpgradeOutcome, UpgradeProgressEvent, UpgradeDecisionEvent, UpgradeStopSet } from "./upgrade";
+import { upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
@@ -4723,9 +4723,10 @@ export class TauriDeckBridge implements DeckBridge {
     ]);
     try {
       const outcome = await invoke<UpgradeOutcome>("desktop_upgrade_daemon", { deckId });
-      // The crate ended this deck's terminal sessions with the old daemon; the
-      // bridge forgets them too, so the next declaration re-attaches.
-      if (outcome.outcome === "restarted") this.forgetDeckSessions(deckId);
+      // When the old daemon may be gone the crate ended this deck's terminal
+      // sessions with it; the bridge forgets them too, so the next declaration
+      // re-attaches against whatever answers now.
+      if (upgradeEndedDeckSessions(outcome)) this.forgetDeckSessions(deckId);
       return outcome;
     } finally {
       stops.forEach((stop) => stop());

@@ -303,7 +303,19 @@ pub(crate) enum UpgradeOutcomeDto {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         installed_version: Option<String>,
+        /// The daemon that was asked may be gone, so this deck's terminal
+        /// sessions with it are stale ([`ends_deck_sessions`]).
+        old_daemon_gone: bool,
     },
+}
+
+/// Whether an upgrade's outcome ends the deck's terminal sessions with the
+/// daemon that was running: after a restart, and after a failure that came
+/// once that daemon accepted the restart, or once its reply was lost and it no
+/// longer answered as itself. A failure that left it answering — refused,
+/// never reached, or still the same process — keeps them (Qodo 4200693875).
+pub(crate) fn ends_deck_sessions(outcome: &UpgradeOutcome) -> bool {
+    outcome.old_daemon_gone()
 }
 
 impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
@@ -365,10 +377,12 @@ impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
                 stage,
                 reason,
                 installed_version,
+                old_daemon_gone,
             } => Self::Failed {
                 stage: *stage,
                 reason: text(reason),
                 installed_version: installed_version.as_ref().map(text),
+                old_daemon_gone: *old_daemon_gone,
             },
         }
     }
@@ -729,11 +743,67 @@ mod tests {
             stage: UpgradeStage::Installing,
             reason: "ssh: connect timed out".into(),
             installed_version: None,
+            old_daemon_gone: false,
         }))
         .unwrap();
         assert_eq!(failed["outcome"], "failed");
         assert_eq!(failed["stage"], "installing");
         assert!(failed.get("installedVersion").is_none());
+        assert_eq!(failed["oldDaemonGone"], false);
+    }
+
+    /// Scenario: every upgrade outcome is checked for whether it ends the
+    /// deck's terminal sessions. A restart does, and so does a failure after
+    /// the old daemon accepted or stopped answering as itself; a failure that
+    /// left it answering, and every not-restarted outcome, keeps them (PRD
+    /// #1487, Qodo 4200693875).
+    #[test]
+    fn only_an_outcome_whose_old_daemon_may_be_gone_ends_the_decks_sessions() {
+        let failed = |stage, old_daemon_gone| UpgradeOutcome::Failed {
+            stage,
+            reason: "r".into(),
+            installed_version: Some("0.45.0".into()),
+            old_daemon_gone,
+        };
+        let restarted = UpgradeOutcome::Restarted {
+            from_version: "0.44.0".into(),
+            to_version: "0.45.0".into(),
+            stopped: RestartStopSet::default(),
+        };
+        assert!(ends_deck_sessions(&restarted));
+        assert!(ends_deck_sessions(&failed(UpgradeStage::Verifying, true)));
+        assert!(ends_deck_sessions(&failed(UpgradeStage::Restarting, true)));
+        assert!(!ends_deck_sessions(&failed(
+            UpgradeStage::Restarting,
+            false
+        )));
+        assert!(!ends_deck_sessions(&failed(
+            UpgradeStage::Installing,
+            false
+        )));
+        assert!(!ends_deck_sessions(
+            &UpgradeOutcome::InstalledNotRestarted {
+                from_version: None,
+                installed_version: "0.45.0".into(),
+                reason: NotRestartedReason::AnotherRestartInProgress,
+            }
+        ));
+        assert!(!ends_deck_sessions(
+            &UpgradeOutcome::InstalledDaemonTooOld {
+                installed_version: "0.45.0".into(),
+                daemon_version: None,
+                remedy: "r".into(),
+            }
+        ));
+        let dto = serde_json::to_value(UpgradeOutcomeDto::from(&failed(
+            UpgradeStage::Verifying,
+            true,
+        )))
+        .unwrap();
+        assert_eq!(
+            dto["oldDaemonGone"], true,
+            "the bridge reads the same answer"
+        );
     }
 
     #[test]
