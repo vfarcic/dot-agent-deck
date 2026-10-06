@@ -755,9 +755,23 @@ impl RestartControl {
     }
 
     /// Whether an accepted restart was left to the service manager, so the
-    /// daemon must exit with [`SUPERVISED_RESTART_EXIT`].
+    /// daemon must exit with [`SUPERVISED_RESTART_EXIT`]. A stop requested
+    /// after the plan was taken still wins: the daemon then exits cleanly.
     pub fn handed_to_supervisor(&self) -> bool {
-        self.handed_off.load(Ordering::SeqCst)
+        self.handed_off.load(Ordering::SeqCst) && !self.is_stop_requested()
+    }
+
+    /// Run `spawn` (the successor's spawn) unless a stop was requested,
+    /// holding the lock [`Self::request_stop`] takes, so a stop handled
+    /// concurrently — by a connection still finishing after the serve loop
+    /// returned — lands either before it (nothing is spawned) or after the
+    /// successor already exists (Qodo 4201481137).
+    pub fn spawn_successor_unless_stopped<R>(&self, spawn: impl FnOnce() -> R) -> Option<R> {
+        let _slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stopped.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(spawn())
     }
 }
 
@@ -1344,6 +1358,42 @@ mod tests {
             assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
             assert!(!control.handed_to_supervisor());
         }
+    }
+
+    /// Scenario: the daemon has already taken its successor plan — the serve
+    /// loop returned — when a connection still finishing handles a stop. The
+    /// successor is not spawned, and a supervised daemon exits cleanly instead
+    /// of asking its service manager for a restart (PRD #1487, Qodo
+    /// 4201481137).
+    #[test]
+    fn a_stop_after_the_plan_was_taken_still_wins() {
+        let control = RestartControl::default();
+        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        let SuccessorPlan::Spawn(_) = control.take_successor_plan() else {
+            panic!("an unsupervised daemon spawns its successor");
+        };
+        assert_eq!(control.spawn_successor_unless_stopped(|| 7), Some(7));
+        control.stop_wins("test");
+        assert_eq!(
+            control.spawn_successor_unless_stopped(|| unreachable!("a stop came first")),
+            None::<()>
+        );
+
+        let control = RestartControl::new(InstallRecord {
+            startup_exe: PathBuf::from("/x/dot-agent-deck"),
+            supervisor: Supervisor::Systemd,
+        });
+        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        assert_eq!(
+            control.take_successor_plan(),
+            SuccessorPlan::LeaveToSupervisor(Supervisor::Systemd)
+        );
+        assert!(control.handed_to_supervisor());
+        control.stop_wins("test");
+        assert!(
+            !control.handed_to_supervisor(),
+            "a stop after the plan was taken exits cleanly"
+        );
     }
 
     /// Scenario: a stop arrives while a restart is still being checked. The

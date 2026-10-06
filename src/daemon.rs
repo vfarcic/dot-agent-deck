@@ -1205,14 +1205,23 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                             "the installed build changed after it was verified; it verified again"
                         );
                     }
-                    match crate::daemon_attach::spawn_restart_successor(
-                        &crate::config::state_dir(),
-                        &target,
-                    ) {
-                        Ok(pid) => {
+                    // A connection still finishing can handle a stop after the
+                    // plan was taken; checked under the lock that stop takes,
+                    // so a stop that lands first means nothing is spawned.
+                    match restart_control.spawn_successor_unless_stopped(|| {
+                        crate::daemon_attach::spawn_restart_successor(
+                            &crate::config::state_dir(),
+                            &target,
+                        )
+                    }) {
+                        None => warn!(
+                            target = %target.display(),
+                            "a stop arrived before the successor was spawned; not spawning it"
+                        ),
+                        Some(Ok(pid)) => {
                             info!(pid, target = %target.display(), "successor daemon spawned")
                         }
-                        Err(e) => error!(
+                        Some(Err(e)) => error!(
                             target = %target.display(),
                             error = %e,
                             "could not spawn the successor daemon; none is running until a client starts one"
