@@ -1166,13 +1166,28 @@ impl Installer for NoInstall {
 // ---------------------------------------------------------------------------
 
 /// What a remote `daemon probe --json` says, as the port reports it.
+///
+/// `running` and `hello` must agree: a report that a daemon is running with no
+/// `Hello` from it (or a `Hello` from a daemon it says is not running) cannot
+/// be read as "no daemon running", which would skip the restart silently, so
+/// it is a failed probe (Qodo 4202911031).
 fn remote_probe_answer<E: SshExecutor>(
     port: &SshDaemonPort<E>,
     probe: Result<crate::daemon_restart::DaemonProbe, RemoteDaemonError>,
 ) -> Result<Option<AttachResponse>, PortError> {
     match probe {
-        Ok(probe) if probe.running => Ok(probe.hello),
-        Ok(_) => Ok(None),
+        Ok(probe) => match (probe.running, probe.hello) {
+            (true, Some(hello)) => Ok(Some(hello)),
+            (false, None) => Ok(None),
+            (true, None) => Err(PortError::Other(format!(
+                "the installed build at {} reported a running daemon but not its answer",
+                port.binary()
+            ))),
+            (false, Some(_)) => Err(PortError::Other(format!(
+                "the installed build at {} reported no running daemon but included its answer",
+                port.binary()
+            ))),
+        },
         Err(RemoteDaemonError::Unsupported { .. }) => {
             Err(PortError::InstalledBuildTooOld(format!(
                 "the installed build at {} is too old to report on the running daemon",
@@ -2718,6 +2733,76 @@ mod tests {
             "{reason}"
         );
         assert_eq!(stages.last(), Some(&UpgradeStage::Verifying));
+    }
+
+    /// Qodo 4202911031: a remote probe report whose `running` and `hello`
+    /// disagree is a failed probe, so the upgrade fails at the restarting stage
+    /// rather than reporting "no daemon running" and skipping the restart; a
+    /// report of no daemon (`running: false`, no `hello`) is still none running.
+    #[test]
+    fn a_remote_probe_whose_running_and_hello_disagree_is_a_failure_not_none_running() {
+        use crate::daemon_restart::DaemonProbe;
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct Probes(DaemonProbe);
+        impl SshExecutor for Probes {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                assert!(command.ends_with("daemon probe --json"), "{command}");
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: serde_json::to_string(&self.0).unwrap(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let port = |running, hello| {
+            SshDaemonPort::new(
+                Probes(DaemonProbe { running, hello }),
+                SshTarget::parse("u@h", 22, None),
+                "~/.local/bin/dot-agent-deck",
+            )
+        };
+        let install = FakeInstaller::ok("0.40.0", InstallMethod::LocalBin);
+
+        let p = port(true, None);
+        match DaemonPort::probe(&p) {
+            Err(PortError::Other(reason)) => assert!(
+                reason.contains("reported a running daemon but not its answer"),
+                "{reason}"
+            ),
+            other => panic!("a running daemon without a hello was not an error: {other:?}"),
+        }
+        let (outcome, _) = run(&install, &p, &NoDecider, &remote_plan());
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::Failed {
+                    stage: UpgradeStage::Restarting,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let p = port(false, Some(hello_from("0.39.0", "old", "old-process")));
+        assert!(
+            matches!(DaemonPort::probe(&p), Err(PortError::Other(_))),
+            "a hello from a daemon reported as not running was not an error"
+        );
+
+        let p = port(false, None);
+        assert!(matches!(DaemonPort::probe(&p), Ok(None)));
+        let (outcome, _) = run(&install, &p, &NoDecider, &remote_plan());
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::InstalledNotRestarted {
+                    reason: NotRestartedReason::NoDaemonRunning,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
     }
 
     /// The identity survives the remote route: `daemon probe --json` on the
