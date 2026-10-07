@@ -240,7 +240,7 @@ pub fn resolve_single_unit_launch(
 
 /// The command's program and its arguments, past any leading `env` and
 /// `NAME=value` assignments. Whitespace-split: enough to name the program and
-/// spot a flag, which is all the two callers below ask.
+/// spot a flag, which is all [`opens_an_interactive_shell`] asks.
 fn program_and_args(command: &str) -> (Option<&str>, Vec<&str>) {
     let mut tokens = command.split_whitespace().peekable();
     while let Some(token) = tokens.peek() {
@@ -337,22 +337,29 @@ pub fn opens_an_interactive_shell(command: &str) -> bool {
     }
 }
 
-/// Issue #1602 (PR #1603 review): whether `command` names its program by a
-/// path relative to the directory it starts in (`./agent.sh`, `tools/agent`).
-/// Such a command only resolves in a unit's worktree when the dispatcher was
-/// started at the repository root, which is where the unit starts.
-fn names_its_program_relatively(command: &str) -> bool {
-    let (Some(program), _) = program_and_args(command) else {
-        return false;
-    };
-    let program = program.trim_matches(['\'', '"']);
-    (program.contains('/') || program.contains('\\'))
-        && !std::path::Path::new(program).is_absolute()
-        // Rooted without a drive (`/opt/agent` on Windows) is not relative to
-        // the directory it starts in either.
-        && !program.starts_with(['/', '\\'])
-        && !program.starts_with('~')
-        && !program.starts_with('$')
+/// Issue #1602 (PR #1603 review): whether `command` names anything by a path
+/// relative to the directory it starts in — its program (`./agent.sh`), a
+/// script it hands a shell or launcher (`sh ./agent.sh`, `devbox run ./agent`),
+/// or an option or variable value (`--settings=./x.json`, `CONF=../x`). Such a
+/// command only resolves in a unit's worktree when the dispatcher was started
+/// at the repository root, which is where the unit starts.
+///
+/// Deliberately broad: a word that merely looks like a relative path
+/// (`--model provider/name`) only makes a dispatcher started below its
+/// repository root hand its unit the fallback command instead of its own.
+fn names_a_relative_path(command: &str) -> bool {
+    command.split_whitespace().any(|word| {
+        let value = word.split_once('=').map_or(word, |(_, value)| value);
+        let path = value.trim_matches(['\'', '"']);
+        (path.contains('/') || path.contains('\\'))
+            && !path.contains("://")
+            && !std::path::Path::new(path).is_absolute()
+            // Rooted without a drive (`/opt/agent` on Windows) is not relative to
+            // the directory it starts in either.
+            && !path.starts_with(['/', '\\'])
+            && !path.starts_with('~')
+            && !path.starts_with('$')
+    })
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -710,12 +717,12 @@ pub async fn handle_dispatch(
     // nothing there, so such a command is not passed on.
     if dispatcher_launch
         .as_ref()
-        .is_some_and(|d| names_its_program_relatively(&d.command))
+        .is_some_and(|d| names_a_relative_path(&d.command))
         && !starts_at_repository_root(&clone_dir).await
     {
         tracing::debug!(
-            "dispatch: the caller's command names its program by a relative path from below \
-             the repository root, so the single unit falls back to the default command"
+            "dispatch: the caller's command names a relative path and the caller is below the \
+             repository root, so the single unit falls back to the default command"
         );
         dispatcher_launch = None;
     }
@@ -1180,6 +1187,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base, format!("feature-x at {}", sha.trim()));
+    }
+
+    /// Issue #1602 (PR #1603 review): the root of a repository is where a
+    /// unit cut from it starts; a subdirectory is not, so a dispatcher there
+    /// does not hand its unit a command naming a relative path.
+    #[tokio::test]
+    async fn starts_at_repository_root_only_at_the_top_of_the_working_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        let sub = repo.join("tools");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(starts_at_repository_root(&repo).await);
+        assert!(!starts_at_repository_root(&sub).await);
+        assert!(
+            !starts_at_repository_root(&tmp.path().join("missing")).await,
+            "a probe that fails withholds the relative command"
+        );
     }
 
     /// A detached checkout answers the literal string `HEAD` to `rev-parse
@@ -1734,17 +1759,23 @@ mod tests {
         }
     }
 
-    /// Greptile, PR #1603: a relatively-named launcher is recognised so it is
-    /// not handed on from a dispatcher started below the repository root.
+    /// Greptile and Qodo, PR #1603: a command naming anything by a relative
+    /// path is recognised, so it is not handed on from a dispatcher started
+    /// below the repository root.
     #[test]
-    fn names_its_program_relatively_only_for_a_relative_path() {
+    fn names_a_relative_path_wherever_the_command_names_one() {
         for relative in [
             "./agent.sh",
             "../bin/agent",
             "tools/agent --x",
             "FOO=1 ./agent",
+            "sh ./agent.sh",
+            "bash tools/agent.sh",
+            "devbox run ./agent",
+            "claude --settings=./settings.json",
+            "CONF=../agent.toml claude",
         ] {
-            assert!(names_its_program_relatively(relative), "{relative:?}");
+            assert!(names_a_relative_path(relative), "{relative:?}");
         }
         for not in [
             "claude",
@@ -1752,8 +1783,10 @@ mod tests {
             "/opt/agent",
             "~/bin/agent",
             "$HOME/agent",
+            "sh /opt/launch.sh",
+            "agent --endpoint https://example.com/v1",
         ] {
-            assert!(!names_its_program_relatively(not), "{not:?}");
+            assert!(!names_a_relative_path(not), "{not:?}");
         }
     }
 

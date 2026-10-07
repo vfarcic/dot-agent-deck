@@ -3111,14 +3111,19 @@ pub struct RunningAgent {
     /// dispatcher-mode flag. Daemon-local, like `spawn_env` — not projected
     /// onto [`AgentRecord`], so the wire is unchanged.
     pub spawn_command: Option<String>,
-    /// Issue #1602 (PR #1603 review): set when a respawn carried the previous
-    /// generation's observed [`Self::agent_type`] onto a child launched with a
-    /// DIFFERENT command. That badge describes the old command, and since
-    /// [`AgentPtyRegistry::set_agent_type`] only fills an empty badge, the new
-    /// child's hooks cannot correct it — so
-    /// [`AgentPtyRegistry::configured_launch_of`] must not hand it to a
-    /// dispatched unit as the new command's agent.
-    pub badge_predates_command: bool,
+    /// Issue #1602 (PR #1603 review): the command [`Self::agent_type`] was
+    /// learned under — the spawn's command when the badge is the spawn's own
+    /// identity, the command running when a hook filled it, or, for a badge a
+    /// respawn carried over, the command it was originally learned under.
+    ///
+    /// [`AgentPtyRegistry::configured_launch_of`] hands the badge to a
+    /// dispatched unit only while this equals [`Self::spawn_command`]: since
+    /// [`AgentPtyRegistry::set_agent_type`] only fills an empty badge, a badge
+    /// carried across a respawn under a different command can never be
+    /// corrected by the new child's hooks, and it names the old command's
+    /// agent. Keeping the origin rather than a stale flag lets A → B → A trust
+    /// it again and keeps A → B → B from doing so.
+    pub badge_command: Option<String>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -9616,7 +9621,7 @@ impl AgentPtyRegistry {
     /// re-inferred from its command where its dispatcher was not. Otherwise it
     /// is the observed [`RunningAgent::agent_type`] a hook event taught the
     /// registry, unless that badge predates the current command
-    /// ([`RunningAgent::badge_predates_command`]). The fallback is what makes a
+    /// ([`RunningAgent::badge_command`]). The fallback is what makes a
     /// launcher pane usable here at all: `devbox run agent` implies no type, so
     /// its spawn identity is `None`, and only the pane's own hooks have said it
     /// is Claude Code. Using that badge as a NEW pane's spawn identity is not
@@ -9638,7 +9643,7 @@ impl AgentPtyRegistry {
             agent
                 .agent_type
                 .clone()
-                .filter(|t| *t != AgentType::None && !agent.badge_predates_command)
+                .filter(|t| *t != AgentType::None && agent.badge_command == agent.spawn_command)
         });
         let shell = agent
             .spawn_env
@@ -10470,8 +10475,8 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type,
             spawn_agent_type,
+            badge_command: spawn_command.clone(),
             spawn_command,
-            badge_predates_command: false,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -12359,10 +12364,9 @@ impl AgentPtyRegistry {
             agent_type: observed_agent_type,
             spawn_agent_type,
             // Issue #1602: the fresh generation records the command it is
-            // actually launched with, which is the one passed in here; the old
-            // one only says whether the restored badge below still fits it.
-            spawn_command: previous_command,
-            badge_predates_command: previous_badge_stale,
+            // actually launched with, which is the one passed in here.
+            spawn_command: _,
+            badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
             // deliberately dropped, not carried over. A token names one spawn,
@@ -12561,21 +12565,19 @@ impl AgentPtyRegistry {
         // the fresh child's first hook lands. Upgrade-only, so a pane created
         // with an explicit identity keeps that identity, and a fresh child that
         // turns out to be a different agent still corrects the badge via its own
-        // hooks. Deliberately AFTER the spawn: routing it through the same
-        // display-only seam the hook path uses is what guarantees it cannot
-        // influence the launch shape.
-        if let Some(observed) = observed_agent_type {
-            self.set_agent_type(pane_id_env, &observed);
-            // Issue #1602: a badge learned under another command is display
-            // only from here on — see `RunningAgent::badge_predates_command`.
-            // Sticky: a badge already stale stays stale when the command is
-            // later restored, since it was never learned under that command
-            // either (Qodo, PR #1603: A → B → B).
-            if (previous_badge_stale || previous_command.as_deref() != Some(command.trim()))
-                && let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&new_agent_id)
-            {
-                agent.badge_predates_command = true;
-            }
+        // hooks. Deliberately AFTER the spawn, and to the display badge only,
+        // which is what guarantees it cannot influence the launch shape.
+        //
+        // Issue #1602: written here under one lock rather than through
+        // `set_agent_type`, so the badge's origin travels with it — and so a
+        // badge the fresh child's own hook already reported is left alone, with
+        // the origin that hook gave it.
+        if let Some(observed) = observed_agent_type.filter(|t| *t != AgentType::None)
+            && let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&new_agent_id)
+            && agent.agent_type.is_none()
+        {
+            agent.agent_type = Some(observed);
+            agent.badge_command = previous_badge_command;
         }
         Ok(new_agent_id)
     }
@@ -14707,7 +14709,7 @@ impl AgentPtyRegistry {
                 agent_type: None,
                 spawn_agent_type: None,
                 spawn_command: None,
-                badge_predates_command: false,
+                badge_command: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real
@@ -14901,6 +14903,7 @@ impl AgentPtyRegistry {
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
+            agent.badge_command = agent.spawn_command.clone();
         }
     }
 
@@ -14916,6 +14919,7 @@ impl AgentPtyRegistry {
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
+            agent.badge_command = agent.spawn_command.clone();
         }
     }
 
@@ -16959,6 +16963,20 @@ mod spawn_tests {
                 .and_then(|l| l.agent_type),
             None,
             "a stale badge stays stale across a later respawn under the same command"
+        );
+
+        // A → B → B → A: back under the command it was learned under, the badge
+        // describes the running command again.
+        let back = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat'")
+            .await
+            .expect("respawn back under the original command");
+        assert_eq!(
+            registry
+                .configured_launch_of(&back)
+                .and_then(|l| l.agent_type),
+            Some(AgentType::Codex),
+            "the badge is trusted again once its own command is running"
         );
         registry.shutdown_all();
     }
