@@ -82,9 +82,12 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
     deck.send_bytes(b"\x04");
     deck.wait_for_string("Dir:");
 
+    // The stand-in sleeps 10 s before it paints anything, so a 15 s budget left
+    // 5 s for the wrapper's boot and the event's round trip, which a starved
+    // machine overran (seen while working on issue #1493).
     let working = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Thinking,
-        Duration::from_secs(15),
+        Duration::from_secs(40),
     );
     assert_eq!(working.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
     assert_eq!(working.agent_type, AgentType::Codex);
@@ -137,8 +140,15 @@ fn codex_wrap_001_synthetic_codex_reaches_dashboard() {
         deck.snapshot_grid()
     );
 
+    // Issue #1493: a wrapper that could not get Codex's hooks trusted (no
+    // `codex` on this host's PATH) also reports quiet output as a classified
+    // Idle, so wait for the hook's.
     let idle = events.wait_for(
-        |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
+        |event| {
+            event.agent_type == AgentType::Codex
+                && event.event_type == EventType::Idle
+                && !event.is_wrapper_output_classified()
+        },
         Duration::from_secs(15),
     );
     // Issue #540: the turn ends through Codex's native `Stop` hook, as it does

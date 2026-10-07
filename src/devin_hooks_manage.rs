@@ -477,6 +477,8 @@ pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
     let path = config_path(config_dir);
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across deck processes too (issue #1493's follow-up), not only threads.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
@@ -499,6 +501,8 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     }
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Across deck processes too (issue #1493's follow-up), not only threads.
+    let _config_lock = crate::agent_hook_config::lock_config(&path)?;
 
     let mut root = read_config(&path)?;
     validate_structure(&root)?;

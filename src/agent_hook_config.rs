@@ -210,6 +210,223 @@ pub(crate) fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<
     Ok(())
 }
 
+/// How long a writer waits for another process's read-modify-write of the same
+/// agent config to finish. One is a few milliseconds, most of it the `fsync`;
+/// a holder still busy after this long is stuck, and the caller's own error
+/// path (a logged warning on the startup install, a printed one from the CLI)
+/// beats blocking a pane's spawn forever.
+const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a waiting writer retries the lock.
+const CONFIG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// An exclusive, cross-process lock on one agent config file, held until
+/// dropped. See [`lock_config`].
+pub(crate) struct ConfigLock {
+    _file: Option<std::fs::File>,
+}
+
+/// Serialise a read-modify-write of `dest` — an agent config the deck merges
+/// its entries into — across PROCESSES (issue #1493's follow-up).
+///
+/// Each adapter already holds an in-process mutex across its read, merge and
+/// publish, which keeps two threads of one deck apart. Nothing kept two deck
+/// processes apart: several Codex panes starting at once each spawn a wrapper
+/// that records hook trust, so each read the same `config.toml`, added its own
+/// `[hooks.state."<key>"]` record and published — and the later rename dropped
+/// the earlier record, leaving that agent's hooks untrusted. Measured: eight
+/// processes recording twenty records each kept 33 of 160 (`codex/trust/008`).
+///
+/// # A sidecar, never deleted
+///
+/// The config itself cannot carry the lock: every publish REPLACES it by
+/// rename, so a lock on the old inode would not exclude a process that opened
+/// the new one. The lock is on `.<name>.lock` beside it, which is never
+/// replaced or removed — deleting a lock file others may be waiting on is how
+/// two processes end up holding locks on different inodes. It is empty and
+/// owner-only, and deleting it by hand is harmless while no write is running.
+/// The same reasoning as the desktop's settings save lock
+/// (`desktop/src-tauri/src/settings.rs`, issue #828), whose shape this follows.
+///
+/// # When it does not lock
+///
+/// - The config's directory does not exist: there is no file to lose an
+///   update from, and every installer creates the directory before it locks.
+///   (An uninstall of something never installed reaches this.)
+/// - The filesystem cannot lock at all (the call reports `Unsupported`):
+///   refusing would make the deck's hooks uninstallable there, so the write
+///   goes ahead as it always did and says so in the log.
+///
+/// Every other failure is an error: the sidecar's name is taken by something
+/// that is not a regular file (a lock would land on whatever it points at), it
+/// cannot be opened, or another process still holds it after
+/// [`CONFIG_LOCK_WAIT`]. Going ahead unlocked is exactly the race this exists
+/// to stop.
+pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        return Ok(ConfigLock { _file: None });
+    }
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let lock_path = dir.join(format!(".{name}.lock"));
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} is not a regular file, so the deck cannot lock {} to update it; \
+                     remove it and try again",
+                    lock_path.display(),
+                    dest.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    // Nothing is ever written to it; `write` is what `create` requires, and
+    // `LockFileEx` needs a handle opened for reading or writing.
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path)?;
+    let deadline = std::time::Instant::now() + CONFIG_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                reap_stale_temps(dir, name);
+                return Ok(ConfigLock { _file: Some(file) });
+            }
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(CONFIG_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "another process has been updating {} for over {}s; not updating it",
+                        dest.display(),
+                        CONFIG_LOCK_WAIT.as_secs()
+                    ),
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
+                tracing::warn!(
+                    "updating {} without a cross-process lock, which this filesystem does \
+                     not support: {e}",
+                    dest.display()
+                );
+                return Ok(ConfigLock { _file: None });
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
+/// How old a leftover temp file must be before [`reap_stale_temps`] removes it.
+/// A publish holds its temp file for milliseconds; an hour is far past any
+/// write, including one by a process in another PID namespace sharing the
+/// directory, whose pid this one cannot see.
+#[cfg(unix)]
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove leftover temp files of earlier publishes of `name` in `dir` that are
+/// provably the deck's and provably abandoned. Called with the config's lock
+/// held, so no other deck is publishing `name` meanwhile.
+///
+/// [`publish`] already removes its temp file whenever a write or the rename
+/// fails. What it cannot clean up is a process killed between creating the file
+/// and renaming it — a `SIGKILL`, a crash, a machine losing power — which is
+/// how `~/.codex` came to hold 21 `.config.toml.tmp.*` files. They are never
+/// read (only `<name>` itself is), and never in the way of a later publish
+/// (each draws a fresh name), so this is tidiness, not correctness — which is
+/// why it is best-effort and silent about anything it cannot settle.
+///
+/// A file is removed only when ALL of these hold, and kept otherwise:
+/// - its name is exactly [`temp_path`]'s shape for `name`:
+///   `.<name>.tmp.<pid>.<16 lowercase hex digits>`;
+/// - it is a regular file (a symlink or anything else is never touched);
+/// - the process that named it is not running ([`process_is_gone`]): a reused
+///   pid reads as running, which keeps the file — the safe direction;
+/// - it was last modified more than [`STALE_TEMP_AGE`] ago.
+///
+/// Unix only: where the deck cannot ask whether a pid is running, it keeps
+/// everything.
+fn reap_stale_temps(dir: &Path, name: &str) {
+    #[cfg(unix)]
+    {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let prefix = format!(".{name}.tmp.");
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(pid) = stale_temp_pid(file_name, &prefix) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|at| now.duration_since(at).ok())
+                .is_some_and(|age| age > STALE_TEMP_AGE);
+            if meta.file_type().is_file() && old_enough && process_is_gone(pid) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, name);
+}
+
+/// The pid in `file_name` when it is exactly `<prefix><pid>.<16 lowercase hex>`
+/// — the shape [`temp_path`] draws — and `None` for anything else.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn stale_temp_pid(file_name: &str, prefix: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(prefix)?;
+    let (pid, tail) = rest.split_once('.')?;
+    let hex = tail.len() == 16 && tail.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let digits = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
+    if hex && digits {
+        pid.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Whether no process with `pid` exists, as far as this process can tell:
+/// `kill(pid, 0)` failing with `ESRCH`. Anything else — success, or `EPERM`
+/// for another user's process — reads as running.
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 /// What [`backup_malformed`] did with the bytes it was handed, so
 /// [`preserved_phrase`] can say exactly that and nothing more.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -980,6 +1197,95 @@ mod tests {
             build_command_for(spaced, "hook --agent codex", HookShell::Posix, true),
             "Native and Posix must differ on a Windows host, or the choice is doing nothing"
         );
+    }
+
+    /// Issue #1493's follow-up: only the exact temp-name shape `temp_path`
+    /// draws names a pid the reaper may act on.
+    #[test]
+    fn stale_temp_pid_recognises_only_the_deck_temp_shape() {
+        let prefix = ".config.toml.tmp.";
+        assert_eq!(
+            stale_temp_pid(".config.toml.tmp.4242.0123456789abcdef", prefix),
+            Some(4242)
+        );
+        for other in [
+            ".config.toml.tmp.4242.0123456789ABCDEF",
+            ".config.toml.tmp.4242.0123456789abcde",
+            ".config.toml.tmp.4242.0123456789abcdef0",
+            ".config.toml.tmp..0123456789abcdef",
+            ".config.toml.tmp.42x.0123456789abcdef",
+            ".config.toml.tmp.4242",
+            "config.toml.tmp.4242.0123456789abcdef",
+            ".hooks.json.tmp.4242.0123456789abcdef",
+            "config.toml",
+        ] {
+            assert_eq!(stale_temp_pid(other, prefix), None, "{other}");
+        }
+    }
+
+    /// Issue #1493's follow-up: taking the config lock removes a leftover temp
+    /// file only when it has the deck's exact shape, its process is gone and it
+    /// is over an hour old — and keeps one whose process is running, a fresh
+    /// one, a symlink, and anything named otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn the_config_lock_reaps_only_provably_abandoned_temp_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("config.toml");
+        std::fs::write(&dest, "").expect("config");
+        let gone = {
+            let mut child = std::process::Command::new("true").spawn().expect("spawn");
+            let pid = child.id();
+            child.wait().expect("reap");
+            pid
+        };
+        let live = std::process::id();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let make = |name: &str, old: bool| {
+            let path = dir.path().join(name);
+            let file = std::fs::File::create(&path).expect("create");
+            if old {
+                file.set_modified(hour_ago).expect("age it");
+            }
+            path
+        };
+        let abandoned = make(&format!(".config.toml.tmp.{gone}.0123456789abcdef"), true);
+        let running = make(&format!(".config.toml.tmp.{live}.0123456789abcdef"), true);
+        let fresh = make(&format!(".config.toml.tmp.{gone}.fedcba9876543210"), false);
+        let foreign = make(&format!(".config.toml.tmp.{gone}.not-ours"), true);
+        let link = dir
+            .path()
+            .join(format!(".config.toml.tmp.{gone}.00000000000000ff"));
+        std::os::unix::fs::symlink(&foreign, &link).expect("symlink");
+
+        let _lock = lock_config(&dest).expect("lock");
+        assert!(!abandoned.exists(), "an abandoned deck temp file is reaped");
+        for kept in [&running, &fresh, &foreign] {
+            assert!(kept.exists(), "{} must be kept", kept.display());
+        }
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a symlink is never touched"
+        );
+    }
+
+    /// Issue #1493's follow-up: no directory means no file to lose an update
+    /// from, so nothing is created; a lock name taken by a symlink is refused
+    /// rather than locking whatever it points at.
+    #[cfg(unix)]
+    #[test]
+    fn the_config_lock_skips_a_missing_directory_and_refuses_a_symlinked_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent").join("config.toml");
+        lock_config(&missing).expect("no directory, no lock");
+        assert!(!dir.path().join("absent").exists());
+
+        let dest = dir.path().join("config.toml");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "").expect("target");
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join(".config.toml.lock"))
+            .expect("symlink");
+        assert!(lock_config(&dest).is_err());
     }
 
     #[test]

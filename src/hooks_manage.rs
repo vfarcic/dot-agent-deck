@@ -369,8 +369,36 @@ static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 /// panicking: a previous caller panicking mid-install says nothing about
 /// whether the settings file is usable now, and the read is re-done from disk
 /// under the guard regardless.
-fn lock_settings() -> MutexGuard<'static, ()> {
-    SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+fn lock_settings(path: &Path) -> io::Result<SettingsGuard> {
+    let thread = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Issue #1493's follow-up: the mutex keeps this process's threads apart;
+    // the file lock keeps other deck processes out of the same read-merge-
+    // publish, which otherwise lost the earlier writer's changes.
+    let process = crate::agent_hook_config::lock_config(path)?;
+    Ok(SettingsGuard {
+        _process: process,
+        _thread: thread,
+    })
+}
+
+/// [`lock_settings`] for an INSTALL, which may be the first write ever: the
+/// settings directory is created before the lock is taken, because a lock beside
+/// a directory that does not exist yet is no lock at all — two first installs
+/// would each read empty settings and the later publish would drop the earlier
+/// one's hooks (Qodo on PR #1523). Uninstall keeps [`lock_settings`] and
+/// creates nothing.
+fn lock_settings_for_install(path: &Path) -> io::Result<SettingsGuard> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    lock_settings(path)
+}
+
+/// [`lock_settings`]'s two locks, released together. The file lock is declared
+/// first so it is dropped first, before the mutex.
+struct SettingsGuard {
+    _process: crate::agent_hook_config::ConfigLock,
+    _thread: MutexGuard<'static, ()>,
 }
 
 /// Read `path` the STRICT way used by every install AND uninstall path. Only a
@@ -1103,7 +1131,13 @@ pub fn auto_install_to_gated(
         }
     };
 
-    let _guard = lock_settings();
+    let _guard = match lock_settings(path) {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
         Err(e) => {
@@ -1169,7 +1203,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
     let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
-    let _guard = lock_settings();
+    let _guard = lock_settings_for_install(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let InstallOutcome {
@@ -1230,7 +1264,7 @@ pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<
 /// `claude_install` alone.
 pub fn uninstall() -> Result<(), String> {
     let path = settings_path();
-    let _guard = lock_settings();
+    let _guard = lock_settings(&path).map_err(|e| e.to_string())?;
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
     let outcome = uninstall_impl(&mut settings);
@@ -1274,7 +1308,7 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
-    let _guard = lock_settings();
+    let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     install_impl(&mut settings, binary_path, stop_failure);
     write_settings(path, &settings)
@@ -1285,7 +1319,7 @@ pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> i
 /// found and reported as an error, and nothing is written when nothing of the
 /// deck's was there.
 pub fn uninstall_from(path: &Path) -> io::Result<()> {
-    let _guard = lock_settings();
+    let _guard = lock_settings(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     if uninstall_impl(&mut settings).commands_removed == 0 {
         return Ok(());
