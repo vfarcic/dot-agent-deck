@@ -366,7 +366,7 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
       - name: Upload the release body
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-body
           path: ${{ runner.temp }}/release-body.md
@@ -562,7 +562,7 @@ jobs:
           BINARY_NAME="dot-agent-deck-${MATRIX_ARTIFACT_SUFFIX}${MATRIX_BINARY_EXT}"
           cp "target/${MATRIX_TARGET}/release/dot-agent-deck${MATRIX_BINARY_EXT}" "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
@@ -672,7 +672,7 @@ jobs:
       # re-run, since its `run_attempt` would no longer match the one
       # `finalize` uploaded under. Same reasoning as the `--clobber` already on
       # this workflow's `gh release upload`.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-checksums
           path: dist/checksums.txt
@@ -937,7 +937,7 @@ jobs:
           mkdir -p dist-desktop-app
           ditto -c -k --sequesterRsrc --keepParent "$APP" "dist-desktop-app/dot-agent-deck-desktop-alpha-${ASSET_SUFFIX}.app.zip"
           ls -la dist-desktop-app
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: runner.os == 'Linux'
         with:
           # Deliberately NOT `dot-agent-deck-*`: that is the pattern `finalize`
@@ -949,7 +949,7 @@ jobs:
           # the run, not the attempt. The sibling upload in `finalize` has the
           # longer reasoning.
           overwrite: true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: runner.os == 'macOS'
         with:
           # Outside BOTH download patterns in this file: not `dot-agent-deck-*`
@@ -1711,7 +1711,7 @@ jobs:
           bash "$RUNNER_TEMP/notarize.sh" "$DMG" "the disk image"
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           # THE name `desktop-publish` and `attest` select with their
           # `desktop-bundle-*` pattern, so the `.dmg` they publish and attest is
@@ -1851,7 +1851,7 @@ jobs:
       # reason the sibling upload in `finalize` gives at length: stable name
       # because `attest` has to ask for it by name, replaceable because a second
       # attempt at this job must not die on its own first attempt's artifact.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-checksums-desktop
           path: dist-desktop/checksums-desktop-alpha.txt
