@@ -12,11 +12,12 @@ Three fixes landed together. This page is the one for contributors; the other tw
 | --- | --- |
 | Codex `hooks.json` install / uninstall | `codex_hooks_manage::install_to_reporting`, and the shared publish |
 | Codex `config.toml` trust | `codex_hooks_manage::edit_trust_state` |
-| Claude Code `settings.json` | `hooks_manage::write_settings` |
+| Claude Code `settings.json` | `hooks_manage::write_settings`, and `lock_settings_for_install` before it creates the directory |
 | Devin `config.json` | `devin_hooks_manage::install_to_reporting`, and the shared publish |
 | OpenCode plugin (install, stale-layout removal, uninstall) | `opencode_manage::write_plugin_reporting`, `uninstall_impl` |
 | Pi extension | `orchestrator_ext::materialize` |
 | any `agent_hook_config::write_atomic` / `backup_malformed` | `agent_hook_config::publish` |
+| the cross-process lock sidecar `.<name>.lock` and its stale temp-file reap | `agent_hook_config::lock_config`, which takes no lock where the guard would refuse the config's write — the writer's own guard then refuses it, and a no-op uninstall stays a no-op |
 
 Two environment variables carry it:
 

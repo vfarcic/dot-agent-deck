@@ -358,10 +358,10 @@ fn settings_path() -> PathBuf {
 /// lets two callers read the same "before" state and have the second one
 /// overwrite the first's rule with a stale copy.
 ///
-/// What this does NOT close is the cross-PROCESS lost update — two deck
-/// binaries at different paths starting at the same instant, or a deck racing a
-/// human's editor save. That needs an advisory file lock; neither sibling
-/// adapter has one either, and the atomic publish means the loser of such a
+/// The cross-PROCESS lost update — two deck binaries starting at the same
+/// instant — is closed by the advisory file lock [`lock_settings`] takes beside
+/// it (`agent_hook_config::lock_config`). A human's editor save takes no such
+/// lock and can still race a deck; the atomic publish means the loser of that
 /// race loses a whole update rather than leaving a torn file behind.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -388,7 +388,11 @@ fn lock_settings(path: &Path) -> io::Result<SettingsGuard> {
 /// one's hooks (Qodo on PR #1523). Uninstall keeps [`lock_settings`] and
 /// creates nothing.
 fn lock_settings_for_install(path: &Path) -> io::Result<SettingsGuard> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|parent| !parent.is_dir()) {
+        // PRD #1487: before the directory. A missing directory means a missing
+        // settings file, so this install is never a no-op and would be refused
+        // by `write_settings` anyway.
+        crate::config_write_guard::ensure_config_write_allowed(path)?;
         std::fs::create_dir_all(parent)?;
     }
     lock_settings(path)

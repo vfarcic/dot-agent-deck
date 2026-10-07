@@ -79,6 +79,14 @@ pub(crate) fn ensure_config_write_allowed(dest: &Path) -> io::Result<()> {
     })
 }
 
+/// Whether [`ensure_config_write_allowed`] would let `dest` be written, without
+/// its log line. For a side effect that is only worth taking when the write it
+/// serves can happen — `agent_hook_config::lock_config`'s sidecar — and whose
+/// absence is not itself a refusal to report.
+pub(crate) fn config_write_allowed(dest: &Path) -> bool {
+    check_config_write(dest).is_ok()
+}
+
 /// [`ensure_config_write_allowed`] without the log line.
 fn check_config_write(dest: &Path) -> io::Result<()> {
     let Some(roots) = armed_roots()? else {

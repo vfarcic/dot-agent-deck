@@ -258,6 +258,9 @@ pub(crate) struct ConfigLock {
 /// - The config's directory does not exist: there is no file to lose an
 ///   update from, and every installer creates the directory before it locks.
 ///   (An uninstall of something never installed reaches this.)
+/// - Test containment would refuse a write beside the config
+///   (`config_write_guard`, PRD #1487): the caller's write is refused too, so
+///   nothing is created, reaped or locked.
 /// - The filesystem cannot lock at all (the call reports `Unsupported`):
 ///   refusing would make the deck's hooks uninstallable there, so the write
 ///   goes ahead as it always did and says so in the log.
@@ -280,6 +283,14 @@ pub(crate) fn lock_config(dest: &Path) -> io::Result<ConfigLock> {
         .and_then(|n| n.to_str())
         .unwrap_or("config");
     let lock_path = dir.join(format!(".{name}.lock"));
+    // PRD #1487: creating the sidecar and reaping temp files are writes in the
+    // config's directory, so they happen only where test containment would let
+    // the config be written. Where it would not, the caller's own write is
+    // refused by the same guard, so there is nothing to lock — and a no-op (an
+    // uninstall of nothing) stays a no-op instead of becoming an error.
+    if !crate::config_write_guard::config_write_allowed(&lock_path) {
+        return Ok(ConfigLock { _file: None });
+    }
     match std::fs::symlink_metadata(&lock_path) {
         Ok(meta) if !meta.file_type().is_file() => {
             return Err(io::Error::new(
@@ -2372,6 +2383,32 @@ mod tests {
         assert!(
             link.symlink_metadata().is_ok(),
             "a symlink is never touched"
+        );
+    }
+
+    /// PRD #1487: in a test process, a config outside every owned root gets no
+    /// lock sidecar (and no temp-file reap) — those are writes beside the
+    /// config, and containment refuses the config's own write there anyway.
+    /// The checkout is outside the default roots, so the probe names a config
+    /// in it that nothing ever writes.
+    #[test]
+    fn the_config_lock_creates_no_sidecar_where_containment_refuses_the_write() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let name = format!("config-lock-containment-probe-{}.json", std::process::id());
+        let dest = dir.join(&name);
+        if crate::config_write_guard::config_write_allowed(&dest) {
+            eprintln!("SKIP: the checkout is inside an owned root here");
+            return;
+        }
+        let sidecar = dir.join(format!(".{name}.lock"));
+        let lock = lock_config(&dest).expect("a refused destination is not a lock error");
+        let created = sidecar.symlink_metadata().is_ok();
+        drop(lock);
+        let _ = std::fs::remove_file(&sidecar);
+        assert!(
+            !created,
+            "lock_config created {} outside every owned root",
+            sidecar.display()
         );
     }
 
