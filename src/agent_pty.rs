@@ -1011,6 +1011,18 @@ pub enum AgentPtyError {
     DeadlineElapsed,
 }
 
+/// Issue #1602: how a running pane was configured to start, as
+/// [`AgentPtyRegistry::configured_launch_of`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredLaunch {
+    /// The command as the spawn's caller gave it, before [`spawn`] wrapped it.
+    pub command: String,
+    /// The agent that command runs, when the spawn or the pane's hooks said.
+    pub agent_type: Option<AgentType>,
+    /// The `SHELL` wrapper-choice override its spawn carried, if any.
+    pub shell: Option<String>,
+}
+
 /// How to spawn an agent.
 pub struct SpawnOptions<'a> {
     /// Command to run. `None` falls back to `$SHELL`. Strings containing spaces
@@ -3085,6 +3097,33 @@ pub struct RunningAgent {
     /// is deterministic for the same command and so reproduces the same exec
     /// line.
     pub spawn_agent_type: Option<AgentType>,
+    /// Issue #1602: the command this generation was started with, exactly as
+    /// the spawn's caller supplied it in [`SpawnOptions::command`] — the
+    /// CONFIGURED command (`devbox run agent`, a role's `command`), before
+    /// [`spawn`] wraps it in `$SHELL -c` or `dot-agent-deck wrap`. `None` for a
+    /// `$SHELL` pane, and for a blank or whitespace-only command.
+    ///
+    /// It is what a `dispatch --single` unit reuses so it runs the way the pane
+    /// that dispatched it runs (see
+    /// [`AgentPtyRegistry::configured_launch_of`]). Nothing session-specific
+    /// rides in it: the deck delivers a pane's seed and task after readiness
+    /// rather than on its command line, so this holds no resume id, seed or
+    /// dispatcher-mode flag. Daemon-local, like `spawn_env` — not projected
+    /// onto [`AgentRecord`], so the wire is unchanged.
+    pub spawn_command: Option<String>,
+    /// Issue #1602 (PR #1603 review): the command [`Self::agent_type`] was
+    /// learned under — the spawn's command when the badge is the spawn's own
+    /// identity, the command running when a hook filled it, or, for a badge a
+    /// respawn carried over, the command it was originally learned under.
+    ///
+    /// [`AgentPtyRegistry::configured_launch_of`] hands the badge to a
+    /// dispatched unit only while this equals [`Self::spawn_command`]: since
+    /// [`AgentPtyRegistry::set_agent_type`] only fills an empty badge, a badge
+    /// carried across a respawn under a different command can never be
+    /// corrected by the new child's hooks, and it names the old command's
+    /// agent. Keeping the origin rather than a stale flag lets A → B → A trust
+    /// it again and keeps A → B → B from doing so.
+    pub badge_command: Option<String>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -9569,6 +9608,55 @@ impl AgentPtyRegistry {
             .and_then(|agent| agent.spawn_agent_type.clone())
     }
 
+    /// Issue #1602: how `agent_id` was configured to run — its
+    /// [`RunningAgent::spawn_command`], the agent type to carry with it, and
+    /// the shell its command line ran under — so a `dispatch --single` unit can
+    /// be started the same way as the pane that dispatched it. `None` when the
+    /// agent is unknown or was started with no command (a `$SHELL` pane), which
+    /// leaves the unit to the fallbacks.
+    ///
+    /// The type is the frozen [`RunningAgent::spawn_agent_type`] whenever the
+    /// spawn had one — including an explicit `AgentType::None`, the identity an
+    /// `agent = "…"` naming an unknown agent resolves to, so the unit is not
+    /// re-inferred from its command where its dispatcher was not. Otherwise it
+    /// is the observed [`RunningAgent::agent_type`] a hook event taught the
+    /// registry, unless that badge predates the current command
+    /// ([`RunningAgent::badge_command`]). The fallback is what makes a
+    /// launcher pane usable here at all: `devbox run agent` implies no type, so
+    /// its spawn identity is `None`, and only the pane's own hooks have said it
+    /// is Claude Code. Using that badge as a NEW pane's spawn identity is not
+    /// the respawn hazard [`RunningAgent::spawn_agent_type`] guards against —
+    /// that is one pane changing launch shape between generations; this is a
+    /// new pane launched the way a role declaring `agent = "…"` beside a
+    /// launcher `command` is. A hook can teach the badge only from inside the
+    /// pane ([`crate::hook_provenance`]), so the producer that can set it is
+    /// the dispatching agent itself, which chooses the unit's task anyway.
+    ///
+    /// The shell is the pane's `SHELL` wrapper-choice override, if its spawn
+    /// carried one (see [`spawn`]); `None` means it ran under the daemon's own
+    /// default shell.
+    pub fn configured_launch_of(&self, agent_id: &str) -> Option<ConfiguredLaunch> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner.agents.get(agent_id)?;
+        let command = agent.spawn_command.clone()?;
+        let agent_type = agent.spawn_agent_type.clone().or_else(|| {
+            agent
+                .agent_type
+                .clone()
+                .filter(|t| *t != AgentType::None && agent.badge_command == agent.spawn_command)
+        });
+        let shell = agent
+            .spawn_env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.clone());
+        Some(ConfiguredLaunch {
+            command,
+            agent_type,
+            shell,
+        })
+    }
+
     /// Issue #243 (audit F1): did THIS DAEMON spawn `agent_id` under
     /// `dot-agent-deck wrap` — i.e. is the frozen launch-shape identity an agent
     /// whose registry strategy is [`crate::agent_registry::IntegrationStrategy::Wrapper`]?
@@ -10180,6 +10268,12 @@ impl AgentPtyRegistry {
         // capture site keeps the on-wire value consistent with the
         // kernel's actual TIOCGWINSZ).
         let captured_env = opts.env.clone();
+        // Issue #1602: the configured command, before `spawn` wraps it.
+        let spawn_command = opts
+            .command
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
         let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
@@ -10381,6 +10475,8 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type,
             spawn_agent_type,
+            badge_command: spawn_command.clone(),
+            spawn_command,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -12267,6 +12363,10 @@ impl AgentPtyRegistry {
             // `spawn`'s wrapper decision — only `spawn_agent_type` does.
             agent_type: observed_agent_type,
             spawn_agent_type,
+            // Issue #1602: the fresh generation records the command it is
+            // actually launched with, which is the one passed in here.
+            spawn_command: _,
+            badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
             // deliberately dropped, not carried over. A token names one spawn,
@@ -12465,11 +12565,19 @@ impl AgentPtyRegistry {
         // the fresh child's first hook lands. Upgrade-only, so a pane created
         // with an explicit identity keeps that identity, and a fresh child that
         // turns out to be a different agent still corrects the badge via its own
-        // hooks. Deliberately AFTER the spawn: routing it through the same
-        // display-only seam the hook path uses is what guarantees it cannot
-        // influence the launch shape.
-        if let Some(observed) = observed_agent_type {
-            self.set_agent_type(pane_id_env, &observed);
+        // hooks. Deliberately AFTER the spawn, and to the display badge only,
+        // which is what guarantees it cannot influence the launch shape.
+        //
+        // Issue #1602: written here under one lock rather than through
+        // `set_agent_type`, so the badge's origin travels with it — and so a
+        // badge the fresh child's own hook already reported is left alone, with
+        // the origin that hook gave it.
+        if let Some(observed) = observed_agent_type.filter(|t| *t != AgentType::None)
+            && let Some(agent) = self.inner.lock().unwrap().agents.get_mut(&new_agent_id)
+            && agent.agent_type.is_none()
+        {
+            agent.agent_type = Some(observed);
+            agent.badge_command = previous_badge_command;
         }
         Ok(new_agent_id)
     }
@@ -14600,6 +14708,8 @@ impl AgentPtyRegistry {
                 tab_membership: None,
                 agent_type: None,
                 spawn_agent_type: None,
+                spawn_command: None,
+                badge_command: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real
@@ -14793,6 +14903,7 @@ impl AgentPtyRegistry {
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
+            agent.badge_command = agent.spawn_command.clone();
         }
     }
 
@@ -14808,6 +14919,7 @@ impl AgentPtyRegistry {
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
+            agent.badge_command = agent.spawn_command.clone();
         }
     }
 
@@ -16706,6 +16818,166 @@ mod spawn_tests {
             let err = registry.resize(&id, rows, cols).unwrap_err();
             assert!(matches!(err, AgentPtyError::Resize(_)));
         }
+        registry.shutdown_all();
+    }
+
+    /// Issue #1602: the registry keeps the command a pane was CONFIGURED with —
+    /// as the caller gave it, before `spawn` wraps it in `$SHELL -c` — so a
+    /// `dispatch --single` unit can be started the same way. The type is the
+    /// spawn's own when it had one, else what the pane's hooks taught it, and a
+    /// `$SHELL` pane offers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn configured_launch_of_reports_the_configured_command_and_its_agent() {
+        let launch = |command: &str, agent_type: Option<AgentType>| ConfiguredLaunch {
+            command: command.to_string(),
+            agent_type,
+            shell: None,
+        };
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let launcher = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("  sh -c 'exec cat'  "),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-launcher".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the launcher-shaped pane");
+        assert_eq!(
+            registry.configured_launch_of(&launcher),
+            Some(launch("sh -c 'exec cat'", None)),
+            "a launcher command implies no type until the pane says"
+        );
+        registry.set_agent_type("pane-launcher", &AgentType::ClaudeCode);
+        assert_eq!(
+            registry.configured_launch_of(&launcher),
+            Some(launch("sh -c 'exec cat'", Some(AgentType::ClaudeCode))),
+            "the type the pane's own hooks reported is carried"
+        );
+
+        let declared = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                agent_type: Some(AgentType::ClaudeCode),
+                env: vec![
+                    (
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        "pane-declared".to_string(),
+                    ),
+                    ("SHELL".to_string(), "/bin/sh".to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the declared pane");
+        registry.set_agent_type("pane-declared", &AgentType::OpenCode);
+        let reported = registry.configured_launch_of(&declared).expect("a launch");
+        assert_eq!(
+            reported.agent_type,
+            Some(AgentType::ClaudeCode),
+            "the spawn's own identity wins over a hook-learned badge"
+        );
+        assert_eq!(
+            reported.shell.as_deref(),
+            Some("/bin/sh"),
+            "the shell the spawn pinned is reported"
+        );
+
+        // Qodo, PR #1603: an explicit "unrecognized agent" identity is carried
+        // as it is, so the unit is not re-inferred from its command.
+        let unknown = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                agent_type: Some(AgentType::None),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-unknown".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the explicitly-unknown pane");
+        assert_eq!(
+            registry
+                .configured_launch_of(&unknown)
+                .and_then(|l| l.agent_type),
+            Some(AgentType::None)
+        );
+
+        let shell = registry
+            .spawn_agent(SpawnOptions::default())
+            .expect("spawn a $SHELL pane");
+        assert_eq!(registry.configured_launch_of(&shell), None);
+        assert_eq!(registry.configured_launch_of("no-such-agent"), None);
+        registry.shutdown_all();
+    }
+
+    /// Qodo, PR #1603: a respawn under a DIFFERENT command keeps the old badge
+    /// for display, but that badge describes the old command and the new
+    /// child's hooks cannot replace it, so it is not carried to a unit. Under
+    /// the same command it still is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_launch_of_drops_a_badge_learned_under_another_command() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exec cat'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-role".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the role pane");
+        registry.set_agent_type("pane-role", &AgentType::Codex);
+
+        let same = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat'")
+            .await
+            .expect("respawn under the same command");
+        assert_eq!(
+            registry
+                .configured_launch_of(&same)
+                .and_then(|l| l.agent_type),
+            Some(AgentType::Codex),
+            "the same command still runs the agent its badge names"
+        );
+
+        let edited = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat >/dev/null'")
+            .await
+            .expect("respawn under an edited command");
+        let launch = registry.configured_launch_of(&edited).expect("a launch");
+        assert_eq!(launch.command, "sh -c 'exec cat >/dev/null'");
+        assert_eq!(
+            launch.agent_type, None,
+            "a badge learned under the previous command must not be carried"
+        );
+
+        // A → B → B: the badge restored again is still the one learned under A.
+        let again = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat >/dev/null'")
+            .await
+            .expect("respawn again under the edited command");
+        assert_eq!(
+            registry
+                .configured_launch_of(&again)
+                .and_then(|l| l.agent_type),
+            None,
+            "a stale badge stays stale across a later respawn under the same command"
+        );
+
+        // A → B → B → A: back under the command it was learned under, the badge
+        // describes the running command again.
+        let back = registry
+            .respawn_agent_for_pane("pane-role", "sh -c 'exec cat'")
+            .await
+            .expect("respawn back under the original command");
+        assert_eq!(
+            registry
+                .configured_launch_of(&back)
+                .and_then(|l| l.agent_type),
+            Some(AgentType::Codex),
+            "the badge is trusted again once its own command is running"
+        );
         registry.shutdown_all();
     }
 

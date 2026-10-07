@@ -148,6 +148,12 @@ mod issue_labeler_policy;
 #[cfg(test)]
 mod junit_strip;
 mod list_tests;
+/// Issue #1610: every project-local skill that runs `gh pr merge` without
+/// `--auto` names the overlap check `issue-queue` defines, and CLAUDE.md rule 8
+/// points a person merging by hand at it. Tests only — the rule is prose in
+/// repository files, which no compile step reads.
+#[cfg(test)]
+mod merge_overlap_check;
 /// Issue #831: printing a walked path the way this repository writes
 /// paths. Shared by `desktop_palette` and `list_tests`, which both build a
 /// repo-relative string out of a directory walk and print it next to

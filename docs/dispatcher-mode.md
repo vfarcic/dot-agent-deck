@@ -63,7 +63,7 @@ dot-agent-deck dispatch --list-targets
 | `<NAME>` | Short name for the unit, for example `fix-auth-bug`. Characters other than letters, digits, `-` and `_` become `-`. The unit works in `../<repo>-dispatch-<name>` (a sibling of your project directory) on branch `agent/dispatch-<name>`. Required except with `--list-targets`. |
 | `--task <TEXT>` | The unit's task. |
 | `--task-file <PATH>` | Read the task from a file, or from stdin with `-`. Use it for text with quotes, backticks, `$` or newlines. A regular file of at most 1 MiB. |
-| `--single` | Start one agent: the configured `default_command`, or `claude`. |
+| `--single` | Start one agent, with the same command and agent as the dispatcher that asked for it: a dispatcher started as `devbox run agent` gets units started as `devbox run agent`, in the unit's own copy of the repository, and a Codex, OpenCode, Pi or Devin dispatcher gets units of its own agent. A dispatcher started with no command, or with one that only opens a shell (`bash`, `devbox shell`, `nix develop`) in which you then started the agent, gets the configured `default_command`, or `claude`. So does one started from a subdirectory of the repository with a command such as `./agent.sh`, which would not be found from the root of the unit's copy. |
 | `--orchestration <NAME>` | Start the orchestration with that `name`. `--orchestration=` with an empty value starts the project's default orchestration (the one with `default = true`, else the first with roles). The value is required: `--orchestration my-unit` reads `my-unit` as the orchestration name. |
 | `--list-targets` | Print what can be dispatched here and exit. It cannot be combined with the other arguments. |
 
