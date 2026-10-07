@@ -828,7 +828,9 @@ async fn dispatch_one_issue(
     // was refused during a restart and the removal failed: that is retried
     // here first, and only a worktree that is still there afterwards claims
     // the issue (PRD #1487 final audit F2).
-    let mut worktree_exists = paths.worktree_dir.exists();
+    // `Path::exists` is a blocking `stat`: `tokio::fs::metadata` is the same
+    // probe (any error reads as absent) run off the async workers.
+    let mut worktree_exists = tokio::fs::metadata(&paths.worktree_dir).await.is_ok();
     if worktree_exists {
         match reclaim_abandoned_spawn(
             &paths.worktree_dir,
@@ -844,7 +846,9 @@ async fn dispatch_one_issue(
                 return Ok(IssueOutcome::Handled);
             }
             Reclaim::Failed(message) => return Err(message),
-            Reclaim::Removed => worktree_exists = paths.worktree_dir.exists(),
+            Reclaim::Removed => {
+                worktree_exists = tokio::fs::metadata(&paths.worktree_dir).await.is_ok()
+            }
         }
         if worktree_exists {
             notify_skip();
