@@ -307,6 +307,10 @@ pub(crate) enum UpgradeOutcomeDto {
         /// sessions with it are stale ([`ends_deck_sessions`]).
         old_daemon_gone: bool,
     },
+    /// The run stopped without an outcome — its blocking task panicked — so
+    /// how far it got is not known: the build may be installed and the old
+    /// daemon may have accepted the restart (PRD #1487, Qodo #15).
+    Interrupted,
 }
 
 /// Whether an upgrade's outcome ends the deck's terminal sessions with the
@@ -316,6 +320,37 @@ pub(crate) enum UpgradeOutcomeDto {
 /// never reached, or still the same process — keeps them (Qodo 4200693875).
 pub(crate) fn ends_deck_sessions(outcome: &UpgradeOutcome) -> bool {
     outcome.old_daemon_gone()
+}
+
+/// What `desktop_upgrade_daemon` does with what its run returned.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SettledUpgrade {
+    /// What the command resolves with.
+    pub(crate) outcome: UpgradeOutcomeDto,
+    /// Whether to detach this deck's terminal sessions ([`ends_deck_sessions`]).
+    pub(crate) ends_deck_sessions: bool,
+}
+
+/// Settle an upgrade run, including one that never returned an outcome. A run
+/// whose task failed to join (a panic) may have stopped anywhere — after the
+/// install, after the old daemon accepted the restart — so it is
+/// [`UpgradeOutcomeDto::Interrupted`] and ends the deck's sessions, as a
+/// daemon that may be gone does, instead of an error that skips the cleanup
+/// and reads as "nothing was changed" (PRD #1487, Qodo #15).
+pub(crate) fn settle_run<E: std::fmt::Display>(run: Result<UpgradeOutcome, E>) -> SettledUpgrade {
+    match run {
+        Ok(outcome) => SettledUpgrade {
+            ends_deck_sessions: ends_deck_sessions(&outcome),
+            outcome: UpgradeOutcomeDto::from(&outcome),
+        },
+        Err(error) => {
+            eprintln!("dot-agent-deck-desktop: the daemon upgrade stopped unexpectedly: {error}");
+            SettledUpgrade {
+                outcome: UpgradeOutcomeDto::Interrupted,
+                ends_deck_sessions: true,
+            }
+        }
+    }
 }
 
 impl From<&UpgradeOutcome> for UpgradeOutcomeDto {
@@ -750,6 +785,49 @@ mod tests {
         assert_eq!(failed["stage"], "installing");
         assert!(failed.get("installedVersion").is_none());
         assert_eq!(failed["oldDaemonGone"], false);
+    }
+
+    /// Scenario: the upgrade's blocking task panics, the way
+    /// `desktop_upgrade_daemon` runs it. The join error is settled as an
+    /// interrupted outcome that still ends the deck's sessions — so the
+    /// command goes on to invalidate, detach and refetch — rather than an
+    /// error; an outcome that did come back is settled as before (PRD #1487,
+    /// Qodo #15).
+    #[test]
+    fn a_run_that_panicked_is_settled_as_interrupted_and_ends_the_decks_sessions() {
+        let run = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(|| -> UpgradeOutcome {
+                panic!("the upgrade run panicked")
+            })
+            .await
+        });
+        assert!(run.is_err(), "the panic must surface as a join error");
+        let settled = settle_run(run);
+        assert_eq!(
+            settled,
+            SettledUpgrade {
+                outcome: UpgradeOutcomeDto::Interrupted,
+                ends_deck_sessions: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&settled.outcome).unwrap(),
+            serde_json::json!({ "outcome": "interrupted" })
+        );
+
+        let kept = UpgradeOutcome::InstalledNotRestarted {
+            from_version: None,
+            installed_version: "0.45.0".into(),
+            reason: NotRestartedReason::AnotherRestartInProgress,
+        };
+        let settled = settle_run(Ok::<_, String>(kept.clone()));
+        assert_eq!(
+            settled,
+            SettledUpgrade {
+                outcome: UpgradeOutcomeDto::from(&kept),
+                ends_deck_sessions: false,
+            }
+        );
     }
 
     /// Scenario: every upgrade outcome is checked for whether it ends the

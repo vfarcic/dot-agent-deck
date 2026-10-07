@@ -53,16 +53,21 @@ export type UpgradeOutcome =
   | { outcome: "restarted"; fromVersion: string; toVersion: string; stopped: UpgradeStopSet }
   | { outcome: "installed-not-restarted"; fromVersion?: string; installedVersion: string; reason: NotRestartedReason }
   | { outcome: "installed-daemon-too-old"; installedVersion: string; daemonVersion?: string; remedy: string }
-  | { outcome: "failed"; stage: UpgradeStage; reason: string; installedVersion?: string; oldDaemonGone?: boolean };
+  | { outcome: "failed"; stage: UpgradeStage; reason: string; installedVersion?: string; oldDaemonGone?: boolean }
+  /** The run stopped without an outcome, so how far it got is not known. */
+  | { outcome: "interrupted" };
 
 /**
  * Whether an upgrade ended the deck's terminal sessions with the daemon that
  * was running — after a restart, and after a failure the crate marks
- * `oldDaemonGone` (the old daemon accepted, or stopped answering as itself).
- * The crate detaches them on the same answer (`ends_deck_sessions`).
+ * `oldDaemonGone` (the old daemon accepted, or stopped answering as itself),
+ * and after a run that stopped unexpectedly, which may have got that far. The
+ * crate detaches them on the same answer (`settle_run`).
  */
 export function upgradeEndedDeckSessions(outcome: UpgradeOutcome): boolean {
-  return outcome.outcome === "restarted" || (outcome.outcome === "failed" && outcome.oldDaemonGone === true);
+  return outcome.outcome === "restarted"
+    || outcome.outcome === "interrupted"
+    || (outcome.outcome === "failed" && outcome.oldDaemonGone === true);
 }
 
 /** `desktop://upgrade-progress`. */
@@ -276,6 +281,19 @@ export function outcomeView(outcome: UpgradeOutcome, deck: string, kind: Upgrade
         body: [`It failed while ${doing}: ${outcome.reason}`, after],
       };
     }
+    case "interrupted":
+      // It may have installed the new version or restarted the daemon before
+      // it stopped, so nothing is claimed either way (PRD #1487, Qodo #15).
+      return {
+        tone: "failure",
+        title: kind === "replace" ? "Replace daemon stopped unexpectedly" : "Upgrade stopped unexpectedly",
+        body: [
+          kind === "replace"
+            ? "Replacing the daemon stopped unexpectedly, so it is not known whether the daemon was replaced."
+            : `The upgrade stopped unexpectedly, so it is not known whether the new version was installed on ${where} or the daemon restarted.`,
+          `Reconnect shows which daemon is answering on ${where} now.`,
+        ],
+      };
   }
   // Unreachable for a well-formed outcome; an unknown arm from a newer crate
   // still says something true rather than rendering nothing.

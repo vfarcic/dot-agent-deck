@@ -74,6 +74,7 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
     ["installed build too old", { outcome: "installed-not-restarted", installedVersion: "0.40.0", reason: { kind: "installed-build-too-old" } }],
     ["older daemon busy", { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "older-daemon-busy", atStake: AT_STAKE } }],
     ["failed after the build landed", { outcome: "failed", stage: "installing", reason: "0.45.0 was installed, but reinstalling the hooks failed: settings.json is not writable", installedVersion: "0.45.0" }],
+    ["stopped unexpectedly", { outcome: "interrupted" }],
   ];
 
   it.each(outcomes)("%s renders a title and at least one sentence, with no internals", (_name, outcome) => {
@@ -121,6 +122,29 @@ describe("outcomeView (CLAUDE.md rule 21)", () => {
       "Stop them, or let them finish, then press Replace daemon again.",
     ]);
     expect(view.list).toEqual(stopSetLines(AT_STAKE));
+  });
+
+  /**
+   * Scenario: the upgrade run stopped without an outcome (its task panicked).
+   * The text says it stopped unexpectedly and that Reconnect shows what is
+   * answering now — never that nothing changed, since it may have installed
+   * or restarted first (PRD #1487, Qodo #15).
+   */
+  it("says a run that stopped unexpectedly may have changed things, and to Reconnect", () => {
+    const upgrade = outcomeView({ outcome: "interrupted" }, "build-box", "upgrade");
+    expect(upgrade.tone).toBe("failure");
+    expect(upgrade.title).toBe("Upgrade stopped unexpectedly");
+    expect(upgrade.body).toEqual([
+      "The upgrade stopped unexpectedly, so it is not known whether the new version was installed on build-box or the daemon restarted.",
+      "Reconnect shows which daemon is answering on build-box now.",
+    ]);
+    const replace = outcomeView({ outcome: "interrupted" }, "this machine", "replace");
+    expect(replace.title).toBe("Replace daemon stopped unexpectedly");
+    expect(replace.body).toEqual([
+      "Replacing the daemon stopped unexpectedly, so it is not known whether the daemon was replaced.",
+      "Reconnect shows which daemon is answering on this machine now.",
+    ]);
+    for (const view of [upgrade, replace]) expect(view.body.join(" ")).not.toMatch(/nothing was changed/i);
   });
 
   it("carries the crate's remedy for a daemon too old to restart itself", () => {
@@ -199,7 +223,8 @@ describe("upgradeEndedDeckSessions (Qodo 4200693875)", () => {
   /**
    * Scenario: each outcome the crate can return is asked whether the deck's
    * terminal sessions ended with the old daemon. A restart and a failure the
-   * crate marks `oldDaemonGone` say yes; a failure that left the old daemon
+   * crate marks `oldDaemonGone` say yes, and so does a run that stopped
+   * unexpectedly; a failure that left the old daemon
    * answering, one from a crate that sent no mark, and every not-restarted
    * outcome say no.
    */
@@ -211,6 +236,7 @@ describe("upgradeEndedDeckSessions (Qodo 4200693875)", () => {
     ["failed with no mark", { outcome: "failed", stage: "installing", reason: "r" }, false],
     ["not restarted", { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } }, false],
     ["daemon too old", { outcome: "installed-daemon-too-old", installedVersion: "0.45.0", remedy: "r" }, false],
+    ["stopped unexpectedly", { outcome: "interrupted" }, true],
   ])("%s", (_, outcome, ended) => {
     expect(upgradeEndedDeckSessions(outcome)).toBe(ended);
   });

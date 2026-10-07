@@ -273,6 +273,23 @@ describe("UpgradeDialog", () => {
     expect(screen.getByTestId("upgrade-decision-stale")).toHaveTextContent("What is running changed since you were asked");
   });
 
+  /**
+   * Scenario: the upgrade run stops without an outcome (its task panicked).
+   * The dialog says it stopped unexpectedly and to Reconnect, and does not
+   * say nothing was changed (PRD #1487, Qodo #15).
+   */
+  it("shows a run that stopped unexpectedly without claiming nothing changed", async () => {
+    const { runtime, finish } = controlledRuntime();
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    await finish({ outcome: "interrupted" });
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Upgrade stopped unexpectedly");
+    expect(screen.getByTestId("upgrade-outcome")).toHaveAttribute("data-tone", "failure");
+    expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("The upgrade stopped unexpectedly");
+    expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("Reconnect shows which daemon is answering on");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("Nothing was changed");
+  });
+
   /** Scenario: A failure at a stage is shown in plain words with what is still running. */
   it("shows a failed stage", async () => {
     const { runtime, finish } = controlledRuntime();

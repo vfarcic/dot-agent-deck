@@ -456,6 +456,14 @@ pub trait DaemonPort {
     /// The running daemon's `Hello`, or `Ok(None)` when none is running. Never
     /// starts one.
     fn probe(&self) -> Result<Option<AttachResponse>, PortError>;
+    /// [`Self::probe`], given up at `budget` when that comes before the port's
+    /// own bound on one probe — what the verify wait uses so a slow probe
+    /// cannot carry it past its deadline (PRD #1487, Qodo 4202262493). The
+    /// default ignores `budget`; a port whose probe can block overrides it.
+    fn probe_within(&self, budget: Duration) -> Result<Option<AttachResponse>, PortError> {
+        let _ = budget;
+        self.probe()
+    }
     /// Send the restart request. Must go through
     /// [`DaemonClient::restart_daemon`], which withholds it from a daemon that
     /// does not advertise it — `Unsupported` then means the daemon is too old.
@@ -914,7 +922,14 @@ fn wait_for_successor(
     // stopped, which the failure then says rather than blaming a successor.
     let mut old_still_answering = false;
     loop {
-        match daemon.probe() {
+        // Each probe gets only what is left of the wait, and none starts once
+        // it has run out: a remote probe can otherwise block well past the
+        // deadline (PRD #1487, Qodo 4202262493).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match daemon.probe_within(remaining) {
             Ok(None) => {
                 endpoint_emptied = true;
                 matching_since = None;
@@ -953,25 +968,27 @@ fn wait_for_successor(
             // A probe that learned nothing is neither an answer nor a gap.
             Err(_) => {}
         }
-        if Instant::now() >= deadline {
-            let seen = match (last_seen, old_still_answering) {
-                (Some(v), true) => format!(
-                    " (the daemon answering reports {v}, and it is still the daemon that was asked to restart)"
-                ),
-                (Some(v), false) => format!(" (the daemon answering reports {v})"),
-                (None, _) => String::new(),
-            };
-            return Err(SuccessorMissing {
-                reason: format!(
-                    "restarted, but the new daemon did not answer within {}s{seen}",
-                    timing.timeout.as_secs()
-                ),
-                seen,
-                old_still_answering,
-            });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        std::thread::sleep(timing.poll);
+        std::thread::sleep(timing.poll.min(remaining));
     }
+    let seen = match (last_seen, old_still_answering) {
+        (Some(v), true) => format!(
+            " (the daemon answering reports {v}, and it is still the daemon that was asked to restart)"
+        ),
+        (Some(v), false) => format!(" (the daemon answering reports {v})"),
+        (None, _) => String::new(),
+    };
+    Err(SuccessorMissing {
+        reason: format!(
+            "restarted, but the new daemon did not answer within {}s{seen}",
+            timing.timeout.as_secs()
+        ),
+        seen,
+        old_still_answering,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,20 +1165,32 @@ impl Installer for NoInstall {
 // Production daemon ports
 // ---------------------------------------------------------------------------
 
+/// What a remote `daemon probe --json` says, as the port reports it.
+fn remote_probe_answer<E: SshExecutor>(
+    port: &SshDaemonPort<E>,
+    probe: Result<crate::daemon_restart::DaemonProbe, RemoteDaemonError>,
+) -> Result<Option<AttachResponse>, PortError> {
+    match probe {
+        Ok(probe) if probe.running => Ok(probe.hello),
+        Ok(_) => Ok(None),
+        Err(RemoteDaemonError::Unsupported { .. }) => {
+            Err(PortError::InstalledBuildTooOld(format!(
+                "the installed build at {} is too old to report on the running daemon",
+                port.binary()
+            )))
+        }
+        Err(e) => Err(PortError::Other(e.to_string())),
+    }
+}
+
 /// A remote daemon, reached through the remote's freshly installed binary.
 impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
     fn probe(&self) -> Result<Option<AttachResponse>, PortError> {
-        match SshDaemonPort::probe(self) {
-            Ok(probe) if probe.running => Ok(probe.hello),
-            Ok(_) => Ok(None),
-            Err(RemoteDaemonError::Unsupported { .. }) => {
-                Err(PortError::InstalledBuildTooOld(format!(
-                    "the installed build at {} is too old to report on the running daemon",
-                    self.binary()
-                )))
-            }
-            Err(e) => Err(PortError::Other(e.to_string())),
-        }
+        remote_probe_answer(self, SshDaemonPort::probe(self))
+    }
+
+    fn probe_within(&self, budget: Duration) -> Result<Option<AttachResponse>, PortError> {
+        remote_probe_answer(self, SshDaemonPort::probe_within(self, budget))
     }
 
     fn restart(
@@ -1275,14 +1304,17 @@ impl WireDaemonPort {
 
 impl DaemonPort for WireDaemonPort {
     fn probe(&self) -> Result<Option<AttachResponse>, PortError> {
+        DaemonPort::probe_within(self, LOCAL_PROBE_TIMEOUT)
+    }
+
+    fn probe_within(&self, budget: Duration) -> Result<Option<AttachResponse>, PortError> {
+        let bound = LOCAL_PROBE_TIMEOUT.min(budget);
         self.handle
-            .block_on(async {
-                tokio::time::timeout(LOCAL_PROBE_TIMEOUT, self.client.probe_running()).await
-            })
+            .block_on(async { tokio::time::timeout(bound, self.client.probe_running()).await })
             .map_err(|_| {
                 format!(
-                    "no answer from the daemon within {}s",
-                    LOCAL_PROBE_TIMEOUT.as_secs()
+                    "no answer from the daemon within {:.1}s",
+                    bound.as_secs_f64()
                 )
             })?
             .map_err(|e| PortError::Other(e.to_string()))
@@ -2758,6 +2790,81 @@ mod tests {
                 "{outcome:?}"
             );
         }
+    }
+
+    /// A probe that takes `delay` to answer with the old daemon's `Hello`, or
+    /// less when `honours_budget` and its budget is shorter — the shape of a
+    /// remote probe over a slow route. Records each budget it was given.
+    struct SlowPort {
+        delay: Duration,
+        honours_budget: bool,
+        budgets: RefCell<Vec<Duration>>,
+    }
+
+    impl DaemonPort for SlowPort {
+        fn probe(&self) -> Probe {
+            self.probe_within(self.delay)
+        }
+        fn probe_within(&self, budget: Duration) -> Probe {
+            self.budgets.borrow_mut().push(budget);
+            if self.honours_budget && budget < self.delay {
+                std::thread::sleep(budget);
+                return Err("no answer within the budget".into());
+            }
+            std::thread::sleep(self.delay);
+            Ok(Some(hello_from("0.1.0", "old", "old-process")))
+        }
+        fn restart(&self, _req: &RestartDaemonRequest) -> Restart {
+            unreachable!("the verify wait sends no restart request")
+        }
+    }
+
+    /// PRD #1487, Qodo 4202262493: each probe of the verify wait is capped at
+    /// what is left of the wait, so a slow probe cannot carry it past its
+    /// deadline, and no probe starts once the wait has run out.
+    #[test]
+    fn a_slow_probe_cannot_carry_the_verify_wait_past_its_deadline() {
+        let timing = Timing {
+            timeout: Duration::from_millis(500),
+            poll: Duration::from_millis(1),
+            settle: Duration::from_secs(60),
+        };
+        let from = OldDaemon {
+            build: Some("old".into()),
+            instance: Some("old-process".into()),
+        };
+        let expected = Expect::Version("0.2.0".into());
+
+        // A port that honours its budget: the second probe is cut short at the
+        // deadline instead of taking its full 300ms.
+        let port = SlowPort {
+            delay: Duration::from_millis(300),
+            honours_budget: true,
+            budgets: RefCell::new(Vec::new()),
+        };
+        let started = Instant::now();
+        let missing = wait_for_successor(&port, &expected, &from, false, timing)
+            .expect_err("the old daemon is never the successor");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timing.timeout + Duration::from_millis(150),
+            "the wait overran its deadline: {elapsed:?}"
+        );
+        let budgets = port.budgets.borrow();
+        assert_eq!(budgets.len(), 2, "{budgets:?}");
+        assert!(budgets.iter().all(|b| *b <= timing.timeout), "{budgets:?}");
+        assert!(budgets[1] < Duration::from_millis(300), "{budgets:?}");
+        assert!(missing.old_still_answering);
+
+        // A port that ignores it still starts no probe past the deadline: its
+        // first probe outlasts the whole wait, so it is the only one.
+        let port = SlowPort {
+            delay: Duration::from_millis(600),
+            honours_budget: false,
+            budgets: RefCell::new(Vec::new()),
+        };
+        assert!(wait_for_successor(&port, &expected, &from, false, timing).is_err());
+        assert_eq!(port.budgets.borrow().len(), 1);
     }
 
     #[test]

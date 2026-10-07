@@ -4944,7 +4944,7 @@ async fn desktop_upgrade_daemon(
     let deck_for_run = deck_id.clone();
     let id_for_run = upgrade_id.clone();
     let endpoint_for_run = endpoint.clone();
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
+    let run = tauri::async_runtime::spawn_blocking(move || {
         let plan = UpgradePlan {
             version: upgrade::plan_version(),
             successor: target.successor(),
@@ -5014,18 +5014,21 @@ async fn desktop_upgrade_daemon(
             }
         }
     })
-    .await
-    .map_err(|error| safe_message(error.to_string()))?;
+    .await;
+    // A run that panicked is settled too, not returned as an error: it may
+    // have installed the build or had the restart accepted, so the cleanup
+    // below runs for it as well (PRD #1487, Qodo #15).
+    let settled = upgrade::settle_run(run);
 
     // Whatever happened, the handshake held for this deck may describe a
     // daemon that is gone or replaced: drop it, and let the deck's watcher
     // and the snapshot below re-establish against whatever answers now.
     state.daemon.invalidate(&endpoint).await;
-    if upgrade::ends_deck_sessions(&outcome) {
+    if settled.ends_deck_sessions {
         // The old daemon's terminals ended with it — restarted, or accepted
-        // and not verified, or gone after a lost reply. This deck's only — the
-        // other decks were not touched. A daemon still answering as itself
-        // keeps them.
+        // and not verified, or gone after a lost reply, or a run that stopped
+        // unexpectedly. This deck's only — the other decks were not touched.
+        // A daemon still answering as itself keeps them.
         terminal::detach_deck(&state, &endpoint).await;
     }
     state.request_refetch(&endpoint.identity());
@@ -5033,7 +5036,7 @@ async fn desktop_upgrade_daemon(
     if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
         emit_snapshot(&app, &snapshot);
     }
-    Ok(upgrade::UpgradeOutcomeDto::from(&outcome))
+    Ok(settled.outcome)
 }
 
 /// PRD #1487 M5: the decision dialog's answer to the restart question an

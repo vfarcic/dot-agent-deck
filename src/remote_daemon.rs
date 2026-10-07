@@ -159,7 +159,14 @@ impl<E: SshExecutor> SshDaemonPort<E> {
     /// `daemon probe --json` on the remote: whether a daemon runs at that
     /// machine's endpoint, and its `Hello` reply. Never starts one.
     pub fn probe(&self) -> Result<DaemonProbe, RemoteDaemonError> {
-        self.run_json("daemon probe --json", self.probe_deadline)
+        self.probe_within(self.probe_deadline)
+    }
+
+    /// [`Self::probe`], killed at `budget` when that comes before the port's
+    /// own probe deadline — for a caller with less time left than one whole
+    /// probe (PRD #1487, Qodo 4202262493).
+    pub fn probe_within(&self, budget: Duration) -> Result<DaemonProbe, RemoteDaemonError> {
+        self.run_json("daemon probe --json", self.probe_deadline.min(budget))
     }
 
     /// `daemon restart-installed --json` on the remote: ask that machine's
@@ -517,6 +524,31 @@ mod tests {
             assert_stopped_at_deadline(started, p.probe());
             let started = Instant::now();
             assert_stopped_at_deadline(started, p.restart_installed(Some("0.46.0"), None));
+        }
+
+        /// Scenario: a caller with one second left probes a remote that never
+        /// answers, through a port whose own probe deadline is a minute. The
+        /// probe is killed at the caller's second, not the port's minute
+        /// (PRD #1487, Qodo 4202262493).
+        #[test]
+        fn a_probe_within_a_shorter_budget_stops_at_that_budget() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let p = port_running(dir.path(), "exec sleep 600")
+                .with_deadlines(Duration::from_secs(60), Duration::from_secs(60));
+            let started = Instant::now();
+            let result = p.probe_within(Duration::from_secs(1));
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "the probe ran past its budget: {elapsed:?}"
+            );
+            match result {
+                Err(RemoteDaemonError::Ssh(SshError::Other { detail, .. })) => assert!(
+                    detail.contains("did not finish within 1s"),
+                    "unexpected detail: {detail}"
+                ),
+                other => panic!("expected the budget to stop the probe, got {other:?}"),
+            }
         }
 
         /// Scenario: a reply that fits is still read and parsed through the
