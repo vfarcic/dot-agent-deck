@@ -755,9 +755,13 @@ impl RestartControl {
     }
 
     /// Wait, at most `bound`, until no stop claim is pending, so the plan is
-    /// decided against stops that are going ahead. A claim still pending at
-    /// the bound counts as a stop in [`Self::take_successor_plan`]: when in
-    /// doubt, the stop wins.
+    /// decided against stops that are going ahead. The bound only ends the
+    /// wait; it decides nothing. [`Self::take_successor_plan`] reads the claims
+    /// as they are when it runs: one still pending then counts as a stop (when
+    /// in doubt, the stop wins), and one settled by then counts as what it
+    /// became — a withdrawn claim is a stop that did not happen, so it cancels
+    /// nothing, whether it settled before the bound or after (Qodo
+    /// 4201713572).
     pub async fn settle_stop_claims(&self, bound: Duration) {
         let deadline = tokio::time::Instant::now() + bound;
         loop {
@@ -1581,9 +1585,23 @@ mod tests {
         assert_eq!(
             control.take_successor_plan(),
             SuccessorPlan::Nothing,
-            "a claim still pending at the bound counts as a stop"
+            "a claim still pending when the plan is decided counts as a stop"
         );
         drop(stuck);
+
+        // The bound passes with the claim pending, and the stop's ack then
+        // fails before the plan is decided: that stop did not happen, so the
+        // accepted restart goes ahead (Qodo 4201713572).
+        let control = RestartControl::default();
+        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        let late = control.claim_stop().expect("nothing is committed yet");
+        control.settle_stop_claims(Duration::from_millis(50)).await;
+        drop(late);
+        assert_eq!(
+            control.take_successor_plan(),
+            SuccessorPlan::Spawn(PathBuf::from("/x/dot-agent-deck")),
+            "a stop withdrawn after the bound cancels nothing"
+        );
     }
 
     /// Scenario: a stop arrives while a restart is still being checked. The

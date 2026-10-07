@@ -1184,8 +1184,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // the unit's own command — the installed build — again.
     // A `StopDaemon` still writing its acknowledgement holds a pending stop
     // claim; wait for it so a stop that is about to be withdrawn does not
-    // cancel the restart, bounded so a stalled peer cannot hold the exit (a
-    // claim still pending then counts as a stop).
+    // cancel the restart, bounded so a stalled peer cannot hold the exit. The
+    // plan reads the claims as they are when it is decided: one still pending
+    // counts as a stop, one withdrawn by then does not.
     restart_control
         .settle_stop_claims(crate::daemon_restart::STOP_CLAIM_SETTLE)
         .await;
