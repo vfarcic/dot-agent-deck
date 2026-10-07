@@ -96,11 +96,16 @@ mod tests {
         let body = &text[start + heading.len()..];
         let body = &body[..body.find("\n### ").unwrap_or(body.len())];
         for needle in [
+            // a failed read stops the check instead of reading as "no overlap"
+            "set -euo pipefail",
+            "STOP:",
             // the PR's files, all of them and renames' old paths too
-            "pulls/<n>/files --paginate",
+            "pulls/$n/files\" --paginate",
             "previous_filename",
+            // past the endpoint's cap the file list is incomplete
+            "-le 3000",
             // commits on main since the branch point, limited to those files
-            "git merge-base origin/main origin/pr-<n>",
+            "git merge-base origin/main \"origin/pr-$n\"",
             "..origin/main\" -- \"${files[@]}\"",
             // what to do when it lists anything
             "gh pr update-branch <n>",
@@ -111,6 +116,11 @@ mod tests {
                 "\"{SECTION}\" in issue-queue/SKILL.md no longer contains `{needle}`"
             );
         }
+        // macOS's system Bash 3.2 has no `mapfile`, and the check must run there.
+        assert!(
+            !body.contains("mapfile"),
+            "\"{SECTION}\" in issue-queue/SKILL.md uses `mapfile`, which Bash 3.2 lacks"
+        );
     }
 
     #[test]
