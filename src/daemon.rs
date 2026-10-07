@@ -3906,7 +3906,10 @@ async fn run_hook_loop_with_idle_timeout(
                                     // single-agent dispatch starts an AGENT rather
                                     // than `$SHELL`. Same resolution as the
                                     // issue-dispatch arm above; empty → the Claude
-                                    // default inside `handle_dispatch`.
+                                    // default inside `handle_dispatch`. Issue #1602:
+                                    // a fallback only — `handle_dispatch` first
+                                    // reuses the caller pane's own configured
+                                    // command (`resolve_single_unit_launch`).
                                     let default_command = {
                                         let dc = crate::config::DashboardConfig::load()
                                             .default_command
