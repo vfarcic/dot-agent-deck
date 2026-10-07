@@ -436,7 +436,7 @@ jobs:
       # existing name.
       - name: Preserve this attempt's browser report
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: playwright-attempt-${{ github.run_attempt }}
           path: |
@@ -551,7 +551,7 @@ jobs:
       # Attempt-named for the reason spelled out on `build-macos`.
       - name: Preserve this attempt's driver results
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: desktop-driver-attempt-${{ github.run_attempt }}
           path: desktop/driver-results/
@@ -700,7 +700,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-linux-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -866,7 +866,7 @@ jobs:
       # real regression.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-e2e-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -1028,7 +1028,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the evidence
         if: always() && steps.plan.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: xver-evidence-attempt-${{ github.run_attempt }}
           path: .dot-agent-deck/xver-evidence/
@@ -1191,7 +1191,7 @@ jobs:
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-windows-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
@@ -1271,7 +1271,7 @@ jobs:
       # the test step has no results and must not fail on that.
       - name: Preserve this attempt's test results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: nextest-macos-attempt-${{ github.run_attempt }}
           path: target/nextest/default/junit.xml
