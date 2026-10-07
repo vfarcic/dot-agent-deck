@@ -147,16 +147,16 @@ export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the w
  * one before it as a statement about their words.
  *
  * **And scoped to FIELDS, not content** (closing audit H2). What the code
- * guarantees is provenance: `prompt::state` adds no path, id or tool-argument
- * field, and of a prompt only its first `LAST_PROMPT_CHARS` (issue #1495, which
- * also added a working directory's NAME — never its path). It cannot promise a name holds none of those — a name is
+ * guarantees is provenance: `prompt::state` adds no path, id, prompt or
+ * tool-argument field (issue #1495 added a working directory's NAME, never its
+ * path, and matches a reference by task against the prompt on this machine). It cannot promise a name holds none of those — a name is
  * whatever it was set to, and `is_valid_display_name` admits `/`, so an agent
  * renamed `/home/alice/private` sends that string verbatim. Likewise "your
  * words" go with every request that REACHES the endpoint, not with every
  * utterance: `INTENT_DISCLOSURE`'s own last sentence names the ones decided on
  * this machine, which send nothing.
  */
-export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected daemon with its role, CLI name, live status and the tool it is running, its mode, its agent type, the name of its working directory (with the name of the folder above it when two agents' directories share a name), its orchestration's title, the start of the last prompt it was sent (at most 80 characters) and the order the agents started in, and the name of the daemon they are on; every daemon's name, and for a remote daemon with no name its SSH user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. This app adds no field of its own for a full filesystem path, a daemon or agent id, more of a prompt than that start, or a tool's arguments \u2014 but a name is whatever it was set to, so a name can itself be a path. Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.";
+export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected daemon with its role, CLI name, live status and the tool it is running, its mode, its agent type, the name of its working directory (with the name of the folder above it when two agents' directories share a name), its orchestration's title and the order the agents started in, and the name of the daemon they are on; every daemon's name, and for a remote daemon with no name its SSH user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. This app adds no field of its own for a full filesystem path, a daemon or agent id, prompt text or a tool's arguments \u2014 but a name is whatever it was set to, so a name can itself be a path. Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.";
 
 /**
  * What Names = Withheld leaves out, and what it costs. Withholding drops the

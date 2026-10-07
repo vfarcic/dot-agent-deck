@@ -713,7 +713,8 @@ pub mod test_support {
     /// Issue #1495 — agents whose labels say nothing about what they are
     /// doing, the way a dispatcher's own name does not say "dispatcher". Each
     /// is told apart only by a fact the deck holds beside the label: its mode,
-    /// its agent type, its directory, its orchestration, its last prompt or
+    /// its agent type, its directory, its orchestration, its last prompt (read
+    /// on this machine) or
     /// when it started.
     ///
     /// - **Mercury** runs in the `dispatcher` mode, in `dot-agent-deck`, and

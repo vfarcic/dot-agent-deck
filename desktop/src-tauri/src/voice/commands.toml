@@ -181,10 +181,11 @@ agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show,
 select, go to or switch to ONE agent, or to see only that one ("everything except the tester") —
 including "open tester agent", the accessible name of a dashboard row's open control, and "select
 dispatcher agent". The agent may be named as the screen shows it (a role like "tester", or a name
-the user gave it) or by anything `agents_on_screen` says about it: its mode, agent type,
-directory, orchestration, daemon, last prompt or start order. Set `agent` to the user's own words
-("dispatcher", "the Claude agent", "the newest agent"), except for an agent named by what it is
-doing (its status, its tool or its last prompt): for that one, its `label`."""
+the user gave it), by anything `agents_on_screen` says about it — its mode, agent type,
+directory, orchestration, daemon or start order — or by what it was asked to do. Set `agent` to the
+user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one fixing the
+scroll"), except for an agent named by what it is doing now (its status or its tool): for that
+one, its `label`."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"

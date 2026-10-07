@@ -2747,7 +2747,7 @@ pub fn resolve_agent_ref(spoken: &str, agents: &[DesktopAgent]) -> AgentRefMatch
 ///    "open tester" reaches the agent labelled tester even when another runs in
 ///    a mode called tester.
 /// 2. **Exact on a facet** — "dispatcher", "dot-agent-deck" — or the start of
-///    an agent's last prompt quoted back ([`quotes_last_prompt`]).
+///    a value the model was shown cut short with an ellipsis.
 /// 3. **Words.** The reference's words, less filler ("the", "one", "agent", …),
 ///    are matched against both tiers at once, and the agents that account for
 ///    the MOST of them win: "the reviewer in the PRD 1487 run" is the reviewer
@@ -2811,14 +2811,6 @@ pub fn resolve_agent_ref_on(
     if !known.is_empty() {
         return agent_ref_match(&known, agents);
     }
-    let quoted: Vec<&DesktopAgent> = agents
-        .iter()
-        .filter(|agent| quotes_last_prompt(spoken, agent))
-        .collect();
-    if !quoted.is_empty() {
-        return agent_ref_match(&quoted, agents);
-    }
-
     // Spelled the way every name below is, so punctuation splits a reference
     // exactly where it splits a name ("deploy@build-box", "schedule: issues").
     let mut said = words(&normalize(&spoken_text(spoken)));
@@ -2854,7 +2846,12 @@ pub fn resolve_agent_ref_on(
             Vec::new()
         }
     } else {
-        best_covered(&content, &said, agents)
+        let named = best_covered(&content, &said, agents);
+        if named.is_empty() {
+            task_matches(&content, agents)
+        } else {
+            named
+        }
     };
     match recency {
         Some(recency) => agent_ref_match(&recency.pick(pool), agents),
@@ -2862,62 +2859,91 @@ pub fn resolve_agent_ref_on(
     }
 }
 
-/// Whether `spoken` is the start of `agent`'s last prompt, as the model is
-/// shown it (`last_prompt`, issue #1495) — at least [`QUOTED_PROMPT_WORDS`]
-/// words of it, in order, from its first.
-///
-/// The model is told to answer a reference by task with the agent's label,
-/// and measured answering with the prompt it matched instead. What it is shown
-/// it may answer with — [`display_label`]'s invariant, for the same reason — so
-/// a quote of the prompt reaches the agent it is the prompt of. A single word
-/// would reach every agent asked to "fix" something, hence the floor.
-fn quotes_last_prompt(spoken: &str, agent: &DesktopAgent) -> bool {
-    let Some(prompt) = agent.last_user_prompt.as_deref() else {
-        return false;
-    };
-    let in_order = |text: &str| -> Vec<String> {
-        normalize(&spoken_text(text))
-            .split(' ')
-            .filter(|word| !word.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    let quoted = in_order(spoken);
-    let prompt = in_order(prompt);
-    let Some((last, whole)) = quoted.split_last() else {
-        return false;
-    };
-    // The model is shown the prompt cut at `LAST_PROMPT_CHARS`, usually
-    // inside a word ("resiz…"), and may quote it back that way (Qodo on PR
-    // #1529): every word but the last must match, the last may be cut short.
-    // Only a quote that SAYS it was cut, with the ellipsis it was shown with:
-    // otherwise "Fix the cat" would also reach "Fix the catalogue".
-    let cut = spoken.trim_end().ends_with('\u{2026}')
-        && agent.last_user_prompt.as_deref().is_some_and(|prompt| {
-            prompt
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .count()
-                > super::prompt::LAST_PROMPT_CHARS
-        });
-    quoted.len() >= QUOTED_PROMPT_WORDS
-        && prompt.len() >= quoted.len()
-        && prompt.starts_with(whole)
-        && if cut {
-            prompt[whole.len()].starts_with(last.as_str())
-        } else {
-            prompt[whole.len()] == *last
-        }
-}
-
 /// The fewest characters of a facet, quoted back cut short, that still name
 /// one ([`resolve_agent_ref_on`]).
 const CUT_FACET_CHARS: usize = 16;
 
-/// The fewest words of a last prompt that count as quoting it.
-const QUOTED_PROMPT_WORDS: usize = 3;
+/// Words a reference to an agent by its TASK carries that are not the task:
+/// "the one I asked to fix the scroll", "the agent working on the login".
+const TASK_FILLER_WORDS: [&str; 22] = [
+    "i", "me", "my", "we", "us", "you", "it", "to", "asked", "ask", "told", "tell", "working",
+    "work", "doing", "do", "about", "was", "were", "last", "prompt", "task",
+];
+
+/// The agents whose last prompt best matches a reference by task — "the one
+/// fixing the scroll" (issue #1495) — read on THIS machine: the prompt never
+/// reaches the Commands endpoint (Qodo on PR #1529), so the model answers a
+/// reference by task with the user's own words and this is where they meet
+/// the prompt.
+///
+/// A word counts when the prompt has it, or a word with the same stem
+/// ("fixing" and "Fix", "resizing" and "resizes", [`same_stem`]). MORE than
+/// half of the reference's task words have to count, so a shared verb alone
+/// ("fixing" in "the one fixing the printer") reaches nobody; the agents counting the
+/// most win, exact words breaking a tie, and a tie that is left is the
+/// numbered choice. Only run when no name or fact matched: a task is the last
+/// thing a reference is read as.
+fn task_matches<'a>(
+    content: &BTreeSet<String>,
+    agents: &'a [DesktopAgent],
+) -> Vec<&'a DesktopAgent> {
+    let wanted: Vec<&String> = content
+        .iter()
+        .filter(|word| !TASK_FILLER_WORDS.contains(&word.as_str()))
+        .collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut best = (0, 0);
+    let mut hits: Vec<&DesktopAgent> = Vec::new();
+    for agent in agents {
+        let Some(prompt) = agent.last_user_prompt.as_deref() else {
+            continue;
+        };
+        let prompt = words(&normalize(&spoken_text(prompt)));
+        let exact = wanted.iter().filter(|word| prompt.contains(**word)).count();
+        let stemmed = wanted
+            .iter()
+            .filter(|word| prompt.iter().any(|said| same_stem(word, said)))
+            .count();
+        if stemmed * 2 <= wanted.len() {
+            continue;
+        }
+        let score = (stemmed, exact);
+        match score.cmp(&best) {
+            std::cmp::Ordering::Greater => {
+                best = score;
+                hits = vec![agent];
+            }
+            std::cmp::Ordering::Equal => hits.push(agent),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+    hits
+}
+
+/// Whether two words share a stem, as a task is said and as it was typed:
+/// equal once a common ending ("ing", "ed", "es", "s") is off, or one the
+/// start of the other with three letters or more ("fix" and "fixing").
+fn same_stem(one: &str, other: &str) -> bool {
+    let stem = |word: &str| -> String {
+        for ending in ["ing", "ed", "es", "s"] {
+            if let Some(stem) = word.strip_suffix(ending)
+                && stem.chars().count() >= 3
+            {
+                return stem.to_string();
+            }
+        }
+        word.to_string()
+    };
+    let (one, other) = (stem(one), stem(other));
+    let (short, long) = if one.len() <= other.len() {
+        (&one, &other)
+    } else {
+        (&other, &one)
+    };
+    one == other || (short.chars().count() >= 3 && long.starts_with(short.as_str()))
+}
 
 /// `text` as the ordered words [`spoken_text`] and [`normalize`] make of it.
 fn word_sequence(text: &str) -> Vec<String> {
@@ -4082,8 +4108,8 @@ pub(super) fn spoken_names(agent: &DesktopAgent) -> Vec<String> {
 /// shows by that name.
 ///
 /// Never the whole path — a directory is called by its name — and never the
-/// last prompt, which is prose rather than a name and is left to the model
-/// ([`super::prompt::state`] shows it a short form).
+/// last prompt, which is prose rather than a name: a reference by task is
+/// read against it last, on this machine ([`task_matches`]).
 pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
     let mut facets: Vec<String> = Vec::new();
     let mut add = |value: &str| {
@@ -4133,9 +4159,16 @@ pub(super) fn agent_facets(agent: &DesktopAgent) -> Vec<String> {
         let parent = path.trim().trim_end_matches(['/', '\\']);
         if let Some(parent) = directory_name(&parent[..parent.len() - name.len()]) {
             add(&format!("{parent}/{name}"));
+            // Only as many as a label can show: `prompt::directory_labels`
+            // never shows more than `FACT_CHARS`, so a longer form is never
+            // what the model answers with, and a path of any length costs a
+            // bounded number of names (Qodo on PR #1529).
             let parent_words = word_sequence(parent);
             for kept in 1..parent_words.len() {
                 let tail = parent_words[parent_words.len() - kept..].join(" ");
+                if tail.chars().count() + name.chars().count() + 1 > super::prompt::FACT_CHARS {
+                    break;
+                }
                 add(&format!("{tail}/{name}"));
             }
         }
@@ -7838,8 +7871,8 @@ mod tests {
             "{outcome:?}"
         );
 
-        // Values the model was shown cut short resolve back: a last prompt
-        // cut inside a word, and a long directory name cut with an ellipsis.
+        // A task is read against the last prompt on this machine, by stem:
+        // "resizing" meets "resizes" in a prompt the model never saw.
         let mut long_task = agent("22", Some("Sigma"), "codex");
         long_task.last_user_prompt = Some(
             "Fix the scroll jump when the terminal pane resizes and keep the cursor where it was before"
@@ -7847,13 +7880,11 @@ mod tests {
         );
         let with_task = vec![long_task, agent("23", Some("Upsilon"), "pi")];
         assert!(matches!(
-            resolve_agent_ref_on(
-                "Fix the scroll jump when the terminal pane resizes and keep the cursor wh\u{2026}",
-                &with_task,
-                &decks()
-            ),
+            resolve_agent_ref_on("the one fixing the pane resizing", &with_task, &decks()),
             AgentRefMatch::One { id, .. } if id == "22"
         ));
+        // A long directory name the model was shown cut with an ellipsis
+        // still resolves.
         let mut long_named = agent("13", Some("Hydra"), "codex");
         long_named.cwd = Some(format!("/srv/{}", "x".repeat(120)));
         let with_long = vec![long_named, agent("14", Some("Lyra"), "codex")];
@@ -7861,7 +7892,7 @@ mod tests {
             resolve_agent_ref_on(&format!("{}\u{2026}", "x".repeat(79)), &with_long, &decks()),
             AgentRefMatch::One { id, .. } if id == "13"
         ));
-        // Without the ellipsis a quote is held to whole words: "Fix the cat"
+        // An exact word outranks a shared stem: "the one fixing the cat"
         // reaches the cat, not the catalogue too.
         let mut cat = agent("16", Some("Cat"), "codex");
         cat.last_user_prompt = Some("Fix the cat".to_string());
@@ -7869,13 +7900,7 @@ mod tests {
         catalogue.last_user_prompt = Some("Fix the catalogue".to_string());
         let pets = vec![cat, catalogue];
         assert!(matches!(
-            resolve_agent_ref_on("Fix the cat", &pets, &decks()),
-            AgentRefMatch::One { id, .. } if id == "16"
-        ));
-        // An ellipsis cuts a word only where the prompt shown WAS cut:
-        // "Fix the cat…" is the cat, never the catalogue.
-        assert!(matches!(
-            resolve_agent_ref_on("Fix the cat\u{2026}", &pets, &decks()),
+            resolve_agent_ref_on("the one fixing the cat", &pets, &decks()),
             AgentRefMatch::One { id, .. } if id == "16"
         ));
         // A control or bidi character is dropped as the model is shown it,
@@ -8056,29 +8081,41 @@ mod tests {
         );
     }
 
-    /// Scenario: asked for "the one fixing the scroll", the model answers with
-    /// the last prompt it was shown rather than the label; a quote of three
-    /// words or more from the start of an agent's last prompt reaches that
-    /// agent, and two words reach nobody.
+    /// Scenario: "the one fixing the scroll" names Juno, whose last prompt
+    /// was "Fix the scroll jump when the terminal pane resizes" — matched on
+    /// this machine, since the prompt is never sent to the Commands endpoint.
+    /// A task word nobody's prompt has names nobody, and a task is read only
+    /// when no name or fact matched.
     #[test]
-    fn voice_outcome_a_quoted_last_prompt_names_its_agent() {
+    fn voice_outcome_a_task_is_matched_on_this_machine() {
         let agents = facets_fleet();
+        for said in [
+            "the one fixing the scroll",
+            "the agent I asked to fix the scroll jump",
+            "the one working on the terminal pane resizing",
+        ] {
+            assert!(
+                matches!(resolve_agent_ref_on(said, &agents, &decks()),
+                    AgentRefMatch::One { id, .. } if id == "agent-juno"),
+                "{said:?}"
+            );
+        }
         assert!(matches!(
-            resolve_agent_ref_on(
-                "Fix the scroll jump when the terminal pane resizes",
-                &agents,
-                &decks()
-            ),
-            AgentRefMatch::One { id, .. } if id == "agent-juno"
-        ));
-        assert!(matches!(
-            resolve_agent_ref_on("Fix the scroll\u{2026}", &agents, &decks()),
-            AgentRefMatch::One { id, .. } if id == "agent-juno"
+            resolve_agent_ref_on("the one rewriting the install guide", &agents, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-vega"
         ));
         assert_eq!(
-            resolve_agent_ref_on("Fix the", &agents, &decks()),
+            resolve_agent_ref_on("the one fixing the printer", &agents, &decks()),
             AgentRefMatch::None
         );
+        // A fact still outranks a task: "dispatcher" is Mercury's mode even
+        // if another agent was asked about a dispatcher.
+        let mut asked = agents.clone();
+        asked[1].last_user_prompt = Some("Review the dispatcher".to_string());
+        assert!(matches!(
+            resolve_agent_ref_on("the dispatcher", &asked, &decks()),
+            AgentRefMatch::One { id, .. } if id == "agent-mercury"
+        ));
     }
 
     /// Scenario: "open the Claude agent" with two Claude Code agents running

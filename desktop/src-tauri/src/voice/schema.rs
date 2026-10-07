@@ -117,15 +117,16 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
     `tool` is what it is running right now. It also carries what the deck knows \
     about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
-    working directory's name), `orchestration` (its run's title), `last_prompt` (the \
-    start of the last prompt it was sent) and `newest_rank` (1 is the agent that \
-    started last); `agents_daemon` is the daemon they are all on. A user refers to \
-    an agent by state or by task as readily as by name — \"the one that is \
-    stuck\", \"the one fixing the scroll\" — so resolve such a reference against \
-    those fields and answer with that agent's `label`. For an agent the user named \
-    by mode, agent type, directory, orchestration, daemon or start order — \"the \
-    dispatcher\", \"the Codex agent\", \"the one in billing\", \"the newest \
-    agent\" — answer with the words the user used and let the app resolve them. \
+    working directory's name), `orchestration` (its run's title) and `newest_rank` \
+    (1 is the agent that started last); `agents_daemon` is the daemon they are all \
+    on. A user refers to an agent by state as readily as by name — \"the one that \
+    is stuck\" — so resolve such a reference against those fields and answer with \
+    that agent's `label`. For an agent the user named by mode, agent type, \
+    directory, orchestration, daemon, start order or what it was asked to do — \
+    \"the dispatcher\", \"the Codex agent\", \"the one in billing\", \"the newest \
+    agent\", \"the one fixing the scroll\" — answer with the words the user used \
+    and let the app resolve them; the app matches a task against each agent's \
+    last prompt itself. \
     A param that names an entry of a list below — a daemon, a \
     directory, a Mode chip, an agent type or an orchestration — is answered, \
     when the user named the entry, with its name exactly as listed, even when \

@@ -245,9 +245,6 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 /// - `orchestration` — for a role, its run's title as the overview's card
 ///   shows it, so "the reviewer in the PRD 1487 run" can tell two reviewers
 ///   apart; `orchestrations` lists the same titles.
-/// - `last_prompt` — a short form of the last prompt the operator sent it,
-///   [`LAST_PROMPT_CHARS`] at most, so "the one fixing the scroll" has
-///   something to match.
 /// - `newest_rank` — 1 for the agent that started last, counting back, among
 ///   the agents whose daemon reports a start time. A rank rather than the
 ///   time, because the model has no clock to read a time against.
@@ -270,16 +267,12 @@ pub fn data_turn(request: &IntentRequest<'_>) -> Option<String> {
 /// it* and the app resolves it, so handing over ids would invite a backend to
 /// assert that an agent exists, which is the app's job.
 ///
-/// **`last_user_prompt` in full.** It used to be left out altogether, as
-/// unbounded prose that would smuggle a second untrusted span into the state.
-/// Two things changed that, and issue #1495 is where it was decided: the state
-/// now travels in a data turn of its own, framed as untrusted, beside directory
-/// names that already admit ordinary prose ([`data_turn`]); and what a name
-/// the model obeyed can reach is bounded by action grounding, on-screen
-/// resolution and the confirmation on every stop, none of which this field
-/// widens. So a SHORT form goes in — the start of the prompt, [`shown`]'s
-/// bound, which is enough to recognise a task by and too short to carry much
-/// else — and the rest stays out.
+/// **`last_user_prompt`**, still. It is operator-written prose, and any secret
+/// or private text at its start would leave the machine on every command
+/// (Qodo on PR #1529, which reversed this PR's first version: that sent the
+/// first 80 characters). "The one fixing the scroll" is answered with the
+/// user's own words instead and matched against the prompt on THIS machine
+/// (`outcome::task_matches`), so the feature stays and the prompt stays put.
 ///
 /// **The active tool's `detail`**, the working directory's full path and the
 /// two timestamps: unbounded, more than a reference needs, or meaningless
@@ -406,12 +399,9 @@ pub fn state(request: &IntentRequest<'_>) -> Value {
 /// How many on-screen directory names [`state`] hands the model.
 pub const DIRECTORY_NAMES_SHOWN: usize = 200;
 
-/// The most characters of an agent's last prompt [`state`] shows the model.
-pub const LAST_PROMPT_CHARS: usize = 80;
-
 /// The most characters of any other observed string [`state`] adds for an
 /// agent — a mode, a directory's name, a run's title.
-const FACT_CHARS: usize = 80;
+pub(super) const FACT_CHARS: usize = 80;
 
 /// `text` as the model may be shown it: control and bidi characters stripped
 /// (`dto::safe_display_text`), every run of whitespace — a newline included —
@@ -579,13 +569,6 @@ fn agent_state(
         if let Some(title) = shown(title, FACT_CHARS) {
             entry.insert("orchestration".to_string(), Value::String(title));
         }
-    }
-    if let Some(prompt) = agent
-        .last_user_prompt
-        .as_deref()
-        .and_then(|prompt| shown(prompt, LAST_PROMPT_CHARS))
-    {
-        entry.insert("last_prompt".to_string(), Value::String(prompt));
     }
     if let Some(rank) = newest_rank {
         entry.insert("newest_rank".to_string(), json!(rank));
@@ -1251,11 +1234,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn voice_prompt_state_carries_a_short_prompt_and_a_directory_name_never_a_path() {
-        // Issue #1495 reversed the old rule that left both out: "the one fixing
-        // the scroll" and "the one in billing" need them. What goes is bounded
-        // — the start of the prompt, scrubbed and on one line, and the
-        // directory's NAME — and the path and the timestamps still stay out.
+    fn voice_prompt_state_carries_a_directory_name_and_never_a_prompt_or_a_path() {
+        // Issue #1495 sends the directory's NAME, so "the one in billing" can
+        // be named; the path, the timestamps and the operator's prompt stay
+        // out — not even its start, which a review on PR #1529 showed could
+        // carry a secret. "The one fixing the scroll" is matched on this
+        // machine instead (`outcome::task_matches`).
         let commands = commands();
         let mut agent = agent("1", "tester");
         agent.last_user_prompt = Some(format!(
@@ -1269,13 +1253,7 @@ pub(crate) mod tests {
         let transcript = Transcript::new("open the tester");
         let state = state(&request(&transcript, &commands, &agents));
         let entry = &state["agents_on_screen"][0];
-        let prompt = entry["last_prompt"].as_str().expect("a prompt");
-        assert!(
-            prompt.starts_with("Fix the scroll jump and then"),
-            "{prompt}"
-        );
-        assert!(prompt.ends_with('\u{2026}'), "{prompt}");
-        assert_eq!(prompt.chars().count(), LAST_PROMPT_CHARS, "{prompt}");
+        assert!(entry.get("last_prompt").is_none(), "{entry}");
         assert_eq!(entry["directory"], "secret-project");
         assert_eq!(entry["newest_rank"], 1);
         let rendered = state.to_string();
@@ -1283,6 +1261,7 @@ pub(crate) mod tests {
         assert!(!rendered.contains("1700000000000"), "{rendered}");
         assert!(!rendered.contains("1700000000001"), "{rendered}");
         assert!(!rendered.contains('\u{202e}'), "{rendered}");
+        assert!(!rendered.contains("scroll"), "{rendered}");
     }
 
     #[test]
@@ -1324,10 +1303,8 @@ pub(crate) mod tests {
                 on_screen[index]
             );
         }
-        assert_eq!(
-            on_screen[1]["last_prompt"],
-            "Fix the scroll jump when the terminal pane resizes"
-        );
+        assert!(on_screen[1].get("last_prompt").is_none(), "{on_screen}");
+        assert!(!state.to_string().contains("scroll jump"), "{state}");
         assert_eq!(on_screen[2]["newest_rank"], 1);
         assert_eq!(on_screen[3]["orchestration"], "prd-1487");
         assert_eq!(on_screen[3]["label"], "reviewer");
