@@ -11566,7 +11566,12 @@ mod tests {
             ),
             other => panic!("expected Accepted, got {other:?}"),
         }
-        assert!(fx.restart.is_accepted());
+        // The handler records the acceptance just after writing it, so the
+        // reply can arrive first; wait for the record rather than race it.
+        wait_until("the handler records the acceptance", || {
+            fx.restart.is_accepted()
+        })
+        .await;
         assert!(
             fx.registry.is_admission_frozen(),
             "an accepted restart keeps refusing starts until the daemon exits"
