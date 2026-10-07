@@ -72,10 +72,24 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     void send(upgradeId, choice).catch(() => undefined);
   };
 
-  // Unmounting with the question open is a Keep: the dialog went away.
-  useEffect(() => () => {
-    const open = pendingQuestion.current;
-    if (open) answer(open, "keep-current");
+  /**
+   * Whether the dialog is still on screen. The run outlives it — the bridge
+   * keeps hearing its events until the upgrade returns — so everything the
+   * run calls back into checks this first.
+   */
+  const mounted = useRef(true);
+
+  // Unmounting with the question open is a Keep: the dialog went away. A
+  // question asked AFTER it went is a Keep too (`start`), answered at once:
+  // nothing is left to ask, and the run would otherwise wait out the crate's
+  // ten-minute decision timeout holding this deck's upgrade.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      const open = pendingQuestion.current;
+      if (open) answer(open, "keep-current");
+    };
   }, []);
 
   const start = () => {
@@ -83,6 +97,11 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     if (!upgrade) return;
     setState({ phase: "running" });
     upgrade(target.deckId, (event) => {
+      if (!mounted.current) {
+        // The dialog's own listener is gone; all that is left of it answers.
+        if (event.type === "decision") answer(event.upgradeId, "keep-current");
+        return;
+      }
       if (event.type === "progress") {
         setState((current) => current.phase === "running" || current.phase === "deciding" ? { ...current, stage: event.progress.stage } : current);
       } else {
@@ -92,11 +111,11 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     }).then(
       (outcome) => {
         pendingQuestion.current = undefined;
-        setState({ phase: "done", outcome });
+        if (mounted.current) setState({ phase: "done", outcome });
       },
       (cause: unknown) => {
         pendingQuestion.current = undefined;
-        setState({ phase: "error", message: cause instanceof Error ? cause.message : String(cause) });
+        if (mounted.current) setState({ phase: "error", message: cause instanceof Error ? cause.message : String(cause) });
       },
     );
   };

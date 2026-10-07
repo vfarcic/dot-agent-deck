@@ -195,6 +195,43 @@ describe("UpgradeDialog", () => {
     expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
   });
 
+  /** Scenario: The dialog closes while the upgrade is still running; a question the run asks afterwards is answered Keep current daemon at once, and its progress reaches nothing. */
+  it("answers Keep at once for a question asked after it unmounted", async () => {
+    const { runtime, emit, finish } = controlledRuntime();
+    const view = render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(progress("installing"));
+    view.unmount();
+    // Nothing was pending when it went, so nothing was answered then.
+    expect(runtime.decideUpgrade).not.toHaveBeenCalled();
+
+    emit(progress("restarting"));
+    expect(runtime.decideUpgrade).not.toHaveBeenCalled();
+    emit(decision);
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    // A re-ask (what is running changed) is answered the same way.
+    emit({ ...decision, stale: true } as UpgradeEvent);
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
+    // The run ending later renders nothing anywhere.
+    await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: A dialog that answered Keep on unmount does not answer the same question twice when its later events arrive. */
+  it("does not hand events to a dialog that has gone", () => {
+    const { runtime, emit } = controlledRuntime();
+    const view = render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+    view.unmount();
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    emit(progress("verifying"));
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("upgrade-stages")).not.toBeInTheDocument();
+  });
+
   /** Scenario: Says that the question changed when the daemon asks again with a different list. */
   it("says so when what is running changed since the last ask", () => {
     const { runtime, emit } = controlledRuntime();
