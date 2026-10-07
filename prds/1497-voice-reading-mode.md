@@ -68,7 +68,7 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 - **D6: Interruptible and quiet by default.** Speech is short, any new speech for the same agent replaces what is queued rather than piling up, and "stop" or "quiet" always works.
 - **D7: Must not hear itself.** The microphone does not treat the app's own speech as a command: listening pauses while speaking, or echo cancellation is used. Decided in D8.
 
-- **D8: Echo handling is hybrid (M1, 2026-10-07).** Listening continues while the app speaks, with the webview's echo cancellation requested on the microphone, but while speech is playing only the interrupt rows ("stop", "quiet") are honoured and every other utterance is dropped. The worst case is the app interrupting itself, which is harmless; pausing the microphone was rejected because "stop" could then not be spoken over the speech.
+- **D8: Echo handling is hybrid (M1, 2026-10-07; narrowed 2026-10-07).** Listening continues while the app speaks, but while speech is playing only the interrupt rows ("stop", "quiet") are honoured and every other utterance is dropped. The maintainer's answer also asked for echo cancellation on the microphone; that half is not available, because the desktop captures audio in Rust through `cpal` (`desktop/src-tauri/src/voice/capture.rs`, since WebKitGTK grants no `getUserMedia`) and `cpal` offers no echo cancellation. Platform echo cancellation (a PipeWire/PulseAudio echo-cancel source, macOS voice-processing I/O, Windows communications mode) is left out of this PRD. The worst case is the app interrupting itself, which is harmless; pausing the microphone was rejected because "stop" could then not be spoken over the speech.
 - **D9: Speech source is provider first, with a picker (M1, 2026-10-07).** Settings → Voice offers **Auto** (the default), **Provider** and **System**. Auto uses the configured connection's text-to-speech when it offers one (an OpenAI-compatible connection does, Anthropic does not) and the operating system's voice otherwise.
 - **D10: A summary always names the agent (M1, 2026-10-07)**, even when only one is open: "The tester finished: all 42 tests pass." It stays unambiguous if the user has switched panes.
 - **D11: Reading ends with its pane (M1, 2026-10-07).** Reading is bound to the agent it was turned on for. Opening a different agent's pane, closing this one, "reading off" or "voice off" ends it, and the app says "Reading off". It never follows the user to another pane.
@@ -98,7 +98,7 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 
 All five were answered with the maintainer on 2026-10-07 (M1):
 
-1. Echo handling → D8 (hybrid: echo cancellation on, only stop/quiet honoured while speaking).
+1. Echo handling → D8 (only stop/quiet honoured while speaking; echo cancellation is not available on the `cpal` capture path).
 2. Speech source order → D9 (provider first, OS voice fallback, Auto / Provider / System picker).
 3. Name the agent → D10 (always).
 4. Persistence across panes → D11 (ends with the pane).
