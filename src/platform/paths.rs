@@ -1278,15 +1278,32 @@ pub(crate) fn pin_is_repairable(pin: &str) -> bool {
 }
 
 /// Whether `path` is positively a live, durable deck install: absolute, reported
-/// to exist, an executable file, and not cargo build output. Every term must be
-/// established — a path whose existence cannot be read is not one. The
-/// automatic hook install keeps another install's entry only on this
-/// (`agent_hook_config::auto_install_keeps`).
+/// to exist, an executable file, and not cargo build output — neither as
+/// spelled nor once its symlinks are resolved. Every term must be established —
+/// a path whose existence cannot be read is not one, and nor is one whose
+/// target cannot be resolved. The automatic hook install keeps another
+/// install's entry only on this (`agent_hook_config::auto_install_keeps`).
+///
+/// The resolved check is what stops a symlink outside any build tree that
+/// points into one (`/usr/local/bin/dot-agent-deck -> …/target/debug/…`, or into
+/// a custom cargo target dir) from being kept: the binary behind it is rebuilt
+/// or deleted by `cargo`, whatever the link is called. This is deliberately the
+/// opposite of [`durable_binary_path`]'s step 2a, which writes such a
+/// `~/.local/bin` link without canonicalizing: that is the installing binary
+/// naming itself, while this decides whether to defer to ANOTHER install, and
+/// there the fail-safe direction is to replace.
 pub(crate) fn is_live_durable_install(path: &Path) -> bool {
     path.is_absolute()
         && matches!(path.try_exists(), Ok(true))
         && is_executable_file(path)
         && !is_build_artifact_path(path)
+        && resolved_install_is_not_build_output(std::fs::canonicalize(path))
+}
+
+/// The resolved half of [`is_live_durable_install`]: `canonical` is the pin's
+/// canonicalized target, and a target that could not be resolved is not kept.
+fn resolved_install_is_not_build_output(canonical: std::io::Result<PathBuf>) -> bool {
+    canonical.is_ok_and(|target| !is_build_artifact_path(&target))
 }
 
 /// Single-quote `path` for a POSIX shell only when it contains a character
@@ -4166,6 +4183,82 @@ mod tests {
                  misclassify it"
             );
         }
+    }
+
+    /// Scenario: a pin outside every build tree that is a symlink is kept only
+    /// when what it resolves to is a real install. A link to a regular install
+    /// is kept; a link into `target/debug` and a link into a custom cargo
+    /// target dir (`.fingerprint/` beside `deps/`) are not, though neither
+    /// link's own spelling names a build tree (PRD #1487 review, Qodo
+    /// 4208317449).
+    #[cfg(unix)]
+    #[test]
+    fn is_live_durable_install_resolves_symlinks_before_the_build_output_check() {
+        let dir = crate::test_temp::tempdir().expect("tempdir");
+        let root = dir.path();
+        let links = root.join("usr-local-bin");
+        std::fs::create_dir_all(&links).expect("create link dir");
+        let link_to = |name: &str, target: &Path| {
+            let link = links.join(name);
+            std::os::unix::fs::symlink(target, &link).expect("symlink");
+            assert!(
+                !is_build_artifact_path(&link),
+                "the link's own spelling must not already read as build output"
+            );
+            link
+        };
+
+        let install = root.join("opt/deck/bin/dot-agent-deck");
+        write_stub_executable(&install);
+        assert!(is_live_durable_install(&install));
+        let to_install = link_to("to-install", &install);
+        assert!(
+            is_live_durable_install(&to_install),
+            "a symlink to a real install stays kept"
+        );
+
+        let debug = root.join("code/deck/target/debug/dot-agent-deck");
+        write_stub_executable(&debug);
+        let to_debug = link_to("to-debug", &debug);
+        assert!(
+            !is_live_durable_install(&to_debug),
+            "a symlink into target/debug is cargo build output once resolved"
+        );
+
+        let profile = root.join("custom-target/dev-profile");
+        std::fs::create_dir_all(profile.join(".fingerprint")).expect("create .fingerprint");
+        std::fs::create_dir_all(profile.join("deps")).expect("create deps");
+        let custom = profile.join("dot-agent-deck");
+        write_stub_executable(&custom);
+        let to_custom = link_to("to-custom", &custom);
+        assert!(
+            !is_live_durable_install(&to_custom),
+            "a symlink into a custom cargo target dir is cargo build output once resolved"
+        );
+        let test_binary = profile.join("deps").join("dot_agent_deck-0123abcd");
+        write_stub_executable(&test_binary);
+        let to_deps = link_to("to-deps", &test_binary);
+        assert!(
+            !is_live_durable_install(&to_deps),
+            "a symlink into a cargo deps/ dir is cargo build output once resolved"
+        );
+    }
+
+    /// Scenario: when a pin's target cannot be resolved, the resolved half of
+    /// the keep check refuses it, so the automatic install replaces the entry
+    /// rather than deferring to something it could not inspect.
+    #[test]
+    fn is_live_durable_install_does_not_keep_a_pin_whose_target_cannot_be_resolved() {
+        assert!(!resolved_install_is_not_build_output(Err(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
+        let durable = std::env::temp_dir()
+            .join("no-such-install-dir")
+            .join("dot-agent-deck");
+        assert!(resolved_install_is_not_build_output(Ok(durable)));
+        assert!(!resolved_install_is_not_build_output(Ok(PathBuf::from(
+            "/home/u/code/deck/target/release/dot-agent-deck"
+        ))));
     }
 
     /// A near-miss end to end: a deck genuinely installed under a directory

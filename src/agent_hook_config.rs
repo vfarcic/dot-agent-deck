@@ -1245,7 +1245,8 @@ pub(crate) enum InstallMode {
 
 /// Whether an automatic install keeps a deck entry pinned to `exe`: only a
 /// POSITIVELY live, durable install — an absolute path the OS reports exists,
-/// to an executable file, that is not cargo build output
+/// to an executable file, that is not cargo build output as spelled or once
+/// its symlinks are resolved
 /// ([`crate::platform::paths::is_build_artifact_path`], which reads cargo's
 /// own layout through `is_cargo_output_dir`).
 ///
