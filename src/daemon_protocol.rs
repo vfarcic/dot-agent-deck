@@ -4758,9 +4758,10 @@ async fn handle_connection(
             // PRD #1487: a stop wins over a restart under way or already
             // accepted, so it is claimed before the ack — never acknowledged
             // once the daemon has committed to a restart, when it is refused
-            // instead — and withdrawn when the ack fails, since then this stop
-            // does not happen (Qodo 4201540983).
-            if !restart.stop_wins("stop-daemon") {
+            // instead — and confirmed only once the ack is written; a failed
+            // ack withdraws this claim alone (Qodo 4201540983, 4201633116).
+            let Some(claim) = restart.claim_stop() else {
+                warn!("StopDaemon refused: the daemon already committed to a restart");
                 let resp = AttachResponse::err(
                     "this daemon is already restarting onto a new build and is exiting; \
                      stop the new daemon once it is up"
@@ -4768,11 +4769,10 @@ async fn handle_connection(
                 );
                 write_resp(&mut stream, &resp).await?;
                 return Ok(());
-            }
-            if let Err(e) = write_resp(&mut stream, &AttachResponse::ok()).await {
-                restart.withdraw_stop();
-                return Err(e);
-            }
+            };
+            // A failed write returns here and drops `claim`, withdrawing it.
+            write_resp(&mut stream, &AttachResponse::ok()).await?;
+            claim.confirm("stop-daemon");
             // The same graceful drain, with the same grace, as the
             // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
             // one. Idempotent via the registry's `shutting_down` latch.

@@ -1182,6 +1182,13 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // would kill it with this unit's cgroup. `daemon serve` reads
     // `handed_to_supervisor` and exits non-zero instead, so the manager runs
     // the unit's own command — the installed build — again.
+    // A `StopDaemon` still writing its acknowledgement holds a pending stop
+    // claim; wait for it so a stop that is about to be withdrawn does not
+    // cancel the restart, bounded so a stalled peer cannot hold the exit (a
+    // claim still pending then counts as a stop).
+    restart_control
+        .settle_stop_claims(crate::daemon_restart::STOP_CLAIM_SETTLE)
+        .await;
     match restart_control.take_successor_plan() {
         crate::daemon_restart::SuccessorPlan::Nothing => {}
         crate::daemon_restart::SuccessorPlan::Spawn(target) => {
