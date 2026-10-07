@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createFixtureFleet, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID } from "../data/fixture";
 import type { UpgradeOutcome } from "../lib/upgrade";
+import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { AgentOverview } from "./AgentOverview";
 
@@ -82,6 +83,23 @@ describe("the dashboard's Upgrade action", () => {
     expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("now runs 0.45.0");
     fireEvent.click(screen.getByTestId("upgrade-close"));
     expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: With voice on, a row's number opens its agent; with the Upgrade dialog up, the same digit opens nothing behind it. */
+  it("keeps the dashboard's number keys off while the Upgrade dialog is open", () => {
+    const onNavigate = vi.fn();
+    render(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(createFixtureFleet("upgrade"))} onNavigate={onNavigate} /></VoiceOn.Provider>);
+
+    fireEvent.click(within(group(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-upgrade"));
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "1" });
+    expect(onNavigate).not.toHaveBeenCalled();
+    expect(screen.getByTestId("upgrade-dialog")).toBeInTheDocument();
+
+    // The control: the same digit with the dialog closed opens the first row.
+    fireEvent.click(screen.getByTestId("upgrade-cancel"));
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(onNavigate).toHaveBeenCalled();
   });
 
   /** Scenario: A runtime that cannot upgrade offers no button rather than one that does nothing. */

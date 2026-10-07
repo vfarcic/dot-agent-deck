@@ -1167,10 +1167,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const rowNumbers = useMemo(() => (
     voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined
   ), [numberedAgents, voiceOn]);
+  /* The Upgrade dialog counts as a confirmation for voice and for the
+     dashboard's own keys: it asks whether to stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
      outside the dashboard's region (see `dashboardKeyScroll`). */
   useEffect(() => {
-    if (!rowsShown || confirm) return;
+    if (!rowsShown || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || modalOpen()) return;
       const target = event.target;
@@ -1185,12 +1188,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, rowsShown]);
+  }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
      digit, and a field or terminal keeps its own. */
   useEffect(() => {
-    if (!rowNumbers || !numberedAgents || confirm) return;
+    if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
@@ -1200,10 +1203,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, numberedAgents, openAgent, rowNumbers]);
-  /* The Upgrade dialog counts as a confirmation for voice: it asks whether to
-     stop agents (PRD #1487 review). */
-  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
+  }, [confirmationOpen, numberedAgents, openAgent, rowNumbers]);
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
