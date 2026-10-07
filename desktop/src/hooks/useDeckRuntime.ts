@@ -438,7 +438,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     ? (deckId: string, onEvent: (event: UpgradeEvent) => void) => bridge.upgradeDaemon(deckId, onEvent)
     : undefined), [bridge]);
   const decideUpgrade = useMemo(() => (typeof bridge.decideUpgrade === "function"
-    ? (upgradeId: string, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, choice)
+    ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
 
   // PRD #882: the geometry the daemon has applied per agent. Held here rather

@@ -4905,6 +4905,11 @@ fn apply_zoom(webview: &Webview, level: settings::ZoomLevel) {
 /// "failed while …", which are answers rather than errors. Rejects only when
 /// the upgrade could not start: a deck this app is not observing, a remote
 /// deck missing from the deck list, or a second press while one is running.
+///
+/// `attempt_id` is the webview's own id for this call, chosen before it is
+/// made: every event the run emits carries it, so the caller's listeners hear
+/// this run and no other — a second call refused here never hears the first
+/// run's question (PRD #1487, Qodo 4208054166).
 #[tauri::command]
 async fn desktop_upgrade_daemon(
     app: AppHandle,
@@ -4912,6 +4917,7 @@ async fn desktop_upgrade_daemon(
     state: State<'_, DesktopState>,
     upgrades: State<'_, upgrade::UpgradeState>,
     deck_id: String,
+    attempt_id: String,
 ) -> Result<upgrade::UpgradeOutcomeDto, String> {
     use dot_agent_deck::daemon_upgrade::UpgradeOutcome;
     use dot_agent_deck::daemon_upgrade::{
@@ -4920,6 +4926,7 @@ async fn desktop_upgrade_daemon(
     use dot_agent_deck::remote_daemon::SshDaemonPort;
 
     ensure_main_webview(&webview)?;
+    let attempt_id = upgrade::validate_attempt_id(&attempt_id)?;
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
     let endpoint = scope.endpoint().clone();
     let _in_flight = upgrades.begin(&deck_id)?;
@@ -4953,6 +4960,7 @@ async fn desktop_upgrade_daemon(
         let decider = upgrade::DesktopDecider::new(
             decider_state,
             deck_for_run.clone(),
+            attempt_id.clone(),
             id_for_run.clone(),
             Box::new(move |event: &upgrade::UpgradeDecisionEvent| {
                 let _ = decision_app.emit(upgrade::DECISION_EVENT, event);
@@ -4963,6 +4971,7 @@ async fn desktop_upgrade_daemon(
                 upgrade::PROGRESS_EVENT,
                 upgrade::UpgradeProgressEvent {
                     deck_id: deck_for_run.clone(),
+                    attempt_id: attempt_id.clone(),
                     upgrade_id: id_for_run.clone(),
                     progress,
                 },
@@ -4972,8 +4981,10 @@ async fn desktop_upgrade_daemon(
             upgrade::UpgradeTarget::Remote(entry) => {
                 // What the installer prints along the way is for a terminal;
                 // the dialog shows the stages and the outcome instead.
-                let installer = SshInstaller::new(
-                    &entry.name,
+                // The row read once above, for the install as for the port,
+                // so both reach the same machine (Greptile 4208066970).
+                let installer = SshInstaller::for_entry(
+                    &entry,
                     crate::decks::remotes_path(),
                     Box::new(std::io::sink()),
                 );
@@ -5041,17 +5052,21 @@ async fn desktop_upgrade_daemon(
 
 /// PRD #1487 M5: the decision dialog's answer to the restart question an
 /// upgrade is waiting on — `"restart-now"` or `"keep-current"`. Closing the
-/// dialog sends `"keep-current"`; an id with no question waiting is refused.
+/// dialog sends `"keep-current"`; an id with no question waiting is refused,
+/// and so is an answer to a question that has since been asked again
+/// (`question_id` is the one the decision event carried — Greptile
+/// 4208066960).
 #[tauri::command]
 fn desktop_upgrade_decide(
     webview: Webview,
     upgrades: State<'_, upgrade::UpgradeState>,
     upgrade_id: String,
+    question_id: u64,
     choice: String,
 ) -> Result<(), String> {
     ensure_main_webview(&webview)?;
     let choice = upgrade::DecisionChoice::parse(&choice)?;
-    upgrades.decide(&upgrade_id, choice)
+    upgrades.decide(&upgrade_id, question_id, choice)
 }
 
 #[tauri::command]

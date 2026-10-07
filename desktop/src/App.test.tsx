@@ -1553,9 +1553,9 @@ describe("ControlDeck", () => {
     };
     const atStake = { agents: [{ id: "1", label: "coder", paneId: "4", cwd: "/work/app" }], roles: [{ paneId: "4", role: "coder", orchestration: "tdd", isOrchestrator: false }] };
     const upgradeDaemon = vi.fn(async (deckId: string, onEvent: (event: UpgradeEvent) => void) => {
-      onEvent({ type: "progress", deckId, upgradeId: "upgrade-1", progress: { stage: "installing" } });
-      onEvent({ type: "progress", deckId, upgradeId: "upgrade-1", progress: { stage: "restarting" } });
-      onEvent({ type: "decision", deckId, upgradeId: "upgrade-1", atStake, stale: false });
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "installing" } });
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "restarting" } });
+      onEvent({ type: "decision", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake, stale: false });
       await new Promise<void>((resolve) => { release = resolve; });
       return { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake } } as UpgradeOutcome;
     });
@@ -1572,7 +1572,7 @@ describe("ControlDeck", () => {
     expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder (pane 4, in /work/app)");
     expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Role coder of tdd, pane 4");
     fireEvent.click(screen.getByTestId("upgrade-keep-current"));
-    expect(live.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    expect(live.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
     release();
 
     const outcome = await screen.findByTestId("upgrade-outcome");

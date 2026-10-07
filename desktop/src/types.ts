@@ -1249,8 +1249,8 @@ export interface DeckRuntimeState {
    * no upgrade rather than a button that does nothing.
    */
   upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
-  /** Answer the restart question `upgradeId` is waiting on. */
-  decideUpgrade?: (upgradeId: string, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
+  /** Answer question `questionId` of the upgrade `upgradeId`. */
+  decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /**
    * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
    * returned, per agent id. An agent with no entry has nothing unresolved.

@@ -2938,7 +2938,9 @@ fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool)
     } else {
         || Box::new(std::io::stdout())
     };
-    let mut installer = SshInstaller::new(name, path.clone(), report());
+    // The row read above, for the install as for the port, so both reach
+    // the same machine even if the row changes meanwhile.
+    let mut installer = SshInstaller::for_entry(&entry, path.clone(), report());
     installer.no_install = no_install;
     let port =
         dot_agent_deck::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);

@@ -27,6 +27,18 @@ export interface UpgradeTarget {
   offer?: UpgradeOffer;
 }
 
+/** Which question an answer is for: the run, and the question within it. */
+type QuestionRef = Pick<UpgradeDecisionEvent, "upgradeId" | "questionId">;
+
+/**
+ * Whether two refer to the same question. A run that asks again — what would
+ * stop changed — asks a new question, so its upgrade id alone is not enough
+ * (PRD #1487, Greptile 4208066960).
+ */
+function sameQuestion(a: QuestionRef | undefined, b: QuestionRef | undefined): boolean {
+  return a !== undefined && b !== undefined && a.upgradeId === b.upgradeId && a.questionId === b.questionId;
+}
+
 type Phase =
   | { phase: "confirm" }
   | { phase: "running"; stage?: UpgradeStage }
@@ -56,22 +68,23 @@ export function UpgradeDialog({ target, runtime, onClose }: {
 }) {
   const [state, setState] = useState<Phase>({ phase: "confirm" });
   /** The question still waiting, for the unmount answer below. */
-  const pendingQuestion = useRef<string | undefined>(undefined);
+  const pendingQuestion = useRef<QuestionRef | undefined>(undefined);
   /** The question a button's answer is on its way to, if any. */
-  const answering = useRef<string | undefined>(undefined);
+  const answering = useRef<QuestionRef | undefined>(undefined);
   const deck = displayText(target.deckName, DISPLAY_LIMITS.name);
   const replace = target.kind === "replace";
 
-  const send = (upgradeId: string, choice: UpgradeChoice): Promise<void> => runtime.decideUpgrade
-    ? runtime.decideUpgrade(upgradeId, choice)
+  const send = (question: QuestionRef, choice: UpgradeChoice): Promise<void> => runtime.decideUpgrade
+    ? runtime.decideUpgrade(question.upgradeId, question.questionId, choice)
     : Promise.reject(new Error("answering is not available"));
 
   /** For a dialog on its way out: nothing is left to show a failure on. */
-  const answer = (upgradeId: string, choice: UpgradeChoice) => {
-    if (pendingQuestion.current === upgradeId) pendingQuestion.current = undefined;
-    // A refusal means the question already closed (it timed out, or the run
-    // ended); the outcome that follows says what happened.
-    void send(upgradeId, choice).catch(() => undefined);
+  const answer = (question: QuestionRef, choice: UpgradeChoice) => {
+    if (sameQuestion(pendingQuestion.current, question)) pendingQuestion.current = undefined;
+    // A refusal means the question already closed (it timed out, the run
+    // ended, or it was asked again); the outcome that follows says what
+    // happened.
+    void send(question, choice).catch(() => undefined);
   };
 
   /**
@@ -93,7 +106,7 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     return () => {
       mounted.current = false;
       const open = pendingQuestion.current;
-      if (open && answering.current !== open) answer(open, "keep-current");
+      if (open && !sameQuestion(answering.current, open)) answer(open, "keep-current");
     };
   }, []);
 
@@ -104,13 +117,15 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     upgrade(target.deckId, (event) => {
       if (!mounted.current) {
         // The dialog's own listener is gone; all that is left of it answers.
-        if (event.type === "decision") answer(event.upgradeId, "keep-current");
+        if (event.type === "decision") answer(event, "keep-current");
         return;
       }
       if (event.type === "progress") {
         setState((current) => current.phase === "running" || current.phase === "deciding" ? { ...current, stage: event.progress.stage } : current);
       } else {
-        pendingQuestion.current = event.upgradeId;
+        // A question asked again replaces the one on screen, even while an
+        // answer to that one is still on its way.
+        pendingQuestion.current = { upgradeId: event.upgradeId, questionId: event.questionId };
         setState((current) => ({ phase: "deciding", stage: current.phase === "running" || current.phase === "deciding" ? current.stage : "restarting", question: event, answering: false }));
       }
     }).then(
@@ -127,20 +142,22 @@ export function UpgradeDialog({ target, runtime, onClose }: {
 
   const decide = (choice: UpgradeChoice) => {
     if (state.phase !== "deciding" || state.answering) return;
-    const { upgradeId } = state.question;
+    const question: QuestionRef = { upgradeId: state.question.upgradeId, questionId: state.question.questionId };
+    // Only THIS question's screen is changed by its answer: one asked again
+    // while the answer was on its way stays up, to be answered in turn.
     const asked = (current: Phase): current is Extract<Phase, { phase: "deciding" }> =>
-      current.phase === "deciding" && current.question.upgradeId === upgradeId;
+      current.phase === "deciding" && sameQuestion(current.question, question);
     setState({ ...state, answering: true, undelivered: false });
     // The question stays open until the answer has arrived; an unmount in the
     // meantime leaves it to this answer.
-    answering.current = upgradeId;
+    answering.current = question;
     const settled = () => {
-      if (answering.current === upgradeId) answering.current = undefined;
+      if (sameQuestion(answering.current, question)) answering.current = undefined;
     };
-    send(upgradeId, choice).then(
+    send(question, choice).then(
       () => {
         settled();
-        if (pendingQuestion.current === upgradeId) pendingQuestion.current = undefined;
+        if (sameQuestion(pendingQuestion.current, question)) pendingQuestion.current = undefined;
         setState((current) => asked(current) ? { phase: "running", stage: current.stage } : current);
       },
       () => {
@@ -148,7 +165,7 @@ export function UpgradeDialog({ target, runtime, onClose }: {
         // Gone while it was on its way: nothing is left to retry from, so the
         // question is answered the way every other way out answers it.
         if (!mounted.current) {
-          if (pendingQuestion.current === upgradeId) answer(upgradeId, "keep-current");
+          if (sameQuestion(pendingQuestion.current, question)) answer(question, "keep-current");
           return;
         }
         setState((current) => asked(current) ? { ...current, answering: false, undelivered: true } : current);
@@ -161,7 +178,7 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     if (state.phase === "running") return; // nothing to answer, and it is still working
     if (state.phase === "deciding") {
       if (state.answering) return; // an answer is on its way; let it land
-      answer(state.question.upgradeId, "keep-current");
+      answer(state.question, "keep-current");
     }
     onClose();
   };

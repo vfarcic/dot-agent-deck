@@ -794,36 +794,105 @@ describe("TauriDeckBridge", () => {
   /**
    * PRD #1487 M5: Upgrade and Replace daemon are one command, scoped to the
    * deck they were pressed on, and the restart answer goes back by the run's
-   * id. No `restart_daemon` action exists any more.
+   * id and the question's. No `restart_daemon` action exists any more. The
+   * call names its own attempt, and only events carrying that attempt reach
+   * its caller — not another deck's, and not another run on the same deck
+   * (Qodo 4208054166).
    */
   it("upgrades a daemon through desktop_upgrade_daemon and answers the question with desktop_upgrade_decide", async () => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const outcome = { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } };
-    invoke.mockImplementation(async (command: string) => {
+    let attemptId = "";
+    invoke.mockImplementation(async (command: string, args?: { attemptId?: string }) => {
       if (command !== "desktop_upgrade_daemon") return undefined;
-      // Another deck's run on the same events must not reach this one's dialog.
-      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-other", upgradeId: "upgrade-9", progress: { stage: "installing" } } });
-      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", progress: { stage: "restarting" } } });
-      listeners.get("desktop://upgrade-decision")?.({ payload: { deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", atStake: { agents: [], roles: [] }, stale: false } });
+      attemptId = args?.attemptId ?? "";
+      // Another deck's run, and another run on this deck, must not reach this one's dialog.
+      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-other", attemptId: "attempt-other", upgradeId: "upgrade-9", progress: { stage: "installing" } } });
+      listeners.get("desktop://upgrade-decision")?.({ payload: { deckId: "deck-000000000000dec1", attemptId: "attempt-other", upgradeId: "upgrade-8", questionId: 4, atStake: { agents: [], roles: [] }, stale: false } });
+      listeners.get("desktop://upgrade-progress")?.({ payload: { deckId: "deck-000000000000dec1", attemptId, upgradeId: "upgrade-3", progress: { stage: "restarting" } } });
+      listeners.get("desktop://upgrade-decision")?.({ payload: { deckId: "deck-000000000000dec1", attemptId, upgradeId: "upgrade-3", questionId: 5, atStake: { agents: [], roles: [] }, stale: false } });
       return outcome;
     });
     const heard: unknown[] = [];
 
     await expect(bridge.upgradeDaemon("deck-000000000000dec1", (event) => heard.push(event))).resolves.toEqual(outcome);
-    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_daemon", { deckId: "deck-000000000000dec1" });
+    expect(attemptId).toMatch(/^[A-Za-z0-9_-]{1,64}$/);
+    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_daemon", { deckId: "deck-000000000000dec1", attemptId });
     expect(heard).toEqual([
-      { type: "progress", deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", progress: { stage: "restarting" } },
-      { type: "decision", deckId: "deck-000000000000dec1", upgradeId: "upgrade-3", atStake: { agents: [], roles: [] }, stale: false },
+      { type: "progress", deckId: "deck-000000000000dec1", attemptId, upgradeId: "upgrade-3", progress: { stage: "restarting" } },
+      { type: "decision", deckId: "deck-000000000000dec1", attemptId, upgradeId: "upgrade-3", questionId: 5, atStake: { agents: [], roles: [] }, stale: false },
     ]);
     // The run's listeners go with it.
     expect(listeners.has("desktop://upgrade-progress")).toBe(false);
     expect(listeners.has("desktop://upgrade-decision")).toBe(false);
 
-    await bridge.decideUpgrade("upgrade-3", "keep-current");
-    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_decide", { upgradeId: "upgrade-3", choice: "keep-current" });
+    await bridge.decideUpgrade("upgrade-3", 5, "keep-current");
+    expect(invoke).toHaveBeenCalledWith("desktop_upgrade_decide", { upgradeId: "upgrade-3", questionId: 5, choice: "keep-current" });
     expect(invoke).not.toHaveBeenCalledWith("desktop_run_action", expect.objectContaining({ action: expect.objectContaining({ type: "restart_daemon" }) }));
     await bridge.dispose();
+  });
+
+  /**
+   * Scenario: press Upgrade on a deck twice, the second while the first run
+   * is asking its restart question. The second call is refused before it
+   * registers anything, so it never hears or answers the first run's
+   * question, and only the first run reaches the crate; once the first run
+   * ends the deck can be upgraded again (PRD #1487, Qodo 4208054166).
+   */
+  it("refuses a second upgrade of a deck without letting it hear the first run's question", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const { UPGRADE_ALREADY_RUNNING } = await import("./upgrade");
+    const event = await import("@tauri-apps/api/event");
+    const listen = vi.mocked(event.listen);
+    const original = listen.getMockImplementation();
+    // Every registration kept, so two runs' listeners can coexist.
+    const registered: { name: string; callback: (event: { payload: unknown }) => void }[] = [];
+    listen.mockImplementation((async (name: string, callback: (event: { payload: unknown }) => void) => {
+      const entry = { name, callback };
+      registered.push(entry);
+      return () => registered.splice(registered.indexOf(entry), 1);
+    }) as never);
+    const broadcast = (name: string, payload: unknown) => registered.filter((entry) => entry.name === name).forEach((entry) => entry.callback({ payload }));
+    let finishFirst!: () => void;
+    let asked!: () => void;
+    const questionAsked = new Promise<void>((resolve) => { asked = resolve; });
+    invoke.mockImplementation(async (command: string, args?: { attemptId?: string }) => {
+      if (command !== "desktop_upgrade_daemon") return undefined;
+      broadcast("desktop://upgrade-decision", { deckId: "deck-000000000000dec1", attemptId: args?.attemptId, upgradeId: "upgrade-1", questionId: 1, atStake: { agents: [{ id: "7", label: "coder" }], roles: [] }, stale: false });
+      asked();
+      await new Promise<void>((resolve) => { finishFirst = resolve; });
+      return { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: { agents: [], roles: [] } } };
+    });
+    const bridge = new TauriDeckBridge();
+    try {
+      const firstHeard: unknown[] = [];
+      const secondHeard: unknown[] = [];
+      const first = bridge.upgradeDaemon("deck-000000000000dec1", (heard) => firstHeard.push(heard));
+      await questionAsked;
+      const listenersBefore = listen.mock.calls.length;
+
+      await expect(bridge.upgradeDaemon("deck-000000000000dec1", (heard) => secondHeard.push(heard))).rejects.toThrow(UPGRADE_ALREADY_RUNNING);
+      expect(listen.mock.calls.length).toBe(listenersBefore);
+      // The first run asks again while the refused call is settling.
+      const firstAttempt = (invoke.mock.calls.find(([command]) => command === "desktop_upgrade_daemon")?.[1] as { attemptId: string }).attemptId;
+      broadcast("desktop://upgrade-decision", { deckId: "deck-000000000000dec1", attemptId: firstAttempt, upgradeId: "upgrade-1", questionId: 2, atStake: { agents: [], roles: [] }, stale: true });
+
+      expect(secondHeard).toEqual([]);
+      expect(firstHeard.map((heard) => (heard as { questionId: number }).questionId)).toEqual([1, 2]);
+      expect(invoke.mock.calls.filter(([command]) => command === "desktop_upgrade_daemon")).toHaveLength(1);
+      expect(invoke).not.toHaveBeenCalledWith("desktop_upgrade_decide", expect.anything());
+
+      finishFirst();
+      await first;
+      expect(registered).toEqual([]);
+      // The deck is free again once the first run has ended.
+      invoke.mockImplementation(async (command: string) => (command === "desktop_upgrade_daemon" ? { outcome: "installed-not-restarted", installedVersion: "0.45.0", reason: { kind: "no-daemon-running" } } : undefined));
+      await expect(bridge.upgradeDaemon("deck-000000000000dec1", () => {})).resolves.toMatchObject({ outcome: "installed-not-restarted" });
+    } finally {
+      if (original) listen.mockImplementation(original);
+      await bridge.dispose();
+    }
   });
 
   /**

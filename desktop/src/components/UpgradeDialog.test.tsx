@@ -31,8 +31,8 @@ function controlledRuntime() {
   };
 }
 
-const progress = (stage: "installing" | "restarting" | "verifying"): UpgradeEvent => ({ type: "progress", deckId: "deck-remote", upgradeId: "upgrade-1", progress: { stage } });
-const decision: UpgradeEvent = { type: "decision", deckId: "deck-remote", upgradeId: "upgrade-1", atStake: AT_STAKE, stale: false };
+const progress = (stage: "installing" | "restarting" | "verifying"): UpgradeEvent => ({ type: "progress", deckId: "deck-remote", attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage } });
+const decision: Extract<UpgradeEvent, { type: "decision" }> = { type: "decision", deckId: "deck-remote", attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake: AT_STAKE, stale: false };
 
 describe("UpgradeDialog", () => {
   /** Scenario: Confirms, shows each stage as it runs, then the outcome in plain words; Close dismisses it. */
@@ -84,7 +84,7 @@ describe("UpgradeDialog", () => {
     expect(list).toHaveTextContent("Agent coder (pane 2, in /work/app)");
     expect(list).toHaveTextContent("Role orchestrator of tdd, pane 1 (the orchestrator)");
     await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "restart-now");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "restart-now");
     // Delivered: back to the stages while the restart runs.
     expect(screen.queryByTestId("upgrade-decision")).not.toBeInTheDocument();
     expect(screen.getByTestId("upgrade-stage-restarting")).toHaveAttribute("data-state", "active");
@@ -102,10 +102,60 @@ describe("UpgradeDialog", () => {
     fireEvent.click(screen.getByTestId("upgrade-start"));
     emit(decision);
     await act(async () => { fireEvent.click(screen.getByTestId("upgrade-keep-current")); });
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
     await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
     expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon kept running");
     expect(screen.getByTestId("upgrade-outcome")).toHaveTextContent("0.45.0 is installed on build-box. The daemon keeps running 0.44.0, as you chose");
+  });
+
+  /**
+   * Scenario: Restart now is pressed, and before that answer has arrived the
+   * run asks again because what would stop changed. The new question stays on
+   * screen when the first answer lands, with its buttons live, and its own
+   * answer names it (PRD #1487, Greptile 4208066960).
+   */
+  it("keeps a question asked again while the previous answer was on its way", async () => {
+    const { runtime, emit } = controlledRuntime();
+    let deliver!: () => void;
+    runtime.decideUpgrade.mockImplementationOnce(() => new Promise<undefined>((resolve) => { deliver = () => resolve(undefined); }));
+    render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(progress("restarting"));
+    emit(decision);
+
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "restart-now");
+    emit({ ...decision, questionId: 2, stale: true, atStake: { agents: [...AT_STAKE.agents, { id: "8", label: "tester" }], roles: AT_STAKE.roles } });
+    await act(async () => deliver());
+
+    const question = screen.getByTestId("upgrade-decision");
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "deciding");
+    expect(question).toHaveAttribute("aria-busy", "false");
+    expect(screen.getByTestId("upgrade-decision-stale")).toBeInTheDocument();
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent tester");
+    await act(async () => { fireEvent.click(screen.getByTestId("upgrade-keep-current")); });
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 2, "keep-current");
+    expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "running");
+  });
+
+  /**
+   * Scenario: the dialog goes away while an answer to the first question is
+   * on its way and the run has asked again. The new question is answered
+   * Keep current daemon — the first answer covers only the first (PRD #1487,
+   * Greptile 4208066960).
+   */
+  it("answers a question asked again Keep when the dialog goes away mid-answer", async () => {
+    const { runtime, emit } = controlledRuntime();
+    runtime.decideUpgrade.mockImplementationOnce(() => new Promise<undefined>(() => {}));
+    const { unmount } = render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    emit({ ...decision, questionId: 2, stale: true });
+    unmount();
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 2, "keep-current");
   });
 
   /** Scenario: Restart now is pressed while the answer is still on its way; the question stays on screen, a second press sends nothing more, and the stages come back once it has arrived. */
@@ -149,7 +199,7 @@ describe("UpgradeDialog", () => {
 
     await act(async () => { fireEvent.click(screen.getByTestId("upgrade-restart-now")); });
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
-    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "restart-now");
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 1, "restart-now");
     expect(screen.queryByTestId("upgrade-decision")).not.toBeInTheDocument();
     expect(screen.queryByTestId("upgrade-decision-error")).not.toBeInTheDocument();
   });
@@ -166,7 +216,7 @@ describe("UpgradeDialog", () => {
     expect(screen.getByTestId("upgrade-decision-error")).toBeInTheDocument();
 
     fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
-    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 1, "keep-current");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -181,7 +231,7 @@ describe("UpgradeDialog", () => {
     fireEvent.click(screen.getByTestId("upgrade-start"));
     emit(decision);
     dismiss();
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
@@ -192,7 +242,7 @@ describe("UpgradeDialog", () => {
     fireEvent.click(screen.getByTestId("upgrade-start"));
     emit(decision);
     view.unmount();
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
   });
 
   /** Scenario: Restart now is on its way when the dialog goes away; the unmount sends no Keep for the same question, and the Restart now answer stands. */
@@ -207,7 +257,7 @@ describe("UpgradeDialog", () => {
     view.unmount();
     await act(async () => deliver());
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "restart-now");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "restart-now");
   });
 
   /** Scenario: Restart now is on its way when the dialog goes away, and then fails to arrive; the question is answered Keep current daemon, and Restart now is never sent again. */
@@ -223,8 +273,8 @@ describe("UpgradeDialog", () => {
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
     await act(async () => refuse());
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
-    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
-    expect(runtime.decideUpgrade).not.toHaveBeenNthCalledWith(2, "upgrade-1", "restart-now");
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 1, "keep-current");
+    expect(runtime.decideUpgrade).not.toHaveBeenNthCalledWith(2, "upgrade-1", 1, "restart-now");
   });
 
   /** Scenario: The dialog closes while the upgrade is still running; a question the run asks afterwards is answered Keep current daemon at once, and its progress reaches nothing. */
@@ -241,11 +291,11 @@ describe("UpgradeDialog", () => {
     expect(runtime.decideUpgrade).not.toHaveBeenCalled();
     emit(decision);
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
-    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
     // A re-ask (what is running changed) is answered the same way.
     emit({ ...decision, stale: true } as UpgradeEvent);
     expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
-    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", 1, "keep-current");
     // The run ending later renders nothing anywhere.
     await finish({ outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake: AT_STAKE } });
     expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();

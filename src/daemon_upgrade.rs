@@ -37,7 +37,7 @@ use crate::daemon_client::{
 use crate::daemon_protocol::{
     AttachResponse, RestartDaemonReply, RestartRefusalReason, RestartStopSet, RestartSuccessor,
 };
-use crate::remote::{SshError, SshExecutor, SystemSshExecutor};
+use crate::remote::{RemoteEntry, SshError, SshExecutor, SystemSshExecutor};
 use crate::remote_daemon::{RemoteDaemonError, SshDaemonPort};
 use crate::untrusted_text::{
     REMOTE_MESSAGE_MAX_BYTES, REMOTE_NAME_MAX_BYTES, REMOTE_PATH_MAX_BYTES, display_line,
@@ -1084,12 +1084,20 @@ pub fn upgrade_ssh_executor() -> SystemSshExecutor {
     )
 }
 
-/// Installs on a registered remote through [`crate::remote::upgrade_reporting_to`]
-/// — the download to `~/.local/bin`, or `brew upgrade` where Homebrew owns the
-/// install — refreshing the hooks and the deck list's row. What that prints
-/// goes to `out`.
+/// Installs on a registered remote through
+/// [`crate::remote::upgrade_entry_reporting_to`] — the download to
+/// `~/.local/bin`, or `brew upgrade` where Homebrew owns the install —
+/// refreshing the hooks and the deck list's row. What that prints goes to
+/// `out`.
+///
+/// It installs on the machine `entry` reaches — the row the caller read once
+/// and also built its [`crate::remote_daemon::SshDaemonPort`] from — rather
+/// than reading the row again by name, so the install and the restart cannot
+/// land on two machines when the row changes mid-upgrade; a row moved
+/// elsewhere in the meantime fails the install instead of being written over
+/// (PRD #1487, Greptile 4208066970).
 pub struct SshInstaller<E: SshExecutor = SystemSshExecutor> {
-    pub name: String,
+    pub entry: RemoteEntry,
     pub remotes_path: PathBuf,
     pub executor: E,
     /// `remote upgrade --no-install`: only verify what is already there.
@@ -1099,10 +1107,11 @@ pub struct SshInstaller<E: SshExecutor = SystemSshExecutor> {
 }
 
 impl SshInstaller<SystemSshExecutor> {
-    /// The production installer for remote `name`, reporting to `out`.
-    pub fn new(name: &str, remotes_path: PathBuf, out: Box<dyn Write>) -> Self {
+    /// The production installer for the deck-list row `entry`, reporting to
+    /// `out`.
+    pub fn for_entry(entry: &RemoteEntry, remotes_path: PathBuf, out: Box<dyn Write>) -> Self {
         Self {
-            name: name.to_string(),
+            entry: entry.clone(),
             remotes_path,
             executor: upgrade_ssh_executor(),
             no_install: false,
@@ -1115,14 +1124,15 @@ impl SshInstaller<SystemSshExecutor> {
 impl<E: SshExecutor> Installer for SshInstaller<E> {
     fn install(&self, version: &str) -> Result<InstalledBuild, InstallError> {
         let opts = crate::remote::UpgradeOptions {
-            name: self.name.clone(),
+            name: self.entry.name.clone(),
             version: version.to_string(),
             no_install: self.no_install,
             release_base: self.release_base.clone(),
         };
         let mut out = self.out.borrow_mut();
-        let entry = crate::remote::upgrade_reporting_to(
+        let entry = crate::remote::upgrade_entry_reporting_to(
             &opts,
+            &self.entry,
             &self.executor,
             &self.remotes_path,
             &mut *out,

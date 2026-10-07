@@ -952,8 +952,11 @@ impl RemoteUpgrader for SystemRemoteUpgrader {
                 };
             }
         };
-        let installer =
-            SshInstaller::new(name, self.remotes_path.clone(), Box::new(std::io::stdout()));
+        let installer = SshInstaller::for_entry(
+            &entry,
+            self.remotes_path.clone(),
+            Box::new(std::io::stdout()),
+        );
         let port = crate::remote_daemon::SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
         let plan = UpgradePlan {
             version: version.to_string(),

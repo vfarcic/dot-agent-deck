@@ -73,6 +73,11 @@ export function upgradeEndedDeckSessions(outcome: UpgradeOutcome): boolean {
 /** `desktop://upgrade-progress`. */
 export interface UpgradeProgressEvent {
   deckId: string;
+  /**
+   * The id the caller chose for this upgrade before starting it; the bridge
+   * hands a run's caller only the events carrying its own (Qodo 4208054166).
+   */
+  attemptId: string;
   upgradeId: string;
   progress: { stage: UpgradeStage; detail?: string | null };
 }
@@ -80,7 +85,13 @@ export interface UpgradeProgressEvent {
 /** `desktop://upgrade-decision`: "restarting stops these — restart now?". */
 export interface UpgradeDecisionEvent {
   deckId: string;
+  attemptId: string;
   upgradeId: string;
+  /**
+   * This question's own id. Asked again (what would stop changed), it is a new
+   * one, and an answer must name the question it answers (Greptile 4208066960).
+   */
+  questionId: number;
   atStake: UpgradeStopSet;
   /** What would stop changed since the last time this upgrade asked. */
   stale: boolean;
@@ -91,6 +102,9 @@ export type UpgradeEvent =
   | ({ type: "decision" } & UpgradeDecisionEvent);
 
 export type UpgradeChoice = "restart-now" | "keep-current";
+
+/** What a second Upgrade of a deck reads while one is already running in this app. */
+export const UPGRADE_ALREADY_RUNNING = "An upgrade of this daemon is already running in this app. Wait for it to finish.";
 
 /**
  * Which flow the dialog runs: **Upgrade** on a remote deck installs this app's

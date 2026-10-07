@@ -10,7 +10,7 @@ import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
 import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
-import { upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
+import { UPGRADE_ALREADY_RUNNING, upgradeEndedDeckSessions, type UpgradeChoice, type UpgradeEvent, type UpgradeOffer, type UpgradeOutcome, type UpgradeProgressEvent, type UpgradeDecisionEvent, type UpgradeStopSet } from "./upgrade";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
@@ -1905,8 +1905,12 @@ export interface DeckBridge {
    * live-agent question; the promise resolves with the outcome.
    */
   upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome>;
-  /** Answer the restart question `upgradeId` is waiting on (`desktop_upgrade_decide`). */
-  decideUpgrade(upgradeId: string, choice: UpgradeChoice): Promise<void>;
+  /**
+   * Answer question `questionId` of the upgrade `upgradeId`
+   * (`desktop_upgrade_decide`). An answer to a question that has since been
+   * asked again is refused.
+   */
+  decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -2407,8 +2411,9 @@ class FixtureDeckBridge implements DeckBridge {
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
   private upgradesInFlight = new Set<string>();
-  private upgradeQuestions = new Map<string, (choice: UpgradeChoice) => void>();
+  private upgradeQuestions = new Map<string, { questionId: number; answer: (choice: UpgradeChoice) => void }>();
   private upgradeCount = 0;
+  private upgradeQuestionCount = 0;
 
   /**
    * The selected deck, which is the only one every mutating fixture action
@@ -3049,13 +3054,13 @@ class FixtureDeckBridge implements DeckBridge {
   async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {
     const deck = this.fleet.find((candidate) => candidate.connection.deckId === deckId);
     if (!deck) throw new Error(`that daemon is not one this app is observing: ${deckId}`);
-    if (this.upgradesInFlight.has(deckId)) throw new Error("An upgrade of this daemon is already running in this app. Wait for it to finish.");
+    if (this.upgradesInFlight.has(deckId)) throw new Error(UPGRADE_ALREADY_RUNNING);
     this.upgradesInFlight.add(deckId);
     const upgradeId = `fixture-upgrade-${++this.upgradeCount}`;
     const offer = deck.connection.upgradeOffer;
     const fromVersion = offer?.kind === "offered" ? offer.from : FIXTURE_DAEMON_VERSION;
     const toVersion = offer?.kind === "offered" ? offer.to : FIXTURE_APP_VERSION;
-    const progress = (stage: UpgradeProgressEvent["progress"]["stage"]) => onEvent({ type: "progress", deckId, upgradeId, progress: { stage } });
+    const progress = (stage: UpgradeProgressEvent["progress"]["stage"]) => onEvent({ type: "progress", deckId, attemptId: upgradeId, upgradeId, progress: { stage } });
     const pause = () => new Promise<void>((resolve) => window.setTimeout(resolve, FIXTURE_UPGRADE_STEP_MS));
     try {
       progress("installing");
@@ -3068,8 +3073,9 @@ class FixtureDeckBridge implements DeckBridge {
       };
       if (atStake.agents.length) {
         const choice = await new Promise<UpgradeChoice>((resolve) => {
-          this.upgradeQuestions.set(upgradeId, resolve);
-          onEvent({ type: "decision", deckId, upgradeId, atStake, stale: false });
+          const questionId = ++this.upgradeQuestionCount;
+          this.upgradeQuestions.set(upgradeId, { questionId, answer: resolve });
+          onEvent({ type: "decision", deckId, attemptId: upgradeId, upgradeId, questionId, atStake, stale: false });
         });
         if (choice === "keep-current") {
           return { outcome: "installed-not-restarted", fromVersion, installedVersion: toVersion, reason: { kind: "kept-by-user", atStake } };
@@ -3098,11 +3104,12 @@ class FixtureDeckBridge implements DeckBridge {
     }
   }
 
-  async decideUpgrade(upgradeId: string, choice: UpgradeChoice): Promise<void> {
-    const answer = this.upgradeQuestions.get(upgradeId);
-    if (!answer) throw new Error("That upgrade is no longer waiting for an answer; it may have finished already.");
+  async decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void> {
+    const waiting = this.upgradeQuestions.get(upgradeId);
+    if (!waiting) throw new Error("That upgrade is no longer waiting for an answer; it may have finished already.");
+    if (waiting.questionId !== questionId) throw new Error("That question was replaced by a newer one, because what a restart would stop changed. Answer the question shown now.");
     this.upgradeQuestions.delete(upgradeId);
-    answer(choice);
+    waiting.answer(choice);
   }
 
   async desktopFeatures(): Promise<DesktopFeatures> {
@@ -3163,6 +3170,16 @@ class FixtureDeckBridge implements DeckBridge {
 export const MAX_WARM_TERMINALS = 3;
 
 /**
+ * PRD #1487 M5 — a fresh id for one `desktop_upgrade_daemon` call, unique
+ * across page reloads (a run a previous page started may still be emitting).
+ * Letters, digits and `-` only, which is what the crate accepts.
+ */
+function newUpgradeAttemptId(): string {
+  const random = globalThis.crypto?.randomUUID?.();
+  return random ?? `attempt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/**
  * One installed terminal session, and the deck it was created against.
  *
  * The target is stored WITH the session rather than re-derived when a frame
@@ -3197,6 +3214,8 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private attached = new Set<string>();
   private sessions = new Map<string, InstalledTerminalSession>();
+  /** PRD #1487 M5 — decks with an upgrade this bridge started still running. */
+  private upgradingDecks = new Set<string>();
   /**
    * The tail of each terminal session's input queue, by the `sessionId` of the
    * session the input was accepted for. See {@link sendTerminalInput} for why
@@ -4709,42 +4728,54 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {
-    const invoke = await this.getInvoke();
-    const { listen } = await import("@tauri-apps/api/event");
-    // One upgrade per deck at a time — the crate refuses a second — so the
-    // deck id is enough to tell this run's events from another deck's.
-    // Settled rather than `Promise.all`, so a listener that did register is
-    // removed when the other one fails, instead of outliving the run (PRD
-    // #1487, Qodo #14).
-    const registered = await Promise.allSettled([
-      listen<UpgradeProgressEvent>("desktop://upgrade-progress", (event) => {
-        if (event.payload.deckId === deckId) onEvent({ type: "progress", ...event.payload });
-      }),
-      listen<UpgradeDecisionEvent>("desktop://upgrade-decision", (event) => {
-        if (event.payload.deckId === deckId) onEvent({ type: "decision", ...event.payload });
-      }),
-    ]);
-    const stops = registered.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
-    const refused = registered.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (refused) {
-      stops.forEach((stop) => stop());
-      throw refused.reason;
-    }
+    // One upgrade per deck at a time from this app, reserved before anything
+    // is awaited: a second call while one runs registers no listener at all,
+    // so it cannot hear, show or answer the first run's question (PRD #1487,
+    // Qodo 4208054166). The crate refuses a second run too.
+    if (this.upgradingDecks.has(deckId)) throw new Error(UPGRADE_ALREADY_RUNNING);
+    this.upgradingDecks.add(deckId);
     try {
-      const outcome = await invoke<UpgradeOutcome>("desktop_upgrade_daemon", { deckId });
-      // When the old daemon may be gone the crate ended this deck's terminal
-      // sessions with it; the bridge forgets them too, so the next declaration
-      // re-attaches against whatever answers now.
-      if (upgradeEndedDeckSessions(outcome)) this.forgetDeckSessions(deckId);
-      return outcome;
+      const invoke = await this.getInvoke();
+      const { listen } = await import("@tauri-apps/api/event");
+      // Every event of this run carries the id chosen here, before the crate
+      // can emit anything, so the listeners hear this run and no other —
+      // another deck's, or one a reloaded page left running.
+      const attemptId = newUpgradeAttemptId();
+      // Settled rather than `Promise.all`, so a listener that did register is
+      // removed when the other one fails, instead of outliving the run (PRD
+      // #1487, Qodo #14).
+      const registered = await Promise.allSettled([
+        listen<UpgradeProgressEvent>("desktop://upgrade-progress", (event) => {
+          if (event.payload.attemptId === attemptId) onEvent({ type: "progress", ...event.payload });
+        }),
+        listen<UpgradeDecisionEvent>("desktop://upgrade-decision", (event) => {
+          if (event.payload.attemptId === attemptId) onEvent({ type: "decision", ...event.payload });
+        }),
+      ]);
+      const stops = registered.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+      const refused = registered.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (refused) {
+        stops.forEach((stop) => stop());
+        throw refused.reason;
+      }
+      try {
+        const outcome = await invoke<UpgradeOutcome>("desktop_upgrade_daemon", { deckId, attemptId });
+        // When the old daemon may be gone the crate ended this deck's terminal
+        // sessions with it; the bridge forgets them too, so the next declaration
+        // re-attaches against whatever answers now.
+        if (upgradeEndedDeckSessions(outcome)) this.forgetDeckSessions(deckId);
+        return outcome;
+      } finally {
+        stops.forEach((stop) => stop());
+      }
     } finally {
-      stops.forEach((stop) => stop());
+      this.upgradingDecks.delete(deckId);
     }
   }
 
-  async decideUpgrade(upgradeId: string, choice: UpgradeChoice): Promise<void> {
+  async decideUpgrade(upgradeId: string, questionId: number, choice: UpgradeChoice): Promise<void> {
     const invoke = await this.getInvoke();
-    await invoke("desktop_upgrade_decide", { upgradeId, choice });
+    await invoke("desktop_upgrade_decide", { upgradeId, questionId, choice });
   }
 
   /**

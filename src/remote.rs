@@ -1616,6 +1616,16 @@ impl RemoteEntry {
         target
     }
 
+    /// Whether `other` reaches the same daemon this row does: the same ssh
+    /// route (host, login, port, key and jump host) and the same daemon
+    /// socket. What an upgrade captured at its start is compared with the row
+    /// it is about to record into, so a row moved to another machine in the
+    /// meantime is refused rather than written over (PRD #1487, Greptile
+    /// 4208066970).
+    pub fn same_route(&self, other: &RemoteEntry) -> bool {
+        self.ssh_target() == other.ssh_target() && self.socket == other.socket
+    }
+
     /// The deck binary to invoke on the remote, spelled for the remote shell:
     /// the recorded [`binary`](Self::binary) when there is one, otherwise
     /// [`REMOTE_INSTALL_PATH`]. Safe to interpolate into a remote command
@@ -2623,6 +2633,14 @@ pub enum RemoteUpgradeError {
     /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
     #[error(transparent)]
     Inner(#[from] RemoteAddError),
+    /// The deck list's row for this remote no longer reaches the machine the
+    /// upgrade installed on: it was removed and re-added, or edited, for
+    /// another address while the upgrade ran (PRD #1487, Greptile
+    /// 4208066970). Nothing is recorded over the row.
+    #[error(
+        "the deck list's row for '{name}' was changed to reach a different machine while the upgrade ran, so the result was not recorded over it. Check the row with `dot-agent-deck remote list` and run the upgrade again."
+    )]
+    RouteChanged { name: String },
     /// The new build is already in place on the remote, and a step after it —
     /// reinstalling the hooks, or recording it in the deck list — failed. The
     /// binary is not rolled back; running the upgrade again finishes the rest.
@@ -2683,17 +2701,37 @@ pub fn upgrade_reporting_to(
     out: &mut dyn std::io::Write,
 ) -> Result<RemoteEntry, RemoteUpgradeError> {
     // 1. Version validation BEFORE any ssh call (mirrors `add`).
-    let version = validate_version_string(&opts.version)?;
+    validate_version_string(&opts.version)?;
 
     // 2. Lookup. Unknown name short-circuits before any ssh work.
     let registry = RemotesFile::load(remotes_path)?;
     let existing = registry
         .remotes
-        .iter()
+        .into_iter()
         .find(|r| r.name == opts.name)
         .ok_or_else(|| RemoteUpgradeError::UnknownName {
             name: opts.name.clone(),
         })?;
+    upgrade_entry_reporting_to(opts, &existing, executor, remotes_path, out)
+}
+
+/// [`upgrade_reporting_to`] against `existing`, the row the caller already
+/// read, instead of reading it again by name — so the install goes to the
+/// machine the caller's other commands (its probe and restart) go to. The
+/// result is recorded only while the row named `opts.name` still reaches that
+/// machine ([`RemoteEntry::same_route`]); a row moved elsewhere in the
+/// meantime is refused with [`RemoteUpgradeError::RouteChanged`] (PRD #1487,
+/// Greptile 4208066970).
+pub fn upgrade_entry_reporting_to(
+    opts: &UpgradeOptions,
+    existing: &RemoteEntry,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+    out: &mut dyn std::io::Write,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
+    // 1. Version validation BEFORE any ssh call (mirrors `add`).
+    let version = validate_version_string(&opts.version)?;
+
     let target = existing.ssh_target();
     let was_homebrew = existing.install.as_deref() == Some(INSTALL_HOMEBREW);
 
@@ -2757,10 +2795,22 @@ pub fn upgrade_reporting_to(
     //    install method and binary are re-recorded on every upgrade, which is
     //    what moves an entry written before issue #1372 onto the method that
     //    actually owns the remote's install.
+    //    Only while the row still reaches the machine this run installed on:
+    //    one moved to another address since `existing` was read is refused
+    //    rather than stamped with a version that machine does not run.
     let now = chrono::Utc::now().to_rfc3339();
-    let updated = crate::deck_list::update(
+    let updated = crate::deck_list::update_if(
         remotes_path,
         crate::deck_list::DeckRef::Name(&opts.name),
+        |entry| {
+            if entry.same_route(existing) {
+                Ok(())
+            } else {
+                Err(RemoteUpgradeError::RouteChanged {
+                    name: opts.name.clone(),
+                })
+            }
+        },
         |entry| {
             entry.version = installed.version.clone();
             entry.upgraded_at = Some(now);
@@ -2768,7 +2818,7 @@ pub fn upgrade_reporting_to(
             entry.binary = installed.binary.clone();
         },
     )
-    .map_err(|e| after_install("recording it in the deck list")(e.into()))?
+    .map_err(after_install("recording it in the deck list"))?
     .ok_or_else(|| {
         after_install("recording it in the deck list")(RemoteUpgradeError::UnknownName {
             name: opts.name.clone(),
@@ -4361,6 +4411,116 @@ mod homebrew_remote_tests {
         assert_eq!(entry.install.as_deref(), Some(INSTALL_LOCAL_BIN));
         assert_eq!(entry.binary, None);
         assert_eq!(entry.remote_binary(), REMOTE_INSTALL_PATH);
+    }
+
+    /// Scenario: an upgrade starts against the deck-list row it read for
+    /// `mac` (`user@mac`), and while it runs that row is removed and re-added
+    /// for another machine (`user@elsewhere`). Every ssh command still goes to
+    /// the machine the upgrade started on, and the result is refused rather
+    /// than recorded over the moved row — the error says so in plain words and
+    /// that the build was installed (PRD #1487, Greptile 4208066970).
+    #[test]
+    fn an_upgrade_whose_row_moves_to_another_machine_mid_run_installs_on_the_first_and_records_nothing()
+     {
+        struct MovesTheRow<'a> {
+            inner: SandboxShell,
+            targets: std::cell::RefCell<Vec<SshTarget>>,
+            registry: &'a Path,
+        }
+        impl SshExecutor for MovesTheRow<'_> {
+            fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if self.targets.borrow().is_empty() {
+                    // Another client removes `mac` and adds it back for a
+                    // different machine, while this upgrade is under way.
+                    let mut file = RemotesFile::load(self.registry).unwrap();
+                    file.remotes[0].host = "user@elsewhere".to_string();
+                    file.save(self.registry).unwrap();
+                }
+                self.targets.borrow_mut().push(target.clone());
+                self.inner.run(target, command)
+            }
+        }
+
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let pinned = remote.entry();
+        let executor = MovesTheRow {
+            inner: remote.shell(BrewAt::PrefixOnly),
+            targets: Default::default(),
+            registry: &remote.registry,
+        };
+        let opts = UpgradeOptions {
+            name: "mac".to_string(),
+            version: "0.43.0".to_string(),
+            no_install: false,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let mut out = Vec::new();
+        let error =
+            upgrade_entry_reporting_to(&opts, &pinned, &executor, &remote.registry, &mut out)
+                .expect_err("a row moved to another machine must not be recorded over");
+
+        let targets = executor.targets.borrow();
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|t| *t == pinned.ssh_target()),
+            "every command must reach the machine the upgrade started on: {targets:?}"
+        );
+        assert!(
+            matches!(
+                &error,
+                RemoteUpgradeError::AfterInstall { source, .. }
+                    if matches!(**source, RemoteUpgradeError::RouteChanged { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(error.installed_version(), Some("0.43.0"));
+        let message = error.to_string();
+        assert!(
+            message.contains("was changed to reach a different machine"),
+            "{message}"
+        );
+        let row = remote.entry();
+        assert_eq!(row.host, "user@elsewhere", "the re-added row is kept");
+        assert_eq!(row.version, "0.40.0", "nothing recorded over it");
+        assert_eq!(row.upgraded_at, None);
+    }
+
+    /// A row whose route is unchanged is the same machine: [`RemoteEntry::same_route`]
+    /// ignores what an upgrade itself records, and notices every address field.
+    #[test]
+    fn same_route_compares_the_address_and_socket_only() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let base = remote.entry();
+        let mut recorded = base.clone();
+        recorded.version = "0.43.0".into();
+        recorded.upgraded_at = Some("2026-10-07T00:00:00Z".into());
+        recorded.install = Some(INSTALL_LOCAL_BIN.into());
+        assert!(base.same_route(&recorded));
+        let moved: [fn(&mut RemoteEntry); 6] = [
+            |e| e.host = "user@elsewhere".into(),
+            |e| e.port = 2222,
+            |e| e.key = Some("/k/id".into()),
+            |e| e.user = Some("other".into()),
+            |e| e.jump_host = Some("bastion".into()),
+            |e| e.socket = Some("/run/other.sock".into()),
+        ];
+        for change in moved {
+            let mut other = base.clone();
+            change(&mut other);
+            assert!(!base.same_route(&other), "{other:?}");
+        }
     }
 
     /// The state the bug leaves behind — a Homebrew install AND a
