@@ -119,11 +119,7 @@ fn armed_roots() -> io::Result<Option<Vec<PathBuf>>> {
         None if explicit => Vec::new(),
         None => default_test_roots(),
     };
-    let roots: Vec<PathBuf> = candidates
-        .iter()
-        .filter(|root| root.is_absolute())
-        .filter_map(|root| std::fs::canonicalize(root).ok())
-        .collect();
+    let roots = owned_roots(&candidates);
     if roots.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -135,6 +131,19 @@ fn armed_roots() -> io::Result<Option<Vec<PathBuf>>> {
         ));
     }
     Ok(Some(roots))
+}
+
+/// The candidates that name an existing absolute directory, canonicalized. A
+/// root that resolves to anything else — a file, say — contributes nothing:
+/// containment under a file would admit a write to the file itself (PRD #1487,
+/// Qodo 4202781000).
+fn owned_roots(candidates: &[PathBuf]) -> Vec<PathBuf> {
+    candidates
+        .iter()
+        .filter(|root| root.is_absolute())
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .filter(|root| root.is_dir())
+        .collect()
 }
 
 /// Whether this process is a test: the lib's own unit-test binary, or a
@@ -238,6 +247,22 @@ mod tests {
         std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).unwrap();
         assert!(resolve_for_containment(&root.join("dangling/file")).is_err());
         assert!(running_under_test_runner());
+    }
+
+    /// Scenario: a root that names a file, a missing path or a relative path
+    /// contributes no owned root; only an existing absolute directory does.
+    #[test]
+    fn only_existing_absolute_directories_are_roots() {
+        let fixture = crate::test_temp::tempdir().unwrap();
+        let dir = std::fs::canonicalize(fixture.path()).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "").unwrap();
+        std::os::unix::fs::symlink(&file, dir.join("file-link")).unwrap();
+        assert!(owned_roots(std::slice::from_ref(&file)).is_empty());
+        assert!(owned_roots(&[dir.join("file-link")]).is_empty());
+        assert!(owned_roots(&[dir.join("missing")]).is_empty());
+        assert!(owned_roots(&[PathBuf::from("relative")]).is_empty());
+        assert_eq!(owned_roots(&[file, dir.clone()]), vec![dir]);
     }
 
     /// Scenario: a stray `NEXTEST` alone does not arm containment; nextest's

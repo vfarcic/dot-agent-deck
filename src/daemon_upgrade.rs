@@ -1331,6 +1331,16 @@ impl DaemonPort for WireDaemonPort {
                 ClientError::Unanswered(_) | ClientError::Malformed(_) => {
                     PortError::ReplyUnreadable(e.to_string())
                 }
+                // Nothing listening, before anything was sent: the daemon
+                // exited after the first probe, as the SSH port reports it.
+                ClientError::Io(ref io)
+                    if matches!(
+                        io.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    PortError::NoDaemonRunning
+                }
                 e => PortError::Other(e.to_string()),
             })
     }
@@ -2255,6 +2265,52 @@ mod tests {
         let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
         assert!(
             matches!(&restarted, Err(PortError::ReplyUnreadable(_))),
+            "{restarted:?}"
+        );
+        drop(port);
+        rt.shutdown_background();
+    }
+
+    /// PRD #1487 review (Qodo summary #16), the local port: a daemon that
+    /// exited between the first probe and the restart leaves nothing
+    /// listening, which the port reports as no daemon running — the upgrade
+    /// then says installed, not restarted — rather than a failed restart.
+    #[cfg(unix)]
+    #[test]
+    fn the_local_port_reports_a_vanished_daemon_as_none_running() {
+        use crate::daemon_client::LocalEndpoint;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
+        let port = WireDaemonPort::new(
+            &Endpoint::Local(LocalEndpoint::at(dir.path().join("gone.sock"))),
+            rt.handle().clone(),
+            Box::new(|| Ok(())),
+        )
+        .unwrap();
+        let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
+        assert!(
+            matches!(&restarted, Err(PortError::NoDaemonRunning)),
+            "{restarted:?}"
+        );
+
+        // A socket file left behind by a daemon that exited refuses the
+        // connection; that is no daemon running too.
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let port = WireDaemonPort::new(
+            &Endpoint::Local(LocalEndpoint::at(stale)),
+            rt.handle().clone(),
+            Box::new(|| Ok(())),
+        )
+        .unwrap();
+        let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
+        assert!(
+            matches!(&restarted, Err(PortError::NoDaemonRunning)),
             "{restarted:?}"
         );
         drop(port);
