@@ -1191,13 +1191,31 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             // version; otherwise start nothing — the client's Verifying stage
             // reports that no new daemon answered, and the next client
             // lazy-spawns its own.
-            match restart_control.recheck_successor(&target) {
+            //
+            // Taking the plan committed the restart, so a stop handled from
+            // here on changes nothing (`RestartControl::take_successor_plan`).
+            // The re-check can run `--version` for up to its timeout and the
+            // spawn forks, so both run on a blocking worker, not the executor
+            // (Qodo 4201540974).
+            let control = restart_control.clone();
+            let spawning = target.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let check = control.recheck_successor(&spawning)?;
+                let spawned = crate::daemon_attach::spawn_restart_successor(
+                    &crate::config::state_dir(),
+                    &spawning,
+                );
+                Ok::<_, String>((check, spawned))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the successor spawn task failed ({e})")));
+            match outcome {
                 Err(reason) => error!(
                     target = %target.display(),
                     %reason,
                     "not spawning the successor daemon; none is running until a client starts one"
                 ),
-                Ok(check) => {
+                Ok((check, spawned)) => {
                     if let crate::daemon_restart::SuccessorCheck::Reverified(version) = &check {
                         warn!(
                             target = %target.display(),
@@ -1205,23 +1223,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                             "the installed build changed after it was verified; it verified again"
                         );
                     }
-                    // A connection still finishing can handle a stop after the
-                    // plan was taken; checked under the lock that stop takes,
-                    // so a stop that lands first means nothing is spawned.
-                    match restart_control.spawn_successor_unless_stopped(|| {
-                        crate::daemon_attach::spawn_restart_successor(
-                            &crate::config::state_dir(),
-                            &target,
-                        )
-                    }) {
-                        None => warn!(
-                            target = %target.display(),
-                            "a stop arrived before the successor was spawned; not spawning it"
-                        ),
-                        Some(Ok(pid)) => {
+                    match spawned {
+                        Ok(pid) => {
                             info!(pid, target = %target.display(), "successor daemon spawned")
                         }
-                        Some(Err(e)) => error!(
+                        Err(e) => error!(
                             target = %target.display(),
                             error = %e,
                             "could not spawn the successor daemon; none is running until a client starts one"

@@ -4754,10 +4754,25 @@ async fn handle_connection(
             // routine and has causes that have nothing to do with intent — so
             // proceeding would let a flaky network stop somebody's deck and tell
             // no one why. Not stopping costs a retry; stopping costs the run.
-            write_resp(&mut stream, &AttachResponse::ok()).await?;
+            //
             // PRD #1487: a stop wins over a restart under way or already
-            // accepted. After the ack, because a failed ack aborts the stop.
-            restart.stop_wins("stop-daemon");
+            // accepted, so it is claimed before the ack — never acknowledged
+            // once the daemon has committed to a restart, when it is refused
+            // instead — and withdrawn when the ack fails, since then this stop
+            // does not happen (Qodo 4201540983).
+            if !restart.stop_wins("stop-daemon") {
+                let resp = AttachResponse::err(
+                    "this daemon is already restarting onto a new build and is exiting; \
+                     stop the new daemon once it is up"
+                        .to_string(),
+                );
+                write_resp(&mut stream, &resp).await?;
+                return Ok(());
+            }
+            if let Err(e) = write_resp(&mut stream, &AttachResponse::ok()).await {
+                restart.withdraw_stop();
+                return Err(e);
+            }
             // The same graceful drain, with the same grace, as the
             // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
             // one. Idempotent via the registry's `shutting_down` latch.
@@ -11883,6 +11898,45 @@ mod tests {
             crate::daemon_restart::SuccessorPlan::Nothing,
             "no successor starts after a stop"
         );
+    }
+
+    /// Scenario: the daemon has committed to a restart onto its installed
+    /// build — its successor plan is taken — when a stop arrives over the
+    /// wire. The stop is refused, saying the daemon is already restarting,
+    /// rather than acknowledged as a stop that cannot happen; nothing is
+    /// drained by it (PRD #1487, Qodo 4201540983).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_after_the_restart_is_committed_is_refused_not_acknowledged() {
+        let fx = RestartFixture::start().await;
+        assert!(
+            fx.restart
+                .mark_accepted(Some(std::path::PathBuf::from("/x/dot-agent-deck")))
+        );
+        assert_ne!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing
+        );
+
+        let stop = crate::daemon_stop::run_daemon_stop_over_wire_with(
+            &fx.sock,
+            false,
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(30), stop)
+            .await
+            .expect("the stop answers")
+            .expect_err("a stop after the commit is refused");
+        assert!(
+            err.to_string().contains("already restarting"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            !fx.registry.is_shutting_down(),
+            "the refused stop drained nothing"
+        );
+        assert!(!fx.restart.is_stop_requested());
     }
 
     /// Scenario: the daemon asks for confirmation; while the user decides, a

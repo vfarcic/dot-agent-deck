@@ -541,14 +541,22 @@ pub fn restart_decision(
 ///   termination signal) through [`Self::request_stop`]. It is written and
 ///   read under `successor`'s lock, together with the successor itself, so a
 ///   stop and an acceptance cannot interleave: a stop clears a successor
-///   already latched, and an acceptance after a stop latches nothing. A stop
-///   always wins over a restart (PRD #1487, Qodo 4201244680).
+///   already latched, and an acceptance after a stop latches nothing
+///   (PRD #1487, Qodo 4201244680).
+/// - `committed` is the one point after which a stop no longer wins: set,
+///   under the same lock, when `run_daemon_with` takes a plan that starts a
+///   successor ([`Self::take_successor_plan`]). Before it a stop always wins;
+///   after it the restart is irrevocable, and a stop is not acknowledged as
+///   one — `StopDaemon` refuses, saying the daemon is already restarting —
+///   so the exit status and the spawn decided there never change
+///   underneath it (Qodo 4201481137, 4201540983).
 #[derive(Debug)]
 pub struct RestartControl {
     lock: tokio::sync::Mutex<()>,
     accepted: AtomicBool,
     successor: StdMutex<Option<PathBuf>>,
     stopped: AtomicBool,
+    committed: AtomicBool,
     handed_off: AtomicBool,
     install: InstallRecord,
     /// The identity of the verified successor, for the re-check just before it
@@ -587,6 +595,7 @@ impl RestartControl {
             accepted: AtomicBool::new(false),
             successor: StdMutex::new(None),
             stopped: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
             handed_off: AtomicBool::new(false),
             install,
             pinned: StdMutex::new(None),
@@ -682,26 +691,57 @@ impl RestartControl {
 
     /// A stop path is tearing this daemon down: no successor may start after
     /// it. Clears a successor already latched and makes every later
-    /// [`Self::mark_accepted`] latch nothing. Returns whether a restart had
-    /// already been accepted, so the caller can say it was overridden.
-    pub fn request_stop(&self) -> bool {
+    /// [`Self::mark_accepted`] latch nothing — unless the restart was already
+    /// committed ([`Self::take_successor_plan`]), which a stop no longer
+    /// changes.
+    pub fn request_stop(&self) -> StopClaim {
         let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        if self.committed.load(Ordering::SeqCst) {
+            return StopClaim::RestartCommitted;
+        }
         self.stopped.store(true, Ordering::SeqCst);
         *slot = None;
         *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        self.accepted.load(Ordering::SeqCst)
+        if self.accepted.load(Ordering::SeqCst) {
+            StopClaim::OverrodeRestart
+        } else {
+            StopClaim::Stopped
+        }
     }
 
-    /// [`Self::request_stop`] for the stop path named by `via`, logging when it
-    /// overrides a restart that was already accepted.
-    pub fn stop_wins(&self, via: &str) {
-        if self.request_stop() {
-            tracing::warn!(
-                via,
-                "a stop arrived after a restart was accepted; the daemon stops without \
-                 starting a successor"
-            );
+    /// [`Self::request_stop`] for the stop path named by `via`, logging what
+    /// it did to a restart. `false` when the restart was already committed:
+    /// the daemon is exiting for it and its successor starts regardless.
+    pub fn stop_wins(&self, via: &str) -> bool {
+        match self.request_stop() {
+            StopClaim::Stopped => true,
+            StopClaim::OverrodeRestart => {
+                tracing::warn!(
+                    via,
+                    "a stop arrived after a restart was accepted; the daemon stops without \
+                     starting a successor"
+                );
+                true
+            }
+            StopClaim::RestartCommitted => {
+                tracing::warn!(
+                    via,
+                    "a stop arrived after this daemon committed to its restart; it is already \
+                     exiting and its successor starts regardless"
+                );
+                false
+            }
         }
+    }
+
+    /// Undo [`Self::request_stop`] for a stop that did not go ahead
+    /// (`StopDaemon` whose acknowledgement could not be written), so later
+    /// restarts are not refused forever. A successor it cleared is not
+    /// restored: a restart accepted before it then ends with no successor,
+    /// and the client's check reports that none answered.
+    pub fn withdraw_stop(&self) {
+        let _slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        self.stopped.store(false, Ordering::SeqCst);
     }
 
     /// Whether a stop path has called [`Self::request_stop`].
@@ -741,13 +781,18 @@ impl RestartControl {
             .take()
     }
 
-    /// What to do with the accepted successor, once — [`Self::take_successor`]
-    /// decided against the recorded [`Supervisor`]. A
-    /// [`SuccessorPlan::LeaveToSupervisor`] answer also latches
+    /// What to do with the accepted successor, once — the latched successor
+    /// decided against the recorded [`Supervisor`], under the lock a stop
+    /// takes. A plan that starts a successor commits the restart: from here
+    /// on [`Self::request_stop`] changes nothing, so neither this plan nor
     /// [`Self::handed_to_supervisor`], which `daemon serve` reads for its exit
-    /// status.
+    /// status, can change after it was decided.
     pub fn take_successor_plan(&self) -> SuccessorPlan {
-        let plan = successor_plan(self.take_successor(), self.install.supervisor);
+        let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
+        let plan = successor_plan(slot.take(), self.install.supervisor);
+        if !matches!(plan, SuccessorPlan::Nothing) {
+            self.committed.store(true, Ordering::SeqCst);
+        }
         if matches!(plan, SuccessorPlan::LeaveToSupervisor(_)) {
             self.handed_off.store(true, Ordering::SeqCst);
         }
@@ -755,24 +800,22 @@ impl RestartControl {
     }
 
     /// Whether an accepted restart was left to the service manager, so the
-    /// daemon must exit with [`SUPERVISED_RESTART_EXIT`]. A stop requested
-    /// after the plan was taken still wins: the daemon then exits cleanly.
+    /// daemon must exit with [`SUPERVISED_RESTART_EXIT`]. Decided once, by
+    /// [`Self::take_successor_plan`].
     pub fn handed_to_supervisor(&self) -> bool {
-        self.handed_off.load(Ordering::SeqCst) && !self.is_stop_requested()
+        self.handed_off.load(Ordering::SeqCst)
     }
+}
 
-    /// Run `spawn` (the successor's spawn) unless a stop was requested,
-    /// holding the lock [`Self::request_stop`] takes, so a stop handled
-    /// concurrently — by a connection still finishing after the serve loop
-    /// returned — lands either before it (nothing is spawned) or after the
-    /// successor already exists (Qodo 4201481137).
-    pub fn spawn_successor_unless_stopped<R>(&self, spawn: impl FnOnce() -> R) -> Option<R> {
-        let _slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
-        if self.stopped.load(Ordering::SeqCst) {
-            return None;
-        }
-        Some(spawn())
-    }
+/// What [`RestartControl::request_stop`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopClaim {
+    /// The stop is recorded; no restart had been accepted.
+    Stopped,
+    /// The stop is recorded and cancelled an accepted restart's successor.
+    OverrodeRestart,
+    /// The restart was already committed; the stop changed nothing.
+    RestartCommitted,
 }
 
 impl Default for RestartControl {
@@ -1350,8 +1393,9 @@ mod tests {
                 supervisor,
             });
             assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
-            assert!(
+            assert_eq!(
                 control.request_stop(),
+                StopClaim::OverrodeRestart,
                 "the stop reports it overrode a restart"
             );
             assert!(control.is_stop_requested());
@@ -1360,40 +1404,53 @@ mod tests {
         }
     }
 
-    /// Scenario: the daemon has already taken its successor plan — the serve
-    /// loop returned — when a connection still finishing handles a stop. The
-    /// successor is not spawned, and a supervised daemon exits cleanly instead
-    /// of asking its service manager for a restart (PRD #1487, Qodo
-    /// 4201481137).
+    /// Scenario: the daemon has already taken a plan that starts its
+    /// successor when a connection still finishing handles a stop. The restart
+    /// was committed there, so the stop changes neither the plan nor the exit
+    /// status and says so; a stop before that point still wins (PRD #1487,
+    /// Qodo 4201481137, 4201540983).
     #[test]
-    fn a_stop_after_the_plan_was_taken_still_wins() {
-        let control = RestartControl::default();
-        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
-        let SuccessorPlan::Spawn(_) = control.take_successor_plan() else {
-            panic!("an unsupervised daemon spawns its successor");
-        };
-        assert_eq!(control.spawn_successor_unless_stopped(|| 7), Some(7));
-        control.stop_wins("test");
-        assert_eq!(
-            control.spawn_successor_unless_stopped(|| unreachable!("a stop came first")),
-            None::<()>
-        );
+    fn a_stop_after_the_restart_is_committed_changes_nothing() {
+        for supervisor in [Supervisor::None, Supervisor::Systemd] {
+            let control = RestartControl::new(InstallRecord {
+                startup_exe: PathBuf::from("/x/dot-agent-deck"),
+                supervisor,
+            });
+            assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+            assert_ne!(control.take_successor_plan(), SuccessorPlan::Nothing);
+            let supervised = control.handed_to_supervisor();
+            assert_eq!(supervised, supervisor == Supervisor::Systemd);
+            assert_eq!(control.request_stop(), StopClaim::RestartCommitted);
+            assert!(
+                !control.stop_wins("test"),
+                "a stop after the commit does not win"
+            );
+            assert!(!control.is_stop_requested());
+            assert_eq!(
+                control.handed_to_supervisor(),
+                supervised,
+                "the exit status decided at the commit does not change"
+            );
+        }
 
-        let control = RestartControl::new(InstallRecord {
-            startup_exe: PathBuf::from("/x/dot-agent-deck"),
-            supervisor: Supervisor::Systemd,
-        });
-        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
-        assert_eq!(
-            control.take_successor_plan(),
-            SuccessorPlan::LeaveToSupervisor(Supervisor::Systemd)
-        );
-        assert!(control.handed_to_supervisor());
-        control.stop_wins("test");
-        assert!(
-            !control.handed_to_supervisor(),
-            "a stop after the plan was taken exits cleanly"
-        );
+        // No restart accepted: taking the (empty) plan commits nothing, and a
+        // late stop is recorded as usual.
+        let control = RestartControl::default();
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(control.stop_wins("test"));
+    }
+
+    /// Scenario: a wire stop is recorded but its acknowledgement cannot be
+    /// written, so the stop does not go ahead. Withdrawing it lets a later
+    /// restart begin instead of being refused forever (PRD #1487).
+    #[test]
+    fn a_withdrawn_stop_lets_restarts_begin_again() {
+        let control = RestartControl::default();
+        assert!(control.stop_wins("test"));
+        assert!(control.try_begin().is_none());
+        control.withdraw_stop();
+        assert!(!control.is_stop_requested());
+        assert!(control.try_begin().is_some());
     }
 
     /// Scenario: a stop arrives while a restart is still being checked. The
@@ -1406,7 +1463,11 @@ mod tests {
         let p = script(dir.path(), "dad", "echo 'dot-agent-deck 0.46.0'", 0o755);
         let control = RestartControl::default();
         let held = control.try_begin().expect("the restart takes the lock");
-        assert!(!control.request_stop(), "nothing was accepted yet");
+        assert_eq!(
+            control.request_stop(),
+            StopClaim::Stopped,
+            "nothing was accepted yet"
+        );
         assert!(!control.mark_accepted_verified(
             verify_restart_target_pinned(&p, None, RESTART_VERIFY_TIMEOUT).unwrap(),
         ));
