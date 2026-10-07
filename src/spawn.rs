@@ -7954,6 +7954,7 @@ mod tests {
             prompt: "unused".to_string(),
             resolved_target: Some(SpawnTarget::SingleAgent {
                 command: Some("cat".to_string()),
+                inherited: None,
             }),
             compose_orchestrator_context: None,
         };
