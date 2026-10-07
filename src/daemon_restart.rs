@@ -23,7 +23,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -533,49 +532,107 @@ pub fn restart_decision(
 /// ([`RestartControl::settle_stop_claims`]).
 pub const STOP_CLAIM_SETTLE: Duration = Duration::from_secs(5);
 
-/// Per-daemon restart state, shared by every connection.
+/// The message every stop path answers with once the daemon has committed to
+/// its restart ([`Decision::CommittedRestart`]): the stop is refused, not
+/// acknowledged, because it cannot happen.
+pub const STOP_REFUSED_RESTART_COMMITTED: &str = "this daemon is already restarting onto a new \
+     build and is exiting; stop the new daemon once it is up";
+
+/// The one decision a daemon's exit takes: whether a successor follows it.
+/// It leaves [`Self::Open`] exactly once, in
+/// [`RestartControl::take_successor_plan`], and never changes after that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Undecided. A stop claimed now wins over any accepted restart.
+    Open,
+    /// The plan starts a successor — spawned by this daemon, or, with
+    /// `to_supervisor`, left to the service manager, which `daemon serve`
+    /// signals with its exit status. A stop is refused from here on.
+    CommittedRestart { to_supervisor: bool },
+    /// The daemon exits without a successor. A stop is still claimed: it
+    /// agrees with what is already happening.
+    CommittedStop,
+}
+
+/// The restart this daemon accepted.
+#[derive(Debug)]
+struct AcceptedRestart {
+    /// The build to start next; `None` in `ClientSpawns` mode, where the
+    /// client starts its own, and once a stop discarded it.
+    successor: Option<PathBuf>,
+    /// What was verified at `successor`, for the re-check just before it is
+    /// spawned (audit A5). `None` when nothing was verified.
+    pinned: Option<VerifiedTarget>,
+}
+
+/// Everything the stop and restart paths decide from, behind one lock, so
+/// each transition reads and writes it in one step.
 ///
-/// - `lock` serialises handlers: it is held from the first check to the
-///   moment the request is accepted, so a second client gets an immediate
-///   `InProgress` rather than a queue.
-/// - `accepted` latches: once one request is accepted, every later one is
-///   `InProgress`.
-/// - `successor` is the verified target, consumed by `run_daemon_with` after
-///   the sockets are released.
-/// - `pending_stops` and `confirmed_stops` count the stop claims of every stop
-///   path (`StopDaemon`, `KIND_SHUTDOWN`, a termination signal; see
-///   [`Self::claim_stop`]). A frame or a signal confirms at once; `StopDaemon`
-///   holds its claim pending until its acknowledgement is written, and a
-///   claim dropped unconfirmed is withdrawn — its own claim only, never
-///   another stop's (Qodo 4201633116). Both counts change only under
-///   `successor`'s lock, so a stop and an acceptance cannot interleave: an
-///   acceptance after a confirmed stop latches nothing (Qodo 4201244680).
-///   Nothing is discarded when a stop is claimed: the successor is dropped
-///   only when the plan is decided with a stop counted, so a withdrawn claim
-///   leaves an accepted restart as it was (Qodo 4201633121).
-/// - `committed` is the one point after which a stop no longer wins: set,
-///   under the same lock, when `run_daemon_with` takes a plan that starts a
-///   successor ([`Self::take_successor_plan`]), after waiting for pending
-///   claims to settle ([`Self::settle_stop_claims`]). Before it a stop always
-///   wins; after it the restart is irrevocable, and a stop is not claimed —
-///   `StopDaemon` refuses, saying the daemon is already restarting — so the
-///   exit status and the spawn decided there never change underneath it
-///   (Qodo 4201481137, 4201540983).
+/// Invariants, each held by every method that takes the lock:
+///
+/// 1. `accepted` is set at most once, and only while `decision` is
+///    [`Decision::Open`] and no stop is confirmed: an acceptance after a
+///    confirmed stop latches nothing (Qodo 4201244680).
+/// 2. `pending_stops` counts claimed stops not yet confirmed or withdrawn. A
+///    claim settles exactly once: confirming sets `stop_confirmed`, withdrawing
+///    only decrements its own count, never another stop's (Qodo 4201633116,
+///    4201633121).
+/// 3. `decision` leaves [`Decision::Open`] once. It becomes
+///    [`Decision::CommittedRestart`] only when, at that moment, a successor is
+///    accepted, no claim is pending and no stop is confirmed; with any stop
+///    claimed it becomes [`Decision::CommittedStop`] and the successor is
+///    dropped. The claims are read as they are when the decision is taken, not
+///    when a settlement bound expired (Qodo 4201713572).
+/// 4. After [`Decision::CommittedRestart`] no stop is claimed — every claim is
+///    refused — so `pending_stops` stays 0 and `stop_confirmed` false, and
+///    neither the spawn nor the exit status decided there changes (Qodo
+///    4201481137, 4201540983, audit A1).
+#[derive(Debug)]
+struct RestartState {
+    accepted: Option<AcceptedRestart>,
+    pending_stops: usize,
+    stop_confirmed: bool,
+    decision: Decision,
+}
+
+impl RestartState {
+    fn stop_claimed(&self) -> bool {
+        self.pending_stops > 0 || self.stop_confirmed
+    }
+
+    /// Whether waiting for pending claims could change the plan: only while
+    /// it is undecided, a successor is waiting on it, and no confirmed stop
+    /// already makes [`Decision::CommittedStop`] certain (audit E1).
+    fn settlement_matters(&self) -> bool {
+        self.decision == Decision::Open
+            && self.pending_stops > 0
+            && !self.stop_confirmed
+            && self
+                .accepted
+                .as_ref()
+                .is_some_and(|accepted| accepted.successor.is_some())
+    }
+}
+
+/// Per-daemon restart state, shared by every connection and by the daemon's
+/// exit path.
+///
+/// - `reservation` serialises restart handlers: held from the first check to
+///   the moment the request is accepted, and only ever tried, so a second
+///   client gets an immediate `InProgress` rather than a queue.
+/// - `state` is every decision the stop and restart paths share — the
+///   accepted restart, the stop claims and the terminal [`Decision`] — behind
+///   one short lock; its invariants are on [`RestartState`]. A stop claim from
+///   any path (`StopDaemon`, `KIND_SHUTDOWN`, a termination signal; see
+///   [`Self::claim_stop`]) wins until the plan is decided, and is refused
+///   after the daemon committed to a restart.
+/// - `settled` wakes [`Self::settle_stop_claims`] whenever a claim settles.
 #[derive(Debug)]
 pub struct RestartControl {
-    lock: tokio::sync::Mutex<()>,
-    accepted: AtomicBool,
-    successor: StdMutex<Option<PathBuf>>,
-    pending_stops: AtomicUsize,
-    confirmed_stops: AtomicUsize,
-    /// Woken whenever a pending stop claim is confirmed or withdrawn.
-    stop_settled: tokio::sync::Notify,
-    committed: AtomicBool,
-    handed_off: AtomicBool,
+    reservation: tokio::sync::Mutex<()>,
+    state: StdMutex<RestartState>,
+    settled: tokio::sync::Notify,
     install: InstallRecord,
-    /// The identity of the verified successor, for the re-check just before it
-    /// is spawned (audit A5). `None` when nothing was verified.
-    pinned: StdMutex<Option<VerifiedTarget>>,
     /// A pause the restart handler takes at one [`RestartPause`] point, so a
     /// unit test can interleave work with a reservation it holds.
     #[cfg(test)]
@@ -605,19 +662,24 @@ pub(crate) struct RestartCheckpoint {
 impl RestartControl {
     pub fn new(install: InstallRecord) -> Self {
         Self {
-            lock: tokio::sync::Mutex::new(()),
-            accepted: AtomicBool::new(false),
-            successor: StdMutex::new(None),
-            pending_stops: AtomicUsize::new(0),
-            confirmed_stops: AtomicUsize::new(0),
-            stop_settled: tokio::sync::Notify::new(),
-            committed: AtomicBool::new(false),
-            handed_off: AtomicBool::new(false),
+            reservation: tokio::sync::Mutex::new(()),
+            state: StdMutex::new(RestartState {
+                accepted: None,
+                pending_stops: 0,
+                stop_confirmed: false,
+                decision: Decision::Open,
+            }),
+            settled: tokio::sync::Notify::new(),
             install,
-            pinned: StdMutex::new(None),
             #[cfg(test)]
             checkpoint: StdMutex::new(None),
         }
+    }
+
+    /// The state, for one transition. A poisoned lock is taken as it stands:
+    /// every transition writes whole values, so none is left half-made.
+    fn state(&self) -> std::sync::MutexGuard<'_, RestartState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Arm a one-shot pause before the next acceptance is written (test only).
@@ -634,10 +696,10 @@ impl RestartControl {
         checkpoint
     }
 
-    /// Whether a restart handler holds the lock (test only).
+    /// Whether a restart handler holds the reservation (test only).
     #[cfg(test)]
     pub(crate) fn handler_busy(&self) -> bool {
-        self.lock.try_lock().is_err()
+        self.reservation.try_lock().is_err()
     }
 
     /// Take the pause armed for `at`, if any (test only).
@@ -661,26 +723,31 @@ impl RestartControl {
         &self.install
     }
 
-    /// Take the handler lock, or `None` when another restart holds it or one
-    /// was already accepted.
+    /// Whether a new restart may begin: nothing accepted, no stop claimed,
+    /// nothing decided.
+    fn may_begin(&self) -> bool {
+        let state = self.state();
+        state.accepted.is_none() && !state.stop_claimed() && state.decision == Decision::Open
+    }
+
+    /// Take the handler reservation, or `None` when another restart holds it,
+    /// one was already accepted, or a stop is under way.
     pub fn try_begin(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        if self.accepted.load(Ordering::SeqCst) || self.is_stop_requested() {
+        if !self.may_begin() {
             return None;
         }
-        let guard = self.lock.try_lock().ok()?;
-        // Re-check under the lock: a request accepted between the load above
-        // and the lock must still win.
-        if self.accepted.load(Ordering::SeqCst) || self.is_stop_requested() {
-            return None;
-        }
-        Some(guard)
+        let guard = self.reservation.try_lock().ok()?;
+        // Re-check under the reservation: a request accepted between the check
+        // above and the lock must still win.
+        self.may_begin().then_some(guard)
     }
 
     /// Latch the acceptance and record the successor to spawn (`None` in
     /// `ClientSpawns` mode, where the client starts its own build). Returns
-    /// `false`, latching nothing, when a stop was confirmed first: the daemon
-    /// then just stops. A stop still pending does not block the latch — it
-    /// may yet be withdrawn — and is settled when the plan is decided.
+    /// `false`, latching nothing, when a stop was confirmed first or the exit
+    /// was already decided: the daemon then just stops. A stop still pending
+    /// does not block the latch — it may yet be withdrawn — and is settled when
+    /// the plan is decided.
     pub fn mark_accepted(&self, successor: Option<PathBuf>) -> bool {
         self.latch(successor, None)
     }
@@ -693,16 +760,12 @@ impl RestartControl {
         self.latch(Some(path), Some(verified))
     }
 
-    fn latch(&self, successor: Option<PathBuf>, verified: Option<VerifiedTarget>) -> bool {
-        let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
-        if self.confirmed_stops.load(Ordering::SeqCst) > 0 {
+    fn latch(&self, successor: Option<PathBuf>, pinned: Option<VerifiedTarget>) -> bool {
+        let mut state = self.state();
+        if state.stop_confirmed || state.decision != Decision::Open || state.accepted.is_some() {
             return false;
         }
-        if verified.is_some() {
-            *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = verified;
-        }
-        *slot = successor;
-        self.accepted.store(true, Ordering::SeqCst);
+        state.accepted = Some(AcceptedRestart { successor, pinned });
         true
     }
 
@@ -710,13 +773,14 @@ impl RestartControl {
     /// dropping the ticket unconfirmed withdraws exactly this claim. `None`
     /// when the restart was already committed
     /// ([`Self::take_successor_plan`]): the daemon is exiting for it and its
-    /// successor starts regardless, so the stop is not this daemon's to make.
+    /// successor starts regardless, so the stop is not this daemon's to make
+    /// and its caller refuses it ([`STOP_REFUSED_RESTART_COMMITTED`]).
     pub fn claim_stop(&self) -> Option<StopTicket<'_>> {
-        let _slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
-        if self.committed.load(Ordering::SeqCst) {
+        let mut state = self.state();
+        if matches!(state.decision, Decision::CommittedRestart { .. }) {
             return None;
         }
-        self.pending_stops.fetch_add(1, Ordering::SeqCst);
+        state.pending_stops += 1;
         Some(StopTicket {
             control: self,
             settled: false,
@@ -724,8 +788,9 @@ impl RestartControl {
     }
 
     /// Claim and confirm a stop at once, for the stop path named by `via` that
-    /// cannot be refused or fail to happen (a `KIND_SHUTDOWN` frame, a
-    /// termination signal). `false` when the restart was already committed.
+    /// cannot fail to happen once claimed (a `KIND_SHUTDOWN` frame, a
+    /// termination signal). `false` when the restart was already committed:
+    /// the caller must not report the stop as done.
     pub fn stop_wins(&self, via: &str) -> bool {
         match self.claim_stop() {
             Some(ticket) => {
@@ -735,40 +800,45 @@ impl RestartControl {
             None => {
                 tracing::warn!(
                     via,
-                    "a stop arrived after this daemon committed to its restart; it is already \
-                     exiting and its successor starts regardless"
+                    "a stop arrived after this daemon committed to its restart; it is not \
+                     acted on — the daemon is already exiting and its successor starts"
                 );
                 false
             }
         }
     }
 
-    fn settle_claim(&self, confirmed: bool) {
-        {
-            let _slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
-            self.pending_stops.fetch_sub(1, Ordering::SeqCst);
+    /// Settle one claim; whether a restart was accepted, for the log.
+    fn settle_claim(&self, confirmed: bool) -> bool {
+        let accepted = {
+            let mut state = self.state();
+            state.pending_stops -= 1;
             if confirmed {
-                self.confirmed_stops.fetch_add(1, Ordering::SeqCst);
+                state.stop_confirmed = true;
             }
-        }
-        self.stop_settled.notify_waiters();
+            state.accepted.is_some()
+        };
+        self.settled.notify_waiters();
+        accepted
     }
 
-    /// Wait, at most `bound`, until no stop claim is pending, so the plan is
-    /// decided against stops that are going ahead. The bound only ends the
-    /// wait; it decides nothing. [`Self::take_successor_plan`] reads the claims
-    /// as they are when it runs: one still pending then counts as a stop (when
-    /// in doubt, the stop wins), and one settled by then counts as what it
-    /// became — a withdrawn claim is a stop that did not happen, so it cancels
-    /// nothing, whether it settled before the bound or after (Qodo
+    /// Wait, at most `bound`, until no stop claim that could change the plan
+    /// is pending, so the plan is decided against stops that are going ahead.
+    /// Returns at once when nothing is waiting on the decision: no successor
+    /// accepted, or a stop already confirmed (audit E1). The bound only ends
+    /// the wait; it decides nothing. [`Self::take_successor_plan`] reads the
+    /// claims as they are when it runs: one still pending then counts as a
+    /// stop (when in doubt, the stop wins), and one settled by then counts as
+    /// what it became — a withdrawn claim is a stop that did not happen, so it
+    /// cancels nothing, whether it settled before the bound or after (Qodo
     /// 4201713572).
     pub async fn settle_stop_claims(&self, bound: Duration) {
         let deadline = tokio::time::Instant::now() + bound;
         loop {
-            let settled = self.stop_settled.notified();
+            let settled = self.settled.notified();
             tokio::pin!(settled);
             settled.as_mut().enable();
-            if self.pending_stops.load(Ordering::SeqCst) == 0 {
+            if !self.state().settlement_matters() {
                 return;
             }
             if tokio::time::timeout_at(deadline, settled).await.is_err() {
@@ -779,7 +849,7 @@ impl RestartControl {
 
     /// Whether a stop is claimed, pending or confirmed.
     pub fn is_stop_requested(&self) -> bool {
-        self.pending_stops.load(Ordering::SeqCst) + self.confirmed_stops.load(Ordering::SeqCst) > 0
+        self.state().stop_claimed()
     }
 
     /// Just before `target` is spawned: whether it may be. Passes when nothing
@@ -788,10 +858,10 @@ impl RestartControl {
     /// the version the first check reported, and refused if that fails.
     pub fn recheck_successor(&self, target: &Path) -> Result<SuccessorCheck, String> {
         let pinned = self
-            .pinned
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+            .state()
+            .accepted
+            .as_ref()
+            .and_then(|accepted| accepted.pinned.clone());
         match pinned {
             Some(verified) if verified.path == target => {
                 recheck_verified_target(&verified, RESTART_VERIFY_TIMEOUT)
@@ -802,43 +872,55 @@ impl RestartControl {
 
     /// Whether a restart has been accepted.
     pub fn is_accepted(&self) -> bool {
-        self.accepted.load(Ordering::SeqCst)
+        self.state().accepted.is_some()
     }
 
-    /// The accepted successor, once. `run_daemon_with` calls this after its
-    /// serve loop has returned and its sockets are released.
+    /// The accepted successor, once.
     pub fn take_successor(&self) -> Option<PathBuf> {
-        self.successor
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+        self.state()
+            .accepted
+            .as_mut()
+            .and_then(|accepted| accepted.successor.take())
     }
 
-    /// What to do with the accepted successor, once — the latched successor
-    /// decided against the recorded [`Supervisor`], under the lock a stop
-    /// claim takes. Any stop claimed by now, pending or confirmed, wins: the
-    /// successor is dropped and the plan is [`SuccessorPlan::Nothing`] (call
-    /// [`Self::settle_stop_claims`] first, so a stop that is about to be
-    /// withdrawn does not). Otherwise a plan that starts a successor commits
-    /// the restart: from here on [`Self::claim_stop`] refuses, so neither this
-    /// plan nor [`Self::handed_to_supervisor`], which `daemon serve` reads for
-    /// its exit status, can change after it was decided.
+    /// What to do with the accepted successor, once — the one transition out
+    /// of [`Decision::Open`], taken under the lock a stop claim takes. Any stop
+    /// claimed by now, pending or confirmed, wins: the successor is dropped,
+    /// the decision is [`Decision::CommittedStop`] and the plan is
+    /// [`SuccessorPlan::Nothing`] (call [`Self::settle_stop_claims`] first, so
+    /// a stop that is about to be withdrawn does not). Otherwise a plan that
+    /// starts a successor is [`Decision::CommittedRestart`]: from here on
+    /// [`Self::claim_stop`] refuses, so neither this plan nor
+    /// [`Self::handed_to_supervisor`], which `daemon serve` reads for its exit
+    /// status, can change after it was decided. A later call is
+    /// [`SuccessorPlan::Nothing`].
     pub fn take_successor_plan(&self) -> SuccessorPlan {
-        let mut slot = self.successor.lock().unwrap_or_else(|p| p.into_inner());
-        if self.pending_stops.load(Ordering::SeqCst) + self.confirmed_stops.load(Ordering::SeqCst)
-            > 0
-        {
-            *slot = None;
-            *self.pinned.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let mut state = self.state();
+        if state.decision != Decision::Open {
             return SuccessorPlan::Nothing;
         }
-        let plan = successor_plan(slot.take(), self.install.supervisor);
-        if !matches!(plan, SuccessorPlan::Nothing) {
-            self.committed.store(true, Ordering::SeqCst);
+        if state.stop_claimed() {
+            if let Some(accepted) = state.accepted.as_mut() {
+                accepted.successor = None;
+                accepted.pinned = None;
+            }
+            state.decision = Decision::CommittedStop;
+            return SuccessorPlan::Nothing;
         }
-        if matches!(plan, SuccessorPlan::LeaveToSupervisor(_)) {
-            self.handed_off.store(true, Ordering::SeqCst);
-        }
+        let successor = state
+            .accepted
+            .as_mut()
+            .and_then(|accepted| accepted.successor.take());
+        let plan = successor_plan(successor, self.install.supervisor);
+        state.decision = match plan {
+            SuccessorPlan::Nothing => Decision::CommittedStop,
+            SuccessorPlan::Spawn(_) => Decision::CommittedRestart {
+                to_supervisor: false,
+            },
+            SuccessorPlan::LeaveToSupervisor(_) => Decision::CommittedRestart {
+                to_supervisor: true,
+            },
+        };
         plan
     }
 
@@ -846,7 +928,10 @@ impl RestartControl {
     /// daemon must exit with [`SUPERVISED_RESTART_EXIT`]. Decided once, by
     /// [`Self::take_successor_plan`].
     pub fn handed_to_supervisor(&self) -> bool {
-        self.handed_off.load(Ordering::SeqCst)
+        self.state().decision
+            == Decision::CommittedRestart {
+                to_supervisor: true,
+            }
     }
 }
 
@@ -864,8 +949,7 @@ impl StopTicket<'_> {
     /// is not started.
     pub fn confirm(mut self, via: &str) {
         self.settled = true;
-        self.control.settle_claim(true);
-        if self.control.is_accepted() {
+        if self.control.settle_claim(true) {
             tracing::warn!(
                 via,
                 "a stop arrived after a restart was accepted; the daemon stops without \
@@ -1601,6 +1685,82 @@ mod tests {
             control.take_successor_plan(),
             SuccessorPlan::Spawn(PathBuf::from("/x/dot-agent-deck")),
             "a stop withdrawn after the bound cancels nothing"
+        );
+    }
+
+    /// Scenario: the daemon is exiting with no restart to decide — none was
+    /// accepted, the one accepted lets the client start its own build, or a
+    /// confirmed stop already settled it — while another wire stop's
+    /// acknowledgement is still being written. The exit does not wait for that
+    /// acknowledgement: there is no successor it could change (PRD #1487
+    /// audit E1).
+    #[tokio::test]
+    async fn a_pure_stop_does_not_wait_on_a_pending_stop() {
+        let quickly = |control: std::sync::Arc<RestartControl>| async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                control.settle_stop_claims(Duration::from_secs(60)),
+            )
+            .await
+            .is_ok()
+        };
+
+        let none_accepted = std::sync::Arc::new(RestartControl::default());
+        let pending = none_accepted
+            .claim_stop()
+            .expect("nothing is committed yet");
+        assert!(quickly(none_accepted.clone()).await, "no restart accepted");
+        drop(pending);
+
+        let client_spawns = std::sync::Arc::new(RestartControl::default());
+        assert!(client_spawns.mark_accepted(None));
+        let pending = client_spawns
+            .claim_stop()
+            .expect("nothing is committed yet");
+        assert!(
+            quickly(client_spawns.clone()).await,
+            "the client starts its own build"
+        );
+        drop(pending);
+
+        let stopped = std::sync::Arc::new(RestartControl::default());
+        assert!(stopped.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        let pending = stopped.claim_stop().expect("nothing is committed yet");
+        assert!(stopped.stop_wins("frame"));
+        assert!(
+            quickly(stopped.clone()).await,
+            "a confirmed stop already decides it"
+        );
+        assert_eq!(stopped.take_successor_plan(), SuccessorPlan::Nothing);
+        drop(pending);
+    }
+
+    /// Scenario: the daemon decided to exit without a successor, and a stop
+    /// arrives after that. It agrees with what is happening, so it is claimed
+    /// and acknowledged, unlike one after a committed restart; and the decision
+    /// is taken once — a second plan starts nothing (PRD #1487).
+    #[test]
+    fn a_stop_after_a_committed_stop_is_claimed_and_the_plan_is_taken_once() {
+        let control = RestartControl::default();
+        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        assert!(control.stop_wins("frame"));
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(
+            control.claim_stop().is_some(),
+            "claimed after CommittedStop"
+        );
+        assert!(!control.mark_accepted(Some(PathBuf::from("/y"))));
+
+        let control = RestartControl::default();
+        assert!(control.mark_accepted(Some(PathBuf::from("/x/dot-agent-deck"))));
+        assert_eq!(
+            control.take_successor_plan(),
+            SuccessorPlan::Spawn(PathBuf::from("/x/dot-agent-deck"))
+        );
+        assert_eq!(control.take_successor_plan(), SuccessorPlan::Nothing);
+        assert!(
+            control.claim_stop().is_none(),
+            "the restart stays committed"
         );
     }
 

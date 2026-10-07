@@ -57,6 +57,18 @@ struct InstalledDaemon {
 
 impl InstalledDaemon {
     fn spawn() -> Self {
+        Self::spawn_with(false)
+    }
+
+    /// [`Self::spawn`] with the daemon's log in the fixture and its e2e
+    /// successor-plan gate armed: after a restart releases the sockets, the
+    /// daemon creates `plan-gate/entered` and waits for `plan-gate/release`
+    /// before it decides its successor plan.
+    fn spawn_gated() -> Self {
+        Self::spawn_with(true)
+    }
+
+    fn spawn_with(gated: bool) -> Self {
         common::init_test_env();
         let dir = common::harness_tempdir().expect("restart fixture tempdir");
         let home = dir.path().join("home");
@@ -68,7 +80,8 @@ impl InstalledDaemon {
         retain_binary(&retained);
         let attach = dir.path().join("attach.sock");
         let log = fs::File::create(dir.path().join("daemon.log")).expect("daemon log");
-        let child = Command::new(&target)
+        let mut command = Command::new(&target);
+        command
             .args(["daemon", "serve"])
             .current_dir(&home)
             .env_clear()
@@ -91,7 +104,15 @@ impl InstalledDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
-            .process_group(0)
+            .process_group(0);
+        if gated {
+            let gate = dir.path().join("plan-gate");
+            fs::create_dir_all(&gate).expect("create the successor-plan gate");
+            command
+                .env("DOT_AGENT_DECK_E2E_SUCCESSOR_PLAN_GATE", &gate)
+                .env("DOT_AGENT_DECK_LOG", dir.path().join("deck.log"));
+        }
+        let child = command
             .spawn()
             .expect("start real daemon from the owned install path");
         let fixture = Self {
@@ -114,6 +135,45 @@ impl InstalledDaemon {
         );
         fixture.install_successor(None);
         fixture
+    }
+
+    fn plan_gate(&self, name: &str) -> PathBuf {
+        self._dir.path().join("plan-gate").join(name)
+    }
+
+    fn deck_log(&self) -> String {
+        fs::read_to_string(self._dir.path().join("deck.log")).unwrap_or_default()
+    }
+
+    fn wait_for_log(&self, line: &str) {
+        assert!(
+            common::wait_until(WAIT, || self.deck_log().contains(line)),
+            "the daemon never logged {line:?}; log:\n{}",
+            self.deck_log()
+        );
+    }
+
+    fn terminate(&self) {
+        // SAFETY: the PID of the daemon this fixture started and still owns.
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        }
+    }
+
+    /// Wait for the original daemon to exit, and reap it.
+    fn exit_status(&mut self) -> std::process::ExitStatus {
+        let exited = {
+            let child = RefCell::new(&mut self.child);
+            common::wait_until(WAIT, || {
+                child
+                    .borrow_mut()
+                    .try_wait()
+                    .expect("poll original daemon")
+                    .is_some()
+            })
+        };
+        assert!(exited, "the original daemon never exited");
+        self.child.wait().expect("reap original daemon")
     }
 
     fn hello(&self) -> Option<AttachResponse> {
@@ -562,4 +622,76 @@ fn wire_restart_006_concurrent_requests_accept_exactly_one_restart() {
         other => panic!("first request was not answered: {other:?}"),
     }
     daemon.assert_replaced();
+}
+
+/// Scenario: Start an idle daemon from an owned install path with its
+/// successor-plan gate armed, and request a restart onto a verified installed
+/// build. Once it is accepted and the daemon has released its sockets and
+/// stopped at the gate — before it decides whether a successor follows —
+/// send it SIGTERM, then open the gate. The signal is a stop that wins: the
+/// daemon exits cleanly and no successor is ever started (PRD #1487 audit A2).
+#[spec("lifecycle/wire-restart/007")]
+#[test]
+fn wire_restart_007_a_signal_before_the_successor_decision_starts_no_successor() {
+    let mut daemon = InstalledDaemon::spawn_gated();
+    assert!(accepted(daemon.restart(None)).is_empty());
+    assert!(
+        common::wait_until(WAIT, || daemon.plan_gate("entered").exists()),
+        "the daemon never reached its successor decision"
+    );
+    daemon.terminate();
+    daemon.wait_for_log("a stop arrived after a restart was accepted");
+    fs::write(daemon.plan_gate("release"), "release").expect("open the plan gate");
+    let status = daemon.exit_status();
+    assert!(
+        status.success(),
+        "the stopped daemon exits cleanly: {status}"
+    );
+    // A spawned successor records its PID at once; give it the chance.
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || daemon.successor_pid.exists()),
+        "a successor started after the signal asked the daemon to stop"
+    );
+    assert!(daemon.hello().is_none(), "nothing answers at the endpoint");
+}
+
+/// Scenario: Start an idle daemon with its successor-plan gate armed, request
+/// a restart and let it be accepted; at the gate, replace the installed build
+/// with one whose version check blocks, then open the gate so the daemon
+/// commits to the restart and stalls re-verifying that build. A first SIGTERM
+/// is logged and not acted on — the daemon is exiting into its successor — and
+/// a second one force-exits it at once with status 143, before any successor
+/// starts (PRD #1487 audit A2).
+#[spec("lifecycle/wire-restart/008")]
+#[test]
+fn wire_restart_008_a_second_signal_during_successor_verification_exits() {
+    let mut daemon = InstalledDaemon::spawn_gated();
+    assert!(accepted(daemon.restart(None)).is_empty());
+    assert!(
+        common::wait_until(WAIT, || daemon.plan_gate("entered").exists()),
+        "the daemon never reached its successor decision"
+    );
+    let entered = daemon._dir.path().join("recheck-entered");
+    let release = daemon._dir.path().join("recheck-release");
+    daemon.install_successor(Some((&entered, &release)));
+    fs::write(daemon.plan_gate("release"), "release").expect("open the plan gate");
+    assert!(
+        common::wait_until(WAIT, || entered.exists()),
+        "the daemon never re-verified the replaced build"
+    );
+    daemon.terminate();
+    daemon.wait_for_log("termination signal after this daemon committed to its restart");
+    daemon.terminate();
+    let status = daemon.exit_status();
+    // Free the blocked version check whatever happened above.
+    fs::write(&release, "release").expect("release the version check");
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "the second signal force-exits: {status}"
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || daemon.successor_pid.exists()),
+        "no successor starts after the forced exit"
+    );
 }

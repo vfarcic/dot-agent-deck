@@ -419,6 +419,11 @@ pub enum PortError {
     /// empty, or not this build's JSON). The daemon may or may not have
     /// restarted, so the upgrade checks before it says which.
     ReplyUnreadable(String),
+    /// No daemon was running to ask: it exited after the probe found it and
+    /// before the restart request reached it (Qodo 4202060284). Not a failure
+    /// of the upgrade — the build is installed and the next start runs it — so
+    /// it becomes [`NotRestartedReason::NoDaemonRunning`].
+    NoDaemonRunning,
     /// Anything else, in plain language.
     Other(String),
 }
@@ -429,6 +434,7 @@ impl std::fmt::Display for PortError {
             Self::InstalledBuildTooOld(reason)
             | Self::ReplyUnreadable(reason)
             | Self::Other(reason) => f.write_str(reason),
+            Self::NoDaemonRunning => f.write_str("no daemon is running"),
         }
     }
 }
@@ -662,7 +668,7 @@ fn run_upgrade(
     });
     let hello = match daemon.probe() {
         Ok(Some(hello)) => hello,
-        Ok(None) => {
+        Ok(None) | Err(PortError::NoDaemonRunning) => {
             return UpgradeOutcome::InstalledNotRestarted {
                 from_version: None,
                 installed_version: installed.version,
@@ -706,6 +712,11 @@ fn run_upgrade(
                 return not_restarted(NotRestartedReason::InstalledBuildTooOld);
             }
             Err(PortError::Other(reason)) => return restarting_failed(reason),
+            // The daemon exited between the probe and the request: nothing was
+            // stopped by this upgrade, and the next start runs the new build.
+            Err(PortError::NoDaemonRunning) => {
+                return not_restarted(NotRestartedReason::NoDaemonRunning);
+            }
             // The request may have been carried out: the tail says so only if
             // a successor now answers. Under the daemon's policy it accepted
             // only an idle daemon or the set it was asked to confirm.
@@ -1161,10 +1172,10 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
             Ok(report) if report.unsupported => Ok(GatedQuery::Unsupported),
             Ok(report) => match report.reply {
                 Some(reply) => Ok(GatedQuery::Answered(reply)),
-                // The daemon went away between the probe and the request.
-                None if !report.running => {
-                    Err("the daemon stopped before it could be asked to restart".into())
-                }
+                // The daemon went away between the probe and the request: the
+                // build is installed and the next start runs it (Qodo
+                // 4202060284).
+                None if !report.running => Err(PortError::NoDaemonRunning),
                 None => Err("the remote reported no answer from the daemon".into()),
             },
             // The installed build is too old to drive the restart (Homebrew
@@ -3183,6 +3194,67 @@ mod tests {
                 assert!(reason.contains("did not finish within 85s"), "{reason}");
                 assert!(reason.contains("the daemon did not restart"), "{reason}");
             }
+        }
+    }
+
+    /// Scenario: a remote daemon is running when the upgrade probes it, then
+    /// exits before the restart request reaches it, so the remote binary
+    /// reports `running: false`. The new build is installed and the next start
+    /// runs it, so the upgrade reports "installed, no daemon to restart" rather
+    /// than a failed upgrade (PRD #1487, Qodo 4202060284).
+    #[test]
+    fn a_daemon_gone_before_the_restart_request_is_installed_not_restarted() {
+        use crate::daemon_restart::{DaemonProbe, RemoteRestartReport};
+        use crate::remote::{SshError, SshOutput, SshTarget};
+
+        struct ExitsAfterProbe;
+        impl SshExecutor for ExitsAfterProbe {
+            fn run(&self, _target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                let stdout = if command.ends_with("daemon probe --json") {
+                    serde_json::to_string(&DaemonProbe {
+                        running: true,
+                        hello: Some(hello_from("0.39.0", "old", "old-process")),
+                    })
+                } else {
+                    serde_json::to_string(&RemoteRestartReport {
+                        running: false,
+                        reply: None,
+                        unsupported: false,
+                    })
+                };
+                Ok(SshOutput {
+                    status: 0,
+                    stdout: stdout.unwrap(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let port = SshDaemonPort::new(
+            ExitsAfterProbe,
+            SshTarget::parse("u@h", 22, None),
+            "~/.local/bin/dot-agent-deck",
+        );
+        let restarted = DaemonPort::restart(&port, &RestartDaemonRequest::default());
+        assert!(
+            matches!(&restarted, Err(PortError::NoDaemonRunning)),
+            "{restarted:?}"
+        );
+        let (outcome, _) = run(
+            &FakeInstaller::ok("0.40.0", InstallMethod::LocalBin),
+            &port,
+            &NoDecider,
+            &remote_plan_for("0.40.0"),
+        );
+        match outcome {
+            UpgradeOutcome::InstalledNotRestarted {
+                installed_version,
+                reason,
+                ..
+            } => {
+                assert_eq!(installed_version, "0.40.0");
+                assert_eq!(reason, NotRestartedReason::NoDaemonRunning);
+            }
+            other => panic!("expected InstalledNotRestarted, got {other:?}"),
         }
     }
 

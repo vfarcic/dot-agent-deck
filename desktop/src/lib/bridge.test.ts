@@ -827,6 +827,33 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Scenario: start an upgrade while one of its two event listeners fails to
+   * register. The upgrade is refused without being sent, and the listener
+   * that did register is removed with it rather than left listening (PRD
+   * #1487, Qodo #14).
+   */
+  it("removes a registered upgrade listener when the other fails to register", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const event = await import("@tauri-apps/api/event");
+    const listen = vi.mocked(event.listen);
+    const original = listen.getMockImplementation();
+    listen.mockImplementation((async (name: string, callback: (event: { payload: unknown }) => void) => {
+      if (name === "desktop://upgrade-decision") throw new Error("listen refused");
+      listeners.set(name, callback);
+      return () => listeners.delete(name);
+    }) as never);
+    const bridge = new TauriDeckBridge();
+    try {
+      await expect(bridge.upgradeDaemon("deck-000000000000dec1", () => {})).rejects.toThrow("listen refused");
+      expect(listeners.has("desktop://upgrade-progress")).toBe(false);
+      expect(invoke).not.toHaveBeenCalledWith("desktop_upgrade_daemon", expect.anything());
+    } finally {
+      if (original) listen.mockImplementation(original);
+      await bridge.dispose();
+    }
+  });
+
+  /**
    * Scenario: submit one guarded message for every delivery verdict the daemon
    * can return. The live bridge must hand each named state to its caller
    * unchanged, including delivered, uncertain, stale, and non-live outcomes.

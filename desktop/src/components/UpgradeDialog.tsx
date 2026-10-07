@@ -57,6 +57,8 @@ export function UpgradeDialog({ target, runtime, onClose }: {
   const [state, setState] = useState<Phase>({ phase: "confirm" });
   /** The question still waiting, for the unmount answer below. */
   const pendingQuestion = useRef<string | undefined>(undefined);
+  /** The question a button's answer is on its way to, if any. */
+  const answering = useRef<string | undefined>(undefined);
   const deck = displayText(target.deckName, DISPLAY_LIMITS.name);
   const replace = target.kind === "replace";
 
@@ -82,13 +84,16 @@ export function UpgradeDialog({ target, runtime, onClose }: {
   // Unmounting with the question open is a Keep: the dialog went away. A
   // question asked AFTER it went is a Keep too (`start`), answered at once:
   // nothing is left to ask, and the run would otherwise wait out the crate's
-  // ten-minute decision timeout holding this deck's upgrade.
+  // ten-minute decision timeout holding this deck's upgrade. A question whose
+  // answer is already on its way is left to that answer — a second, opposite
+  // one for the same upgrade must not race it (PRD #1487, Qodo #15); if it
+  // then fails, `decide` answers Keep, never Restart now.
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
       const open = pendingQuestion.current;
-      if (open) answer(open, "keep-current");
+      if (open && answering.current !== open) answer(open, "keep-current");
     };
   }, []);
 
@@ -126,14 +131,28 @@ export function UpgradeDialog({ target, runtime, onClose }: {
     const asked = (current: Phase): current is Extract<Phase, { phase: "deciding" }> =>
       current.phase === "deciding" && current.question.upgradeId === upgradeId;
     setState({ ...state, answering: true, undelivered: false });
-    // The question stays until the answer has arrived; until then it is still
-    // the one an unmount answers.
+    // The question stays open until the answer has arrived; an unmount in the
+    // meantime leaves it to this answer.
+    answering.current = upgradeId;
+    const settled = () => {
+      if (answering.current === upgradeId) answering.current = undefined;
+    };
     send(upgradeId, choice).then(
       () => {
+        settled();
         if (pendingQuestion.current === upgradeId) pendingQuestion.current = undefined;
         setState((current) => asked(current) ? { phase: "running", stage: current.stage } : current);
       },
-      () => setState((current) => asked(current) ? { ...current, answering: false, undelivered: true } : current),
+      () => {
+        settled();
+        // Gone while it was on its way: nothing is left to retry from, so the
+        // question is answered the way every other way out answers it.
+        if (!mounted.current) {
+          if (pendingQuestion.current === upgradeId) answer(upgradeId, "keep-current");
+          return;
+        }
+        setState((current) => asked(current) ? { ...current, answering: false, undelivered: true } : current);
+      },
     );
   };
 

@@ -4390,8 +4390,9 @@ async fn handle_restart_daemon(
     drop(guard);
     if !latched {
         warn!(
-            "RestartDaemon accepted, but a stop arrived before the successor was recorded; \
-             the daemon stops without starting a successor"
+            "RestartDaemon accepted, but the daemon began stopping before the successor was \
+             recorded; it stops without starting a successor, and the stop path discloses what \
+             it stops"
         );
         return Ok(());
     }
@@ -4486,9 +4487,23 @@ async fn handle_connection(
             );
             return Ok(());
         }
-        info!("KIND_SHUTDOWN received — sending ack and beginning graceful daemon shutdown");
         // PRD #1487: a stop wins over a restart under way or already accepted.
-        restart.stop_wins("shutdown-frame");
+        // Once the daemon has committed to a restart it cannot stop instead, so
+        // the frame is refused rather than acknowledged (audit A1): the reply
+        // is a `KIND_RESP` error, which `DaemonClient::send_shutdown` reports
+        // as a failed Stop with this message — and which a client predating
+        // the refusal also treats as a failure, since it accepts nothing but
+        // `KIND_SHUTDOWN_ACK`. Nothing is drained: the restart already did.
+        if !restart.stop_wins("shutdown-frame") {
+            let resp = AttachResponse::err(
+                crate::daemon_restart::STOP_REFUSED_RESTART_COMMITTED.to_string(),
+            );
+            if let Err(e) = write_resp(&mut stream, &resp).await {
+                warn!(error = %e, "failed to write the KIND_SHUTDOWN refusal");
+            }
+            return Ok(());
+        }
+        info!("KIND_SHUTDOWN received — sending ack and beginning graceful daemon shutdown");
         // Ack first: the client's `send_shutdown` waits up to 1s for this
         // frame and treats absence as a hard error. Writing the ack
         // before kicking off the registry drain keeps the wire ordering
@@ -4763,9 +4778,7 @@ async fn handle_connection(
             let Some(claim) = restart.claim_stop() else {
                 warn!("StopDaemon refused: the daemon already committed to a restart");
                 let resp = AttachResponse::err(
-                    "this daemon is already restarting onto a new build and is exiting; \
-                     stop the new daemon once it is up"
-                        .to_string(),
+                    crate::daemon_restart::STOP_REFUSED_RESTART_COMMITTED.to_string(),
                 );
                 write_resp(&mut stream, &resp).await?;
                 return Ok(());
@@ -4773,6 +4786,12 @@ async fn handle_connection(
             // A failed write returns here and drops `claim`, withdrawing it.
             write_resp(&mut stream, &AttachResponse::ok()).await?;
             claim.confirm("stop-daemon");
+            // Issue #1109's disclosure, which this path lacked (PRD #1487
+            // audit D1): `--force` stops live agents and roles, and the
+            // acceptance log above carries only their counts. After the ack —
+            // the client is waiting on it — and before the drain, which
+            // empties what this reads.
+            crate::daemon_stop::log_teardown_inventory(&state, &registry, "stop-daemon").await;
             // The same graceful drain, with the same grace, as the
             // `KIND_SHUTDOWN` handler: one audited teardown path, not a second
             // one. Idempotent via the registry's `shutting_down` latch.
@@ -11927,6 +11946,40 @@ mod tests {
         let err = tokio::time::timeout(Duration::from_secs(30), stop)
             .await
             .expect("the stop answers")
+            .expect_err("a stop after the commit is refused");
+        assert!(
+            err.to_string().contains("already restarting"),
+            "the refusal says why: {err}"
+        );
+        assert!(
+            !fx.registry.is_shutting_down(),
+            "the refused stop drained nothing"
+        );
+        assert!(!fx.restart.is_stop_requested());
+    }
+
+    /// Scenario: the daemon has committed to a restart onto its installed
+    /// build — its successor plan is taken — when the TUI's `Stop` frame
+    /// arrives on a connection still being served. The frame is refused with
+    /// an error saying the daemon is already restarting, which the client
+    /// reports as a failed Stop, rather than acknowledged as a stop that
+    /// cannot happen; nothing is drained by it (PRD #1487 audit A1).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shutdown_frame_after_the_restart_is_committed_is_refused_not_acknowledged() {
+        let fx = RestartFixture::start().await;
+        assert!(
+            fx.restart
+                .mark_accepted(Some(std::path::PathBuf::from("/x/dot-agent-deck")))
+        );
+        assert_ne!(
+            fx.restart.take_successor_plan(),
+            crate::daemon_restart::SuccessorPlan::Nothing
+        );
+
+        let err = tokio::time::timeout(Duration::from_secs(30), fx.client().send_shutdown())
+            .await
+            .expect("the frame is answered")
             .expect_err("a stop after the commit is refused");
         assert!(
             err.to_string().contains("already restarting"),

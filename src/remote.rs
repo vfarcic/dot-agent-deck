@@ -92,12 +92,29 @@ impl SshTarget {
     /// `-i` is deliberately absent: host-key verification happens before
     /// authentication, so naming a key buys nothing here, and leaving it out
     /// keeps a `--key` path out of a rendered message.
+    ///
+    /// The jump host is named when the session takes one (Qodo 4202060288):
+    /// without `-J` the remedy reaches the deck by a different route than the
+    /// one that failed, or not at all.
     pub fn host_key_remedy(&self) -> String {
-        if self.port == DEFAULT_SSH_PORT {
-            format!("ssh {}", self.user_host())
-        } else {
-            format!("ssh -p {} {}", self.port, self.user_host())
+        let mut line = String::from("ssh");
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
         }
+        if self.port != DEFAULT_SSH_PORT {
+            line.push_str(&format!(" -p {}", self.port));
+        }
+        line.push(' ');
+        line.push_str(&self.user_host());
+        line
+    }
+
+    /// [`Self::jump`] when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`], the form every ssh session and
+    /// every printed command uses; an invalid value (a hand-edited registry)
+    /// is dropped, as [`SystemSshExecutor::build_command`] drops it.
+    pub fn valid_jump(&self) -> Option<crate::remote_tunnel::HostAlias> {
+        crate::remote_tunnel::HostAlias::parse(self.jump.as_deref()?).ok()
     }
 
     /// A command line the user can paste to run `remote_command` on this
@@ -111,7 +128,9 @@ impl SshTarget {
     /// to expand, not the laptop's, whose home can be a different path (PR
     /// #1373 review). A destination
     /// that starts with `-` is preceded by `--` so ssh cannot read it as an
-    /// option (PR #1373 review).
+    /// option (PR #1373 review). The jump host rides along as `-J`, in the
+    /// position [`SystemSshExecutor::build_command`] passes it, so the line
+    /// takes the deck's route (Qodo 4202060288).
     pub fn command_line(&self, remote_command: &str) -> String {
         let mut line = String::from("ssh");
         if self.port != DEFAULT_SSH_PORT {
@@ -119,6 +138,9 @@ impl SshTarget {
         }
         if let Some(key) = &self.key {
             line.push_str(&format!(" -i {}", shell_word(&key.to_string_lossy())));
+        }
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
         }
         let destination = self.user_host();
         if destination.starts_with('-') {
@@ -2810,6 +2832,34 @@ mod tests {
         assert_eq!(hostile, "ssh 'u@h;touch pwned' 'rm x'");
         let option = SshTarget::parse("-oProxyCommand=id", 22, None).command_line("rm x");
         assert_eq!(option, "ssh -- -oProxyCommand=id 'rm x'");
+    }
+
+    /// Scenario: a deck reached through a jump host prints its remedy and its
+    /// cleanup commands with `-J <jump host>`, in the place the real session
+    /// passes it, so a pasted command takes the deck's route; a jump host that
+    /// does not validate is left out of both, as the session leaves it out
+    /// (PRD #1487, Qodo 4202060288).
+    #[test]
+    fn printed_commands_take_the_jump_host_the_session_takes() {
+        let mut routed = SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/id")));
+        routed.jump = Some("bastion".to_string());
+        assert_eq!(
+            routed.command_line("rm x"),
+            "ssh -p 2222 -i /k/id -J bastion u@h 'rm x'"
+        );
+        assert_eq!(routed.host_key_remedy(), "ssh -J bastion -p 2222 u@h");
+        let session = SystemSshExecutor::default().build_command(&routed, "rm x");
+        let args: Vec<String> = session
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let jump_at = args.iter().position(|a| a == "-J").expect("-J is passed");
+        assert_eq!(args[jump_at + 1], "bastion");
+
+        let mut hostile = SshTarget::parse("u@h", 22, None);
+        hostile.jump = Some("-oProxyCommand=id".to_string());
+        assert_eq!(hostile.command_line("rm x"), "ssh u@h 'rm x'");
+        assert_eq!(hostile.host_key_remedy(), "ssh u@h");
     }
 
     #[test]

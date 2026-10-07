@@ -2890,6 +2890,21 @@ impl DaemonClient {
             tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut rd)).await;
         match read_result {
             Ok(Ok(Some((kind, _payload)))) if kind == KIND_SHUTDOWN_ACK => Ok(()),
+            // PRD #1487 (audit A1): a daemon that has committed to a restart
+            // refuses the stop with an error reply instead of acknowledging
+            // it, because it cannot stop instead. Report what it said.
+            Ok(Ok(Some((kind, payload)))) if kind == KIND_RESP => {
+                match serde_json::from_slice::<AttachResponse>(&payload) {
+                    Ok(resp) if !resp.ok => Err(ClientError::Server(
+                        resp.error
+                            .unwrap_or_else(|| "the daemon refused the stop".to_string()),
+                    )),
+                    _ => Err(ClientError::Server(format!(
+                        "expected KIND_SHUTDOWN_ACK (0x{KIND_SHUTDOWN_ACK:02x}), got a reply the \
+                         stop cannot be read from"
+                    ))),
+                }
+            }
             Ok(Ok(Some((kind, _)))) => Err(ClientError::Server(format!(
                 "expected KIND_SHUTDOWN_ACK (0x{:02x}), got kind 0x{:02x} — daemon may predate PROTOCOL_VERSION 2",
                 KIND_SHUTDOWN_ACK, kind

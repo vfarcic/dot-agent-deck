@@ -195,6 +195,38 @@ describe("UpgradeDialog", () => {
     expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "keep-current");
   });
 
+  /** Scenario: Restart now is on its way when the dialog goes away; the unmount sends no Keep for the same question, and the Restart now answer stands. */
+  it("leaves an answer on its way alone when it unmounts", async () => {
+    const { runtime, emit } = controlledRuntime();
+    let deliver!: () => void;
+    runtime.decideUpgrade.mockImplementationOnce(() => new Promise<undefined>((resolve) => { deliver = () => resolve(undefined); }));
+    const view = render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    view.unmount();
+    await act(async () => deliver());
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    expect(runtime.decideUpgrade).toHaveBeenCalledWith("upgrade-1", "restart-now");
+  });
+
+  /** Scenario: Restart now is on its way when the dialog goes away, and then fails to arrive; the question is answered Keep current daemon, and Restart now is never sent again. */
+  it("answers Keep, not Restart now, when an answer on its way fails after it unmounted", async () => {
+    const { runtime, emit } = controlledRuntime();
+    let refuse!: () => void;
+    runtime.decideUpgrade.mockImplementationOnce(() => new Promise<undefined>((_resolve, reject) => { refuse = () => reject(new Error("unreachable")); }));
+    const view = render(<UpgradeDialog target={TARGET} runtime={runtime} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    emit(decision);
+    fireEvent.click(screen.getByTestId("upgrade-restart-now"));
+    view.unmount();
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(1);
+    await act(async () => refuse());
+    expect(runtime.decideUpgrade).toHaveBeenCalledTimes(2);
+    expect(runtime.decideUpgrade).toHaveBeenLastCalledWith("upgrade-1", "keep-current");
+    expect(runtime.decideUpgrade).not.toHaveBeenNthCalledWith(2, "upgrade-1", "restart-now");
+  });
+
   /** Scenario: The dialog closes while the upgrade is still running; a question the run asks afterwards is answered Keep current daemon at once, and its progress reaches nothing. */
   it("answers Keep at once for a question asked after it unmounted", async () => {
     const { runtime, emit, finish } = controlledRuntime();

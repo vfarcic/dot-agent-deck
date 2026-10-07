@@ -4713,7 +4713,10 @@ export class TauriDeckBridge implements DeckBridge {
     const { listen } = await import("@tauri-apps/api/event");
     // One upgrade per deck at a time — the crate refuses a second — so the
     // deck id is enough to tell this run's events from another deck's.
-    const stops = await Promise.all([
+    // Settled rather than `Promise.all`, so a listener that did register is
+    // removed when the other one fails, instead of outliving the run (PRD
+    // #1487, Qodo #14).
+    const registered = await Promise.allSettled([
       listen<UpgradeProgressEvent>("desktop://upgrade-progress", (event) => {
         if (event.payload.deckId === deckId) onEvent({ type: "progress", ...event.payload });
       }),
@@ -4721,6 +4724,12 @@ export class TauriDeckBridge implements DeckBridge {
         if (event.payload.deckId === deckId) onEvent({ type: "decision", ...event.payload });
       }),
     ]);
+    const stops = registered.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+    const refused = registered.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (refused) {
+      stops.forEach((stop) => stop());
+      throw refused.reason;
+    }
     try {
       const outcome = await invoke<UpgradeOutcome>("desktop_upgrade_daemon", { deckId });
       // When the old daemon may be gone the crate ended this deck's terminal

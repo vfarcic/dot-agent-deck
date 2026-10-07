@@ -2654,6 +2654,21 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** client UI deduplication, real-agent teardown or cross-release compatibility.
 - **Platform coverage:** linux+mac.
 
+##### lifecycle/wire-restart/007 — A termination signal after the restart released its sockets, but before the successor is decided, stops the daemon and starts no successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon from an owned install path; the `e2e`-only successor-plan gate holds it between releasing its sockets and deciding its plan).
+- **Agent:** none.
+- **Asserts:** the restart is accepted; at the gate a SIGTERM is claimed as a stop (the daemon logs that the stop overrides the accepted restart); once the gate opens the daemon exits with status 0, no successor PID is ever recorded, and nothing answers at the endpoint.
+- **Does not assert:** the five-second settlement for a pending wire stop (`daemon_restart::tests::the_plan_waits_for_a_pending_stop_to_settle`); a supervised daemon's exit status.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/008 — After the daemon committed to its restart, a first signal is logged and a second force-exits it, even while it re-verifies its successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon; the successor-plan gate, then an installed build replaced at the gate whose `--version` blocks on a file).
+- **Agent:** none.
+- **Asserts:** with the daemon committed and blocked re-verifying the replaced build, a first SIGTERM is logged as arriving after the commit and not acted on; a second SIGTERM ends the process with status 143; no successor PID is recorded.
+- **Does not assert:** what happens to a successor that was already spawned when the signal arrived (it runs on its own); Windows' Ctrl-C delivery.
+- **Platform coverage:** linux+mac.
+
+
 #### lifecycle/wire-stop
 
 ##### lifecycle/wire-stop/001 — `StopDaemon` REFUSES over the wire while orchestration roles are live, and carries the panes, the roles and both renderings back (issue #1049).
@@ -2710,6 +2725,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the outcome is `WireStopOutcome::AcceptedNotConfirmed`, not `Stopped`. A daemon that exits CLOSES its socket, so its peer sees EOF; silence is a stalled peer and proves nothing, which is why a stalled probe resets the consecutive-unreachable count rather than advancing it. Reporting success for a daemon the caller cannot see is the precise defect #1049 was filed about — over `ssh -L` the PID path printed "Daemon stopped gracefully (pid N)" having killed the tunnel.
 - **Does not assert:** the three-probe confirmation threshold in isolation; the request-timeout half (`lifecycle/wire-stop/007`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/009 — A forced `StopDaemon` names every agent and orchestration role it destroys before it drains them (PRD #1487 audit D1).
+- **Layer:** L1/synthetic (real attach socket served by the production `serve_attach_with_counter`, real stand-in children, `AppState` holding live roles, the daemon's `tracing` output captured on a current-thread runtime).
+- **Agent:** none (three `sleep 30` stand-ins: two role panes and a plain one).
+- **Asserts:** the `force: true` stop is accepted and drains the registry, and the daemon's log carries the issue #1109 teardown inventory under the `stop-daemon` path — the three agents, both roles, which one is the orchestrator — which the wire stop used to omit, logging only counts.
+- **Does not assert:** the inventory's wording (`lifecycle/teardown-inventory/001`); that it precedes the drain beyond the inventory being non-empty, which only holds when it does (`lifecycle/teardown-inventory/002`).
 - **Platform coverage:** linux+mac (`#![cfg(unix)]`).
 
 
