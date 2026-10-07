@@ -102,7 +102,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::model_service::{ModelId, ServiceUrl, TokenCeiling};
-use crate::secrets::{SecretId, SecretStore, load_off_runtime};
+use crate::secrets::{Secret, SecretId, SecretStore, load_off_runtime};
 
 use super::prompt::{action_enum, commands_state, data_turn, param_names};
 use super::resolver::{IntentAnswer, IntentError, IntentRequest, IntentResolver, ResolveFuture};
@@ -224,37 +224,10 @@ impl RemoteResolver {
     }
 
     async fn run(&self, request: IntentRequest<'_>) -> Result<IntentAnswer, IntentError> {
-        // **A loopback endpoint takes no credential, and the keychain is not
-        // consulted at all.** The same rule Speech has, reached by a different
-        // route: there the keyless choice is a backend token and the
-        // deserializer refuses to pair it with an off-machine endpoint, because
-        // the hazard is an upload with no key on it. Here the two choices are a
-        // PROTOCOL choice, so the endpoint is what decides — a server on this
-        // machine is one the user started, it has no notion of a key, and
-        // handing it theirs is a thing to not do rather than a thing to make
-        // work. "No key was asked for" rather than "no key was found", which is
-        // the distinction `HttpTranscriber::keyless` spells out at length.
-        let secret = if self.endpoint.is_loopback() {
-            None
-        } else {
-            // Read at call time, Rust-side, and dropped with this scope — and
-            // on a blocking thread, because a keychain read is entitled to
-            // prompt and this is an async fn on a shared runtime.
-            match load_off_runtime(Arc::clone(&self.secrets), SecretId::VoiceIntent).await {
-                Ok(Some(secret)) => Some(secret),
-                Ok(None) => {
-                    return Err(IntentError::NotConfigured(format!(
-                        "no key is stored for {} — add one in Settings → Voice",
-                        self.endpoint.host()
-                    )));
-                }
-                // The keychain itself failed. `SecretError::public` is already
-                // a complete sentence naming what did not happen, which is the
-                // whole point of PRD #802 M4's refusal to report a failed read
-                // as "nothing stored".
-                Err(error) => return Err(IntentError::NotConfigured(error.public())),
-            }
-        };
+        // No key for a loopback endpoint; see `endpoint_credential`.
+        let secret = endpoint_credential(&self.endpoint, &self.secrets)
+            .await
+            .map_err(IntentError::NotConfigured)?;
 
         let Some(client) = self.client.as_ref() else {
             // Fail closed: the one thing this must never do is fall back to a
@@ -279,16 +252,7 @@ impl RemoteResolver {
             .header("content-type", "application/json");
         // The credential's header is the protocol's, and an absent one is a
         // loopback endpoint: no header of either shape goes out.
-        if let Some(secret) = &secret {
-            post = match self.protocol {
-                Protocol::Anthropic => post
-                    .header("anthropic-version", API_VERSION)
-                    .header("x-api-key", secret.expose()),
-                Protocol::OpenAiCompatible { .. } => {
-                    post.header("authorization", format!("Bearer {}", secret.expose()))
-                }
-            };
-        }
+        post = authorise(post, self.protocol, secret.as_ref());
         let response = post
             .json(&body)
             .send()
@@ -326,6 +290,71 @@ impl RemoteResolver {
             Protocol::OpenAiCompatible { .. } => {
                 super::openai::parse_response(&payload, self.max_tokens)
             }
+        }
+    }
+}
+
+/// The credential for one request to `endpoint`, read at call time — or
+/// `None` for a loopback endpoint, which is sent no key at all.
+///
+/// Shared by every keyed request on the configured Commands connection: the
+/// intent request above, and PRD #1497's turn summaries
+/// ([`super::summary`]) and provider speech ([`super::speech`]), which ride
+/// the same connection and so the same key. One copy, so the loopback rule
+/// and the keychain-failure wording cannot drift between them.
+///
+/// **A loopback endpoint takes no credential, and the keychain is not
+/// consulted at all.** The same rule Speech has, reached by a different
+/// route: there the keyless choice is a backend token and the deserializer
+/// refuses to pair it with an off-machine endpoint, because the hazard is an
+/// upload with no key on it. Here the choice is a PROTOCOL choice, so the
+/// endpoint is what decides — a server on this machine is one the user
+/// started, it has no notion of a key, and handing it theirs is a thing to
+/// not do rather than a thing to make work. "No key was asked for" rather
+/// than "no key was found", which is the distinction
+/// `HttpTranscriber::keyless` spells out at length.
+///
+/// The `Err` is a complete sentence for the user.
+pub(super) async fn endpoint_credential(
+    endpoint: &ServiceUrl,
+    secrets: &Arc<dyn SecretStore>,
+) -> Result<Option<Secret>, String> {
+    if endpoint.is_loopback() {
+        return Ok(None);
+    }
+    // Read at call time, Rust-side, and dropped with the caller's scope — and
+    // on a blocking thread, because a keychain read is entitled to prompt and
+    // this is an async fn on a shared runtime.
+    match load_off_runtime(Arc::clone(secrets), SecretId::VoiceIntent).await {
+        Ok(Some(secret)) => Ok(Some(secret)),
+        Ok(None) => Err(format!(
+            "no key is stored for {} — add one in Settings → Voice",
+            endpoint.host()
+        )),
+        // The keychain itself failed. `SecretError::public` is already a
+        // complete sentence naming what did not happen, which is the whole
+        // point of PRD #802 M4's refusal to report a failed read as "nothing
+        // stored".
+        Err(error) => Err(error.public()),
+    }
+}
+
+/// Attach `secret` to `post` in `protocol`'s header, or nothing when there is
+/// no secret (a loopback endpoint, see [`endpoint_credential`]).
+pub(super) fn authorise(
+    post: reqwest::RequestBuilder,
+    protocol: Protocol,
+    secret: Option<&Secret>,
+) -> reqwest::RequestBuilder {
+    let Some(secret) = secret else {
+        return post;
+    };
+    match protocol {
+        Protocol::Anthropic => post
+            .header("anthropic-version", API_VERSION)
+            .header("x-api-key", secret.expose()),
+        Protocol::OpenAiCompatible { .. } => {
+            post.header("authorization", format!("Bearer {}", secret.expose()))
         }
     }
 }

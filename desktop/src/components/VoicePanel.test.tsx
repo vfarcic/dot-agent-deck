@@ -70,6 +70,7 @@ const BOTH_KEYED = {
     intent: VOICE_STAGE_PRESETS.intent.anthropic,
     transcription: VOICE_STAGE_PRESETS.transcription.remote,
     labels: "shared",
+    speech: "auto",
   },
 };
 
@@ -193,6 +194,7 @@ describe("VoicePanel", () => {
           intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
           labels: "shared",
+          speech: "auto",
         },
       }),
     );

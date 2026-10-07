@@ -389,6 +389,9 @@ pub struct VoiceSettings {
     /// Whether the command backend is shown the names the app observed (PRD
     /// #1223, audit finding A1). See [`LabelSharing`].
     pub labels: LabelSharing,
+    /// Where reading mode's voice comes from (PRD #1497 D9). See
+    /// [`SpeechSource`].
+    pub speech: SpeechSource,
 }
 
 /// The endpoint the keyless local speech container listens on.
@@ -1178,6 +1181,49 @@ impl VoiceToken for LabelSharing {
     }
 }
 
+/// Where reading mode's spoken summaries come from (PRD #1497 D9).
+///
+/// **Auto** uses the Commands connection's own text-to-speech when it offers
+/// one — an OpenAI-compatible connection does, Anthropic does not — and the
+/// operating system's voice otherwise, including when the provider's request
+/// fails. **Provider** uses only the connection's, and **System** only the
+/// operating system's. [`crate::voice::speech::plan`] is where the choice is
+/// applied.
+///
+/// A choice of source, never a value that is sent: no text, voice name or
+/// credential is stored here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeechSource {
+    /// The connection's speech when it has one, else the system voice.
+    #[default]
+    Auto,
+    /// The connection's speech only.
+    Provider,
+    /// The operating system's voice only.
+    System,
+}
+
+impl VoiceToken for SpeechSource {
+    const TOKENS: &'static [&'static str] = &["auto", "provider", "system"];
+    const LABEL: &'static str = "a speech source";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Provider => "provider",
+            Self::System => "system",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "provider" => Self::Provider,
+            "system" => Self::System,
+            _ => Self::default(),
+        }
+    }
+}
+
 macro_rules! voice_token_serde {
     ($($ty:ty),+ $(,)?) => {$(
         impl $ty {
@@ -1201,14 +1247,15 @@ macro_rules! voice_token_serde {
     )+};
 }
 
-// Four identical serde impls, written once. The macro generates NO struct and
+// Five identical serde impls, written once. The macro generates NO struct and
 // NO field — see [`VoiceToken`] for why that boundary matters to the
 // linkage-check scanner that reads this file as text.
 voice_token_serde!(
     ActivationMode,
     IntentBackend,
     TranscriptionBackend,
-    LabelSharing
+    LabelSharing,
+    SpeechSource
 );
 
 /// The whole settings document.
@@ -4900,6 +4947,9 @@ mod tests {
                 // Absent from the document above, so this build's default:
                 // the observed names ARE sent (PRD #1223, audit finding A1).
                 "labels": "shared",
+                // Absent too, so Auto: the connection's speech when it has
+                // one, else the system voice (PRD #1497 D9).
+                "speech": "auto",
             })
         );
 
@@ -5701,6 +5751,13 @@ mod tests {
         round_trips::<IntentBackend>();
         round_trips::<TranscriptionBackend>();
         round_trips::<LabelSharing>();
+        assert_eq!(
+            <SpeechSource as VoiceToken>::TOKENS,
+            ["auto", "provider", "system"],
+            "keep this identical to VOICE_SPEECH_SOURCES in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(SpeechSource::default(), SpeechSource::Auto);
+        round_trips::<SpeechSource>();
     }
 
     /// The preset endpoints and models are duplicated in
@@ -8145,6 +8202,7 @@ forms it is.";
                     model: ModelId::parse(HOSTED_SPEECH_MODEL).unwrap(),
                 },
                 labels: LabelSharing::Withheld,
+                speech: SpeechSource::Provider,
             }),
             ..DesktopSettings::default()
         }
@@ -9035,6 +9093,7 @@ user = \"dev\"
 [voice]
 activation = \"toggle\"
 labels = \"withheld\"
+speech = \"provider\"
 
 [voice.intent]
 backend = \"anthropic\"

@@ -55,6 +55,8 @@ pub mod prompt;
 pub mod remote;
 pub mod resolver;
 pub mod schema;
+pub mod speech;
+pub mod summary;
 pub mod table;
 pub mod transcribe;
 pub mod wake;

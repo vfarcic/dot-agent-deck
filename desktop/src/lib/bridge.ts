@@ -438,6 +438,12 @@ export interface VoiceSettingsDto {
    * #1223, audit finding A1). One of `VOICE_LABEL_SHARING`.
    */
   labels: string;
+  /**
+   * Where reading mode's voice comes from (PRD #1497 D9): `auto` (the
+   * connection's text-to-speech when it has one, else the system voice),
+   * `provider` or `system`. One of `VOICE_SPEECH_SOURCES`.
+   */
+  speech: string;
 }
 
 /**
@@ -636,6 +642,12 @@ export const VOICE_TRANSCRIPTION_BACKENDS = ["local", "remote"] as const;
 export const VOICE_LABEL_SHARING = ["shared", "withheld"] as const;
 
 /**
+ * Where reading mode's voice comes from (PRD #1497 D9). `auto` is the default.
+ * Keep identical to `SpeechSource::TOKENS` in `src-tauri/src/settings.rs`.
+ */
+export const VOICE_SPEECH_SOURCES = ["auto", "provider", "system"] as const;
+
+/**
  * The bounds and the default for the command stage's answer ceiling.
  *
  * Mirrors `MIN_TOKEN_CEILING`, `MAX_TOKEN_CEILING` and `DEFAULT_TOKEN_CEILING`
@@ -711,6 +723,7 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   intent: VOICE_STAGE_PRESETS.intent.openai_compatible,
   transcription: VOICE_STAGE_PRESETS.transcription.local,
   labels: "shared",
+  speech: "auto",
 };
 
 /**
@@ -1045,6 +1058,16 @@ export interface VoiceCommandDto {
   params: { name: string; kind: string }[];
 }
 
+/**
+ * How reading mode's next sentence is to be spoken (PRD #1497 D9), as
+ * `desktop_voice_speech_plan` answers: `voice::speech::SpeechPlan`, field for
+ * field.
+ */
+export type SpeechPlanDto =
+  | { kind: "provider"; fallbackToSystem: boolean }
+  | { kind: "system" }
+  | { kind: "unavailable"; reason: string };
+
 export interface VoiceStatusDto {
   state: VoiceCaptureState;
   capturedMs: number;
@@ -1236,11 +1259,14 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
     ?? DEFAULT_VOICE_SETTINGS.activation;
   const labels = VOICE_LABEL_SHARING.find((candidate) => candidate === record.labels)
     ?? DEFAULT_VOICE_SETTINGS.labels;
+  const speech = VOICE_SPEECH_SOURCES.find((candidate) => candidate === record.speech)
+    ?? DEFAULT_VOICE_SETTINGS.speech;
   return {
     activation,
     intent: normalizeVoiceIntentStage(record.intent),
     transcription: normalizeVoiceStage(record.transcription, VOICE_TRANSCRIPTION_BACKENDS, DEFAULT_VOICE_SETTINGS.transcription, VOICE_STAGE_PRESETS.transcription),
     labels,
+    speech,
   };
 }
 
@@ -1825,6 +1851,18 @@ export interface DeckBridge {
    * which one it was in would get it wrong.
    */
   voiceCancel(): Promise<VoiceStatusDto>;
+  /**
+   * How reading mode's next sentence is to be spoken
+   * (`desktop_voice_speech_plan`, PRD #1497 D9). Read per sentence, so a
+   * changed Speech source applies to the next one.
+   */
+  voiceSpeechPlan(): Promise<SpeechPlanDto>;
+  /**
+   * The Commands connection's text-to-speech audio for `text`, as MP3 bytes
+   * (`desktop_voice_speech_audio`). Rejects with a sentence when the
+   * connection has no speech, no key, or the request fails.
+   */
+  voiceSpeechAudio(text: string): Promise<ArrayBuffer>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -2956,6 +2994,17 @@ class FixtureDeckBridge implements DeckBridge {
     // device; it does not rewind the session's script.
     this.microphone = { ...this.microphone, recording: false, delivered: false };
     return fixtureVoiceStatus();
+  }
+
+  /** The preview has no Commands connection, so it speaks with the system voice. */
+  async voiceSpeechPlan(): Promise<SpeechPlanDto> {
+    await Promise.resolve();
+    return { kind: "system" };
+  }
+
+  async voiceSpeechAudio(): Promise<ArrayBuffer> {
+    await Promise.resolve();
+    throw new Error("the preview has no speech service");
   }
 
   /**
@@ -4482,6 +4531,17 @@ export class TauriDeckBridge implements DeckBridge {
   async voiceCancel(): Promise<VoiceStatusDto> {
     const invoke = await this.getInvoke();
     return invoke<VoiceStatusDto>("desktop_voice_cancel");
+  }
+
+  async voiceSpeechPlan(): Promise<SpeechPlanDto> {
+    const invoke = await this.getInvoke();
+    return invoke<SpeechPlanDto>("desktop_voice_speech_plan");
+  }
+
+  async voiceSpeechAudio(text: string): Promise<ArrayBuffer> {
+    const invoke = await this.getInvoke();
+    // A raw `tauri::ipc::Response` arrives as an ArrayBuffer.
+    return invoke<ArrayBuffer>("desktop_voice_speech_audio", { text });
   }
 
   /**

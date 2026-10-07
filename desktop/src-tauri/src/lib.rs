@@ -3859,6 +3859,47 @@ fn voice_decks(
 ///
 /// # No daemon round trip, no model, no state
 ///
+/// How reading mode's next sentence is to be spoken (PRD #1497 D9):
+/// the provider's text-to-speech, the operating system's voice, or nothing
+/// and why. Read per call, for `desktop_voice_resolve`'s reason: a changed
+/// Speech source or connection applies to the next sentence.
+///
+/// Reaches nothing: the answer is a function of the settings document.
+#[tauri::command]
+async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::SpeechPlan, String> {
+    ensure_main_webview(&webview)?;
+    let settings = crate::settings::load_settings_without_decks()
+        .voice
+        .unwrap_or_default();
+    Ok(voice::speech::plan(settings.speech, &settings.intent))
+}
+
+/// The provider's audio for one sentence of reading mode (PRD #1497 M4), as
+/// raw MP3 bytes the webview decodes and plays.
+///
+/// Spends the Commands connection's key, so the text is bounded here before
+/// anything is sent ([`voice::speech::MAX_SPEECH_INPUT_CHARS`] after a byte
+/// bound that refuses an oversized IPC argument outright).
+#[tauri::command]
+async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Response, String> {
+    ensure_main_webview(&webview)?;
+    // Four bytes a character at most, so this refuses nothing the character
+    // bound would keep.
+    if text.len() > voice::speech::MAX_SPEECH_INPUT_CHARS * 4 {
+        return Err("that is too long to speak".to_string());
+    }
+    let settings = crate::settings::load_settings_without_decks()
+        .voice
+        .unwrap_or_default();
+    let audio = voice::speech::synthesise(
+        &settings.intent,
+        Arc::new(KeychainSecretStore::new()),
+        &text,
+    )
+    .await?;
+    Ok(Response::new(audio))
+}
+
 /// Unlike [`desktop_voice_resolve`] this reaches nothing: the table is
 /// `include_str!`d into the binary and the screen arrives as a parameter, so
 /// the answer is a pure function of the two. It costs no `ListAgents`, spends
@@ -5488,6 +5529,8 @@ pub fn run() {
             desktop_voice_choice,
             desktop_voice_number,
             desktop_voice_commands,
+            desktop_voice_speech_plan,
+            desktop_voice_speech_audio,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build dot-agent-deck desktop application");

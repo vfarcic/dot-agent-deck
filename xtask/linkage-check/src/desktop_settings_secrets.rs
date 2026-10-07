@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 27] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 28] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -354,6 +354,16 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 27] = [
          folding deserializer and same MAX_VOICE_TOKEN_BYTES bound as its \
          three neighbours, so no text is representable",
     ),
+    (
+        "SpeechSource",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `auto`, `provider` or `system` \
+         — where reading mode's voice comes from (PRD #1497 D9). A choice of \
+         source, never a value that is sent: no text, voice name or credential \
+         is stored here. Same folding deserializer and same \
+         MAX_VOICE_TOKEN_BYTES bound as its neighbours, so no text is \
+         representable",
+    ),
     // PRD #802's provider work: the two stages stopped being one token each
     // and became a backend plus the coordinates it is reached at. The endpoint
     // and the model are the values that COULD have been `String`s — this list
@@ -511,7 +521,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 27] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 28] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -567,6 +577,9 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 27] = [
     // PRD #1223, audit finding A1: a closed token (`VOICE_LABEL_SHARING`) —
     // whether names are SENT, never a name.
     ("VoiceSettingsDto", "labels", "string"),
+    // PRD #1497 D9: a closed token (`VOICE_SPEECH_SOURCES`) — where reading
+    // mode's voice comes from, never a voice name or a key.
+    ("VoiceSettingsDto", "speech", "string"),
     // PRD #802's provider work. One interface for both stages, because both
     // hold the same three values and a second copy would be a second place to
     // forget a field. Every one is a REFERENCE — which backend, where it is,
