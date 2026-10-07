@@ -1,6 +1,6 @@
 # PRD #1497: Voice "reading on" — hear a short summary of the open agent's turns
 
-**Status**: Draft — not started
+**Status**: In progress — M1 decided 2026-10-07
 **Priority**: Medium
 **Created**: 2026-10-02
 **Issue**: [#1497](https://github.com/vfarcic/dot-agent-deck/issues/1497)
@@ -66,11 +66,17 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 - **D4: Opt-in.** Reading sends agent replies to the model provider, which is more than voice sends today (the user's own spoken commands). It is off until turned on in Settings, which says so.
 - **D5: The daemon supplies the reply (rule 18).** The final reply arrives in the daemon (hooks, session logs), and a remote deck's files are reachable only by its daemon, so the daemon passes it on through an additive, capability-gated request or event field. A client that finds no capability says reading is not available on that daemon.
 - **D6: Interruptible and quiet by default.** Speech is short, any new speech for the same agent replaces what is queued rather than piling up, and "stop" or "quiet" always works.
-- **D7: Must not hear itself.** The microphone does not treat the app's own speech as a command: listening pauses while speaking, or echo cancellation is used. M1 decides which.
+- **D7: Must not hear itself.** The microphone does not treat the app's own speech as a command: listening pauses while speaking, or echo cancellation is used. Decided in D8.
+
+- **D8: Echo handling is hybrid (M1, 2026-10-07).** Listening continues while the app speaks, with the webview's echo cancellation requested on the microphone, but while speech is playing only the interrupt rows ("stop", "quiet") are honoured and every other utterance is dropped. The worst case is the app interrupting itself, which is harmless; pausing the microphone was rejected because "stop" could then not be spoken over the speech.
+- **D9: Speech source is provider first, with a picker (M1, 2026-10-07).** Settings → Voice offers **Auto** (the default), **Provider** and **System**. Auto uses the configured connection's text-to-speech when it offers one (an OpenAI-compatible connection does, Anthropic does not) and the operating system's voice otherwise.
+- **D10: A summary always names the agent (M1, 2026-10-07)**, even when only one is open: "The tester finished: all 42 tests pass." It stays unambiguous if the user has switched panes.
+- **D11: Reading ends with its pane (M1, 2026-10-07).** Reading is bound to the agent it was turned on for. Opening a different agent's pane, closing this one, "reading off" or "voice off" ends it, and the app says "Reading off". It never follows the user to another pane.
+- **D12: Not behind the experimental flag (M1, 2026-10-07, CLAUDE.md rule 9).** Reading ships visible by default; it stays opt-in through the Settings switch (D4). No `show_*` wrapper and no `graduate-*` follow-up.
 
 ## Milestones
 
-- [ ] **M1: Decisions recorded.** The open questions below answered with the maintainer and written into this document, including the CLAUDE.md rule 9 experimental-flag question for this new voice surface.
+- [x] **M1: Decisions recorded.** (2026-10-07: D8–D12.) The open questions below answered with the maintainer and written into this document, including the CLAUDE.md rule 9 experimental-flag question for this new voice surface.
 - [ ] **M2: Daemon turn-end reply.** The daemon makes each finished turn's final reply available to clients for a given agent, from the agent's own data (Claude Code hooks, Codex session log, and whatever OpenCode provides), additive and capability-gated per rule 18, with rule 12 answered and the cross-version check run.
 - [ ] **M3: Summaries.** The desktop turns a final reply into one or two spoken-length sentences through the existing voice model connection, bounded in input and output, with a deterministic fallback when the model fails (e.g. "The tester finished its turn.").
 - [ ] **M4: Speech.** Provider text-to-speech where available, the OS voice otherwise; interrupt and replace-queue behaviour; the microphone does not hear the app's speech.
@@ -90,11 +96,13 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 
 ## Open questions
 
-1. Echo handling: pause listening while speaking, or echo cancellation?
-2. Speech source order: provider TTS first or OS voice first, and should the user be able to pick?
-3. Should a summary also say *which* agent spoke when only one is open (useful if the user switches panes)?
-4. Does "reading on" persist when the user opens a different agent's pane, or end with the first pane?
-5. Ship behind the `experimental` flag (rule 9)?
+All five were answered with the maintainer on 2026-10-07 (M1):
+
+1. Echo handling → D8 (hybrid: echo cancellation on, only stop/quiet honoured while speaking).
+2. Speech source order → D9 (provider first, OS voice fallback, Auto / Provider / System picker).
+3. Name the agent → D10 (always).
+4. Persistence across panes → D11 (ends with the pane).
+5. Experimental flag → D12 (no; visible by default, opt-in in Settings).
 
 ## Success criteria
 
