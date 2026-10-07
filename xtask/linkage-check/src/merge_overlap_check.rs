@@ -102,6 +102,8 @@ mod tests {
             // the PR's files, all of them and renames' old paths too
             "pulls/$n/files\" --paginate",
             "previous_filename",
+            // the list is newline-delimited, so a newline inside a path stops it
+            "if test(\"\\n\") then error(",
             // past the endpoint's cap the file list is incomplete
             "-le 3000",
             // commits on main since the branch point, limited to those files
