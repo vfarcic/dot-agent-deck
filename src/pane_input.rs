@@ -17,6 +17,8 @@
 //! user-typed prompts (e.g., multi-line tasks fragmenting into separate
 //! submissions inside Claude Code).
 
+use std::borrow::Cow;
+
 use thiserror::Error;
 
 /// Errors that can arise when encoding a pane input payload.
@@ -44,6 +46,10 @@ pub enum PaneInputError {
 /// whitespace is stripped so a one-line prompt doesn't accidentally submit
 /// twice (once on the trailing `\n`, once on the explicit submit CR).
 ///
+/// Issue #1616: every line break is written as LF first
+/// ([`normalize_line_breaks`]), so any text with more than one line goes in
+/// as a bracketed paste and no bare CR is ever typed in the middle of it.
+///
 /// Returns `Err(PaneInputError::EmbeddedPasteMarker)` when the trimmed
 /// payload is multi-line *and* contains a literal `ESC[200~` or
 /// `ESC[201~` byte sequence — the inner marker would otherwise terminate
@@ -53,6 +59,7 @@ pub enum PaneInputError {
 /// harmless and accepted (see
 /// `encode_pane_payload_single_line_with_marker_still_passes`).
 pub fn encode_pane_payload(text: &str) -> Result<Vec<u8>, PaneInputError> {
+    let text = normalize_line_breaks(text);
     let trimmed = text.trim_end_matches(['\n', '\r', ' ', '\t']);
     let mut out = Vec::with_capacity(trimmed.len() + 16);
     if trimmed.contains('\n') {
@@ -70,6 +77,46 @@ pub fn encode_pane_payload(text: &str) -> Result<Vec<u8>, PaneInputError> {
         out.extend_from_slice(trimmed.as_bytes());
     }
     Ok(out)
+}
+
+/// Issue #1616: `text` with every line break written as LF — CRLF and a bare
+/// CR, and the vertical tab, form feed, NEL, line separator and paragraph
+/// separator. A CRLF is one line break.
+///
+/// What an agent does with any of the others is not a line break. Unbracketed,
+/// a bare CR is an Enter in the middle of the prompt. And Claude Code 2.1.294
+/// removes each of them as an invisible character and then holds the prompt
+/// in its composer with "review and press Enter to send", so the deck's own
+/// Enter never submits it — measured with a bare CR, VT, FF, NEL, LS and PS.
+/// LF is the one every agent's editor shows as a new line inside a paste, and
+/// the one Claude Code reports a CRLF paste back as.
+///
+/// [`crate::prompt_delivery`] compares a reported prompt with the one written
+/// under this same normalization, since the agent only ever saw LF.
+pub fn normalize_line_breaks(text: &str) -> Cow<'_, str> {
+    if !text.contains(is_line_break_other_than_lf) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        out.push(if is_line_break_other_than_lf(c) {
+            '\n'
+        } else {
+            c
+        });
+    }
+    Cow::Owned(out)
+}
+
+fn is_line_break_other_than_lf(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\u{0b}' | '\u{0c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -152,6 +199,42 @@ mod tests {
         assert_eq!(
             encode_pane_payload("line1\nline2\n").unwrap(),
             b"\x1b[200~line1\nline2\x1b[201~"
+        );
+    }
+
+    /// Issue #1616: a line break that is not LF must not reach the agent as
+    /// itself. Unbracketed, a bare CR is an Enter in the middle of the
+    /// prompt; and Claude Code 2.1.294 treats a bare CR, VT, FF, NEL, LS or PS
+    /// as an invisible character it removes, after which it holds the prompt
+    /// in its composer ("review and press Enter to send") instead of
+    /// submitting it. Every one becomes LF, so the payload is a bracketed
+    /// paste whose lines the agent shows and submits.
+    #[test]
+    fn encode_pane_payload_writes_every_line_break_as_lf() {
+        for separator in [
+            "\r\n", "\r", "\x0b", "\x0c", "\u{85}", "\u{2028}", "\u{2029}",
+        ] {
+            assert_eq!(
+                encode_pane_payload(&format!("line1{separator}line2")).unwrap(),
+                b"\x1b[200~line1\nline2\x1b[201~",
+                "{separator:?}"
+            );
+            assert_eq!(
+                encode_pane_payload(&format!("line1{separator}{separator}line2{separator}"))
+                    .unwrap(),
+                b"\x1b[200~line1\n\nline2\x1b[201~",
+                "{separator:?}"
+            );
+            assert_eq!(
+                encode_pane_payload(&format!("one line{separator}")).unwrap(),
+                b"one line",
+                "{separator:?}"
+            );
+        }
+        // A CRLF is ONE line break, not two.
+        assert_eq!(
+            encode_pane_payload("a\r\nb\r\n\r\nc").unwrap(),
+            b"\x1b[200~a\nb\n\nc\x1b[201~"
         );
     }
 
