@@ -99,30 +99,20 @@ const TERM_RESISTANT_WORKER_COMMAND: &str = "trap '' TERM; printf TERM-READY; ex
 /// What [`TERM_RESISTANT_WORKER_COMMAND`] prints once SIGTERM is ignored.
 const TERM_RESISTANT_READY: &[u8] = b"TERM-READY";
 
-/// A worker that stays alive just long enough to receive its
-/// delegated task pointer, then ENDS ITS OWN PROCESS — no SIGTERM, no
+/// A worker that stays alive until its delegated task pointer has been
+/// observed and the fixture releases its exit flag, then ENDS ITS OWN PROCESS — no SIGTERM, no
 /// `StopAgent`, no explicit close of any kind. This is the whole scenario the
 /// EOF-triggered sweep exists for: a worker that genuinely finished (its
 /// session simply ended) without ever calling `work-done`, so the daemon's
 /// only signal that anything happened is `pump_reader` observing PTY EOF.
 ///
-/// The fixed sleep's margin does NOT measure the delegate's guarded write
-/// landing — the property the EOF-triggered sweep actually depends on is
-/// earlier and cheaper than that: `dispatch_one_owned` calls
-/// `AgentPtyRegistry::bind_delegation_worker_agent_id` before it ever
-/// attempts the write, and it is the BIND, not the write, that lets the
-/// sweep's worker-side identity match find this record at all (an unbound
-/// record is left for its own timer instead — see
-/// `OutstandingDelegation::worker_agent_id`'s doc comment). If the worker
-/// exits before the bind lands, the test does not fail loudly at the delegate
-/// — it fails later at the notice-appears assertion, which reads as a
-/// product regression rather than a harness timing loss. This sleep is sized
-/// well above the ordinary poll-latency-plus-task-scheduling cost of the bind
-/// as a safety margin against a loaded CI runner; it is not a signal-driven
-/// wait because nothing in the current registry API lets a test observe the
-/// bind directly without a source change out of this fix's scope.
-const WORKER_EXITS_ON_ITS_OWN_COMMAND: &str =
-    "stty -echo -icanon -icrnl -opost min 1 time 0 && printf WORKER-READY && sleep 2.0";
+/// The old two-second lifetime could beat the worker-identity bind under load,
+/// leaving an unbound record which EOF correctly did not retire. Terminal echo
+/// makes pointer delivery observable without consuming it; for pi-native seed
+/// delivery the fixture uses the same identity-scoped seed take as `get-seed`.
+/// Both happen after the idle record's bind, so no new observation seam is needed.
+const WORKER_EXITS_ON_ITS_OWN_COMMAND: &str = "stty echo -icanon -icrnl -opost min 1 time 0 && printf WORKER-READY && \
+     while [ ! -f worker-exit.flag ]; do sleep 0.05; done";
 
 /// The daemon-authored opening clause of `compose_worker_exited_notice` — the
 /// EOF-triggered notice, distinct from both
@@ -180,9 +170,9 @@ enum OrchestratorStub {
     /// `scheduler/idle-worker/008` cannot reach: `StopAgent` runs
     /// `begin_pane_close`, whose sweep drops every record pointing at the pane
     /// *before* any timer can wake, whereas a process that simply exits
-    /// triggers no close transition and therefore no sweep at all. On that path
-    /// the `write_and_submit_guarded` agent-id gate is the ONLY thing between a
-    /// still-armed timer and whichever agent inherits the freed pane id.
+    /// triggers no close transition. Its EOF sweep and the
+    /// `write_and_submit_guarded` agent-id gate protect whichever agent
+    /// inherits the freed pane id.
     ExitsOnFlag,
 }
 
@@ -492,13 +482,13 @@ impl IdleHarness {
     /// caller can hand the freed pane id to a successor.
     ///
     /// Deliberately NOT a `StopAgent`: nothing in this path calls
-    /// `begin_pane_close`, so no record sweep runs and the armed delegation
-    /// survives its orchestrator. The caller asserts `is_pane_closing` is false
+    /// `begin_pane_close`; natural EOF handling retires the delegation.
+    /// The caller asserts `is_pane_closing` is false
     /// afterwards to pin that down.
     async fn end_orchestrator_process(&self) {
         std::fs::write(self.cwd.path().join(NATURAL_EXIT_FLAG), b"exit\n")
             .expect("write the orchestrator stub's exit flag");
-        let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        let freed = tokio::time::timeout(common::child_boot_budget(), async {
             while self.registry.pane_current_agent_id(ORCH_PANE).is_some() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1156,7 +1146,7 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a silent worker, then let the ORCHESTRATOR's own process end — no StopAgent, so no close transition and no record sweep ever runs. A brand-new unrelated agent inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker.
+/// Scenario: Queue a delegation to a silent worker while deliberately delaying setup beyond the old deadline, then let the orchestrator's own process end without StopAgent. A brand-new unrelated agent inherits the freed pane and reports ready before the queued dispatch is released; after two further timeout windows its PTY must still hold nothing but its own readiness marker.
 #[spec("scheduler/idle-worker/014")]
 #[test]
 fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
@@ -1171,17 +1161,38 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
         )
         .await;
 
-        let delegated_at = tokio::time::Instant::now();
+        // A queued dispatch holds the production idle clock. Setup can take
+        // arbitrarily longer than the nominal timeout without letting the
+        // timer fire before there is a successor to observe a stray notice.
+        let dispatch_lock = harness
+            .registry
+            .pane_dispatch_order_lock(&worker_pane("orphaned-worker"));
+        let dispatch_guard = dispatch_lock.lock().await;
         harness.delegate(&["orphaned-worker"]).await;
+        let worker_pane_id = worker_pane("orphaned-worker");
+        let seq = harness
+            .registry
+            .outstanding_delegation_seq(&worker_pane_id)
+            .expect("the delegation is armed before the orchestrator's natural exit");
+        assert!(
+            harness
+                .registry
+                .delegation_idle_clock(&worker_pane_id, seq)
+                .is_some_and(|clock| clock.pointer_queued),
+            "setup must hold the idle clock before the artificial delay"
+        );
+
+        // Regression stimulus: the old fixture lost its setup race after 1.5s.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
 
         // The orchestrator simply ENDS. Unlike `008`'s StopAgent, this path
-        // never enters `begin_pane_close`, so nothing sweeps the armed record
-        // and the identity gate is the only guard left.
+        // never enters `begin_pane_close`; the natural EOF cleanup and guarded
+        // delivery must protect the unrelated successor.
         harness.end_orchestrator_process().await;
         assert!(
             !harness.registry.is_pane_closing(ORCH_PANE),
             "the orchestrator pane is in a CLOSE transition, so the close-time record sweep — \
-             not the identity gate — would be what suppresses the prompt, and this test would \
+             not natural-exit handling — would be what suppresses the prompt, and this test would \
              stop covering the natural-exit path"
         );
 
@@ -1193,25 +1204,29 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
             "SUCCESSOR-READY",
             &harness.cwd_str(),
         );
-        let ready = harness
-            .wait_for_snapshot_of(
-                &successor,
-                |snapshot| snapshot.contains("SUCCESSOR-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
+        let ready = String::from_utf8_lossy(
+            &common::wait_for_child_first_output(&harness.registry, &successor, b"SUCCESSOR-READY")
+                .await,
+        )
+        .into_owned();
         assert!(
             ready.contains("SUCCESSOR-READY"),
             "the successor agent never became ready, so it could not have observed a stray \
              submit either; snapshot = {ready:?}"
         );
-        assert!(
-            tokio::time::Instant::now() < delegated_at + timeout,
-            "the successor only took the pane AFTER the delegation's deadline had already \
-             passed, so the timer had nobody to mis-deliver to and this test would pass for the \
-             wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
-            tokio::time::Instant::now() - delegated_at
-        );
+        // Causal ordering replaces the wall-clock race: any surviving watch
+        // remains queued until the successor is ready. EOF may already have
+        // retired it, which is also correct natural-exit handling.
+        if let Some(seq) = harness.registry.outstanding_delegation_seq(&worker_pane_id) {
+            assert!(
+                harness
+                    .registry
+                    .delegation_idle_clock(&worker_pane_id, seq)
+                    .is_some_and(|clock| clock.pointer_queued),
+                "a surviving timer must still be queued until the successor reports ready"
+            );
+        }
+        drop(dispatch_guard);
 
         // Two further timeout windows: the deadline passes while the successor
         // owns the pane and is fully observable.
@@ -1237,7 +1252,7 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
     });
 }
 
-/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's EOF-triggered notice must be SUBMITTED into the orchestrator's pane as a turn naming what to do next, well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead. Run twice: once for a worker delegated to in place, and once for a pi-native `clear = true` role, whose delegate respawns the worker and hands the task over as the replacement's seed before that replacement exits on its own (issue #1448).
+/// Scenario: Delay dispatch beyond the old worker lifetime, observe the delegated pointer reaching the worker, then release a flag so its process ends naturally without StopAgent. The daemon's EOF-triggered notice must be submitted into the orchestrator's pane with remediation options before either older timeout notice fires. Run for both an in-place worker and a pi-native clear role, whose replacement receives the pointer through the identity-scoped native seed API before exiting.
 #[spec("scheduler/idle-worker/016")]
 #[test]
 fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
@@ -1284,7 +1299,7 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
         .wait_for_snapshot_of(
             &worker_agent_id,
             |snapshot| snapshot.contains("WORKER-READY"),
-            Duration::from_secs(5),
+            common::child_boot_budget(),
         )
         .await;
     assert!(
@@ -1292,16 +1307,20 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
         "the {role} stub never became ready; snapshot = {ready:?}"
     );
 
+    let dispatch_lock = harness.registry.pane_dispatch_order_lock(&worker_pane_id);
+    let dispatch_guard = dispatch_lock.lock().await;
     harness.delegate(&[role]).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    drop(dispatch_guard);
 
-    if project_config.is_some() {
+    let exit_agent_id = if project_config.is_some() {
         // The `clear = true` delegate respawns the worker: wait for the
         // replacement to own the pane, so the exit awaited below is ITS exit
         // and not the original's.
-        let replaced = tokio::time::timeout(Duration::from_secs(5), async {
+        let replaced = tokio::time::timeout(common::child_boot_budget(), async {
             loop {
                 match harness.registry.pane_current_agent_id(&worker_pane_id) {
-                    Some(current) if current != worker_agent_id => return,
+                    Some(current) if current != worker_agent_id => return current,
                     _ => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
@@ -1311,13 +1330,47 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
             replaced.is_ok(),
             "precondition: the clear = true delegate never respawned the {role} worker"
         );
-    }
+        replaced.unwrap()
+    } else {
+        worker_agent_id
+    };
 
-    // The worker's own script exits on its own shortly after — no
+    // The native seed is consumed exactly as pi's startup get-seed request
+    // would consume it. An injected pointer is visible through terminal echo.
+    // Neither a live pane nor a commission binding proves the idle record was
+    // bound: both can exist earlier. These delivery signals occur AFTER it.
+    let pointer_path = format!(".dot-agent-deck/worker-task-{role}.md");
+    let delivered = tokio::time::timeout(common::child_boot_budget(), async {
+        loop {
+            let pointer = if project_config.is_some() {
+                harness
+                    .registry
+                    .take_pending_seed_native_for(&worker_pane_id, Some(&exit_agent_id))
+                    .unwrap_or_else(|| harness.snapshot_of(&exit_agent_id))
+            } else {
+                harness.snapshot_of(&exit_agent_id)
+            };
+            if pointer.contains(&pointer_path) {
+                return pointer;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        delivered.is_ok(),
+        "the {role} worker never received its task pointer before exit was released; \
+         snapshot = {:?}",
+        harness.snapshot_of(&exit_agent_id)
+    );
+    std::fs::write(harness.cwd.path().join("worker-exit.flag"), b"exit\n")
+        .expect("release the task-ready worker's natural exit");
+
+    // The released worker's own script exits on its own — no
     // StopAgent, no explicit close of any kind. Wait until the registry
     // genuinely has no live owner for its pane, mirroring
     // `end_orchestrator_process`'s freed-pane wait.
-    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+    let freed = tokio::time::timeout(common::child_boot_budget(), async {
         while harness
             .registry
             .pane_current_agent_id(&worker_pane_id)
@@ -1393,7 +1446,7 @@ async fn natural_worker_exit_reports_promptly(role: &str, project_config: Option
     );
 }
 
-/// Scenario: Delegate to a silent control worker and to a worker that ignores SIGTERM, then StopAgent the TERM-resistant one so its three-second grace window brackets the detector deadline. The test asserts the overlap actually happened, then requires a prompt for the control and none for the worker whose close was in flight.
+/// Scenario: Queue delegations to a silent control and a SIGTERM-ignoring worker while deliberately delaying setup beyond the old deadline. Start StopAgent, wait for its close-begin signal, then release dispatch so the control's real detector deadline falls within the three-second grace window. Assert that overlap, then require a prompt for the control and none for the closing worker.
 #[spec("scheduler/idle-worker/009")]
 #[test]
 fn idle_worker_009_close_grace_window_suppresses_the_timeout() {
@@ -1414,30 +1467,75 @@ fn idle_worker_009_close_grace_window_suppresses_the_timeout() {
             .await;
         let server = start_attach_server(&harness).await;
 
-        let delegated_at = tokio::time::Instant::now();
+        let control_pane = worker_pane("silent-control");
+        let resistant_pane = worker_pane("term-resistant-worker");
+        let control_lock = harness.registry.pane_dispatch_order_lock(&control_pane);
+        let resistant_lock = harness.registry.pane_dispatch_order_lock(&resistant_pane);
+        let control_guard = control_lock.lock().await;
+        let resistant_guard = resistant_lock.lock().await;
         harness
             .delegate(&["silent-control", "term-resistant-worker"])
             .await;
+        let control_seq = harness
+            .registry
+            .outstanding_delegation_seq(&control_pane)
+            .expect("the control delegation is armed before close");
 
-        // Start the close well inside the timeout window; the SIGTERM grace
-        // then keeps the pane closing until well past the deadline.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Regression stimulus: setup used to consume the two-second deadline.
+        // The queued dispatches now hold both clocks until close is observable.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         let stopped_id = harness
             .worker_agent_ids
             .get("term-resistant-worker")
             .expect("term-resistant worker registry id")
             .clone();
-        let (close_started, close_finished) =
-            IdleHarness::stop_agent_timed(server.path.clone(), stopped_id).await;
+        let close_begun = harness.registry.pane_close_signal(&resistant_pane);
+        let mut close = tokio::spawn(IdleHarness::stop_agent_timed(
+            server.path.clone(),
+            stopped_id,
+        ));
+        tokio::select! {
+            _ = close_begun => {}
+            finished = &mut close => panic!(
+                "StopAgent completed without the close-begin signal; result = {finished:?}"
+            ),
+            _ = tokio::time::sleep(common::child_boot_budget()) => panic!(
+                "StopAgent never began closing the TERM-resistant worker"
+            ),
+        }
+        drop(resistant_guard);
+        drop(control_guard);
 
-        let deadline = delegated_at + timeout;
+        // Read the production clock after dispatch actually dequeues and its
+        // pointer write settles, rather than guessing from handle_delegate's
+        // return. Queue and draft deferral are part of the detector's deadline.
+        let deadline = tokio::time::timeout(common::child_boot_budget(), async {
+            loop {
+                let clock = harness
+                    .registry
+                    .delegation_idle_clock(&control_pane, control_seq)
+                    .expect("the control's idle clock vanished before setup completed");
+                if !clock.pointer_queued && !clock.pointer_in_progress {
+                    return tokio::time::Instant::from_std(
+                        clock.armed_at
+                            + timeout
+                            + clock.pointer_queued_for
+                            + clock.pointer_deferred,
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the control pointer never settled during the close grace window");
+        let (close_started, close_finished) = close.await.expect("StopAgent task");
         assert!(
             close_started < deadline && close_finished > deadline,
             "the close window did not bracket the detector deadline, so this test would pass \
-             for the wrong reason: close ran for {:?} starting {:?} after the delegate, \
+             for the wrong reason: close ran for {:?}, deadline was {:?} after close began, \
              timeout {timeout:?}",
             close_finished - close_started,
-            close_started - delegated_at
+            deadline.saturating_duration_since(close_started)
         );
 
         let snapshot = harness
