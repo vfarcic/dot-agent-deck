@@ -1017,18 +1017,32 @@ pub const TURN_REPLY_STDIN_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// dropped; any other invalid UTF-8 becomes U+FFFD. `None` when `input` gives
 /// nothing, fails, or has not ended within `timeout`: the reader runs on a
 /// thread of its own, so a stdin nobody closes cannot hold the report.
+///
+/// What follows the bound is read and discarded until `input` ends, still
+/// within `timeout`, so a writer blocked on a full pipe is released instead of
+/// waiting on a reader that stopped reading (PR #1617's macOS hang). A writer
+/// that has not finished by then costs the wait, never the reply.
 pub fn read_turn_reply_stdin<R>(input: R, timeout: std::time::Duration) -> Option<String>
 where
     R: std::io::Read + Send + 'static,
 {
+    let deadline = std::time::Instant::now() + timeout;
     let limit = (crate::daemon_protocol::MAX_TURN_REPLY_BYTES + 3) as u64;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (drained_tx, drained) = std::sync::mpsc::sync_channel::<()>(1);
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let read = input.take(limit).read_to_end(&mut bytes).map(|_| bytes);
+        let mut input = input.take(limit);
+        let read = input.read_to_end(&mut bytes).map(|_| bytes);
+        let full = matches!(&read, Ok(bytes) if bytes.len() as u64 == limit);
         let _ = tx.send(read);
+        if full {
+            let _ = std::io::copy(&mut input.into_inner(), &mut std::io::sink());
+        }
+        let _ = drained_tx.send(());
     });
     let bytes = rx.recv_timeout(timeout).ok()?.ok()?;
+    let _ = drained.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(err) if err.utf8_error().error_len().is_none() => {
@@ -2174,6 +2188,35 @@ mod tests {
             None
         );
         assert!(started.elapsed() < wait, "{:?}", started.elapsed());
+    }
+
+    /// PR #1617: a writer that sends far more than the bound through a real
+    /// pipe — past the 64 KiB a Linux pipe holds, so a reader that stopped at
+    /// the bound would leave it blocked until the reader went away and then
+    /// fail it with EPIPE — finishes its write whole, and the reply is still
+    /// the bounded prefix.
+    #[cfg(unix)]
+    #[test]
+    fn read_turn_reply_stdin_drains_a_writer_past_the_bound() {
+        use crate::daemon_protocol::MAX_TURN_REPLY_BYTES;
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let input = "x".repeat(256 * 1024);
+        let writing = {
+            let input = input.clone();
+            std::thread::spawn(move || writer.write_all(input.as_bytes()))
+        };
+        let read = read_turn_reply_stdin(reader, Duration::from_secs(10)).expect("a reply");
+        assert_eq!(
+            &read[..MAX_TURN_REPLY_BYTES],
+            &input[..MAX_TURN_REPLY_BYTES]
+        );
+        writing
+            .join()
+            .expect("writer thread")
+            .expect("the whole write is consumed, never refused");
     }
 
     /// A lifecycle report with no detail is the frame it has always been.

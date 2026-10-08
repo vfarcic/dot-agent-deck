@@ -36,6 +36,19 @@ fn agent_event(args: &[&str]) -> AgentEvent {
 /// Run `dot-agent-deck agent-event <args>` from a pane, writing `stdin` to it
 /// (none: stdin is null), and return the raw line it put on the hook socket.
 fn agent_event_line(args: &[&str], stdin: Option<&[u8]>) -> String {
+    agent_event_line_writing(args, stdin).0
+}
+
+/// [`agent_event_line`], also returning how the write to stdin ended (`None`
+/// when there was no stdin). Both ends run concurrently, as the deck and the
+/// Pi extension do: stdin is written from a thread of its own and the socket
+/// is accepted while the CLI runs, so neither a full pipe nor a hook line
+/// larger than the socket buffer (macOS keeps 8 KiB, PR #1617) can leave the
+/// CLI and this test waiting on each other.
+fn agent_event_line_writing(
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> (String, Option<std::io::Result<()>>) {
     let temp = test_temp::tempdir().expect("create agent-event socket directory");
     let socket = temp.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).expect("bind agent-event socket");
@@ -58,10 +71,38 @@ fn agent_event_line(args: &[&str], stdin: Option<&[u8]>) -> String {
         .stderr(Stdio::piped())
         .spawn()
         .expect("run agent-event");
-    if let Some(bytes) = stdin {
+    let writing = stdin.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("piped stdin");
+        let bytes = bytes.to_vec();
         // Dropping the handle closes stdin, as the Pi extension does.
-        let _ = child.stdin.take().expect("piped stdin").write_all(bytes);
-    }
+        std::thread::spawn(move || pipe.write_all(&bytes))
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let line = loop {
+        // Polled before the accept, so an accept that finds nothing after the
+        // CLI exited means it never connected.
+        let exited = child.try_wait().expect("poll agent-event").is_some();
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("make the accepted stream blocking");
+                let mut line = String::new();
+                stream
+                    .read_to_string(&mut line)
+                    .expect("read emitted AgentEvent");
+                break Some(line);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if exited || Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept emitted AgentEvent: {error}"),
+        }
+    };
     let output = child.wait_with_output().expect("wait for agent-event");
     assert!(
         output.status.success(),
@@ -69,27 +110,9 @@ fn agent_event_line(args: &[&str], stdin: Option<&[u8]>) -> String {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut line = String::new();
-                stream
-                    .read_to_string(&mut line)
-                    .expect("read emitted AgentEvent");
-                return line;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    Instant::now() < deadline,
-                    "`agent-event {args:?}` exited 0 but sent nothing"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("accept emitted AgentEvent: {error}"),
-        }
-    }
+    let line = line.unwrap_or_else(|| panic!("`agent-event {args:?}` exited 0 but sent nothing"));
+    let written = writing.map(|thread| thread.join().expect("stdin writer thread"));
+    (line, written)
 }
 
 /// Scenario: Report a Pi turn the way the bundled extension does — session
@@ -262,9 +285,11 @@ fn a_settled_turns_reply_is_read_from_stdin_never_argv() {
     );
     assert!(reply_from_line(&line).expect("failed reply").failed);
 
-    // A reply past what the deck keeps is cut to it.
-    let long = "x".repeat(MAX_TURN_REPLY_BYTES * 3);
-    let line = agent_event_line(
+    // A reply past what the deck keeps is cut to it, and a writer sending far
+    // more than a pipe holds (64 KiB on Linux) still finishes its write: the
+    // CLI reads what follows the bound and discards it.
+    let long = "x".repeat(256 * 1024);
+    let (line, written) = agent_event_line_writing(
         &["--type", "finished", "--turn-reply-stdin"],
         Some(long.as_bytes()),
     );
@@ -272,6 +297,9 @@ fn a_settled_turns_reply_is_read_from_stdin_never_argv() {
         reply_from_line(&line).expect("long reply").text.len(),
         MAX_TURN_REPLY_BYTES
     );
+    written
+        .expect("stdin was written")
+        .expect("the whole write is consumed, never refused");
 
     // Nothing on stdin, and a report that is not a turn end, carry no reply.
     let line = agent_event_line(&["--type", "finished", "--turn-reply-stdin"], None);
