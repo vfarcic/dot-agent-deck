@@ -1907,6 +1907,12 @@ export interface DeckBridge {
   /** End the reading session `voiceReadingStart` answered (`desktop_voice_reading_stop`). Idempotent. */
   voiceReadingStop(session: number): Promise<void>;
   /**
+   * PRD #1497 — be told when a settings save, from any window of this app,
+   * turned reading's Settings opt-in off (`desktop://reading-consent-off`),
+   * so a drain this window holds is cut off too. Answers the unsubscribe.
+   */
+  onVoiceReadingConsentOff(listener: () => void): Promise<() => void>;
+  /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
    * a snapshot event — because an attach costs one daemon socket and one full
@@ -2920,6 +2926,12 @@ class FixtureDeckBridge implements DeckBridge {
 
   async voiceReadingStop(): Promise<void> {
     await Promise.resolve();
+  }
+
+  /** The preview has one window and saves nothing elsewhere, so this is never told. */
+  async onVoiceReadingConsentOff(): Promise<() => void> {
+    await Promise.resolve();
+    return () => undefined;
   }
 
   /**
@@ -4633,6 +4645,11 @@ export class TauriDeckBridge implements DeckBridge {
   async voiceReadingStop(session: number): Promise<void> {
     const invoke = await this.getInvoke();
     await invoke<null>("desktop_voice_reading_stop", { session });
+  }
+
+  async onVoiceReadingConsentOff(listener: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<null>("desktop://reading-consent-off", () => listener());
   }
 
   /**

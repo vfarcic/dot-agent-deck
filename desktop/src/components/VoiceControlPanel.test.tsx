@@ -2695,12 +2695,17 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
     const deck = runtime(resolveVoice, voice);
     const stopped: number[] = [];
+    const consentOff = new Set<() => void>();
     const reading = {
       declareVoiceScreen: vi.fn(),
       voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
       voiceSpeechAudio: vi.fn(async () => new ArrayBuffer(0)),
       voiceReadingStart: vi.fn(start),
       voiceReadingStop: vi.fn(async (session: number) => { stopped.push(session); }),
+      onVoiceReadingConsentOff: vi.fn(async (listener: () => void) => {
+        consentOff.add(listener);
+        return () => { consentOff.delete(listener); };
+      }),
     };
     Object.assign(deck, reading);
     if (consented) {
@@ -2723,7 +2728,7 @@ describe("voice reading mode (PRD #1497 M5)", () => {
       await flush();
       expect(voice.voiceStop).toHaveBeenCalledTimes(before + 1);
     };
-    return { deck, reading, spoken, stopped, say, resolveVoice };
+    return { deck, reading, spoken, stopped, say, resolveVoice, consentOff };
   }
 
   /** The agent being read exits: its events close while the app is still saying "Reading on.", so reading is off but draining. */
@@ -2755,6 +2760,18 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     expect(within(group).getByRole("radio", { name: "On" })).toBeChecked();
     const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
     await act(async () => { fireEvent.click(within(group).getByRole("radio", { name: "Off" })); });
+    await flush();
+    expect(vi.mocked(speechSynthesis.cancel).mock.calls.length).toBeGreaterThan(cancels);
+    expect(spoken.at(-1)).toBe("Reading off.");
+  });
+
+  /** Scenario (PR #1617 round 4): the agent being read exits while the app is still speaking, so its last sentences are draining; a save from another window of the app turns Read turns aloud off, which this window hears only as the app's consent-off event — the drain is cut off at once and the app says "Reading off.". */
+  it("ends a drain when another window turns the Settings opt-in off", async () => {
+    const { reading, spoken, consentOff } = await startReading();
+    await closeEvents(reading);
+    expect(consentOff.size).toBe(1);
+    const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
+    await act(async () => { for (const listener of consentOff) listener(); });
     await flush();
     expect(vi.mocked(speechSynthesis.cancel).mock.calls.length).toBeGreaterThan(cancels);
     expect(spoken.at(-1)).toBe("Reading off.");

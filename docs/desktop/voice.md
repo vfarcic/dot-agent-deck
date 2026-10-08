@@ -241,7 +241,7 @@ The reading switches work in typing mode too, so a bare "reading on" or "reading
 
 | Choice | Voice |
 | --- | --- |
-| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. A sentence the service may no longer be sent, because **Read turns aloud** was turned off or the Commands service changed, is not said at all. |
+| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. A sentence the service may no longer be sent, because **Read turns aloud** was turned off or the Commands service changed in Settings, is not said at all. |
 | **Provider** | Only the Commands service's text-to-speech. With the Anthropic API, nothing can speak, and the app says to choose Auto or System. |
 | **System** | Only this computer's voice. Nothing is sent to be spoken. |
 

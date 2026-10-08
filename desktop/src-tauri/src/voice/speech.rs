@@ -203,26 +203,57 @@ impl SpeechError {
 /// reading's opt-in off, or changes the Commands connection, cancels a request
 /// that already passed its last check (PR #1617's review).
 ///
-/// Each request registers what it was prepared for ([`Self::revoked`]), and
-/// every save walks the registry ([`Self::publish`]), cancelling each request
-/// the saved settings do not permit — at the publish itself, so a later save
-/// that permits it again cannot take the cancellation back (PR #1617's third
-/// review: a watch channel kept only the latest value, so Off then On before
-/// the request next ran left it alive). The save path does not have to know
-/// which connection a request was prepared for.
+/// Each request registers when its command starts ([`Self::register`]),
+/// before it reads the settings at all, and every save walks the registry
+/// ([`Self::publish`]), cancelling each request the saved settings do not
+/// permit — at the publish itself, so a later save that permits it again
+/// cannot take the cancellation back (PR #1617's third review: a watch channel
+/// kept only the latest value, so Off then On before the request next ran left
+/// it alive). The save path does not have to know which connection a request
+/// was prepared for.
+///
+/// Until the request knows its connection ([`Self::prepared_for`]), a save
+/// that does not permit the provider's speech at all cancels it at once, and
+/// every other save is kept and checked against the connection when it is
+/// known (PR #1617's fourth review: a request that registered only after its
+/// first settings read missed an Off-then-On, or B-then-A, pair of saves
+/// landing between that read and the registration).
 #[derive(Default)]
 pub struct SpeechRevocation {
-    in_flight: std::sync::Mutex<Vec<InFlightSpeech>>,
+    registry: std::sync::Mutex<Registry>,
+}
+
+#[derive(Default)]
+struct Registry {
+    next: u64,
+    in_flight: Vec<InFlightSpeech>,
 }
 
 struct InFlightSpeech {
-    intent: IntentSettings,
+    id: u64,
+    prepared: Prepared,
     cancel: tokio::sync::oneshot::Sender<String>,
 }
 
+/// What a registered request was prepared for.
+enum Prepared {
+    /// Not known yet: the settings of every save since it registered that
+    /// permit the provider's speech, to check its connection against.
+    Unknown(Vec<VoiceSettings>),
+    For(IntentSettings),
+}
+
+/// A request registered with [`SpeechRevocation::register`], not yet told
+/// which connection it is for. Dropping it unregisters the request at the
+/// next publish.
+pub struct SpeechTicket {
+    id: u64,
+    cancelled: tokio::sync::oneshot::Receiver<String>,
+}
+
 impl SpeechRevocation {
-    fn in_flight(&self) -> std::sync::MutexGuard<'_, Vec<InFlightSpeech>> {
-        self.in_flight
+    fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -230,13 +261,19 @@ impl SpeechRevocation {
     /// A save wrote `settings`: every request in flight they do not permit is
     /// cancelled now, with why. Requests that finished are forgotten.
     pub fn publish(&self, settings: &VoiceSettings) {
-        let mut in_flight = self.in_flight();
-        for request in std::mem::take(&mut *in_flight) {
+        let mut registry = self.registry();
+        for mut request in std::mem::take(&mut registry.in_flight) {
             if request.cancel.is_closed() {
                 continue;
             }
-            match permitted_on(settings, &request.intent) {
-                Ok(()) => in_flight.push(request),
+            let verdict = match &mut request.prepared {
+                Prepared::For(intent) => permitted_on(settings, intent),
+                Prepared::Unknown(seen) => provider_permitted(settings).inspect(|()| {
+                    seen.push(settings.clone());
+                }),
+            };
+            match verdict {
+                Ok(()) => registry.in_flight.push(request),
                 Err(refusal) => {
                     let _ = request.cancel.send(refusal);
                 }
@@ -244,20 +281,55 @@ impl SpeechRevocation {
         }
     }
 
-    /// Resolves, with why, once a save after this call no longer permits a
-    /// request prepared for `intent` ([`permitted_on`]); pending otherwise.
-    ///
-    /// Registers when called, not when first polled, so a caller that calls
-    /// this before its last settings read misses no save: one written before
-    /// that read is in what it read, and one written after it is published
-    /// after this registered. Dropping the future unregisters it at the next
-    /// publish.
-    pub fn revoked(&self, intent: IntentSettings) -> impl Future<Output = String> + Send + 'static {
+    /// Register a request now — call it before the request's first settings
+    /// read — so every save from this moment on is held against it.
+    pub fn register(&self) -> SpeechTicket {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        let mut in_flight = self.in_flight();
-        in_flight.retain(|request| !request.cancel.is_closed());
-        in_flight.push(InFlightSpeech { intent, cancel });
-        drop(in_flight);
+        let mut registry = self.registry();
+        registry
+            .in_flight
+            .retain(|request| !request.cancel.is_closed());
+        let id = registry.next;
+        registry.next += 1;
+        registry.in_flight.push(InFlightSpeech {
+            id,
+            prepared: Prepared::Unknown(Vec::new()),
+            cancel,
+        });
+        SpeechTicket { id, cancelled }
+    }
+
+    /// The request `ticket` registered was prepared for `intent`. Resolves,
+    /// with why, once a save since it registered no longer permits it
+    /// ([`permitted_on`]) — at once, if one already has — and stays pending
+    /// otherwise. Dropping the future unregisters it at the next publish.
+    pub fn prepared_for(
+        &self,
+        ticket: SpeechTicket,
+        intent: IntentSettings,
+    ) -> impl Future<Output = String> + Send + 'static {
+        let SpeechTicket { id, cancelled } = ticket;
+        let mut registry = self.registry();
+        if let Some(at) = registry
+            .in_flight
+            .iter()
+            .position(|request| request.id == id)
+        {
+            let refusal = match &registry.in_flight[at].prepared {
+                Prepared::Unknown(seen) => seen
+                    .iter()
+                    .find_map(|settings| permitted_on(settings, &intent).err()),
+                Prepared::For(_) => None,
+            };
+            match refusal {
+                Some(refusal) => {
+                    let request = registry.in_flight.swap_remove(at);
+                    let _ = request.cancel.send(refusal);
+                }
+                None => registry.in_flight[at].prepared = Prepared::For(intent),
+            }
+        }
+        drop(registry);
         async move {
             match cancelled.await {
                 Ok(refusal) => refusal,
@@ -266,10 +338,19 @@ impl SpeechRevocation {
         }
     }
 
+    /// [`Self::register`] and [`Self::prepared_for`] at once, for a caller
+    /// that already knows its connection: every save after this call is held
+    /// against it.
+    pub fn revoked(&self, intent: IntentSettings) -> impl Future<Output = String> + Send + 'static {
+        let ticket = self.register();
+        self.prepared_for(ticket, intent)
+    }
+
     /// How many requests are registered and not yet finished.
     #[cfg(test)]
     fn pending(&self) -> usize {
-        self.in_flight()
+        self.registry()
+            .in_flight
             .iter()
             .filter(|request| !request.cancel.is_closed())
             .count()
@@ -902,7 +983,89 @@ mod tests {
         drop(request);
         assert_eq!(revocation.pending(), 0);
         revocation.publish(&permitting);
-        assert!(revocation.in_flight().is_empty());
+        assert!(revocation.registry().in_flight.is_empty());
+    }
+
+    /// Scenario (PR #1617's fourth review): the speech command registers at
+    /// entry, and two saves land before its first settings read — reading's
+    /// opt-in turned off and straight back on, or the connection changed and
+    /// changed back. Its read then sees the settings as they are again, and
+    /// the request is still refused once its connection is known: every save
+    /// since the command started is held against it. Saves that permit it
+    /// throughout leave it alone.
+    #[tokio::test]
+    async fn voice_speech_a_save_before_the_first_read_is_not_missed() {
+        let intent = openai();
+        let other = openai_at("https://gateway.example/v1/chat/completions");
+        for (name, first, expected) in [
+            (
+                "opt-in off then on",
+                voice(SpeechSource::Auto, intent.clone(), ReadingConsent::Off),
+                PROVIDER_SPEECH_NOT_PERMITTED,
+            ),
+            (
+                "connection away and back",
+                voice(SpeechSource::Auto, other.clone(), ReadingConsent::On),
+                SPEECH_CONNECTION_CHANGED,
+            ),
+        ] {
+            let revocation = SpeechRevocation::default();
+            let ticket = revocation.register();
+            revocation.publish(&first);
+            revocation.publish(&voice(
+                SpeechSource::Auto,
+                intent.clone(),
+                ReadingConsent::On,
+            ));
+            // The first settings read now sees `intent` with reading on.
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut request = Box::pin(unless_revoked(
+                in_flight(&dropped),
+                revocation.prepared_for(ticket, intent.clone()),
+            ));
+            assert_eq!(
+                settle(&mut request).await,
+                Some(Err(SpeechError::refused(expected))),
+                "{name}: the save before the first read was missed"
+            );
+            drop(request);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+            assert_eq!(revocation.pending(), 0, "{name}");
+        }
+
+        // Permitted by every save since it registered: left alone, and still
+        // held against the saves after it knows its connection.
+        let revocation = SpeechRevocation::default();
+        let ticket = revocation.register();
+        revocation.publish(&voice(
+            SpeechSource::Provider,
+            intent.clone(),
+            ReadingConsent::On,
+        ));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = Box::pin(unless_revoked(
+            in_flight(&dropped),
+            revocation.prepared_for(ticket, intent.clone()),
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            None,
+            "a permitting save cancelled it"
+        );
+        revocation.publish(&voice(
+            SpeechSource::Auto,
+            intent.clone(),
+            ReadingConsent::Off,
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            Some(Err(SpeechError::refused(PROVIDER_SPEECH_NOT_PERMITTED)))
+        );
+
+        // A ticket dropped before its connection was known is forgotten.
+        let revocation = SpeechRevocation::default();
+        drop(revocation.register());
+        assert_eq!(revocation.pending(), 0);
     }
 
     /// Scenario (PR #1617's third review): the webview reads a refusal and a

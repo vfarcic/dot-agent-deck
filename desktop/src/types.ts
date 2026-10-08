@@ -1451,6 +1451,8 @@ export interface DeckRuntimeState {
   voiceReadingStart?: (target: import("./lib/reading").ReadingTarget, onSentence: (sentence: import("./lib/reading").ReadingSentenceDto) => void) => Promise<import("./lib/reading").ReadingStartDto>;
   /** PRD #1497 M5 — end a reading session. */
   voiceReadingStop?: (session: number) => Promise<void>;
+  /** PRD #1497 — a save from any window turned reading's opt-in off; see `DeckBridge.onVoiceReadingConsentOff`. */
+  onVoiceReadingConsentOff?: (listener: () => void) => Promise<() => void>;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *

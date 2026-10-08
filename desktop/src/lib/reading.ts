@@ -155,9 +155,13 @@ export class ReadingMode {
   async turnOn(target: ReadingTarget): Promise<ReadingTurnOn> {
     if (sameAgent(this.current?.target, target)) return { kind: "started", sentence: READING_ALREADY_ON };
     if (this.current !== undefined) await this.end(false);
-    // A drain is left to finish: those sentences are already queued, and the
-    // new session's own ending cuts them off with everything else.
-    this.draining = undefined;
+    /* A fresh "reading on" wants new reading, not the old tail (PR #1617
+       round 4): a drain is cut off here, before the start is asked for, so
+       a start that fails or is refused leaves no speech without an owner. */
+    if (this.draining !== undefined) {
+      this.draining = undefined;
+      this.deps.speech.interrupt();
+    }
     const generation = ++this.generation;
     this.starting = target;
     let answer: ReadingStartDto;
@@ -256,9 +260,15 @@ export class ReadingMode {
    * queued — a drain's included — unless `drain` (the agent's events ended,
    * and what was already handed to the speech queue is heard, as a drain);
    * then say "Reading off." (when `announce`); then stop the subscription.
+   *
+   * A drain is owned by the session that ended, or — when `closed` arrived
+   * before the start answered — by that start, whose late answer is then
+   * stopped as abandoned. Either way, everything that ends reading still
+   * reaches what it handed to the speech queue.
    */
   private async end(announce: boolean, drain = false): Promise<void> {
     this.generation += 1;
+    const starting = this.starting;
     this.starting = undefined;
     this.draining = undefined;
     const ended = this.current;
@@ -266,7 +276,8 @@ export class ReadingMode {
     if (ended !== undefined) this.deps.onChange?.(undefined);
     if (!drain) this.deps.speech.interrupt();
     if (announce) this.deps.speech.say(READING_VOICE_KEY, READING_OFF);
-    if (drain && ended !== undefined && this.deps.speech.speaking) this.draining = ended.target;
+    const owner = ended?.target ?? starting;
+    if (drain && owner !== undefined && this.deps.speech.speaking) this.draining = owner;
     if (ended !== undefined) await this.deps.stop(ended.session);
   }
 }

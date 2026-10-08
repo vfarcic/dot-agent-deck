@@ -415,6 +415,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   const voiceSpeechAudio = useCallback((text: string) => bridge.voiceSpeechAudio(text), [bridge]);
   const voiceReadingStart = useCallback((target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => bridge.voiceReadingStart(target, onSentence), [bridge]);
   const voiceReadingStop = useCallback((session: number) => bridge.voiceReadingStop(session), [bridge]);
+  const onVoiceReadingConsentOff = useCallback((listener: () => void) => bridge.onVoiceReadingConsentOff(listener), [bridge]);
 
   const sendTerminalInput = useCallback((target: AgentTarget, data: string, precondition?: () => boolean) => bridge.sendTerminalInput(target, data, precondition), [bridge]);
   const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
@@ -516,6 +517,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     voiceSpeechAudio,
     voiceReadingStart,
     voiceReadingStop,
+    onVoiceReadingConsentOff,
     setZoom,
   };
 }

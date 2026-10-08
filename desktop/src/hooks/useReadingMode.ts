@@ -31,7 +31,7 @@ export interface UseReadingMode {
 }
 
 export function useReadingMode(
-  runtime: Pick<DeckRuntimeState, "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop">,
+  runtime: Pick<DeckRuntimeState, "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff">,
   onChange?: (target: ReadingTarget | undefined) => void,
   onProblem?: (reason: string) => void,
 ): UseReadingMode {
@@ -67,6 +67,23 @@ export function useReadingMode(
   useEffect(() => queue.subscribe((speaking) => {
     if (speaking) spoke.current = true;
   }), [queue]);
+  /* A save from any window that turned reading's opt-in off ends reading
+     here too — a drain or a start in progress included, which the Rust side
+     has no session for (PR #1617's fourth review). */
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    let gone = false;
+    void runtimeRef.current.onVoiceReadingConsentOff?.(() => { void mode.consentOff(); })
+      .then((stop) => {
+        if (gone) stop();
+        else unsubscribe = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      gone = true;
+      unsubscribe?.();
+    };
+  }, [mode]);
   // Unmounting ends the session and silences the app, without a sentence.
   useEffect(() => () => { void mode.dispose(); }, [mode]);
 

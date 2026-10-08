@@ -1487,6 +1487,12 @@ fn ensure_main_webview(webview: &Webview) -> Result<(), String> {
     }
 }
 
+/// PRD #1497 — a save turned reading's Settings opt-in off: every webview of
+/// this app ends its reading mode, a drain or a start in progress included.
+fn emit_reading_consent_off(app: &AppHandle) {
+    let _ = app.emit("desktop://reading-consent-off", ());
+}
+
 fn emit_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
     let _ = app.emit("desktop://snapshot", snapshot);
 }
@@ -2497,7 +2503,12 @@ async fn desktop_set_settings(
     let failure = match saved {
         Ok(written) => {
             voice_state
-                .put_saved_in_force(order, &written, apply_selection(&app, &state, &written))
+                .put_saved_in_force(
+                    order,
+                    &written,
+                    || emit_reading_consent_off(&app),
+                    apply_selection(&app, &state, &written),
+                )
                 .await;
             return Ok(written);
         }
@@ -2522,7 +2533,12 @@ async fn desktop_set_settings(
         return Err(message.into());
     };
     voice_state
-        .put_saved_in_force(order, &disk, apply_selection(&app, &state, &disk))
+        .put_saved_in_force(
+            order,
+            &disk,
+            || emit_reading_consent_off(&app),
+            apply_selection(&app, &state, &disk),
+        )
         .await;
     Err(crate::dto::DesktopSettingsSaveError::Partial(
         crate::dto::DesktopPartialSettingsSave {
@@ -2865,13 +2881,22 @@ impl VoiceState {
     /// #1617's third review). `order` is released then, so the next save puts
     /// its own settings in force after these and need not wait on the deck
     /// work.
+    ///
+    /// A save that leaves reading not consented to also calls `consent_off`,
+    /// which tells every webview of this app (PR #1617's fourth review): a
+    /// webview whose session is draining — or starting — has nothing here to
+    /// end, and a window other than the one that saved never sees the new
+    /// settings otherwise.
     async fn put_saved_in_force(
         &self,
         order: tokio::sync::MutexGuard<'_, ()>,
         settings: &DesktopSettings,
+        consent_off: impl FnOnce(),
         deck_work: impl std::future::Future<Output = ()>,
     ) {
-        self.reading.end_unless_consented(settings);
+        if !self.reading.end_unless_consented(settings) {
+            consent_off();
+        }
         self.speech
             .publish(&settings.voice.clone().unwrap_or_default());
         drop(order);
@@ -3952,12 +3977,14 @@ async fn desktop_voice_speech_audio(
     if text.len() > voice::speech::MAX_SPEECH_INPUT_CHARS * 4 {
         return Err(SpeechError::failed("that is too long to speak"));
     }
+    // Registered before the first settings read, so every save from here on
+    // is held against this request — one that lands before its connection
+    // is known included (PR #1617's fourth review).
+    let ticket = voice_state.speech.register();
     let settings = voice_settings_now().await.map_err(SpeechError::failed)?;
     voice::speech::provider_permitted(&settings).map_err(SpeechError::refused)?;
     let intent = settings.intent;
-    // Before the last settings read (inside `synthesise`), so no save between
-    // that read and the request is missed.
-    let revoked = voice_state.speech.revoked(intent.clone());
+    let revoked = voice_state.speech.prepared_for(ticket, intent.clone());
     let audio = voice::speech::unless_revoked(
         voice::speech::synthesise(
             &intent,
@@ -4259,14 +4286,14 @@ impl ReadingSessions {
     /// current session ends now — its task stops, so no further summary is
     /// requested — and the webview is told, so it clears the indicator and
     /// the queued speech. A start still in progress is made stale, so it is
-    /// not installed after this.
-    fn end_unless_consented(&self, settings: &DesktopSettings) {
+    /// not installed after this. Answers whether reading is consented to.
+    fn end_unless_consented(&self, settings: &DesktopSettings) -> bool {
         let consented = settings
             .voice
             .as_ref()
             .is_some_and(|voice| voice.reading == crate::settings::ReadingConsent::On);
         if consented {
-            return;
+            return true;
         }
         let ended = {
             let mut state = self.state();
@@ -4277,6 +4304,7 @@ impl ReadingSessions {
             ended.task.abort();
             (ended.ender)();
         }
+        false
     }
 }
 
@@ -6103,9 +6131,17 @@ mod tests {
         };
         let order = voice_state.saves.lock().await;
         let (finish_deck_work, deck_work) = tokio::sync::oneshot::channel::<()>();
-        let save = voice_state.put_saved_in_force(order, &off, async {
-            let _ = deck_work.await;
-        });
+        let told = AtomicUsize::new(0);
+        let save = voice_state.put_saved_in_force(
+            order,
+            &off,
+            || {
+                told.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                let _ = deck_work.await;
+            },
+        );
         tokio::pin!(save);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut save)
@@ -6121,6 +6157,11 @@ mod tests {
             "the speech request was not cancelled before the deck work finished"
         );
         assert_eq!(ended.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            told.load(Ordering::SeqCst),
+            1,
+            "the webviews were not told before the deck work finished"
+        );
         wait_for(&aborted);
         assert!(
             voice_state.saves.try_lock().is_ok(),
@@ -6128,6 +6169,38 @@ mod tests {
         );
         finish_deck_work.send(()).expect("the deck work is waiting");
         save.await;
+    }
+
+    /// Scenario (PR #1617's fourth review): a save that turns Read turns
+    /// aloud off tells the webviews even when this process holds no reading
+    /// session — a window's reading can be draining, or another window's
+    /// speech can be playing, with nothing here to end — and a save that
+    /// keeps it on tells them nothing.
+    #[tokio::test]
+    async fn voice_reading_a_consent_off_save_tells_the_webviews_without_a_session() {
+        let voice_state = VoiceState::default();
+        let consenting = |reading| DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                reading,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let told = AtomicUsize::new(0);
+        let tell = || {
+            told.fetch_add(1, Ordering::SeqCst);
+        };
+        for (settings, expected) in [
+            (consenting(crate::settings::ReadingConsent::On), 0),
+            (consenting(crate::settings::ReadingConsent::Off), 1),
+            (DesktopSettings::default(), 2),
+        ] {
+            let order = voice_state.saves.lock().await;
+            voice_state
+                .put_saved_in_force(order, &settings, tell, async {})
+                .await;
+            assert_eq!(told.load(Ordering::SeqCst), expected);
+        }
     }
 
     /// Scenario (PR #1617 review): "reading on" is said twice in quick

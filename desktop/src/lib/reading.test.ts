@@ -453,3 +453,74 @@ describe("ReadingMode ending with speech in flight (audit A-B3)", () => {
     expect(system.fetched).toEqual(["The tester finished: fell back."]);
   });
 });
+
+/** Reading mode over a real speech queue whose start the test drives: held until released, and answering whatever each call is given. */
+function drivenStart() {
+  const provider = new FetchingVoice();
+  const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: false }), provider, system: new FetchingVoice() });
+  const sinks: ((sentence: ReadingSentenceDto) => void)[] = [];
+  const answers: (() => Promise<ReadingStartDto>)[] = [];
+  const stop = vi.fn(async () => undefined);
+  const mode = new ReadingMode({
+    start: (_target, onSentence) => {
+      sinks.push(onSentence);
+      const answer = answers.shift();
+      return answer ? answer() : Promise.resolve({ kind: "started", session: 7 });
+    },
+    stop,
+    speech: queue,
+  });
+  return { mode, queue, provider, sinks, stop, answers };
+}
+
+describe("ReadingMode drain ownership (PR #1617 round 4)", () => {
+  /** Scenario: "reading on" is said and, before the start has answered, the agent's channel delivers a summary and then `closed`; the summary keeps playing as a drain owned by that start, whose late answer is stopped, and turning the Settings opt-in off cuts it off. */
+  it("gives a drain an owner when the events close before the start answers", async () => {
+    const h = drivenStart();
+    let release!: (value: ReadingStartDto) => void;
+    h.answers.push(() => new Promise((resolve) => { release = resolve; }));
+    const turning = h.mode.turnOn(TESTER);
+    h.sinks[0]({ kind: "turn", text: "The tester finished: before the answer." });
+    h.sinks[0]({ kind: "closed", text: "Reading off." });
+    await flush();
+    release({ kind: "started", session: 9 });
+    expect(await turning).toEqual({ kind: "abandoned" });
+    expect(h.stop).toHaveBeenCalledWith(9);
+    expect(h.mode.on).toBe(false);
+    expect(h.mode.active).toBe(true);
+
+    await h.mode.consentOff();
+    expect(h.provider.aborted).toEqual(["The tester finished: before the answer."]);
+    await flush();
+    h.provider.finish(); // "Reading off.", said once more
+    await flush();
+    expect(h.provider.fetched).toEqual(["The tester finished: before the answer.", READING_OFF]);
+    expect(h.mode.active).toBe(false);
+  });
+
+  const failedRestarts: [string, () => Promise<ReadingStartDto>][] = [
+    ["rejects", () => Promise.reject(new Error("ipc down"))],
+    ["is refused", () => Promise.resolve({ kind: "not_enabled", sentence: "Reading is turned off in Settings." })],
+  ];
+  for (const [name, answer] of failedRestarts) {
+    /** Scenario: the agent's events close while its last summary is being said, so reading is draining; "reading on" is said again for the same pane and the new start fails. The drain is cut off before the start is asked for, so no summary from the old session keeps playing without an owner. */
+    it(`cuts a drain off when "reading on" is said again and the start ${name}`, async () => {
+      const h = drivenStart();
+      await h.mode.turnOn(TESTER);
+      await flush();
+      h.provider.finish(); // "Reading on."
+      await flush();
+      h.sinks[0]({ kind: "turn", text: "The tester finished: the old tail." });
+      await flush();
+      h.sinks[0]({ kind: "closed", text: "Reading off." });
+      await flush();
+      expect(h.mode.active).toBe(true);
+
+      h.answers.push(answer);
+      expect((await h.mode.turnOn(TESTER)).kind).toBe("refused");
+      expect(h.provider.aborted).toEqual(["The tester finished: the old tail."]);
+      expect(h.queue.pending.map((entry) => entry.text)).not.toContain(READING_OFF);
+      expect(h.mode.active).toBe(false);
+    });
+  }
+});
