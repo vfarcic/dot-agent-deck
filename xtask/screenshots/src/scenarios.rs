@@ -107,6 +107,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "daemon-upgrade",
+        description: "The desktop Upgrade dialog for a remote daemon on an older release, stopped at the restart question that names the agents a restart would stop, with Keep current daemon and Restart now.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "settings-voice",
         description: "Desktop Voice settings.",
         clients: &[Client::Desktop],

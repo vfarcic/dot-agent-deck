@@ -1,0 +1,21 @@
+# Fixture for pane/restart/014 (`tests/e2e_pane_restart_live.rs`). The same
+# shape as `pane-restart-live` — `orchestrator` (start = true) on `cat`, plus
+# `coder` — except that `coder` exits only when the test creates
+# `./coder-may-exit` in the orchestration's working directory, rather than on
+# its own after `sleep 0.3`. The test must read coder's FIRST generation's id
+# before that generation exits, because the daemon stops listing an agent
+# once it has exited; with a 0.3 s lifetime a starved runner read it too late
+# and found no coder at all. The test overwrites this block with a
+# long-lived `coder` before restarting it, as pane/restart/009 does.
+[[orchestrations]]
+name = "restart-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "while [ ! -f ./coder-may-exit ]; do sleep 0.05; done; exit 0"
+clear = false

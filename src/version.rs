@@ -52,6 +52,38 @@ pub async fn check_for_update() -> Option<String> {
     should_notify(&current, &tag)
 }
 
+/// Pull the version number out of `dot-agent-deck --version` output.
+///
+/// The one parser for that output (PRD #1487 merged the two copies `remote.rs`
+/// and `connect.rs` each carried). Strict on purpose, because callers use the
+/// parse to tell "this really is dot-agent-deck" from "some other binary sits
+/// at the same path" — `connect`'s probe, `remote`'s install check, and the
+/// daemon's verification of the build it is about to restart onto. Requires:
+///
+/// 1. The first whitespace token to be exactly `dot-agent-deck`.
+/// 2. The second token to start with a digit (after an optional `v`) and
+///    contain a `.` — a cheap-but-sufficient sanity check that catches
+///    "hello world" while accepting both `0.24.5` and `v0.24.5-rc.1`.
+///
+/// Returns the version token verbatim; callers compare strings.
+pub(crate) fn parse_version_output(stdout: &str) -> Option<String> {
+    let mut parts = stdout.split_whitespace();
+    let prog = parts.next()?;
+    if prog != "dot-agent-deck" {
+        return None;
+    }
+    let version = parts.next()?;
+    let stripped = version.strip_prefix('v').unwrap_or(version);
+    let first = stripped.chars().next()?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    if !stripped.contains('.') {
+        return None;
+    }
+    Some(version.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -72,7 +72,7 @@ Other `remote` subcommands:
 | Command | What it does |
 |---|---|
 | `dot-agent-deck remote list` | Prints the registry as a table. Offline. |
-| `dot-agent-deck remote upgrade <NAME> [--version <V>] [--no-install]` | Reinstalls the binary on the host (see [Upgrade a remote](#upgrade-a-remote)). |
+| `dot-agent-deck remote upgrade <NAME> [--version <V>] [--no-install] [--json]` | Installs a new release on the host and restarts its daemon onto it, asking first when agents are running (see [Upgrade a remote](#upgrade-a-remote)). |
 | `dot-agent-deck remote doctor <NAME>` | Read-only diagnosis of ssh, the install and reverse tunnels (see [Check a remote's health](#check-a-remotes-health)). |
 | `dot-agent-deck remote remove <NAME>` | Removes the entry from the registry. The binary, hooks, daemon and agents on the host are left as they are. |
 | `dot-agent-deck connect [NAME]` | Opens the TUI on the host (see [Connect](#connect)). |
@@ -113,7 +113,7 @@ These stop agents:
 
 - **Stop** in the same `Ctrl+C` dialog: it stops every agent the daemon manages and shuts the daemon down, asking once more first while agents are running.
 - Closing one agent: press `Ctrl+D` to reach command mode, then `Ctrl+W`, and choose **Close**. That stops that agent and removes its card.
-- `remote upgrade` followed by accepting the restart prompt (see [Upgrade a remote](#upgrade-a-remote)).
+- An upgrade, from `remote upgrade`, `connect`'s upgrade offer or the desktop app's **Upgrade**, when you choose **Restart now** at the question naming them (see [Upgrade a remote](#upgrade-a-remote)).
 - Anything that stops the host: a reboot, a shutdown, or system sleep. After a reboot the agents are gone; the next `connect` recreates the saved workspace (panes, names, directories, commands) and starts each command again, without the agents' conversations (see [Resuming Sessions](session-management.md#resuming-sessions)). [Keep the daemon running](remote-requirements.md#keep-the-daemon-running) covers the daemon itself.
 
 The `Ctrl+C` dialog looks like this:
@@ -156,18 +156,55 @@ This covers **your laptop** sleeping. A host that sleeps suspends its agents; on
 dot-agent-deck remote upgrade my-vm
 ```
 
-`remote upgrade` repeats the install from `remote add` (arch check, install detection, download, version check, `hooks install`) and records the new version and an `upgraded_at` time in the registry. It prints `Upgraded remote 'my-vm' to version 0.44.0.` on success.
+`remote upgrade` installs the new release on the host and then restarts the host's daemon onto it. The install repeats the one from `remote add` (arch check, install detection, download, version check, `hooks install`) and records the new version and an `upgraded_at` time in the registry. The desktop app's **Upgrade** button ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)) does the same thing, and so does answering `y` to the [upgrade offer on connect](#the-upgrade-offer-on-connect); all three ask the same question and end with the same result.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--version <VERSION>` | this binary's version | Release to install. Use it to move a host to an older release as well as a newer one. |
-| `--no-install` | off | Download nothing; only check that the host's binary reports `--version` and update the registry. Use it after replacing the binary on the host yourself. |
+| `--no-install` | off | Download nothing; only check that the host's binary reports `--version` and update the registry, then restart the daemon as below. Use it after replacing the binary on the host yourself. |
+| `--json` | off | Print the result as one JSON object on stdout, for scripts. The progress lines go to stderr. |
 
-`remote upgrade` replaces the file on disk. It does not touch the running daemon or its agents. The daemon changes version the next time you `connect`, when the new TUI on the host finds a daemon from a different build:
+It prints each step as it goes, then one sentence saying what happened:
 
-- **No agents running**: the TUI restarts the daemon onto the new version without asking.
-- **Agents running**: the TUI shows a prompt naming the running agents. Press `S` to restart the daemon (the listed agents stop). Any other key keeps the current daemon.
-- If the new release also changed the attach protocol, the TUI cannot attach to the old daemon at all. The prompt then says `[any other key] exit, leaving the daemon running`, and declining ends the session with the agents still running under the old daemon. To reach them, reinstall the old release with `dot-agent-deck remote upgrade my-vm --version <old-version>` and connect again. When you are ready to lose them, connect and press `S`.
+```
+Installing the new build on 'my-vm'...
+Upgraded remote 'my-vm' to version 0.44.0.
+Asking the daemon on 'my-vm' to restart...
+Waiting for the new daemon on 'my-vm' to answer...
+Restarted the daemon on 'my-vm' onto the new build (was 0.43.0, now 0.44.0).
+```
+
+What happens to the running daemon depends on what it is running:
+
+- **Nothing running**: the daemon restarts onto the new release without asking.
+- **Agents or orchestration roles running**, in a terminal: the command lists every agent and role the restart would stop, then asks.
+
+  ```
+  Restarting the daemon on 'my-vm' onto the new build stops:
+    Agents:
+      api-refactor (pane 3, in /home/deck/api)
+    Orchestration roles:
+      tdd: orchestrator in pane 1 (orchestrator)
+  Restart now? [r] / Keep current daemon [K]:
+  ```
+
+  `r` restarts now and stops exactly what is listed. Anything else, including `Enter`, keeps the current daemon: the new release stays installed, the old daemon keeps running with your agents, and the next time it restarts it runs the new release. If what is running changes while you are deciding, nothing is stopped and you are asked again with the new list.
+- **Agents or roles running, and no terminal** (a script, a pipe, a scheduled job): nobody can answer, so the command installs the new release, keeps the current daemon, and lists what is still running. Run `remote upgrade` again from a terminal to choose, or once that work has finished.
+- **No daemon running**: the command installs and says so; the next daemon to start runs the new release.
+
+Once the daemon has agreed to restart, it starts no new agents: starting one, from any terminal or the desktop app, fails with `the daemon is restarting; start the agent again once it is back`. Start it again once the upgrade has finished. An agent that starts while you are still deciding is added to the list, and you are asked again.
+
+The command exits non-zero only when a step fails. Keeping the current daemon, by your choice or because nobody could answer, is not a failure.
+
+### When the upgrade cannot restart the daemon
+
+- **`… the running daemon (0.43.0) is too old to restart itself, so it keeps running.`** The daemon was started by a release that cannot be asked to restart. The new release is installed. To switch, run `dot-agent-deck connect my-vm`: the TUI on the host finds the older daemon and restarts it, without asking when nothing is running, or with a prompt naming the running agents (press `S` to restart and stop them, any other key to keep them). Or run `dot-agent-deck daemon restart` on the host, which refuses while agents are running unless you add `--force`, which stops them. Once the host's daemon runs this release or a later one, it can restart itself.
+- **`Upgrade of 'my-vm' failed while installing the new build: …`** The daemon keeps running. The reason is one of the [errors below](#remote-add-and-remote-upgrade-errors). When the reason starts with `0.45.0 was installed, but …` (reinstalling the hooks, or recording the new version in the deck list, failed), the new release is already on the host, and the summary says `… is installed, but the upgrade stopped before restarting the daemon`: fix what the reason names and run `dot-agent-deck remote upgrade my-vm` again to finish. When the reason says `~/.local/bin/dot-agent-deck on the remote was replaced, but the new binary did not pass its version check`, the download is already in place, so the old binary is gone, and the summary names what is installed now: the version the check read, or `An unverified build`. Run `dot-agent-deck remote upgrade my-vm` again; if the check keeps failing, run `~/.local/bin/dot-agent-deck --version` on the host (or the Homebrew binary the message names) to see what it reports.
+- **`Upgrade of 'my-vm' failed while restarting the daemon: …`** The new release is installed, but the daemon refused to restart onto it, for example because the binary it would restart into is missing or does not answer. Nothing was stopped and the old daemon keeps running. Run `dot-agent-deck remote doctor my-vm` to check the install. If the summary says instead `The daemon that was running may have stopped`, the daemon's answer to the restart request never arrived and the old daemon no longer answers: run `dot-agent-deck connect my-vm` to see what is running now (it starts a daemon if none is).
+- **`Upgrade of 'my-vm' failed while checking the restarted daemon: restarted, but the new daemon did not answer within 20s`** The old daemon stopped, and the new one did not come up in time. Run `dot-agent-deck connect my-vm`, which starts a daemon on the new release if none is running, or `ssh <host> '~/.local/bin/dot-agent-deck daemon status'` to see whether one is. On a host where a systemd user service runs the daemon, systemd starts the new one, so this means the unit does not restart the service: check that it keeps `Restart=on-failure` ([Keep the daemon running](remote-requirements.md#keep-the-daemon-running)) and run `systemctl --user restart dot-agent-deck.service` on the host. When the message ends with `and it is still the daemon that was asked to restart`, the old daemon agreed to restart but never stopped, and nothing replaced it: run `dot-agent-deck remote upgrade my-vm` again, or `dot-agent-deck daemon restart` on the host.
+- **`… another restart of it is already in progress.`** Someone else, from another terminal or the desktop app, is restarting the same daemon. Wait for that to finish.
+- **`… the remote command did not finish within 45s, so it was stopped`** (75s while restarting). The host answered ssh, but the deck on it did not reply in time. If it happened while checking the daemon, nothing was stopped. If it happened while restarting, the daemon may have restarted anyway: run `dot-agent-deck connect my-vm` to see what is running, and `dot-agent-deck remote doctor my-vm` to check the host.
+- **`Installed 0.40.0 on 'my-vm'. The daemon was not restarted, because 0.40.0 is too old to restart it from here; …`** You moved to an **older** release with `--version`, or the host's Homebrew tap had an older release than the one you asked for, from before the deck could restart a daemon during an upgrade. The release is installed, nothing was stopped, the daemon keeps running, and the command exits 0. To switch to it, run `dot-agent-deck connect my-vm`: the TUI on the host restarts the daemon onto it, asking first when agents are running.
 
 ### The upgrade offer on connect
 
@@ -177,11 +214,14 @@ When your laptop's version is newer than the version the host reports, and stdin
 Remote 'my-vm' runs 0.43.0; you have 0.44.0 (2 running agents). Upgrade and connect? [y/N]
 ```
 
-- `y` or `yes` runs `remote upgrade my-vm` to your laptop's version, then connects. The restart rules above then apply.
+- `y` or `yes` runs the same upgrade as `remote upgrade my-vm` to your laptop's version, including the question above when agents or roles are running, prints the result, then connects.
 - Anything else, including `Enter`, connects to the host's current version.
 - The agent count appears when it is known.
-- If the upgrade fails, `connect` prints `warning: upgrade of remote 'my-vm' failed: …` and `Connecting to the existing 0.43.0 install instead.`, and connects anyway.
+- If you chose **Keep current daemon**, the session attaches to the old daemon with your agents and does not ask a second time. If the new release also changed the attach protocol, the session cannot attach to the old daemon: it ends with `error: daemon speaks attach protocol vN, but this binary speaks vM`, leaving the daemon and its agents running. To reach them, reinstall the old release with `dot-agent-deck remote upgrade my-vm --version <old-version>`, keeping the current daemon if it asks, and connect again. If that release predates restart support, the command reports a failure while restarting the daemon; the release is still installed and your agents are untouched.
+- If the install fails, `connect` prints `warning: Upgrade of 'my-vm' failed while installing the new build: …` and `Connecting to the existing 0.43.0 install instead.`, and connects anyway. Whatever the result, `connect` still connects.
 - No offer is made when the host is the same or newer, or when stdin is not a terminal. A version difference never blocks `connect`: the host runs its own TUI and daemon, so your laptop's version does not affect the session.
+
+Without the offer, for example after `remote upgrade` kept the current daemon, the TUI on the host finds a daemon from a different build when you next `connect`. With nothing running it restarts the daemon onto the new version without asking; with agents running it shows a prompt naming them, where `S` restarts the daemon (the listed agents stop) and any other key keeps it.
 
 ### Hosts where Homebrew installed the deck
 

@@ -1,11 +1,13 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey } from "../lib/bridge";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
+import { upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
 import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "../lib/connectionRemedy";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
@@ -1127,6 +1129,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
+  const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1163,10 +1167,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const rowNumbers = useMemo(() => (
     voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined
   ), [numberedAgents, voiceOn]);
+  /* The Upgrade dialog counts as a confirmation for voice and for the
+     dashboard's own keys: it asks whether to stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
      outside the dashboard's region (see `dashboardKeyScroll`). */
   useEffect(() => {
-    if (!rowsShown || confirm) return;
+    if (!rowsShown || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || modalOpen()) return;
       const target = event.target;
@@ -1181,12 +1188,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, rowsShown]);
+  }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
      digit, and a field or terminal keeps its own. */
   useEffect(() => {
-    if (!rowNumbers || !numberedAgents || confirm) return;
+    if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
@@ -1196,8 +1203,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, numberedAgents, openAgent, rowNumbers]);
-  const confirmationOpen = confirm !== undefined;
+  }, [confirmationOpen, numberedAgents, openAgent, rowNumbers]);
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
@@ -1387,12 +1393,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               }}
               overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
+              /*
+                PRD #1487 D8/D9: Upgrade on THIS deck's card, offered only when
+                the crate says its daemon runs an older release than the app.
+              */
+              onUpgrade={runtime.upgradeDaemon && upgradeOffered(deck.snapshot.connection) && deck.snapshot.connection.deckId !== undefined
+                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: "upgrade", offer: deck.snapshot.connection.upgradeOffer })
+                : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
         </section>
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
+      {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {newAgent && newAgentRuntime && (
         <NewAgentDialog
           runtime={newAgentRuntime}
@@ -1466,7 +1480,7 @@ function decksUpTitle(up: number, total: number): string {
  * nothing" and "we cannot see what this deck runs" are different statements and
  * only the first is a number.
  */
-function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
+function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onUpgrade, onNewAgent }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1477,10 +1491,18 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
   onOpenDeck?: () => void;
   onReconnect: () => void;
   onConnectAnyway?: () => void;
+  /** PRD #1487 — Upgrade this deck's daemon. Absent unless the crate offers it. */
+  onUpgrade?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
 }) {
   const connection = deck.snapshot.connection;
+  /*
+    An incompatible deck's note carries Upgrade beside Connect anyway, with the
+    sentence that explains it; every other state puts it on the header, so a
+    card never shows two.
+  */
+  const upgradeInNote = connection.status === "error" && connection.daemonDetected === true;
   const socketPath = connection.socketPath;
   const titleId = useId();
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
@@ -1580,6 +1602,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
+        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${deckName(connection)}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 
@@ -1596,6 +1619,7 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           onOpenDeck={onOpenDeck}
           onReconnect={onReconnect}
           onConnectAnyway={onConnectAnyway}
+          onUpgrade={upgradeInNote ? onUpgrade : undefined}
           onNewAgent={onNewAgent}
         />
       </div>
@@ -1618,7 +1642,7 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
+function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onUpgrade, onNewAgent }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   /** The one instant every relative cell on this screen is measured against. */
@@ -1640,6 +1664,8 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   onReconnect: () => void;
   /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
   onConnectAnyway?: () => void;
+  /** PRD #1487 — Upgrade, in the incompatible note. Absent unless offered. */
+  onUpgrade?: () => void;
   /** The New agent flow on this deck (PRD #1223 M4) — what the first-run note offers. */
   onNewAgent?: () => void;
 }) {
@@ -1741,12 +1767,13 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
             : `The daemon reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this app cannot show ${connection.runningAgentCount === 1 ? "it" : "them"} until the two match, so nothing is listed rather than guessed.`}
           {" "}
           {/* Names exactly the buttons rendered below, with what each does (CLAUDE.md rule 21). */}
-          {incompatibleRemedy(connection, { openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
+          {incompatibleRemedy(connection, { upgrade: Boolean(onUpgrade), openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
         </p>
         <ConnectionDetail detail={connection.detail} />
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
+          {onUpgrade && <button className="button primary" data-testid="overview-upgrade" onClick={onUpgrade}><CircleArrowUp size={14} /> Upgrade</button>}
           {onConnectAnyway && <button className="button primary" data-testid="overview-connect-anyway" onClick={onConnectAnyway}><ShieldAlert size={14} /> Connect anyway</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>

@@ -2397,12 +2397,37 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
 - **Platform coverage:** linux.
 
-##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
+##### hooks/install/006 — The unattended startup install consolidates valid deck pins while keeping user handlers at their existing indices.
 - **Layer:** L2.
 - **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
-- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The two events diverge on WHERE the deck's command ends up, which is issue #1034 — under the installed event it is refreshed at the index it already occupied, the array gains no rule, and the user's handler stays at `…:0:1`; under the retired event, where there is nothing to refresh it with, it is swept out of the user's rule as before and that event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Asserts:** real startup consolidates the installed `PreToolUse` event to one current deck command, refreshing it in place while the user's handler stays at `…:0:1` with its matcher. A second valid deck pin is removed from that installed event. Under retired `SessionEnd`, the user's handler and the other installation's existing rule survive the current installation's retired-event sweep.
 - **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
 - **Platform coverage:** linux.
+
+#### hooks/containment
+
+##### hooks/containment/001 — A real Codex wrapper writes only its sandbox home, and repeat startup leaves current definitions untouched.
+- **Layer:** L2, lane 1 (real binary with a pane id, piped input/output).
+- **Agent:** none (`/bin/true` stands in for the wrapped child).
+- **Asserts:** hooks are installed in an owned sandbox and name its installed binary; a second automatic install preserves bytes, inode and mtime. Separate fake operator Codex, Claude, Devin, OpenCode and Pi files preserve bytes, inode and mtime.
+- **Does not assert:** real Codex trust screens, PTY rendering, or model execution.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/002 — A test-marked real wrapper without an owned root refuses before directory creation.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** omitting the owned root creates no Codex home, temporary file or backup; separate fake operator configs are unchanged.
+- **Does not assert:** a fatal wrapper exit; automatic installation may warn and continue to its child.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/003 — A CODEX_HOME override cannot escape the wrapper's owned root through a symlink.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a symlink from the sandbox to a separate fake operator home cannot rewrite hooks or trust config, create a backup or leave a temporary file. All fake operator configs keep bytes, inode and mtime.
+- **Does not assert:** other agents' environment overrides (covered by the shared config-writer unit tests), races replacing symlinks during a write, or a real agent trust dialog.
+- **Platform coverage:** mac+linux.
+
+#### hooks/install (continued)
 
 ##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
 - **Layer:** fast real-binary-subprocess integration (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`; no PTY, no daemon, no LLM, no `e2e` feature gate).
@@ -2585,6 +2610,65 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/wire-restart
+
+##### lifecycle/wire-restart/001 — An idle daemon restarts onto its installed target without confirmation.
+- **Layer:** L2 (lane 1, real headless `daemon serve` at an isolated endpoint).
+- **Agent:** none.
+- **Asserts:** Hello advertises `restart-daemon`; the production client helper returns Accepted with an empty stopping set and a verified target version; the original process exits cleanly; a wrapper atomically installed at the daemon's captured startup path launches a different successor PID that answers Hello at the same endpoint.
+- **Does not assert:** two independently compiled release versions, SSH installation, CLI prompts, desktop or TUI rendering; the wrapper executes a retained copy of the same test build.
+- **Platform coverage:** linux+mac (Unix sockets and executable install fixtures).
+
+##### lifecycle/wire-restart/002 — Live agents and orchestration roles require explicit confirmation and remain untouched.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** three synthetic `cat` stand-ins, one ordinary agent and two orchestration roles.
+- **Asserts:** repeated unconfirmed requests return NeedsConfirmation with stale false and every stable agent identity, label, pane and cwd, plus both roles and the orchestrator marker; the original daemon stays alive, no successor launches, ListAgents retains the same identities and both roles, and each stand-in PID remains running.
+- **Does not assert:** confirmation UI, real-agent work or installed release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/003 — Returning the matching confirmed set stops the disclosed work and replaces the daemon.
+- **Layer:** L2 (lane 1, real headless daemon and installed-target fixture).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** returning the daemon's disclosed set with reversed agent and role order yields Accepted naming the full stop set; the original daemon exits, every named stand-in PID stops, and a different successor PID answers Hello with empty agent and role inventories.
+- **Does not assert:** UI consent, real-agent behavior, two-release handover or client-spawned successor mode.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/004 — A newly spawned identity makes an earlier confirmation stale without stopping work.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** four synthetic `cat` stand-ins, including two roles and two ordinary agents sharing a display name.
+- **Asserts:** after one extra agent starts, returning the earlier set yields NeedsConfirmation with stale true and all four identities plus both roles; the original daemon, each stand-in PID and the role map remain alive, and no successor launches.
+- **Does not assert:** removed or reassigned roles, perpetual mutation retry limits, UI consent or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/005 — Failed install-target verification preserves the daemon and all live work.
+- **Layer:** L2 (lane 1, owned startup executable atomically replaced under a real headless daemon).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** a non-executable target yields Refused/TargetMissing; an executable whose version probe exits 23 yields Refused/TargetDidNotAnswer; verification refuses before asking for consent, with an explanation, while the original daemon PID, agent identities, live stand-in PIDs and role map remain unchanged.
+- **Does not assert:** Homebrew resolution, verification timeout, wrong architecture, expected-version mismatch, UI or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/006 — Concurrent restart requests accept exactly one handover.
+- **Layer:** L2 (lane 1, two production clients against a real headless daemon).
+- **Agent:** none.
+- **Asserts:** while the first request is inside a filesystem-gated installed-target version probe, a second returns Refused/InProgress before the gate opens; the first then returns Accepted, the original daemon exits, and one recorded successor PID answers Hello at the original endpoint.
+- **Does not assert:** client UI deduplication, real-agent teardown or cross-release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/007 — A termination signal after the restart released its sockets, but before the successor is decided, stops the daemon and starts no successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon from an owned install path; the `e2e`-only successor-plan gate holds it between releasing its sockets and deciding its plan).
+- **Agent:** none.
+- **Asserts:** the restart is accepted; at the gate a SIGTERM is claimed as a stop (the daemon logs that the stop overrides the accepted restart); once the gate opens the daemon exits with status 0, no successor PID is ever recorded, and nothing answers at the endpoint.
+- **Does not assert:** the five-second settlement for a pending wire stop (`daemon_restart::tests::the_plan_waits_for_a_pending_stop_to_settle`); a supervised daemon's exit status.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/008 — After the daemon committed to its restart, a first signal is logged and a second force-exits it, even while it re-verifies its successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon; the successor-plan gate, then an installed build replaced at the gate whose `--version` blocks on a file).
+- **Agent:** none.
+- **Asserts:** with the daemon committed and blocked re-verifying the replaced build, a first SIGTERM is logged as arriving after the commit and not acted on; a second SIGTERM ends the process with status 143; no successor PID is recorded.
+- **Does not assert:** what happens to a successor that was already spawned when the signal arrived (it runs on its own); Windows' Ctrl-C delivery.
+- **Platform coverage:** linux+mac.
+
+
 #### lifecycle/wire-stop
 
 ##### lifecycle/wire-stop/001 — `StopDaemon` REFUSES over the wire while orchestration roles are live, and carries the panes, the roles and both renderings back (issue #1049).
@@ -2641,6 +2725,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the outcome is `WireStopOutcome::AcceptedNotConfirmed`, not `Stopped`. A daemon that exits CLOSES its socket, so its peer sees EOF; silence is a stalled peer and proves nothing, which is why a stalled probe resets the consecutive-unreachable count rather than advancing it. Reporting success for a daemon the caller cannot see is the precise defect #1049 was filed about — over `ssh -L` the PID path printed "Daemon stopped gracefully (pid N)" having killed the tunnel.
 - **Does not assert:** the three-probe confirmation threshold in isolation; the request-timeout half (`lifecycle/wire-stop/007`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/009 — A forced `StopDaemon` names every agent and orchestration role it destroys before it drains them (PRD #1487 audit D1).
+- **Layer:** L1/synthetic (real attach socket served by the production `serve_attach_with_counter`, real stand-in children, `AppState` holding live roles, the daemon's `tracing` output captured on a current-thread runtime).
+- **Agent:** none (three `sleep 30` stand-ins: two role panes and a plain one).
+- **Asserts:** the `force: true` stop is accepted and drains the registry, and the daemon's log carries the issue #1109 teardown inventory under the `stop-daemon` path — the three agents, both roles, which one is the orchestrator — which the wire stop used to omit, logging only counts.
+- **Does not assert:** the inventory's wording (`lifecycle/teardown-inventory/001`); that it precedes the drain beyond the inventory being non-empty, which only holds when it does (`lifecycle/teardown-inventory/002`).
 - **Platform coverage:** linux+mac (`#![cfg(unix)]`).
 
 
@@ -2788,11 +2879,12 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/008 — A daemon whose `Hello` omits `capabilities` makes a project-aware client WITHHOLD the project verbs, and the withheld verb never reaches the wire (PRD #819 M5 capability negotiation).
+##### lifecycle/handshake/008 — Capability-absent project and restart verbs are withheld before the wire.
 - **Layer:** L2 (lane 1 — a real `DaemonClient` against a protocol-faithful synthetic daemon on its own Unix socket; no binary is spawned).
 - **Agent:** none (a scripted in-process daemon thread; the production `Hello` handler calls `AttachResponse::with_capabilities()` unconditionally and takes no argument, so no real daemon can be asked to omit the field, and a production env knob on the `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` model would fake the thing being measured).
 - **Asserts:** against a `Hello` with no `capabilities` key, `DaemonCapabilities::is_advertised()` is false, `require_capability` declines all three of `list-projects` / `resolve-project` / `prepare-orchestration` with a `ClientError::Server` naming the capability, the real M6 call sites `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration` each fail with that same decline, and — the core claim — the scripted daemon's own request log holds the single `hello` and nothing else, so no project verb reached the wire and the `unknown variant …` refusal text was never read. Against a second scripted daemon that DOES advertise, the same `DaemonClient::list_projects` proceeds: all three capabilities are permitted, `list-projects` appears in that daemon's log after one handshake, and the scripted listing comes back.
 - **Does not assert:** any TUI or desktop surface (PRD #819 leaves the TUI's project-resolution sites out of scope, so the client methods are driven directly rather than through a UI); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
+- **Also asserts:** the production `DaemonClient::restart_daemon` returns Unsupported against both an omitted capabilities field and a present set lacking `restart-daemon`; two calls on the same handle each add exactly one fresh Hello to the peer's request log, with no restart or fallback stop frame.
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/handshake/009 — A daemon on a different attach protocol with a live agent: declining the restart prompt refuses to attach, names both protocol numbers, and leaves the daemon and its agent running (issue #405).
@@ -4894,6 +4986,89 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
 - **Platform coverage:** mac+linux+windows.
 
+### Remote upgrade and connect (PRD #1487)
+
+#### remote/upgrade
+
+##### remote/upgrade/001 — TTY upgrades restart idle daemons without a question.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, real sandboxed daemon, SSH shell shim and deterministic download).
+- **Agent:** none.
+- **Asserts:** idle upgrade installs and restarts without asking; restarted summary names from/to versions; a different installed successor PID answers on the same endpoint.
+- **Does not assert:** independently compiled releases, SSH authentication, real-agent work or desktop UI. Old/new debug build stamps distinguish processes executing one retained Cargo build; synthetic PTY coverage is not reel-eligible.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/002 — Piped live upgrades install and keep the current daemon.
+- **Layer:** L2 (lane 1, real CLI with piped stdout and sandboxed SSH installer/daemon).
+- **Agent:** three synthetic cat stand-ins.
+- **Asserts:** no question or hang; exit 0 after installation; live work keeps the original daemon and role map, with a visible installed-not-restarted explanation naming blockers.
+- **Does not assert:** real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/003 — JSON upgrades emit structured outcomes with correct exit codes.
+- **Layer:** L2 (lane 1, real CLI and sandboxed installer/daemon).
+- **Agent:** synthetic cat stand-ins in the live case.
+- **Asserts:** stdout parses as one UpgradeOutcome with kebab-case restarted, installed-not-restarted and failed tags; restarted carries from/to versions; live no-one-to-ask reason contains every agent and role; installation failure names the installing stage and download reason; process outcomes and exit codes agree.
+- **Does not assert:** exact JSON whitespace, every shared outcome variant, real SSH or release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/004 — An older daemon is installed over without receiving a restart frame.
+- **Layer:** L2 (lane 1, real CLI/installer and protocol-faithful Unix-socket old peer).
+- **Agent:** none.
+- **Asserts:** installation succeeds and CLI exits 0; output explains that the daemon is too old to restart itself and gives a remedy; the old peer remains reachable, receives only Hello frames and no successor starts.
+- **Does not assert:** genuine previous-release compatibility (cargo xver owns that), real SSH or TTY rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/005 — Installation failure identifies its stage and preserves live work.
+- **Layer:** L2 (lane 1, real CLI/daemon and deterministic failing download).
+- **Agent:** three synthetic cat stand-ins, including two orchestration roles.
+- **Asserts:** exit nonzero; visible installing-stage reason; installed bytes, original daemon PID/build, agent identities/PIDs and role map remain unchanged.
+- **Does not assert:** restart/verification-stage failures (wire-restart/005 and shared-function coverage own those), real SSH or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/006 — A TTY restart question discloses live agents and roles and honors both choices.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, sandboxed SSH installer and real daemon).
+- **Agent:** three synthetic cat stand-ins, including an orchestrator and coder role.
+- **Asserts:** installation finishes before the question; prompt names all labels, panes, roles, orchestration and orchestrator; Enter preserves the original daemon, agent identities/PIDs and role map; r stops the named work and replaces the daemon.
+- **Does not assert:** real SSH, release compatibility or real-agent work; no reel marker for stand-ins.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/007 — An idle daemon restarts without a TTY.
+- **Layer:** L2 (lane 1, real CLI with piped stdout, sandboxed SSH installer and real daemon).
+- **Agent:** none.
+- **Asserts:** installation and silent restart complete with exit 0 and from/to versions despite no TTY; successor has a new PID/build and answers on the same endpoint (D6 ruling).
+- **Does not assert:** real SSH or independently compiled releases.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/008 — Interactive Haiku keeps working after Keep, then a named restart stops it. [reel]
+- **Layer:** L2 (PTY-attached TUI and upgrade CLI; lane 2, real interactive Claude Haiku).
+- **Agent:** Claude Code (Haiku, interactive; imported credentials, onboarding and cwd trust seeded).
+- **Asserts:** unique file contents absent from the prompt render in the agent's live pane before upgrade; the restart question names that agent and pane; Keep preserves its identity and PID and it reads a new sentinel afterward; Restart now stops the sole disclosed agent, replaces the daemon build at the same endpoint, and connect renders the new empty dashboard.
+- **Does not assert:** real SSH authentication, release-download compatibility, desktop behavior, or survival of a role map (covered synthetically by /006).
+- **Platform coverage:** mac+linux (Unix); credentials required locally, never run in CI.
+
+#### remote/connect
+
+##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, SSH shell shim, real daemon).
+- **Agent:** three synthetic cat stand-ins in the live cases.
+- **Asserts:** y at Upgrade and connect installs; live restart question names all agents and roles; Enter connects to the old daemon with preserved live work and renders its upgrade-team tab with lead and coder cards; r connects to a different successor at the installed build and renders its empty dashboard; neither asks a second remote handshake question and the shared outcome is visible.
+- **Does not assert:** private shared-function routing, independently compiled releases, SSH authentication, real-agent work or desktop UI; no reel marker for synthetic coverage.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/002 — Declining the upgrade still connects to the existing daemon.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty and sandboxed SSH).
+- **Agent:** none.
+- **Asserts:** N and Enter at Upgrade and connect reach the empty dashboard, preserving original daemon PID/build and installed bytes; hooks/install and restart questions do not run.
+- **Does not assert:** live-work decline policy, real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/003 — An idle upgrade-and-connect reaches the new daemon without a second question.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, sandboxed SSH and real daemon).
+- **Agent:** none.
+- **Asserts:** y installs and restarts the idle remote, a different PID/build answers, the empty dashboard renders, the shared restarted outcome is visible and no second handshake consent appears.
+- **Does not assert:** real SSH, independently compiled releases, real-agent work or desktop UI.
+- **Platform coverage:** linux+mac.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor
@@ -5242,14 +5417,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/008 — A surplus copy of this binary's own deck rule is dropped without moving the user (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and keeps the vacated rule object in place as an empty one so no later index moves.
-- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test.
+- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and drops the vacated rule because it is trailing, so nothing after it moves (PRD #1487; an interior vacated rule is kept as an empty one, pinned by `agent_hook_config`'s consolidation unit tests).
+- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test, whose vacated rule is trailing and therefore dropped.
 - **Platform coverage:** mac+linux.
 
 ##### codex/hooks/009 — A legacy flat deck rule is swept without disturbing the nested ones (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves. Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
+- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx`, and the trailing rule the flat command vacated is dropped, which moves nothing (PRD #1487). Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
 - **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex would index a handler inside a flat rule if it ever supported one (it lists none today, which is why that shape claims nothing).
 - **Platform coverage:** mac+linux.
 
@@ -5477,7 +5652,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pane/restart/014 — After `pane restart`, a late `SessionStart` from the REPLACED generation cannot take the role's card back in an attached TUI (issue #320).
 - **Layer:** L2 (PTY-attached real binary: real daemon, real TUI, the real `pane restart` CLI; hook frames posted on the real hook socket).
-- **Agent:** none (`cat` stand-ins for both roles; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
+- **Agent:** none (`cat` for the orchestrator and coder's restarted generation; coder's first generation is a shell loop in the `pane-restart-late-start` fixture that exits only when the test creates `coder-may-exit`, so the test reads its id before it exits even on a starved runner; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
 - **Asserts:** with coder restarted so the daemon has published two generations on its pane, the new generation's `SessionStart` draws its prompt on coder's card; a late `SessionStart` from the replaced generation, followed on the same connection by a barrier frame on the orchestrator's pane, leaves the live generation's prompt on screen and never draws the replaced generation's. The barrier is on another pane on purpose: one from coder's live generation would re-retire a wrongly restored card and hide the defect. Verified load-bearing: with the daemon's generation stamp removed the replaced generation's prompt is drawn and the test fails.
 - **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
 - **Platform coverage:** mac+linux (the e2e tier is Unix-only).

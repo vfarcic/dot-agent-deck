@@ -125,7 +125,7 @@ systemctl --user enable --now dot-agent-deck.service
 sudo loginctl enable-linger "$USER"
 ```
 
-Check it: `systemctl --user status dot-agent-deck.service` shows `active (running)`, and `~/.local/bin/dot-agent-deck daemon endpoint` prints a socket path. For `connect` to find this daemon, your ssh session must see the same `XDG_RUNTIME_DIR` as the service, which is normally the case on a systemd host, where `pam_systemd` sets it for ssh logins; check with `ssh <target> 'echo $XDG_RUNTIME_DIR'`. After `remote upgrade`, run `systemctl --user restart dot-agent-deck.service` so the service runs the new binary. A service starts with a minimal environment, and the daemon takes only `PATH` from your login shell, so put agent credentials in the unit (`Environment=`, or an `EnvironmentFile=` with mode `0600`).
+Check it: `systemctl --user status dot-agent-deck.service` shows `active (running)`, and `~/.local/bin/dot-agent-deck daemon endpoint` prints a socket path. For `connect` to find this daemon, your ssh session must see the same `XDG_RUNTIME_DIR` as the service, which is normally the case on a systemd host, where `pam_systemd` sets it for ssh logins; check with `ssh <target> 'echo $XDG_RUNTIME_DIR'`. After `remote upgrade`, or the desktop app's **Upgrade**, there is nothing to do: the restart ends the service's daemon and systemd starts the service again on the new release. Keep `Restart=on-failure` (or `Restart=always`) in the unit, because that is what starts it again. The journal records the old daemon's exit as `status=75/TEMPFAIL` followed by `Scheduled restart job`; that is the upgrade's restart, not an error. A service starts with a minimal environment, and the daemon takes only `PATH` from your login shell, so put agent credentials in the unit (`Environment=`, or an `EnvironmentFile=` with mode `0600`).
 
 On macOS, see [macOS as a remote host](#macos-as-a-remote-host) for the launchd equivalent.
 
@@ -216,7 +216,7 @@ sudo pmset -a disksleep 0
 </plist>
 ```
 
-Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist`. Keep `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`: without it, a daemon with no agents can exit on its idle timer and `KeepAlive` starts it again, over and over. Three constraints:
+Load it with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.devopstoolkit.dot-agent-deck.plist`. Keep `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`: without it, a daemon with no agents can exit on its idle timer and `KeepAlive` starts it again, over and over. `KeepAlive` is also what starts the daemon again on the new release after `remote upgrade` or the desktop app's **Upgrade**; that has not been tested on a Mac. Three constraints:
 
 - **A LaunchAgent, not a LaunchDaemon.** A LaunchDaemon runs outside your user session, without your environment or the `~/.claude/.credentials.json` that `/login` writes.
 - **A LaunchAgent starts at GUI login, not at boot.** An unattended Mac needs automatic login to come back after a reboot, and FileVault asks for a password at startup before any automatic login. Decide that trade-off deliberately.
