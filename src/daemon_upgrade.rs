@@ -1323,21 +1323,33 @@ impl WireDaemonPort {
 
     /// Wait for the old daemon to release the endpoint, then start the
     /// client's build.
+    ///
+    /// Only `Ok(None)` means released. A probe error is inconclusive, not a
+    /// verdict: a daemon shutting down can accept the connection and close it
+    /// before its `Hello` reply, so polling continues to the deadline
+    /// (Qodo 4219656676).
     fn release_then_spawn(&self) -> Result<(), String> {
         let deadline = Instant::now() + LOCAL_RELEASE_TIMEOUT;
-        while DaemonPort::probe(self)
-            .map_err(|e| e.to_string())?
-            .is_some()
-        {
+        loop {
+            let last_error = match DaemonPort::probe(self) {
+                Ok(None) => return (self.spawn)(),
+                Ok(Some(_)) => None,
+                Err(e) => Some(e.to_string()),
+            };
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "the daemon that was asked to restart was still running {}s later",
-                    LOCAL_RELEASE_TIMEOUT.as_secs()
-                ));
+                let secs = LOCAL_RELEASE_TIMEOUT.as_secs();
+                return Err(match last_error {
+                    Some(e) => format!(
+                        "the daemon that was asked to restart had not released its endpoint \
+                         {secs}s later; the last check failed: {e}"
+                    ),
+                    None => format!(
+                        "the daemon that was asked to restart was still running {secs}s later"
+                    ),
+                });
             }
             std::thread::sleep(VERIFY_POLL);
         }
-        (self.spawn)()
     }
 }
 
@@ -2306,6 +2318,56 @@ mod tests {
             matches!(&restarted, Err(PortError::ReplyUnreadable(_))),
             "{restarted:?}"
         );
+        drop(port);
+        rt.shutdown_background();
+    }
+
+    /// Scenario: the old daemon is shutting down after accepting a restart. It
+    /// accepts one more probe connection and closes it without a `Hello`
+    /// reply, then releases its endpoint. The local Replace keeps polling
+    /// through the failed probe and starts the successor, instead of giving up
+    /// with no daemon running (Qodo 4219656676).
+    #[cfg(unix)]
+    #[test]
+    fn the_local_port_spawns_after_a_probe_lost_during_shutdown() {
+        use crate::daemon_client::LocalEndpoint;
+        use std::os::unix::fs::PermissionsExt;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = crate::test_temp::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("closing.sock");
+        let listener = {
+            let _guard = rt.enter();
+            crate::daemon_protocol::bind_attach_listener(&path).expect("bind the daemon")
+        };
+        let socket = path.clone();
+        rt.spawn(async move {
+            // One probe connects and loses its reply; then the endpoint goes.
+            if let Ok(stream) = listener.accept().await {
+                drop(stream);
+            }
+            let _ = std::fs::remove_file(&socket);
+            drop(listener);
+        });
+
+        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_count = spawned.clone();
+        let port = WireDaemonPort::new(
+            &Endpoint::Local(LocalEndpoint::at(path)),
+            rt.handle().clone(),
+            Box::new(move || {
+                spawn_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert_eq!(DaemonPort::spawn_successor(&port), Ok(()));
+        assert_eq!(spawned.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(port);
         rt.shutdown_background();
     }

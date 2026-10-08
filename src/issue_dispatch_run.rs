@@ -718,7 +718,9 @@ async fn reclaim_abandoned_spawn_paced(
             worktree_dir.display()
         ));
     };
-    if !worktree_dir.exists() {
+    // `Path::exists` is a blocking `stat`; the same probe (any error reads as
+    // absent) runs off the async workers (Qodo 4219656655).
+    if tokio::fs::metadata(worktree_dir).await.is_err() {
         return Reclaim::Removed;
     }
     if abandoned_generation_if_unused(worktree_dir, &creator, worktrees, &records).await
