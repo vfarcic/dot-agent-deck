@@ -259,10 +259,11 @@ const MAX_INLINED_UNIT_NAME_CHARS: usize = 120;
 /// closes a finding of its own:
 ///
 /// * **Control and bidi bytes do not survive into the delivered turn.**
-///   `encode_pane_payload` only
-///   inspects payloads containing LF, so a single-line payload's CR, ESC, C0, C1,
-///   DEL and bidi bytes would otherwise cross that seam byte-for-byte. They are
-///   gone before this function returns.
+///   `encode_pane_payload` changes only line breaks and trailing whitespace —
+///   since issue #1616 it writes CR, VT, FF and NEL as LF — so ESC, the other
+///   C0 and C1 bytes, DEL and bidi bytes would otherwise cross that seam
+///   byte-for-byte, and a CR would turn the one-line message into a multi-line
+///   one. They are gone before this function returns.
 /// * **The whole message is bounded**, not just the report — hence
 ///   [`MAX_INLINED_UNIT_NAME_CHARS`]. A raw hook producer can put megabytes on the
 ///   wire; what it can put in a caller's context window is this.
@@ -706,10 +707,11 @@ mod tests {
         );
     }
 
-    /// PRD #220 Phase 2 audit (finding 3): `encode_pane_payload` only inspects
-    /// payloads containing LF, so a SINGLE-LINE payload's control and bidi bytes
-    /// would otherwise cross the PTY-input seam byte-for-byte. They have to be
-    /// gone before this function returns, not after.
+    /// PRD #220 Phase 2 audit (finding 3): `encode_pane_payload` changes only
+    /// line breaks and trailing whitespace (issue #1616), so a payload's other
+    /// control bytes and its bidi bytes would otherwise cross the PTY-input
+    /// seam byte-for-byte. They have to be gone before this function returns,
+    /// not after.
     #[test]
     fn control_and_bidi_bytes_never_survive_into_the_delivered_turn() {
         let hostile = "line one\r\x1b[2Jcleared\u{202e}reversed\u{0085}next\u{7f}del";
