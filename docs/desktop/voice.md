@@ -245,7 +245,7 @@ The reading switches work in typing mode too, so a bare "reading on" or "reading
 | **Provider** | Only the Commands service's text-to-speech. With the Anthropic API, nothing can speak, and the app says to choose Auto or System. |
 | **System** | Only this computer's voice. Nothing is sent to be spoken. |
 
-The service's voice uses the Commands endpoint and key: the app asks for speech at the same address with `/chat/completions` replaced by `/audio/speech`, with OpenAI's `gpt-4o-mini-tts` model and its `alloy` voice. A local OpenAI-compatible server is used for speech only if it answers there.
+The service's voice uses the Commands server and key, with OpenAI's `gpt-4o-mini-tts` model and its `alloy` voice. Another OpenAI-compatible server, such as one on this computer, must also offer OpenAI's speech endpoint next to the chat one: for a Commands endpoint of `http://localhost:8080/v1/chat/completions`, that is `http://localhost:8080/v1/audio/speech`. With a server that does not, or a Commands endpoint that does not end in `/chat/completions`, **Auto** uses this computer's voice.
 
 **On Linux, the computer's voice is not always available.** It works when the system's WebKitGTK was built with speech synthesis and a speech engine is installed. Without one, the app says it could not speak because this system has no speech voice, or says nothing at all. Use an OpenAI-compatible Commands service with **Speech source** set to **Auto** or **Provider** instead.
 
@@ -253,7 +253,7 @@ The service's voice uses the Commands endpoint and key: the app asks for speech 
 
 Turn summaries work for Claude Code, Codex, OpenCode and Pi. Devin reports its turns the same way Claude Code does, so reading is expected to work for it, but it has not been checked. Permission prompts, errors and usage limits are announced when the agent reports them, which is when its card shows **Needs Input**, **Error** or **Blocked**; [Session management](../session-management.md) says which agents report which. Pi asks no permission questions the deck can see, so none are announced for it.
 
-Reading needs a daemon that reports finished turns. Under an older one, "reading on" says "Reading is not available: this deck's daemon is too old to report finished turns." Update dot-agent-deck on the machine the daemon runs on. A Pi agent whose deck is older than reading keeps its status and card as before; only its turns cannot be read.
+Reading needs a daemon that reports finished turns. Under an older one, "reading on" says "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine." That machine is the one the daemon runs on. A Pi agent whose deck is older than reading keeps its status and card as before; only its turns cannot be read.
 
 ## Settings → Voice
 
@@ -327,7 +327,7 @@ What went wrong is shown beside the Voice button.
 | You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |
 | Answers are cut off or not understood with a reasoning model | **Max tokens** is too low for its reasoning. | Raise **Max tokens**. |
 | "Reading is turned off in Settings…" after "reading on" | **Read turns aloud** is **Off**. | Set it to **On** in **Settings → Voice**, then say "reading on" again. |
-| "Reading is not available: this deck's daemon is too old to report finished turns" | The daemon predates reading mode. | Update dot-agent-deck on the machine the daemon runs on. |
+| "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine." | The daemon predates reading mode. | Update dot-agent-deck on the machine the daemon runs on. |
 | "Reading is not available: the deck did not answer" | The daemon could not be reached. | Check the daemon is running (see [Daemons](daemons.md)), then say "reading on" again. |
 | Everything you say is ignored with "only “stop” or “quiet” works while the app is speaking" | The app was speaking when you spoke. | Say "stop" or "quiet", then the command. |
 | "Could not speak: this system has no speech voice" | The computer's voice is not available, which happens on Linux without a speech engine. | Set **Speech source** to **Auto** or **Provider** with an OpenAI-compatible Commands service. |
