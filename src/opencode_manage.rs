@@ -2316,6 +2316,103 @@ if (asked("hang") !== 2) throw new Error("hang not asked again: " + calls);
         );
     }
 
+    /// PRD #1497 audit: OpenCode's client IGNORES the abort signal, so eight
+    /// lookups stay unsettled past `ANCESTRY_LOOKUP_MS` although every signal
+    /// fired. More assistant messages, idle reports, a delete and a recreated
+    /// session under the same id start no ninth request until one original
+    /// promise settles, and every idle report is still sent at once. The
+    /// deleted session's stale "root" answer, settling while the recreated
+    /// session's own lookup is in flight, does not make the recreated session
+    /// read; that lookup's answer does. After a dispose, the remaining stale
+    /// answers mark nothing.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_ancestry_lookup_stays_bounded_when_the_client_ignores_abort() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const calls = [];
+const client = { session: { get: ({ path, signal }) => {
+  const call = { id: path.id, signal };
+  calls.push(call);
+  return new Promise((resolve) => { call.settle = resolve; });
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const expectCalls = (n, why) => {
+  if (calls.length !== n) throw new Error(why + ": " + calls.length + " requests: " + calls.map((c) => c.id));
+};
+const idle = async (s) => {
+  const started = Date.now();
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+  const took = Date.now() - started;
+  if (took > 1000) throw new Error("the idle report for " + s + " waited " + took + " ms");
+};
+const turn = async (s, m, text) => {
+  await assistant(s, m);
+  await part(s, m, m + "t", text);
+  await idle(s);
+};
+
+for (let i = 0; i < 8; i++) await assistant("s" + i, "s" + i + "-a0");
+expectCalls(8, "eight sessions, eight lookups");
+await new Promise((resolve) => setTimeout(resolve, 2300));
+if (!calls.every((c) => c.signal?.aborted)) throw new Error("a lookup's signal never fired");
+
+for (let i = 0; i < 4; i++) await turn("n" + i, "n" + i + "-a", "UNKNOWN_REPLY n" + i);
+for (let i = 0; i < 8; i++) await turn("s" + i, "s" + i + "-a1", "UNKNOWN_REPLY s" + i);
+await send("session.deleted", { sessionID: "s0", info: { id: "s0", directory: "/work/s0" } });
+await turn("s0", "s0-b1", "RECREATED_UNKNOWN_REPLY 1");
+expectCalls(8, "no ninth request while eight ignore their abort");
+
+calls[1].settle({ data: { id: "s1" } });
+await settle();
+await assistant("s0", "s0-b2");
+expectCalls(9, "a settled original frees one slot");
+if (calls[8].id !== "s0") throw new Error("the ninth request is " + calls[8].id);
+calls[0].settle({ data: { id: "s0" } });
+await settle();
+await part("s0", "s0-b2", "s0-b2t", "RECREATED_UNKNOWN_REPLY 2");
+await idle("s0");
+await turn("s1", "s1-a2", "S1_ROOT_REPLY");
+calls[8].settle({ data: { id: "s0" } });
+await settle();
+await turn("s0", "s0-b3", "RECREATED_ROOT_REPLY");
+
+await send("server.instance.disposed", {});
+for (let i = 2; i < 8; i++) calls[i].settle({ data: { id: "s" + i } });
+await settle();
+await turn("s2", "s2-a2", "AFTER_DISPOSE_UNKNOWN_REPLY");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("UNKNOWN_REPLY"),
+            "a session whose ancestry was never confirmed was read: {payloads:#?}"
+        );
+        let replies: Vec<Option<String>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply.map(|r| r.text))
+            .collect();
+        let mut expected = vec![None; 14];
+        expected.push(Some("S1_ROOT_REPLY".to_owned()));
+        expected.push(Some("RECREATED_ROOT_REPLY".to_owned()));
+        expected.push(None);
+        assert_eq!(
+            replies, expected,
+            "twelve turns of unknown sessions and two of the recreated one are sent replyless, \
+             the settled root and the recreated session's own confirmed lookup are read, and \
+             nothing is read after the dispose: {payloads:#?}"
+        );
+    }
+
     /// PRD #1497 review: an ancestry answer that arrives after its session was
     /// deleted, or after OpenCode disposed, is discarded — so a session later
     /// reported under the same id is not read on the strength of it — while
