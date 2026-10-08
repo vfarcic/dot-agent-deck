@@ -285,6 +285,7 @@ fn choice_refuses_an_offered_value_that_is_no_longer_live() {
         address: None,
         local: false,
         unavailable: None,
+        holds_agents: false,
     }];
     let live = ChoiceLive {
         agents: &agents,
