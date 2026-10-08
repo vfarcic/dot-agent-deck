@@ -3021,11 +3021,24 @@ mod tests {
 
     /// A probe that takes `delay` to answer with the old daemon's `Hello`, or
     /// less when `honours_budget` and its budget is shorter — the shape of a
-    /// remote probe over a slow route. Records each budget it was given.
+    /// remote probe over a slow route. Records each budget it was given, and
+    /// when each probe started and returned.
     struct SlowPort {
         delay: Duration,
         honours_budget: bool,
         budgets: RefCell<Vec<Duration>>,
+        spans: RefCell<Vec<(Instant, Instant)>>,
+    }
+
+    impl SlowPort {
+        fn new(delay: Duration, honours_budget: bool) -> Self {
+            Self {
+                delay,
+                honours_budget,
+                budgets: RefCell::new(Vec::new()),
+                spans: RefCell::new(Vec::new()),
+            }
+        }
     }
 
     impl DaemonPort for SlowPort {
@@ -3033,13 +3046,17 @@ mod tests {
             self.probe_within(self.delay)
         }
         fn probe_within(&self, budget: Duration) -> Probe {
+            let started = Instant::now();
             self.budgets.borrow_mut().push(budget);
-            if self.honours_budget && budget < self.delay {
+            let answer = if self.honours_budget && budget < self.delay {
                 std::thread::sleep(budget);
-                return Err("no answer within the budget".into());
-            }
-            std::thread::sleep(self.delay);
-            Ok(Some(hello_from("0.1.0", "old", "old-process")))
+                Err("no answer within the budget".into())
+            } else {
+                std::thread::sleep(self.delay);
+                Ok(Some(hello_from("0.1.0", "old", "old-process")))
+            };
+            self.spans.borrow_mut().push((started, Instant::now()));
+            answer
         }
         fn restart(&self, _req: &RestartDaemonRequest) -> Restart {
             unreachable!("the verify wait sends no restart request")
@@ -3062,34 +3079,36 @@ mod tests {
         };
         let expected = Expect::Version("0.2.0".into());
 
-        // A port that honours its budget: the second probe is cut short at the
-        // deadline instead of taking its full 300ms.
-        let port = SlowPort {
-            delay: Duration::from_millis(300),
-            honours_budget: true,
-            budgets: RefCell::new(Vec::new()),
-        };
-        let started = Instant::now();
+        // A port that honours its budget: a second probe is given only what
+        // was left of the wait, not its full 300ms. Checked against the
+        // instants the port recorded rather than a wall-clock bound, which a
+        // starved runner breaks whatever its slack (a macOS runner measured
+        // 650.06ms against a 650ms bound, and a starved dev box 1.5s).
+        let port = SlowPort::new(Duration::from_millis(300), true);
         let missing = wait_for_successor(&port, &expected, &from, false, timing)
             .expect_err("the old daemon is never the successor");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < timing.timeout + Duration::from_millis(150),
-            "the wait overran its deadline: {elapsed:?}"
-        );
         let budgets = port.budgets.borrow();
-        assert_eq!(budgets.len(), 2, "{budgets:?}");
+        let spans = port.spans.borrow();
+        assert!(!budgets.is_empty());
         assert!(budgets.iter().all(|b| *b <= timing.timeout), "{budgets:?}");
-        assert!(budgets[1] < Duration::from_millis(300), "{budgets:?}");
+        // The wait's deadline is at most `timeout` after the first probe
+        // started, and each later probe was asked for no more than what was
+        // left once the one before it returned, so none runs past the
+        // deadline, and none is given time once nothing is left.
+        let latest_deadline = spans[0].0 + timing.timeout;
+        for i in 1..budgets.len() {
+            let left = latest_deadline.saturating_duration_since(spans[i - 1].1);
+            assert!(
+                !budgets[i].is_zero() && budgets[i] <= left,
+                "probe {i} was given {:?} with at most {left:?} of the wait left",
+                budgets[i]
+            );
+        }
         assert!(missing.old_still_answering);
 
         // A port that ignores it still starts no probe past the deadline: its
         // first probe outlasts the whole wait, so it is the only one.
-        let port = SlowPort {
-            delay: Duration::from_millis(600),
-            honours_budget: false,
-            budgets: RefCell::new(Vec::new()),
-        };
+        let port = SlowPort::new(Duration::from_millis(600), false);
         assert!(wait_for_successor(&port, &expected, &from, false, timing).is_err());
         assert_eq!(port.budgets.borrow().len(), 1);
     }
