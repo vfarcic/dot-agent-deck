@@ -1611,8 +1611,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                 Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
                 _ => {
                     view.resubscribed();
-                    let snapshot = snapshot_with(&endpoint, &links, None).await;
-                    emit_snapshot(&app, &snapshot);
+                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1637,8 +1636,7 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
                     // machines in the fleet, and dropping their links would make
                     // one deck's bad moment cost N handshakes.
                     links.invalidate(&endpoint).await;
-                    let snapshot = snapshot_with(&endpoint, &links, None).await;
-                    emit_snapshot(&app, &snapshot);
+                    emit_unconnected_snapshot(&app, &endpoint, &links).await;
                     tokio::time::sleep(WATCH_RETRY_DELAY).await;
                     continue;
                 }
@@ -1688,6 +1686,27 @@ fn spawn_deck_watcher(app: &AppHandle, state: &DesktopState, endpoint: Endpoint)
         }
     });
     state.register_watcher(&key, claim, handle);
+}
+
+/// Emit the snapshot of a deck its watcher could not subscribe to, and when it
+/// is disconnected, why (issue #1490).
+///
+/// A remote deck's reason is asked on its host over ssh, so it is asked here,
+/// on this deck's own watcher and at most every
+/// [`crate::daemon_bridge::REMOTE_REASON_TTL`], rather than on every snapshot:
+/// the snapshot goes out first with the stored answer, and again once a fresh
+/// one arrives.
+async fn emit_unconnected_snapshot(app: &AppHandle, endpoint: &Endpoint, links: &DaemonLinks) {
+    let mut snapshot = snapshot_with(endpoint, links, None).await;
+    emit_snapshot(app, &snapshot);
+    if snapshot.connection.status == ConnectionStatus::Disconnected
+        && links.refresh_disconnected_reason(endpoint).await
+    {
+        let reason = links.disconnected_reason(endpoint).await;
+        snapshot.connection.disconnected_reason =
+            Some(crate::dto::DisconnectedReasonDto::new(endpoint, &reason));
+        emit_snapshot(app, &snapshot);
+    }
 }
 
 /// Drain one subscription into a channel until it ends.
@@ -2283,6 +2302,55 @@ async fn new_agent_orchestrations_on(
         }
         Err(error) => Err(safe_message(error.to_string())),
     }
+}
+
+/// Issue #1490: start the daemon of deck `deck_id` (the selected deck when
+/// absent), wherever it lives — on this machine, or on a remote deck's host
+/// over ssh with the deck's own ssh details and socket — through the shared
+/// `dot_agent_deck::daemon_start` procedure, then connect to it as usual.
+///
+/// Resolves once the deck is connected, with what the start did and the deck's
+/// snapshot. Rejects with the sentence to show when it is not: the start's own
+/// failure in the user's terms (host unreachable, ssh login refused,
+/// `dot-agent-deck` not installed there, the daemon not answering at the deck's
+/// socket), or a daemon that runs and still did not connect.
+#[tauri::command]
+async fn desktop_start_daemon(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: Option<String>,
+) -> Result<crate::dto::StartDaemonResultDto, String> {
+    use dot_agent_deck::daemon_start::StartOutcome;
+
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(deck_id.as_deref())?;
+    let endpoint = scope.endpoint().clone();
+    let host = dot_agent_deck::daemon_start::host_label(&endpoint);
+    let (outcome, snapshot) =
+        crate::daemon_bridge::start_and_snapshot(&endpoint, &state.daemon).await;
+    emit_snapshot(&app, &snapshot);
+    ensure_snapshot_watchers(&app, &state);
+    let outcome = match outcome {
+        StartOutcome::Failed(problem) => return Err(safe_message(problem.message)),
+        StartOutcome::Started => "started",
+        StartOutcome::AlreadyRunning => "already-running",
+    };
+    if snapshot.connection.status != ConnectionStatus::Connected {
+        return Err(safe_message(format!(
+            "The daemon is running on {host}, but the app could not connect to it: {}",
+            snapshot
+                .connection
+                .error
+                .as_deref()
+                .unwrap_or("it did not respond as expected")
+        )));
+    }
+    Ok(crate::dto::StartDaemonResultDto {
+        outcome,
+        host: safe_message(host),
+        snapshot,
+    })
 }
 
 #[tauri::command]
@@ -5615,6 +5683,7 @@ pub fn run() {
             desktop_list_directories,
             desktop_new_agent_options,
             desktop_bootstrap,
+            desktop_start_daemon,
             desktop_terminal_attach,
             desktop_terminal_write,
             desktop_terminal_resize,

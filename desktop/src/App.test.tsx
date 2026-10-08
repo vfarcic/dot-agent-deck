@@ -28,7 +28,7 @@ vi.mock("./components/TerminalViewport", () => ({
   ),
 }));
 
-import { ControlDeck } from "./App";
+import { ControlDeck, DeckShell } from "./App";
 import { SETTINGS_SECTIONS } from "./lib/settingsRegistry";
 
 /**
@@ -200,6 +200,87 @@ async function chooseTheOnlyProject() {
 }
 
 describe("ControlDeck", () => {
+  describe("starting a disconnected deck (issue #1490)", () => {
+    function disconnectedDeck(deckKind: "local" | "remote", kind: "not-running" | "running-not-connected" | "unknown" = "not-running") {
+      const snapshot = createFixtureSnapshot("disconnected");
+      const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+      snapshot.agents = [];
+      snapshot.connection = {
+        ...snapshot.connection, deckId: deckKind === "local" ? "deck-0000000000001490" : "deck-0000000000001491", deckKind,
+        socketPath: deckKind === "local" ? "/tmp/start-daemon-test.sock" : host,
+        disconnectedReason: {
+          kind, action: kind === "not-running" ? "start-daemon" : "reconnect", host,
+          message: kind === "not-running" ? `No daemon is running on ${host}.`
+            : kind === "unknown" ? `The app cannot reach ${host}. Check that the host is up and reachable from this machine.`
+              : `A daemon is running on ${host}, but the app is not connected to it. Reconnect to try again.`,
+        },
+      };
+      return snapshot;
+    }
+
+    /// Scenario: With experimental features off, start a deck from its dashboard card while a different deck is selected.
+    /// Cancel sends nothing; confirmation names that deck's host and starts that deck alone.
+    it.each(["local", "remote"] as const)("confirms the host and targets the %s overview deck", async (deckKind) => {
+      window.history.replaceState({}, "", "/");
+      const target = disconnectedDeck(deckKind);
+      const selected = createFixtureSnapshot("connected");
+      const live = runtime({ mode: "live", snapshot: selected, fleet: [selected, target], desktopFeatures: fixtureDesktopFeatures("") });
+      render(<DeckShell runtime={live} />);
+      expect(screen.queryByTestId("open-deck")).not.toBeInTheDocument();
+      const card = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === target.connection.deckId)!;
+      const start = within(card).getByTestId("start-daemon");
+      fireEvent.click(start);
+      const dialog = screen.getByRole("alertdialog");
+      expect(dialog).toHaveTextContent(target.connection.disconnectedReason!.host);
+      expect(dialog).not.toHaveTextContent("local daemon");
+      expect(live.runAction).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(live.runAction).not.toHaveBeenCalled();
+      fireEvent.click(start);
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      await waitFor(() => expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: target.connection.deckId }));
+      expect(live.reconnect).not.toHaveBeenCalled();
+    });
+
+    /// Scenario: A failed start from a local or remote dashboard card displays the runtime's user-facing rejection sentence.
+    it.each(["local", "remote"] as const)("shows a rejected start on the %s overview deck", async (deckKind) => {
+      window.history.replaceState({}, "", "/");
+      const snapshot = disconnectedDeck(deckKind);
+      const sentence = `The daemon was started on ${snapshot.connection.disconnectedReason!.host} but did not answer at /tmp/deck.sock within 25s. Check that this deck's daemon socket setting is where the daemon listens.`;
+      const live = runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures(""), runAction: vi.fn(async () => { throw new Error(sentence); }) });
+      render(<DeckShell runtime={live} />);
+      fireEvent.click(screen.getByTestId("start-daemon"));
+      fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Start daemon" }));
+      expect(await screen.findByText(sentence)).toBeVisible();
+      expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: snapshot.connection.deckId });
+    });
+
+    /// Scenario: The experimental Daemons screen offers one remedy for a local or remote disconnected deck, and its Start confirmation uses that host.
+    it.each((["local", "remote"] as const).flatMap((deckKind) =>
+      (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind }))))(
+      "offers one banner action for $deckKind / $kind", async ({ deckKind, kind }) => {
+        const snapshot = disconnectedDeck(deckKind, kind);
+        const live = runtime({ mode: "live", snapshot });
+        render(<ControlDeck runtime={live} />);
+        const banner = screen.getByRole("alert");
+        const actions = within(banner).getAllByRole("button");
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+        expect(banner).toHaveTextContent(snapshot.connection.disconnectedReason!.message);
+        if (kind !== "not-running") {
+          expect(within(banner).queryByTestId("start-daemon")).not.toBeInTheDocument();
+          return;
+        }
+        fireEvent.click(within(banner).getByTestId("start-daemon"));
+        const dialog = screen.getByRole("alertdialog");
+        expect(dialog).toHaveTextContent(snapshot.connection.disconnectedReason!.host);
+        expect(dialog).not.toHaveTextContent("local daemon");
+        fireEvent.click(within(dialog).getByRole("button", { name: "Start daemon" }));
+        await waitFor(() => expect(live.runAction).toHaveBeenCalledExactlyOnceWith({ type: "start_daemon", deckId: snapshot.connection.deckId }));
+      });
+  });
+
   beforeEach(() => {
     window.localStorage.clear();
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
@@ -1465,21 +1546,25 @@ describe("ControlDeck", () => {
     expect(screen.getByTestId("remote-deck-notice")).toHaveTextContent("acts on a process on this machine");
   });
 
-  /** Scenario: Confirmation-gates an explicit daemon start from the disconnected state. */
+  /// Scenario: Confirm starting a disconnected local daemon on this machine, without a second reconnect action.
+  /// While the start is in flight, its confirmation is disabled and the request names that deck.
   it("confirmation-gates an explicit daemon start from the disconnected state", async () => {
     const disconnected = createFixtureSnapshot("disconnected");
     disconnected.agents = [];
+    disconnected.connection.disconnectedReason = { kind: "not-running", action: "start-daemon", host: "this machine", message: "No daemon is running on this machine." };
     let releaseStart!: () => void;
     const runAction = vi.fn(() => new Promise<import("./types").DeckActionResult>((resolve) => { releaseStart = () => resolve({ ok: true }); }));
     const live = runtime({ mode: "live", snapshot: disconnected, runAction });
     render(<ControlDeck runtime={live} />);
     fireEvent.click(screen.getByTestId("start-daemon"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("this machine");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("local daemon");
     expect(live.runAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
     expect(screen.getByRole("button", { name: "Starting…" })).toBeDisabled();
     expect(screen.queryByText("Stopping…")).not.toBeInTheDocument();
     releaseStart();
-    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "start_daemon" }));
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "start_daemon", deckId: disconnected.connection.deckId }));
     expect(live.reconnect).not.toHaveBeenCalled();
   });
 

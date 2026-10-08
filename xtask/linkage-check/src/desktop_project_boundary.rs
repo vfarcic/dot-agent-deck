@@ -135,6 +135,22 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_attach",
     "daemon_client",
     "daemon_protocol",
+    // Issue #1490, argued rather than added quietly. `daemon_start` is the ONE
+    // start procedure and the ONE "why is this deck not connected" decision
+    // every client calls (PRD #1487's D1, applied to starting), so the
+    // desktop's Start daemon has to reach it — a desktop-side copy of the
+    // probe, the Start-versus-Reconnect rule or the failure classification is
+    // the second copy of a policy the module exists to keep single. The
+    // desktop names `DisconnectedReason`, `StartOutcome` and its problem
+    // types, and `start_local` / `start_remote` with their probes. It starts a
+    // daemon, it does not resolve a project: a local deck is probed at its
+    // socket and started through `daemon_attach`'s lazy-spawn (already
+    // allowlisted), a remote one over ssh through `remote_daemon`'s
+    // `SshDaemonPort` (allowlisted below). Checked
+    // against this rule's lines: the module resolves no project, reads no
+    // project state file, names no FORBIDDEN_SYMBOL or project-state literal,
+    // and contains no `std::env::current_dir` — all zero for it.
+    "daemon_start",
     "daemon_stop",
     // PRD #1487 M5, argued rather than added quietly. `daemon_upgrade` is the
     // ONE upgrade procedure every client calls (the PRD's D1: no client

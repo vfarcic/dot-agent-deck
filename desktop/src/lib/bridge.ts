@@ -30,6 +30,7 @@ import type { HandoffEdge,
   DeckListingOptions,
   DeckSnapshot,
   DesktopFeatures,
+  DisconnectedReason,
   EvidenceItem,
   NewAgentOptions,
   NewAgentOrchestrations,
@@ -38,6 +39,18 @@ import type { HandoffEdge,
   TerminalChunk,
   WorkflowStage,
 } from "../types";
+
+/**
+ * Exact DTO `desktop_start_daemon` resolves with (issue #1490). It rejects
+ * with the sentence to show instead of resolving when the deck did not end up
+ * connected.
+ */
+export interface StartDaemonResultDto {
+  outcome: "started" | "already-running";
+  /** The machine the daemon runs on: `"this machine"` or `user@host[:port]`. */
+  host: string;
+  snapshot: DesktopSnapshotDto;
+}
 
 /** Exact DTO returned by the Tauri `desktop_get_snapshot` command. */
 export interface DesktopSnapshotDto {
@@ -94,6 +107,8 @@ export interface DesktopSnapshotDto {
     buildStampMismatchOnly?: boolean;
     /** PRD #1487 D8 — whether to offer Upgrade, decided in Rust. Always emitted by the crate. */
     upgradeOffer?: UpgradeOffer;
+    /** Issue #1490 — why the deck is not connected and which control to offer; present when `status` is `"disconnected"`. */
+    disconnectedReason?: DisconnectedReason;
   };
   agents: DesktopAgentDto[];
   /*
@@ -2349,6 +2364,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       newAgentReason: dto.connection.newAgentReason,
       listingOptions: dto.connection.listingOptions === true,
       ...(dto.connection.upgradeOffer === undefined ? {} : { upgradeOffer: dto.connection.upgradeOffer }),
+      ...(dto.connection.disconnectedReason === undefined ? {} : { disconnectedReason: dto.connection.disconnectedReason }),
     },
     // Issue #714: a blocked agent needs a person, so it is `attention` — below
     // `failed`, since nothing has crashed.
@@ -4320,9 +4336,16 @@ export class TauriDeckBridge implements DeckBridge {
       return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message, ...(agentId === undefined ? {} : { agentId }) };
     }
     if (action.type === "start_daemon") {
-      const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: true } });
-      if (dto.connection.status !== "connected") {
-        throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
+      // Issue #1490: one command for every deck, local or remote. It resolves
+      // only once the deck is connected and rejects with the sentence to show.
+      let result: StartDaemonResultDto;
+      try {
+        result = await invoke<StartDaemonResultDto>("desktop_start_daemon", { deckId: action.deckId ?? null });
+      } catch (cause) {
+        throw cause instanceof Error ? cause : new Error(String(cause));
+      }
+      if (result?.snapshot?.connection?.status !== "connected") {
+        throw new Error(result?.snapshot?.connection?.error ?? "The daemon did not become connected.");
       }
       // PRD #745 M7: starting the daemon no longer attaches its whole fleet
       // either — this was the third eager call site, and the one reachable

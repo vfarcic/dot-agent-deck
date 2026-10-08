@@ -221,7 +221,53 @@ export interface ConnectionView {
    * Absent in fixture scenarios that do not play an older daemon.
    */
   upgradeOffer?: import("./lib/upgrade").UpgradeOffer;
+  /**
+   * Issue #1490 — why this deck is not connected, and the ONE control to offer
+   * for it, decided in Rust (`dot_agent_deck::daemon_start`): render
+   * **Start daemon** when `action` is `"start-daemon"` and **Reconnect** when it
+   * is `"reconnect"`, never both. Present on a live `"disconnected"` deck;
+   * absent otherwise, and in fixture scenarios that do not play one.
+   */
+  disconnectedReason?: DisconnectedReason;
 }
+
+/**
+ * Issue #1490 — why a deck the app is not connected to is not connected.
+ *
+ * - `"not-running"`: no daemon runs at the deck's socket → `action` is
+ *   `"start-daemon"`.
+ * - `"running-not-connected"`: a daemon runs there and the app is not
+ *   connected to it → `"reconnect"`.
+ * - `"unknown"`: the app cannot tell (the host is unreachable, ssh refused the
+ *   login, the deck is not installed there, or the first check has not
+ *   answered yet) → `"reconnect"`, and `message` says why.
+ *
+ * `message` is the sentence to show, `detail` the technical half for a
+ * disclosure, and `host` the machine the daemon runs on as the confirm dialog
+ * names it: `"this machine"` for a local deck, `user@host[:port]` for a remote
+ * one.
+ */
+export interface DisconnectedReason {
+  kind: "not-running" | "running-not-connected" | "unknown";
+  action: "start-daemon" | "reconnect";
+  message: string;
+  /** What kind of problem, when `kind` is `"unknown"`. */
+  failure?: StartDaemonFailure;
+  detail?: string;
+  host: string;
+}
+
+/** Issue #1490 — what stopped a start, or a check of whether a daemon runs. */
+export type StartDaemonFailure =
+  | "host-unreachable"
+  | "auth-failed"
+  | "host-key-not-trusted"
+  | "not-installed"
+  | "too-old"
+  | "did-not-answer"
+  | "start-failed"
+  | "check-failed"
+  | "not-checked-yet";
 
 /**
  * One project the DAEMON knows about (PRD #819 M6).
@@ -932,7 +978,13 @@ export type DeckAction =
   | { type: "resume_run" }
   | { type: "approve_run" }
   | { type: "advance_fixture" }
-  | { type: "start_daemon" }
+  /**
+   * Start the daemon of deck `deckId` (issue #1490), on this machine or on a
+   * remote deck's host over ssh, then connect to it. Absent means the selected
+   * deck. Resolves once the deck is connected; rejects with the sentence to
+   * show otherwise.
+   */
+  | { type: "start_daemon"; deckId?: string }
   | { type: "stop_daemon"; force?: boolean }
   /**
    * Connect anyway (issue #801). `deckId` names the deck whose refusal the

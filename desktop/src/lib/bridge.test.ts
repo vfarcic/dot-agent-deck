@@ -389,16 +389,22 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  it("rejects an explicit daemon start unless bootstrap returns connected", async () => {
+  it("rejects an explicit daemon start with the crate's sentence", async () => {
     const { TauriDeckBridge } = await import("./bridge");
-    const disconnected = structuredClone(snapshot);
-    disconnected.connection.status = "disconnected";
-    disconnected.connection.error = "daemon start timed out";
-    disconnected.agents = [];
-    invoke.mockResolvedValue(disconnected);
+    invoke.mockRejectedValue("daemon start timed out");
 
     const bridge = new TauriDeckBridge();
     await expect(bridge.runAction({ type: "start_daemon" })).rejects.toThrow("daemon start timed out");
+    await bridge.dispose();
+  });
+
+  it("starts the named deck's daemon through desktop_start_daemon (issue #1490)", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    invoke.mockResolvedValue({ outcome: "started", host: "deploy@build-box:2222", snapshot });
+
+    const bridge = new TauriDeckBridge();
+    await expect(bridge.runAction({ type: "start_daemon", deckId: "deck-0123456789abcdef" })).resolves.toEqual({ ok: true });
+    expect(invoke).toHaveBeenCalledWith("desktop_start_daemon", { deckId: "deck-0123456789abcdef" });
     await bridge.dispose();
   });
 

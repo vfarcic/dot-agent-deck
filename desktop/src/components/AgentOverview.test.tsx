@@ -125,6 +125,39 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   };
 }
 
+describe("disconnected daemon actions (issue #1490)", () => {
+  const cases = (["local", "remote"] as const).flatMap((deckKind) =>
+    (["not-running", "running-not-connected", "unknown"] as const).map((kind) => ({ deckKind, kind })));
+
+  /// Scenario: With experimental features off, a local or remote deck offers one remedy selected by its disconnected reason.
+  /// An unreachable host explains why retrying is the available action.
+  it.each(cases)("offers one action for $deckKind / $kind with experimental off", ({ deckKind, kind }) => {
+    window.history.replaceState({}, "", "/");
+    const snapshot = createFixtureSnapshot("disconnected");
+    const host = deckKind === "local" ? "this machine" : "deploy@build-box:2222";
+    const message = kind === "unknown"
+      ? `The app cannot reach ${host} over ssh. Check that the host is up and reachable from this machine.`
+      : kind === "not-running" ? `No daemon is running on ${host}.` : `A daemon is running on ${host}, but the app is not connected to it. Reconnect to try again.`;
+    snapshot.connection = {
+      ...snapshot.connection, deckKind,
+      disconnectedReason: { kind, action: kind === "not-running" ? "start-daemon" : "reconnect", message, host },
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot, desktopFeatures: fixtureDesktopFeatures("") })} onNavigate={vi.fn()} />);
+    const note = screen.getByTestId("overview-disconnected");
+    const buttons = within(note).getAllByRole("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toHaveAccessibleName(kind === "not-running" ? "Start daemon" : "Reconnect");
+    expect(note).toHaveTextContent(message);
+    if (kind === "not-running") {
+      expect(within(note).getByTestId("start-daemon")).toBeVisible();
+      expect(within(note).queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
+      expect(note).not.toHaveTextContent("Start one, then reconnect.");
+    } else {
+      expect(within(note).queryByRole("button", { name: "Start daemon" })).not.toBeInTheDocument();
+    }
+  });
+});
+
 describe.each(["selector", "overview", "deck"] as const)("%s voice toggle", (surface) => {
   /// Scenario: Turning voice on and off keeps this numbered desktop surface mounted without React reporting a changed hook order.
   /// The selector, overview, and deck each have hooks after their voice-number visibility check.
