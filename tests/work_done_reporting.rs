@@ -146,7 +146,7 @@ impl WorkDoneHarness {
 
         // PRD #140: the daemon's routing identity, in the `Instance` shape a
         // current client stamps.
-        let orchestration = OrchestrationIdentity::Instance {
+        let orchestration = OrchestrationIdentity {
             id: ORCHESTRATION_INSTANCE.to_string(),
             name: ORCHESTRATION.to_string(),
         };

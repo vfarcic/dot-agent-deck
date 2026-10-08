@@ -840,7 +840,7 @@ pub async fn spawn(
             // rule and `delegate_targets`' identity equality behaves identically
             // for both (PRD #140 M2.0). Minted once, before the loop, because
             // every role of one orchestration shares it.
-            let identity = crate::state::OrchestrationIdentity::Instance {
+            let identity = crate::state::OrchestrationIdentity {
                 id: orchestration_id.clone(),
                 name: name.clone(),
             };

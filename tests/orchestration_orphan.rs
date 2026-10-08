@@ -185,7 +185,7 @@ fn orphan_001_daemon_marks_events_from_a_role_pane_it_holds_no_role_for() {
         ORCHESTRATOR_PANE,
         "orchestrator",
         true,
-        OrchestrationIdentity::Instance {
+        OrchestrationIdentity {
             id: "inst-1".to_string(),
             name: "issue-work".to_string(),
         },
@@ -340,7 +340,7 @@ async fn orphan_003_inner() {
         .expect("stand-in departed agent should spawn");
 
     let mut state = AppState::default();
-    let identity = OrchestrationIdentity::Instance {
+    let identity = OrchestrationIdentity {
         id: "inst-1".to_string(),
         name: "issue-work".to_string(),
     };
@@ -477,7 +477,7 @@ async fn orphan_004_inner() {
         DEPARTED_PANE,
         "reviewer",
         false,
-        OrchestrationIdentity::Instance {
+        OrchestrationIdentity {
             id: "inst-1".to_string(),
             name: "issue-work".to_string(),
         },

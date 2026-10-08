@@ -502,7 +502,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
@@ -542,7 +542,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         },
     )
     .await;
@@ -561,7 +561,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         })
     );
     server.registry.shutdown_all();
@@ -1657,7 +1657,7 @@ fn prepared_start_payload(
                 is_start_role,
                 orchestration_cwd: cwd.map(str::to_string),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }
         }),
         agent_type: None,
@@ -2309,7 +2309,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
                     is_start_role: true,
                     orchestration_cwd: Some(prepared.path.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
                 ..StartAgentOptions::default()
             },

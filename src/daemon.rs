@@ -7884,7 +7884,7 @@ mod hook_ingestion_tests {
                 })
                 .expect("spawn worker stub");
 
-            let orchestration = OrchestrationIdentity::Instance {
+            let orchestration = OrchestrationIdentity {
                 id: "prov-instance".to_string(),
                 name: "prov-orchestration".to_string(),
             };

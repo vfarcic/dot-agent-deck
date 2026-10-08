@@ -157,7 +157,7 @@ fn spawn_stand_in(registry: &Arc<AgentPtyRegistry>, pane: &str) {
 /// An `AppState` holding the two live orchestration roles.
 fn state_with_roles() -> AppState {
     let mut state = AppState::default();
-    let identity = OrchestrationIdentity::Instance {
+    let identity = OrchestrationIdentity {
         id: "inst-1049".to_string(),
         name: "issue-work".to_string(),
     };
