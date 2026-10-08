@@ -458,8 +458,7 @@ fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, Strin
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_without_waiting(child);
                 return Err(format!("it did not exit within {}s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -478,6 +477,31 @@ fn run_version_bounded(target: &Path, timeout: Duration) -> Result<String, Strin
         .recv_timeout(remaining)
         .map_err(|_| "its output did not close".to_string())?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The part of a child process [`stop_without_waiting`] uses, so a test can
+/// stand in a child that does not exit when killed.
+trait KillableChild: Send + 'static {
+    fn kill(&mut self);
+    fn wait(&mut self);
+}
+
+impl KillableChild for std::process::Child {
+    fn kill(&mut self) {
+        let _ = std::process::Child::kill(self);
+    }
+    fn wait(&mut self) {
+        let _ = std::process::Child::wait(self);
+    }
+}
+
+/// Kill a child that outlived its deadline and return at once, leaving the
+/// reaping to a detached thread. A child stuck in uninterruptible I/O does not
+/// exit on `SIGKILL` until the I/O completes, and waiting for it here would hold
+/// the restart handler past its limit (Qodo 4218118669).
+fn stop_without_waiting<C: KillableChild>(mut child: C) {
+    child.kill();
+    std::thread::spawn(move || child.wait());
 }
 
 /// What a restart would stop, from the same two sources the `StopDaemon` and
@@ -1307,6 +1331,53 @@ mod tests {
             "the bound must hold: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A child that ignores the kill and blocks in `wait` until released.
+    struct StuckChild {
+        killed: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        reaped: std::sync::mpsc::Sender<()>,
+    }
+
+    impl KillableChild for StuckChild {
+        fn kill(&mut self) {
+            let _ = self.killed.send(());
+        }
+        fn wait(&mut self) {
+            let _ = self.release.recv();
+            let _ = self.reaped.send(());
+        }
+    }
+
+    /// Scenario: the version check's deadline passes and the child does not
+    /// exit when killed (stuck in uninterruptible I/O). The check returns at
+    /// once instead of waiting on it, and the child is still reaped once it
+    /// does exit (Qodo 4218118669).
+    #[test]
+    fn a_killed_child_that_does_not_exit_is_reaped_off_the_caller() {
+        let (killed_tx, killed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let child = StuckChild {
+            killed: killed_tx,
+            release: release_rx,
+            reaped: reaped_tx,
+        };
+        std::thread::spawn(move || {
+            stop_without_waiting(child);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the caller returns while the child is still stuck");
+        killed_rx.try_recv().expect("the child was killed first");
+        assert!(reaped_rx.try_recv().is_err(), "not reaped while stuck");
+        release_tx.send(()).unwrap();
+        reaped_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the detached thread reaps the child once it exits");
     }
 
     #[cfg(unix)]

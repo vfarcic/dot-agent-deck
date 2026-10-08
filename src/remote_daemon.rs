@@ -83,8 +83,9 @@ pub enum RemoteDaemonError {
     /// The subcommand ran and failed.
     #[error("the remote command failed (exit {status}): {stderr}")]
     Failed { status: i32, stderr: String },
-    /// The subcommand exited 0 but printed nothing this build can read.
-    #[error("the remote command printed an unreadable reply: {0}")]
+    /// The subcommand exited 0 but its output was not a reply this build can
+    /// parse: none at all, more than the cap, or a line that is not its JSON.
+    #[error("the remote command printed no reply this build can parse: {0}")]
     Malformed(String),
 }
 

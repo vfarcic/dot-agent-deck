@@ -415,9 +415,11 @@ pub enum PortError {
     /// S1, so the restart path no longer blames the daemon). Not a failure of the upgrade — the build is in
     /// place — so it becomes [`NotRestartedReason::InstalledBuildTooOld`].
     InstalledBuildTooOld(String),
-    /// The restart request ran, but its reply could not be read (cut off,
-    /// empty, or not this build's JSON). The daemon may or may not have
-    /// restarted, so the upgrade checks before it says which.
+    /// The restart request ran, but no usable reply came back: none arrived
+    /// (the session dropped, the deadline passed, the output was empty), or
+    /// what arrived could not be parsed (cut off, oversized, or not this
+    /// build's JSON). The daemon may or may not have restarted, so the upgrade
+    /// checks before it says which.
     ReplyUnreadable(String),
     /// No daemon was running to ask: it exited after the probe found it and
     /// before the restart request reached it (Qodo 4202060284). Not a failure
@@ -1254,9 +1256,10 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
             }
             // The same build just answered `daemon probe`, so it is new enough;
             // the reply went bad after the request ran, and the remote may
-            // already have restarted.
+            // already have restarted. `reason` says whether output arrived and
+            // failed to parse or none arrived (Qodo 4218118658).
             Err(RemoteDaemonError::Malformed(reason)) => Err(PortError::ReplyUnreadable(format!(
-                "the restart reply could not be read: {reason}"
+                "the remote's reply to the restart request was not usable: {reason}"
             ))),
             // Failures from before the request was sent: ssh never got a
             // session, or the remote binary said it did not send it.
@@ -2596,7 +2599,7 @@ mod tests {
             let restarted =
                 DaemonPort::restart(&port(reply, false), &RestartDaemonRequest::default());
             assert!(
-                matches!(&restarted, Err(PortError::ReplyUnreadable(r)) if r.contains("the restart reply could not be read")),
+                matches!(&restarted, Err(PortError::ReplyUnreadable(r)) if r.contains("the remote's reply to the restart request was not usable")),
                 "{reply:?} gave {restarted:?}"
             );
         }
@@ -2636,7 +2639,7 @@ mod tests {
         };
         assert_eq!(*stage, UpgradeStage::Restarting);
         assert!(
-            reason.contains("the restart reply could not be read"),
+            reason.contains("the remote's reply to the restart request was not usable"),
             "{reason}"
         );
         assert_eq!(installed_version.as_deref(), Some("0.40.0"));
