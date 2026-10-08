@@ -750,6 +750,12 @@ asks_to     = "interrupt the agent"
 try_saying  = "interrupt"
 heard_as_whole = ["interrupt", "interrupt it", "interrupt that"]
 
+# `clear_prompt`'s last sentence is for "clear the prompt" said away from an
+# agent's pane (fixture `clear-prompt-unavailable`, on the overview): the model
+# read "answered by the app itself" as nothing for it to pick and answered
+# `none`, so the user heard "no matching action" instead of where the command
+# works — 1 of 10 runs passed against `gpt-5-mini`, and it failed on
+# `origin/main` too. With the sentence, 50 of 50 (2026-10-08).
 [[commands]]
 id          = "clear_prompt"
 description = """Clear the open agent's prompt: the app deletes everything typed in it and sends
@@ -912,7 +918,7 @@ to start. Use for new agent, start a new agent, create an agent, launch an agent
 spawn an agent, spin one up, or I want another agent. While the New agent dialog is NOT open, any
 request to start an agent — "start the new agent", "start it", "launch the agent", "create
 agent", "activate orchestration" — means THIS one, because the dialog has to be open before
-anything can start. When the user names the daemon (which a user may also call a deck) it
+anything can start; while it IS open, such a request is `start_new_agent`. When the user names the daemon (which a user may also call a deck) it
 should go on — "new agent on the build box", "start an agent on local" — set `deck` to the words
 they used for it; otherwise leave `deck` out. This only OPENS the dialog: it starts nothing. It is
 not `open_agent`, which shows an agent that already exists."""
@@ -992,7 +998,8 @@ id          = "go_to_parent"
 description = """In the New agent dialog's directory browser, go up one level to the parent
 directory — the `..` row. Use for go to parent, go to the parent dir, go up, up one level, one
 level up, go back one directory, back up a level, parent directory, or cd dot dot. It moves the
-browser only and starts nothing."""
+browser only and starts nothing. A bare "go up" means this only while the directory browser is on
+screen; with the New agent dialog closed it is `scroll_up`, which scrolls the dashboard."""
 invoke      = "goToParentDirectory"
 screens     = ["overview"]
 requires    = ["parent_directory"]
@@ -1145,12 +1152,26 @@ heard_as    = ["previous", "back", "before", "page up"]
 #
 # `scroll_up`'s "up" is also `go_to_parent`'s word; that row needs a directory
 # listing on screen, which only the New agent dialog shows, and these need the
-# dialog closed, so the two are never callable together.
+# dialog closed, so the two are never callable together. That alone did not
+# settle a bare "go up" on the dashboard (fixture `scroll-up-go-up`): both
+# descriptions listed it, and the model answered `go_to_parent`, not callable
+# there, in 8 of 10 runs against `gpt-5-mini`, as it did on `origin/main`. Each
+# description now says which screen "go up" belongs to; 50 of 50 after
+# (2026-10-08), with `go-to-parent*` unchanged.
+#
+# `scroll_down`'s sentence about the open dialog is for "scroll down" said over
+# it (fixture `scroll-negative-under-the-new-agent-dialog`): the model answered
+# `next_page`, callable there and the row that scrolls the dashboard too, which
+# grounding then refused, so the user heard nothing useful — 26 of 30 runs
+# passed, against 10 of 10 on `origin/main`. With it, 120 of 120 across the
+# builds measured (2026-10-08).
 [[commands]]
 id          = "scroll_down"
 description = """Scroll the agent dashboard down by about one screen, to show the daemons, orchestrations
 and agents below what is on screen. Use for scroll down, scroll down a bit, go down, move down, or
-show what is below; "page down" is next page, which scrolls the dashboard the same way. It changes which part of the dashboard is showing and nothing else: it
+show what is below; "page down" is next page, which scrolls the dashboard the same way. A request to
+scroll down is THIS one even while the New agent dialog is open and it is `callable: false`: pick it
+anyway rather than `next_page`, and the app says to close the dialog. It changes which part of the dashboard is showing and nothing else: it
 opens, chooses, starts and stops nothing."""
 invoke      = "scrollDown"
 screens     = ["overview"]
@@ -1165,7 +1186,9 @@ heard_as    = ["down", "below"]
 id          = "scroll_up"
 description = """Scroll the agent dashboard up by about one screen, to show the daemons, orchestrations
 and agents above what is on screen. Use for scroll up, scroll up a bit, go up, move up, or show what
-is above; "page up" is previous page, which scrolls the dashboard the same way. It changes which part of the dashboard is showing and nothing else: it opens,
+is above; "page up" is previous page, which scrolls the dashboard the same way. With the New agent
+dialog closed a bare "go up" is THIS one, never `go_to_parent`: there is no directory browser to
+leave. It changes which part of the dashboard is showing and nothing else: it opens,
 chooses, starts and stops nothing."""
 invoke      = "scrollUp"
 screens     = ["overview"]
@@ -1512,6 +1535,18 @@ heard_as    = ["daemon", "deck", "demon"]
 # has no confirmation. 70/70 after, against 59/60 for a wording that avoided
 # the word; `voice_table_d5_rows_only_ask` admits exactly those two negated
 # mentions and still refuses any other "confirm" in this row.
+#
+# "launch the agent now" in that list, and `open_new_agent`'s "while it IS
+# open, such a request is `start_new_agent`", are for an insistent start said
+# while the dialog is open and no directory is chosen yet (fixture
+# `start-new-agent-adversarial-incomplete-form`, "just launch the agent
+# immediately"): the model answered `none` for it in 12 of 70 runs against
+# `gpt-5-mini` once PRD #1497 added its reading rows, though none of them is
+# about starting (10 of 10 on `origin/main`). Each alone was not enough — the
+# phrase 55 of 70, the sentence 23 of 30 — and saying here that "the agent" is
+# the new one, not one on screen, made it worse (7 of 20). Both together, 69 of
+# 70 (2026-10-08), with `start-new-agent-dialog-closed` unchanged (19 of 30
+# against 18 of 30 without them; it fails on `origin/main` too).
 [[commands]]
 id          = "start_new_agent"
 description = """Start what the New agent dialog's form describes — the voice form of its Start
@@ -1525,8 +1560,8 @@ looking at, so "activate orchestration" starts the orchestration already chosen 
 `choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to
 start an agent or an orchestration is `open_new_agent`, which opens the dialog. If the form is
 incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
-for — "start it right now", "just launch it, don't ask me", "skip the confirmation" — since it
-starts at once: a start has no confirmation and no second step for it to skip. A bare "go ahead"
+for — "start it right now", "just launch it, don't ask me", "launch the agent now",
+"skip the confirmation" — since it starts at once: a start has no confirmation and no second step for it to skip. A bare "go ahead"
 means THIS one whenever it is callable and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up."""
 invoke      = "startNewAgent"
 screens     = ["overview"]
