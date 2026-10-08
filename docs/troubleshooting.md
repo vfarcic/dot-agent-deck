@@ -476,6 +476,16 @@ If a pane stays smaller than its box with no other client open, check for a `dot
 
 When an agent's size changes, the daemon discards the output history it keeps for clients that attach later, because that output was drawn for the old size and would replay garbled. Only a client that attaches or re-attaches after the change is affected: it gets the correct live screen with no history behind it. A client that was already attached keeps its own scrollback. In practice you see this when you open an agent's pane in the desktop app after the agent was resized, or when a pane reconnects. Switching between two clients whose panes differ in size resizes the agent, so each switch discards the history again (switches within about a quarter of a second count as one). The history fills back in as the agent keeps working.
 
+### Card borders or right edges look misaligned in the TUI
+
+If card and pane borders are broken or shifted, a card's bottom-right corner is painted over, or text in card titles runs into the border, check whether your terminal is set to draw "ambiguous-width" characters two columns wide. The lines the deck draws borders with, and the `·`, `…` and `—` it uses in card titles and messages, are such characters, and the TUI expects them to be one column wide. That setting is not supported, so turn it off:
+
+- **iTerm2:** Settings → Profiles → Text, clear **Ambiguous characters are double-width**.
+- **GNOME Terminal:** Preferences → your profile → Compatibility, set **Ambiguous-width characters** to **Narrow**.
+- **Other terminals:** look for a setting with "ambiguous" or "East Asian width" in its name.
+
+The borders should line up again. If they are still off, quit the TUI, choosing **Detach** so your agents keep running, and start it again. The desktop app is not affected by this setting.
+
 ## Configuration and schedules
 
 ### A setting or environment variable has no effect
