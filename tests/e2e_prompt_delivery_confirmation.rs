@@ -56,7 +56,17 @@ fn dispatch_worktree_of(deck: &TuiDeck, name: &str) -> PathBuf {
         ))
 }
 
-fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+/// The pane the `dispatch` CLI is run from, started with NO command — the
+/// user's shell.
+///
+/// Issue #1602: a `--single` unit now starts with its dispatcher's own command,
+/// so a `cat` caller (what this used to open) gave every unit `cat` instead of
+/// the `default_command` these tests configure, and the stand-ins and the real
+/// Claude never ran. A dispatcher that only opens a shell is the one a unit
+/// does not copy, so it starts the deck's `default_command` as before. The
+/// Command field is cleared first because the form seeds it from that
+/// `default_command`.
+fn open_shell_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");
     deck.wait_for_string("┌ New Agent");
@@ -64,7 +74,6 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 128]);
-    deck.send_keys(b"cat");
     let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
@@ -608,7 +617,7 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
     common::commit_fixture_repo(deck.workdir());
-    let caller_pane = open_cat_caller_pane(&deck);
+    let caller_pane = open_shell_caller_pane(&deck);
 
     // The first three announce themselves BEFORE the write — the control, and
     // the nearest thing to the fourth that should still work. `seed-late-claim`
@@ -880,7 +889,7 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     let trust_paths = trust_paths_for_worktrees(&deck, &names);
     common::seed_claude_trust_in_home(deck.home_dir(), &trust_paths)
         .expect("seed Claude onboarding and project trust");
-    let caller_pane = open_cat_caller_pane(&deck);
+    let caller_pane = open_shell_caller_pane(&deck);
     let worktrees: Vec<PathBuf> = names
         .iter()
         .map(|name| dispatch_worktree_of(&deck, name))
@@ -948,5 +957,220 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
         delivery_diagnostics(&deck, &cases),
         delivery_log_evidence(&log),
         deck.snapshot_grid()
+    );
+}
+
+/// Issue #1616: the dispatched unit's pane, rendered from the daemon's own
+/// scrollback the way the agent last painted it.
+fn rendered_pane(deck: &TuiDeck, agent_id: &str) -> String {
+    let mut parser = vt100::Parser::new(60, 200, 0);
+    parser.process(&common::pane_snapshot_on(
+        deck.attach_socket_path(),
+        agent_id,
+    ));
+    parser.screen().contents()
+}
+
+/// Issue #1616: the daemon-side record of the unit dispatched as `name`.
+fn dispatched_record(deck: &TuiDeck, name: &str) -> Option<dot_agent_deck::agent_pty::AgentRecord> {
+    let display_name = format!("dispatch-{name}");
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some(display_name.as_str()))
+}
+
+/// Scenario: Dispatch one real interactive Haiku agent with a task file written with Windows line endings (CRLF, a blank line, a trailing line break) that asks it to print a sentinel file's contents; the deck must submit that task exactly once — confirmed by Claude on the first write, never typed into the pane again — and the agent must print the contents. Then send the same pane a follow-up whose two lines are separated by a bare carriage return, through the submit path the desktop app and the TUI use; it must start a turn of its own and the agent must print the second sentinel's contents, rather than sitting in the composer.
+#[spec("scheduler/dispatch/028")]
+#[test]
+fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude() {
+    skip_unless!(common::check_claude_available());
+
+    // `Write` as well as `Bash`: a `--single` unit is told to write its report
+    // with its file-writing tool, and a permission prompt would hold the first
+    // turn open, leaving the follow-up no idle composer to land in.
+    let config = write_default_command_config(&format!("{REAL_AGENT_COMMAND} Write"));
+    let log_name = "prompt-delivery.log";
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            config.path().join("config.toml").to_string_lossy(),
+        )
+        .with_env("DOT_AGENT_DECK_LOG", log_name)
+        .with_env("PATH", path_with_binary_dir())
+        // Above the test's 540s nextest window (`.config/nextest.toml`), so its
+        // daemon and agent are not reaped at the 300s harness default before
+        // the waits below can use it.
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")
+        // The `dispatch` CLI runs from the test process naming the caller's
+        // pane, as in `dispatch/014` and `/015` (issue #1077).
+        .impersonating_pane_signals()
+        .with_imported_claude_credentials()
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    // The contents are what the agent has to print, and appear in neither
+    // prompt, so seeing them proves the agent read the file rather than
+    // echoed its task.
+    let first_sentinel = "line-break-sentinel-a-5d21.txt";
+    let first_contents = "crlf-task-contents-91f3";
+    let second_sentinel = "line-break-sentinel-b-6e32.txt";
+    let second_contents = "bare-cr-followup-contents-4c7a";
+    std::fs::write(
+        deck.workdir().join(first_sentinel),
+        format!("{first_contents}\n"),
+    )
+    .expect("write first sentinel");
+    std::fs::write(
+        deck.workdir().join(second_sentinel),
+        format!("{second_contents}\n"),
+    )
+    .expect("write second sentinel");
+    common::commit_fixture_repo(deck.workdir());
+
+    let name = "line-breaks";
+    let trust_paths = trust_paths_for_worktrees(&deck, &[name]);
+    common::seed_claude_trust_in_home(deck.home_dir(), &trust_paths)
+        .expect("seed Claude onboarding and project trust");
+    let caller_pane = open_shell_caller_pane(&deck);
+    let _guards = SiblingWorktreeGuards(vec![dispatch_worktree_of(&deck, name)]);
+
+    // A task file saved by an editor that writes CRLF. `--task-file` reads it
+    // verbatim, so every line break reaches the deck as `\r\n`.
+    let task = format!(
+        "This task file was saved with Windows line endings.\r\n\r\nUse Bash to run cat {first_sentinel} and print exactly what it contains, then wait.\r\n"
+    );
+    let staging = common::harness_tempdir().expect("task file staging dir");
+    let task_file = staging.path().join("task.md");
+    std::fs::write(&task_file, &task).expect("write CRLF task file");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["dispatch", name, "--single", "--task-file"])
+        .arg(&task_file)
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("run dispatch");
+    assert!(
+        output.status.success(),
+        "dispatch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let read_log = || std::fs::read_to_string(deck.workdir().join(log_name)).unwrap_or_default();
+    let record = || dispatched_record(&deck, name);
+    assert!(
+        common::wait_until(Duration::from_secs(90), || record()
+            .and_then(|r| r.live)
+            .and_then(|live| live.last_user_prompt)
+            .is_some_and(|prompt| prompt.contains(first_sentinel))),
+        "the CRLF task never started a turn in the dispatched pane.\nDelivery log:\n{}\nPane:\n{}",
+        delivery_log_evidence(&read_log()),
+        record()
+            .map(|r| rendered_pane(&deck, &r.id))
+            .unwrap_or_default()
+    );
+    let agent_id = record().expect("dispatched record seen above").id;
+    let pane_id = record()
+        .and_then(|r| r.pane_id_env)
+        .expect("dispatched pane id");
+    let printed_first = common::wait_for_pane_text_on(
+        deck.attach_socket_path(),
+        &agent_id,
+        first_contents,
+        Duration::from_secs(90),
+    );
+    // The retry backoff's floor for Claude Code is 2 s, so by the time the
+    // agent has run a command and printed its output a delivery the daemon
+    // did not recognise as submitted has already been typed in again.
+    let log = read_log();
+    let lines = pane_delivery_log_lines(&log, &pane_id);
+    let confirmed = lines
+        .iter()
+        .any(|line| line.contains("prompt delivery confirmed by the agent"));
+    let resubmitted = lines
+        .iter()
+        .any(|line| line.contains("prompt delivery unconfirmed; re-submitting"));
+    let payload_writes = lines
+        .iter()
+        .filter(|line| payload_write_attempt(line).is_some())
+        .count();
+    assert!(
+        printed_first && confirmed && !resubmitted && payload_writes == 1,
+        "a CRLF task must be submitted exactly once: confirmed by the agent's own report of it on the first write, and never typed into the pane again. printed_first={printed_first}, confirmed={confirmed}, resubmitted={resubmitted}, payload_writes={payload_writes}\nDelivery log for {pane_id}:\n{}\nPane:\n{}",
+        lines.join("\n"),
+        rendered_pane(&deck, &agent_id)
+    );
+
+    // Let the first turn finish so the follow-up lands in an idle composer, as
+    // a person sending it from the desktop app would see it: the card reads
+    // Idle (Claude's `Stop` hook) and stays Idle a moment, since text typed
+    // while Claude is still running its turn-end hooks is not what this checks.
+    let idle = || {
+        record()
+            .and_then(|r| r.live)
+            .is_some_and(|live| live.status == dot_agent_deck::state::SessionStatus::Idle)
+    };
+    // Polled, so a turn that starts and ends inside the window restarts it
+    // rather than being slept through (Qodo, PR #1618).
+    const SUSTAINED_IDLE: Duration = Duration::from_secs(3);
+    let idle_since = std::cell::Cell::new(None::<std::time::Instant>);
+    let settled_idle = common::wait_until(Duration::from_secs(120), || {
+        if !idle() {
+            idle_since.set(None);
+            return false;
+        }
+        let since = idle_since.get().unwrap_or_else(std::time::Instant::now);
+        idle_since.set(Some(since));
+        since.elapsed() >= SUSTAINED_IDLE
+    });
+    assert!(
+        settled_idle,
+        "the first turn never ended, so the follow-up has no idle composer to land in.\nPane:\n{}",
+        rendered_pane(&deck, &agent_id)
+    );
+    let follow_up = format!(
+        "One more check, sent with an old Mac line break.\rUse Bash to run cat {second_sentinel} and print exactly what it contains."
+    );
+    // Named the way the TUI names it: a pane with a live conversation refuses
+    // an unnamed write as `stale` and answers with the conversation's id, which
+    // the retry then names (issues #608, #621).
+    let submit = |session: Option<&str>| {
+        common::write_and_submit_with_identity_on(
+            deck.attach_socket_path(),
+            &pane_id,
+            &follow_up,
+            &agent_id,
+            session,
+        )
+        .expect("write-and-submit the follow-up")
+    };
+    let mut response = submit(None);
+    if response.send_result == Some(dot_agent_deck::event::SendResult::Stale)
+        && let Some(session) = response.current_session_id.clone()
+    {
+        response = submit(Some(&session));
+    }
+    assert_eq!(
+        response.send_result,
+        Some(dot_agent_deck::event::SendResult::Applied),
+        "the follow-up was not written: {response:?}"
+    );
+    let follow_up_started = common::wait_until(Duration::from_secs(60), || {
+        record()
+            .and_then(|r| r.live)
+            .and_then(|live| live.last_user_prompt)
+            .is_some_and(|prompt| prompt.contains(second_sentinel))
+    });
+    let printed_second = follow_up_started
+        && common::wait_for_pane_text_on(
+            deck.attach_socket_path(),
+            &agent_id,
+            second_contents,
+            Duration::from_secs(90),
+        );
+    assert!(
+        follow_up_started && printed_second,
+        "a prompt whose lines are separated by a bare CR must be submitted, not left in the agent's composer. follow_up_started={follow_up_started}, printed_second={printed_second}\nPane:\n{}",
+        rendered_pane(&deck, &agent_id)
     );
 }
