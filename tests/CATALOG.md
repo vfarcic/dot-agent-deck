@@ -7111,6 +7111,24 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the real Tauri window or its form controls (no `tauri-driver` tier, #953); alternate agents or models; authoring and orchestration modes; desktop fallback against missing capabilities; model prose beyond the literal sentinel filename.
 - **Platform coverage:** mac+linux, developer machine only (`#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2 needs a developer's Claude credential and the harness uses Unix-domain sockets and Unix PTYs).
 
+### Voice reading
+
+#### voice/reading-reply
+
+##### voice/reading-reply/001 — A per-agent reading subscription delivers final replies only for turns finished after reading starts.
+- **Layer:** L2 lane 1, PTY-attached (real binary and isolated daemon; production client library and hook CLI).
+- **Agent:** none (daemon-owned `cat` stand-in exporting its own hook capability; synthetic Claude Stop payloads).
+- **Asserts:** a Stop processed before subscription is not replayed; two later Stop payloads deliver their exact final-reply sentinels once, with the selected agent and pane ids, normal-turn outcomes, and increasing sequence numbers; unrelated terminal text is not included.
+- **Does not assert:** provider speech, desktop summarisation or reading controls, genuine agent work, other-agent filtering, permission/error announcement text, Codex rollout tailing, or OpenCode reply capture.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
+
+##### voice/reading-reply/002 — A REAL interactive Claude Haiku turn delivers its discovered sentinel filename through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine Claude Stop hook).
+- **Agent:** REAL interactive Claude Code on Haiku, using the `prompt/voice-keys/001` harness with imported credentials, seeded onboarding and per-folder trust, and `--allowedTools Bash Read`.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel file discovered by Claude; the sentinel is also visible in the attached pane and the agent remains running. The full filename is never supplied in the prompt, and reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, other-agent filtering, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Claude authentication and runs nowhere in CI.
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown

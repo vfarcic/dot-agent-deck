@@ -9,16 +9,22 @@
 //! webview**: the reply goes from the turn event to the summary request and
 //! nowhere else, and only the finished sentence crosses the IPC boundary.
 //!
-//! # The seam M2 fills: [`TurnEventSource`]
+//! # Where turn events come from: [`TurnEventSource`]
 //!
 //! Where turn events come from is the daemon's to say (PRD #1497 D5: the final
-//! reply arrives in the daemon, from Claude Code's hooks and Codex's session
-//! log, and a remote deck's files are reachable only by its daemon). M5 is
-//! built against the trait alone, and the shipped source is [`NoTurnEvents`],
-//! which refuses every subscription with [`NO_TURN_EVENTS`] — so until M2
-//! plugs in a daemon subscription, "reading on" says in plain words that
-//! reading is not available rather than starting a mode that never speaks
-//! (CLAUDE.md rule 20).
+//! reply arrives in the daemon, from Claude Code's hooks, Codex's hooks and
+//! session log, and the deck's OpenCode plugin, and a remote deck's files are
+//! reachable only by its daemon). The shipped source is [`DaemonTurnEvents`]:
+//! the daemon's `subscribe-turn-replies` stream for finished and failed turns,
+//! and its status stream, filtered to the agent, for permission prompts, errors
+//! and usage limits. A daemon too old to offer the reply stream is refused with
+//! [`DAEMON_TOO_OLD`], so "reading on" says in plain words that reading is not
+//! available rather than starting a mode that never speaks (CLAUDE.md rule 20).
+//!
+//! A failed turn usually reaches the app twice — as its final reply, marked
+//! failed, and as the agent's status turning to Error or Blocked — on two
+//! connections, in either order. [`coalesce`] holds one back for
+//! [`FAILURE_COALESCE_WINDOW`] so such a turn is announced once.
 //!
 //! A source answers one subscription per [`ReadingTarget`] with a channel of
 //! [`TurnEvent`]s for that agent alone, from the moment of subscribing — never
@@ -37,16 +43,32 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
+use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
+use dot_agent_deck::daemon_protocol::FinalReply;
+use dot_agent_deck::event::{AgentEvent, BroadcastMsg, EventType};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use super::summary::{Summary, TurnKind, TurnSummaryRequest, spoken_name};
 
-/// Why "reading on" cannot start while no daemon supplies turn events (PRD
-/// #1497 M2 replaces [`NoTurnEvents`]). A fragment, rendered into
+/// Why "reading on" cannot start on a deck whose daemon predates the reply
+/// stream (it does not advertise `turn-replies`). A fragment, rendered into
 /// [`unavailable_sentence`].
-pub const NO_TURN_EVENTS: &str = "this daemon does not report when an agent finishes a turn yet";
+pub const DAEMON_TOO_OLD: &str =
+    "this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine";
+
+/// Why "reading on" cannot start when the deck's daemon did not answer the
+/// subscription. A fragment, rendered into [`unavailable_sentence`].
+pub const DAEMON_UNREACHABLE: &str = "the deck did not answer";
+
+/// How long [`coalesce`] holds back one half of a failed turn waiting for the
+/// other, so the turn is announced once. Both halves leave the daemon within
+/// one hook (a Codex session-log failure within one of its polls), so this only
+/// has to cover two connections' delivery.
+pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
 
 /// What "reading on" says while the Settings opt-in is off (D4), spoken.
 pub const READING_NOT_ENABLED: &str =
@@ -119,27 +141,247 @@ pub trait TurnEventSource: Send + Sync {
     fn subscribe(&self, target: &ReadingTarget) -> SubscribeFuture<'_>;
 }
 
-/// The source shipped until M2: refuses every subscription with
-/// [`NO_TURN_EVENTS`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoTurnEvents;
+/// The shipped source: one deck's daemon, through the client library.
+///
+/// A subscription opens two connections — the daemon's reply stream for the
+/// agent (withheld by the client library unless the daemon advertises it) and
+/// its status stream — and one task that merges them through [`coalesce`]. The
+/// task ends, closing both, when the reading session drops its receiver or the
+/// reply stream ends.
+pub struct DaemonTurnEvents {
+    client: Arc<DaemonClient>,
+}
 
-impl TurnEventSource for NoTurnEvents {
-    fn subscribe(&self, _target: &ReadingTarget) -> SubscribeFuture<'_> {
-        Box::pin(async { Err(NO_TURN_EVENTS.to_string()) })
+impl DaemonTurnEvents {
+    pub fn new(client: Arc<DaemonClient>) -> Self {
+        Self { client }
+    }
+}
+
+impl TurnEventSource for DaemonTurnEvents {
+    fn subscribe(&self, target: &ReadingTarget) -> SubscribeFuture<'_> {
+        let agent_id = target.agent_id.clone();
+        Box::pin(async move {
+            let mut replies = match self.client.subscribe_turn_replies(&agent_id).await {
+                Ok(GatedQuery::Answered(replies)) => replies,
+                Ok(GatedQuery::Unsupported) => return Err(DAEMON_TOO_OLD.to_string()),
+                Err(_) => return Err(DAEMON_UNREACHABLE.to_string()),
+            };
+            let mut statuses = self
+                .client
+                .subscribe_events()
+                .await
+                .map_err(|_| DAEMON_UNREACHABLE.to_string())?;
+            let (incoming_tx, incoming) = mpsc::channel(16);
+            let (events_tx, events) = mpsc::channel(16);
+            tauri::async_runtime::spawn(async move {
+                let status_tx = incoming_tx.clone();
+                let reply_agent = agent_id.clone();
+                let read_replies = async move {
+                    while let Ok(Some(turn)) = replies.next_reply().await {
+                        if turn.agent_id == reply_agent
+                            && incoming_tx.send(Incoming::Reply(turn.reply)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                };
+                let read_statuses = async move {
+                    while let Ok(Some(message)) = statuses.next_event().await {
+                        let BroadcastMsg::Event(event) = message else {
+                            continue;
+                        };
+                        if let Some(status) = status_turn_event(&event, &agent_id)
+                            && status_tx.send(Incoming::Status(status)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // A status stream that ends (a lagged subscriber) costs the
+                    // announcements, not the summaries.
+                    std::future::pending::<()>().await;
+                };
+                let merging = coalesce(incoming, events_tx);
+                tokio::pin!(merging);
+                tokio::select! {
+                    _ = &mut merging => return,
+                    _ = read_replies => {}
+                    _ = read_statuses => {}
+                }
+                // The reply stream ended: both readers are dropped, so the
+                // merge sees its input close, says what it was holding, and
+                // ends the session's events.
+                merging.await;
+            });
+            Ok(events)
+        })
+    }
+}
+
+/// What [`coalesce`] merges: a finished turn's reply, or a status the agent
+/// reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incoming {
+    Reply(FinalReply),
+    Status(TurnEvent),
+}
+
+/// The status event `event` means for reading the agent `agent_id`, or `None`.
+///
+/// Only events naming that agent, and not an outside agent's unproven report.
+/// A permission prompt is a `PermissionRequest`, or a `WaitingForInput` that is
+/// not some other kind of notification (Claude Code's is installed for
+/// permission prompts only). An error is an `Error` that ends work: not a
+/// failed tool call (an `Error` naming a tool, after which the agent carries
+/// on) and not the deck's own delivery notice about a message it could not
+/// hand the agent. A usage limit is a `QuotaBlocked`.
+pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent> {
+    use dot_agent_deck::event::{DELIVERY_NOTICE_METADATA_KEY, UNPROVEN_METADATA_KEY};
+    use dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY;
+    if event.agent_id.as_deref() != Some(agent_id)
+        || event.metadata.contains_key(UNPROVEN_METADATA_KEY)
+    {
+        return None;
+    }
+    match event.event_type {
+        EventType::PermissionRequest => Some(TurnEvent::Permission {
+            wants: permission_wants(event),
+        }),
+        EventType::WaitingForInput => event
+            .metadata
+            .get(NOTIFICATION_TYPE_METADATA_KEY)
+            .is_none_or(|kind| kind == "permission_prompt")
+            .then(|| TurnEvent::Permission {
+                wants: permission_wants(event),
+            }),
+        EventType::Error
+            if event.tool_name.is_none()
+                && !event.metadata.contains_key(DELIVERY_NOTICE_METADATA_KEY) =>
+        {
+            Some(TurnEvent::Blocked {
+                cause: BlockCause::Error,
+            })
+        }
+        EventType::QuotaBlocked => Some(TurnEvent::Blocked {
+            cause: BlockCause::Quota,
+        }),
+        _ => None,
+    }
+}
+
+/// What a permission prompt asks to do: "Bash: cargo publish" from the tool and
+/// its detail, the prompt text an agent sent instead (OpenCode), or nothing.
+fn permission_wants(event: &AgentEvent) -> String {
+    match (event.tool_name.as_deref(), event.tool_detail.as_deref()) {
+        (Some(tool), Some(detail)) if !detail.is_empty() => format!("{tool}: {detail}"),
+        (Some(tool), _) => tool.to_string(),
+        _ => event.user_prompt.clone().unwrap_or_default(),
+    }
+}
+
+/// Merge `incoming` into the events a reading session announces, until either
+/// side closes, announcing a failed turn once.
+///
+/// A failed reply and an error status within [`FAILURE_COALESCE_WINDOW`] of
+/// each other are one failed turn, announced as the reply's summary — it
+/// carries the agent's own words. A failed reply and a usage-limit status are
+/// announced as the usage limit, which says what the user has to do. Whichever
+/// arrives first is held for the window (a status) or remembered for it (a
+/// reply already announced), so the second is dropped. Everything else passes
+/// through in arrival order, a held status first.
+pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
+    use tokio::time::{Instant, sleep_until};
+    // A status held back for its window.
+    let mut held: Option<(BlockCause, Instant)> = None;
+    // The last failed turn already announced, and until when it absorbs the
+    // other half.
+    let mut announced: Option<Instant> = None;
+    loop {
+        let next = match held {
+            Some((_, until)) => tokio::select! {
+                message = incoming.recv() => Some(message),
+                _ = sleep_until(until) => None,
+                _ = out.closed() => return,
+            },
+            None => tokio::select! {
+                message = incoming.recv() => Some(message),
+                _ = out.closed() => return,
+            },
+        };
+        let now = Instant::now();
+        let absorbing = announced.is_some_and(|until| now < until);
+        let mut emit = Vec::new();
+        match next {
+            // The window ran out with no reply: announce the status.
+            None => {
+                if let Some((cause, _)) = held.take() {
+                    emit.push(TurnEvent::Blocked { cause });
+                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+                }
+            }
+            Some(None) => {
+                if let Some((cause, _)) = held.take() {
+                    let _ = out.send(TurnEvent::Blocked { cause }).await;
+                }
+                return;
+            }
+            Some(Some(Incoming::Reply(reply))) if reply.failed => match held.take() {
+                Some((BlockCause::Quota, _)) => {
+                    emit.push(TurnEvent::Blocked {
+                        cause: BlockCause::Quota,
+                    });
+                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+                }
+                Some((BlockCause::Error, _)) | None if !absorbing => {
+                    emit.push(TurnEvent::Failed { reply: reply.text });
+                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+                }
+                _ => {}
+            },
+            Some(Some(Incoming::Reply(reply))) => {
+                if let Some((cause, _)) = held.take() {
+                    emit.push(TurnEvent::Blocked { cause });
+                }
+                emit.push(TurnEvent::Finished { reply: reply.text });
+            }
+            Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
+                if !absorbing
+                    && let Some((earlier, _)) = held.replace((cause, now + FAILURE_COALESCE_WINDOW))
+                {
+                    emit.push(TurnEvent::Blocked { cause: earlier });
+                }
+            }
+            Some(Some(Incoming::Status(status))) => {
+                if let Some((cause, _)) = held.take() {
+                    emit.push(TurnEvent::Blocked { cause });
+                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+                }
+                emit.push(status);
+            }
+        }
+        for event in emit {
+            if out.send(event).await.is_err() {
+                return;
+            }
+        }
     }
 }
 
 /// Why an agent of `agent_type` cannot be read, as a fragment, or `None` when
-/// nothing is known against it (CLAUDE.md rule 20).
+/// its final reply reaches the daemon (CLAUDE.md rule 20).
 ///
-/// TODO(PRD #1497 M2/M6): fill in per agent once the daemon's turn-end data is
-/// known for each — Claude Code (hooks), Codex (session log), OpenCode, and Pi
-/// and Devin — and name every gap in `docs/desktop/voice.md`. Empty today, so
-/// the source's own answer is the only refusal.
+/// Claude Code and Codex report it in their `Stop` hooks (and Codex a failed
+/// turn's in its session log), and OpenCode through the deck's plugin. Devin's
+/// hooks go through the same Claude-compatible path, and its hook input names
+/// the same `last_assistant_message` field, so it is not refused here. Pi is
+/// the gap: the deck's Pi extension does not pass the agent's reply on.
 pub fn agent_gap(agent_type: &str) -> Option<String> {
-    let _ = agent_type;
-    None
+    match agent_type {
+        "pi" => Some(
+            "the deck does not receive Pi's replies yet, so it cannot read Pi's turns".to_string(),
+        ),
+        _ => None,
+    }
 }
 
 /// What "reading on" says when reading cannot run, from a source's or
@@ -400,18 +642,364 @@ mod tests {
         assert!(!sentence.contains('\n'));
     }
 
-    #[tokio::test]
-    async fn voice_reading_no_turn_events_refuses_in_plain_words() {
-        let target = ReadingTarget {
-            deck_id: "deck".to_string(),
-            agent_id: "agent".to_string(),
-            agent_type: Some("claude_code".to_string()),
+    fn failed(text: &str) -> Incoming {
+        Incoming::Reply(FinalReply {
+            turn_id: None,
+            text: text.to_string(),
+            failed: true,
+        })
+    }
+
+    fn blocked(cause: BlockCause) -> Incoming {
+        Incoming::Status(TurnEvent::Blocked { cause })
+    }
+
+    /// Feed `script` into [`coalesce`], waiting `gap` of (paused) time after
+    /// each step, and collect what it announces once the input closes.
+    async fn coalesced(script: Vec<(Incoming, Duration)>) -> Vec<TurnEvent> {
+        let (tx, incoming) = mpsc::channel(16);
+        let (out, mut events) = mpsc::channel(16);
+        let merging = tokio::spawn(coalesce(incoming, out));
+        for (message, gap) in script {
+            tx.send(message).await.unwrap();
+            tokio::time::sleep(gap).await;
+        }
+        drop(tx);
+        merging.await.unwrap();
+        let mut heard = Vec::new();
+        while let Some(event) = events.recv().await {
+            heard.push(event);
+        }
+        heard
+    }
+
+    const SHORT: Duration = Duration::from_millis(100);
+    const LONG: Duration = Duration::from_secs(10);
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_reading_a_failed_turn_is_announced_once_whichever_half_comes_first() {
+        let failed_turn = vec![TurnEvent::Failed {
+            reply: "I could not finish.".to_string(),
+        }];
+        // The error status first, then the failed reply within the window.
+        assert_eq!(
+            coalesced(vec![
+                (blocked(BlockCause::Error), SHORT),
+                (failed("I could not finish."), SHORT),
+            ])
+            .await,
+            failed_turn
+        );
+        // The failed reply first, then the error status.
+        assert_eq!(
+            coalesced(vec![
+                (failed("I could not finish."), SHORT),
+                (blocked(BlockCause::Error), SHORT),
+            ])
+            .await,
+            failed_turn
+        );
+        // A usage limit wins over the failed reply, in either order.
+        let quota = vec![TurnEvent::Blocked {
+            cause: BlockCause::Quota,
+        }];
+        assert_eq!(
+            coalesced(vec![
+                (blocked(BlockCause::Quota), SHORT),
+                (failed("rate limited"), SHORT),
+            ])
+            .await,
+            quota
+        );
+        // The usage limit announced when its window ran out, and the failed
+        // reply arriving after that but within the announcement's window.
+        assert_eq!(
+            coalesced(vec![
+                (
+                    blocked(BlockCause::Quota),
+                    FAILURE_COALESCE_WINDOW + Duration::from_secs(1)
+                ),
+                (failed("rate limited"), SHORT),
+            ])
+            .await,
+            quota
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_reading_an_error_with_no_reply_is_announced_after_the_window() {
+        // No reply comes: the error is announced once the window runs out, and
+        // a later, unrelated finished turn still is.
+        let (tx, incoming) = mpsc::channel(16);
+        let (out, mut events) = mpsc::channel(16);
+        let merging = tokio::spawn(coalesce(incoming, out));
+        tx.send(blocked(BlockCause::Error)).await.unwrap();
+        tokio::time::sleep(SHORT).await;
+        assert!(events.try_recv().is_err(), "held for the window");
+        tokio::time::sleep(FAILURE_COALESCE_WINDOW).await;
+        assert_eq!(
+            events.recv().await,
+            Some(TurnEvent::Blocked {
+                cause: BlockCause::Error
+            })
+        );
+        tokio::time::sleep(LONG).await;
+        tx.send(Incoming::Reply(FinalReply {
+            turn_id: None,
+            text: "done".to_string(),
+            failed: false,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            events.recv().await,
+            Some(TurnEvent::Finished {
+                reply: "done".to_string()
+            })
+        );
+        // Two failed turns far apart are two announcements.
+        tx.send(failed("first")).await.unwrap();
+        tokio::time::sleep(LONG).await;
+        tx.send(failed("second")).await.unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            TurnEvent::Failed {
+                reply: "first".into()
+            }
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            TurnEvent::Failed {
+                reply: "second".into()
+            }
+        );
+        // Dropping the session's receiver ends the merge without more input.
+        drop(events);
+        merging.await.unwrap();
+    }
+
+    fn status(agent: &str, event_type: EventType) -> AgentEvent {
+        AgentEvent {
+            session_id: "s".to_string(),
+            agent_type: dot_agent_deck::event::AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("p".to_string()),
+            agent_id: Some(agent.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    #[test]
+    fn voice_reading_status_events_are_filtered_to_the_agent_and_to_what_stops_it() {
+        let mut permission = status("a", EventType::PermissionRequest);
+        permission.tool_name = Some("Bash".to_string());
+        permission.tool_detail = Some("cargo publish".to_string());
+        assert_eq!(
+            status_turn_event(&permission, "a"),
+            Some(TurnEvent::Permission {
+                wants: "Bash: cargo publish".to_string()
+            })
+        );
+        assert_eq!(status_turn_event(&permission, "b"), None, "another agent's");
+        let mut idle_prompt = status("a", EventType::WaitingForInput);
+        idle_prompt.metadata.insert(
+            dot_agent_deck::quota_block::NOTIFICATION_TYPE_METADATA_KEY.to_string(),
+            "idle_prompt".to_string(),
+        );
+        assert_eq!(status_turn_event(&idle_prompt, "a"), None);
+        assert_eq!(
+            status_turn_event(&status("a", EventType::QuotaBlocked), "a"),
+            Some(TurnEvent::Blocked {
+                cause: BlockCause::Quota
+            })
+        );
+        assert_eq!(
+            status_turn_event(&status("a", EventType::Error), "a"),
+            Some(TurnEvent::Blocked {
+                cause: BlockCause::Error
+            })
+        );
+        let mut tool_failure = status("a", EventType::Error);
+        tool_failure.tool_name = Some("Bash".to_string());
+        assert_eq!(
+            status_turn_event(&tool_failure, "a"),
+            None,
+            "the agent carries on"
+        );
+        let mut notice = status("a", EventType::Error);
+        notice.metadata.insert(
+            dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
+            "d-1".to_string(),
+        );
+        assert_eq!(status_turn_event(&notice, "a"), None);
+        assert_eq!(status_turn_event(&status("a", EventType::Idle), "a"), None);
+    }
+
+    #[test]
+    fn voice_reading_only_pi_is_a_named_gap() {
+        assert!(agent_gap("pi").is_some());
+        for covered in ["claude_code", "codex", "open_code", "devin"] {
+            assert_eq!(agent_gap(covered), None, "{covered}");
+        }
+    }
+
+    /// A fake deck daemon on a Unix socket: answers `hello` with `capabilities`,
+    /// confirms both subscriptions, and on each writes `frames` — the reply
+    /// stream's and the status stream's — then holds the connection open.
+    #[cfg(unix)]
+    async fn fake_deck(
+        path: std::path::PathBuf,
+        capabilities: Vec<String>,
+        reply_frames: Vec<Vec<u8>>,
+        status_frames: Vec<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, KIND_EVENT, PROTOCOL_VERSION, read_frame, write_frame, write_resp,
         };
-        let refused = NoTurnEvents.subscribe(&target).await.unwrap_err();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let capabilities = capabilities.clone();
+                let reply_frames = reply_frames.clone();
+                let status_frames = status_frames.clone();
+                tokio::spawn(async move {
+                    let Ok(Some((_, bytes))) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let frames = match request["op"].as_str() {
+                        Some("hello") => {
+                            let hello = AttachResponse {
+                                capabilities: Some(capabilities),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            };
+                            let _ = write_resp(&mut stream, &hello).await;
+                            return;
+                        }
+                        Some("subscribe-turn-replies") => reply_frames,
+                        Some("subscribe-events") => status_frames,
+                        _ => {
+                            let _ = write_resp(&mut stream, &AttachResponse::err("unknown")).await;
+                            return;
+                        }
+                    };
+                    let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                    for frame in frames {
+                        let _ = write_frame(&mut stream, KIND_EVENT, &frame).await;
+                    }
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn target() -> ReadingTarget {
+        ReadingTarget {
+            deck_id: "deck".to_string(),
+            agent_id: "agent-7".to_string(),
+            agent_type: Some("claude_code".to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reading_a_daemon_without_turn_replies_refuses_in_plain_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let deck = fake_deck(
+            path.clone(),
+            vec!["focus-gained".to_string()],
+            vec![],
+            vec![],
+        )
+        .await;
+        let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
+        let refused = source.subscribe(&target()).await.unwrap_err();
         assert_eq!(
             unavailable_sentence(&refused),
-            "Reading is not available: this daemon does not report when an agent finishes a turn yet."
+            "Reading is not available: this deck's daemon is too old to report finished turns. \
+             Update dot-agent-deck on that machine."
         );
+        deck.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reading_the_daemon_source_delivers_the_agents_replies_and_statuses() {
+        use dot_agent_deck::daemon_protocol::TurnReply;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let reply = |agent: &str, sequence: u64, text: &str| {
+            serde_json::to_vec(&TurnReply {
+                agent_id: agent.to_string(),
+                pane_id: "p".to_string(),
+                sequence,
+                reply: FinalReply {
+                    turn_id: None,
+                    text: text.to_string(),
+                    failed: false,
+                },
+            })
+            .unwrap()
+        };
+        let mut permission = status("agent-7", EventType::PermissionRequest);
+        permission.tool_name = Some("Bash".to_string());
+        let deck = fake_deck(
+            path.clone(),
+            vec![dot_agent_deck::daemon_protocol::CAP_TURN_REPLIES.to_string()],
+            vec![
+                reply("someone-else", 1, "not ours"),
+                reply("agent-7", 2, "All tests pass."),
+            ],
+            vec![
+                serde_json::to_vec(&BroadcastMsg::Event(status(
+                    "someone-else",
+                    EventType::QuotaBlocked,
+                )))
+                .unwrap(),
+                serde_json::to_vec(&BroadcastMsg::Event(permission)).unwrap(),
+            ],
+        )
+        .await;
+        let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
+        let mut events = source.subscribe(&target()).await.unwrap();
+        let mut heard = Vec::new();
+        for _ in 0..2 {
+            heard.push(
+                tokio::time::timeout(Duration::from_secs(10), events.recv())
+                    .await
+                    .expect("delivered promptly")
+                    .expect("stream live"),
+            );
+        }
+        heard.sort_by_key(|event| format!("{event:?}"));
+        assert_eq!(
+            heard,
+            vec![
+                TurnEvent::Finished {
+                    reply: "All tests pass.".to_string()
+                },
+                TurnEvent::Permission {
+                    wants: "Bash".to_string()
+                },
+            ]
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
+            "nothing of another agent's"
+        );
+        deck.abort();
     }
 
     #[tokio::test]

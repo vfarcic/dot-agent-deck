@@ -3905,9 +3905,13 @@ async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Re
 /// The Settings opt-in first (D4): reading sends agent replies to the Commands
 /// connection, so with `[voice] reading` off it answers
 /// [`ReadingStart::NotEnabled`] and nothing is subscribed. Then the agent's
-/// type ([`voice::reading::agent_gap`]) and the turn-event source
-/// ([`voice::reading::TurnEventSource`], M2's seam), either of which answers
-/// [`ReadingStart::Unavailable`] with why.
+/// type ([`voice::reading::agent_gap`]) and the deck's daemon
+/// ([`voice::reading::DaemonTurnEvents`]), either of which answers
+/// [`ReadingStart::Unavailable`] with why — a daemon too old to report finished
+/// turns among them.
+///
+/// The deck is the one `deck_id` names, resolved against the observed set like
+/// every deck-scoped action, never the selection.
 ///
 /// # The reply stays here
 ///
@@ -3937,7 +3941,8 @@ async fn desktop_voice_reading_start(
             sentence: voice::reading::READING_NOT_ENABLED.to_string(),
         });
     }
-    let snapshot = get_snapshot(&state.daemon).await;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let snapshot = daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
     let agent_type = snapshot
         .agents
         .iter()
@@ -3948,12 +3953,20 @@ async fn desktop_voice_reading_start(
             sentence: voice::reading::unavailable_sentence(&gap),
         });
     }
+    let unavailable = |reason: &str| ReadingStart::Unavailable {
+        sentence: voice::reading::unavailable_sentence(reason),
+    };
+    let daemon = match state.daemon.trusted(scope.endpoint()).await {
+        Ok(daemon) if daemon.require_compatible().is_ok() => daemon,
+        _ => return Ok(unavailable(voice::reading::DAEMON_UNREACHABLE)),
+    };
     let target = voice::reading::ReadingTarget {
         deck_id,
         agent_id,
         agent_type,
     };
-    let events = match voice_state.reading.source.subscribe(&target).await {
+    let source = voice::reading::DaemonTurnEvents::new(daemon.client.clone());
+    let events = match voice::reading::TurnEventSource::subscribe(&source, &target).await {
         Ok(events) => events,
         Err(reason) => {
             return Ok(ReadingStart::Unavailable {
@@ -4004,11 +4017,9 @@ enum ReadingStart {
 }
 
 /// The one reading session a window has (PRD #1497 D11: reading is bound to
-/// one agent), and where its turn events come from.
+/// one agent). Its turn events come from the agent's deck, subscribed per
+/// session ([`voice::reading::DaemonTurnEvents`]).
 pub(crate) struct ReadingSessions {
-    /// The turn-event source — [`voice::reading::NoTurnEvents`] until PRD
-    /// #1497 M2 puts a daemon subscription here.
-    source: Arc<dyn voice::reading::TurnEventSource>,
     current: std::sync::Mutex<Option<(u64, tauri::async_runtime::JoinHandle<()>)>>,
     next: std::sync::atomic::AtomicU64,
 }
@@ -4016,7 +4027,6 @@ pub(crate) struct ReadingSessions {
 impl Default for ReadingSessions {
     fn default() -> Self {
         Self {
-            source: Arc::new(voice::reading::NoTurnEvents),
             current: std::sync::Mutex::new(None),
             next: std::sync::atomic::AtomicU64::new(1),
         }

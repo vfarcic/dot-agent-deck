@@ -365,6 +365,34 @@ struct CodexRateLimits {
 pub struct CodexTurnWatch {
     turn_id: String,
     rate_limits: Option<CodexRateLimits>,
+    /// PRD #1497: the final reply of the watched turn's `task_complete`, once
+    /// seen, until [`Self::take_reply`].
+    reply: Option<crate::daemon_protocol::FinalReply>,
+}
+
+/// PRD #1497: the final reply a Codex rollout record carries — the
+/// `last_agent_message` of an `event_msg` whose payload is a `task_complete`,
+/// marked failed when that payload's `error` is an object. `None` for every
+/// other record, and when the message is missing, not a string, or blank. The
+/// text is cut to [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8
+/// boundary, and the payload's `turn_id` is kept.
+pub fn extract_codex_turn_reply(record: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = record.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+        return None;
+    }
+    let text = payload.get("last_agent_message")?.as_str()?;
+    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+        turn_id: payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        text: text.to_owned(),
+        failed: payload.get("error").is_some_and(Value::is_object),
+    })
 }
 
 impl CodexTurnWatch {
@@ -372,7 +400,14 @@ impl CodexTurnWatch {
         Self {
             turn_id: turn_id.into(),
             rate_limits: None,
+            reply: None,
         }
+    }
+
+    /// PRD #1497: the watched turn's final reply, if its `task_complete` has
+    /// been seen and carried one. Taken, so it is handed out once.
+    pub fn take_reply(&mut self) -> Option<crate::daemon_protocol::FinalReply> {
+        self.reply.take()
     }
 
     /// The turn this watch is for.
@@ -420,6 +455,7 @@ impl CodexTurnWatch {
                 CodexLineOutcome::Nothing
             }
             Some("task_complete") if turn == Some(self.turn_id.as_str()) => {
+                self.reply = extract_codex_turn_reply(&record);
                 let Some(error) = payload.get("error").filter(|e| e.is_object()) else {
                     return CodexLineOutcome::TurnEnded;
                 };

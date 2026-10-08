@@ -60,7 +60,11 @@ toml_edit = { version = "0.25", features = ["serde"] }
 # by feature unification. Declaring it is the same discipline the
 # dev-dependency block below states — a change over there cannot silently take
 # this crate's backends out.
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+#
+# `macros` is `tokio::select!`, which `lib.rs` and `daemon_bridge.rs` were
+# already using by the same unification; PRD #1497's reading source
+# (`voice/reading.rs`) uses it too, and declaring it is the same discipline.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 # PRD #802 M5: the keyed remote intent backend's one HTTPS request
 # (`voice/remote.rs`). The CSP leaves no alternative to making it here —
 # `tauri.conf.json`'s `connect-src` names `ipc:` and `http://ipc.localhost` and

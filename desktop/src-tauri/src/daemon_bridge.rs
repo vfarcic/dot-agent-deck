@@ -1352,7 +1352,7 @@ pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<S
 /// socket without reaching for the process-global
 /// `DOT_AGENT_DECK_ATTACH_SOCKET`, and because PRD #741 M9 makes the selection a
 /// parameter in earnest.
-async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapshot {
+pub(crate) async fn snapshot_of(endpoint: &Endpoint, links: &DaemonLinks) -> DesktopSnapshot {
     snapshot_with(endpoint, links, None).await
 }
 

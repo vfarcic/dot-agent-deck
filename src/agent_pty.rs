@@ -5345,6 +5345,8 @@ pub struct AgentPtyRegistry {
     focus_applied: tokio::sync::watch::Sender<u64>,
     /// Issue #714: see [`Self::codex_rollout_arms`].
     codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms,
+    /// PRD #1497: see [`Self::turn_replies`].
+    turn_replies: crate::turn_reply::TurnReplyHub,
     /// Issue #1383: see [`Self::pending_deliveries`].
     pending_deliveries: crate::delegate_retry::PendingDeliveries,
     /// Issue #1383 test seam: when set, the next [`Self::echo_watch`] reports
@@ -7065,6 +7067,7 @@ impl AgentPtyRegistry {
             focus_pass: Mutex::new(()),
             focus_applied: tokio::sync::watch::Sender::new(0),
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
+            turn_replies: crate::turn_reply::TurnReplyHub::default(),
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
@@ -7084,6 +7087,28 @@ impl AgentPtyRegistry {
     /// object both already share.
     pub fn codex_rollout_arms(&self) -> &crate::codex_rollout_tail::CodexRolloutArms {
         &self.codex_rollout_arms
+    }
+
+    /// PRD #1497: the fan-out of finished-turn replies to
+    /// `subscribe-turn-replies` connections. Held here because the hook loop,
+    /// the Codex rollout monitor and the attach server all share the registry.
+    pub fn turn_replies(&self) -> &crate::turn_reply::TurnReplyHub {
+        &self.turn_replies
+    }
+
+    /// PRD #1497: publish `reply` as `agent_id`'s finished turn in `pane_id`,
+    /// only while `agent_id` is that pane's live owner, so no payload can speak
+    /// for another pane's agent. Returns the delivered sequence number.
+    pub fn publish_turn_reply(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        reply: crate::daemon_protocol::FinalReply,
+    ) -> Option<u64> {
+        if !self.is_live_owner(pane_id, agent_id) {
+            return None;
+        }
+        self.turn_replies.publish(agent_id, pane_id, reply)
     }
 
     /// Record the hook-ingestion socket the owning daemon bound, so

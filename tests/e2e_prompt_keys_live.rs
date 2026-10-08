@@ -17,6 +17,9 @@
 //! that runs all three keys in one session, asserted on the whole pane, since
 //! their input boxes are drawn differently. Pi is not covered — see the
 //! catalog's `prompt/voice-keys` section for why.
+//!
+//! `voice/reading-reply/002` reuses the interactive Claude harness to prove
+//! that a genuine Stop hook delivers the final reply to a subscribed client.
 
 mod common;
 
@@ -232,6 +235,75 @@ impl LiveClaude {
             claude_input_text(grid).as_deref() == Some(text)
         });
     }
+}
+
+/// Scenario: Open a real interactive Claude Haiku pane in a fixture containing a uniquely named sentinel file and subscribe to that agent's future turn replies. Ask Claude to list the files and report the sentinel filename; its genuine Stop hook must deliver a successful final reply containing the filename to the client, and the reply must be visible in the attached pane.
+#[spec("voice/reading-reply/002")]
+#[test]
+fn reading_reply_002_real_claude_stop_delivers_sentinel_to_subscribed_client() {
+    use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
+
+    skip_unless!(common::check_claude_available());
+
+    const SENTINEL: &str = "reading_reply_sentinel_7c4e.txt";
+    let claude = LiveClaude::launch("reading-reply", Some(SENTINEL));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("turn reply client runtime");
+    let client = DaemonClient::new(claude.deck.attach_socket_path().to_path_buf());
+    let GatedQuery::Answered(mut replies) = runtime
+        .block_on(client.subscribe_turn_replies(&claude.agent_id))
+        .expect("subscribe to real Claude turn replies before submitting the prompt")
+    else {
+        panic!("the current daemon must advertise turn-replies");
+    };
+
+    // The full filename is absent from the prompt: Claude must discover it
+    // from the fixture, rather than echo a filename provided by the test.
+    let mut writer = claude.writer();
+    claude.submit(
+        &mut writer,
+        "Use the Bash tool to run ls -1 in the current directory. Then reply with the full \
+         filename that starts with reading_reply_sentinel, verbatim. That is the whole task; \
+         do not change any files.",
+        "Use the Bash tool",
+    );
+    let reply = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(180), replies.next_reply())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the genuine Claude Stop hook delivered no turn reply within 180s; grid:\n{}",
+                    claude.deck.snapshot_grid()
+                )
+            })
+            .expect("decode the real Claude final reply")
+            .expect("turn reply subscription must stay open until the turn ends")
+    });
+    assert_eq!(reply.agent_id, claude.agent_id);
+    assert!(
+        !reply.reply.failed,
+        "the real Claude turn failed: {reply:?}"
+    );
+    assert!(
+        reply.reply.text.contains(SENTINEL),
+        "the hook's final reply must contain the discovered sentinel {SENTINEL:?}: {reply:?}"
+    );
+    assert!(
+        claude
+            .deck
+            .wait_for_grid_string_within(SENTINEL, Duration::from_secs(30)),
+        "the real agent's sentinel reply must also be visible in its attached pane:\n{}",
+        claude.deck.snapshot_grid()
+    );
+    claude.assert_still_running("the completed reading turn");
+    claude.deck.wait_until_grid_then_hold(
+        "the real Claude reply remains visible for the recording",
+        Duration::from_secs(2),
+        |grid| grid.contains(SENTINEL),
+    );
 }
 
 /// The highest number that opens a line of the pane — how far a numbered list

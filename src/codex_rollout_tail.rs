@@ -163,6 +163,15 @@ pub struct CodexTurnFailure {
     pub message: Option<String>,
 }
 
+/// PRD #1497: a watched turn's final reply read from its rollout's
+/// `task_complete`, for the daemon to publish to reading subscribers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexTurnReply {
+    pub pane_id: String,
+    pub agent_id: String,
+    pub reply: crate::daemon_protocol::FinalReply,
+}
+
 /// The queue between the hook loop and the monitor task.
 #[derive(Debug, Default)]
 pub struct CodexRolloutArms {
@@ -269,6 +278,9 @@ pub struct CodexRolloutTailers {
     refused: HashSet<String>,
     /// The sum of the lengths of `refused`.
     refused_bytes: usize,
+    /// PRD #1497: replies found by [`Self::tick`], until
+    /// [`Self::take_replies`]. At most one per armed tailer per tick.
+    replies: Vec<CodexTurnReply>,
 }
 
 impl CodexRolloutTailers {
@@ -316,6 +328,12 @@ impl CodexRolloutTailers {
                 self.tailers.insert(req.agent_id, tailer);
             }
         }
+    }
+
+    /// PRD #1497: the final replies the ticks so far found in watched turns'
+    /// `task_complete` records — successful and failed — oldest first.
+    pub fn take_replies(&mut self) -> Vec<CodexTurnReply> {
+        std::mem::take(&mut self.replies)
     }
 
     /// Whether `agent_id` has a turn armed. For tests and diagnostics.
@@ -383,7 +401,15 @@ impl CodexRolloutTailers {
                 .watch
                 .as_ref()
                 .map_or_else(String::new, |w| w.turn_id().to_owned());
-            if let Some((outcome, message)) = read_tailer(tailer) {
+            let (found, reply) = read_tailer(tailer);
+            if let Some(reply) = reply {
+                self.replies.push(CodexTurnReply {
+                    pane_id: tailer.pane_id.clone(),
+                    agent_id: agent_id.clone(),
+                    reply,
+                });
+            }
+            if let Some((outcome, message)) = found {
                 failures.push(CodexTurnFailure {
                     pane_id: tailer.pane_id.clone(),
                     agent_id: agent_id.clone(),
@@ -418,14 +444,22 @@ fn opens_mid_record(file: &File, start: u64) -> bool {
 }
 
 /// Read what `tailer`'s rollout gained since its last read, feeding each
-/// complete line to its watch. Returns the failure the watch found, if any.
-fn read_tailer(tailer: &mut Tailer) -> Option<FoundFailure> {
-    let open = tailer.open.as_mut()?;
+/// complete line to its watch. Returns the failure the watch found, if any,
+/// and the watched turn's final reply once its `task_complete` is read.
+fn read_tailer(
+    tailer: &mut Tailer,
+) -> (
+    Option<FoundFailure>,
+    Option<crate::daemon_protocol::FinalReply>,
+) {
+    let Some(open) = tailer.open.as_mut() else {
+        return (None, None);
+    };
     let len = match open.file.metadata() {
         Ok(meta) => meta.len(),
         Err(_) => {
             tailer.open = None;
-            return None;
+            return (None, None);
         }
     };
     if len < open.offset || tailer.rewind {
@@ -440,18 +474,20 @@ fn read_tailer(tailer: &mut Tailer) -> Option<FoundFailure> {
     }
     let want = (len - open.offset).min(MAX_READ_PER_TICK);
     if want == 0 {
-        return None;
+        return (None, None);
     }
     let mut buf = Vec::with_capacity(want as usize);
     if open.file.seek(SeekFrom::Start(open.offset)).is_err()
         || (&open.file).take(want).read_to_end(&mut buf).is_err()
     {
         tailer.open = None;
-        return None;
+        return (None, None);
     }
     open.offset += buf.len() as u64;
 
-    let watch = tailer.watch.as_mut()?;
+    let Some(watch) = tailer.watch.as_mut() else {
+        return (None, None);
+    };
     let mut found = None;
     let mut ended = false;
     let mut start = 0;
@@ -495,11 +531,12 @@ fn read_tailer(tailer: &mut Tailer) -> Option<FoundFailure> {
             open.partial.extend_from_slice(rest);
         }
     }
+    let reply = watch.take_reply();
     if ended {
         tailer.watch = None;
         tailer.open = None;
     }
-    found
+    (found, reply)
 }
 
 /// Validate and open the rollout at `path` — see the module doc's path-safety
@@ -820,6 +857,71 @@ mod tests {
             t.tick(live).is_empty(),
             "a window opening mid-record must drop that record's fragment"
         );
+    }
+
+    /// PRD #1497: a watched turn's `task_complete` hands its final reply to the
+    /// daemon — a successful one and a failed one alike — once, with the
+    /// tailer's pane and agent; another turn's completion, and one with no
+    /// reply, hand nothing.
+    #[test]
+    fn a_watched_turns_task_complete_yields_its_reply_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-08T05-00-00-r.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+
+        tailers.apply(arm("r", &rollout, Some("turn-ok")));
+        append(
+            &rollout,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"other","last_agent_message":"not ours"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-ok","last_agent_message":"All tests pass."}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert!(
+            tailers.tick(live).is_empty(),
+            "a successful turn is no failure"
+        );
+        let replies = tailers.take_replies();
+        assert_eq!(
+            replies,
+            vec![CodexTurnReply {
+                pane_id: "pane-r".into(),
+                agent_id: "r".into(),
+                reply: crate::daemon_protocol::FinalReply {
+                    turn_id: Some("turn-ok".into()),
+                    text: "All tests pass.".into(),
+                    failed: false,
+                },
+            }]
+        );
+        assert!(tailers.take_replies().is_empty(), "taken once");
+        assert!(!tailers.is_armed("r"), "the completed turn disarms");
+
+        // A failed turn's reply is marked failed and still reported as a failure.
+        tailers.apply(arm("r", &rollout, Some("turn-bad")));
+        append(
+            &rollout,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-bad","last_agent_message":"I could not finish.","error":{"message":"boom","codex_error_info":"other"}}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(tailers.tick(live).len(), 1);
+        let replies = tailers.take_replies();
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].reply.failed);
+        assert_eq!(replies[0].reply.text, "I could not finish.");
+
+        // A completion with no reply hands nothing.
+        tailers.apply(arm("r", &rollout, Some("turn-quiet")));
+        append(&rollout, failure_lines("turn-quiet").as_bytes());
+        assert_eq!(tailers.tick(live).len(), 1);
+        assert!(tailers.take_replies().is_empty());
     }
 
     /// Issue #714 (audit A3): disarming — by a matching `Stop` or by the turn's

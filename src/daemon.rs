@@ -1942,6 +1942,41 @@ fn normalize_quota_blocked_metadata(
     }
 }
 
+/// PRD #1497: publish the final reply a hook-socket `line` carries beside its
+/// turn-ending `event` ([`crate::turn_reply::TURN_REPLY_LINE_KEY`]).
+///
+/// Only for an attested or legacy-admitted event (the caller has excluded an
+/// outside agent's), only for a turn end — `Idle`, or the `Error` /
+/// `QuotaBlocked` a failed turn becomes — and only when the event names its
+/// agent and that agent is the live owner of the pane it names, so a payload
+/// cannot speak for another pane's agent.
+fn publish_hook_turn_reply(
+    registry: &AgentPtyRegistry,
+    event: &AgentEvent,
+    attested_agent: Option<&str>,
+    line: &str,
+) {
+    use crate::event::EventType;
+    if !matches!(
+        event.event_type,
+        EventType::Idle | EventType::Error | EventType::QuotaBlocked
+    ) || event.is_daemon_synthetic()
+    {
+        return;
+    }
+    let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
+    else {
+        return;
+    };
+    if attested_agent.is_some_and(|attested| attested != agent_id) {
+        return;
+    }
+    let Some(reply) = crate::turn_reply::reply_from_line(line) else {
+        return;
+    };
+    registry.publish_turn_reply(pane_id, agent_id, reply);
+}
+
 /// Issue #714: queue the Codex rollout tailer's side of a Codex hook event
 /// (`crate::codex_rollout_tail`). `SessionStart` / `UserPromptSubmit` name the
 /// rollout and the turn to watch; a native `Stop` for the watched turn disarms
@@ -2001,7 +2036,8 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
 }
 
 /// Issues #714 and #1359: the daemon half of Codex failed-turn detection
-/// (`crate::codex_rollout_tail`).
+/// (`crate::codex_rollout_tail`), and PRD #1497's source of a Codex turn's final
+/// reply when no `Stop` hook reports it (an errored turn runs none).
 ///
 /// Every [`crate::codex_rollout_tail::POLL_INTERVAL`] it applies the arm
 /// commands the hook loop queued, then polls every armed tailer on a blocking
@@ -2029,6 +2065,13 @@ async fn run_codex_rollout_monitor(
         }
         let failures;
         (tailers, failures) = poll_codex_rollouts(&registry, tailers).await;
+        // PRD #1497: a watched turn's reply, published before its failure (if
+        // any) is reported, as the hook loop publishes a reply before its
+        // event. A turn whose `Stop` hook already delivered it is not
+        // delivered again (`crate::turn_reply::TurnReplyHub::publish`).
+        for found in tailers.take_replies() {
+            registry.publish_turn_reply(&found.pane_id, &found.agent_id, found.reply);
+        }
         for failure in failures {
             report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
@@ -4353,6 +4396,20 @@ async fn run_hook_loop_with_idle_timeout(
                             // different connection, so doing it first only
                             // means a client that reacts to the event by
                             // listing agents sees the fresher answer.
+                            //
+                            // PRD #1497: a turn-ending event's final reply goes
+                            // to `subscribe-turn-replies` connections, published
+                            // BEFORE the event is broadcast, so a client that
+                            // has seen this turn end and subscribes afterwards
+                            // is not handed its reply as if it were new.
+                            if !unproven {
+                                publish_hook_turn_reply(
+                                    &pty_registry,
+                                    &event,
+                                    attested_agent.as_deref(),
+                                    &line,
+                                );
+                            }
                             ingest_hook_event(
                                 &state,
                                 &event_tx,

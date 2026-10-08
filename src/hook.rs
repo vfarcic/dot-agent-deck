@@ -166,16 +166,108 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         None => return ExitCode::SUCCESS,
     };
 
+    // PRD #1497: the turn's final reply, for the daemon's reading
+    // subscribers. Read from the raw payload, so a reply of a strange shape
+    // costs the reply and never the event.
+    let reply = serde_json::from_str::<Value>(&input)
+        .ok()
+        .and_then(|payload| match agent {
+            "opencode" => extract_opencode_turn_reply(&payload),
+            _ => extract_turn_reply(&payload),
+        });
+
     // Issue #318: present this pane's hook capability token, so the daemon can
     // tell this pane's own report from one naming it from outside.
     let token = crate::hook_provenance::token_from_env();
-    let json = match crate::event::agent_event_line(&event, token.as_deref()) {
+    let json = match crate::event::agent_event_line(&event, token.as_deref())
+        .and_then(|line| with_turn_reply(line, reply.as_ref()))
+    {
         Ok(j) => j,
         Err(_) => return ExitCode::SUCCESS,
     };
 
     let _ = send_to_socket(&json);
     ExitCode::SUCCESS
+}
+
+/// PRD #1497: `line` with `reply` added under
+/// [`crate::turn_reply::TURN_REPLY_LINE_KEY`], or unchanged when there is none —
+/// so an event with no reply is sent exactly as before.
+fn with_turn_reply(
+    line: String,
+    reply: Option<&crate::daemon_protocol::FinalReply>,
+) -> serde_json::Result<String> {
+    let Some(reply) = reply else {
+        return Ok(line);
+    };
+    let mut value: Value = serde_json::from_str(&line)?;
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            crate::turn_reply::TURN_REPLY_LINE_KEY.to_string(),
+            serde_json::to_value(reply)?,
+        );
+    }
+    serde_json::to_string(&value)
+}
+
+/// PRD #1497: the final reply a Claude-compatible hook payload carries — the
+/// `last_assistant_message` of a main-agent `Stop`, or of a `StopFailure`
+/// (marked failed). `None` for every other hook, for a `Stop` fired inside a
+/// subagent (one whose payload names an `agent_id`), and when the message is
+/// missing, not a string, or blank. The text is cut to
+/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8 boundary, and a
+/// `turn_id` (Codex reports one) is kept.
+pub fn extract_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    let failed = match payload.get("hook_event_name").and_then(Value::as_str)? {
+        "Stop" => false,
+        "StopFailure" => true,
+        _ => return None,
+    };
+    if payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return None;
+    }
+    let text = payload.get("last_assistant_message")?.as_str()?;
+    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+        turn_id: payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        text: text.to_owned(),
+        failed,
+    })
+}
+
+/// PRD #1497: the final reply the deck's OpenCode plugin attaches to the report
+/// of a session going idle (`session.idle`, or `session.status` with status
+/// `idle`) — the text of the session's last assistant message, under `reply`,
+/// with `reply_failed` set when the turn ended on a `session.error`
+/// (`crate::opencode_manage`). `None` for every other event and for a missing,
+/// non-string or blank reply.
+pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
+    let idle = match payload.get("event").and_then(Value::as_str)? {
+        "session.idle" => true,
+        "session.status" | "session.status.updated" => payload
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("idle")),
+        _ => false,
+    };
+    if !idle {
+        return None;
+    }
+    let text = payload.get("reply")?.as_str()?;
+    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+        turn_id: None,
+        text: text.to_owned(),
+        failed: payload
+            .get("reply_failed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 fn read_stdin() -> Option<String> {

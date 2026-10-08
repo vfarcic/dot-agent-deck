@@ -159,6 +159,20 @@ const directorySessions = new Map();
 const sessionAliases = new Map();
 let shuttingDown = false;
 
+// PRD #1497: the assistant's reply, for the deck's voice "reading on". The text
+// parts of each assistant message are kept as they stream in (the full text
+// arrives on `message.part.updated`, and `message.part.delta` carries the
+// increments in between); when the session goes idle, the text of its LAST
+// assistant message is attached to that idle report as `reply`, once. Keyed by
+// OpenCode's own session id. Bounded: a part keeps at most MAX_REPLY_CHARS code
+// points, and at most MAX_REPLY_MESSAGES messages are tracked at once.
+const MAX_REPLY_CHARS = 8192;
+const MAX_REPLY_MESSAGES = 64;
+const replyMessages = new Map();
+const lastAssistantMessage = new Map();
+const failedTurns = new Set();
+const abortedTurns = new Set();
+
 const sendEvent = (payload) => {{
   try {{
     execFileSync(BINARY_PATH, ["hook", "--agent", "opencode"], {{
@@ -406,6 +420,85 @@ for (const signal of ["SIGINT", "SIGTERM"]) {{
   process.once(signal, handleShutdown);
 }}
 
+const clipReply = (text) => {{
+  const chars = Array.from(text);
+  return chars.length <= MAX_REPLY_CHARS ? text : chars.slice(0, MAX_REPLY_CHARS).join("");
+}};
+
+const replyMessage = (messageId, sessionId) => {{
+  let message = replyMessages.get(messageId);
+  if (!message) {{
+    while (replyMessages.size >= MAX_REPLY_MESSAGES) {{
+      replyMessages.delete(replyMessages.keys().next().value);
+    }}
+    message = {{ sessionId, parts: new Map() }};
+    replyMessages.set(messageId, message);
+  }}
+  return message;
+}};
+
+const recordAssistantMessage = (info) => {{
+  const sessionId = info?.sessionID;
+  if (!sessionId) {{
+    return;
+  }}
+  const previous = lastAssistantMessage.get(sessionId);
+  if (previous && previous !== info.id) {{
+    replyMessages.delete(previous);
+  }}
+  lastAssistantMessage.set(sessionId, info.id);
+  replyMessage(info.id, sessionId);
+}};
+
+const recordReplyPart = (part) => {{
+  if (part?.type !== "text" || part.synthetic || part.ignored || !part.id || !part.messageID) {{
+    return;
+  }}
+  const message = replyMessage(part.messageID, part.sessionID);
+  message.parts.set(part.id, clipReply(typeof part.text === "string" ? part.text : ""));
+}};
+
+const recordReplyDelta = (props) => {{
+  if (props?.field !== "text" || typeof props.delta !== "string") {{
+    return;
+  }}
+  const parts = replyMessages.get(props.messageID)?.parts;
+  if (!parts || !parts.has(props.partID)) {{
+    return;
+  }}
+  parts.set(props.partID, clipReply(parts.get(props.partID) + props.delta));
+}};
+
+// The reply owed for OpenCode session `sessionId`'s turn that just went idle,
+// as the fields to add to that idle report, consumed so it is sent once.
+const takeReply = (sessionId) => {{
+  if (!sessionId) {{
+    return {{}};
+  }}
+  const messageId = lastAssistantMessage.get(sessionId);
+  const failed = failedTurns.delete(sessionId);
+  const aborted = abortedTurns.delete(sessionId);
+  lastAssistantMessage.delete(sessionId);
+  const message = messageId ? replyMessages.get(messageId) : undefined;
+  for (const [id, entry] of replyMessages.entries()) {{
+    if (entry.sessionId === sessionId) {{
+      replyMessages.delete(id);
+    }}
+  }}
+  if (!message || aborted) {{
+    return {{}};
+  }}
+  const text = clipReply(Array.from(message.parts.values()).join("").trim());
+  if (!text) {{
+    return {{}};
+  }}
+  return failed ? {{ reply: text, reply_failed: true }} : {{ reply: text }};
+}};
+
+const isIdleReport = (payload) =>
+  payload.event === "session.idle" ||
+  (payload.event === "session.status" && payload.status === "idle");
+
 const recordUserMessage = (event, directory) => {{
   const info = event?.properties?.info;
   const messageId = info?.id;
@@ -415,6 +508,9 @@ const recordUserMessage = (event, directory) => {{
   const role = (info?.role ?? "").toLowerCase();
   if (role !== "user") {{
     messageRoles.delete(messageId);
+    if (role === "assistant") {{
+      recordAssistantMessage(info);
+    }}
     return;
   }}
   const dir = info?.directory ?? directory ?? process.cwd();
@@ -441,11 +537,15 @@ const emitUserPrompt = (sessionId, prompt, directory) => {{
 
 const handleMessagePartUpdated = (event, directory) => {{
   const part = event?.properties?.part;
-  if (!part?.messageID || part.type !== "text" || !part.text) {{
+  if (!part?.messageID || part.type !== "text") {{
     return;
   }}
   const info = messageRoles.get(part.messageID);
   if (!info || info.role !== "user") {{
+    recordReplyPart(part);
+    return;
+  }}
+  if (!part.text) {{
     return;
   }}
   const sessionId = normalizeSessionId(
@@ -480,6 +580,10 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         handleMessagePartUpdated(event, directory);
         return;
       }}
+      if (eventType === "message.part.delta") {{
+        recordReplyDelta(event?.properties);
+        return;
+      }}
       if (eventType === "permission.asked" || eventType === "permission.replied") {{
         const payload = permissionPayload(event, directory);
         ensureSessionRegistered(payload.session_id, payload.cwd);
@@ -504,7 +608,15 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         payload.status,
         event?.type !== "session.created"
       );
-      sendEvent(payload);
+      const rawSessionId = event?.properties?.sessionID;
+      if (event?.type === "session.error" && rawSessionId) {{
+        if (event?.properties?.error?.name === "MessageAbortedError") {{
+          abortedTurns.add(rawSessionId);
+        }} else {{
+          failedTurns.add(rawSessionId);
+        }}
+      }}
+      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
     }},
     "tool.execute.before": async (input, output) => {{
       const sessionId = normalizeSessionId(
@@ -1632,6 +1744,135 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
             assert!(
                 bare.get(key).is_none(),
                 "{key} from an unexpected shape: {bare}"
+            );
+        }
+    }
+
+    /// PRD #1497: load the generated plugin under Node with its binary pinned to
+    /// a recorder, and play it a turn the way OpenCode 1.18 publishes one — the
+    /// user's message, a reasoning part, an assistant message streamed as an
+    /// empty text part plus deltas and then its full text, a second assistant
+    /// message after a tool step, then `session.status` idle and the deprecated
+    /// `session.idle`. The first idle report carries the LAST assistant
+    /// message's text as `reply`, the second none; a turn that hit a
+    /// `session.error` carries `reply_failed`; an interrupted turn carries none.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_attaches_the_last_assistant_reply_to_the_idle_report() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"import plugin from "{}";
+const hooks = await plugin({{ directory: "/work" }});
+const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
+const part = (sessionID, messageID, id, type, text) =>
+  send("message.part.updated", {{ sessionID, time: 1, part: {{ id, sessionID, messageID, type, text, time: {{ start: 1 }} }} }});
+const turn = async (s, prefix, finalText) => {{
+  await send("session.status", {{ sessionID: s, status: {{ type: "busy" }} }});
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "u", sessionID: s, role: "user" }} }});
+  await part(s, prefix + "u", prefix + "pu", "text", "list the files");
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "a1", sessionID: s, role: "assistant" }} }});
+  await part(s, prefix + "a1", prefix + "r", "reasoning", "thinking about it");
+  await part(s, prefix + "a1", prefix + "t1", "text", "");
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a1", partID: prefix + "t1", field: "text", delta: "Let me " }});
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a1", partID: prefix + "t1", field: "text", delta: "look." }});
+  await part(s, prefix + "a1", prefix + "t1", "text", "Let me look.");
+  await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "a2", sessionID: s, role: "assistant" }} }});
+  await part(s, prefix + "a2", prefix + "t2", "text", "");
+  await send("message.part.delta", {{ sessionID: s, messageID: prefix + "a2", partID: prefix + "t2", field: "text", delta: finalText }});
+}};
+await turn("s1", "m1", "Final: two files changed. 🦀");
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await send("session.idle", {{ sessionID: "s1" }});
+await turn("s1", "m2", "I could not finish.");
+await send("session.error", {{ sessionID: "s1", error: {{ name: "APIError", data: {{ message: "boom" }} }} }});
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await turn("s1", "m3", "half a sentence");
+await send("session.error", {{ sessionID: "s1", error: {{ name: "MessageAbortedError", data: {{}} }} }});
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+"#,
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("node")
+            .arg(&driver)
+            .status()
+            .expect("run node");
+        assert!(status.success(), "the plugin driver failed");
+        let payloads: Vec<serde_json::Value> = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let replies: Vec<Option<crate::daemon_protocol::FinalReply>> = payloads
+            .iter()
+            .filter(|p| {
+                p["event"] == "session.idle"
+                    || (p["event"] == "session.status" && p["status"] == "idle")
+            })
+            .map(crate::hook::extract_opencode_turn_reply)
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: "Final: two files changed. 🦀".into(),
+                    failed: false,
+                }),
+                None,
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: "I could not finish.".into(),
+                    failed: true,
+                }),
+                None,
+            ],
+            "{payloads:#?}"
+        );
+        assert!(
+            payloads
+                .iter()
+                .filter(|p| p["event"] != "session.idle" && p["event"] != "session.status")
+                .all(|p| p.get("reply").is_none()),
+            "only an idle report carries a reply: {payloads:#?}"
+        );
+        // Every payload still decodes and builds its event.
+        for payload in &payloads {
+            let input: crate::hook::OpenCodeHookInput =
+                serde_json::from_value(payload.clone()).unwrap();
+            assert!(
+                crate::hook::build_opencode_event(input).is_some(),
+                "{payload}"
             );
         }
     }

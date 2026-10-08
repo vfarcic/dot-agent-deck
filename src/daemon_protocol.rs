@@ -71,7 +71,7 @@
 //! | `KIND_STREAM_IN`  | client → server | raw bytes for PTY stdin       |
 //! | `KIND_DETACH`     | client → server | empty — detach, leave agent   |
 //! | `KIND_STREAM_END` | server → client | optional reason (e.g. lagged) |
-//! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request) |
+//! | `KIND_EVENT`      | server → client | JSON [`crate::event::BroadcastMsg`] (M2.17/M2.19, after a `SubscribeEvents` request); JSON [`TurnReply`] on a `SubscribeTurnReplies` connection (PRD #1497) |
 //! | `KIND_SHUTDOWN`   | client → server | empty — shut the daemon down (PRD #92 F1) |
 //! | `KIND_SHUTDOWN_ACK` | server → client | empty — acknowledges `KIND_SHUTDOWN` before teardown begins (PRD #92 F1 followup) |
 //!
@@ -480,6 +480,18 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// file". So no
 /// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
 ///
+/// **PRD #1497 contributes no bump for [`AttachRequest::SubscribeTurnReplies`]**,
+/// for the same reason: its one sender,
+/// [`crate::daemon_client::DaemonClient::subscribe_turn_replies`], withholds it
+/// unless [`CAP_TURN_REPLIES`] is advertised on a fresh `Hello`, and a daemon
+/// replaced by an older build in between refuses the unknown variant and opens
+/// nothing. Its [`TurnReply`] frames travel only on that variant's own
+/// connection, so no existing stream's payload changed, and the reply text
+/// reaches the daemon beside a hook-socket event line rather than inside
+/// [`crate::event::AgentEvent`] (`crate::turn_reply::TURN_REPLY_LINE_KEY`),
+/// which an older daemon ignores. No existing field changed meaning, so no
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
+///
 /// # Where this constant is enforced
 ///
 /// **Two call sites refuse on it, and both require exact equality**
@@ -801,6 +813,69 @@ pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 /// directory on every platform this builds for.
 pub const CAP_LAST_COMMAND: &str = "last-command";
 
+/// Capability string for [`AttachRequest::SubscribeTurnReplies`] (PRD #1497):
+/// a stream of one agent's finished-turn replies, for the desktop's voice
+/// "reading on". Held by
+/// [`crate::daemon_client::DaemonClient::subscribe_turn_replies`], so no call
+/// site checks it itself. Advertised on every platform: the dispatch arm is not
+/// `#[cfg]`-gated, and the replies come from the hook socket and the Codex
+/// rollout tailer, which run on every platform this builds for.
+pub const CAP_TURN_REPLIES: &str = "turn-replies";
+
+/// The longest [`FinalReply::text`] the daemon stores or sends, in bytes. A
+/// longer reply is cut to its longest valid UTF-8 prefix within the bound
+/// ([`clamp_turn_reply`]). Reading speaks a summary of the reply, so the head
+/// of a long one is what matters, and a fixed bound keeps one agent's reply
+/// from becoming a peer-chosen allocation in every subscriber.
+pub const MAX_TURN_REPLY_BYTES: usize = 8192;
+
+/// `text` cut to its longest valid UTF-8 prefix of at most
+/// [`MAX_TURN_REPLY_BYTES`] bytes.
+pub fn clamp_turn_reply(text: &str) -> &str {
+    if text.len() <= MAX_TURN_REPLY_BYTES {
+        return text;
+    }
+    let mut end = MAX_TURN_REPLY_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The final reply of one finished agent turn (PRD #1497), read from the
+/// agent's own turn-end data — a Claude Code or Codex `Stop` /
+/// `StopFailure` hook's `last_assistant_message`, a Codex rollout's
+/// `task_complete`, the deck's OpenCode plugin at `session.idle` — never from
+/// terminal output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalReply {
+    /// The agent's own id for the turn, when it reports one (Codex does;
+    /// Claude Code does not). The daemon uses it to deliver a turn reported
+    /// through two routes once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// The reply, at most [`MAX_TURN_REPLY_BYTES`].
+    pub text: String,
+    /// The turn ended on an error rather than completing.
+    #[serde(default)]
+    pub failed: bool,
+}
+
+/// One [`FinalReply`] as the daemon streams it to an
+/// [`AttachRequest::SubscribeTurnReplies`] subscriber, as a `KIND_EVENT` frame
+/// on that subscription's own connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReply {
+    /// The deck's registry id of the agent whose turn ended.
+    pub agent_id: String,
+    /// The pane that agent runs in.
+    pub pane_id: String,
+    /// Increases with every reply the daemon delivers, so successive turns of
+    /// one agent carry increasing numbers. Not contiguous per agent.
+    pub sequence: u64,
+    pub reply: FinalReply,
+}
+
 /// The longest [`AttachRequest::FocusGained::client_id`] (and
 /// [`AttachRequest::AttachStream::client_id`]) this daemon accepts, in bytes.
 ///
@@ -878,7 +953,7 @@ fn invalid_client_id_message() -> String {
 /// [`CAP_PREPARE_ORCHESTRATION`]. Issue #1445's
 /// [`CAP_RECORD_ORCHESTRATOR_CONTEXT`] is on both lists: its dispatch arm is
 /// not `#[cfg]`-gated, and neither is issue #1555's
-/// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`].
+/// [`CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT`] nor PRD #1497's [`CAP_TURN_REPLIES`].
 #[cfg(unix)]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_PROJECTS,
@@ -897,6 +972,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_TURN_REPLIES,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -911,6 +987,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LAST_COMMAND,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
+    CAP_TURN_REPLIES,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1828,6 +1905,24 @@ pub enum AttachRequest {
     /// which a client falls back from to `SubscribeEvents` plus `ListAgents`.
     /// An older daemon refuses the unknown variant and opens nothing.
     SubscribeEventsWithSnapshot,
+    /// PRD #1497: long-lived subscription to the finished-turn replies of the
+    /// agent `id` names. The daemon answers an OK `RESP`, then writes one
+    /// `KIND_EVENT` frame carrying a JSON [`TurnReply`] per turn of that agent
+    /// that ends after the subscription opened — no reply from before it is
+    /// replayed — until either side closes the connection.
+    ///
+    /// The replies travel only on this stream: no [`BroadcastMsg`] carries
+    /// them, so a client that never subscribes never receives an agent's reply
+    /// text. Refused, with nothing opened, when `id` names no agent of this
+    /// daemon's.
+    ///
+    /// **Withheld unless the daemon advertises [`CAP_TURN_REPLIES`]**, by
+    /// [`crate::daemon_client::DaemonClient::subscribe_turn_replies`]. An older
+    /// daemon refuses the unknown variant and opens nothing.
+    SubscribeTurnReplies {
+        /// The registry id of the agent whose replies to stream.
+        id: String,
+    },
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
@@ -5417,6 +5512,9 @@ async fn handle_connection(
         AttachRequest::SubscribeEventsWithSnapshot => {
             handle_subscribe_events_with_snapshot(stream, event_tx, &registry, &state).await?;
         }
+        AttachRequest::SubscribeTurnReplies { id } => {
+            handle_subscribe_turn_replies(stream, &registry, id).await?;
+        }
         AttachRequest::Hello {
             client_version: _,
             client_build_version,
@@ -6202,13 +6300,55 @@ async fn handle_subscribe_events_with_snapshot(
     forward_event_stream(stream, rx, &AttachResponse::agent_records(records)).await
 }
 
+/// PRD #1497: [`AttachRequest::SubscribeTurnReplies`]. The receiver is opened
+/// BEFORE the OK `RESP` is written, so every reply the daemon publishes after
+/// the client reads its confirmation is on this stream, and nothing published
+/// before the receiver existed is replayed. Only the named agent's replies are
+/// forwarded.
+async fn handle_subscribe_turn_replies(
+    stream: IpcStream,
+    registry: &Arc<AgentPtyRegistry>,
+    id: String,
+) -> io::Result<()> {
+    if !registry.agent_ids().contains(&id) {
+        let (_rd, mut wr) = stream.into_split();
+        return write_resp(
+            &mut wr,
+            &AttachResponse::err("subscribe-turn-replies: no such agent"),
+        )
+        .await;
+    }
+    let rx = registry.turn_replies().subscribe();
+    forward_broadcast(
+        stream,
+        rx,
+        &AttachResponse::ok(),
+        "subscribe-turn-replies",
+        |reply| reply.agent_id == id,
+    )
+    .await
+}
+
 /// The forwarding loop both subscribe handlers share: confirm with `resp`, then
 /// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
 /// ends. See [`handle_subscribe_events`].
 async fn forward_event_stream(
     stream: IpcStream,
-    mut rx: broadcast::Receiver<BroadcastMsg>,
+    rx: broadcast::Receiver<BroadcastMsg>,
     resp: &AttachResponse,
+) -> io::Result<()> {
+    forward_broadcast(stream, rx, resp, "subscribe-events", |_| true).await
+}
+
+/// Confirm with `resp`, then write each message `rx` receives that `keep`
+/// accepts as a `KIND_EVENT` frame until the stream ends. `label` names the
+/// subscription in the log. See [`handle_subscribe_events`].
+async fn forward_broadcast<T: Serialize + Clone>(
+    stream: IpcStream,
+    mut rx: broadcast::Receiver<T>,
+    resp: &AttachResponse,
+    label: &str,
+    keep: impl Fn(&T) -> bool,
 ) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     write_resp(&mut wr, resp).await?;
@@ -6218,13 +6358,16 @@ async fn forward_event_stream(
             recv = rx.recv() => {
                 match recv {
                     Ok(msg) => {
+                        if !keep(&msg) {
+                            continue;
+                        }
                         let payload = match serde_json::to_vec(&msg) {
                             Ok(b) => b,
                             Err(e) => {
-                                // A BroadcastMsg that can't serialize is a daemon
+                                // A message that can't serialize is a daemon
                                 // bug — log and skip rather than tear the
                                 // subscription down for every other client.
-                                warn!("subscribe-events: skipping unserializable broadcast: {e}");
+                                warn!("{label}: skipping unserializable broadcast: {e}");
                                 continue;
                             }
                         };
