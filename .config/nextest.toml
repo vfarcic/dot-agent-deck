@@ -590,9 +590,12 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # Two real-agent turns plus readiness and bounded upgrade/reconnect waits can
 # exceed the default 180s kill window. Let the scenario report its own failed
 # phase and grid; this changes neither its assertion waits nor retry policy.
+# Its five sequential agent waits alone can take 600s (5 x AGENT_WAIT), so the
+# allowance is 840s, and the fixture daemon's lifetime (900s, in the test) is
+# longer than that, so the daemon outlives the test's own failure report.
 [[profile.default.overrides]]
 filter = 'test(remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts)'
-slow-timeout = { period = "60s", terminate-after = 10 }
+slow-timeout = { period = "60s", terminate-after = 14 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

@@ -64,7 +64,10 @@ fn report_file(
 #[test]
 fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
     skip_unless!(common::check_claude_available());
-    let mut remote = Remote::with_lifetime(600);
+    // Outlives nextest's 840s allowance for this test (`.config/nextest.toml`),
+    // so a slow phase fails on its own wait, not on a daemon that reached its
+    // lifetime first. 900 is the most `MAX_PINNED_ORPHAN_CAP_SECS` allows.
+    let mut remote = Remote::with_lifetime(900);
     let home = remote.dir.path().join("remote-home");
     let workspace = remote.dir.path().join("haiku-workspace");
     fs::create_dir_all(&workspace).unwrap();
