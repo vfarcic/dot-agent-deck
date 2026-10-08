@@ -324,6 +324,9 @@ fn permission_wants(event: &AgentEvent) -> String {
 ///   announced when the hold runs out, and an error status within
 ///   [`FAILURE_COALESCE_WINDOW`] after that is still absorbed.
 ///
+/// The window is time, not turn identity: two distinct failed turns finishing
+/// within it are announced as one.
+///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
     use tokio::time::{Instant, sleep_until};

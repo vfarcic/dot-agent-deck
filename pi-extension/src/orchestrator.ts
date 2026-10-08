@@ -142,26 +142,24 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
 
 /**
- * The `agent-event` flags that carry a settled turn's final reply (PRD #1497):
- * the text of Pi's last assistant message, and whether that message ended in
- * an error. The deck reads a short summary of it aloud while reading mode is
- * on.
+ * The `agent-event` flags that announce a settled turn's final reply (PRD
+ * #1497): the reply itself comes on the CLI's stdin, and the second flag says
+ * the message it came from ended in an error. The deck reads a short summary
+ * of it aloud while reading mode is on.
  *
- * The reply travels on the argv of the short-lived `agent-event` process, so
- * while that process runs, any local user who can list processes can read it
- * (`/proc/<pid>/cmdline`). `pi.exec` gives an extension no way to write a
- * child's stdin (Pi 0.84.4 through 1.1.0 spawn with stdin ignored), which is
- * what keeps it off a private channel.
+ * The text never goes on the command line, where any local user who can list
+ * processes could read it (`/proc/<pid>/cmdline`). `pi.exec` spawns with stdin
+ * ignored and takes no stdin option (Pi 0.84.4 and 1.1.0), so a report that
+ * carries a reply is spawned by {@link execWithStdin} instead.
  */
-export const TURN_REPLY_FLAG = "--turn-reply";
+export const TURN_REPLY_STDIN_FLAG = "--turn-reply-stdin";
 export const TURN_REPLY_FAILED_FLAG = "--turn-reply-failed";
 
 /**
- * The longest reply put on argv, in code points. The deck keeps at most 8 KiB
- * of a reply, so this only keeps a very long one well clear of the OS's
- * per-argument limit; it never decides what is read.
+ * The longest reply written to the CLI's stdin, in UTF-8 bytes: what the deck
+ * keeps of a reply (`MAX_TURN_REPLY_BYTES`), so nothing past it is ever sent.
  */
-export const MAX_TURN_REPLY_CHARS = 8192;
+export const MAX_TURN_REPLY_BYTES = 8192;
 
 /** A settled turn's final reply, as the extension reports it. */
 export interface TurnReply {
@@ -215,10 +213,11 @@ export function buildAgentEventArgv(
 		}
 	}
 	// PRD #1497: LAST, and only when there is text — an older CLI's refusal
-	// of it is handled by `createReporter`, which drops the reply first.
-	if (reply !== undefined && reply.text.trim().length > 0) {
-		argv.push(`${TURN_REPLY_FLAG}=${clip(reply.text, MAX_TURN_REPLY_CHARS)}`);
-		if (reply.failed) {
+	// of it is handled by `createReporter`, which drops the reply first. Only
+	// the flags: the text goes on stdin (`turnReplyStdin`).
+	if (turnReplyStdin(reply) !== undefined) {
+		argv.push(TURN_REPLY_STDIN_FLAG);
+		if (reply!.failed) {
 			argv.push(TURN_REPLY_FAILED_FLAG);
 		}
 	}
@@ -343,6 +342,21 @@ export type DetailEvent = (typeof DETAIL_EVENTS)[number];
  */
 export const MAX_PROMPT_CHARS = 4000;
 
+/** Cut `text` to at most `max` UTF-8 bytes, never splitting a code point. */
+function clipUtf8(text: string, max: number): string {
+	let bytes = 0;
+	let end = 0;
+	for (const char of text) {
+		const size = char.codePointAt(0)! < 0x80 ? 1 : char.codePointAt(0)! < 0x800 ? 2 : char.codePointAt(0)! < 0x10000 ? 3 : 4;
+		if (bytes + size > max) {
+			return text.slice(0, end);
+		}
+		bytes += size;
+		end += char.length;
+	}
+	return text;
+}
+
 /** Cut `text` to at most `max` code points, never splitting a surrogate pair. */
 function clip(text: string, max: number): string {
 	const chars = Array.from(text);
@@ -414,7 +428,17 @@ export function piAssistantReply(message: unknown): TurnReply | undefined {
 		.join("\n\n");
 	const failed = record.stopReason === "error";
 	const said = text.length > 0 ? text : failed ? nonBlankString(record.errorMessage)?.trim() : undefined;
-	return said === undefined ? undefined : { text: clip(said, MAX_TURN_REPLY_CHARS), failed };
+	return said === undefined ? undefined : { text: clipUtf8(said, MAX_TURN_REPLY_BYTES), failed };
+}
+
+/**
+ * The stdin a report carrying `reply` writes for {@link TURN_REPLY_STDIN_FLAG}:
+ * its text, at most {@link MAX_TURN_REPLY_BYTES}, or `undefined` when there is
+ * nothing to read (no reply, or a blank one), in which case no reply flag is
+ * sent either.
+ */
+export function turnReplyStdin(reply: TurnReply | undefined): string | undefined {
+	return reply !== undefined && reply.text.trim().length > 0 ? clipUtf8(reply.text, MAX_TURN_REPLY_BYTES) : undefined;
 }
 
 /**
@@ -599,9 +623,13 @@ export class DeckExecError extends Error {
  * that refuses any flag of a report carrying a reply cannot take the reply:
  * the first such refusal drops the reply for the rest of the session and
  * sends the report again at the same level, and only a refusal of that steps
- * the level down. The levels themselves move exactly as they did before.
+ * the level down. The levels themselves move exactly as they did before. A
+ * report carrying the reply hands `run` its text as `stdin`
+ * ({@link turnReplyStdin}); every other report hands it none.
  */
-export function createReporter(run: (argv: string[], signal?: AbortSignal) => Promise<unknown>): {
+export function createReporter(
+	run: (argv: string[], signal?: AbortSignal, stdin?: string) => Promise<unknown>,
+): {
 	send: (report: AgentEventReport, signal?: AbortSignal) => Promise<void>;
 	level: () => ReportLevel;
 	replies: () => boolean;
@@ -616,8 +644,10 @@ export function createReporter(run: (argv: string[], signal?: AbortSignal) => Pr
 			if (argv === null) {
 				return;
 			}
+			// The reply flags are on `argv` exactly when this is defined.
+			const stdin = tried === "declared" && withReply ? turnReplyStdin(report.reply) : undefined;
 			try {
-				await run(argv, signal);
+				await (stdin === undefined ? run(argv, signal) : run(argv, signal, stdin));
 				level = tried;
 				return;
 			} catch (err) {
@@ -730,4 +760,115 @@ export function spawnFailureMessage(argv: string[], err: unknown, bin: string = 
 			? ` (is \`${DECK_BIN}\` installed and on PATH?)`
 			: ` (does \`${bin}\` still exist?)`;
 	return `Failed to run \`${cmd}\`${hint}: ${reason}`;
+}
+
+/** The part of a spawned child {@link execWithStdin} uses (Node's `ChildProcess`). */
+export interface StdinChild {
+	stdin: { on(event: string, listener: (...args: any[]) => void): unknown; end(data: string): unknown } | null;
+	stdout: { on(event: string, listener: (...args: any[]) => void): unknown } | null;
+	stderr: { on(event: string, listener: (...args: any[]) => void): unknown } | null;
+	kill(signal?: "SIGTERM" | "SIGKILL"): boolean;
+	once(event: string, listener: (...args: any[]) => void): unknown;
+}
+
+/** Node's `child_process.spawn`, as {@link execWithStdin} calls it. */
+export type SpawnWithStdin = (
+	command: string,
+	args: string[],
+	options: { cwd?: string; shell: false; stdio: ["pipe", "pipe", "pipe"]; windowsHide: boolean },
+) => StdinChild;
+
+/** How long {@link execWithStdin} waits for a SIGTERMed child before SIGKILL, as `pi.exec` does. */
+const FORCE_KILL_AFTER_MS = 5000;
+/** How long after `exit` it waits for the output pipes to close, as `pi.exec` does. */
+const EXIT_STDIO_GRACE_MS = 100;
+
+/**
+ * Run `bin argv` and write `stdin` to it (PRD #1497), resolving with the same
+ * `{code, stdout, stderr, killed}` `pi.exec` gives, which cannot write a
+ * child's stdin. Spawned the way `pi.exec` spawns: an argv array, no shell,
+ * in `cwd`, killed on `signal` (SIGTERM, then SIGKILL after 5s) or after
+ * `timeout` ms when one is given. Rejects only when the child cannot be
+ * spawned (e.g. ENOENT), which callers report as a spawn failure. A child that
+ * exits without reading its stdin — an older CLI refusing a flag — is not an
+ * error here: the write's EPIPE is ignored and its exit code answers. A child
+ * killed by a signal reports a non-zero code.
+ */
+export function execWithStdin(
+	spawn: SpawnWithStdin,
+	bin: string,
+	argv: string[],
+	stdin: string,
+	options: { signal?: AbortSignal; cwd?: string; timeout?: number } = {},
+): Promise<{ code: number; stdout: string; stderr: string; killed: boolean }> {
+	return new Promise((resolve, reject) => {
+		let child: StdinChild;
+		try {
+			child = spawn(bin, argv, { cwd: options.cwd, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		} catch (err) {
+			reject(err);
+			return;
+		}
+		let stdout = "";
+		let stderr = "";
+		let killed = false;
+		let settled = false;
+		let exitCode: number | null = null;
+		const timers: Array<ReturnType<typeof setTimeout>> = [];
+		const kill = () => {
+			if (killed) {
+				return;
+			}
+			killed = true;
+			child.kill("SIGTERM");
+			timers.push(setTimeout(() => child.kill("SIGKILL"), FORCE_KILL_AFTER_MS));
+		};
+		const cleanup = () => {
+			settled = true;
+			for (const timer of timers) {
+				clearTimeout(timer);
+			}
+			options.signal?.removeEventListener("abort", kill);
+		};
+		const finish = (code: number | null) => {
+			if (settled) {
+				return;
+			}
+			cleanup();
+			resolve({ stdout, stderr, code: code ?? 1, killed });
+		};
+		child.once("error", (err: unknown) => {
+			if (settled) {
+				return;
+			}
+			cleanup();
+			reject(err);
+		});
+		child.once("exit", (code: number | null) => {
+			if (settled) {
+				return;
+			}
+			exitCode = code;
+			timers.push(setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS));
+		});
+		child.once("close", (code: number | null) => finish(code ?? exitCode));
+		child.stdout?.on("data", (chunk: unknown) => {
+			stdout += String(chunk);
+		});
+		child.stderr?.on("data", (chunk: unknown) => {
+			stderr += String(chunk);
+		});
+		if (options.signal?.aborted) {
+			kill();
+		} else {
+			options.signal?.addEventListener("abort", kill, { once: true });
+		}
+		if (options.timeout !== undefined && options.timeout > 0) {
+			timers.push(setTimeout(kill, options.timeout));
+		}
+		// An older CLI exits on its usage error without reading stdin, and the
+		// write then fails with EPIPE; its exit code is the answer, not this.
+		child.stdin?.on("error", () => {});
+		child.stdin?.end(stdin);
+	});
 }

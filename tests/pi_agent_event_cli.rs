@@ -16,9 +16,9 @@
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixListener;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
@@ -30,6 +30,12 @@ const AGENT: &str = "pi-cli-agent";
 /// Run `dot-agent-deck agent-event <args>` from a pane and return the frame it
 /// put on the hook socket.
 fn agent_event(args: &[&str]) -> AgentEvent {
+    serde_json::from_str(agent_event_line(args, None).trim()).expect("parse emitted AgentEvent")
+}
+
+/// Run `dot-agent-deck agent-event <args>` from a pane, writing `stdin` to it
+/// (none: stdin is null), and return the raw line it put on the hook socket.
+fn agent_event_line(args: &[&str], stdin: Option<&[u8]>) -> String {
     let temp = test_temp::tempdir().expect("create agent-event socket directory");
     let socket = temp.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).expect("bind agent-event socket");
@@ -37,14 +43,26 @@ fn agent_event(args: &[&str]) -> AgentEvent {
         .set_nonblocking(true)
         .expect("make agent-event listener nonblocking");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .arg("agent-event")
         .args(args)
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", PANE)
         .env("DOT_AGENT_DECK_AGENT_ID", AGENT)
-        .output()
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run agent-event");
+    if let Some(bytes) = stdin {
+        // Dropping the handle closes stdin, as the Pi extension does.
+        let _ = child.stdin.take().expect("piped stdin").write_all(bytes);
+    }
+    let output = child.wait_with_output().expect("wait for agent-event");
     assert!(
         output.status.success(),
         "`agent-event {args:?}` failed: status={} stderr={}",
@@ -60,7 +78,7 @@ fn agent_event(args: &[&str]) -> AgentEvent {
                 stream
                     .read_to_string(&mut line)
                     .expect("read emitted AgentEvent");
-                return serde_json::from_str(line.trim()).expect("parse emitted AgentEvent");
+                return line;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
@@ -200,6 +218,80 @@ fn an_unknown_type_is_refused_with_the_full_vocabulary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("running, waiting, finished, prompt, tool-start, tool-end"),
+        "stderr: {stderr}"
+    );
+}
+
+/// Scenario: Report a settled Pi turn the way the bundled extension does since
+/// PRD #1497 moved the reply off the command line: `--type finished
+/// --turn-reply-stdin` (and `--turn-reply-failed`) with the reply written to
+/// stdin. The line on the hook socket carries the reply under `turn_reply`
+/// beside an unchanged `Idle` event; with nothing on stdin, or on another
+/// `--type`, the line carries no reply; and the old `--turn-reply=<text>` form
+/// is refused as an unknown flag, so no reply can be put on argv.
+#[test]
+fn a_settled_turns_reply_is_read_from_stdin_never_argv() {
+    use dot_agent_deck::daemon_protocol::{FinalReply, MAX_TURN_REPLY_BYTES};
+    use dot_agent_deck::turn_reply::reply_from_line;
+
+    let reply = "All 42 tests pass.\n\n--not-a-flag é";
+    let line = agent_event_line(
+        &["--type", "finished", "--cwd=/w", "--turn-reply-stdin"],
+        Some(reply.as_bytes()),
+    );
+    assert_eq!(
+        reply_from_line(&line),
+        Some(FinalReply {
+            turn_id: None,
+            text: reply.to_string(),
+            failed: false,
+        })
+    );
+    let event: AgentEvent = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(event.event_type, EventType::Idle);
+    assert_eq!(event.cwd.as_deref(), Some("/w"));
+
+    let line = agent_event_line(
+        &[
+            "--type",
+            "finished",
+            "--turn-reply-stdin",
+            "--turn-reply-failed",
+        ],
+        Some(b"429 rate limited"),
+    );
+    assert!(reply_from_line(&line).expect("failed reply").failed);
+
+    // A reply past what the deck keeps is cut to it.
+    let long = "x".repeat(MAX_TURN_REPLY_BYTES * 3);
+    let line = agent_event_line(
+        &["--type", "finished", "--turn-reply-stdin"],
+        Some(long.as_bytes()),
+    );
+    assert_eq!(
+        reply_from_line(&line).expect("long reply").text.len(),
+        MAX_TURN_REPLY_BYTES
+    );
+
+    // Nothing on stdin, and a report that is not a turn end, carry no reply.
+    let line = agent_event_line(&["--type", "finished", "--turn-reply-stdin"], None);
+    assert_eq!(reply_from_line(&line), None);
+    let line = agent_event_line(
+        &["--type", "running", "--turn-reply-stdin"],
+        Some(b"not a turn end"),
+    );
+    assert_eq!(reply_from_line(&line), None);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["agent-event", "--type", "finished", "--turn-reply=secret"])
+        .env("DOT_AGENT_DECK_PANE_ID", PANE)
+        .env("DOT_AGENT_DECK_SOCKET", "/nonexistent/hook.sock")
+        .output()
+        .expect("run agent-event");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("error: unexpected argument '--turn-reply"),
         "stderr: {stderr}"
     );
 }

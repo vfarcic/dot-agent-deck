@@ -167,9 +167,10 @@ let shuttingDown = false;
 // OpenCode's own (raw) session id, never by the directory alias below: a
 // subagent's child session shares the root's directory, and its reply is not
 // the user's turn. A reply is only published for a session KNOWN to be a root
-// (no `parentID`), learned from `session.created` / `session.updated` or, when
-// neither was seen, asked of OpenCode's client; an unknown or child session's
-// idle report carries no reply.
+// (no `parentID`) when it goes idle, learned from `session.created` /
+// `session.updated` or, when neither was seen, asked of OpenCode's client in
+// the background (lookUpAncestry); an unknown or child session's idle report
+// carries no reply, and never waits for an answer.
 //
 // Bounded: a message retains at most MAX_REPLY_BYTES of UTF-8 text across all
 // its parts (the daemon's own bound, so nothing kept here is cut there) and at
@@ -181,6 +182,7 @@ const MAX_REPLY_PARTS = 256;
 const MAX_REPLY_MESSAGES = 64;
 const MAX_REPLY_SESSIONS = 256;
 const ANCESTRY_LOOKUP_MS = 2000;
+const MAX_ANCESTRY_LOOKUPS = 8;
 const replyMessages = new Map();
 const lastAssistantMessage = new Map();
 const failedTurns = new Set();
@@ -188,6 +190,12 @@ const abortedTurns = new Set();
 // Raw session id -> its parent's id, or "" for a root session.
 const sessionParents = new Map();
 let sessionClient = undefined;
+// Ancestry lookups in flight, by raw session id (lookUpAncestry), how many of
+// their requests have not settled, and a count bumped on every disposal so an
+// answer to a lookup started before one is discarded.
+const ancestryLookups = new Map();
+let unsettledAncestryLookups = 0;
+let disposalGeneration = 0;
 
 const sendEvent = (payload) => {{
   try {{
@@ -486,6 +494,10 @@ const forgetReplyState = (sessionId) => {{
 }};
 
 const forgetAllReplyState = () => {{
+  disposalGeneration += 1;
+  for (const sessionId of Array.from(ancestryLookups.keys())) {{
+    cancelAncestryLookup(sessionId);
+  }}
   replyMessages.clear();
   lastAssistantMessage.clear();
   failedTurns.clear();
@@ -510,27 +522,80 @@ const noteSessionAncestry = (info) => {{
   }}
 }};
 
-// Whether `sessionId` is a root session. When no session event named its
-// ancestry, OpenCode's client is asked, bounded by ANCESTRY_LOOKUP_MS; a
-// session whose ancestry is still unknown is not a root.
-const isRootSession = async (sessionId) => {{
-  const sessions = sessionClient?.session;
-  if (!sessionParents.has(sessionId) && typeof sessions?.get === "function") {{
-    try {{
-      const answer = await Promise.race([
-        sessions.get({{ path: {{ id: sessionId }} }}),
-        new Promise((resolve) => {{
-          const timer = setTimeout(resolve, ANCESTRY_LOOKUP_MS);
-          timer?.unref?.();
-        }}),
-      ]);
-      const info = answer?.data ?? answer;
-      if (info?.id === sessionId) {{
-        noteSessionAncestry(info);
-      }}
-    }} catch (_) {{}}
+// Stop waiting for `sessionId`'s ancestry lookup (it was deleted, or OpenCode
+// disposed): its answer, if one still comes, is discarded.
+const cancelAncestryLookup = (sessionId) => {{
+  const lookup = ancestryLookups.get(sessionId);
+  if (lookup) {{
+    ancestryLookups.delete(sessionId);
+    lookup.abort();
   }}
-  return sessionParents.get(sessionId) === "";
+}};
+
+// Ask OpenCode's client, in the background, whether `sessionId` is a root,
+// when no session event named its ancestry; nothing waits for the answer, so
+// a report is never delayed by it. One lookup per session at a time, and none
+// started while MAX_ANCESTRY_LOOKUPS requests are unsettled, so a client that
+// never answers cannot pile them up. One that has not answered within
+// ANCESTRY_LOOKUP_MS is aborted through the request's `signal` (a client that
+// ignores the signal still holds its session's slot and one of the
+// MAX_ANCESTRY_LOOKUPS until it settles). An answer is recorded only if its
+// session was not deleted, and OpenCode not disposed, while it was asked.
+const lookUpAncestry = (sessionId) => {{
+  const sessions = sessionClient?.session;
+  if (
+    !sessionId ||
+    sessionParents.has(sessionId) ||
+    ancestryLookups.has(sessionId) ||
+    unsettledAncestryLookups >= MAX_ANCESTRY_LOOKUPS ||
+    typeof sessions?.get !== "function"
+  ) {{
+    return;
+  }}
+  const controller = typeof AbortController === "function" ? new AbortController() : undefined;
+  let timer;
+  const lookup = {{
+    abort: () => {{
+      clearTimeout(timer);
+      try {{
+        controller?.abort();
+      }} catch (_) {{}}
+    }},
+  }};
+  const disposal = disposalGeneration;
+  ancestryLookups.set(sessionId, lookup);
+  unsettledAncestryLookups += 1;
+  timer = setTimeout(lookup.abort, ANCESTRY_LOOKUP_MS);
+  timer?.unref?.();
+  let request;
+  try {{
+    request = Promise.resolve(
+      sessions.get({{ path: {{ id: sessionId }}, ...(controller ? {{ signal: controller.signal }} : {{}}) }})
+    );
+  }} catch (error) {{
+    request = Promise.reject(error);
+  }}
+  request
+    .then(
+      (answer) => {{
+        const info = answer?.data ?? answer;
+        if (
+          ancestryLookups.get(sessionId) === lookup &&
+          disposal === disposalGeneration &&
+          info?.id === sessionId
+        ) {{
+          noteSessionAncestry(info);
+        }}
+      }},
+      () => {{}}
+    )
+    .finally(() => {{
+      clearTimeout(timer);
+      unsettledAncestryLookups -= 1;
+      if (ancestryLookups.get(sessionId) === lookup) {{
+        ancestryLookups.delete(sessionId);
+      }}
+    }});
 }};
 
 const replyMessage = (messageId, sessionId) => {{
@@ -554,6 +619,8 @@ const recordAssistantMessage = (info) => {{
   if (!sessionId || !info.id || isChildSession(sessionId)) {{
     return;
   }}
+  // Asked now, so the answer is usually in by the time the turn goes idle.
+  lookUpAncestry(sessionId);
   const previous = lastAssistantMessage.get(sessionId);
   if (previous && previous !== info.id) {{
     replyMessages.delete(previous);
@@ -609,9 +676,15 @@ const recordTurnError = (sessionId, error) => {{
 
 // The reply owed for OpenCode session `sessionId`'s turn that just went idle,
 // as the fields to add to that idle report, consumed so it is sent once. Only
-// a root session's: a subagent's child session, or one whose ancestry cannot
-// be learned, gets none.
-const takeReply = async (sessionId) => {{
+// a session already known to be a root gets one; this never waits for a
+// lookup, so the idle report is sent at once. A subagent's child session gets
+// none. So does a session whose ancestry is not known yet, and that reply is
+// dropped rather than sent later: the deck takes a reply only on a turn-end
+// report, and a second idle report would end the turn twice. A session that
+// neither a session event nor the client ever names stays replyless on
+// purpose: an unknown session might be a subagent's, and its text is not the
+// user's turn, so privacy wins over completeness.
+const takeReply = (sessionId) => {{
   if (!sessionId) {{
     return {{}};
   }}
@@ -624,7 +697,11 @@ const takeReply = async (sessionId) => {{
     return {{}};
   }}
   const text = Array.from(message.parts.values(), (part) => part.text).join("").trim();
-  if (!text || !(await isRootSession(sessionId))) {{
+  if (!text) {{
+    return {{}};
+  }}
+  if (sessionParents.get(sessionId) !== "") {{
+    lookUpAncestry(sessionId);
     return {{}};
   }}
   return failed ? {{ reply: text, reply_failed: true }} : {{ reply: text }};
@@ -742,6 +819,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         if (deletedId) {{
           forgetReplyState(deletedId);
           sessionParents.delete(deletedId);
+          cancelAncestryLookup(deletedId);
         }}
         closeSession(payload.session_id, payload.cwd, false, false);
         return;
@@ -756,9 +834,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (event?.type === "session.error") {{
         recordTurnError(rawSessionId, event?.properties?.error);
       }}
-      sendEvent(
-        isIdleReport(payload) ? {{ ...payload, ...(await takeReply(rawSessionId)) }} : payload
-      );
+      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
     }},
     "tool.execute.before": async (input, output) => {{
       const sessionId = normalizeSessionId(
@@ -2180,6 +2256,125 @@ for (const id of ["resumed", "lookup-child", "lookup-fails"]) {
             "the child's two idle reports (filed under the root by the directory alias) carry \
              nothing, the root's carries its own reply, and only the client-confirmed root is \
              read: {payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 review: OpenCode's client never answers the ancestry lookup.
+    /// Each idle report of a session no event named is sent at once, without
+    /// a reply, instead of waiting on the lookup; the session is asked once
+    /// however many turns it ends, at most `MAX_ANCESTRY_LOOKUPS` (8) lookups
+    /// are outstanding across twenty such sessions, every one is aborted
+    /// through its `signal` after `ANCESTRY_LOOKUP_MS`, and once they have
+    /// settled the session can be asked again.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_ancestry_lookup_never_delays_the_idle_report_and_is_bounded() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const calls = [];
+let aborted = 0;
+const client = { session: { get: ({ path, signal }) => {
+  calls.push(path.id);
+  return new Promise((_, reject) => {
+    signal?.addEventListener("abort", () => { aborted += 1; reject(new Error("aborted")); });
+  });
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+for (let turn = 0; turn < 3; turn++) {
+  await assistant("hang", "hang-a" + turn);
+  await part("hang", "hang-a" + turn, "hang-t" + turn, "HANG_REPLY");
+  const started = Date.now();
+  await send("session.status", { sessionID: "hang", status: { type: "idle" } });
+  const took = Date.now() - started;
+  if (took > 1000) throw new Error("the idle report waited " + took + " ms for the lookup");
+}
+const asked = (id) => calls.filter((c) => c === id).length;
+if (asked("hang") !== 1) throw new Error("hang asked " + asked("hang") + " times: " + calls);
+for (let i = 0; i < 20; i++) {
+  await assistant("many" + i, "many-a" + i);
+}
+if (calls.length !== 8) throw new Error(calls.length + " lookups outstanding: " + calls);
+await new Promise((resolve) => setTimeout(resolve, 2600));
+if (aborted !== 8) throw new Error(aborted + " of 8 lookups aborted");
+await assistant("hang", "hang-again");
+if (asked("hang") !== 2) throw new Error("hang not asked again: " + calls);
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let replies = idle_replies(&payloads);
+        assert_eq!(replies.len(), 3, "{payloads:#?}");
+        assert!(
+            replies.iter().all(|(_, reply)| reply.is_none()),
+            "{payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 review: an ancestry answer that arrives after its session was
+    /// deleted, or after OpenCode disposed, is discarded — so a session later
+    /// reported under the same id is not read on the strength of it — while
+    /// the same answer for a live session still makes its next idle report
+    /// carry the reply.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_discards_an_ancestry_answer_after_delete_or_dispose() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const pending = new Map();
+const client = { session: { get: ({ path }) =>
+  new Promise((resolve) => { pending.set(path.id, resolve); }) } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+const answer = async (id) => { pending.get(id)({ data: { id } }); pending.delete(id); await settle(); };
+const turn = async (s, m, text) => {
+  await assistant(s, m);
+  await part(s, m, m + "t", text);
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+};
+
+await assistant("live", "live-a1");
+await answer("live");
+await turn("live", "live-a2", "LIVE_REPLY");
+
+await assistant("gone", "gone-a1");
+await send("session.deleted", { sessionID: "gone", info: { id: "gone", directory: "/work/gone" } });
+const staleGone = pending.get("gone");
+pending.delete("gone");
+staleGone({ data: { id: "gone" } });
+await settle();
+await turn("gone", "gone-a2", "STALE_DELETE_REPLY");
+
+await assistant("old", "old-a1");
+const staleOld = pending.get("old");
+pending.delete("old");
+await send("server.instance.disposed", {});
+staleOld({ data: { id: "old" } });
+await settle();
+await turn("old", "old-a2", "STALE_DISPOSE_REPLY");
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let replies: Vec<Option<String>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply.map(|r| r.text))
+            .collect();
+        assert_eq!(
+            replies,
+            vec![Some("LIVE_REPLY".to_owned()), None, None],
+            "{payloads:#?}"
         );
     }
 

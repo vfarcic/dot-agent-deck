@@ -1002,8 +1002,48 @@ pub fn build_agent_event_cli(
     }
 }
 
-/// PRD #1497: the final reply `dot-agent-deck agent-event --turn-reply` carries
-/// — the bundled Pi extension's last assistant text for a settled turn —
+/// How long `dot-agent-deck agent-event --turn-reply-stdin` waits for its
+/// stdin to end. The bundled Pi extension writes the reply and closes stdin
+/// as it spawns the CLI, so the read ends at once; the bound is for a stdin
+/// nobody closes (a terminal, a held-open pipe), which costs the report its
+/// reply and never the report.
+pub const TURN_REPLY_STDIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// PRD #1497: the reply `dot-agent-deck agent-event --turn-reply-stdin` reads
+/// from `input`: at most [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] plus
+/// the three bytes that complete a character straddling the bound — the
+/// daemon keeps no more ([`crate::turn_reply::normalize`] cuts it there) — so
+/// a longer input is never read in full. A character the read cut short is
+/// dropped; any other invalid UTF-8 becomes U+FFFD. `None` when `input` gives
+/// nothing, fails, or has not ended within `timeout`: the reader runs on a
+/// thread of its own, so a stdin nobody closes cannot hold the report.
+pub fn read_turn_reply_stdin<R>(input: R, timeout: std::time::Duration) -> Option<String>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let limit = (crate::daemon_protocol::MAX_TURN_REPLY_BYTES + 3) as u64;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = input.take(limit).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = tx.send(read);
+    });
+    let bytes = rx.recv_timeout(timeout).ok()?.ok()?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) if err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// PRD #1497: the final reply `dot-agent-deck agent-event --turn-reply-stdin`
+/// carries — the bundled Pi extension's last assistant text for a settled turn —
 /// bounded like every other route ([`crate::turn_reply::normalize`]). Only a
 /// turn end (`--type finished`, an [`EventType::Idle`]) carries one; on any
 /// other `--type`, and for a missing or blank text, it is `None`, so the line
@@ -2077,8 +2117,67 @@ mod tests {
         }
     }
 
+    /// PRD #1497: `agent-event --turn-reply-stdin` reads the reply whole when
+    /// it fits, never more than the daemon keeps plus a straddling character,
+    /// drops a character the bound cut short, and gives up on a stdin that
+    /// does not end instead of holding the report.
+    #[test]
+    fn read_turn_reply_stdin_is_bounded_and_never_blocks() {
+        use crate::daemon_protocol::MAX_TURN_REPLY_BYTES;
+        use std::io::Cursor;
+        use std::time::{Duration, Instant};
+        let wait = Duration::from_secs(5);
+
+        let reply = "All 42 tests pass.\n\n--not-a-flag é😀";
+        assert_eq!(
+            read_turn_reply_stdin(Cursor::new(reply.as_bytes().to_vec()), wait).as_deref(),
+            Some(reply)
+        );
+        assert_eq!(read_turn_reply_stdin(Cursor::new(Vec::new()), wait), None);
+
+        // Far past the bound: what is read stops at the bound plus three bytes,
+        // and normalizing it gives exactly what normalizing all of it would.
+        let long = format!("a{}", "€".repeat(MAX_TURN_REPLY_BYTES));
+        let read = read_turn_reply_stdin(Cursor::new(long.clone().into_bytes()), wait)
+            .expect("a long reply");
+        assert!(read.len() <= MAX_TURN_REPLY_BYTES + 3, "{}", read.len());
+        assert!(read.len() > MAX_TURN_REPLY_BYTES);
+        let normalize = |text: String| {
+            crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+                turn_id: None,
+                text,
+                failed: false,
+            })
+        };
+        assert_eq!(normalize(read), normalize(long));
+
+        // A character the bound cuts short is dropped, never turned into U+FFFD.
+        let straddling = format!("{}😀tail", "a".repeat(MAX_TURN_REPLY_BYTES));
+        let read = read_turn_reply_stdin(Cursor::new(straddling.into_bytes()), wait).unwrap();
+        assert_eq!(read, "a".repeat(MAX_TURN_REPLY_BYTES));
+        // Invalid bytes inside the text are replaced, not fatal.
+        let read = read_turn_reply_stdin(Cursor::new(b"ok \xff done".to_vec()), wait).unwrap();
+        assert_eq!(read, "ok \u{FFFD} done");
+
+        /// A stdin nobody closes: `read` blocks until the test drops `_open`.
+        struct NeverEnds(std::sync::mpsc::Receiver<()>);
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.0.recv();
+                Ok(0)
+            }
+        }
+        let (_open, held) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        assert_eq!(
+            read_turn_reply_stdin(NeverEnds(held), Duration::from_millis(100)),
+            None
+        );
+        assert!(started.elapsed() < wait, "{:?}", started.elapsed());
+    }
+
     /// A lifecycle report with no detail is the frame it has always been.
-    /// PRD #1497: the Pi extension's `--turn-reply` on a `--type finished`
+    /// PRD #1497: the Pi extension's `--turn-reply-stdin` on a `--type finished`
     /// report becomes the line's `turn_reply`, which the daemon reads as it
     /// reads a hook's; no other `--type` carries one, a blank text carries
     /// none, and a line without one is the line it always was.

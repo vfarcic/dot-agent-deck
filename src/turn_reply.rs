@@ -180,7 +180,9 @@ impl TurnReplyHub {
     /// Review RV-B1: Codex's `Stop` hook carries no turn id, while its rollout's
     /// `task_complete` for the same turn does. Giving the `Stop`'s reply the
     /// turn its `UserPromptSubmit` named is what lets [`Self::publish`] see the
-    /// two as one turn.
+    /// two as one turn. A reply-bearing turn end with no `Thinking` before it
+    /// (abnormal) would take an older turn's recorded id; at most one entry
+    /// per agent is kept, so that is bounded to one stale id.
     pub fn take_begun_turn(&self, agent_id: &str) -> Option<String> {
         self.begun
             .lock()

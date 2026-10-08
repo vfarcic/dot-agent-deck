@@ -21,6 +21,7 @@
  * which is why they are not dependencies of this package.
  */
 
+import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -33,6 +34,7 @@ import {
 	createTurnReplyTracker,
 	DeckExecError,
 	execFailureMessage,
+	execWithStdin,
 	piEventReport,
 	resolveDeckBin,
 	SEED_DELIVER_AS,
@@ -48,7 +50,8 @@ import {
 const deckBin = resolveDeckBin(process.env);
 
 /**
- * Shell `dot-agent-deck <argv>` via Pi's exec helper. Throws a clear Error on a
+ * Shell `dot-agent-deck <argv>` via Pi's exec helper, or with `stdin` written
+ * to it, run in `stdin.cwd` (the session's directory). Throws a clear Error on a
  * spawn failure (missing binary) or a non-zero exit, so tool callers surface
  * `isError` to the LLM. Returns the exec result on success.
  */
@@ -56,10 +59,17 @@ async function runDeck(
 	pi: ExtensionAPI,
 	argv: string[],
 	signal: AbortSignal | undefined,
+	stdin?: { text: string; cwd: string | undefined },
 ) {
 	let outcome: { code: number; stdout: string; stderr: string; killed: boolean };
 	try {
-		outcome = await pi.exec(deckBin, argv, { signal });
+		// PRD #1497: `pi.exec` cannot write a child's stdin, so a report that
+		// carries a turn's reply spawns the CLI itself and hands it the reply
+		// there rather than on the command line.
+		outcome =
+			stdin === undefined
+				? await pi.exec(deckBin, argv, { signal })
+				: await execWithStdin(spawn, deckBin, argv, stdin.text, { signal, cwd: stdin.cwd });
 	} catch (err) {
 		throw new Error(spawnFailureMessage(argv, err, deckBin));
 	}
@@ -136,7 +146,14 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// a flag as unknown — an older deck; see `createReporter`. A deck that
 	// predates the declaration still gets the detail, and one that predates the
 	// detail still gets the status.
-	const reporter = createReporter((argv, signal) => runDeck(pi, argv, signal));
+	//
+	// The session directory the last report was sent from, for the one report
+	// spawned outside `pi.exec` (a settled turn's reply on stdin), which runs
+	// there the way `pi.exec` runs a command in the session's directory.
+	let reportCwd: string | undefined;
+	const reporter = createReporter((argv, signal, stdin) =>
+		runDeck(pi, argv, signal, stdin === undefined ? undefined : { text: stdin, cwd: reportCwd }),
+	);
 	// Every report, with its retries, runs to completion before the next one
 	// starts, so the deck receives them in the order Pi emitted them.
 	const inOrder = createSerialQueue();
@@ -151,6 +168,7 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 			if (!decided) {
 				return;
 			}
+			reportCwd = ctx.cwd;
 			await reporter.send(decided, ctx.signal);
 		});
 	};
