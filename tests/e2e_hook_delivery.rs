@@ -194,6 +194,207 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
     });
 }
 
+/// Scenario: Start a daemon-owned Codex stand-in pane and send Codex hooks through the real hook CLI, with a rollout file the daemon tails. Each turn is reported twice, as Codex does — a Stop hook that names no turn, and the rollout's task_complete that does — once with the rollout first and once with the Stop first. A reading subscriber must receive each turn's reply exactly once, and the stream must end when the agent is stopped.
+#[spec("voice/reading-reply/003")]
+#[cfg(unix)]
+#[test]
+fn reading_reply_003_a_codex_turn_reported_by_hook_and_rollout_is_delivered_once() {
+    use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+    use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery, StartAgentOptions};
+    use dot_agent_deck::event::{BroadcastMsg, EventType};
+    use dot_agent_deck::hook_provenance::DOT_AGENT_DECK_PANE_CAPABILITY;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    const SESSION: &str = "codex-reading-1497";
+    const PANE: &str = "pane-codex-reading";
+    const ROLLOUT_FIRST: &str = "CODEX_ROLLOUT_FIRST_1497_f40a: two files changed.";
+    const STOP_FIRST: &str = "CODEX_STOP_FIRST_1497_9b2e: all tests pass.";
+    // Verbatim task_complete captured from a real Codex rollout (see
+    // tests/turn_replies.rs); only its turn id and reply are replaced.
+    const CAPTURED: &str = include_str!("fixtures/turn-replies/codex-task-complete.json");
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let rollout = deck
+        .workdir()
+        .join("rollout-2026-10-08T00-00-00-reading.jsonl");
+    std::fs::write(&rollout, "").unwrap();
+    let append_task_complete = |turn: &str, reply: &str| {
+        let mut record: serde_json::Value = serde_json::from_str(CAPTURED).unwrap();
+        record["payload"]["turn_id"] = turn.into();
+        record["payload"]["last_agent_message"] = reply.into();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("reply client runtime");
+    let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
+    let agent_id = runtime
+        .block_on(client.start_agent(StartAgentOptions {
+            command: Some(common::capability_export_command("cat")),
+            cwd: Some(deck.workdir().to_string_lossy().into_owned()),
+            display_name: Some("codex-reading".into()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.into(), PANE.into())],
+            // Untyped: a Codex-typed spawn is wrapped, which would not run the
+            // stand-in's capability export. The daemon's Codex handling keys on
+            // the hook events, which the Codex hook CLI types as Codex.
+            agent_type: None,
+            ..Default::default()
+        }))
+        .expect("daemon-owned stand-in for a Codex pane");
+    let token = runtime
+        .block_on(common::recorded_hook_capability(deck.workdir(), &agent_id))
+        .expect("stand-in's own capability");
+
+    let send_hook = |event: &str, extra: serde_json::Value| {
+        let mut payload = serde_json::json!({
+            "session_id": SESSION,
+            "hook_event_name": event,
+            "cwd": deck.workdir(),
+            "transcript_path": rollout,
+            "model": "gpt-5-codex",
+            "permission_mode": "default",
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args(["hook", "--agent", "codex"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", deck.home_dir())
+            .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+            .env(DOT_AGENT_DECK_PANE_ID, PANE)
+            .env(DOT_AGENT_DECK_AGENT_ID, &agent_id)
+            .env(DOT_AGENT_DECK_PANE_CAPABILITY, &token)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Codex hook CLI");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "hook CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // A Codex Stop as Codex sends it: no turn id.
+    let stop = |reply: &str| {
+        send_hook(
+            "Stop",
+            serde_json::json!({"last_assistant_message": reply, "stop_hook_active": false}),
+        )
+    };
+    let mut status_stream = runtime
+        .block_on(client.subscribe_events())
+        .expect("hook ingestion barrier");
+    send_hook("SessionStart", serde_json::json!({"source": "startup"}));
+    let GatedQuery::Answered(mut replies) = runtime
+        .block_on(client.subscribe_turn_replies(&agent_id))
+        .expect("subscribe through the client library")
+    else {
+        panic!("this daemon must advertise turn-replies");
+    };
+    let next_reply = |replies: &mut dot_agent_deck::daemon_client::TurnReplySubscription| {
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), replies.next_reply())
+                .await
+                .expect("final reply delivered promptly")
+                .expect("decode final reply")
+                .expect("reply stream live")
+        })
+    };
+    // Two of the daemon's 2 s rollout polls plus margin: a second copy from
+    // either route would have arrived by then.
+    let assert_no_second_copy =
+        |replies: &mut dot_agent_deck::daemon_client::TurnReplySubscription, what: &str| {
+            runtime.block_on(async {
+                let late = tokio::time::timeout(Duration::from_secs(5), replies.next_reply()).await;
+                assert!(
+                    late.is_err(),
+                    "{what}: the turn was delivered twice: {late:?}"
+                );
+            });
+        };
+    let wait_for_idle = |status_stream: &mut dot_agent_deck::daemon_client::EventSubscription| {
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = status_stream
+                        .next_event()
+                        .await
+                        .unwrap()
+                        .expect("status stream live");
+                    if matches!(event, BroadcastMsg::Event(ref event)
+                        if event.session_id == SESSION && event.event_type == EventType::Idle)
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the Stop reaches the daemon");
+        })
+    };
+
+    // Turn 1: the rollout records the turn first, then the Stop hook runs.
+    send_hook(
+        "UserPromptSubmit",
+        serde_json::json!({"prompt": "first turn", "turn_id": "turn-rollout-first"}),
+    );
+    append_task_complete("turn-rollout-first", ROLLOUT_FIRST);
+    let first = next_reply(&mut replies);
+    assert_eq!(first.reply.text, ROLLOUT_FIRST);
+    assert_eq!(first.reply.turn_id.as_deref(), Some("turn-rollout-first"));
+    stop(ROLLOUT_FIRST);
+    wait_for_idle(&mut status_stream);
+    assert_no_second_copy(&mut replies, "rollout first");
+
+    // Turn 2: the Stop hook runs first, then the rollout records the turn.
+    send_hook(
+        "UserPromptSubmit",
+        serde_json::json!({"prompt": "second turn", "turn_id": "turn-stop-first"}),
+    );
+    stop(STOP_FIRST);
+    let second = next_reply(&mut replies);
+    assert_eq!(second.reply.text, STOP_FIRST);
+    assert_eq!(
+        second.reply.turn_id.as_deref(),
+        Some("turn-stop-first"),
+        "the Stop's reply carries the turn its prompt began"
+    );
+    assert!(second.sequence > first.sequence);
+    append_task_complete("turn-stop-first", STOP_FIRST);
+    assert_no_second_copy(&mut replies, "Stop first");
+
+    // The agent goes away: the stream ends instead of staying open forever.
+    runtime
+        .block_on(client.stop_agent(&agent_id))
+        .expect("stop the stand-in");
+    let ended = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), replies.next_reply())
+            .await
+            .expect("the stream ends promptly when the agent exits")
+            .expect("a clean end, not an error")
+    });
+    assert!(ended.is_none(), "the stream ended: {ended:?}");
+}
+
 /// Scenario: Launch the deck against the `minimal` fixture, wait
 /// for the empty dashboard to render, then write a synthetic
 /// Claude Code `SessionStart` hook payload (with `pane_id =

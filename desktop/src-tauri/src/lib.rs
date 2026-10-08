@@ -3983,6 +3983,9 @@ async fn desktop_voice_reading_start(
             });
         }
     };
+    let Ok(events) = reading_events_still_in_scope(&scope, events) else {
+        return Ok(unavailable(voice::reading::DECK_CHANGED));
+    };
     let agent = voice::summary::agent_name(&agent_label);
     let ender = on_sentence.clone();
     let summariser = settings_summariser();
@@ -3998,6 +4001,20 @@ async fn desktop_voice_reading_start(
         }),
     );
     Ok(ReadingStart::Started { session })
+}
+
+/// Audit AU-S1: reading's subscription outlives the start, so its deck is
+/// checked once more after the subscription answered and right before the
+/// session is installed — the publication point [`crate::dto::DeckScope::revalidate`]
+/// exists for. A deck that left the fleet (or a fleet that moved) while the
+/// subscription was being confirmed is refused, and `events` is dropped, which
+/// closes the subscription.
+fn reading_events_still_in_scope(
+    scope: &crate::dto::DeckScope,
+    events: voice::reading::TurnEvents,
+) -> Result<voice::reading::TurnEvents, String> {
+    scope.revalidate()?;
+    Ok(events)
 }
 
 /// PRD #1497 M5 — end the reading session `session` started, if it is still
@@ -7140,6 +7157,40 @@ mod tests {
             }),
             ..DesktopSettings::default()
         }
+    }
+
+    /// PRD #1497 audit AU-S1: a deck that leaves the fleet while reading's
+    /// subscription is being confirmed is refused at the point the session
+    /// would be installed, and the subscription's receiver is dropped — its
+    /// source sees the session go. A fleet that did not move installs it.
+    #[tokio::test]
+    async fn voice_reading_is_not_installed_for_a_deck_that_left_while_subscribing() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let both = fleet_of(&["build-box.example.com", "laptop.example.com"]);
+        crate::dto::apply_settings_selection(&both);
+        let build_box = both
+            .connectable_endpoints()
+            .into_iter()
+            .find(|endpoint| format!("{endpoint:?}").contains("build-box"))
+            .expect("the fleet has build-box");
+        let wire = crate::dto::deck_wire_id(&build_box);
+
+        let scope = crate::dto::DeckScope::resolve(Some(&wire)).expect("an observed deck");
+        let (source, events) = tokio::sync::mpsc::channel(1);
+        let kept = reading_events_still_in_scope(&scope, events)
+            .expect("an unmoved fleet installs the session");
+        assert!(!source.is_closed());
+        drop(kept);
+
+        let scope = crate::dto::DeckScope::resolve(Some(&wire)).expect("an observed deck");
+        let (source, events) = tokio::sync::mpsc::channel(1);
+        // The deck leaves while the subscription is confirming.
+        crate::dto::apply_settings_selection(&fleet_of(&["laptop.example.com"]));
+        let refused = reading_events_still_in_scope(&scope, events)
+            .expect_err("the departed deck's session is not installed");
+        assert!(refused.contains("left the fleet"), "{refused}");
+        assert!(source.is_closed(), "the subscription was dropped");
+        crate::dto::apply_settings_selection(&DesktopSettings::default());
     }
 
     /// A configured deck with no socket path gets NO transport and NO watcher,

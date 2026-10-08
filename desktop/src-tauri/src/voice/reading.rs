@@ -79,11 +79,22 @@ pub const DAEMON_TOO_OLD: &str =
 /// subscription. A fragment, rendered into [`unavailable_sentence`].
 pub const DAEMON_UNREACHABLE: &str = "the deck did not answer";
 
-/// How long [`coalesce`] holds back one half of a failed turn waiting for the
-/// other, so the turn is announced once. Both halves leave the daemon within
-/// one hook (a Codex session-log failure within one of its polls), so this only
-/// has to cover two connections' delivery.
+/// Why "reading on" cannot start when the agent's deck left the app's decks
+/// while the subscription was being confirmed. A fragment, rendered into
+/// [`unavailable_sentence`].
+pub const DECK_CHANGED: &str = "the deck changed while reading was starting. Say reading on again";
+
+/// How long after [`coalesce`] announced one half of a failed turn it absorbs
+/// the other, so the turn is announced once.
 pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
+
+/// How long [`coalesce`] holds a failed reply that arrived before its turn's
+/// block status, so a usage limit can still replace it. Both halves leave the
+/// daemon together — from one hook line (the reply is published just before
+/// the status is broadcast) or one Codex session-log poll — so this only has to
+/// cover two local connections' delivery, which takes milliseconds; one second
+/// leaves a wide margin while keeping the announcement prompt.
+pub const FAILED_REPLY_HOLD: Duration = Duration::from_secs(1);
 
 /// What "reading on" says while the Settings opt-in is off (D4), spoken.
 pub const READING_NOT_ENABLED: &str =
@@ -162,7 +173,8 @@ pub trait TurnEventSource: Send + Sync {
 /// agent (withheld by the client library unless the daemon advertises it) and
 /// its status stream — and one task that merges them through [`coalesce`]. The
 /// task ends, closing both, when the reading session drops its receiver or the
-/// reply stream ends.
+/// reply stream ends, which the daemon does when the agent exits; the session's
+/// events then end, and [`read_turns`] ends reading.
 pub struct DaemonTurnEvents {
     client: Arc<DaemonClient>,
 }
@@ -297,25 +309,33 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// Merge `incoming` into the events a reading session announces, until either
 /// side closes, announcing a failed turn once.
 ///
-/// A failed reply and an error status within [`FAILURE_COALESCE_WINDOW`] of
-/// each other are one failed turn, announced as the reply's summary — it
-/// carries the agent's own words. A failed reply and a usage-limit status are
-/// announced as the usage limit, which says what the user has to do. Whichever
-/// arrives first is held for the window (a status) or remembered for it (a
-/// reply already announced), so the second is dropped. Everything else passes
-/// through in arrival order, a held status first.
+/// A failed turn reaches reading in two halves — the agent's failed reply and
+/// a block status (an error or a usage limit) — and the daemon publishes the
+/// reply first, so the reply is usually the first to arrive. What is announced
+/// depends on which arrives first:
+///
+/// - **A block status first** is announced immediately, with no hold, and a
+///   failed reply arriving within [`FAILURE_COALESCE_WINDOW`] after it is
+///   absorbed: the turn was already announced.
+/// - **A failed reply first** is held for [`FAILED_REPLY_HOLD`]. A usage-limit
+///   status within the hold replaces it — the usage limit says what the user
+///   has to do — while an error status is absorbed into the failed turn's
+///   summary, which carries the agent's own words. With no status, the reply is
+///   announced when the hold runs out, and an error status within
+///   [`FAILURE_COALESCE_WINDOW`] after that is still absorbed.
+///
+/// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
     use tokio::time::{Instant, sleep_until};
-    // A status held back for its window.
-    let mut held: Option<(BlockCause, Instant)> = None;
-    // The last failed turn already announced, and until when it absorbs the
-    // other half.
-    let mut announced: Option<Instant> = None;
+    // A failed reply held back, and until when.
+    let mut held: Option<(String, Instant)> = None;
+    // The failure last announced, and until when it absorbs the other half.
+    let mut announced: Option<(Announced, Instant)> = None;
     loop {
-        let next = match held {
+        let next = match &held {
             Some((_, until)) => tokio::select! {
                 message = incoming.recv() => Some(message),
-                _ = sleep_until(until) => None,
+                _ = sleep_until(*until) => None,
                 _ = out.closed() => return,
             },
             None => tokio::select! {
@@ -324,53 +344,63 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
             },
         };
         let now = Instant::now();
-        let absorbing = announced.is_some_and(|until| now < until);
+        let recent = announced
+            .filter(|(_, until)| now < *until)
+            .map(|(what, _)| what);
         let mut emit = Vec::new();
-        match next {
-            // The window ran out with no reply: announce the status.
-            None => {
-                if let Some((cause, _)) = held.take() {
-                    emit.push(TurnEvent::Blocked { cause });
-                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+        let release_held =
+            |held: &mut Option<(String, Instant)>,
+             emit: &mut Vec<TurnEvent>,
+             announced: &mut Option<(Announced, Instant)>| {
+                if let Some((reply, _)) = held.take() {
+                    emit.push(TurnEvent::Failed { reply });
+                    *announced = Some((Announced::Reply, now + FAILURE_COALESCE_WINDOW));
                 }
-            }
+            };
+        match next {
+            // The hold ran out with no status: announce the failed reply.
+            None => release_held(&mut held, &mut emit, &mut announced),
             Some(None) => {
-                if let Some((cause, _)) = held.take() {
-                    let _ = out.send(TurnEvent::Blocked { cause }).await;
+                release_held(&mut held, &mut emit, &mut announced);
+                for event in emit {
+                    let _ = out.send(event).await;
                 }
                 return;
             }
-            Some(Some(Incoming::Reply(reply))) if reply.failed => match held.take() {
-                Some((BlockCause::Quota, _)) => {
-                    emit.push(TurnEvent::Blocked {
-                        cause: BlockCause::Quota,
-                    });
-                    announced = Some(now + FAILURE_COALESCE_WINDOW);
+            Some(Some(Incoming::Reply(reply))) if reply.failed => {
+                if !matches!(recent, Some(Announced::Status(_))) {
+                    release_held(&mut held, &mut emit, &mut announced);
+                    held = Some((reply.text, now + FAILED_REPLY_HOLD));
                 }
-                Some((BlockCause::Error, _)) | None if !absorbing => {
-                    emit.push(TurnEvent::Failed { reply: reply.text });
-                    announced = Some(now + FAILURE_COALESCE_WINDOW);
-                }
-                _ => {}
-            },
+            }
             Some(Some(Incoming::Reply(reply))) => {
-                if let Some((cause, _)) = held.take() {
-                    emit.push(TurnEvent::Blocked { cause });
-                }
+                release_held(&mut held, &mut emit, &mut announced);
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
             Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
-                if !absorbing
-                    && let Some((earlier, _)) = held.replace((cause, now + FAILURE_COALESCE_WINDOW))
-                {
-                    emit.push(TurnEvent::Blocked { cause: earlier });
+                match (held.is_some(), cause, recent) {
+                    // The usage limit replaces the held failed reply.
+                    (true, BlockCause::Quota, _) => {
+                        held = None;
+                        emit.push(TurnEvent::Blocked { cause });
+                        announced = Some((Announced::Status(cause), now + FAILURE_COALESCE_WINDOW));
+                    }
+                    // The error is the held failed reply's own turn.
+                    (true, BlockCause::Error, _) => {
+                        release_held(&mut held, &mut emit, &mut announced)
+                    }
+                    // Already said: an error after this turn's failed reply or
+                    // after any block, a usage limit after a usage limit.
+                    (false, BlockCause::Error, Some(_))
+                    | (false, BlockCause::Quota, Some(Announced::Status(BlockCause::Quota))) => {}
+                    (false, cause, _) => {
+                        emit.push(TurnEvent::Blocked { cause });
+                        announced = Some((Announced::Status(cause), now + FAILURE_COALESCE_WINDOW));
+                    }
                 }
             }
             Some(Some(Incoming::Status(status))) => {
-                if let Some((cause, _)) = held.take() {
-                    emit.push(TurnEvent::Blocked { cause });
-                    announced = Some(now + FAILURE_COALESCE_WINDOW);
-                }
+                release_held(&mut held, &mut emit, &mut announced);
                 emit.push(status);
             }
         }
@@ -380,6 +410,15 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
             }
         }
     }
+}
+
+/// What [`coalesce`] last announced of a failed turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Announced {
+    /// The failed reply's summary.
+    Reply,
+    /// A block status.
+    Status(BlockCause),
 }
 
 /// Why an agent of `agent_type` cannot be read, as a fragment, or `None` when
@@ -414,9 +453,10 @@ pub enum ReadingSentenceKind {
     Permission,
     /// An error or quota block, announced at once.
     Blocked,
-    /// Reading ended on this side — its Settings opt-in was turned off. Not a
-    /// sentence to queue: the webview ends reading mode on it, clearing the
-    /// indicator and the queued speech, and says "Reading off."
+    /// Reading ended on this side — its Settings opt-in was turned off, or the
+    /// agent's reply stream ended (the agent exited). Not a sentence to queue:
+    /// the webview ends reading mode on it, clearing the indicator and the
+    /// queued speech, and says "Reading off."
     Ended,
 }
 
@@ -567,6 +607,12 @@ pub async fn announce(
 /// Before each event the summariser is asked whether reading's opt-in is
 /// still on, and the summary request asks again; when it is off, the loop
 /// sends [`ended_sentence`] and ends, so nothing more is announced or sent.
+///
+/// When `events` end on the source's side — the deck ended the agent's reply
+/// stream because the agent exited (review RV-S2), or the deck went away — the
+/// loop sends [`ended_sentence`] too: nothing more can be read, and the webview
+/// ends reading mode and says so rather than staying on for an agent that is
+/// gone.
 pub async fn read_turns(
     agent: &str,
     mut events: TurnEvents,
@@ -587,6 +633,7 @@ pub async fn read_turns(
             return;
         }
     }
+    sink(ended_sentence());
 }
 
 /// `text` on one line with control characters dropped and whitespace
@@ -774,33 +821,50 @@ mod tests {
     const SHORT: Duration = Duration::from_millis(100);
     const LONG: Duration = Duration::from_secs(10);
 
+    /// Review RV-B2: a failed turn's two halves, in all four orders, are one
+    /// announcement — and the usage limit is never lost to the reply that the
+    /// daemon publishes first.
     #[tokio::test(start_paused = true)]
-    async fn voice_reading_a_failed_turn_is_announced_once_whichever_half_comes_first() {
+    async fn voice_reading_a_failed_turn_is_announced_once_in_every_order() {
         let failed_turn = vec![TurnEvent::Failed {
             reply: "I could not finish.".to_string(),
         }];
-        // The error status first, then the failed reply within the window.
-        assert_eq!(
-            coalesced(vec![
-                (blocked(BlockCause::Error), SHORT),
-                (failed("I could not finish."), SHORT),
-            ])
-            .await,
-            failed_turn
-        );
-        // The failed reply first, then the error status.
-        assert_eq!(
-            coalesced(vec![
-                (failed("I could not finish."), SHORT),
-                (blocked(BlockCause::Error), SHORT),
-            ])
-            .await,
-            failed_turn
-        );
-        // A usage limit wins over the failed reply, in either order.
         let quota = vec![TurnEvent::Blocked {
             cause: BlockCause::Quota,
         }];
+        let error = vec![TurnEvent::Blocked {
+            cause: BlockCause::Error,
+        }];
+        // The failed reply first (the daemon's order), then an error status:
+        // the error is absorbed into the failed turn's summary.
+        assert_eq!(
+            coalesced(vec![
+                (failed("I could not finish."), SHORT),
+                (blocked(BlockCause::Error), SHORT),
+            ])
+            .await,
+            failed_turn
+        );
+        // The failed reply first, then a usage limit: the usage limit replaces
+        // it (a Claude quota block arrives this way).
+        assert_eq!(
+            coalesced(vec![
+                (failed("rate limited"), SHORT),
+                (blocked(BlockCause::Quota), SHORT),
+            ])
+            .await,
+            quota
+        );
+        // An error status first: announced as it came, the reply absorbed.
+        assert_eq!(
+            coalesced(vec![
+                (blocked(BlockCause::Error), SHORT),
+                (failed("I could not finish."), SHORT),
+            ])
+            .await,
+            error
+        );
+        // A usage limit first: announced as it came, the reply absorbed.
         assert_eq!(
             coalesced(vec![
                 (blocked(BlockCause::Quota), SHORT),
@@ -809,36 +873,50 @@ mod tests {
             .await,
             quota
         );
-        // The usage limit announced when its window ran out, and the failed
-        // reply arriving after that but within the announcement's window.
+        // An error status after the hold ran out is still this turn's.
         assert_eq!(
             coalesced(vec![
-                (
-                    blocked(BlockCause::Quota),
-                    FAILURE_COALESCE_WINDOW + Duration::from_secs(1)
-                ),
-                (failed("rate limited"), SHORT),
+                (failed("I could not finish."), FAILED_REPLY_HOLD + SHORT),
+                (blocked(BlockCause::Error), SHORT),
             ])
             .await,
-            quota
+            failed_turn
         );
     }
 
+    /// Review RV-S1: a block status is announced the moment it arrives, with
+    /// no hold, while a failed reply waits only [`FAILED_REPLY_HOLD`]. A later,
+    /// unrelated turn is announced as usual, and two failed turns far apart are
+    /// two announcements.
     #[tokio::test(start_paused = true)]
-    async fn voice_reading_an_error_with_no_reply_is_announced_after_the_window() {
-        // No reply comes: the error is announced once the window runs out, and
-        // a later, unrelated finished turn still is.
+    async fn voice_reading_a_lone_status_is_announced_without_delay() {
+        use tokio::time::Instant;
         let (tx, incoming) = mpsc::channel(16);
         let (out, mut events) = mpsc::channel(16);
         let merging = tokio::spawn(coalesce(incoming, out));
-        tx.send(blocked(BlockCause::Error)).await.unwrap();
-        tokio::time::sleep(SHORT).await;
-        assert!(events.try_recv().is_err(), "held for the window");
-        tokio::time::sleep(FAILURE_COALESCE_WINDOW).await;
+        for cause in [BlockCause::Error, BlockCause::Quota] {
+            let start = Instant::now();
+            tx.send(blocked(cause)).await.unwrap();
+            assert_eq!(events.recv().await, Some(TurnEvent::Blocked { cause }));
+            assert_eq!(start.elapsed(), Duration::ZERO, "{cause:?} was held");
+            tokio::time::sleep(LONG).await;
+        }
+
+        let start = Instant::now();
+        tx.send(failed("first")).await.unwrap();
         assert_eq!(
             events.recv().await,
-            Some(TurnEvent::Blocked {
-                cause: BlockCause::Error
+            Some(TurnEvent::Failed {
+                reply: "first".into()
+            })
+        );
+        assert_eq!(start.elapsed(), FAILED_REPLY_HOLD);
+        tokio::time::sleep(LONG).await;
+        tx.send(failed("second")).await.unwrap();
+        assert_eq!(
+            events.recv().await,
+            Some(TurnEvent::Failed {
+                reply: "second".into()
             })
         );
         tokio::time::sleep(LONG).await;
@@ -854,22 +932,6 @@ mod tests {
             Some(TurnEvent::Finished {
                 reply: "done".to_string()
             })
-        );
-        // Two failed turns far apart are two announcements.
-        tx.send(failed("first")).await.unwrap();
-        tokio::time::sleep(LONG).await;
-        tx.send(failed("second")).await.unwrap();
-        assert_eq!(
-            events.recv().await.unwrap(),
-            TurnEvent::Failed {
-                reply: "first".into()
-            }
-        );
-        assert_eq!(
-            events.recv().await.unwrap(),
-            TurnEvent::Failed {
-                reply: "second".into()
-            }
         );
         // Dropping the session's receiver ends the merge without more input.
         drop(events);
@@ -953,16 +1015,19 @@ mod tests {
 
     /// A fake deck daemon on a Unix socket: answers `hello` with `capabilities`,
     /// confirms both subscriptions, and on each writes `frames` — the reply
-    /// stream's and the status stream's — then holds the connection open.
+    /// stream's and the status stream's — then holds the connection open, or,
+    /// with `end_replies` set, ends the reply stream with that reason.
     #[cfg(unix)]
     async fn fake_deck(
         path: std::path::PathBuf,
         capabilities: Vec<String>,
         reply_frames: Vec<Vec<u8>>,
         status_frames: Vec<Vec<u8>>,
+        end_replies: Option<&'static [u8]>,
     ) -> tokio::task::JoinHandle<()> {
         use dot_agent_deck::daemon_protocol::{
-            AttachResponse, KIND_EVENT, PROTOCOL_VERSION, read_frame, write_frame, write_resp,
+            AttachResponse, KIND_EVENT, KIND_STREAM_END, PROTOCOL_VERSION, read_frame, write_frame,
+            write_resp,
         };
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         tokio::spawn(async move {
@@ -975,6 +1040,7 @@ mod tests {
                         return;
                     };
                     let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let replies = request["op"] == "subscribe-turn-replies";
                     let frames = match request["op"].as_str() {
                         Some("hello") => {
                             let hello = AttachResponse {
@@ -994,6 +1060,10 @@ mod tests {
                     let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
                     for frame in frames {
                         let _ = write_frame(&mut stream, KIND_EVENT, &frame).await;
+                    }
+                    if let Some(reason) = end_replies.filter(|_| replies) {
+                        let _ = write_frame(&mut stream, KIND_STREAM_END, reason).await;
+                        return;
                     }
                     std::future::pending::<()>().await;
                 });
@@ -1020,6 +1090,7 @@ mod tests {
             vec!["focus-gained".to_string()],
             vec![],
             vec![],
+            None,
         )
         .await;
         let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
@@ -1068,6 +1139,7 @@ mod tests {
                 .unwrap(),
                 serde_json::to_vec(&BroadcastMsg::Event(permission)).unwrap(),
             ],
+            None,
         )
         .await;
         let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
@@ -1098,6 +1170,61 @@ mod tests {
                 .await
                 .is_err(),
             "nothing of another agent's"
+        );
+        deck.abort();
+    }
+
+    /// Review RV-S2: the deck ends the agent's reply stream when the agent
+    /// exits. The source's events then end after what was already delivered,
+    /// and reading ends with the "Reading off." sentence rather than staying on
+    /// for an agent that is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reading_ends_when_the_deck_ends_the_agents_reply_stream() {
+        use dot_agent_deck::daemon_protocol::{TURN_REPLIES_END_AGENT_EXITED, TurnReply};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let last = serde_json::to_vec(&TurnReply {
+            agent_id: "agent-7".to_string(),
+            pane_id: "p".to_string(),
+            sequence: 1,
+            reply: FinalReply {
+                turn_id: None,
+                text: "last turn".to_string(),
+                failed: false,
+            },
+        })
+        .unwrap();
+        let deck = fake_deck(
+            path.clone(),
+            vec![dot_agent_deck::daemon_protocol::CAP_TURN_REPLIES.to_string()],
+            vec![last],
+            vec![],
+            Some(TURN_REPLIES_END_AGENT_EXITED),
+        )
+        .await;
+        let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
+        let events = source.subscribe(&target()).await.unwrap();
+        let summariser = Recording::default();
+        let mut heard = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            read_turns("tester", events, &summariser, |sentence| {
+                heard.push(sentence);
+                true
+            }),
+        )
+        .await
+        .expect("reading ends when the agent's stream does");
+        assert_eq!(
+            heard,
+            vec![
+                ReadingSentence {
+                    kind: ReadingSentenceKind::Turn,
+                    text: "summary of last turn".to_string(),
+                },
+                ended_sentence(),
+            ]
         );
         deck.abort();
     }
@@ -1134,7 +1261,9 @@ mod tests {
                 "summary of one".to_string(),
                 "The tester is asking for permission: two.".to_string(),
                 "summary of three".to_string(),
-            ]
+                READING_ENDED.to_string(),
+            ],
+            "events that end on the source's side end reading"
         );
 
         // A sink that stops listening ends the loop and drops the receiver,

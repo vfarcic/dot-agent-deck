@@ -7129,6 +7129,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, other-agent filtering, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Claude authentication and runs nowhere in CI.
 
+##### voice/reading-reply/003 — A Codex turn reported by both its Stop hook and its rollout is delivered once, and the stream ends when the agent exits.
+- **Layer:** L2 lane 1, PTY-attached (real binary and isolated daemon; production client library, Codex hook CLI and rollout tailer).
+- **Agent:** none (daemon-owned `cat` stand-in exporting its own hook capability, reported through the Codex hook CLI; Codex-shaped hook payloads and a rollout file holding the captured `task_complete` record with its turn id and reply replaced).
+- **Asserts:** with the rollout's `task_complete` first and the Stop hook (which names no turn) second, and again in the reverse order, each turn's reply arrives once, carrying the turn id its `UserPromptSubmit` began, and no second copy follows within two rollout polls; stopping the agent ends the subscription cleanly.
+- **Does not assert:** a real Codex process, a failed or quota-blocked Codex turn's reply, the desktop's handling of the ended stream, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown

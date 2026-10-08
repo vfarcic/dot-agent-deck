@@ -3113,7 +3113,9 @@ pub struct TurnReplySubscription {
 impl TurnReplySubscription {
     /// Read the next reply. `Ok(None)` on `KIND_STREAM_END`, peer EOF, or an
     /// unexpected frame kind — the caller resubscribes if it still wants
-    /// replies. A malformed payload is an `Err`. The text is re-bounded to
+    /// replies. A daemon of this build ends the stream when the agent exits
+    /// ([`crate::daemon_protocol::TURN_REPLIES_END_AGENT_EXITED`]), after which
+    /// no reply of that agent can follow. A malformed payload is an `Err`. The text is re-bounded to
     /// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`], so a misbehaving peer
     /// cannot hand the caller more than a daemon of this build would.
     pub async fn next_reply(&mut self) -> io::Result<Option<crate::daemon_protocol::TurnReply>> {
@@ -3134,7 +3136,9 @@ impl TurnReplySubscription {
                 Ok(Some(reply))
             }
             Some((KIND_STREAM_END, reason)) => {
-                if !reason.is_empty() {
+                if reason == crate::daemon_protocol::TURN_REPLIES_END_AGENT_EXITED {
+                    tracing::debug!("subscribe_turn_replies: the agent exited");
+                } else if !reason.is_empty() {
                     tracing::warn!(
                         reason = %String::from_utf8_lossy(&reason),
                         "subscribe_turn_replies: daemon ended stream"

@@ -1950,18 +1950,27 @@ fn normalize_quota_blocked_metadata(
 /// `QuotaBlocked` a failed turn becomes — and only when the event names its
 /// agent and that agent is the live owner of the pane it names, so a payload
 /// cannot speak for another pane's agent.
+///
+/// Review RV-B1: a Codex turn is reported twice — by its `Stop` hook, whose
+/// payload names no turn, and by its rollout's `task_complete`, which does —
+/// and the hub delivers a turn once only when both name it. So the turn a
+/// Codex `UserPromptSubmit` (a `Thinking` carrying
+/// [`crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY`]) begins is
+/// recorded here, and a Codex turn end whose reply names no turn is given it.
+/// One source per turn was the alternative: suppressing the `Stop` reply would
+/// leave only the rollout, which is read every
+/// [`crate::codex_rollout_tail::POLL_INTERVAL`] and only when Codex named a
+/// rollout to watch, and suppressing the rollout's would lose the errored turn
+/// it alone reports. Matching on the reply's text was not considered: two turns
+/// can end with the same words.
 fn publish_hook_turn_reply(
     registry: &AgentPtyRegistry,
     event: &AgentEvent,
     attested_agent: Option<&str>,
     line: &str,
 ) {
-    use crate::event::EventType;
-    if !matches!(
-        event.event_type,
-        EventType::Idle | EventType::Error | EventType::QuotaBlocked
-    ) || event.is_daemon_synthetic()
-    {
+    use crate::event::{AgentType, EventType};
+    if event.is_daemon_synthetic() {
         return;
     }
     let (Some(pane_id), Some(agent_id)) = (event.pane_id.as_deref(), event.agent_id.as_deref())
@@ -1971,9 +1980,30 @@ fn publish_hook_turn_reply(
     if attested_agent.is_some_and(|attested| attested != agent_id) {
         return;
     }
-    let Some(reply) = crate::turn_reply::reply_from_line(line) else {
+    let codex = event.agent_type == AgentType::Codex;
+    if codex && event.event_type == EventType::Thinking {
+        if let Some(turn_id) = event
+            .metadata
+            .get(crate::codex_rollout_tail::CODEX_TURN_ID_METADATA_KEY)
+            && registry.is_live_owner(pane_id, agent_id)
+        {
+            registry.turn_replies().begin_turn(agent_id, turn_id);
+        }
+        return;
+    }
+    if !matches!(
+        event.event_type,
+        EventType::Idle | EventType::Error | EventType::QuotaBlocked
+    ) {
+        return;
+    }
+    let Some(mut reply) = crate::turn_reply::reply_from_line(line) else {
         return;
     };
+    if codex && registry.is_live_owner(pane_id, agent_id) {
+        let begun = registry.turn_replies().take_begun_turn(agent_id);
+        reply.turn_id = reply.turn_id.or(begun);
+    }
     registry.publish_turn_reply(pane_id, agent_id, reply);
 }
 
@@ -3299,6 +3329,12 @@ fn clamp_for_log(line: &str) -> std::borrow::Cow<'_, str> {
 /// wrote, every first-party producer now puts its pane's token on it, and a
 /// capability in `deck.log` is exactly the leak the token check exists to
 /// avoid — already a live one for a `DaemonMessage` line that failed to decode.
+///
+/// PRD #1497 audit AU-B3: and so is a turn's final reply. A turn-ending line
+/// carries the agent's reply under [`crate::turn_reply::TURN_REPLY_LINE_KEY`]
+/// (a hook's `Stop`, the OpenCode plugin's idle report, Pi's `agent-event`),
+/// and that text reaches only `subscribe-turn-replies` connections — never the
+/// log, whichever diagnostic the line trips ([`redact_hook_token`] says how).
 fn hook_line_for_log(line: &str) -> String {
     crate::config_validation::escape_for_terminal(&clamp_for_log(&redact_hook_token(line)))
         .into_owned()
@@ -3329,17 +3365,58 @@ fn hook_line_for_log(line: &str) -> String {
 /// that does not parse cannot be walked: every such hex run in it is masked,
 /// and a line containing a `\u` escape, which could spell a token in a form
 /// the mask does not recognise, is not logged at all beyond saying so.
+///
+/// A turn reply is withheld the same two ways (PRD #1497): in a line that
+/// parses, every [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member at any depth
+/// is replaced by its serialized length; in one that does not, nothing from the
+/// first occurrence of that key onwards is logged, only how many bytes were
+/// withheld. Every producer serializes the key after the event's identifiers
+/// (`serde_json` writes members in sorted order), so what is logged of such a
+/// line is still the part a diagnostic needs.
 fn redact_hook_token(line: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) {
+        withhold_turn_replies(&mut value);
         redact_json_capabilities(&mut value);
         return std::borrow::Cow::Owned(value.to_string());
     }
     if line.contains("\\u") {
         return std::borrow::Cow::Borrowed("<withheld: an unparseable line with a \\u escape>");
     }
-    match mask_capability_runs(line) {
+    let (head, withheld) = match line.find(crate::turn_reply::TURN_REPLY_LINE_KEY) {
+        Some(at) => (&line[..at], Some(line.len() - at)),
+        None => (line, None),
+    };
+    let head = match mask_capability_runs(head) {
         Some(masked) => std::borrow::Cow::Owned(masked),
-        None => std::borrow::Cow::Borrowed(line),
+        None => std::borrow::Cow::Borrowed(head),
+    };
+    match withheld {
+        None => head,
+        Some(bytes) => std::borrow::Cow::Owned(format!(
+            "{head}<withheld: a turn reply and the {bytes} bytes from it on>"
+        )),
+    }
+}
+
+/// [`redact_hook_token`]'s turn-reply half over a parsed line: every
+/// [`crate::turn_reply::TURN_REPLY_LINE_KEY`] member, at any depth, becomes a
+/// note of its serialized length.
+fn withhold_turn_replies(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(withhold_turn_replies),
+        serde_json::Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if key == crate::turn_reply::TURN_REPLY_LINE_KEY {
+                    *item = serde_json::Value::String(format!(
+                        "<withheld: {} bytes>",
+                        item.to_string().len()
+                    ));
+                } else {
+                    withhold_turn_replies(item);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -6460,6 +6537,108 @@ mod hook_ingestion_tests {
                  cover that site: {raw:?}"
             );
         }
+    }
+
+    /// PRD #1497 audit AU-B3: a turn-ending line carries the agent's private
+    /// reply, and no diagnostic that logs the raw line may put it in the log.
+    /// Drives the real `run_hook_loop` with lines built by the production
+    /// producer (`agent_event_cli_line`, the shape Pi's `agent-event` and every
+    /// hook's `Stop` send): one whose `event_type` is a typo (the
+    /// unrecognized-event warning), one cut off inside the reply (unparseable,
+    /// the `Malformed event:` warning), and one that parses but is not an event.
+    /// The sentinel never reaches the captured log, while each warning still
+    /// names the line's identifiers.
+    #[tokio::test]
+    async fn hook_diagnostics_never_log_a_turn_reply() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        const SENTINEL: &str = "PRIVATE_REPLY_SENTINEL_1497_e71f";
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+        let fixture = HookLoopFixture::start();
+
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "reply-log-session", "agent_type": "pi", "event_type": "idle",
+            "timestamp": "2026-10-08T12:00:00Z", "pane_id": "reply-log-pane", "metadata": {},
+        }))
+        .unwrap();
+        let reply = crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: format!("{SENTINEL}: all tests pass. {}", "padding ".repeat(80)),
+            failed: false,
+        };
+        let line = crate::hook::agent_event_cli_line(&event, None, Some(&reply)).unwrap();
+        assert!(
+            line.contains(SENTINEL),
+            "the producer put the reply on the line"
+        );
+        let unknown = line.replace("\"event_type\":\"idle\"", "\"event_type\":\"idel\"");
+        assert_ne!(unknown, line, "the typo must land in the line");
+        let cut = line[..line.find(SENTINEL).unwrap() + SENTINEL.len()].to_owned();
+        let not_an_event = line.replace(
+            "\"session_id\":\"reply-log-session\"",
+            "\"session_id\":7,\"note\":\"reply-log-session\"",
+        );
+        assert_ne!(not_an_event, line);
+
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        for line in [&unknown, &cut, &not_an_event] {
+            stream
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .expect("write hook line");
+        }
+        stream
+            .write_all(format!("{}\n", padded_session_start("reply-log-sentinel", 0)).as_bytes())
+            .await
+            .expect("write sentinel");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("reply-log-sentinel").await;
+
+        drop(subscriber_guard);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+
+        let raw = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            raw.contains("unrecognized event_type") && raw.matches("Malformed event:").count() == 2,
+            "every diagnostic was reached, or this proves nothing: {raw}"
+        );
+        assert!(
+            !raw.contains(SENTINEL) && !raw.contains("all tests pass"),
+            "a turn reply reached the log: {raw}"
+        );
+        assert!(
+            raw.contains("reply-log-session") && raw.contains("<withheld"),
+            "the diagnostics still name the line and say what was withheld: {raw}"
+        );
     }
 
     // ── Issue #1159: why the two tests below no longer race a 2-second window ──

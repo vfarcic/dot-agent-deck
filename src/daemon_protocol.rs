@@ -1914,7 +1914,9 @@ pub enum AttachRequest {
     /// The replies travel only on this stream: no [`BroadcastMsg`] carries
     /// them, so a client that never subscribes never receives an agent's reply
     /// text. Refused, with nothing opened, when `id` names no agent of this
-    /// daemon's.
+    /// daemon's or the daemon already serves its bound of such streams. When
+    /// the agent's process is gone, the daemon ends the stream with
+    /// `KIND_STREAM_END` carrying [`TURN_REPLIES_END_AGENT_EXITED`].
     ///
     /// **Withheld unless the daemon advertises [`CAP_TURN_REPLIES`]**, by
     /// [`crate::daemon_client::DaemonClient::subscribe_turn_replies`]. An older
@@ -6305,6 +6307,15 @@ async fn handle_subscribe_events_with_snapshot(
 /// the client reads its confirmation is on this stream, and nothing published
 /// before the receiver existed is replayed. Only the named agent's replies are
 /// forwarded.
+///
+/// Refused, with nothing opened, when the daemon already serves
+/// [`crate::turn_reply::MAX_TURN_REPLY_SUBSCRIBERS`] such streams (audit
+/// AU-S2); the slot is held until this connection ends.
+///
+/// Review RV-S2: the stream ends, with [`TURN_REPLIES_END_AGENT_EXITED`], once
+/// the named agent's process is gone — after forwarding any of its replies
+/// already published — so a client reading one agent learns it will hear no
+/// more rather than waiting on a stream nothing will ever write to.
 async fn handle_subscribe_turn_replies(
     stream: IpcStream,
     registry: &Arc<AgentPtyRegistry>,
@@ -6318,16 +6329,34 @@ async fn handle_subscribe_turn_replies(
         )
         .await;
     }
-    let rx = registry.turn_replies().subscribe();
+    let Some(receiver) = registry.turn_replies().subscribe() else {
+        let (_rd, mut wr) = stream.into_split();
+        return write_resp(
+            &mut wr,
+            &AttachResponse::err("subscribe-turn-replies: too many subscriptions"),
+        )
+        .await;
+    };
+    // `receiver` keeps holding its slot until this handler returns.
+    let rx = receiver.rx;
+    let exited = registry.agent_exit_signal(&id);
     forward_broadcast(
         stream,
         rx,
         &AttachResponse::ok(),
         "subscribe-turn-replies",
-        |reply| reply.agent_id == id,
+        |reply: &Arc<TurnReply>| (reply.agent_id == id).then(|| serde_json::to_vec(&**reply)),
+        async move {
+            let _ = exited.await;
+            TURN_REPLIES_END_AGENT_EXITED
+        },
     )
     .await
 }
+
+/// The `KIND_STREAM_END` reason a `subscribe-turn-replies` stream ends with when
+/// its agent's process is gone (PRD #1497 review RV-S2).
+pub const TURN_REPLIES_END_AGENT_EXITED: &[u8] = b"agent-exited";
 
 /// The forwarding loop both subscribe handlers share: confirm with `resp`, then
 /// write each broadcast `rx` receives as a `KIND_EVENT` frame until the stream
@@ -6337,31 +6366,56 @@ async fn forward_event_stream(
     rx: broadcast::Receiver<BroadcastMsg>,
     resp: &AttachResponse,
 ) -> io::Result<()> {
-    forward_broadcast(stream, rx, resp, "subscribe-events", |_| true).await
+    forward_broadcast(
+        stream,
+        rx,
+        resp,
+        "subscribe-events",
+        |msg| Some(serde_json::to_vec(msg)),
+        std::future::pending(),
+    )
+    .await
 }
 
-/// Confirm with `resp`, then write each message `rx` receives that `keep`
-/// accepts as a `KIND_EVENT` frame until the stream ends. `label` names the
-/// subscription in the log. See [`handle_subscribe_events`].
-async fn forward_broadcast<T: Serialize + Clone>(
+/// Confirm with `resp`, then write each message `rx` receives that `encode`
+/// keeps (answers `Some` for) as a `KIND_EVENT` frame until the stream ends.
+/// `label` names the subscription in the log. When `end` resolves, the
+/// messages already received are still forwarded, then the stream ends with
+/// `KIND_STREAM_END` carrying the reason `end` answered. See
+/// [`handle_subscribe_events`].
+async fn forward_broadcast<T: Clone>(
     stream: IpcStream,
     mut rx: broadcast::Receiver<T>,
     resp: &AttachResponse,
     label: &str,
-    keep: impl Fn(&T) -> bool,
+    encode: impl Fn(&T) -> Option<serde_json::Result<Vec<u8>>>,
+    end: impl std::future::Future<Output = &'static [u8]>,
 ) -> io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     write_resp(&mut wr, resp).await?;
+    tokio::pin!(end);
 
     loop {
         tokio::select! {
+            reason = &mut end => {
+                while let Ok(msg) = rx.try_recv() {
+                    let Some(Ok(payload)) = encode(&msg) else {
+                        continue;
+                    };
+                    if !write_or_timeout(&mut wr, KIND_EVENT, &payload).await {
+                        break;
+                    }
+                }
+                let _ = write_or_timeout(&mut wr, KIND_STREAM_END, reason).await;
+                break;
+            }
             recv = rx.recv() => {
                 match recv {
                     Ok(msg) => {
-                        if !keep(&msg) {
+                        let Some(encoded) = encode(&msg) else {
                             continue;
-                        }
-                        let payload = match serde_json::to_vec(&msg) {
+                        };
+                        let payload = match encoded {
                             Ok(b) => b,
                             Err(e) => {
                                 // A message that can't serialize is a daemon

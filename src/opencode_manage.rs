@@ -164,14 +164,30 @@ let shuttingDown = false;
 // arrives on `message.part.updated`, and `message.part.delta` carries the
 // increments in between); when the session goes idle, the text of its LAST
 // assistant message is attached to that idle report as `reply`, once. Keyed by
-// OpenCode's own session id. Bounded: a part keeps at most MAX_REPLY_CHARS code
-// points, and at most MAX_REPLY_MESSAGES messages are tracked at once.
-const MAX_REPLY_CHARS = 8192;
+// OpenCode's own (raw) session id, never by the directory alias below: a
+// subagent's child session shares the root's directory, and its reply is not
+// the user's turn. A reply is only published for a session KNOWN to be a root
+// (no `parentID`), learned from `session.created` / `session.updated` or, when
+// neither was seen, asked of OpenCode's client; an unknown or child session's
+// idle report carries no reply.
+//
+// Bounded: a message retains at most MAX_REPLY_BYTES of UTF-8 text across all
+// its parts (the daemon's own bound, so nothing kept here is cut there) and at
+// most MAX_REPLY_PARTS parts; at most MAX_REPLY_MESSAGES messages and
+// MAX_REPLY_SESSIONS sessions' reply state are tracked at once, the oldest
+// forgotten first, and a deleted or disposed session's state is dropped.
+const MAX_REPLY_BYTES = 8192;
+const MAX_REPLY_PARTS = 256;
 const MAX_REPLY_MESSAGES = 64;
+const MAX_REPLY_SESSIONS = 256;
+const ANCESTRY_LOOKUP_MS = 2000;
 const replyMessages = new Map();
 const lastAssistantMessage = new Map();
 const failedTurns = new Set();
 const abortedTurns = new Set();
+// Raw session id -> its parent's id, or "" for a root session.
+const sessionParents = new Map();
+let sessionClient = undefined;
 
 const sendEvent = (payload) => {{
   try {{
@@ -405,6 +421,7 @@ const flushSessions = () => {{
   for (const [sessionId, info] of knownSessions.entries()) {{
     closeSession(sessionId, info?.cwd, true, true);
   }}
+  forgetAllReplyState();
 }};
 
 const handleShutdown = () => {{
@@ -420,18 +437,113 @@ for (const signal of ["SIGINT", "SIGTERM"]) {{
   process.once(signal, handleShutdown);
 }}
 
-const clipReply = (text) => {{
-  const chars = Array.from(text);
-  return chars.length <= MAX_REPLY_CHARS ? text : chars.slice(0, MAX_REPLY_CHARS).join("");
+// `text` cut to at most `budget` bytes of UTF-8 at a code point boundary, with
+// a lone surrogate replaced by U+FFFD (JSON would carry it as an escape the
+// deck cannot decode). The string is walked lazily and the walk stops at the
+// budget, so a huge input costs the budget, not its length.
+const clipBytes = (text, budget) => {{
+  let kept = "";
+  let bytes = 0;
+  if (typeof text !== "string" || budget <= 0) {{
+    return {{ text: kept, bytes }};
+  }}
+  for (const ch of text) {{
+    const cp = ch.codePointAt(0);
+    const lone = cp >= 0xd800 && cp <= 0xdfff;
+    const size = lone ? 3 : cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes + size > budget) {{
+      break;
+    }}
+    kept += lone ? "�" : ch;
+    bytes += size;
+  }}
+  return {{ text: kept, bytes }};
+}};
+
+// Insert or refresh `key` in a Map (with `value`) or a Set, as its newest
+// entry, forgetting the oldest past MAX_REPLY_SESSIONS.
+const rememberBounded = (collection, key, value) => {{
+  collection.delete(key);
+  if (collection instanceof Map) {{
+    collection.set(key, value);
+  }} else {{
+    collection.add(key);
+  }}
+  while (collection.size > MAX_REPLY_SESSIONS) {{
+    collection.delete(collection.keys().next().value);
+  }}
+}};
+
+const forgetReplyState = (sessionId) => {{
+  lastAssistantMessage.delete(sessionId);
+  failedTurns.delete(sessionId);
+  abortedTurns.delete(sessionId);
+  for (const [id, entry] of replyMessages.entries()) {{
+    if (entry.sessionId === sessionId) {{
+      replyMessages.delete(id);
+    }}
+  }}
+}};
+
+const forgetAllReplyState = () => {{
+  replyMessages.clear();
+  lastAssistantMessage.clear();
+  failedTurns.clear();
+  abortedTurns.clear();
+  sessionParents.clear();
+}};
+
+const isChildSession = (sessionId) => {{
+  const parent = sessionParents.get(sessionId);
+  return parent !== undefined && parent !== "";
+}};
+
+// Record a session's ancestry from its info; a child's reply state is dropped.
+const noteSessionAncestry = (info) => {{
+  if (!info || typeof info.id !== "string" || !info.id) {{
+    return;
+  }}
+  const parent = typeof info.parentID === "string" ? info.parentID : "";
+  rememberBounded(sessionParents, info.id, parent);
+  if (parent) {{
+    forgetReplyState(info.id);
+  }}
+}};
+
+// Whether `sessionId` is a root session. When no session event named its
+// ancestry, OpenCode's client is asked, bounded by ANCESTRY_LOOKUP_MS; a
+// session whose ancestry is still unknown is not a root.
+const isRootSession = async (sessionId) => {{
+  const sessions = sessionClient?.session;
+  if (!sessionParents.has(sessionId) && typeof sessions?.get === "function") {{
+    try {{
+      const answer = await Promise.race([
+        sessions.get({{ path: {{ id: sessionId }} }}),
+        new Promise((resolve) => {{
+          const timer = setTimeout(resolve, ANCESTRY_LOOKUP_MS);
+          timer?.unref?.();
+        }}),
+      ]);
+      const info = answer?.data ?? answer;
+      if (info?.id === sessionId) {{
+        noteSessionAncestry(info);
+      }}
+    }} catch (_) {{}}
+  }}
+  return sessionParents.get(sessionId) === "";
 }};
 
 const replyMessage = (messageId, sessionId) => {{
   let message = replyMessages.get(messageId);
   if (!message) {{
     while (replyMessages.size >= MAX_REPLY_MESSAGES) {{
-      replyMessages.delete(replyMessages.keys().next().value);
+      const [oldest, evicted] = replyMessages.entries().next().value;
+      replyMessages.delete(oldest);
+      if (lastAssistantMessage.get(evicted.sessionId) === oldest) {{
+        lastAssistantMessage.delete(evicted.sessionId);
+      }}
     }}
-    message = {{ sessionId, parts: new Map() }};
+    message = {{ sessionId, parts: new Map(), bytes: 0 }};
     replyMessages.set(messageId, message);
   }}
   return message;
@@ -439,14 +551,14 @@ const replyMessage = (messageId, sessionId) => {{
 
 const recordAssistantMessage = (info) => {{
   const sessionId = info?.sessionID;
-  if (!sessionId) {{
+  if (!sessionId || !info.id || isChildSession(sessionId)) {{
     return;
   }}
   const previous = lastAssistantMessage.get(sessionId);
   if (previous && previous !== info.id) {{
     replyMessages.delete(previous);
   }}
-  lastAssistantMessage.set(sessionId, info.id);
+  rememberBounded(lastAssistantMessage, sessionId, info.id);
   replyMessage(info.id, sessionId);
 }};
 
@@ -454,42 +566,65 @@ const recordReplyPart = (part) => {{
   if (part?.type !== "text" || part.synthetic || part.ignored || !part.id || !part.messageID) {{
     return;
   }}
+  if (isChildSession(part.sessionID)) {{
+    return;
+  }}
   const message = replyMessage(part.messageID, part.sessionID);
-  message.parts.set(part.id, clipReply(typeof part.text === "string" ? part.text : ""));
+  const existing = message.parts.get(part.id);
+  if (!existing && message.parts.size >= MAX_REPLY_PARTS) {{
+    return;
+  }}
+  const others = message.bytes - (existing?.bytes ?? 0);
+  const kept = clipBytes(part.text, MAX_REPLY_BYTES - others);
+  message.parts.set(part.id, kept);
+  message.bytes = others + kept.bytes;
 }};
 
 const recordReplyDelta = (props) => {{
   if (props?.field !== "text" || typeof props.delta !== "string") {{
     return;
   }}
-  const parts = replyMessages.get(props.messageID)?.parts;
-  if (!parts || !parts.has(props.partID)) {{
+  const message = replyMessages.get(props.messageID);
+  const existing = message?.parts.get(props.partID);
+  if (!existing) {{
     return;
   }}
-  parts.set(props.partID, clipReply(parts.get(props.partID) + props.delta));
+  const added = clipBytes(props.delta, MAX_REPLY_BYTES - message.bytes);
+  if (added.bytes === 0) {{
+    return;
+  }}
+  message.parts.set(props.partID, {{
+    text: existing.text + added.text,
+    bytes: existing.bytes + added.bytes,
+  }});
+  message.bytes += added.bytes;
+}};
+
+const recordTurnError = (sessionId, error) => {{
+  if (!sessionId || isChildSession(sessionId)) {{
+    return;
+  }}
+  rememberBounded(error?.name === "MessageAbortedError" ? abortedTurns : failedTurns, sessionId);
 }};
 
 // The reply owed for OpenCode session `sessionId`'s turn that just went idle,
-// as the fields to add to that idle report, consumed so it is sent once.
-const takeReply = (sessionId) => {{
+// as the fields to add to that idle report, consumed so it is sent once. Only
+// a root session's: a subagent's child session, or one whose ancestry cannot
+// be learned, gets none.
+const takeReply = async (sessionId) => {{
   if (!sessionId) {{
     return {{}};
   }}
   const messageId = lastAssistantMessage.get(sessionId);
-  const failed = failedTurns.delete(sessionId);
-  const aborted = abortedTurns.delete(sessionId);
-  lastAssistantMessage.delete(sessionId);
+  const failed = failedTurns.has(sessionId);
+  const aborted = abortedTurns.has(sessionId);
   const message = messageId ? replyMessages.get(messageId) : undefined;
-  for (const [id, entry] of replyMessages.entries()) {{
-    if (entry.sessionId === sessionId) {{
-      replyMessages.delete(id);
-    }}
-  }}
+  forgetReplyState(sessionId);
   if (!message || aborted) {{
     return {{}};
   }}
-  const text = clipReply(Array.from(message.parts.values()).join("").trim());
-  if (!text) {{
+  const text = Array.from(message.parts.values(), (part) => part.text).join("").trim();
+  if (!text || !(await isRootSession(sessionId))) {{
     return {{}};
   }}
   return failed ? {{ reply: text, reply_failed: true }} : {{ reply: text }};
@@ -564,6 +699,7 @@ export const DotAgentDeckPlugin = async (ctx) => {{
   }}
 
   const directory = ctx?.directory ?? process.cwd();
+  sessionClient = ctx?.client;
 
   return {{
     event: async (input) => {{
@@ -597,8 +733,16 @@ export const DotAgentDeckPlugin = async (ctx) => {{
       if (!event?.type?.startsWith("session.")) {{
         return;
       }}
+      if (eventType === "session.created" || eventType === "session.updated") {{
+        noteSessionAncestry(event?.properties?.info);
+      }}
       const payload = sessionPayload(event, directory);
       if (event?.type === "session.deleted") {{
+        const deletedId = event?.properties?.info?.id ?? event?.properties?.sessionID;
+        if (deletedId) {{
+          forgetReplyState(deletedId);
+          sessionParents.delete(deletedId);
+        }}
         closeSession(payload.session_id, payload.cwd, false, false);
         return;
       }}
@@ -609,14 +753,12 @@ export const DotAgentDeckPlugin = async (ctx) => {{
         event?.type !== "session.created"
       );
       const rawSessionId = event?.properties?.sessionID;
-      if (event?.type === "session.error" && rawSessionId) {{
-        if (event?.properties?.error?.name === "MessageAbortedError") {{
-          abortedTurns.add(rawSessionId);
-        }} else {{
-          failedTurns.add(rawSessionId);
-        }}
+      if (event?.type === "session.error") {{
+        recordTurnError(rawSessionId, event?.properties?.error);
       }}
-      sendEvent(isIdleReport(payload) ? {{ ...payload, ...takeReply(rawSessionId) }} : payload);
+      sendEvent(
+        isIdleReport(payload) ? {{ ...payload, ...(await takeReply(rawSessionId)) }} : payload
+      );
     }},
     "tool.execute.before": async (input, output) => {{
       const sessionId = normalizeSessionId(
@@ -1753,7 +1895,8 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
     /// user's message, a reasoning part, an assistant message streamed as an
     /// empty text part plus deltas and then its full text, a second assistant
     /// message after a tool step, then `session.status` idle and the deprecated
-    /// `session.idle`. The first idle report carries the LAST assistant
+    /// `session.idle`, for a session whose `session.created` named it a root.
+    /// The first idle report carries the LAST assistant
     /// message's text as `reply`, the second none; a turn that hit a
     /// `session.error` carries `reply_failed`; an interrupted turn carries none.
     #[cfg(unix)]
@@ -1794,6 +1937,7 @@ const hooks = await plugin({{ directory: "/work" }});
 const send = (type, properties) => hooks.event({{ event: {{ type, properties }} }});
 const part = (sessionID, messageID, id, type, text) =>
   send("message.part.updated", {{ sessionID, time: 1, part: {{ id, sessionID, messageID, type, text, time: {{ start: 1 }} }} }});
+await send("session.created", {{ sessionID: "s1", info: {{ id: "s1", directory: "/work" }} }});
 const turn = async (s, prefix, finalText) => {{
   await send("session.status", {{ sessionID: s, status: {{ type: "busy" }} }});
   await send("message.updated", {{ sessionID: s, info: {{ id: prefix + "u", sessionID: s, role: "user" }} }});
@@ -1875,5 +2019,284 @@ await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
                 "{payload}"
             );
         }
+    }
+
+    /// Run `body` under Node against the generated plugin, its binary pinned to
+    /// a recorder, and answer the payloads the plugin sent — or `None` (after a
+    /// `SKIP:`) when Node is not available. `node_args` go before the driver.
+    #[cfg(unix)]
+    fn run_plugin_driver(body: &str, node_args: &[&str]) -> Option<Vec<serde_json::Value>> {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: node is not available");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payloads.jsonl");
+        let recorder = dir.path().join("recorder.sh");
+        crate::test_isolation::write_script(
+            &recorder,
+            format!(
+                "#!/bin/sh\ncat >> '{}'\necho >> '{}'\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = dir.path().join("dot-agent-deck.mjs");
+        std::fs::write(&plugin, plugin_template(&recorder.to_string_lossy())).unwrap();
+        let driver = dir.path().join("driver.mjs");
+        std::fs::write(
+            &driver,
+            format!(
+                "import plugin from {};\n{body}",
+                serde_json::to_string(&plugin.display().to_string()).unwrap()
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("node")
+            .args(node_args)
+            .arg(&driver)
+            .output()
+            .expect("run node");
+        assert!(
+            output.status.success(),
+            "the plugin driver failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(
+            std::fs::read_to_string(&out)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("every payload is JSON the deck decodes"))
+                .collect(),
+        )
+    }
+
+    /// The final replies the plugin attached to its idle reports, in order,
+    /// paired with the session the report names.
+    #[cfg(unix)]
+    fn idle_replies(
+        payloads: &[serde_json::Value],
+    ) -> Vec<(String, Option<crate::daemon_protocol::FinalReply>)> {
+        payloads
+            .iter()
+            .filter(|p| {
+                p["event"] == "session.idle"
+                    || (p["event"] == "session.status" && p["status"] == "idle")
+            })
+            .map(|p| {
+                (
+                    p["session_id"].as_str().unwrap_or_default().to_owned(),
+                    crate::hook::extract_opencode_turn_reply(p),
+                )
+            })
+            .collect()
+    }
+
+    /// PRD #1497 audit AU-B1: a subagent's child session (`parentID` naming
+    /// the root, same directory) streams its own assistant text interleaved
+    /// with the root's turn and goes idle first. Its text never reaches any
+    /// report — not even the idle report the directory alias files under the
+    /// root's id — and the root's own final reply still arrives. A session
+    /// whose ancestry no session event named is asked of OpenCode's client:
+    /// a root's reply is sent, a child's or an unanswerable one's is not.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_never_attaches_a_subagent_reply_to_the_root() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const client = { session: { get: async ({ path }) => {
+  if (path.id === "lookup-fails") throw new Error("offline");
+  return { data: path.id === "resumed" ? { id: "resumed" } : { id: path.id, parentID: "root" } };
+} } };
+const hooks = await plugin({ directory: "/work", client });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const part = (sessionID, messageID, id, text) =>
+  send("message.part.updated", { sessionID, part: { id, sessionID, messageID, type: "text", text } });
+const delta = (sessionID, messageID, partID, d) =>
+  send("message.part.delta", { sessionID, messageID, partID, field: "text", delta: d });
+const assistant = (sessionID, id) =>
+  send("message.updated", { sessionID, info: { id, sessionID, role: "assistant" } });
+await send("session.created", { sessionID: "root", info: { id: "root", directory: "/work" } });
+await send("session.status", { sessionID: "root", status: { type: "busy" } });
+await send("message.updated", { sessionID: "root", info: { id: "ru", sessionID: "root", role: "user" } });
+await part("root", "ru", "rpu", "run the subagent");
+await assistant("root", "ra1");
+await part("root", "ra1", "rt1", "Delegating.");
+await send("session.created", { sessionID: "child", info: { id: "child", parentID: "root", directory: "/work" } });
+await send("session.status", { sessionID: "child", status: { type: "busy" } });
+await assistant("child", "ca1");
+await part("child", "ca1", "ct1", "");
+await delta("child", "ca1", "ct1", "SUBAGENT_PRIVATE_SENTINEL ");
+await assistant("root", "ra2");
+await part("root", "ra2", "rt2", "");
+await delta("child", "ca1", "ct1", "more SUBAGENT_PRIVATE_SENTINEL");
+await part("child", "ca1", "ct1", "SUBAGENT_PRIVATE_SENTINEL final");
+await send("session.status", { sessionID: "child", status: { type: "idle" } });
+await send("session.idle", { sessionID: "child" });
+await delta("root", "ra2", "rt2", "ROOT_FINAL_SENTINEL: done.");
+await send("session.status", { sessionID: "root", status: { type: "idle" } });
+for (const id of ["resumed", "lookup-child", "lookup-fails"]) {
+  await assistant(id, id + "-a");
+  await part(id, id + "-a", id + "-t", "LOOKUP_REPLY " + id);
+  await send("session.status", { sessionID: id, status: { type: "idle" } });
+}
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(
+            !all.contains("SUBAGENT_PRIVATE_SENTINEL"),
+            "a subagent's reply leaked into a report: {payloads:#?}"
+        );
+        let replies: Vec<(String, Option<String>)> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(session, reply)| (session, reply.map(|r| r.text)))
+            .collect();
+        assert_eq!(
+            replies,
+            vec![
+                ("root".to_owned(), None),
+                ("root".to_owned(), None),
+                (
+                    "root".to_owned(),
+                    Some("ROOT_FINAL_SENTINEL: done.".to_owned())
+                ),
+                ("root".to_owned(), Some("LOOKUP_REPLY resumed".to_owned())),
+                ("root".to_owned(), None),
+                ("root".to_owned(), None),
+            ],
+            "the child's two idle reports (filed under the root by the directory alias) carry \
+             nothing, the root's carries its own reply, and only the client-confirmed root is \
+             read: {payloads:#?}"
+        );
+    }
+
+    /// PRD #1497 audit AU-B2 and review RV-S3: one assistant message streamed
+    /// as 10,000 distinct 8 KiB parts and 10,000 8 KiB deltas, under a 64 MiB
+    /// heap, retains at most the daemon's byte bound in total: the driver
+    /// completes (retaining every part, as the unbounded tracker did, exhausts
+    /// that heap), and the reply the plugin sends is the message's head, at most
+    /// `MAX_TURN_REPLY_BYTES` of UTF-8 bytes, with a lone surrogate replaced
+    /// rather than sent as an escape the deck cannot decode.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_bounds_a_huge_reply_by_bytes_and_parts() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+await send("session.created", { sessionID: "big", info: { id: "big", directory: "/work" } });
+await send("message.updated", { sessionID: "big", info: { id: "ba", sessionID: "big", role: "assistant" } });
+await send("message.part.updated", { sessionID: "big", part: { id: "p-first", sessionID: "big",
+  messageID: "ba", type: "text", text: "\ud800HEAD " } });
+for (let i = 0; i < 10000; i++) {
+  await send("message.part.updated", { sessionID: "big", part: { id: "p" + i, sessionID: "big",
+    messageID: "ba", type: "text", text: Buffer.alloc(8192, i + "é🦀").toString() } });
+}
+for (let i = 0; i < 10000; i++) {
+  await send("message.part.delta", { sessionID: "big", messageID: "ba", partID: "p" + (i % 300),
+    field: "text", delta: Buffer.alloc(8192, "x" + i).toString() });
+}
+await send("session.status", { sessionID: "big", status: { type: "idle" } });
+"#,
+            &["--max-old-space-size=64"],
+        ) else {
+            return;
+        };
+        let raw: Vec<&str> = payloads
+            .iter()
+            .filter_map(|p| p.get("reply").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0].len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES,
+            "the plugin sends at most the daemon's bound, in bytes: {}",
+            raw[0].len()
+        );
+        let replies = idle_replies(&payloads);
+        assert_eq!(replies.len(), 1);
+        let reply = replies[0].1.clone().expect("the head of the reply is kept");
+        assert!(
+            reply.text.len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES,
+            "{} bytes",
+            reply.text.len()
+        );
+        assert!(
+            reply.text.len() > crate::daemon_protocol::MAX_TURN_REPLY_BYTES - 8,
+            "the byte budget is used, not a code-point one: {} bytes",
+            reply.text.len()
+        );
+        assert!(
+            reply.text.starts_with("\u{fffd}HEAD 0é🦀"),
+            "{}",
+            &reply.text[..32]
+        );
+        // The deck bounds it identically, so nothing the plugin kept is cut.
+        assert_eq!(
+            crate::daemon_protocol::clamp_turn_reply(&reply.text),
+            reply.text
+        );
+    }
+
+    /// PRD #1497 audit AU-B2: a session deleted without going idle leaves no
+    /// reply state behind. A failed turn and an interrupted turn are each
+    /// followed by `session.deleted`; a session later reported under the same
+    /// id is read fresh — its reply is neither marked failed nor withheld as
+    /// interrupted, and the deleted turn's text is never sent.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_plugin_forgets_a_deleted_sessions_reply_state() {
+        let Some(payloads) = run_plugin_driver(
+            r#"
+const hooks = await plugin({ directory: "/work" });
+const send = (type, properties) => hooks.event({ event: { type, properties } });
+const reply = async (s, m, text) => {
+  await send("message.updated", { sessionID: s, info: { id: m, sessionID: s, role: "assistant" } });
+  await send("message.part.updated", { sessionID: s, part: { id: m + "t", sessionID: s, messageID: m, type: "text", text } });
+};
+for (const [s, error] of [["d1", "APIError"], ["d2", "MessageAbortedError"]]) {
+  await send("session.created", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await reply(s, s + "-old", "DELETED_TURN_SENTINEL");
+  await send("session.error", { sessionID: s, error: { name: error, data: { message: "boom" } } });
+  await send("session.deleted", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await send("session.created", { sessionID: s, info: { id: s, directory: "/work" + s } });
+  await reply(s, s + "-new", "FRESH " + s);
+  await send("session.status", { sessionID: s, status: { type: "idle" } });
+}
+"#,
+            &[],
+        ) else {
+            return;
+        };
+        let all = serde_json::to_string(&payloads).unwrap();
+        assert!(!all.contains("DELETED_TURN_SENTINEL"), "{payloads:#?}");
+        let replies: Vec<Option<crate::daemon_protocol::FinalReply>> = idle_replies(&payloads)
+            .into_iter()
+            .map(|(_, reply)| reply)
+            .collect();
+        assert_eq!(
+            replies,
+            ["d1", "d2"]
+                .iter()
+                .map(|s| Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: format!("FRESH {s}"),
+                    failed: false,
+                }))
+                .collect::<Vec<_>>(),
+            "{payloads:#?}"
+        );
     }
 }
