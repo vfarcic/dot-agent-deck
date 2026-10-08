@@ -802,6 +802,16 @@ impl IntentSettings {
             && self.model == preset.model)
             .then_some(OPENAI_COMMAND_REASONING_EFFORT)
     }
+
+    /// Whether `other` names the same connection: the same backend at the same
+    /// endpoint. The key for both is read from one keychain slot, so a request
+    /// prepared for one connection must not be sent once the settings name
+    /// another (PRD #1497, PR #1617's review). The model and the token ceiling
+    /// are not part of it: a request built for the old model still goes to the
+    /// endpoint the key was stored for.
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.backend == other.backend && self.endpoint == other.endpoint
+    }
 }
 
 impl Default for IntentSettings {

@@ -213,6 +213,22 @@ describe("ReadingMode (PRD #1497 M5)", () => {
     expect(h.said.filter(([key]) => key !== READING_VOICE_KEY)).toEqual([]);
     expect(h.stop).toHaveBeenCalledWith(7);
   });
+
+  /** Scenario (PR #1617 review): the agent exits, so its events end and the Rust side sends `closed` after the last summary; reading mode ends — indicator cleared, "Reading off." queued, subscription stopped, a late sentence ignored — but nothing is interrupted, so the last summary is still heard. */
+  it("ends without cutting off speech when the agent's events close", async () => {
+    const h = harness();
+    await h.mode.turnOn(TESTER);
+    h.sinks[0]({ kind: "turn", text: "The tester finished: the last turn." });
+    h.sinks[0]({ kind: "closed", text: "Reading off." });
+    await Promise.resolve();
+    expect(h.mode.on).toBe(false);
+    expect(h.changes).toEqual([TESTER, undefined]);
+    expect(h.speech.interrupt).not.toHaveBeenCalled();
+    expect(h.said.slice(-2)).toEqual([["deck-local\u0000tester", "The tester finished: the last turn."], [READING_VOICE_KEY, READING_OFF]]);
+    expect(h.stop).toHaveBeenCalledWith(7);
+    h.sinks[0]({ kind: "turn", text: "The tester finished: late news." });
+    expect(h.said.at(-1)).toEqual([READING_VOICE_KEY, READING_OFF]);
+  });
 });
 
 /** A provider voice that records every sentence it is asked to fetch and play, and finishes only when the test says so. */
@@ -293,6 +309,37 @@ describe("ReadingMode ending with speech in flight (audit A-B3)", () => {
       expect(h.queue.speaking).toBe(false);
     });
   }
+
+  /** Scenario (PR #1617 review): a summary is being spoken and the agent's last summary is queued behind it when the agent exits and its events close; neither is cut off — both are heard, then "Reading off." — and reading is already off while they play. */
+  it("lets the last summary finish when the agent's events close", async () => {
+    const h = speaking();
+    await h.mode.turnOn(TESTER);
+    await flush();
+    h.provider.finish(); // "Reading on."
+    await flush();
+    h.sinks[0]({ kind: "permission", text: "The tester is asking for permission: run the tests." });
+    await flush();
+    h.sinks[0]({ kind: "turn", text: "The tester finished: the last turn." });
+    h.sinks[0]({ kind: "closed", text: "Reading off." });
+    await flush();
+    expect(h.mode.on).toBe(false);
+    expect(h.stop).toHaveBeenCalledWith(7);
+    expect(h.provider.aborted).toEqual([]);
+    h.provider.finish(); // the permission sentence
+    await flush();
+    h.provider.finish(); // the last summary
+    await flush();
+    h.provider.finish(); // "Reading off."
+    await flush();
+    expect(h.provider.fetched).toEqual([
+      "Reading on.",
+      "The tester is asking for permission: run the tests.",
+      "The tester finished: the last turn.",
+      READING_OFF,
+    ]);
+    expect(h.provider.aborted).toEqual([]);
+    expect(h.queue.speaking).toBe(false);
+  });
 
   /** Scenario (audit A-B2): under a provider speech source, a permission sentence — the agent's name and up to 120 characters of what it wants — is sent to the provider's speech like every other sentence, which is what Settings → Voice discloses. */
   it("sends a permission sentence to the provider's speech when it is the source", async () => {

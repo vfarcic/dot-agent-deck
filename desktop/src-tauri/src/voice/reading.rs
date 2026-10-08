@@ -67,7 +67,10 @@ use tokio::sync::mpsc;
 
 use crate::settings::{IntentSettings, ReadingConsent, VoiceSettings};
 
-use super::summary::{Summary, SummaryTransport, TurnKind, TurnSummaryRequest, spoken_name};
+use super::summary::{
+    RequestGate, Summary, SummaryFailure, SummaryTransport, TurnKind, TurnSummaryRequest,
+    spoken_name,
+};
 
 /// Why "reading on" cannot start on a deck whose daemon predates the reply
 /// stream (it does not advertise `turn-replies`). A fragment, rendered into
@@ -465,11 +468,17 @@ pub enum ReadingSentenceKind {
     Permission,
     /// An error or quota block, announced at once.
     Blocked,
-    /// Reading ended on this side — its Settings opt-in was turned off, or the
-    /// agent's reply stream ended (the agent exited). Not a sentence to queue:
-    /// the webview ends reading mode on it, clearing the indicator and the
-    /// queued speech, and says "Reading off."
+    /// Reading ended on this side because its Settings opt-in was turned off.
+    /// Not a sentence to queue: the webview ends reading mode on it, cutting
+    /// off what it is saying and clearing the indicator and the queued speech,
+    /// and says "Reading off."
     Ended,
+    /// Reading ended because the agent's events ended — its reply stream
+    /// closed (the agent exited) or the deck went away — after everything
+    /// received was read. Not a sentence to queue either: the webview ends
+    /// reading mode and says "Reading off.", but lets the speech already
+    /// handed to it finish, so the last summary is heard.
+    Closed,
 }
 
 /// The text of the [`ReadingSentenceKind::Ended`] sentence.
@@ -479,6 +488,15 @@ pub const READING_ENDED: &str = "Reading off.";
 pub fn ended_sentence() -> ReadingSentence {
     ReadingSentence {
         kind: ReadingSentenceKind::Ended,
+        text: READING_ENDED.to_string(),
+    }
+}
+
+/// The sentence that ends a reading session whose events ended
+/// ([`ReadingSentenceKind::Closed`]).
+pub fn closed_sentence() -> ReadingSentence {
+    ReadingSentence {
+        kind: ReadingSentenceKind::Closed,
         text: READING_ENDED.to_string(),
     }
 }
@@ -509,14 +527,25 @@ pub trait TurnSummariser: Send + Sync {
 }
 
 /// The settings document's voice section, read when asked.
-pub type LoadVoiceSettings = Box<dyn Fn() -> VoiceSettings + Send + Sync>;
+pub type LoadVoiceSettings = Arc<dyn Fn() -> VoiceSettings + Send + Sync>;
 
-/// A summary transport for the Commands connection the settings name.
-pub type ConnectTransport = Box<dyn Fn(&IntentSettings) -> Box<dyn SummaryTransport> + Send + Sync>;
+/// A summary transport for the Commands connection the settings name, which
+/// asks the gate after its keychain read and sends nothing when it refuses.
+pub type ConnectTransport =
+    Box<dyn Fn(&IntentSettings, RequestGate) -> Box<dyn SummaryTransport> + Send + Sync>;
 
 /// The real [`TurnSummariser`]: the settings read per call — so a changed
 /// connection applies to the next turn and a revoked opt-in stops the next
 /// request — and a transport to the Commands connection they name.
+///
+/// The transport reads the key and then asks again (PR #1617's review): the
+/// settings as they are then must still have the opt-in on and still name the
+/// connection the request was prepared for, or nothing is sent — the key
+/// comes from one keychain slot for whichever connection is configured, so a
+/// request must not go to the old endpoint once the connection changed. With
+/// the opt-in off by then the answer is `None`, which ends reading; with only
+/// the connection changed it is the fallback sentence, and the next turn goes
+/// to the new connection.
 pub struct SettingsSummariser {
     load: LoadVoiceSettings,
     connect: ConnectTransport,
@@ -541,10 +570,23 @@ impl TurnSummariser for SettingsSummariser {
             if settings.reading != ReadingConsent::On {
                 return None;
             }
-            let transport = (self.connect)(&settings.intent);
-            Some(
-                super::summary::summarise_over(&settings.intent, transport.as_ref(), request).await,
-            )
+            let gate: RequestGate = {
+                let load = Arc::clone(&self.load);
+                let intent = settings.intent.clone();
+                Arc::new(move || {
+                    let now = load();
+                    now.reading == ReadingConsent::On && now.intent.same_connection(&intent)
+                })
+            };
+            let transport = (self.connect)(&settings.intent, gate);
+            let summary =
+                super::summary::summarise_over(&settings.intent, transport.as_ref(), request).await;
+            if summary.fallback == Some(SummaryFailure::NotPermitted)
+                && (self.load)().reading != ReadingConsent::On
+            {
+                return None;
+            }
+            Some(summary)
         })
     }
 }
@@ -618,6 +660,22 @@ pub async fn announce(
 /// nobody is listening any more (the webview's channel closed), which ends the
 /// loop and drops `events` — the unsubscribe.
 ///
+/// # At most one turn waits for a summary
+///
+/// While a summary is being made, the turns that end are not queued: the
+/// latest one waits and replaces any that was already waiting, failed or not
+/// (D6: you hear where the agent is now, not a backlog). So of a burst of turns
+/// ending during one slow summary, the user hears that summary and then the
+/// summary of the last turn of the burst — announced as failed only if that
+/// last turn itself failed. A failure that stops the agent is still announced
+/// at once as an error, which is never dropped this way.
+///
+/// A summary that is ready is delivered before the next event after it, so a
+/// stream of permission prompts or errors that is never empty cannot hold a
+/// summary back.
+///
+/// # How it ends
+///
 /// Every event is checked against reading's opt-in as it arrives, and each
 /// summary request checks it again immediately before it is sent; when it is
 /// off, the loop sends [`ended_sentence`] and ends, so nothing more is
@@ -625,22 +683,31 @@ pub async fn announce(
 ///
 /// When `events` end on the source's side — the deck ended the agent's reply
 /// stream because the agent exited (review RV-S2), or the deck went away — the
-/// turns already received are still read, and then the loop sends
-/// [`ended_sentence`] too: nothing more can be read, and the webview ends
-/// reading mode and says so rather than staying on for an agent that is gone.
+/// turn already received is still read, and then the loop sends
+/// [`closed_sentence`]: nothing more can be read, and the webview ends reading
+/// mode and says so, letting what it was already saying finish rather than
+/// cutting off that last summary.
 pub async fn read_turns(
     agent: &str,
     mut events: TurnEvents,
     summariser: &dyn TurnSummariser,
     mut sink: impl FnMut(ReadingSentence) -> bool,
 ) {
-    let mut waiting: std::collections::VecDeque<(TurnKind, String)> =
-        std::collections::VecDeque::new();
+    use std::task::Poll;
+    // The turn waiting for a summary — at most one (see above).
+    let mut waiting: Option<(TurnKind, String)> = None;
     let mut summarising: Option<SummaryFuture<'_>> = None;
+    // A summary that finished and is not delivered yet.
+    let mut ready: Option<Option<Summary>> = None;
     let mut open = true;
+    enum Next {
+        Event(Option<TurnEvent>),
+        Summary(Option<Summary>),
+    }
     loop {
         if summarising.is_none()
-            && let Some((kind, reply)) = waiting.pop_front()
+            && ready.is_none()
+            && let Some((kind, reply)) = waiting.take()
         {
             summarising = Some(Box::pin(async move {
                 summariser
@@ -652,34 +719,50 @@ pub async fn read_turns(
                     .await
             }));
         }
-        if !open && summarising.is_none() {
-            sink(ended_sentence());
+        if !open && summarising.is_none() && ready.is_none() {
+            sink(closed_sentence());
             return;
         }
-        let in_flight = async {
-            match summarising.as_mut() {
-                Some(summary) => summary.await,
-                None => std::future::pending().await,
+        let next = match ready.take() {
+            // Delivered before anything else once it has waited behind one
+            // event, so events that keep arriving cannot hold it back.
+            Some(summary) => Next::Summary(summary),
+            None => {
+                std::future::poll_fn(|cx| {
+                    // The summary is polled every time, so it makes progress
+                    // whatever the events do; an event that is ready as well
+                    // goes first, so an alert is not held behind it.
+                    if let Some(summary) = summarising.as_mut()
+                        && let Poll::Ready(summary) = summary.as_mut().poll(cx)
+                    {
+                        summarising = None;
+                        ready = Some(summary);
+                    }
+                    if open && let Poll::Ready(event) = events.poll_recv(cx) {
+                        return Poll::Ready(Next::Event(event));
+                    }
+                    match ready.take() {
+                        Some(summary) => Poll::Ready(Next::Summary(summary)),
+                        None => Poll::Pending,
+                    }
+                })
+                .await
             }
         };
-        tokio::select! {
-            biased;
-            event = events.recv(), if open => {
-                let Some(event) = event else {
-                    open = false;
-                    continue;
-                };
+        match next {
+            Next::Event(None) => open = false,
+            Next::Event(Some(event)) => {
                 if !summariser.consented() {
                     sink(ended_sentence());
                     return;
                 }
                 let sentence = match event {
                     TurnEvent::Finished { reply } => {
-                        waiting.push_back((TurnKind::Finished, reply));
+                        waiting = Some((TurnKind::Finished, reply));
                         continue;
                     }
                     TurnEvent::Failed { reply } => {
-                        waiting.push_back((TurnKind::Failed, reply));
+                        waiting = Some((TurnKind::Failed, reply));
                         continue;
                     }
                     TurnEvent::Permission { wants } => ReadingSentence {
@@ -695,12 +778,11 @@ pub async fn read_turns(
                     return;
                 }
             }
-            summary = in_flight => {
-                summarising = None;
-                let Some(summary) = summary else {
-                    sink(ended_sentence());
-                    return;
-                };
+            Next::Summary(None) => {
+                sink(ended_sentence());
+                return;
+            }
+            Next::Summary(Some(summary)) => {
                 let sentence = ReadingSentence {
                     kind: ReadingSentenceKind::Turn,
                     text: summary.text,
@@ -1254,7 +1336,8 @@ mod tests {
     /// Review RV-S2: the deck ends the agent's reply stream when the agent
     /// exits. The source's events then end after what was already delivered,
     /// and reading ends with the "Reading off." sentence rather than staying on
-    /// for an agent that is gone.
+    /// for an agent that is gone — as a `closed` end (PR #1617's review), which
+    /// lets the last summary be heard, not the `ended` one that cuts it off.
     #[cfg(unix)]
     #[tokio::test]
     async fn voice_reading_ends_when_the_deck_ends_the_agents_reply_stream() {
@@ -1300,7 +1383,7 @@ mod tests {
                     kind: ReadingSentenceKind::Turn,
                     text: "summary of last turn".to_string(),
                 },
-                ended_sentence(),
+                closed_sentence(),
             ]
         );
         deck.abort();
@@ -1461,7 +1544,7 @@ mod tests {
         summariser.release.notify_one();
         assert_eq!(next(&mut heard).await.text, "summary of two");
         drop(send);
-        assert_eq!(next(&mut heard).await, ended_sentence());
+        assert_eq!(next(&mut heard).await, closed_sentence());
         tokio::time::timeout(Duration::from_secs(5), reading)
             .await
             .expect("reading ends")
@@ -1551,7 +1634,7 @@ mod tests {
         posts: Posts,
     ) -> SettingsSummariser {
         SettingsSummariser::new(
-            Box::new(move || VoiceSettings {
+            Arc::new(move || VoiceSettings {
                 intent: IntentSettings::for_backend(
                     crate::settings::IntentBackend::OpenaiCompatible,
                 ),
@@ -1562,7 +1645,7 @@ mod tests {
                 },
                 ..VoiceSettings::default()
             }),
-            Box::new(move |_| Box::new(posts.clone())),
+            Box::new(move |_, _| Box::new(posts.clone())),
         )
     }
 
@@ -1655,5 +1738,239 @@ mod tests {
         })
         .await;
         assert_eq!(heard, vec![ended_sentence()]);
+    }
+
+    /// Scenario (PR #1617 review): a turn finishes and its summary is slow;
+    /// while it is being made nine more turns finish. Only the newest of them
+    /// waits — the summariser is asked for the first turn and then for the
+    /// tenth, never the ones in between — and when the agent's events end the
+    /// session ends with the `closed` sentence.
+    #[tokio::test]
+    async fn voice_reading_only_the_newest_turn_waits_behind_a_slow_summary() {
+        let summariser = Arc::new(Slow::default());
+        let (send, events) = mpsc::channel(16);
+        let (heard_tx, mut heard) = mpsc::unbounded_channel();
+        let reading = {
+            let summariser = Arc::clone(&summariser);
+            tokio::spawn(async move {
+                read_turns("tester", events, summariser.as_ref(), |sentence| {
+                    heard_tx.send(sentence).is_ok()
+                })
+                .await;
+            })
+        };
+        async fn next(heard: &mut mpsc::UnboundedReceiver<ReadingSentence>) -> ReadingSentence {
+            tokio::time::timeout(Duration::from_secs(5), heard.recv())
+                .await
+                .expect("a sentence in time")
+                .expect("reading live")
+        }
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        send.send(TurnEvent::Finished {
+            reply: "turn 1".to_string(),
+        })
+        .await
+        .unwrap();
+        while summariser.started.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < until, "no summary started");
+            tokio::task::yield_now().await;
+        }
+        for turn in 2..=10 {
+            let event = if turn % 2 == 0 {
+                TurnEvent::Failed {
+                    reply: format!("turn {turn}"),
+                }
+            } else {
+                TurnEvent::Finished {
+                    reply: format!("turn {turn}"),
+                }
+            };
+            send.send(event).await.unwrap();
+        }
+        // Every event taken off the channel.
+        while send.capacity() < send.max_capacity() {
+            assert!(tokio::time::Instant::now() < until, "events not read");
+            tokio::task::yield_now().await;
+        }
+        summariser.release.notify_one();
+        assert_eq!(next(&mut heard).await.text, "summary of turn 1");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while summariser.started.lock().unwrap().len() < 2 {
+            assert!(tokio::time::Instant::now() < until, "no second summary");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *summariser.started.lock().unwrap(),
+            vec!["turn 1".to_string(), "turn 10".to_string()],
+            "only the newest waiting turn is summarised next"
+        );
+        summariser.release.notify_one();
+        assert_eq!(next(&mut heard).await.text, "summary of turn 10");
+        drop(send);
+        assert_eq!(next(&mut heard).await, closed_sentence());
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("reading ends")
+            .unwrap();
+        assert_eq!(summariser.started.lock().unwrap().len(), 2);
+    }
+
+    /// Scenario (PR #1617 review): a turn finishes and then a hundred
+    /// permission prompts arrive back to back, so the agent's events are never
+    /// empty. The turn's summary is spoken right after the first prompt rather
+    /// than after all of them.
+    #[tokio::test]
+    async fn voice_reading_a_stream_of_alerts_does_not_starve_a_summary() {
+        let summariser = Recording::default();
+        let (send, events) = mpsc::channel(128);
+        send.send(TurnEvent::Finished {
+            reply: "one".to_string(),
+        })
+        .await
+        .unwrap();
+        for prompt in 0..100 {
+            send.send(TurnEvent::Permission {
+                wants: format!("prompt {prompt}"),
+            })
+            .await
+            .unwrap();
+        }
+        let mut heard = Vec::new();
+        read_turns("tester", events, &summariser, |sentence| {
+            let summary = sentence.kind == ReadingSentenceKind::Turn;
+            heard.push(sentence);
+            // Stop listening once the summary is heard.
+            !summary
+        })
+        .await;
+        let at = heard
+            .iter()
+            .position(|sentence| sentence.text == "summary of one")
+            .expect("the summary was spoken");
+        assert!(at <= 1, "the summary waited behind {at} prompts");
+        drop(send);
+    }
+
+    /// A keychain whose read is where the user changes the Commands
+    /// connection, as a save during a keychain prompt would.
+    struct ConnectionChangedWhileReading(Arc<std::sync::atomic::AtomicBool>);
+
+    impl crate::secrets::SecretStore for ConnectionChangedWhileReading {
+        fn store(
+            &self,
+            _: crate::secrets::SecretId,
+            _: &crate::secrets::Secret,
+        ) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            _: crate::secrets::SecretId,
+        ) -> Result<Option<crate::secrets::Secret>, crate::secrets::SecretError> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(crate::secrets::Secret::new("sk-new-connection")))
+        }
+
+        fn delete(&self, _: crate::secrets::SecretId) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    /// A [`SettingsSummariser`] over the real HTTP transport, gated, whose
+    /// keychain read flips `changed`; `settings` reads the settings from it.
+    fn flipped_during_the_keychain_read(
+        changed: Arc<std::sync::atomic::AtomicBool>,
+        settings: impl Fn(bool) -> VoiceSettings + Send + Sync + 'static,
+    ) -> SettingsSummariser {
+        let secrets: Arc<dyn crate::secrets::SecretStore> =
+            Arc::new(ConnectionChangedWhileReading(Arc::clone(&changed)));
+        SettingsSummariser::new(
+            Arc::new(move || settings(changed.load(std::sync::atomic::Ordering::SeqCst))),
+            Box::new(move |intent, gate| {
+                Box::new(
+                    super::super::summary::HttpSummaryTransport::new(
+                        super::super::summary::protocol_for(intent),
+                        Arc::clone(&secrets),
+                        intent.endpoint.clone(),
+                    )
+                    .gated(gate),
+                )
+            }),
+        )
+    }
+
+    /// Scenario (PR #1617 review): reading is on when a turn's summary is
+    /// asked for, and the Commands connection is changed to another endpoint
+    /// while the key is being read. The opt-in is still on, but the settings
+    /// name a different connection, so nothing is sent — no request to the old
+    /// endpoint (unroutable on purpose, so a request would fail as a backend
+    /// error) with the new connection's key — and the plain fallback sentence
+    /// is spoken. With the opt-in turned off during the read instead, nothing
+    /// is sent either, and the answer is `None`, which ends reading.
+    #[tokio::test]
+    async fn voice_reading_summary_checks_the_connection_after_the_keychain_read() {
+        use crate::settings::IntentBackend;
+        let at = |endpoint: &str| IntentSettings {
+            endpoint: crate::model_service::ServiceUrl::parse(endpoint).expect("valid"),
+            ..IntentSettings::for_backend(IntentBackend::OpenaiCompatible)
+        };
+        let old = at("https://voice-summary-old.invalid/v1/chat/completions");
+        let new = at("https://voice-summary-new.invalid/v1/chat/completions");
+        let request = TurnSummaryRequest {
+            agent: "tester",
+            kind: TurnKind::Finished,
+            reply: "a reply that must not leave",
+        };
+
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let summariser = {
+            let (old, new) = (old.clone(), new);
+            flipped_during_the_keychain_read(Arc::clone(&changed), move |changed| VoiceSettings {
+                intent: if changed { new.clone() } else { old.clone() },
+                reading: ReadingConsent::On,
+                ..VoiceSettings::default()
+            })
+        };
+        let summary = summariser.summarise(request).await;
+        assert!(changed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            summary,
+            Some(Summary {
+                text: super::super::summary::fallback("tester", TurnKind::Finished),
+                fallback: Some(SummaryFailure::NotPermitted),
+            }),
+            "a request was attempted"
+        );
+
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let summariser =
+            flipped_during_the_keychain_read(Arc::clone(&revoked), move |revoked| VoiceSettings {
+                intent: old.clone(),
+                reading: if revoked {
+                    ReadingConsent::Off
+                } else {
+                    ReadingConsent::On
+                },
+                ..VoiceSettings::default()
+            });
+        assert_eq!(summariser.summarise(request).await, None);
+        assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Scenario (PR #1617 review): the two ways a session ends on this side
+    /// reach the webview as two kinds — `ended` (the opt-in was turned off),
+    /// which cuts speech off, and `closed` (the agent's events ended), which
+    /// lets the last summary finish — both saying "Reading off.".
+    #[test]
+    fn voice_reading_the_two_ends_serialise_as_the_webview_reads_them() {
+        assert_eq!(
+            serde_json::to_value(ended_sentence()).unwrap(),
+            serde_json::json!({ "kind": "ended", "text": "Reading off." })
+        );
+        assert_eq!(
+            serde_json::to_value(closed_sentence()).unwrap(),
+            serde_json::json!({ "kind": "closed", "text": "Reading off." })
+        );
     }
 }

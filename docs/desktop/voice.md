@@ -217,7 +217,7 @@ Reading mode lets you hear what an agent did without looking at its pane. While 
 
 From then on, each turn that agent finishes is summarised and spoken. Nothing that happened before you said "reading on" is read, and only that one agent is read. If **Read turns aloud** is **Off**, "reading on" is refused and the app tells you to turn it on in Settings.
 
-The summary is written by the model you set under **Commands**, from the agent's final reply for the turn. If the model does not answer within about ten seconds, or its answer cannot be used, the app says a plain sentence instead, such as "The tester finished its turn." A turn the agent ends without writing a reply, such as one you interrupted, is not announced. When several turns end while the app is still speaking, the latest summary replaces one that was still waiting, so you hear where the agent is now rather than a backlog; a permission prompt or error is never dropped that way.
+The summary is written by the model you set under **Commands**, from the agent's final reply for the turn. If the model does not answer within about ten seconds, or its answer cannot be used, the app says a plain sentence instead, such as "The tester finished its turn." A turn the agent ends without writing a reply, such as one you interrupted, is not announced. When several turns end while the app is still speaking, the latest summary replaces one that was still waiting, so you hear where the agent is now rather than a backlog; a permission prompt or error is never dropped that way. The same goes for turns that end while a summary is still being written: when it is done, only the last of them is summarised next.
 
 ### Stop the speech, or reading
 
@@ -231,7 +231,7 @@ Reading ends, and the app says "Reading off.", when you:
 - turn voice off;
 - or set **Read turns aloud** to **Off** in Settings.
 
-It also ends when the agent exits. Whatever was being said is cut off when reading ends.
+Whatever was being said is cut off when reading ends in one of those ways. It also ends when the agent exits, but then the app first finishes what it was saying, including the summary of the agent's last turn, and says "Reading off." after it.
 
 The reading switches work in typing mode too, so a bare "reading on" or "reading off" said in typing mode switches reading rather than being typed. While reading is on or the app is speaking, the same goes for the "quiet" phrases.
 

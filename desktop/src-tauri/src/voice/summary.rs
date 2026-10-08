@@ -127,7 +127,15 @@ pub enum SummaryFailure {
     Timeout,
     /// The answer had nothing speakable in it, or the reply was empty.
     Empty,
+    /// Nothing was sent: after the keychain read the settings no longer
+    /// permitted the request ([`RequestGate`]) — reading's opt-in was off, or
+    /// the Commands connection was another one.
+    NotPermitted,
 }
+
+/// Asked after the keychain read and immediately before a summary request:
+/// whether the settings as they are then still permit it (PR #1617's review).
+pub type RequestGate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// What reading mode speaks for one turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +531,8 @@ pub struct HttpSummaryTransport {
     /// `None` when no client could be built; see [`super::http::client`].
     client: Option<reqwest::Client>,
     endpoint: ServiceUrl,
+    /// Asked after the keychain read; `None` asks nothing.
+    gate: Option<RequestGate>,
 }
 
 impl HttpSummaryTransport {
@@ -532,13 +542,25 @@ impl HttpSummaryTransport {
             secrets,
             client: super::http::client(),
             endpoint,
+            gate: None,
         }
+    }
+
+    /// Ask `gate` after the keychain read, immediately before the request,
+    /// and send nothing ([`SummaryFailure::NotPermitted`]) when it refuses: the
+    /// keychain can take as long as a prompt the user answers.
+    pub fn gated(mut self, gate: RequestGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     async fn send(&self, body: Value) -> Result<Value, SummaryFailure> {
         let secret = endpoint_credential(&self.endpoint, &self.secrets)
             .await
             .map_err(SummaryFailure::NotConfigured)?;
+        if self.gate.as_ref().is_some_and(|gate| !gate()) {
+            return Err(SummaryFailure::NotPermitted);
+        }
         let Some(client) = self.client.as_ref() else {
             return Err(SummaryFailure::Backend(
                 "the summary could not start a secure connection".into(),

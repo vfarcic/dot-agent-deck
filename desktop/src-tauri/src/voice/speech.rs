@@ -24,7 +24,10 @@
 //! opt-in off, [`plan_for`] answers the system voice whatever the source, and
 //! [`provider_permitted`] — which the speech command checks before every
 //! request — refuses. A webview asking for audio directly gets the same
-//! refusal.
+//! refusal. The check is repeated after the keychain read against the
+//! connection the request was prepared for ([`permitted_on`]), and a save
+//! while the request is in flight cancels it when it no longer permits it
+//! ([`SpeechRevocation`]).
 //!
 //! # The audio is fetched here and not in the webview
 //!
@@ -33,6 +36,7 @@
 //! boundary as bytes and is decoded by the webview's Web Audio, which a CSP
 //! does not restrict.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -150,6 +154,88 @@ pub fn provider_permitted(settings: &VoiceSettings) -> Result<(), String> {
     }
 }
 
+/// Why a sentence prepared for one Commands connection is not sent once the
+/// settings name another.
+pub const SPEECH_CONNECTION_CHANGED: &str =
+    "the Commands connection changed while the sentence was being prepared";
+
+/// [`provider_permitted`] under `settings`, and `settings` still name the
+/// connection the request was prepared for (`intent`): the key is read from
+/// one keychain slot for whichever connection is configured, so a sentence
+/// must not go to the old endpoint, possibly with the new connection's key,
+/// after the connection was changed (PR #1617's review).
+pub fn permitted_on(settings: &VoiceSettings, intent: &IntentSettings) -> Result<(), String> {
+    provider_permitted(settings)?;
+    if !settings.intent.same_connection(intent) {
+        return Err(SPEECH_CONNECTION_CHANGED.to_string());
+    }
+    Ok(())
+}
+
+/// The settings each save writes, published to the speech requests in flight
+/// so a save that turns reading's opt-in off, or changes the Commands
+/// connection, cancels a request that already passed its last check (PR
+/// #1617's review).
+///
+/// Every save publishes, and each request decides for itself
+/// ([`Self::revoked`]): the save path does not have to know which connection a
+/// request was prepared for. Each publish is a new generation of the watch
+/// channel, the counterpart of reading's `revoked_through`.
+pub struct SpeechRevocation {
+    saved: tokio::sync::watch::Sender<Option<VoiceSettings>>,
+}
+
+impl Default for SpeechRevocation {
+    fn default() -> Self {
+        Self {
+            saved: tokio::sync::watch::Sender::new(None),
+        }
+    }
+}
+
+impl SpeechRevocation {
+    /// A save wrote `settings`.
+    pub fn publish(&self, settings: VoiceSettings) {
+        self.saved.send_replace(Some(settings));
+    }
+
+    /// Resolves, with why, once a save after this call no longer permits a
+    /// request prepared for `intent` ([`permitted_on`]); pending otherwise.
+    ///
+    /// Subscribes when called, not when first polled, so a caller that calls
+    /// this before its last settings read misses no save: one written before
+    /// that read is in what it read, and one written after it is published
+    /// after this subscribed.
+    pub fn revoked(&self, intent: IntentSettings) -> impl Future<Output = String> + Send + 'static {
+        let mut saved = self.saved.subscribe();
+        async move {
+            while saved.changed().await.is_ok() {
+                let refusal = saved
+                    .borrow_and_update()
+                    .as_ref()
+                    .and_then(|settings| permitted_on(settings, &intent).err());
+                if let Some(refusal) = refusal {
+                    return refusal;
+                }
+            }
+            std::future::pending().await
+        }
+    }
+}
+
+/// `work`, unless `revoked` resolves first: then `work` is dropped — with it
+/// any request it has in flight — and the answer is `revoked`'s reason.
+pub async fn unless_revoked<T>(
+    work: impl Future<Output = Result<T, String>>,
+    revoked: impl Future<Output = String>,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        reason = revoked => Err(reason),
+        result = work => result,
+    }
+}
+
 /// `text` bounded to [`MAX_SPEECH_INPUT_CHARS`] at a word boundary.
 pub fn bounded_input(text: &str) -> String {
     let text = text.trim();
@@ -177,9 +263,10 @@ pub fn request_body(text: &str) -> Value {
 /// not.
 ///
 /// `still_permitted` is asked after the keychain read and immediately before
-/// the request ([`provider_permitted`] against the settings as they are then):
-/// the keychain can take as long as a prompt the user answers, and reading's
-/// opt-in turned off during it sends nothing (PR #1617's review).
+/// the request ([`permitted_on`] against the settings as they are then): the
+/// keychain can take as long as a prompt the user answers, and reading's
+/// opt-in turned off, or the connection changed, during it sends nothing (PR
+/// #1617's review). A save after that check is [`SpeechRevocation`]'s.
 pub async fn synthesise<P, F>(
     intent: &IntentSettings,
     secrets: Arc<dyn SecretStore>,
@@ -522,5 +609,167 @@ mod tests {
             .await,
             Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string())
         );
+    }
+
+    /// A keychain whose read is where the user changes the Commands
+    /// connection, as a save during a keychain prompt would.
+    struct ConnectionChangedWhileReading(Arc<std::sync::atomic::AtomicBool>);
+
+    impl SecretStore for ConnectionChangedWhileReading {
+        fn store(
+            &self,
+            _: crate::secrets::SecretId,
+            _: &crate::secrets::Secret,
+        ) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            _: crate::secrets::SecretId,
+        ) -> Result<Option<crate::secrets::Secret>, crate::secrets::SecretError> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(crate::secrets::Secret::new("sk-new-connection")))
+        }
+
+        fn delete(&self, _: crate::secrets::SecretId) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    /// Scenario (PR #1617 review): reading is on with the provider's speech
+    /// when a sentence is asked for, and the Commands connection is changed to
+    /// another endpoint while the key is being read. The settings still permit
+    /// the provider's speech, but they name a different connection, so nothing
+    /// is sent: the answer is the connection-changed sentence, never a request
+    /// to the old endpoint (unroutable on purpose) with the new key.
+    #[tokio::test]
+    async fn voice_speech_connection_changed_during_the_keychain_read_sends_nothing() {
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let secrets: Arc<dyn SecretStore> =
+            Arc::new(ConnectionChangedWhileReading(Arc::clone(&changed)));
+        let old = openai_at("https://voice-speech-old.invalid/v1/chat/completions");
+        let new = openai_at("https://voice-speech-new.invalid/v1/chat/completions");
+        let settings_now = || {
+            let intent = if changed.load(std::sync::atomic::Ordering::SeqCst) {
+                new.clone()
+            } else {
+                old.clone()
+            };
+            voice(SpeechSource::Provider, intent, ReadingConsent::On)
+        };
+        assert!(permitted_on(&settings_now(), &old).is_ok());
+        assert_eq!(
+            synthesise(&old, secrets, "hello", || async {
+                permitted_on(&settings_now(), &old)
+            })
+            .await,
+            Err(SPEECH_CONNECTION_CHANGED.to_string())
+        );
+        // Another model at the same endpoint is the same connection.
+        let other_model = IntentSettings {
+            model: crate::model_service::ModelId::parse("gpt-5").expect("valid"),
+            ..old.clone()
+        };
+        assert!(
+            permitted_on(
+                &voice(SpeechSource::Provider, other_model, ReadingConsent::On),
+                &old
+            )
+            .is_ok()
+        );
+    }
+
+    /// Stands in for a speech request in flight: never finishes, and records
+    /// being dropped, which is what cancels a real request.
+    struct InFlight(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn in_flight(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Future<Output = Result<Vec<u8>, String>> {
+        let guard = InFlight(Arc::clone(dropped));
+        async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+
+    async fn settle<F: Future + Unpin>(future: &mut F) -> Option<F::Output> {
+        tokio::time::timeout(Duration::from_millis(50), future)
+            .await
+            .ok()
+    }
+
+    /// Scenario (PR #1617 review): a speech request is in flight when the
+    /// settings are saved with reading's opt-in turned off. The request is
+    /// dropped — cancelling it — and the command answers the not-permitted
+    /// sentence; a save that keeps the opt-in and the connection leaves an
+    /// in-flight request alone, and one that changes the connection cancels it
+    /// too.
+    #[tokio::test]
+    async fn voice_speech_a_save_revoking_consent_cancels_the_request_in_flight() {
+        let intent = openai();
+        let revocation = SpeechRevocation::default();
+
+        // Consent off while the request is pending.
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = Box::pin(unless_revoked(
+            in_flight(&dropped),
+            revocation.revoked(intent.clone()),
+        ));
+        assert_eq!(settle(&mut request).await, None, "the request is pending");
+        // A save that changes nothing that matters to it does not cancel it.
+        revocation.publish(voice(
+            SpeechSource::Auto,
+            intent.clone(),
+            ReadingConsent::On,
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            None,
+            "an unrelated save cancelled it"
+        );
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        revocation.publish(voice(
+            SpeechSource::Auto,
+            intent.clone(),
+            ReadingConsent::Off,
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            Some(Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string()))
+        );
+        drop(request);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        // The connection replaced while the request is pending.
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = Box::pin(unless_revoked(
+            in_flight(&dropped),
+            revocation.revoked(intent.clone()),
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            None,
+            "a save before it began cancelled it"
+        );
+        revocation.publish(voice(
+            SpeechSource::Auto,
+            openai_at("https://gateway.example/v1/chat/completions"),
+            ReadingConsent::On,
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            Some(Err(SPEECH_CONNECTION_CHANGED.to_string()))
+        );
+        drop(request);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -2494,6 +2494,9 @@ async fn desktop_set_settings(
         Ok(written) => {
             apply_selection(&app, &state, &written).await;
             voice_state.reading.end_unless_consented(&written);
+            voice_state
+                .speech
+                .publish(written.voice.clone().unwrap_or_default());
             return Ok(written);
         }
         Err(failure) => failure,
@@ -2518,6 +2521,9 @@ async fn desktop_set_settings(
     };
     apply_selection(&app, &state, &disk).await;
     voice_state.reading.end_unless_consented(&disk);
+    voice_state
+        .speech
+        .publish(disk.voice.clone().unwrap_or_default());
     Err(crate::dto::DesktopSettingsSaveError::Partial(
         crate::dto::DesktopPartialSettingsSave {
             message,
@@ -2843,6 +2849,9 @@ pub(crate) struct VoiceState {
     hold: voice::VoiceHold,
     /// PRD #1497 — reading mode's one session and its turn-event source.
     reading: ReadingSessions,
+    /// PRD #1497 — the saved settings, published to the provider speech
+    /// requests in flight so a save that no longer permits one cancels it.
+    speech: voice::speech::SpeechRevocation,
 }
 
 impl Default for VoiceState {
@@ -2855,6 +2864,7 @@ impl Default for VoiceState {
             // platform is not asked for anything until voice is switched on.
             hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
             reading: ReadingSessions::default(),
+            speech: voice::speech::SpeechRevocation::default(),
         }
     }
 }
@@ -3893,10 +3903,18 @@ async fn voice_settings_now() -> Result<crate::settings::VoiceSettings, String> 
 /// Refused, with nothing sent, unless reading's Settings opt-in is on and the
 /// speech source resolves to the provider ([`voice::speech::provider_permitted`],
 /// checked against the settings as they are now, and again after the keychain
-/// read, immediately before the request): the webview cannot use this to send
-/// arbitrary text to the provider outside reading mode's consent.
+/// read, immediately before the request, when they must also still name the
+/// connection the request was prepared for — [`voice::speech::permitted_on`]):
+/// the webview cannot use this to send arbitrary text to the provider outside
+/// reading mode's consent. A save while the request is in flight that turns
+/// the opt-in off or changes the connection cancels it
+/// ([`voice::speech::SpeechRevocation`]).
 #[tauri::command]
-async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Response, String> {
+async fn desktop_voice_speech_audio(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+    text: String,
+) -> Result<Response, String> {
     ensure_main_webview(&webview)?;
     // Four bytes a character at most, so this refuses nothing the character
     // bound would keep.
@@ -3905,11 +3923,18 @@ async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Re
     }
     let settings = voice_settings_now().await?;
     voice::speech::provider_permitted(&settings)?;
-    let audio = voice::speech::synthesise(
-        &settings.intent,
-        Arc::new(KeychainSecretStore::new()),
-        &text,
-        || async { voice::speech::provider_permitted(&voice_settings_now().await?) },
+    let intent = settings.intent;
+    // Before the last settings read (inside `synthesise`), so no save between
+    // that read and the request is missed.
+    let revoked = voice_state.speech.revoked(intent.clone());
+    let audio = voice::speech::unless_revoked(
+        voice::speech::synthesise(
+            &intent,
+            Arc::new(KeychainSecretStore::new()),
+            &text,
+            || async { voice::speech::permitted_on(&voice_settings_now().await?, &intent) },
+        ),
+        revoked,
     )
     .await?;
     Ok(Response::new(audio))
@@ -4229,17 +4254,20 @@ impl ReadingSessions {
 /// connection they name with its key from the keychain.
 fn settings_summariser() -> voice::reading::SettingsSummariser {
     voice::reading::SettingsSummariser::new(
-        Box::new(|| {
+        Arc::new(|| {
             crate::settings::load_settings_without_decks()
                 .voice
                 .unwrap_or_default()
         }),
-        Box::new(|intent| {
-            Box::new(voice::summary::HttpSummaryTransport::new(
-                voice::summary::protocol_for(intent),
-                Arc::new(KeychainSecretStore::new()),
-                intent.endpoint.clone(),
-            ))
+        Box::new(|intent, gate| {
+            Box::new(
+                voice::summary::HttpSummaryTransport::new(
+                    voice::summary::protocol_for(intent),
+                    Arc::new(KeychainSecretStore::new()),
+                    intent.endpoint.clone(),
+                )
+                .gated(gate),
+            )
         }),
     )
 }
@@ -7100,6 +7128,7 @@ mod tests {
                     Arc::new(voice::WakeLock::new(Arc::new(inhibitor))),
                 ),
                 reading: ReadingSessions::default(),
+                speech: voice::speech::SpeechRevocation::default(),
             },
             stopped,
             counts,
@@ -7257,6 +7286,7 @@ mod tests {
                 ))),
             ),
             reading: ReadingSessions::default(),
+            speech: voice::speech::SpeechRevocation::default(),
         };
 
         let (opened, _ticket) = voice_state
