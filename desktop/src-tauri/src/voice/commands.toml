@@ -932,10 +932,10 @@ asks_to     = "go up a directory"
 try_saying  = "go up"
 heard_as    = ["parent", "up", "back", "dot dot"]
 # "Go up" is this row in the New agent dialog and `scroll_up` on the dashboard,
-# and the two need exact complements (a parent on screen; the dialog closed),
-# so a pick of either where it cannot run goes to the other when that can and
-# the same words ask for it (#1495; `scroll-up-go-up` was red on main).
-unavailable_redirects = "scroll_up"
+# and the two need exact complements (a parent on screen; the dialog closed).
+# A pick of either where it cannot run goes to the other only for a bare "go
+# up" — words naming a folder or a scroll keep it (`outcome::go_up_elsewhere`,
+# #1495; `scroll-up-go-up` was red on main).
 
 [[commands]]
 id          = "use_this_directory"
@@ -1105,7 +1105,6 @@ report      = "Scrolling up."
 asks_to     = "scroll the dashboard up"
 try_saying  = "scroll up"
 heard_as    = ["up", "above"]
-unavailable_redirects = "go_to_parent"
 
 [[commands]]
 id          = "scroll_to_top"

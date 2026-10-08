@@ -866,6 +866,25 @@ pub async fn handle_utterance_with_dictation(
     let row = if row.callable(screen, directories, new_agent) {
         row
     } else {
+        // A bare "go up" picked as the one of its two rows that cannot run
+        // here ([`go_up_elsewhere`]).
+        if let Some(target) = go_up_elsewhere(&row.id, transcript.text())
+            .and_then(|id| table.row(id))
+            .filter(|target| {
+                target.callable(screen, directories, new_agent)
+                    && !hidden_by_flag(target, show_deck)
+                    && action_grounded(target, transcript.text(), directories, new_agent)
+            })
+        {
+            return finish(VoiceOutcome::Dispatch {
+                sentence: report(target, &[]),
+                transcript,
+                action: target.id.clone(),
+                invoke: target.invoke.clone(),
+                params: Vec::new(),
+                then_submit: false,
+            });
+        }
         // A row whose words another row answers here (`unavailable_redirects`,
         // PRD #1223 D3): "start it" with the New agent dialog closed opens the
         // dialog rather than being told to say "new agent" first, and "Start
@@ -2692,6 +2711,40 @@ fn offered(
 /// ([`resolve_param`]'s `spoken_prefix` arm). Not a vocabulary: every other
 /// introduction still works the way it always has, through the model's mark.
 const MARKED_WHOLE_INTRODUCTIONS: [&str; 4] = ["tell it to", "ask it to", "tell it", "ask it"];
+
+/// The other row a bare "go up" means, when the model picked `row` and `row`
+/// cannot run here: the New agent dialog's `go_to_parent` and the dashboard's
+/// `scroll_up` both claim "go up", and need exact complements (a parent
+/// directory on screen; the dialog closed), so a bare "go up" is whichever can
+/// run — the model picked `go_to_parent` on the dashboard every time
+/// (`scroll-up-go-up`, red on `main` after #1509). Only BARE: words that name
+/// a folder ("go up a directory") or a scroll ("scroll up a bit") ask for the
+/// row the model picked, and keep its refusal (Qodo on PR #1529, where a
+/// two-way `unavailable_redirects` grounded on "up" alone crossed them).
+fn go_up_elsewhere(row: &str, text: &str) -> Option<&'static str> {
+    const FOLDER_WORDS: [&str; 9] = [
+        "parent",
+        "directory",
+        "directories",
+        "dir",
+        "folder",
+        "folders",
+        "level",
+        "dot",
+        "cd",
+    ];
+    const SCROLL_WORDS: [&str; 6] = ["scroll", "scrolling", "page", "above", "screen", "bit"];
+    let said = words(&normalize(&spoken_text(text)));
+    let names = |list: &[&str]| list.iter().any(|word| said.contains(*word));
+    if !said.contains("up") {
+        return None;
+    }
+    match row {
+        "go_to_parent" if !names(&FOLDER_WORDS) && !names(&SCROLL_WORDS) => Some("scroll_up"),
+        "scroll_up" if !names(&SCROLL_WORDS) && !names(&FOLDER_WORDS) => Some("go_to_parent"),
+        _ => None,
+    }
+}
 
 /// Whether `text` names the Daemons screen itself rather than only asking to
 /// go back — a word `open_deck` answers to that a bare "go back" does not
@@ -4844,6 +4897,11 @@ mod tests {
             &on_the_dashboard("go back", "go_to_parent").await,
             VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
         ));
+        // Words naming a folder keep the folder row's refusal.
+        assert!(matches!(
+            &on_the_dashboard("go up a directory", "go_to_parent").await,
+            VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
+        ));
         let dialog = VoiceNewAgent { form: None };
         let browsing = listing(&["billing"], true);
         let resolver = StubResolver::new().answering("go up", IntentAnswer::new("scroll_up"));
@@ -4861,6 +4919,25 @@ mod tests {
         .outcome;
         assert!(
             matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "go_to_parent"),
+            "{outcome:?}"
+        );
+        // Words naming a scroll keep the scroll's refusal over the dialog.
+        let resolver =
+            StubResolver::new().answering("scroll up a bit", IntentAnswer::new("scroll_up"));
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&browsing),
+            Some(&dialog),
+            Transcript::new("scroll up a bit"),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Unavailable { action, .. } if action == "scroll_up"),
             "{outcome:?}"
         );
     }

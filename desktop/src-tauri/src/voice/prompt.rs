@@ -444,8 +444,14 @@ fn directory_labels(agents: &[DesktopAgent]) -> Vec<Option<String>> {
         .map(|agent| {
             let path = cwd(agent)?;
             let name = directory_name(path)?;
+            // "The same name" the way the resolver hears it — case and `-`/`_`
+            // aside — or `api` and `API` would be shown alike and tie (Qodo
+            // on PR #1529).
             let shared = agents.iter().any(|other| {
-                cwd(other).is_some_and(|other| other != path && directory_name(other) == Some(name))
+                cwd(other).is_some_and(|other| {
+                    other != path
+                        && directory_name(other).is_some_and(|other| same_spoken_name(other, name))
+                })
             });
             let raw_name = name;
             let name = shown(raw_name, FACT_CHARS)?;
@@ -1416,6 +1422,27 @@ pub(crate) mod tests {
             directories,
             [json!("work/api"), json!("oss/api"), json!("billing")]
         );
+        // `API` is the same name to a speaker as `api`, so it is told apart
+        // by its parent too, and each label reaches its own agent (Qodo on
+        // PR #1529).
+        let mut upper = dashboard_agent("4", Some("Dione"), "codex");
+        upper.cwd = Some("/home/dev/vendor/API".to_string());
+        let mut lower = dashboard_agent("5", Some("Elara"), "codex");
+        lower.cwd = Some("/home/dev/team/api".to_string());
+        let pair = vec![upper, lower];
+        let shown_pair = super::state(&request(&transcript, &commands, &pair));
+        for (index, id) in [(0, "4"), (1, "5")] {
+            let label = shown_pair["agents_on_screen"][index]["directory"]
+                .as_str()
+                .expect("a directory")
+                .to_string();
+            assert!(label.contains('/'), "{label}");
+            assert!(
+                matches!(crate::voice::outcome::resolve_agent_ref(&label, &pair),
+                    crate::voice::outcome::AgentRefMatch::One { id: found, .. } if found == id),
+                "{label}"
+            );
+        }
     }
 
     #[test]
