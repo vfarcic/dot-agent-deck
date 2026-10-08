@@ -761,6 +761,30 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		assert.equal(tracker.take(), undefined);
 	});
 
+	test("a final assistant message with nothing to read leaves no earlier reply behind", () => {
+		const commentary = assistant([{ type: "text", text: "Running the tests." }]);
+		const finals: Array<[string, ReturnType<typeof assistant>]> = [
+			["thinking only", assistant([{ type: "thinking", thinking: "done", thinkingSignature: "sig" }])],
+			["a tool call only", assistant([{ type: "toolCall", id: "c", name: "bash", arguments: {} }])],
+			["empty", assistant([])],
+			["an error with no errorMessage", assistant([], { stopReason: "error" })],
+		];
+		for (const [label, final] of finals) {
+			const tracker = createTurnReplyTracker();
+			tracker.observe("agent_start", { type: "agent_start" });
+			tracker.observe("message_end", commentary);
+			tracker.observe("message_end", toolResult);
+			tracker.observe("message_end", final);
+			assert.equal(tracker.take(), undefined, `${label}: the earlier commentary is not the reply`);
+		}
+		// A non-assistant message after the reply leaves it in place.
+		const tracker = createTurnReplyTracker();
+		tracker.observe("message_end", assistant([{ type: "text", text: "All 42 tests pass." }]));
+		tracker.observe("message_end", toolResult);
+		tracker.observe("message_end", user);
+		assert.deepEqual(tracker.take(), { text: "All 42 tests pass.", failed: false });
+	});
+
 	test("only agent_settled carries the reply, as the last flags of a declared report", () => {
 		const reply = { text: "All 42 tests pass.", failed: false };
 		const settled = piEventReport("agent_settled", { type: "agent_settled" }, "/w", reply);

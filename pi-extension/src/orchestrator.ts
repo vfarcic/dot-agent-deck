@@ -145,7 +145,13 @@ export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
  * The `agent-event` flags that carry a settled turn's final reply (PRD #1497):
  * the text of Pi's last assistant message, and whether that message ended in
  * an error. The deck reads a short summary of it aloud while reading mode is
- * on, and never shows or stores it otherwise.
+ * on.
+ *
+ * The reply travels on the argv of the short-lived `agent-event` process, so
+ * while that process runs, any local user who can list processes can read it
+ * (`/proc/<pid>/cmdline`). `pi.exec` gives an extension no way to write a
+ * child's stdin (Pi 0.84.4 through 1.1.0 spawn with stdin ignored), which is
+ * what keeps it off a private channel.
  */
 export const TURN_REPLY_FLAG = "--turn-reply";
 export const TURN_REPLY_FAILED_FLAG = "--turn-reply-failed";
@@ -415,9 +421,12 @@ export function piAssistantReply(message: unknown): TurnReply | undefined {
  * Keeps the last assistant reply of the run Pi is in, for its `agent_settled`
  * report (PRD #1497). `observe` is handed every `agent_start` and
  * `message_end` in the order Pi emits them: a run starting forgets the last
- * run's reply, and each assistant message with text replaces the one before,
- * so what `take` answers at `agent_settled` is the run's final reply. `take`
- * clears it, so a reply is reported once.
+ * run's reply, and each assistant message replaces the one before, so what
+ * `take` answers at `agent_settled` is the run's final reply. An assistant
+ * message with nothing to read (only thinking or tool calls, empty, or an
+ * error with no message) replaces it too, with nothing: the commentary an
+ * earlier message carried is not the turn's reply. `take` clears it, so a
+ * reply is reported once.
  */
 export function createTurnReplyTracker(): {
 	observe: (eventName: string, event: unknown) => void;
@@ -429,9 +438,9 @@ export function createTurnReplyTracker(): {
 			if (eventName === "agent_start") {
 				last = undefined;
 			} else if (eventName === "message_end") {
-				const reply = piAssistantReply(asRecord(event)?.message);
-				if (reply !== undefined) {
-					last = reply;
+				const message = asRecord(event)?.message;
+				if (asRecord(message)?.role === "assistant") {
+					last = piAssistantReply(message);
 				}
 			}
 		},
