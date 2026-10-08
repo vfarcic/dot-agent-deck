@@ -5038,6 +5038,9 @@ async fn desktop_upgrade_daemon(
         }
     })
     .await;
+    // A question a panicked run left waiting is closed, so a late answer is
+    // refused rather than read as accepted (Qodo 4222406400).
+    upgrades.end_upgrade(&upgrade_id);
     // A run that panicked is settled too, not returned as an error: it may
     // have installed the build or had the restart accepted, so the cleanup
     // below runs for it as well (PRD #1487, Qodo #15).

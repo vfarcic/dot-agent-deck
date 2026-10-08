@@ -2388,8 +2388,11 @@ pub enum AttachRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartSuccessor {
-    /// The daemon resolves the binary now installed at its own path, verifies
-    /// it, and spawns it once it has released its sockets.
+    /// The daemon restarts onto the binary now installed at its own path,
+    /// verified first. How the successor starts is the daemon's own policy: an
+    /// unsupervised daemon spawns it once it has released its sockets; one a
+    /// service manager supervises spawns nothing and exits for the manager to
+    /// start the installed build (`SuccessorPlan::LeaveToSupervisor`).
     #[default]
     Installed,
     /// The local Replace: the daemon applies the same policy, drains and exits,

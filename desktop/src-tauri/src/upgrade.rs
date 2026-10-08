@@ -192,6 +192,14 @@ impl UpgradeState {
         Ok(())
     }
 
+    /// Close whatever question upgrade `upgrade_id` left waiting, once its run
+    /// has returned. A run that panicked while its decider waited never ran
+    /// `forget`, and a later answer would otherwise read as accepted by an
+    /// upgrade that has ended (PRD #1487, Qodo 4222406400).
+    pub(crate) fn end_upgrade(&self, upgrade_id: &str) {
+        lock(&self.inner.pending).remove(upgrade_id);
+    }
+
     /// Drop every waiting question, so each reads as Keep current daemon. Run
     /// on app exit.
     pub(crate) fn abandon_all(&self) {
@@ -937,6 +945,34 @@ mod tests {
         assert_eq!(failed["stage"], "installing");
         assert!(failed.get("installedVersion").is_none());
         assert_eq!(failed["oldDaemonGone"], false);
+    }
+
+    /// Scenario: the upgrade's blocking task panics while its decider is
+    /// waiting on the dialog. Once the run is settled its question is gone, and
+    /// a later answer from the dialog is refused instead of reading as
+    /// accepted by an upgrade that has ended (PRD #1487, Qodo 4222406400).
+    #[test]
+    fn a_run_that_panicked_while_asking_leaves_no_question_to_answer() {
+        let state = UpgradeState::default();
+        let asking = state.clone();
+        let run = tauri::async_runtime::block_on(async move {
+            tauri::async_runtime::spawn_blocking(move || -> UpgradeOutcome {
+                let (_question, _answer) = asking.register("upgrade-1");
+                panic!("the upgrade run panicked while asking")
+            })
+            .await
+        });
+        assert!(run.is_err(), "the panic must surface as a join error");
+        assert_eq!(state.waiting(), 1, "the panic skipped the decider's forget");
+
+        state.end_upgrade("upgrade-1");
+        assert_eq!(state.waiting(), 0);
+        assert!(
+            state
+                .decide("upgrade-1", 1, DecisionChoice::RestartNow)
+                .is_err(),
+            "an answer to an ended upgrade is refused"
+        );
     }
 
     /// Scenario: the upgrade's blocking task panics, the way
