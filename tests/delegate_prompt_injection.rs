@@ -2444,9 +2444,8 @@ async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_r
 /// The production value is `SESSION_START_WAIT_TIMEOUT` (30 s), and the only
 /// knob that brings the post-release buffer within a fast-tier test's reach is
 /// the scheduler's own `DOT_AGENT_DECK_SESSION_START_WAIT_MS`. Two seconds
-/// leaves the weak fact (~0.8 s after the banner: a 750 ms settle window plus
-/// the wrapper's 50 ms poll) more than a second of room to arrive first, which
-/// is what makes the release a release ON the weak fact rather than a timeout.
+/// is advanced only after the real wrapper's weak fact has arrived. Child
+/// startup and hook delivery therefore cannot spend this virtual budget.
 #[cfg(unix)]
 const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 
@@ -2464,16 +2463,11 @@ const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 #[cfg(unix)]
 const REPRICE_FIXTURE_BUFFER_MS: u64 = 4000;
 
-/// Issue #724: the stand-in's cooked dwell for `scheduler/spawn/010`, in
-/// seconds as `sleep` spells it.
-///
-/// Sized so the strong fact lands inside the weak fact's buffer with room on
-/// both sides: the gate releases at ~`REPRICE_FIXTURE_WAIT_MS` (2 s), the strong
-/// fact arrives at ~3.55 s, and the weak buffer would end at ~6 s. So ~1.5 s of
-/// margin separates it from the release — the side where a miss makes the run
-/// vacuous, which the control checks — and ~2.5 s from the buffer's end.
+/// The stand-in stays cooked until the test has crossed the readiness wait
+/// and entered the weak fact's buffer. Only then may the real wrapper observe
+/// raw input. A file handshake replaces the old 3.5 s startup race.
 #[cfg(unix)]
-const REPRICE_FIXTURE_COOKED_DWELL: &str = "3.5";
+const REPRICE_ALLOW_RAW: &str = "reprice-allow-raw";
 
 /// The nonce-carrying banner `scheduler/spawn/010`'s stand-in paints.
 #[cfg(unix)]
@@ -2484,7 +2478,7 @@ const REPRICE_READY_BANNER: &str = "Ask Codex to do anything (reprice-5c1d)";
 #[cfg(unix)]
 const REPRICE_PROMPT: &str = "SCHEDREPRICEMARKER list the files";
 
-/// Scenario: Fire a scheduled single-agent Codex through the real spawn primitive, into a wrapped stand-in that paints its banner, stays in COOKED mode for 3.5 s and only then clears `ICANON`/`ECHO`, with the scheduler's readiness wait shortened to 2 s. The wait expires holding the wrapper's weak output-settled fact, so the gate releases on it and starts that fact's buffer; the strong raw-input fact then lands while that buffer is still running. Assert the prompt reaches the pane no sooner than a full buffer after the STRONG fact, not at the end of the buffer the weak fact started.
+/// Scenario: Fire a scheduled Codex stand-in through the real spawn primitive and wrapper, holding it in cooked mode until the wrapper's weak fact arrives and a paused clock crosses the readiness wait. Permit raw mode 300 ms into the weak buffer, then assert the prompt is absent at that buffer's original deadline and just before a full buffer from the real strong fact, and arrives after the repriced deadline.
 #[spec("scheduler/spawn/010")]
 #[test]
 #[cfg(unix)]
@@ -2504,7 +2498,7 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
     write_executable(
         &bin_dir.join("codex"),
         &format!(
-            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nsleep {REPRICE_FIXTURE_COOKED_DWELL}\nstty raw -echo\nexec cat\n"
+            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nwhile [ ! -e {REPRICE_ALLOW_RAW} ]; do sleep 0.02; done\nstty raw -echo\nexec cat\n"
         ),
     );
     // The spawn primitive gives a scheduled pane no per-spawn environment of its
@@ -2527,8 +2521,7 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     let _homes = EnvGuard::set(&values);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build re-pricing readiness runtime")
@@ -2543,6 +2536,7 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
 ) {
     let daemon = common::spawn_inprocess_daemon().await;
     let collector = EventCollector::start(&daemon.event_tx);
+    tokio::time::pause();
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
             task_name: "reprice".to_string(),
@@ -2555,16 +2549,14 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
         &daemon.registry,
         &SpawnTestNotifier,
         Some(&daemon.event_tx),
-        // Detached, so this returns once the delivery task is running and the
-        // readiness wait has (all but) begun. `returned` is the upper bound on
-        // when that wait started, which is what the release-ordering control
-        // below needs.
+        // Detached: the current-thread runtime runs the delivery task when the
+        // wall-clock poll below yields, without advancing the paused clock.
         true,
         Some(&daemon.state),
     )
     .await
     .expect("the scheduler spawn primitive must bring the wrapped Codex card up");
-    let returned = chrono::Utc::now();
+    let returned = tokio::time::Instant::now();
     let agent_id = handle.delivery_agent_id.clone();
     assert!(
         daemon.registry.agent_spawned_as_wrapper_host(&agent_id),
@@ -2572,74 +2564,78 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
          wrap`, or its strong fact is priced as an ordinary one and nothing here is re-priced"
     );
 
-    let weak = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let strong = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let wait = chrono::Duration::milliseconds(REPRICE_FIXTURE_WAIT_MS as i64);
-
-    // CONTROL 1: the weak fact arrived while the wait was still open, so the
-    // wait's expiry released the gate ON it and started its buffer. A weak fact
-    // that missed the wait would make this an unready timeout instead, which the
-    // scheduler writes with no buffer at all.
+    let has_fact = |origin: &str| {
+        collector
+            .interface_session_starts(&agent_id)
+            .iter()
+            .any(|event| {
+                event
+                    .metadata
+                    .get(SESSION_START_ORIGIN_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(origin)
+            })
+    };
+    // The real wrapper and hook socket use wall time. Keep yielding to the
+    // daemon without moving its readiness clock while they boot under load.
     assert!(
-        weak.timestamp < returned + wait,
-        "control: the weak fact was stamped {:?}, not inside the {REPRICE_FIXTURE_WAIT_MS} ms \
-         readiness wait that began by {returned:?}, so the gate did not release on it",
-        weak.timestamp
+        poll_until_after_time_advance(Duration::from_secs(30), || {
+            has_fact(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced its weak interface fact"
     );
-    // CONTROL 2, the one that keeps this from being vacuous: the strong fact
-    // came AFTER the release. Had it come inside the wait, the gate would have
-    // released on it directly and priced it from its own arrival with or
-    // without re-pricing, and the bound below would hold for the wrong reason.
-    // The wait began after `spawn` was called and, in ordinary scheduling,
-    // before it returned, so its expiry is at most `returned + wait`; the
-    // 250 ms is room for the delivery task's first poll.
+    assert_eq!(
+        tokio::time::Instant::now(),
+        returned,
+        "control: fixture startup must not spend the readiness wait"
+    );
+    advance_and_run(Duration::from_millis(REPRICE_FIXTURE_WAIT_MS) + TIMER_TICK_SLACK).await;
+    let prompt_seen = || {
+        snapshot_contains(
+            &daemon.registry.snapshot(&agent_id).unwrap_or_default(),
+            REPRICE_PROMPT.as_bytes(),
+        )
+    };
     assert!(
-        strong.timestamp > returned + wait + chrono::Duration::milliseconds(250),
-        "control: the strong fact was stamped {:?}, before the readiness wait that began by \
-         {returned:?} could have expired, so the gate released on it directly and this run \
-         says nothing about a buffer already in flight",
-        strong.timestamp
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "control: the prompt was written at release, so no weak buffer was in flight"
     );
-
-    let snapshot = wait_for_snapshot_needle(
-        &daemon.registry,
-        &agent_id,
-        REPRICE_PROMPT.as_bytes(),
-        HELD_POINTER_DELIVERY_CEILING,
+    assert!(
+        !has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
+        "control: the strong fact must not release the readiness wait directly"
+    );
+    let strong_at = Duration::from_millis(300);
+    advance_and_run(strong_at).await;
+    std::fs::write(cwd.path().join(REPRICE_ALLOW_RAW), "ready").unwrap();
+    assert!(
+        poll_until_after_time_advance(Duration::from_secs(10), || {
+            has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced raw input after permission"
+    );
+    // Cross the old weak-buffer deadline, leaving nearly 300 ms of the strong
+    // buffer unpaid. A scheduler that omits repricing writes here.
+    advance_and_run(
+        Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS) - strong_at + TIMER_TICK_SLACK * 10,
     )
     .await;
-    // Measured from the wrapper's own stamp on the strong event, which is at or
-    // before the daemon acted on it, so latency only pushes this UP — the same
-    // one-sided shape `orchestration/delegate/026` uses.
-    let held_from_strong = (chrono::Utc::now() - strong.timestamp)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
     assert!(
-        snapshot_contains(&snapshot, REPRICE_PROMPT.as_bytes()),
-        "the scheduled prompt never reached the pane within {HELD_POINTER_DELIVERY_CEILING:?} \
-         of the strong interface fact; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        !poll_until_after_time_advance(Duration::from_millis(500), prompt_seen).await,
+        "the scheduled prompt was written at the weak buffer's deadline instead of repricing \
+         from the real strong interface fact"
     );
+    advance_and_run(strong_at - TIMER_TICK_SLACK * 10 - Duration::from_millis(10)).await;
     assert!(
-        held_from_strong >= Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS),
-        "the scheduled prompt landed {held_from_strong:?} after the wrapper's STRONG interface \
-         fact, short of the {REPRICE_FIXTURE_BUFFER_MS} ms buffer that fact is priced at. The \
-         gate had already released on the weak output-settled fact, and the buffer that fact \
-         started ran to its end although the strong fact landed inside it: a full-screen TUI \
-         that has just taken raw mode is still initialising and eats input, so the prompt was \
-         written into it on the weak fact's schedule (issue #724)"
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "the scheduled prompt was written before the full strong interface buffer elapsed"
+    );
+    advance_and_run(Duration::from_millis(10) + TIMER_TICK_SLACK).await;
+    assert!(
+        poll_until_after_time_advance(HELD_POINTER_DELIVERY_CEILING, prompt_seen).await,
+        "the scheduled prompt never reached the pane after the repriced deadline; snapshot = {:?}",
+        String::from_utf8_lossy(&daemon.registry.snapshot(&agent_id).unwrap_or_default())
     );
     daemon.registry.shutdown_all();
 }
