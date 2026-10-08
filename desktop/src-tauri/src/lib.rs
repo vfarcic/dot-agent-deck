@@ -32,6 +32,9 @@ mod secrets;
 mod selection_capture;
 mod settings;
 mod terminal;
+// PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
+// crate's shared upgrade procedure.
+mod upgrade;
 // Tests only: binding the production attach server's listener without the
 // process-umask flip (issue #1078).
 #[cfg(all(test, unix))]
@@ -4422,8 +4425,8 @@ async fn desktop_voice_commands(
 ///
 /// 4. **Every terminal session is detached.** A session streams from ONE
 ///    daemon's PTY; after a selection change every one of them is showing the
-///    deck the user has left. The same pairing `StopDaemon` and `RestartDaemon`
-///    already make, and for the same reason: a tile left attached to a deck that
+///    deck the user has left. The same pairing `StopDaemon` and a restarting
+///    `desktop_upgrade_daemon` already make, and for the same reason: a tile left attached to a deck that
 ///    is no longer selected is a tile whose keystrokes go to another machine's
 ///    agent.
 /// 5. **The watcher is told** (M9). Its event subscription is a connection to
@@ -5389,6 +5392,190 @@ fn apply_zoom(webview: &Webview, level: settings::ZoomLevel) {
     }
 }
 
+/// PRD #1487 M5: upgrade the daemon of the deck `deck_id` names — the
+/// dashboard card's and the Daemons screen's **Upgrade** on a remote deck, and
+/// **Replace daemon** on the local one.
+///
+/// Both run the root crate's one procedure,
+/// [`dot_agent_deck::daemon_upgrade::upgrade_daemon`]; what differs is only
+/// what it runs with. A remote deck installs the app's version over SSH and
+/// restarts onto it through the freshly installed binary; the local deck
+/// installs nothing, and the app starts its own bundled build once the old
+/// daemon has gone (D10). The live-agent question is the daemon's and is
+/// asked through `desktop://upgrade-decision`, answered by
+/// [`desktop_upgrade_decide`].
+///
+/// Resolves with the outcome — including "installed, not restarted" and
+/// "failed while …", which are answers rather than errors. Rejects only when
+/// the upgrade could not start: a deck this app is not observing, a remote
+/// deck missing from the deck list, or a second press while one is running.
+///
+/// `attempt_id` is the webview's own id for this call, chosen before it is
+/// made: every event the run emits carries it, so the caller's listeners hear
+/// this run and no other — a second call refused here never hears the first
+/// run's question (PRD #1487, Qodo 4208054166).
+#[tauri::command]
+async fn desktop_upgrade_daemon(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    upgrades: State<'_, upgrade::UpgradeState>,
+    deck_id: String,
+    attempt_id: String,
+) -> Result<upgrade::UpgradeOutcomeDto, String> {
+    use dot_agent_deck::daemon_upgrade::UpgradeOutcome;
+    use dot_agent_deck::daemon_upgrade::{
+        NoInstall, SshInstaller, UpgradePlan, WireDaemonPort, upgrade_daemon, upgrade_ssh_executor,
+    };
+    use dot_agent_deck::remote_daemon::SshDaemonPort;
+
+    ensure_main_webview(&webview)?;
+    let attempt_id = upgrade::validate_attempt_id(&attempt_id)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let endpoint = scope.endpoint().clone();
+    let _in_flight = upgrades.begin(&deck_id)?;
+    let upgrade_id = upgrades.next_upgrade_id();
+
+    let target = if endpoint.as_local().is_some() {
+        upgrade::UpgradeTarget::Local
+    } else {
+        let lookup = endpoint.clone();
+        let path = crate::decks::remotes_path();
+        let entry =
+            tauri::async_runtime::spawn_blocking(move || upgrade::remote_entry_for(&lookup, &path))
+                .await
+                .map_err(|error| safe_message(error.to_string()))??;
+        upgrade::UpgradeTarget::Remote(Box::new(entry))
+    };
+
+    let handle = tokio::runtime::Handle::current();
+    let decider_state = upgrades.inner().clone();
+    let progress_app = app.clone();
+    let decision_app = app.clone();
+    let deck_for_run = deck_id.clone();
+    let id_for_run = upgrade_id.clone();
+    let endpoint_for_run = endpoint.clone();
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        let plan = UpgradePlan {
+            version: upgrade::plan_version(),
+            successor: target.successor(),
+        };
+        let deck_name = target.deck_name();
+        let decider = upgrade::DesktopDecider::new(
+            decider_state,
+            deck_for_run.clone(),
+            attempt_id.clone(),
+            id_for_run.clone(),
+            Box::new(move |event: &upgrade::UpgradeDecisionEvent| {
+                let _ = decision_app.emit(upgrade::DECISION_EVENT, event);
+            }),
+        );
+        let mut progress = |progress| {
+            let _ = progress_app.emit(
+                upgrade::PROGRESS_EVENT,
+                upgrade::UpgradeProgressEvent {
+                    deck_id: deck_for_run.clone(),
+                    attempt_id: attempt_id.clone(),
+                    upgrade_id: id_for_run.clone(),
+                    progress,
+                },
+            );
+        };
+        match target {
+            upgrade::UpgradeTarget::Remote(entry) => {
+                // What the installer prints along the way is for a terminal;
+                // the dialog shows the stages and the outcome instead.
+                // The row read once above, for the install as for the port,
+                // so both reach the same machine (Greptile 4208066970).
+                let installer = SshInstaller::for_entry(
+                    &entry,
+                    crate::decks::remotes_path(),
+                    Box::new(std::io::sink()),
+                );
+                let port = SshDaemonPort::for_entry(upgrade_ssh_executor(), &entry);
+                upgrade_daemon(
+                    &deck_name,
+                    &plan,
+                    &installer,
+                    &port,
+                    &decider,
+                    &mut progress,
+                )
+            }
+            upgrade::UpgradeTarget::Local => {
+                let port = match WireDaemonPort::new(
+                    &endpoint_for_run,
+                    handle,
+                    Box::new(crate::daemon_bridge::spawn_local_daemon),
+                ) {
+                    Ok(port) => port,
+                    Err(reason) => {
+                        return UpgradeOutcome::Failed {
+                            stage: dot_agent_deck::daemon_upgrade::UpgradeStage::Restarting,
+                            reason,
+                            installed_version: None,
+                            old_daemon_gone: false,
+                        };
+                    }
+                };
+                upgrade_daemon(
+                    &deck_name,
+                    &plan,
+                    &NoInstall,
+                    &port,
+                    &decider,
+                    &mut progress,
+                )
+            }
+        }
+    })
+    .await;
+    // A question a panicked run left waiting is closed, so a late answer is
+    // refused rather than read as accepted (Qodo 4222406400).
+    upgrades.end_upgrade(&upgrade_id);
+    // A run that panicked is settled too, not returned as an error: it may
+    // have installed the build or had the restart accepted, so the cleanup
+    // below runs for it as well (PRD #1487, Qodo #15).
+    let settled = upgrade::settle_run(run);
+
+    // Whatever happened, the handshake held for this deck may describe a
+    // daemon that is gone or replaced: drop it, and let the deck's watcher
+    // and the snapshot below re-establish against whatever answers now.
+    state.daemon.invalidate(&endpoint).await;
+    if settled.ends_deck_sessions {
+        // The old daemon's terminals ended with it — restarted, or accepted
+        // and not verified, or gone after a lost reply, or a run that stopped
+        // unexpectedly. This deck's only — the other decks were not touched.
+        // A daemon still answering as itself keeps them.
+        terminal::detach_deck(&state, &endpoint).await;
+    }
+    state.request_refetch(&endpoint.identity());
+    ensure_snapshot_watchers(&app, &state);
+    if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+        emit_snapshot(&app, &snapshot);
+    }
+    Ok(settled.outcome)
+}
+
+/// PRD #1487 M5: the decision dialog's answer to the restart question an
+/// upgrade is waiting on — `"restart-now"` or `"keep-current"`. Closing the
+/// dialog sends `"keep-current"`; an id with no question waiting is refused,
+/// and so is an answer to a question that has since been asked again
+/// (`question_id` is the one the decision event carried — Greptile
+/// 4208066960).
+#[tauri::command]
+fn desktop_upgrade_decide(
+    webview: Webview,
+    upgrades: State<'_, upgrade::UpgradeState>,
+    upgrade_id: String,
+    question_id: u64,
+    choice: String,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    let choice = upgrade::DecisionChoice::parse(&choice)?;
+    upgrades.decide(&upgrade_id, question_id, choice)
+}
+
 #[tauri::command]
 async fn desktop_run_action(
     app: AppHandle,
@@ -5565,44 +5752,6 @@ async fn desktop_run_action(
                 StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
                 StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
                 StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
-            });
-        }
-        DesktopAction::RestartDaemon => {
-            // Replace daemon is Stop plus a lazy-spawn of the desktop's own
-            // bundled build. Both halves are local acts, and on a remote deck
-            // the pair would be worse than either: terminate the ssh tunnel,
-            // then start a LOCAL daemon and report success. Refused by type.
-            let endpoint = selected_endpoint();
-            let local = endpoint
-                .require_local("Replace daemon")
-                .map_err(|error| safe_message(error.to_string()))?;
-            run_daemon_stop(local, false)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // Same as Stop: the held handshake describes the daemon just
-            // terminated, and the `bootstrap` below is about to start a
-            // different one at the same address.
-            state.daemon.invalidate(&endpoint).await;
-            // This deck's sessions only, for the same reason Stop's are.
-            terminal::detach_deck(&state, &endpoint).await;
-            let snapshot = bootstrap(
-                &BootstrapOptions {
-                    start_if_missing: true,
-                },
-                &state.daemon,
-            )
-            .await;
-            emit_snapshot(&app, &snapshot);
-            ensure_snapshot_watchers(&app, &state);
-            ensure_explicit_start_connected(true, &snapshot)?;
-            return Ok(DesktopActionResult {
-                ok: true,
-                agent_id: None,
-                agent_ids: Vec::new(),
-                send_result: None,
-                terminal: None,
-                message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
-                snapshot,
             });
         }
         DesktopAction::AllowBuildMismatch { deck_id } => {
@@ -5829,6 +5978,8 @@ pub fn run() {
         .manage(DesktopState::default())
         // PRD #802 M7: the capture session. Opens no device until a `start`.
         .manage(VoiceState::default())
+        // PRD #1487 M5: the running upgrades and the restart questions they wait on.
+        .manage(upgrade::UpgradeState::default())
         // Issue #845: the stored Light/Dark choice reaches the document root
         // before the webview parses the document, so the first painted frame is
         // already the one the user chose. Registered before `build()`, which is
@@ -5969,6 +6120,8 @@ pub fn run() {
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
+            desktop_upgrade_daemon,
+            desktop_upgrade_decide,
             desktop_secret_status,
             desktop_store_secret,
             desktop_forget_secret,
@@ -5994,6 +6147,9 @@ pub fn run() {
         ) {
             let state = app_handle.state::<DesktopState>();
             let voice_state = app_handle.state::<VoiceState>();
+            // PRD #1487 M5: a restart question still open is answered Keep
+            // current daemon — nothing is stopped by the app going away.
+            app_handle.state::<upgrade::UpgradeState>().abandon_all();
             tauri::async_runtime::block_on(release_on_exit(&state, &voice_state));
         }
     });

@@ -73,6 +73,19 @@ use crate::platform::peercred::peer_pid;
 /// 3-second SIGTERM grace on its agents, so 5 s is comfortable headroom.
 pub const TERMINATE_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #1487: set to `1` by `connect` on the remote TUI's environment when the
+/// user, upgrading from the laptop, chose to keep the remote's running daemon
+/// (or no one could be asked). [`ensure_compatible_daemon_or_die`] then takes
+/// the decline branch without asking a second time — attach unchanged, or the
+/// protocol refusal across a protocol skew. Only sent after a successful
+/// install, so the binary reading it always knows it.
+pub const KEEP_DAEMON_ENV: &str = "DOT_AGENT_DECK_KEEP_DAEMON";
+
+/// Whether a [`KEEP_DAEMON_ENV`] value asks to keep the daemon: exactly `1`.
+fn keep_daemon_requested(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 /// Outcome of [`ensure_compatible_daemon_or_die`] when the call resolves
 /// successfully. Callers proceed to attach in either case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +328,22 @@ pub async fn ensure_compatible_daemon_or_die(
             local: PROTOCOL_VERSION,
         }
     };
+
+    // PRD #1487: the user already answered this question on the laptop —
+    // "keep the current daemon" — while upgrading through `connect`. Take the
+    // decline branch without asking again: attach to the daemon unchanged, or
+    // refuse across a protocol skew exactly as declining would.
+    if keep_daemon_requested(std::env::var(KEEP_DAEMON_ENV).ok().as_deref()) {
+        tracing::debug!(
+            target: "build_version_handshake",
+            live_agents = agents.len(),
+            "local daemon build_version handshake: mismatch, kept by the user's earlier choice"
+        );
+        return match protocol {
+            ProtocolCheck::Compatible => Ok(HandshakeOutcome::ProceedOnExisting),
+            ProtocolCheck::Skewed { daemon } => Err(refuse_protocol(daemon)),
+        };
+    }
 
     // (c) Agents present + non-TTY: the restart is mandatory but can't get
     // consent on a pipe, so print the daemon-recovery hint to stderr and
@@ -1016,6 +1045,16 @@ fn interactive_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1487: only an explicit `1` keeps the daemon; anything else (unset,
+    /// empty, `0`, `true`) leaves the ordinary mismatch handling in charge.
+    #[test]
+    fn keep_daemon_is_requested_only_by_an_explicit_one() {
+        assert!(keep_daemon_requested(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(!keep_daemon_requested(value), "{value:?}");
+        }
+    }
 
     /// PRD #163 M3 — the protocol-delivered graceful stop is best-effort: asked
     /// against an endpoint no daemon is listening on it must return normally

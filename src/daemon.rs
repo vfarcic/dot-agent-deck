@@ -78,10 +78,30 @@ const EXIT_FORCED_BY_SECOND_SIGNAL: i32 = 143;
 /// the orchestration roles at stake before the drain empties both. The full
 /// argument, including the two shapes that were rejected, is in
 /// `docs/develop/daemon-teardown-paths.md`.
+///
+/// PRD #1487: `restart` is told first, so a stop wins over a restart under way
+/// or already accepted — no successor starts after a signal asked the daemon
+/// to stop. The watch lives until `run_daemon_with` has decided its successor
+/// plan and finished acting on it (audit A2), so a signal is never lost in
+/// that window:
+///
+/// - before the plan is decided, it is a stop like any other: the plan is
+///   then [`crate::daemon_restart::SuccessorPlan::Nothing`] and the stop is
+///   disclosed;
+/// - after the daemon committed to a restart, it is logged and not acted on —
+///   the daemon is already exiting into its successor, and a stop cannot be
+///   taken instead;
+/// - either way a second signal force-exits at once, so a wedged teardown or
+///   successor start can still be ended with `pkill`.
+///
+/// `registry` is weak so the watch never keeps the registry alive past the
+/// `drop` in `run_daemon_with` that tears it down; a signal after that has no
+/// agents left to name or drain.
 fn spawn_termination_signal_watch(
     shutdown: Arc<Notify>,
-    registry: Arc<AgentPtyRegistry>,
+    registry: std::sync::Weak<AgentPtyRegistry>,
     state: SharedState,
+    restart: Arc<crate::daemon_restart::RestartControl>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
@@ -108,39 +128,20 @@ fn spawn_termination_signal_watch(
                 _ = sigterm.recv() => "SIGTERM",
                 _ = sigint.recv() => "SIGINT",
             };
-            warn!(
-                signal = sig,
-                "daemon received termination signal; initiating graceful shutdown \
-                 (every managed agent will be stopped)"
-            );
-            // Issue #1109: say WHICH, before the drain below empties the
-            // registry this reads. Ordered ahead of the drain for that reason
-            // and not merely for tidiness — `agent_records` filters to live
-            // agents, so the same call after `shutdown_all_graceful` reports an
-            // empty deck no matter what was running.
-            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
-
-            // Drain managed agents with the SAME grace the `KIND_SHUTDOWN`
-            // handler gives them, BEFORE releasing the hook loop. Notifying
-            // `shutdown` alone is not enough: the loop returns, `run_daemon_with`
-            // drops the registry, and `Drop` calls `shutdown_all` — the
-            // SIGKILL-WITHOUT-grace path, which `shutdown_all_graceful`'s own docs
-            // scope to "idle shutdown and test cleanup". Idle shutdown only fires
-            // with no agents left, so force-killing there costs nothing; a signal
-            // is a DELIBERATE stop that routinely lands on live agents, so it
-            // belongs on the graceful path. (Greptile P1 on the first draft, which
-            // notified and returned — agents lost the grace this change promised.)
-            //
-            // `spawn_blocking` mirrors `daemon_protocol`'s KIND_SHUTDOWN arm: the
-            // drain blocks while it polls for each child to exit. Idempotent via
-            // the registry's `shutting_down` latch, whose docs already anticipate
-            // "a SIGTERM landing during shutdown".
-            let draining = registry.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
-            })
-            .await;
-            shutdown.notify_one();
+            if restart.stop_wins("signal") {
+                warn!(
+                    signal = sig,
+                    "daemon received termination signal; initiating graceful shutdown \
+                     (every managed agent will be stopped)"
+                );
+                stop_for_signal(&shutdown, &registry, &state).await;
+            } else {
+                warn!(
+                    signal = sig,
+                    "termination signal after this daemon committed to its restart; it keeps \
+                     exiting into its successor — a second signal exits at once"
+                );
+            }
 
             // Escape hatch, and the reason this task keeps waiting instead of
             // returning here. Installing a handler REPLACES the default
@@ -152,9 +153,9 @@ fn spawn_termination_signal_watch(
             // sends SIGTERM by default and is the escape hatch the in-repo audit
             // notes call the only way to stop a daemon. A second signal
             // therefore force-exits, preserving that. A second signal arriving
-            // DURING the drain above is buffered by tokio's signal stream and
-            // handled as soon as the drain returns, so the hatch is delayed by at
-            // most `AGENT_TERMINATE_GRACE`, never lost.
+            // DURING the drain is buffered by tokio's signal stream and handled
+            // as soon as the drain returns, so the hatch is delayed by at most
+            // `AGENT_TERMINATE_GRACE`, never lost.
             let again = tokio::select! {
                 _ = sigterm.recv() => "SIGTERM",
                 _ = sigint.recv() => "SIGINT",
@@ -174,21 +175,21 @@ fn spawn_termination_signal_watch(
                 warn!(error = %e, "could not await Ctrl-C; termination will not be logged");
                 return;
             }
-            warn!(
-                signal = "CTRL_C",
-                "daemon received termination signal; initiating graceful shutdown \
-                 (every managed agent will be stopped)"
-            );
-            // Issue #1109: same disclosure, same position, as the Unix arm
-            // above; see its comment for why it precedes the drain.
-            crate::daemon_stop::log_teardown_inventory(&state, &registry, "signal").await;
-            // Same graceful drain as the Unix arm above; see its comment.
-            let draining = registry.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                draining.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
-            })
-            .await;
-            shutdown.notify_one();
+            // Same decision as the Unix arm above; see its comment.
+            if restart.stop_wins("signal") {
+                warn!(
+                    signal = "CTRL_C",
+                    "daemon received termination signal; initiating graceful shutdown \
+                     (every managed agent will be stopped)"
+                );
+                stop_for_signal(&shutdown, &registry, &state).await;
+            } else {
+                warn!(
+                    signal = "CTRL_C",
+                    "termination signal after this daemon committed to its restart; it keeps \
+                     exiting into its successor — a second signal exits at once"
+                );
+            }
 
             // Same second-signal escape hatch as the Unix arm above.
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -200,6 +201,66 @@ fn spawn_termination_signal_watch(
                 std::process::exit(EXIT_FORCED_BY_SECOND_SIGNAL);
             }
         }))
+    }
+}
+
+/// What a termination signal that won does: disclose, drain, release the hook
+/// loop. Shared by both platforms' arms of [`spawn_termination_signal_watch`].
+async fn stop_for_signal(
+    shutdown: &Notify,
+    registry: &std::sync::Weak<AgentPtyRegistry>,
+    state: &SharedState,
+) {
+    // The registry is gone once `run_daemon_with` dropped it, and its `Drop`
+    // already stopped every agent; there is nothing left to name or drain.
+    if let Some(registry) = registry.upgrade() {
+        // Issue #1109: say WHICH, before the drain below empties the registry
+        // this reads. Ordered ahead of the drain for that reason and not merely
+        // for tidiness — `agent_records` filters to live agents, so the same
+        // call after `shutdown_all_graceful` reports an empty deck no matter
+        // what was running.
+        crate::daemon_stop::log_teardown_inventory(state, &registry, "signal").await;
+
+        // Drain managed agents with the SAME grace the `KIND_SHUTDOWN` handler
+        // gives them, BEFORE releasing the hook loop. Notifying `shutdown`
+        // alone is not enough: the loop returns, `run_daemon_with` drops the
+        // registry, and `Drop` calls `shutdown_all` — the SIGKILL-WITHOUT-grace
+        // path, which `shutdown_all_graceful`'s own docs scope to "idle shutdown
+        // and test cleanup". Idle shutdown only fires with no agents left, so
+        // force-killing there costs nothing; a signal is a DELIBERATE stop that
+        // routinely lands on live agents, so it belongs on the graceful path.
+        // (Greptile P1 on the first draft, which notified and returned — agents
+        // lost the grace this change promised.)
+        //
+        // `spawn_blocking` mirrors `daemon_protocol`'s KIND_SHUTDOWN arm: the
+        // drain blocks while it polls for each child to exit. Idempotent via
+        // the registry's `shutting_down` latch, whose docs already anticipate
+        // "a SIGTERM landing during shutdown".
+        let _ = tokio::task::spawn_blocking(move || {
+            registry.shutdown_all_graceful(crate::agent_pty::AGENT_TERMINATE_GRACE);
+        })
+        .await;
+    }
+    shutdown.notify_one();
+}
+
+/// PRD #1487 e2e seam (audit A2): hold the daemon between releasing its
+/// sockets and deciding its successor plan, so a process-level test can deliver
+/// a signal inside that window, which no outside timing reaches reliably.
+/// `DOT_AGENT_DECK_E2E_SUCCESSOR_PLAN_GATE` names a directory: the daemon
+/// creates `entered` in it, then waits — at most a minute — for `release`.
+/// Compiled only into the `e2e` build, like the subscriber seams in `main.rs`,
+/// so a shipped binary has no switch that holds its exit.
+#[cfg(feature = "e2e")]
+async fn e2e_successor_plan_gate() {
+    let Some(dir) = std::env::var_os("DOT_AGENT_DECK_E2E_SUCCESSOR_PLAN_GATE") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let _ = std::fs::write(dir.join("entered"), b"");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !dir.join("release").exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -416,6 +477,14 @@ pub struct Daemon {
     /// endpoint. Ignored when [`Self::attach_socket_path`] is `None` — a daemon
     /// that serves no attach protocol has nothing to alias.
     pub legacy_attach_socket_path: Option<PathBuf>,
+    /// PRD #1487: this daemon's restart state — what it recorded about its own
+    /// binary, the lock that serialises `restart-daemon` requests, and the
+    /// accepted successor [`run_daemon_with`] spawns once the sockets are
+    /// released. Every constructor records no install
+    /// ([`crate::daemon_restart::InstallRecord::unresolved`]), so an in-process
+    /// or test daemon never spawns its own harness; `daemon serve` sets the real
+    /// one through [`Self::with_restart_control`].
+    pub restart_control: Arc<crate::daemon_restart::RestartControl>,
 }
 
 impl Daemon {
@@ -440,6 +509,7 @@ impl Daemon {
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
             legacy_socket_path: None,
             legacy_attach_socket_path: None,
+            restart_control: Arc::default(),
         }
     }
 
@@ -467,6 +537,7 @@ impl Daemon {
             worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
             legacy_socket_path: None,
             legacy_attach_socket_path: None,
+            restart_control: Arc::default(),
         }
     }
 
@@ -500,6 +571,17 @@ impl Daemon {
     pub fn with_legacy_aliases(mut self, hook: Option<PathBuf>, attach: Option<PathBuf>) -> Self {
         self.legacy_socket_path = hook;
         self.legacy_attach_socket_path = attach;
+        self
+    }
+
+    /// PRD #1487: use this restart control — `daemon serve` passes one built
+    /// from [`crate::daemon_restart::InstallRecord::capture`]; a test passes one
+    /// whose record points at a script of its own.
+    pub fn with_restart_control(
+        mut self,
+        control: Arc<crate::daemon_restart::RestartControl>,
+    ) -> Self {
+        self.restart_control = control;
         self
     }
 }
@@ -778,6 +860,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
+    let restart_control = daemon.restart_control;
     // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
     // this event names?" against the registry rather than against a set it
     // would have to maintain by hand — see `crate::state::AgentOwnership`.
@@ -862,8 +945,12 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Production termination watch: route SIGTERM/SIGINT through the same
     // `shutdown` notify. Armed unconditionally — unlike the two backstops
     // below, this is not test-only: `daemon stop` IS a SIGTERM.
-    let signal_handle =
-        spawn_termination_signal_watch(shutdown.clone(), pty_registry.clone(), state.clone());
+    let signal_handle = spawn_termination_signal_watch(
+        shutdown.clone(),
+        Arc::downgrade(&pty_registry),
+        state.clone(),
+        restart_control.clone(),
+    );
 
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
@@ -955,8 +1042,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
+        let attach_restart = restart_control.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_restart(
                 listener,
                 registry,
                 attach_event_tx,
@@ -966,6 +1054,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_scheduler,
                 attach_reuse,
                 attach_worktrees,
+                attach_restart,
             )
             .await
             {
@@ -1018,8 +1107,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
         let attach_worktrees = worktree_registry.clone();
+        let attach_restart = restart_control.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
+            if let Err(e) = crate::daemon_protocol::serve_attach_with_restart(
                 listener,
                 registry,
                 attach_event_tx,
@@ -1029,6 +1119,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 attach_scheduler,
                 attach_reuse,
                 attach_worktrees,
+                attach_restart,
             )
             .await
             {
@@ -1122,9 +1213,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = max_lifetime_handle {
         h.abort();
     }
-    if let Some(h) = signal_handle {
-        h.abort();
-    }
+    // The signal watch is NOT aborted here (PRD #1487 audit A2): a signal
+    // between now and the end of the successor work must still claim its stop
+    // before the plan is decided, and a second one must still force-exit. It is
+    // aborted once that work is done, below.
     // Issue #424 (reviewer finding B9): a spawn-time prompt's confirmation loop
     // must not outlive the daemon that owns the PTY it re-submits into. The loop
     // also ends on its own when the broadcast sender drops (`PromptWatch::Closed`),
@@ -1132,6 +1224,92 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // the deterministic half.
     crate::spawn::cancel_all_prompt_confirmations();
     drop(pty_registry);
+
+    // PRD #1487: an accepted `restart-daemon` in `Installed` mode left its
+    // verified target here. Spawn it only now — the hook loop has returned,
+    // the attach servers are aborted and the aliases unlinked — because the
+    // successor's bind refuses while this daemon's socket is alive. It inherits
+    // this process's environment, so it binds the same endpoint. If the spawn
+    // fails no daemon is left running: the agents were stopped by consent, and
+    // the next client lazy-spawns from its own binary.
+    //
+    // Under a service manager the successor is not ours to start: systemd
+    // would kill it with this unit's cgroup. `daemon serve` reads
+    // `handed_to_supervisor` and exits non-zero instead, so the manager runs
+    // the unit's own command — the installed build — again.
+    // A `StopDaemon` still writing its acknowledgement holds a pending stop
+    // claim; wait for it so a stop that is about to be withdrawn does not
+    // cancel the restart, bounded so a stalled peer cannot hold the exit. The
+    // plan reads the claims as they are when it is decided: one still pending
+    // counts as a stop, one withdrawn by then does not.
+    #[cfg(feature = "e2e")]
+    e2e_successor_plan_gate().await;
+    restart_control
+        .settle_stop_claims(crate::daemon_restart::STOP_CLAIM_SETTLE)
+        .await;
+    match restart_control.take_successor_plan() {
+        crate::daemon_restart::SuccessorPlan::Nothing => {}
+        crate::daemon_restart::SuccessorPlan::Spawn(target) => {
+            // Audit A5: the drain took a while, and an installer may have
+            // replaced the file since it was verified. Spawn it only if it is
+            // still the verified file, or it verifies again as the same
+            // version; otherwise start nothing — the client's Verifying stage
+            // reports that no new daemon answered, and the next client
+            // lazy-spawns its own.
+            //
+            // Taking the plan committed the restart, so a stop handled from
+            // here on changes nothing (`RestartControl::take_successor_plan`).
+            // The re-check can run `--version` for up to its timeout and the
+            // spawn forks, so both run on a blocking worker, not the executor
+            // (Qodo 4201540974).
+            let control = restart_control.clone();
+            let spawning = target.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let check = control.recheck_successor(&spawning)?;
+                let spawned = crate::daemon_attach::spawn_restart_successor(
+                    &crate::config::state_dir(),
+                    &spawning,
+                );
+                Ok::<_, String>((check, spawned))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the successor spawn task failed ({e})")));
+            match outcome {
+                Err(reason) => error!(
+                    target = %target.display(),
+                    %reason,
+                    "not spawning the successor daemon; none is running until a client starts one"
+                ),
+                Ok((check, spawned)) => {
+                    if let crate::daemon_restart::SuccessorCheck::Reverified(version) = &check {
+                        warn!(
+                            target = %target.display(),
+                            %version,
+                            "the installed build changed after it was verified; it verified again"
+                        );
+                    }
+                    match spawned {
+                        Ok(pid) => {
+                            info!(pid, target = %target.display(), "successor daemon spawned")
+                        }
+                        Err(e) => error!(
+                            target = %target.display(),
+                            error = %e,
+                            "could not spawn the successor daemon; none is running until a client starts one"
+                        ),
+                    }
+                }
+            }
+        }
+        crate::daemon_restart::SuccessorPlan::LeaveToSupervisor(supervisor) => info!(
+            ?supervisor,
+            exit_status = crate::daemon_restart::SUPERVISED_RESTART_EXIT,
+            "restart accepted under a service manager; exiting for it to start the installed build"
+        ),
+    }
+    if let Some(h) = signal_handle {
+        h.abort();
+    }
 
     result
 }
@@ -1327,20 +1505,45 @@ fn make_schedule_callback(
                 }
             }
             let debounce = crate::spawn::reuse_debounce();
-            if let Err(e) = crate::spawn::spawn_or_reuse(
-                req,
-                new_tab_per_fire,
-                &registry,
-                &reuse,
-                &notifier,
-                debounce,
-                Some(&event_tx),
-                Some(&state),
-            )
-            .await
-            {
-                // Already surfaced via the notifier; log for the operator.
-                warn!(error = %e, "scheduled spawn failed");
+            loop {
+                match crate::spawn::spawn_or_reuse(
+                    req.clone(),
+                    new_tab_per_fire,
+                    &registry,
+                    &reuse,
+                    &notifier,
+                    debounce,
+                    Some(&event_tx),
+                    Some(&state),
+                )
+                .await
+                {
+                    Ok(()) => break,
+                    // PRD #1487 re-check, reviewer R3: refused because a restart
+                    // holds the admission freeze. Not a failure of this task, so
+                    // it is not reported as one: retried if the restart is called
+                    // off, and left to the successor daemon's next fire if it
+                    // goes ahead.
+                    Err(crate::spawn::SpawnError::DaemonRestarting) => {
+                        info!(
+                            task = %req.task_name,
+                            "scheduled fire deferred: the daemon is restarting"
+                        );
+                        if !registry.wait_for_admission().await {
+                            info!(
+                                task = %req.task_name,
+                                "the daemon is going down; this fire is left to its successor"
+                            );
+                            break;
+                        }
+                        info!(task = %req.task_name, "restart called off; firing again");
+                    }
+                    Err(e) => {
+                        // Already surfaced via the notifier; log for the operator.
+                        warn!(error = %e, "scheduled spawn failed");
+                        break;
+                    }
+                }
             }
         })
     })

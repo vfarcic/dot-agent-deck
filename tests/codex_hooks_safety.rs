@@ -482,16 +482,15 @@ fn codex_hooks_install_007_a_mixed_rule_keeps_the_users_sibling_handler() {
     );
 }
 
-/// Scenario: Reinstall Codex hooks over a deck-owned rule pinned at a second, still-valid deck install, and separately over one whose binary is positively gone. The valid foreign pin must be left in place with the fresh rule added beside it; the dead one must be repaired away, leaving a single deck rule.
+/// Scenario: Reinstall Codex hooks over a second valid deck installation, and separately over a missing installation. Both are replaced in place with exactly one command for the installing deck.
 #[test]
-fn codex_hooks_install_008_a_valid_foreign_pin_survives_and_a_dead_one_is_repaired() {
+fn codex_hooks_install_008_valid_and_dead_deck_pins_are_replaced_in_place() {
     let fixture = test_temp::tempdir().expect("create install fixture");
     let installing = seed_executable(&fixture.path().join("this-install").join("dot-agent-deck"));
     let installing_command = expected_hook_command(&installing);
 
-    // Arm 1 — a DIFFERENT but still-valid install, deliberately sharing the
-    // installing binary's own basename so the only thing standing between it and
-    // deletion is `pin_is_repairable` saying the target is still there.
+    // Arm 1 — a different still-valid install with the deck's basename.
+    // The valid sibling must be replaced under the consolidation policy.
     let other = seed_executable(&fixture.path().join("other-install").join("dot-agent-deck"));
     let other_command = expected_hook_command(&other);
     let valid = test_temp::tempdir().expect("create Codex home");
@@ -510,14 +509,11 @@ fn codex_hooks_install_008_a_valid_foreign_pin_survives_and_a_dead_one_is_repair
 
     assert_eq!(
         deck_commands_for(valid.path(), "SessionStart"),
-        vec![other_command.clone(), installing_command.clone()],
-        "PRD #381 Open Question 3: a deck pin that still works is left alone and the fresh \
-         rule is added ALONGSIDE it, never repointed"
+        vec![installing_command.clone()],
+        "a different valid deck install must be replaced in place, never appended alongside"
     );
 
-    // Arm 2 — the same shape, but the pin is positively gone. Without this arm
-    // the first one proves nothing: a predicate that never prunes anything would
-    // pass it.
+    // Arm 2 — the same shape with a missing binary still exercises dead-pin repair.
     let dead = fixture
         .path()
         .join("pruned-worktree")
@@ -1332,7 +1328,7 @@ fn codex_hooks_007_install_leaves_a_users_hook_at_its_trust_key() {
     );
 }
 
-/// Scenario: Seed a Codex home holding two of this binary's own deck rules — the duplicate shape only a pre-fix install could leave behind — with a user's hook sitting between them, then install once. The surplus deck rule must go while the user's handler keeps the exact `group_idx` it started with.
+/// Scenario: Seed a Codex home holding two of this binary's own deck rules — the duplicate shape only a pre-fix install could leave behind — with a user's hook sitting between them, then install once. The surplus deck rule must go while the user's handler keeps the exact `group_idx` it started with, and the trailing rule it vacated is dropped.
 #[spec("codex/hooks/008")]
 #[test]
 fn codex_hooks_008_a_surplus_deck_rule_is_dropped_without_moving_the_user() {
@@ -1363,18 +1359,19 @@ fn codex_hooks_008_a_surplus_deck_rule_is_dropped_without_moving_the_user() {
         "the surplus copy of this binary's own rule must be removed"
     );
     // The point of the test: the user was at `group_idx` 1 and is still at
-    // `group_idx` 1. The emptied rule at index 2 is KEPT rather than dropped —
-    // it carries no handler so it contributes no trust key of its own, but it
-    // still consumes its index, which is what would move anything after it.
+    // `group_idx` 1. The rule the surplus emptied is TRAILING, so it is dropped
+    // (PRD #1487) — nothing follows it to re-key. An emptied rule with anything
+    // after it is kept instead; `agent_hook_config`'s consolidation tests pin
+    // that half.
     assert_eq!(
         rules[1]["hooks"][0]["command"],
         json!("/usr/bin/env USER_HOOK=1"),
         "the user's rule must keep the group_idx Codex keyed their trust record to: {rules:?}"
     );
     assert_eq!(
-        rules[2]["hooks"].as_array().map(Vec::len),
-        Some(0),
-        "the rule the surplus handler vacated is kept, empty, so no later index moves: {rules:?}"
+        rules.len(),
+        2,
+        "a trailing rule the surplus handler vacated is dropped: {rules:?}"
     );
 }
 
@@ -1430,8 +1427,8 @@ fn codex_hooks_009_a_legacy_flat_deck_rule_is_swept_without_disturbing_the_neste
     );
     assert_eq!(
         rules.len(),
-        3,
-        "the rule the flat command vacated is kept so no later index moves: {rules:?}"
+        2,
+        "a trailing rule the flat command vacated is dropped, moving nothing (PRD #1487): {rules:?}"
     );
 }
 

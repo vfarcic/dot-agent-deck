@@ -136,6 +136,21 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "daemon_client",
     "daemon_protocol",
     "daemon_stop",
+    // PRD #1487 M5, argued rather than added quietly. `daemon_upgrade` is the
+    // ONE upgrade procedure every client calls (the PRD's D1: no client
+    // carries its own upgrade policy), so the desktop's Upgrade and Replace
+    // daemon have to reach it — a desktop-side copy of the procedure, the
+    // newer-only offer rule or the outcome type is exactly the third copy of a
+    // policy about stopping somebody's agents that the PRD exists to prevent.
+    // The desktop names its result and progress types, `upgrade_offer`, the
+    // `RestartDecider` seam it answers through a dialog, and the production
+    // installers and daemon ports. Checked against this rule's lines: the
+    // module resolves no project, reads no project state file, names no
+    // FORBIDDEN_SYMBOL or project-state literal, and contains no
+    // `std::env::current_dir` — all zero for it. (It calls
+    // `std::env::current_exe` once, in `NoInstall`, to name the client's own
+    // binary; that is not a project read.)
+    "daemon_upgrade",
     // Issue #1350, argued rather than added quietly. `deck_list` reads and
     // edits `remotes.toml`, the user's list of WHICH daemons to connect to —
     // the CLI's `connect` registry, which the desktop now shares as its deck
@@ -225,6 +240,12 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // project, reads a project state file, names a FORBIDDEN_SYMBOL, or
     // contains `std::env::current_dir` — checked, both are zero for it.
     "remote",
+    // PRD #1487 M5, argued with `daemon_upgrade` above: `SshDaemonPort`, the
+    // remote half of the upgrade, reaches a remote machine's daemon by running
+    // that machine's freshly installed binary over the deck list's own ssh
+    // route. It reads no local file at all; checked against this rule's lines,
+    // all zero for it.
+    "remote_daemon",
     "remote_doctor",
     "state",
     "ui",

@@ -84,6 +84,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::agent_hook_config::{InstallMode, KeptDeckEntry};
+
 /// The fixed command signature that identifies a deck-authored Codex hook. Every
 /// deck hook command is `<binary_path> hook --agent codex`, so a command ending
 /// in this exact suffix is deck-owned. Matching the full verb (rather than the
@@ -226,6 +228,17 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
     command_is_this_binary(command, binary_path) || command_is_dead_deck(command, binary_path)
 }
 
+/// Whether an install by `binary_path` owns `command` under an event it
+/// INSTALLS: any deck install sharing its basename, live or not
+/// ([`crate::agent_hook_config::is_replaceable_deck_install`]) — one deck
+/// entry per event (PRD #1487). Wider than [`command_is_replaceable`], which
+/// still governs the retired-event sweep: there the deck has nothing to put in
+/// the removed command's place, so a live sibling's rule is left alone.
+fn command_is_deck_install(command: &str, binary_path: &str) -> bool {
+    deck_command_executable(command)
+        .is_some_and(|exe| crate::agent_hook_config::is_replaceable_deck_install(&exe, binary_path))
+}
+
 /// Refresh this install's command hook inside ONE event array **without moving
 /// any rule or handler that is already there**, returning whether it found a
 /// position to claim.
@@ -298,15 +311,14 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 ///   stable across a steady-state install: the hash is a SHA-256 over command +
 ///   `matcher` + `async`, so an unchanged command under preserved siblings
 ///   leaves the deck's own grant valid instead of churning it.
-/// - **A rule emptied by the surplus sweep is kept, not dropped.** Measured on
-///   0.149.0 in both shapes this sweep can leave — `{"hooks": []}` and a bare
-///   `{}` — placed at index 1: the handlers either side reported
+/// - **An interior rule emptied by the surplus sweep is kept, not dropped.**
+///   Measured on 0.149.0 in both shapes this sweep can leave — `{"hooks": []}`
+///   and a bare `{}` — placed at index 1: the handlers either side reported
 ///   `pre_tool_use:0:0` and `pre_tool_use:2:0`, with `warnings` and `errors`
 ///   both empty. So an emptied rule contributes no trust key of its own, draws
 ///   no complaint, and still consumes its `group_idx` — which is exactly what
-///   makes keeping it preserve the indices of everything after it.
-///   Dropping it would re-introduce the defect this function exists to remove,
-///   in exchange for tidiness in a file the deck does not own.
+///   makes keeping it preserve the indices of everything after it. A TRAILING
+///   emptied rule is dropped (PRD #1487): nothing follows it to re-key.
 /// - **The legacy flat rule shape (`{"command": …}`) claims nothing, but is
 ///   still swept.** This adapter's writer emits only the nested shape, so a
 ///   flat deck-owned rule here came from somewhere else, and how Codex indexes
@@ -320,98 +332,16 @@ fn command_is_replaceable(command: &str, binary_path: &str) -> bool {
 ///   out moves nothing. (It also never ran under Codex, so this is tidying
 ///   rather than a duplicate-fire fix.)
 ///
-/// The signature takes `&mut [Value]` rather than `&mut Vec<Value>` on purpose:
-/// this function may edit a rule but may never add or remove one, and that is
-/// the whole property, so the type says it.
-fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &str) -> bool {
-    let replaceable = |value: &Value| {
-        value
-            .as_str()
-            .is_some_and(|cmd| command_is_replaceable(cmd, binary_path))
-    };
-
-    // Locate the first replaceable command, in `strip_deck_commands`'s walk
-    // order. A flat rule reached before any nested handler abandons the claim.
-    let mut claim = None;
-    'scan: for (rule_idx, rule) in rules.iter().enumerate() {
-        if let Some(handlers) = rule.get("hooks").and_then(Value::as_array) {
-            for (handler_idx, handler) in handlers.iter().enumerate() {
-                if handler.get("command").is_some_and(&replaceable) {
-                    claim = Some((rule_idx, handler_idx));
-                    break 'scan;
-                }
-            }
-        }
-        if rule.get("command").is_some_and(&replaceable) {
-            return false;
-        }
-    }
-    let Some((claimed_rule, claimed_handler)) = claim else {
-        return false;
-    };
-
-    // Drop surplus copies of this install — a second handler for the same
-    // binary, or a dead pin under its basename — but ONLY from the TAIL of a
-    // rule's handler list, because removing one that a surviving handler
-    // follows shifts that handler's `handler_idx`. That is this very defect at
-    // handler granularity, and the first draft of this function had it
-    // (Greptile P1 on PR #1166): a rule holding
-    // `[deck-claimed, deck-surplus, user]` moved the user from `:0:2` to
-    // `:0:1`. Rules before the claim are never visited, since the scan above
-    // stops at the first replaceable command in either shape.
-    for (rule_idx, rule) in rules.iter_mut().enumerate().skip(claimed_rule) {
-        if let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) {
-            while let Some(last_idx) = handlers.len().checked_sub(1) {
-                if (rule_idx, last_idx) == (claimed_rule, claimed_handler)
-                    || !handlers[last_idx].get("command").is_some_and(&replaceable)
-                {
-                    break;
-                }
-                handlers.pop();
-            }
-        }
-        // The legacy flat `command` goes unconditionally: measured on 0.149.0,
-        // a rule carrying no `hooks` array contributes NO listed entry at all —
-        // a `{"type":"command","command":…}` rule placed at index 1 left the
-        // handlers either side reporting `pre_tool_use:0:0` and
-        // `pre_tool_use:2:0` with no warnings — so it holds no trust key of its
-        // own and taking the key out moves nothing. (It also means such a rule
-        // never runs under Codex, so this is tidying, not a duplicate-fire
-        // fix.) The rule OBJECT stays, which is what keeps `group_idx` still.
-        if rule.get("command").is_some_and(&replaceable)
-            && let Some(object) = rule.as_object_mut()
-        {
-            object.remove("command");
-        }
-    }
-
-    // Refresh EVERY replaceable handler still standing, not only the claim.
-    // An interior surplus that the tail rule above could not remove would
-    // otherwise be left carrying a stale command — and if it is a dead pin,
-    // that is an exec failure on every event rather than a harmless duplicate.
-    // Refreshing it costs a second firing of the deck's own hook, which is the
-    // cheaper side of the trade against re-keying a user's grant.
-    for rule in rules.iter_mut().skip(claimed_rule) {
-        let Some(handlers) = rule.get_mut("hooks").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for handler in handlers.iter_mut() {
-            if !handler.get("command").is_some_and(&replaceable) {
-                continue;
-            }
-            let Some(object) = handler.as_object_mut() else {
-                continue;
-            };
-            object.insert("command".into(), Value::String(command.to_string()));
-            // Only when absent: a handler carrying a deck command but no `type`
-            // is one the deck did not write, and Codex needs the discriminant
-            // to run it. An existing value is the user's and not ours to fix.
-            object
-                .entry("type")
-                .or_insert_with(|| Value::String("command".into()));
-        }
-    }
-    true
+/// **What it claims is any install of the deck, not only this one** (PRD
+/// #1487, [`command_is_deck_install`]): a different still-valid install's
+/// handler is consolidated into the one this install keeps, rather than left
+/// beside it as issue #730 had it. The logic is shared with the Claude and Devin
+/// writers — `agent_hook_config::consolidate_deck_handlers_in_place`.
+fn refresh_deck_rule_in_place(rules: &mut Vec<Value>, command: &str, binary_path: &str) -> bool {
+    crate::agent_hook_config::consolidate_deck_handlers_in_place(rules, command, |cmd| {
+        command_is_deck_install(cmd, binary_path)
+    })
+    .is_some()
 }
 
 /// Merge the deck's command hooks for `command` — the command built for
@@ -430,7 +360,22 @@ fn refresh_deck_rule_in_place(rules: &mut [Value], command: &str, binary_path: &
 /// [`refresh_deck_rule_in_place`], which carries the measurement. The one place
 /// an index can still move is the retired-event sweep below, because removing a
 /// rule is what that sweep IS.
-fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
+///
+/// Under [`InstallMode::Automatic`] a deck entry naming another live, durable
+/// install is kept rather than replaced (PRD #1487 —
+/// [`crate::agent_hook_config::auto_install_kept_command`]), and an event with
+/// no such entry gets the first kept install's command rather than this
+/// binary's. Returns every binary the installed events now name — the first
+/// kept install's first, then any other an event kept for itself — which is
+/// what the trust write has to be about: events that already named different
+/// live installs keep them, and each of those commands needs its own grant
+/// (Qodo 4200693859).
+fn install_impl(
+    root: &mut Value,
+    command: &str,
+    binary_path: &str,
+    mode: InstallMode,
+) -> Vec<String> {
     use crate::agent_hook_config::strip_deck_commands;
 
     if !root.is_object() {
@@ -480,22 +425,49 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         }
     }
 
-    let entry = json!({
-        "hooks": [ { "type": "command", "command": command } ]
-    });
+    let kept = |rules: &[Value]| {
+        crate::agent_hook_config::auto_install_kept_entry(
+            rules,
+            binary_path,
+            |cmd| command_is_deck_install(cmd, binary_path),
+            deck_command_executable,
+        )
+    };
+    let keeper = match mode {
+        InstallMode::Explicit => None,
+        InstallMode::Automatic => CODEX_HOOK_EVENTS.iter().find_map(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .and_then(|rules| kept(rules))
+        }),
+    };
+    let mut named = vec![KeptDeckEntry::named_binary(keeper.as_ref(), binary_path)];
     for &event in CODEX_HOOK_EVENTS {
         let arr = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
         if !arr.is_array() {
             *arr = json!([]);
         }
         let arr = arr.as_array_mut().expect("hook event value is an array");
-        // Normalize down to a single rule, but only for THIS binary — plus any
-        // deck pin sharing its basename that the deck would not itself write
-        // (missing, bare or relative, non-executable, or a build-artifact
-        // path), the shape N worktree builds actually take. A deck rule
-        // belonging to a genuinely different, still-valid install is left in
-        // place and the new rule is added ALONGSIDE it (issue #730), which is
-        // what Claude's `install_impl` has always done.
+        let kept_here = match mode {
+            InstallMode::Explicit => None,
+            InstallMode::Automatic => kept(arr),
+        };
+        let named_here =
+            KeptDeckEntry::named_binary(kept_here.as_ref().or(keeper.as_ref()), binary_path);
+        if !named.contains(&named_here) {
+            named.push(named_here);
+        }
+        let command = KeptDeckEntry::command_for(kept_here.as_ref(), keeper.as_ref(), command);
+        let entry = json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        });
+        // Normalize down to ONE deck rule per event (PRD #1487): this
+        // binary's own, plus every other install of the deck sharing its
+        // basename, live or dead — a different still-valid install is
+        // consolidated rather than kept alongside as issue #730 had it, because
+        // a second rule fires every hook twice and is a new untrusted entry
+        // Codex holds every start on.
         //
         // REFRESH IN PLACE FIRST (issue #1034). Codex's trust keys are
         // file-positional, so removing this install's rule and appending a
@@ -515,10 +487,11 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str) {
         // nothing to overwrite it with, so it is left as it is rather than
         // papered over with a tombstone rule.
         if !refresh_deck_rule_in_place(arr, command, binary_path) {
-            strip_deck_commands(arr, |cmd| command_is_replaceable(cmd, binary_path));
-            arr.push(entry.clone());
+            strip_deck_commands(arr, |cmd| command_is_deck_install(cmd, binary_path));
+            arr.push(entry);
         }
     }
+    named
 }
 
 /// Reject a structurally-incompatible existing `hooks.json` shape without
@@ -562,8 +535,33 @@ fn validate_structure(root: &Value) -> io::Result<()> {
 /// call errors (never discarded); a structurally-incompatible shape errors
 /// WITHOUT touching the file; unreadable content propagates its error unwritten.
 pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(codex_home)?;
+    install_to_reporting(codex_home, binary_path, InstallMode::Explicit).map(|_| ())
+}
+
+/// The automatic install's seam: [`install_to`] under
+/// [`InstallMode::Automatic`], which keeps another live durable install's entry
+/// rather than replacing it (PRD #1487). Returns whether the file changed and
+/// every binary its entries now name, the first kept install's first.
+pub(crate) fn auto_install_to(
+    codex_home: &Path,
+    binary_path: &str,
+) -> std::io::Result<(bool, Vec<String>)> {
+    install_to_reporting(codex_home, binary_path, InstallMode::Automatic)
+}
+
+/// [`install_to`], reporting whether it changed the definitions and the binary
+/// they name. Equal merged definitions are not written at all (PRD #1487): the
+/// file keeps its bytes, formatting, inode and mtime, so an unchanged install
+/// is invisible to Codex and to anything watching the file.
+fn install_to_reporting(
+    codex_home: &Path,
+    binary_path: &str,
+    mode: InstallMode,
+) -> std::io::Result<(bool, Vec<String>)> {
     let path = codex_home.join("hooks.json");
+    // Before the directory, the backup and the temp file (PRD #1487).
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    std::fs::create_dir_all(codex_home)?;
 
     let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // Across processes too: every wrapper starting a Codex pane runs this.
@@ -603,9 +601,14 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
     // structural, the way S-2 made the trust half structural, instead of held by
     // duplication that a future edit to either site quietly breaks.
     let command = expected_hook_command(binary_path);
-    install_impl(&mut root, &command, binary_path);
+    let before = root.clone();
+    let named = install_impl(&mut root, &command, binary_path, mode);
+    if root == before {
+        return Ok((false, named));
+    }
     let contents = serde_json::to_string_pretty(&root)?;
-    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())?;
+    Ok((true, named))
 }
 
 /// Whether the active `CODEX_HOME`'s `hooks.json` declares any command hook NOT
@@ -699,11 +702,14 @@ fn any_foreign_command_hook(root: &Value) -> bool {
 /// `auto_install`): a missing home or unwritable dir degrades to the coarse
 /// stdout fallback rather than blocking the spawn.
 ///
-/// Returns the durable binary path the definitions were written for, or `None`
-/// if nothing was written. The caller needs it to build the expected command
-/// [`trust_deck_hooks_in`] compares against (issue #730) — the SAME value, so
-/// install and trust can never be about two different binaries.
-pub fn auto_install() -> Option<String> {
+/// Returns every binary the deck's definitions name afterwards, or `None` if
+/// the install failed. That is this process's durable path unless another live,
+/// durable install's entry was already there — an automatic install keeps that
+/// one rather than replacing it (PRD #1487), and keeps each event's own when
+/// events name different live installs. The caller needs them to build the
+/// expected commands [`trust_deck_hooks_for`] compares against (issue #730) —
+/// the SAME values, so install and trust can never be about different binaries.
+pub fn auto_install() -> Option<Vec<String>> {
     let home = codex_home()?;
     // PRD #381: never `current_exe()` directly — a `target/debug` path written
     // here is gone the moment its worktree is pruned, and this write is silent
@@ -716,11 +722,25 @@ pub fn auto_install() -> Option<String> {
             return None;
         }
     };
-    if let Err(e) = install_to(&home, &binary_path) {
-        tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
-        return None;
+    // Automatic: another live durable install's entry is kept, and the trust
+    // write is then about that install's command (PRD #1487).
+    match auto_install_to(&home, &binary_path) {
+        Ok((changed, named)) => {
+            if changed {
+                crate::agent_hook_config::log_auto_install_change(
+                    "codex",
+                    &home.join("hooks.json"),
+                    &named.join(", "),
+                    "codex auto-install",
+                );
+            }
+            Some(named)
+        }
+        Err(e) => {
+            tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
+            None
+        }
     }
-    Some(binary_path)
 }
 
 /// The exact hook command the deck writes for `binary_path` — what
@@ -754,6 +774,7 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
     let mut root: Value = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("hooks.json: {e}")))?;
     validate_structure(&root)?;
+    let before = root.clone();
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for value in hooks.values_mut() {
             if let Some(arr) = value.as_array_mut() {
@@ -765,6 +786,11 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
             }
         }
         hooks.retain(|_, value| !value.as_array().is_some_and(|arr| arr.is_empty()));
+    }
+    // Nothing of the deck's was there: leave the user's file untouched rather
+    // than reserializing it (PRD #1487).
+    if root == before {
+        return Ok(());
     }
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
@@ -1577,10 +1603,35 @@ pub fn trust_deck_hooks_in(
     cwd: &Path,
     binary_path: &str,
 ) -> std::io::Result<TrustOutcome> {
-    let expected = expected_hook_command(binary_path);
+    trust_deck_hooks_for(home, cwd, &[binary_path.to_string()])
+}
+
+/// [`trust_deck_hooks_in`] for every binary an automatic install left the
+/// deck's definitions naming ([`auto_install`]): each listed entry is matched
+/// [`DeckCommandMatch::Exact`] against one of their expected commands, so the
+/// grant is exactly as narrow as for one binary — never a signature match, never
+/// a foreign handler — and no event an earlier install kept is left untrusted
+/// because a different event kept a different install (Qodo 4200693859).
+/// `binary_paths` must be non-empty; the first is the one a zero-trust warning
+/// is reported against.
+pub fn trust_deck_hooks_for(
+    home: &Path,
+    cwd: &Path,
+    binary_paths: &[String],
+) -> std::io::Result<TrustOutcome> {
+    let mut expected_commands: Vec<String> = Vec::new();
+    for binary_path in binary_paths {
+        let command = expected_hook_command(binary_path);
+        if !expected_commands.contains(&command) {
+            expected_commands.push(command);
+        }
+    }
+    let Some(expected) = expected_commands.first().cloned() else {
+        return Ok(TrustOutcome::NothingListed);
+    };
     let listing = list_hooks_in(home, cwd)?;
     let entries = &listing.entries;
-    let eligible = deck_owned_entries(entries, home, DeckCommandMatch::Exact(&expected));
+    let eligible = trust_eligible(entries, home, &expected_commands);
     // Issue #559: taken from the same eligible set the records are, so it can
     // only name an entry this call is about to trust.
     let reports_prompts = eligible.iter().any(|entry| entry.is_enabled_prompt_hook());
@@ -1660,6 +1711,20 @@ pub fn trust_deck_hooks_in(
         reports_prompts,
         turned_off,
     })
+}
+
+/// The listed entries a trust write grants: those [`deck_owned_entries`] keeps
+/// under [`DeckCommandMatch::Exact`] for one of `expected_commands`, so a grant
+/// for several installs is the union of single-install grants and nothing wider.
+fn trust_eligible<'a>(
+    entries: &'a [CodexHookEntry],
+    home: &Path,
+    expected_commands: &[String],
+) -> Vec<&'a CodexHookEntry> {
+    expected_commands
+        .iter()
+        .flat_map(|command| deck_owned_entries(entries, home, DeckCommandMatch::Exact(command)))
+        .collect()
 }
 
 /// The name a user sees for a Codex event, from the `<event_snake>` segment of
@@ -1973,8 +2038,9 @@ pub fn untrust_deck_hooks_in(home: &Path) -> std::io::Result<usize> {
 fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> std::io::Result<()> {
     use toml_edit::{DocumentMut, Item, Table};
 
-    std::fs::create_dir_all(home)?;
     let path = home.join(CONFIG_TOML);
+    crate::config_write_guard::ensure_config_write_allowed(&path)?;
+    std::fs::create_dir_all(home)?;
     // Held across the read, the edit and the publish, against every other
     // process recording trust here — several Codex panes starting at once each
     // run this (`codex/trust/008`). The callers' `INSTALL_LOCK` covers threads
@@ -2027,7 +2093,12 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
 
     edit(state);
 
-    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
+    // An edit that changed nothing is not a write (PRD #1487).
+    let updated = doc.to_string();
+    if updated == existing {
+        return Ok(());
+    }
+    crate::agent_hook_config::write_atomic(home, &path, updated.as_bytes())
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { trusted_hash }` record.
@@ -2149,12 +2220,12 @@ pub fn auto_install_and_trust_at_startup() {
     // No durable path means nothing was installed, so there is no command to
     // trust and no entry of ours in the listing. Fail closed rather than falling
     // back to a wider predicate (issue #730).
-    let Some(binary_path) = auto_install() else {
+    let Some(binary_paths) = auto_install() else {
         tracing::debug!("codex startup install: skipped trust (no durable binary path resolved)");
         return;
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
-    match trust_deck_hooks_in(&home, &cwd, &binary_path) {
+    match trust_deck_hooks_for(&home, &cwd, &binary_paths) {
         Ok(outcome) => {
             // The `Unrecognised` case has already warned from inside; this path
             // has no user watching, so the count is all it needs.
@@ -2344,6 +2415,85 @@ mod tests {
             .flat_map(crate::agent_hook_config::rule_commands)
             .map(str::to_string)
             .collect()
+    }
+
+    /// Scenario: two events already name two different live installs (A and
+    /// B) and a third install auto-installs. Each event keeps its own install,
+    /// the install reports both A and B, and the trust grant covers both
+    /// events' exact commands while a foreign handler and a lookalike stay
+    /// ungranted (PRD #1487, Qodo 4200693859).
+    #[cfg(unix)]
+    #[test]
+    fn an_auto_install_keeping_two_live_installs_trusts_both() {
+        let fixture = crate::test_temp::tempdir().expect("codex fixture tempdir");
+        let a = seed_executable(&fixture.path().join("install-a").join("dot-agent-deck"));
+        let b = seed_executable(&fixture.path().join("install-b").join("dot-agent-deck"));
+        let c = seed_executable(&fixture.path().join("install-c").join("dot-agent-deck"));
+        let home = fixture.path().join("codex-home");
+        std::fs::create_dir_all(&home).expect("create codex home");
+        install_to(&home, &a).expect("explicit install from A");
+        // Point one event at B, as a second live install would have left it.
+        let mut root = read_back(&home);
+        root["hooks"]["Stop"][0]["hooks"][0]["command"] = json!(expected_hook_command(&b));
+        std::fs::write(
+            home.join("hooks.json"),
+            serde_json::to_vec_pretty(&root).unwrap(),
+        )
+        .unwrap();
+
+        let (_, named) = auto_install_to(&home, &c).expect("automatic install from C");
+        assert_eq!(named, vec![a.clone(), b.clone()], "A first, then B");
+
+        let root = read_back(&home);
+        let command_of = |event: &str| {
+            root["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event} has a deck command"))
+                .to_string()
+        };
+        assert_eq!(
+            command_of("Stop"),
+            expected_hook_command(&b),
+            "Stop keeps B"
+        );
+        assert_eq!(
+            command_of("SessionStart"),
+            expected_hook_command(&a),
+            "SessionStart keeps A"
+        );
+
+        let source = home.join("hooks.json");
+        let entry = |command: String, event: &str| CodexHookEntry {
+            key: format!("{}:{event}:0:0", source.display()),
+            command,
+            source_path: source.clone(),
+            current_hash: format!("sha256:{event}"),
+            trust_status: "untrusted".to_string(),
+            is_managed: Some(false),
+            enabled: None,
+        };
+        let entries = vec![
+            entry(command_of("SessionStart"), "session_start"),
+            entry(command_of("Stop"), "stop"),
+            entry(expected_hook_command(&c), "pre_tool_use"),
+            entry("/usr/local/bin/my-audit.sh".to_string(), "post_tool_use"),
+        ];
+        let granted: Vec<&str> = trust_eligible(
+            &entries,
+            &home,
+            &[
+                expected_hook_command(&named[0]),
+                expected_hook_command(&named[1]),
+            ],
+        )
+        .into_iter()
+        .map(|e| e.key.rsplit(':').nth(2).unwrap())
+        .collect();
+        assert_eq!(
+            granted,
+            vec!["session_start", "stop"],
+            "both kept installs' events are granted; C's lookalike and the foreign hook are not"
+        );
     }
 
     /// The retired-event sweep clears THIS install's leftovers under an event

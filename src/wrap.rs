@@ -932,8 +932,8 @@ fn codex_spawn_prep(
     // calls it, and `active_codex_home()` calls it again — but both reads happen
     // in this process from the same environment, so they agree. The BINARY half
     // is the one that is structurally pinned: `auto_install()` returns the very
-    // path it installed with, and that value is what reaches the trust write
-    // below (issue #730).
+    // paths its definitions name, and those values are what reach the trust
+    // write below (issue #730).
     let mut installed_binary = None;
     let mut prompt_hook_live = false;
     let pinned_home = if installs_hooks {
@@ -948,9 +948,10 @@ fn codex_spawn_prep(
     // means nothing was installed, so there is nothing of ours to trust — fail
     // closed rather than trusting by signature alone.
     // The child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
-    if let (Some(home), Some(binary_path)) = (pinned_home.as_deref(), installed_binary.as_deref()) {
+    if let (Some(home), Some(binary_paths)) = (pinned_home.as_deref(), installed_binary.as_deref())
+    {
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
-        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd, binary_path) {
+        match crate::codex_hooks_manage::trust_deck_hooks_for(home, &cwd, binary_paths) {
             // A zero that means "our own entry was unrecognisable" has already
             // warned from inside `trust_deck_hooks_in`; nothing here reports to a
             // user, so the count is all this path needs.
