@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SpeechPlanDto } from "./bridge";
-import { READING_ALREADY_OFF, READING_OFF, READING_ON, READING_VOICE_KEY, ReadingMode, type ReadingSentenceDto, type ReadingStartDto, type ReadingTarget } from "./reading";
+import { READING_ALREADY_OFF, READING_OFF, READING_ON, READING_START_FAILED, READING_VOICE_KEY, ReadingMode, type ReadingSentenceDto, type ReadingStartDto, type ReadingTarget } from "./reading";
 import { SpeechQueue, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingTarget = { deckId: "deck-local", agentId: "tester", label: "tester" };
@@ -64,6 +64,19 @@ describe("ReadingMode (PRD #1497 M5)", () => {
     expect(await h.mode.turnOn(TESTER)).toEqual({ kind: "refused", sentence });
     expect(h.mode.on).toBe(false);
     expect(h.said).toEqual([[READING_VOICE_KEY, sentence]]);
+  });
+
+  /** Scenario (PR #1617 review): "reading on" is said and the start fails outright (the app's call rejects). Reading stays off with no indicator, the failure is spoken in plain words and answered as a refusal, and a later "reading on" starts normally. */
+  it("reports a start that fails outright and stays off", async () => {
+    const h = harness();
+    h.start.mockRejectedValueOnce(new Error("ipc down"));
+    expect(await h.mode.turnOn(TESTER)).toEqual({ kind: "refused", sentence: READING_START_FAILED });
+    expect(h.mode.on).toBe(false);
+    expect(h.mode.active).toBe(false);
+    expect(h.changes).toEqual([]);
+    expect(h.said).toEqual([[READING_VOICE_KEY, READING_START_FAILED]]);
+    expect(await h.mode.turnOn(TESTER)).toEqual({ kind: "started", sentence: READING_ON });
+    expect(h.changes).toEqual([TESTER]);
   });
 
   /** Scenario (D11): "reading off" ends reading, stops the subscription, and says "Reading off."; said again, it reports reading is not on. */

@@ -11,6 +11,7 @@ import {
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
+import { READING_START_FAILED } from "../lib/reading";
 
 const { terminalInvoke } = vi.hoisted(() => ({ terminalInvoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -2686,7 +2687,7 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     return result({ kind: "dispatch", transcript: said, action, invoke, params: [], sentence }, null, "local");
   }
 
-  async function startReading() {
+  async function startReading(start: () => Promise<{ kind: "started"; session: number }> = async () => ({ kind: "started", session: 41 })) {
     const spoken = silentSynth();
     const steps: Parameters<typeof sequencedVoice>[0] = [{ outcome: heard("reading on") }];
     const voice = sequencedVoice(steps);
@@ -2697,7 +2698,7 @@ describe("voice reading mode (PRD #1497 M5)", () => {
       declareVoiceScreen: vi.fn(),
       voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
       voiceSpeechAudio: vi.fn(async () => new ArrayBuffer(0)),
-      voiceReadingStart: vi.fn(async () => ({ kind: "started" as const, session: 41 })),
+      voiceReadingStart: vi.fn(start),
       voiceReadingStop: vi.fn(async (session: number) => { stopped.push(session); }),
     };
     Object.assign(deck, reading);
@@ -2722,6 +2723,15 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     expect(reading.voiceReadingStart).toHaveBeenCalledWith(expect.objectContaining({ agentId: "planner", label: "Plan / architecture" }), expect.any(Function));
     expect(screen.getByTestId("agent-pane-reading")).toHaveTextContent("Reading Plan / architecture aloud");
     expect(spoken).toEqual(["Reading on."]);
+  });
+
+  /** Scenario (PR #1617 review): saying "reading on" when the app's start call fails outright leaves the pane unmarked, replaces the row's "Reading on." with a plain failure, and says that failure. */
+  it("reports a start that fails outright", async () => {
+    const { spoken } = await startReading(async () => { throw new Error("ipc down"); });
+    expect(screen.queryByTestId("agent-pane-reading")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(READING_START_FAILED);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent("Reading on.");
+    expect(spoken).toEqual([READING_START_FAILED]);
   });
 
   /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */

@@ -1803,9 +1803,11 @@ export const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” wo
 
 /**
  * PRD #1497 — the preview's copy of `outcome::reading_intercept`: "quiet"
- * always, the bare "stop" forms while the app was speaking or while reading
- * is on outside typing mode; while the app was speaking, everything else is
- * dropped (D8); then the reading switches, in every mode.
+ * while reading is on or the app was speaking, the bare "stop" forms while the
+ * app was speaking or while reading is on outside typing mode; while the app
+ * was speaking, everything else is dropped (D8); then the reading switches, in
+ * every mode. With reading off and nothing spoken, "quiet" is left to the
+ * rest of the resolver, as in Rust.
  */
 function fixtureReadingIntercept(utterance: string, screen: VoiceScreen, typing: boolean, reading: VoiceReadingStateDto): VoiceResultDto["outcome"] | undefined {
   const dispatch = (action: string): VoiceResultDto["outcome"] | undefined => {
@@ -1816,8 +1818,9 @@ function fixtureReadingIntercept(utterance: string, screen: VoiceScreen, typing:
     }
     return { kind: "dispatch", transcript: utterance, action, invoke: row.invoke, params: [], sentence: row.report };
   };
+  const quietLive = reading.speaking || reading.reading;
   const stopsQuiet = reading.speaking || (reading.reading && !typing);
-  if (fixtureReserved(utterance, ["hush_reading"]) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("hush_reading");
+  if ((quietLive && fixtureReserved(utterance, ["hush_reading"])) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("hush_reading");
   if (reading.speaking) {
     return { kind: "dropped", transcript: utterance, sentence: `Heard: “${utterance.trim()}” — ${FIXTURE_DROPPED_WHILE_SPEAKING}.` };
   }

@@ -3866,10 +3866,21 @@ fn voice_decks(
 #[tauri::command]
 async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::SpeechPlan, String> {
     ensure_main_webview(&webview)?;
-    let settings = crate::settings::load_settings_without_decks()
-        .voice
-        .unwrap_or_default();
+    let settings = voice_settings_now().await?;
     Ok(voice::speech::plan_for(&settings))
+}
+
+/// The voice settings as they are now, read on a blocking thread: the speech
+/// and reading commands are async, and the read is file I/O (PR #1617's
+/// review).
+async fn voice_settings_now() -> Result<crate::settings::VoiceSettings, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::settings::load_settings_without_decks()
+            .voice
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| safe_message(format!("the settings could not be read: {error}")))
 }
 
 /// The provider's audio for one sentence of reading mode (PRD #1497 M4), as
@@ -3881,8 +3892,9 @@ async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::Sp
 ///
 /// Refused, with nothing sent, unless reading's Settings opt-in is on and the
 /// speech source resolves to the provider ([`voice::speech::provider_permitted`],
-/// checked against the settings as they are now): the webview cannot use this
-/// to send arbitrary text to the provider outside reading mode's consent.
+/// checked against the settings as they are now, and again after the keychain
+/// read, immediately before the request): the webview cannot use this to send
+/// arbitrary text to the provider outside reading mode's consent.
 #[tauri::command]
 async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Response, String> {
     ensure_main_webview(&webview)?;
@@ -3891,14 +3903,13 @@ async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Re
     if text.len() > voice::speech::MAX_SPEECH_INPUT_CHARS * 4 {
         return Err("that is too long to speak".to_string());
     }
-    let settings = crate::settings::load_settings_without_decks()
-        .voice
-        .unwrap_or_default();
+    let settings = voice_settings_now().await?;
     voice::speech::provider_permitted(&settings)?;
     let audio = voice::speech::synthesise(
         &settings.intent,
         Arc::new(KeychainSecretStore::new()),
         &text,
+        || async { voice::speech::provider_permitted(&voice_settings_now().await?) },
     )
     .await?;
     Ok(Response::new(audio))
@@ -3942,13 +3953,12 @@ async fn desktop_voice_reading_start(
     if bad(&deck_id) || bad(&agent_id) || agent_label.len() > MAX_VOICE_DECK_ID_BYTES {
         return Err("the agent sent with that command is not one a pane shows".to_string());
     }
-    let settings = crate::settings::load_settings_without_decks()
-        .voice
-        .unwrap_or_default();
+    // Taken before anything is awaited: a later start, or the opt-in turned
+    // off on a save, makes this one stale, and it is then never installed.
+    let ticket = voice_state.reading.begin();
+    let settings = voice_settings_now().await?;
     if settings.reading != crate::settings::ReadingConsent::On {
-        return Ok(ReadingStart::NotEnabled {
-            sentence: voice::reading::READING_NOT_ENABLED.to_string(),
-        });
+        return Ok(ReadingStart::not_enabled());
     }
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
     let snapshot = daemon_bridge::snapshot_of(scope.endpoint(), &state.daemon).await;
@@ -3983,24 +3993,52 @@ async fn desktop_voice_reading_start(
             });
         }
     };
+    // PR #1617's review: the opt-in, read again now that the subscription
+    // answered — it may have been turned off while it was being confirmed.
+    let Ok(events) = reading_events_still_consented(voice_settings_now().await?.reading, events)
+    else {
+        return Ok(ReadingStart::not_enabled());
+    };
     let Ok(events) = reading_events_still_in_scope(&scope, events) else {
         return Ok(unavailable(voice::reading::DECK_CHANGED));
     };
     let agent = voice::summary::agent_name(&agent_label);
     let ender = on_sentence.clone();
     let summariser = settings_summariser();
-    let session = voice_state.reading.start(
-        tauri::async_runtime::spawn(async move {
-            voice::reading::read_turns(&agent, events, &summariser, |sentence| {
-                on_sentence.send(sentence).is_ok()
+    let started = voice_state.reading.start(
+        ticket,
+        move || {
+            tauri::async_runtime::spawn(async move {
+                voice::reading::read_turns(&agent, events, &summariser, |sentence| {
+                    on_sentence.send(sentence).is_ok()
+                })
+                .await;
             })
-            .await;
-        }),
+        },
         Box::new(move || {
             let _ = ender.send(voice::reading::ended_sentence());
         }),
     );
-    Ok(ReadingStart::Started { session })
+    Ok(match started {
+        Ok(session) => ReadingStart::Started { session },
+        Err(StaleStart::Revoked) => ReadingStart::not_enabled(),
+        Err(StaleStart::Restarted) => unavailable(voice::reading::READING_RESTARTED),
+    })
+}
+
+/// PR #1617's review: reading's opt-in is read once more after the
+/// subscription answered, immediately before the session is installed. With it
+/// off the session is refused and `events` is dropped, which closes the
+/// subscription.
+fn reading_events_still_consented(
+    consent: crate::settings::ReadingConsent,
+    events: voice::reading::TurnEvents,
+) -> Result<voice::reading::TurnEvents, ()> {
+    if consent == crate::settings::ReadingConsent::On {
+        Ok(events)
+    } else {
+        Err(())
+    }
 }
 
 /// Audit AU-S1: reading's subscription outlives the start, so its deck is
@@ -4047,6 +4085,14 @@ enum ReadingStart {
     Unavailable { sentence: String },
 }
 
+impl ReadingStart {
+    fn not_enabled() -> Self {
+        Self::NotEnabled {
+            sentence: voice::reading::READING_NOT_ENABLED.to_string(),
+        }
+    }
+}
+
 /// Tells the webview a session ended on this side (a
 /// [`voice::reading::ReadingSentenceKind::Ended`] sentence down its channel).
 type ReadingEnder = Box<dyn FnOnce() + Send>;
@@ -4055,8 +4101,18 @@ type ReadingEnder = Box<dyn FnOnce() + Send>;
 /// one agent). Its turn events come from the agent's deck, subscribed per
 /// session ([`voice::reading::DaemonTurnEvents`]).
 pub(crate) struct ReadingSessions {
-    current: std::sync::Mutex<Option<ReadingSession>>,
+    state: std::sync::Mutex<ReadingState>,
     next: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct ReadingState {
+    current: Option<ReadingSession>,
+    /// The ticket of the latest start ([`ReadingSessions::begin`]).
+    latest_start: u64,
+    /// Every start up to this ticket began before the opt-in was last turned
+    /// off ([`ReadingSessions::end_unless_consented`]).
+    revoked_through: u64,
 }
 
 struct ReadingSession {
@@ -4065,38 +4121,79 @@ struct ReadingSession {
     ender: ReadingEnder,
 }
 
+/// A start in progress, from [`ReadingSessions::begin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadingTicket(u64);
+
+/// Why [`ReadingSessions::start`] installed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleStart {
+    /// The opt-in was turned off after this start began.
+    Revoked,
+    /// A later start began (PR #1617's review: two quick "reading on"s, the
+    /// first answering last).
+    Restarted,
+}
+
 impl Default for ReadingSessions {
     fn default() -> Self {
         Self {
-            current: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(ReadingState::default()),
             next: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
 
 impl ReadingSessions {
-    fn current(&self) -> std::sync::MutexGuard<'_, Option<ReadingSession>> {
-        self.current
+    fn state(&self) -> std::sync::MutexGuard<'_, ReadingState> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Make `task` the current session, ending any other, and name it.
-    /// `ender` is how [`Self::end_unless_consented`] tells the webview.
-    fn start(&self, task: tauri::async_runtime::JoinHandle<()>, ender: ReadingEnder) -> u64 {
+    /// A start begins; any start that began before it is now stale.
+    fn begin(&self) -> ReadingTicket {
+        let mut state = self.state();
+        state.latest_start += 1;
+        ReadingTicket(state.latest_start)
+    }
+
+    /// Install the start `ticket` names — `task` spawned, any other session
+    /// ended — and name it, unless the start is stale: a later one began, or
+    /// the opt-in was turned off since it did. A stale start spawns nothing,
+    /// and `task` is dropped with whatever it holds (the subscription's
+    /// receiver). `ender` is how [`Self::end_unless_consented`] tells the
+    /// webview.
+    fn start(
+        &self,
+        ticket: ReadingTicket,
+        task: impl FnOnce() -> tauri::async_runtime::JoinHandle<()>,
+        ender: ReadingEnder,
+    ) -> Result<u64, StaleStart> {
+        let mut state = self.state();
+        if ticket.0 <= state.revoked_through {
+            return Err(StaleStart::Revoked);
+        }
+        if ticket.0 != state.latest_start {
+            return Err(StaleStart::Restarted);
+        }
         let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(previous) = self.current().replace(ReadingSession { id, task, ender }) {
+        let task = task();
+        if let Some(previous) = state.current.replace(ReadingSession { id, task, ender }) {
             previous.task.abort();
         }
-        id
+        Ok(id)
     }
 
     /// End `session` if it is the current one. The webview asked, so it is
     /// not told.
     fn stop(&self, session: u64) {
-        let mut current = self.current();
-        if current.as_ref().is_some_and(|ended| ended.id == session)
-            && let Some(ended) = current.take()
+        let mut state = self.state();
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|ended| ended.id == session)
+            && let Some(ended) = state.current.take()
         {
             ended.task.abort();
         }
@@ -4105,7 +4202,8 @@ impl ReadingSessions {
     /// Audit A-B1: the settings were saved, and with reading's opt-in off the
     /// current session ends now — its task stops, so no further summary is
     /// requested — and the webview is told, so it clears the indicator and
-    /// the queued speech.
+    /// the queued speech. A start still in progress is made stale, so it is
+    /// not installed after this.
     fn end_unless_consented(&self, settings: &DesktopSettings) {
         let consented = settings
             .voice
@@ -4114,7 +4212,11 @@ impl ReadingSessions {
         if consented {
             return;
         }
-        let ended = self.current().take();
+        let ended = {
+            let mut state = self.state();
+            state.revoked_through = state.latest_start;
+            state.current.take()
+        };
         if let Some(ended) = ended {
             ended.task.abort();
             (ended.ender)();
@@ -5856,15 +5958,21 @@ mod tests {
         let ended = Arc::new(AtomicUsize::new(0));
         let guard = Dropped(Arc::clone(&aborted));
         let told = Arc::clone(&ended);
-        let id = sessions.start(
-            tauri::async_runtime::spawn(async move {
-                let _guard = guard;
-                std::future::pending::<()>().await;
-            }),
-            Box::new(move || {
-                told.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+        let ticket = sessions.begin();
+        let id = sessions
+            .start(
+                ticket,
+                move || {
+                    tauri::async_runtime::spawn(async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    })
+                },
+                Box::new(move || {
+                    told.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .expect("the latest start installs");
         (id, aborted, ended)
     }
 
@@ -5911,6 +6019,79 @@ mod tests {
         sessions.stop(id);
         wait_for(&aborted);
         assert_eq!(ended.load(Ordering::SeqCst), 0);
+    }
+
+    /// Scenario (PR #1617 review): "reading on" is said twice in quick
+    /// succession and the first start answers last. The later start is
+    /// installed; the earlier one is refused as stale when it finally
+    /// answers — its task is never spawned and its subscription's receiver is
+    /// dropped — so the later session keeps running under the indicator.
+    #[test]
+    fn voice_reading_a_stale_start_is_discarded() {
+        let sessions = ReadingSessions::default();
+        let first = sessions.begin();
+        let (_, aborted, _) = held_session(&sessions);
+
+        let (source, events) = tokio::sync::mpsc::channel::<voice::reading::TurnEvent>(1);
+        let spawned = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&spawned);
+        let stale = sessions.start(
+            first,
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                tauri::async_runtime::spawn(async move {
+                    drop(events);
+                })
+            },
+            Box::new(|| {}),
+        );
+        assert_eq!(stale, Err(StaleStart::Restarted));
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the stale task was spawned"
+        );
+        assert!(source.is_closed(), "the stale subscription was not dropped");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !aborted.load(Ordering::SeqCst),
+            "the later session's task was aborted"
+        );
+    }
+
+    /// Scenario (PR #1617 review): "reading on" is said with the opt-in on,
+    /// and while the subscription is being confirmed the user turns Read turns
+    /// aloud off. The opt-in read again just before installing refuses the
+    /// session and drops the subscription; a save that turned it off makes
+    /// the start stale even when that read came first.
+    #[test]
+    fn voice_reading_consent_revoked_while_starting_is_not_installed() {
+        use crate::settings::ReadingConsent;
+        let (source, events) = tokio::sync::mpsc::channel::<voice::reading::TurnEvent>(1);
+        let kept = reading_events_still_consented(ReadingConsent::On, events)
+            .expect("an opt-in still on installs");
+        assert!(!source.is_closed());
+        drop(kept);
+        let (source, events) = tokio::sync::mpsc::channel::<voice::reading::TurnEvent>(1);
+        assert!(reading_events_still_consented(ReadingConsent::Off, events).is_err());
+        assert!(source.is_closed(), "the subscription was not dropped");
+
+        let sessions = ReadingSessions::default();
+        let ticket = sessions.begin();
+        sessions.end_unless_consented(&DesktopSettings::default());
+        let spawned = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&spawned);
+        let refused = sessions.start(
+            ticket,
+            move || {
+                ran.store(true, Ordering::SeqCst);
+                tauri::async_runtime::spawn(async {})
+            },
+            Box::new(|| {}),
+        );
+        assert_eq!(refused, Err(StaleStart::Revoked));
+        assert!(!spawned.load(Ordering::SeqCst));
+        // A start that begins after the save is not stale.
+        held_session(&sessions);
     }
 
     fn voice_listing(entries: usize) -> voice::VoiceDirectories {

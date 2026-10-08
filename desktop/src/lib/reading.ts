@@ -61,6 +61,8 @@ export const READING_OFF = "Reading off.";
 export const READING_ALREADY_OFF = "Reading is not on.";
 /** Shown when "reading on" is said for the agent already being read. */
 export const READING_ALREADY_ON = "Reading is already on.";
+/** Spoken when the start itself failed — the app could not ask, or got no answer. */
+export const READING_START_FAILED = "Reading did not start. Say reading on to try again.";
 
 /**
  * The speech queue's key for the mode's own sentences ("Reading on.", the
@@ -123,7 +125,8 @@ export class ReadingMode {
   /**
    * Start reading `target`. Ends reading for any other agent first (D11:
    * one agent at a time). A refusal — the Settings opt-in off, or reading not
-   * available for this agent — is spoken, and reading stays off.
+   * available for this agent — is spoken, and reading stays off. So is a start
+   * that failed outright ({@link READING_START_FAILED}): this never rejects.
    */
   async turnOn(target: ReadingTarget): Promise<ReadingTurnOn> {
     if (sameAgent(this.current?.target, target)) return { kind: "started", sentence: READING_ALREADY_ON };
@@ -145,6 +148,13 @@ export class ReadingMode {
         const key = sentence.kind === "turn" ? agent : `${agent}\u0000alert\u0000${++this.alerts}`;
         this.deps.speech.say(key, sentence.text);
       });
+    } catch {
+      /* The start failed outright (PR #1617's review): no session was made,
+         so reading stays off and nothing marks the pane. */
+      if (this.generation !== generation) return { kind: "abandoned" };
+      this.starting = undefined;
+      this.deps.speech.say(READING_VOICE_KEY, READING_START_FAILED);
+      return { kind: "refused", sentence: READING_START_FAILED };
     } finally {
       if (this.generation === generation) this.starting = undefined;
     }
@@ -154,7 +164,7 @@ export class ReadingMode {
       return { kind: "refused", sentence: answer.sentence };
     }
     if (this.generation !== generation) {
-      await this.deps.stop(answer.session);
+      await this.deps.stop(answer.session).catch(() => undefined);
       return { kind: "abandoned" };
     }
     this.current = { target, session: answer.session };

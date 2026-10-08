@@ -175,11 +175,21 @@ pub fn request_body(text: &str) -> Value {
 
 /// Fetch the provider's audio for `text`: MP3 bytes, or a sentence saying why
 /// not.
-pub async fn synthesise(
+///
+/// `still_permitted` is asked after the keychain read and immediately before
+/// the request ([`provider_permitted`] against the settings as they are then):
+/// the keychain can take as long as a prompt the user answers, and reading's
+/// opt-in turned off during it sends nothing (PR #1617's review).
+pub async fn synthesise<P, F>(
     intent: &IntentSettings,
     secrets: Arc<dyn SecretStore>,
     text: &str,
-) -> Result<Vec<u8>, String> {
+    still_permitted: P,
+) -> Result<Vec<u8>, String>
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Result<(), String>>,
+{
     let Some(endpoint) = speech_endpoint(intent) else {
         return Err(NO_PROVIDER_SPEECH.to_string());
     };
@@ -187,6 +197,7 @@ pub async fn synthesise(
         return Err("there is nothing to say".to_string());
     }
     let secret = endpoint_credential(&endpoint, &secrets).await?;
+    still_permitted().await?;
     let Some(client) = super::http::client() else {
         return Err("speech could not start a secure connection".to_string());
     };
@@ -435,11 +446,15 @@ mod tests {
         }
     }
 
+    async fn permitted() -> Result<(), String> {
+        Ok(())
+    }
+
     #[tokio::test]
     async fn voice_speech_refuses_without_a_route_or_a_key_before_any_request() {
         let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
         assert_eq!(
-            synthesise(&anthropic(), Arc::clone(&secrets), "hello").await,
+            synthesise(&anthropic(), Arc::clone(&secrets), "hello", permitted).await,
             Err(NO_PROVIDER_SPEECH.to_string())
         );
         // Off this machine with no key stored: refused by the keychain read,
@@ -448,9 +463,64 @@ mod tests {
             &openai_at("https://voice-speech.invalid/v1/chat/completions"),
             secrets,
             "hello",
+            permitted,
         )
         .await
         .expect_err("no key");
         assert!(error.contains("no key is stored"), "{error}");
+    }
+
+    /// A keychain whose read is where the user turns reading off: answering
+    /// it revokes the opt-in, as a save during a keychain prompt would.
+    struct RevokedWhileReading(Arc<std::sync::atomic::AtomicBool>);
+
+    impl SecretStore for RevokedWhileReading {
+        fn store(
+            &self,
+            _: crate::secrets::SecretId,
+            _: &crate::secrets::Secret,
+        ) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            _: crate::secrets::SecretId,
+        ) -> Result<Option<crate::secrets::Secret>, crate::secrets::SecretError> {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(crate::secrets::Secret::new("sk-test")))
+        }
+
+        fn delete(&self, _: crate::secrets::SecretId) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    /// Scenario (PR #1617 review): reading is on when a sentence is asked
+    /// for, and is turned off while the key is being read from the keychain.
+    /// Consent is checked again after the read, so nothing is sent: the
+    /// answer is the not-permitted sentence, never a request to the provider
+    /// (whose endpoint is unroutable on purpose).
+    #[tokio::test]
+    async fn voice_speech_consent_revoked_during_the_keychain_read_sends_nothing() {
+        let consent = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let secrets: Arc<dyn SecretStore> = Arc::new(RevokedWhileReading(Arc::clone(&consent)));
+        let intent = openai_at("https://voice-speech.invalid/v1/chat/completions");
+        let settings_now = || {
+            let reading = if consent.load(std::sync::atomic::Ordering::SeqCst) {
+                ReadingConsent::On
+            } else {
+                ReadingConsent::Off
+            };
+            voice(SpeechSource::Provider, intent.clone(), reading)
+        };
+        assert!(provider_permitted(&settings_now()).is_ok());
+        assert_eq!(
+            synthesise(&intent, secrets, "hello", || async {
+                provider_permitted(&settings_now())
+            })
+            .await,
+            Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string())
+        );
     }
 }

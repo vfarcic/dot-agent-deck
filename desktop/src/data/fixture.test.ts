@@ -329,4 +329,15 @@ describe("browser fixture reading rows (PRD #1497)", () => {
     expect(resolveFixtureVoice("stop", "agent", false, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
     expect(resolveFixtureVoice("stop", "agent", true, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ action: "interrupt_agent" });
   });
+
+  /** Scenario: "quiet" and "hush" are reserved for silencing the app only while reading is on or the app is speaking, as in Rust; with reading off and nothing spoken, typing mode types them as it did before reading mode existed. */
+  it("reserves quiet only while reading or speaking", () => {
+    const off = { reading: false, speaking: false };
+    for (const phrase of ["quiet", "hush"]) {
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, off).outcome).not.toMatchObject({ action: "hush_reading" });
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+      expect(resolveFixtureVoice(phrase, "agent", true, false, false, false, { reading: false, speaking: true }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    }
+    expect(resolveFixtureVoice("hush", "agent", true, false, false, false, off).outcome).toMatchObject({ kind: "dispatch", params: [{ value: "hush" }] });
+  });
 });

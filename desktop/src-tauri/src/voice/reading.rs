@@ -84,6 +84,11 @@ pub const DAEMON_UNREACHABLE: &str = "the deck did not answer";
 /// [`unavailable_sentence`].
 pub const DECK_CHANGED: &str = "the deck changed while reading was starting. Say reading on again";
 
+/// Why a "reading on" was not installed when a later one began before it
+/// answered. A fragment, rendered into [`unavailable_sentence`]; the webview
+/// has already moved on to the later start and does not speak it.
+pub const READING_RESTARTED: &str = "reading was turned on again";
+
 /// How long after [`coalesce`] announced one half of a failed turn it absorbs
 /// the other, so the turn is announced once.
 pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
@@ -189,16 +194,20 @@ impl TurnEventSource for DaemonTurnEvents {
     fn subscribe(&self, target: &ReadingTarget) -> SubscribeFuture<'_> {
         let agent_id = target.agent_id.clone();
         Box::pin(async move {
-            let mut replies = match self.client.subscribe_turn_replies(&agent_id).await {
-                Ok(GatedQuery::Answered(replies)) => replies,
-                Ok(GatedQuery::Unsupported) => return Err(DAEMON_TOO_OLD.to_string()),
-                Err(_) => return Err(DAEMON_UNREACHABLE.to_string()),
-            };
+            // The status stream first (PR #1617's review): a permission prompt
+            // or an error the agent reports while the reply stream is being
+            // confirmed is then already on a subscribed connection, not lost
+            // between the two.
             let mut statuses = self
                 .client
                 .subscribe_events()
                 .await
                 .map_err(|_| DAEMON_UNREACHABLE.to_string())?;
+            let mut replies = match self.client.subscribe_turn_replies(&agent_id).await {
+                Ok(GatedQuery::Answered(replies)) => replies,
+                Ok(GatedQuery::Unsupported) => return Err(DAEMON_TOO_OLD.to_string()),
+                Err(_) => return Err(DAEMON_UNREACHABLE.to_string()),
+            };
             let (incoming_tx, incoming) = mpsc::channel(16);
             let (events_tx, events) = mpsc::channel(16);
             tauri::async_runtime::spawn(async move {
@@ -601,42 +610,107 @@ pub async fn announce(
 
 /// Read `events` until they end or `sink` refuses a sentence.
 ///
-/// One event at a time, in order: a summary is waited for before the next
-/// event is announced, so what is spoken never arrives out of the order it
-/// happened in. `sink` answers `false` when nobody is listening any more (the
-/// webview's channel closed), which ends the loop and drops `events` — the
-/// unsubscribe.
+/// Turns are summarised one at a time, in the order they finished, so their
+/// summaries are spoken in that order. A permission prompt or an error is
+/// announced the moment it arrives, never behind a summary still being made
+/// (PR #1617's review): the user has to act on it, and a summary can take as
+/// long as the Commands connection's timeout. `sink` answers `false` when
+/// nobody is listening any more (the webview's channel closed), which ends the
+/// loop and drops `events` — the unsubscribe.
 ///
-/// Before each event the summariser is asked whether reading's opt-in is
-/// still on, and the summary request asks again; when it is off, the loop
-/// sends [`ended_sentence`] and ends, so nothing more is announced or sent.
+/// Every event is checked against reading's opt-in as it arrives, and each
+/// summary request checks it again immediately before it is sent; when it is
+/// off, the loop sends [`ended_sentence`] and ends, so nothing more is
+/// announced or sent.
 ///
 /// When `events` end on the source's side — the deck ended the agent's reply
 /// stream because the agent exited (review RV-S2), or the deck went away — the
-/// loop sends [`ended_sentence`] too: nothing more can be read, and the webview
-/// ends reading mode and says so rather than staying on for an agent that is
-/// gone.
+/// turns already received are still read, and then the loop sends
+/// [`ended_sentence`] too: nothing more can be read, and the webview ends
+/// reading mode and says so rather than staying on for an agent that is gone.
 pub async fn read_turns(
     agent: &str,
     mut events: TurnEvents,
     summariser: &dyn TurnSummariser,
     mut sink: impl FnMut(ReadingSentence) -> bool,
 ) {
-    while let Some(event) = events.recv().await {
-        let sentence = if summariser.consented() {
-            announce(agent, event, summariser).await
-        } else {
-            None
-        };
-        let Some(sentence) = sentence else {
+    let mut waiting: std::collections::VecDeque<(TurnKind, String)> =
+        std::collections::VecDeque::new();
+    let mut summarising: Option<SummaryFuture<'_>> = None;
+    let mut open = true;
+    loop {
+        if summarising.is_none()
+            && let Some((kind, reply)) = waiting.pop_front()
+        {
+            summarising = Some(Box::pin(async move {
+                summariser
+                    .summarise(TurnSummaryRequest {
+                        agent,
+                        kind,
+                        reply: &reply,
+                    })
+                    .await
+            }));
+        }
+        if !open && summarising.is_none() {
             sink(ended_sentence());
             return;
+        }
+        let in_flight = async {
+            match summarising.as_mut() {
+                Some(summary) => summary.await,
+                None => std::future::pending().await,
+            }
         };
-        if !sink(sentence) {
-            return;
+        tokio::select! {
+            biased;
+            event = events.recv(), if open => {
+                let Some(event) = event else {
+                    open = false;
+                    continue;
+                };
+                if !summariser.consented() {
+                    sink(ended_sentence());
+                    return;
+                }
+                let sentence = match event {
+                    TurnEvent::Finished { reply } => {
+                        waiting.push_back((TurnKind::Finished, reply));
+                        continue;
+                    }
+                    TurnEvent::Failed { reply } => {
+                        waiting.push_back((TurnKind::Failed, reply));
+                        continue;
+                    }
+                    TurnEvent::Permission { wants } => ReadingSentence {
+                        kind: ReadingSentenceKind::Permission,
+                        text: permission_sentence(agent, &wants),
+                    },
+                    TurnEvent::Blocked { cause } => ReadingSentence {
+                        kind: ReadingSentenceKind::Blocked,
+                        text: blocked_sentence(agent, cause),
+                    },
+                };
+                if !sink(sentence) {
+                    return;
+                }
+            }
+            summary = in_flight => {
+                summarising = None;
+                let Some(summary) = summary else {
+                    sink(ended_sentence());
+                    return;
+                };
+                let sentence = ReadingSentence {
+                    kind: ReadingSentenceKind::Turn,
+                    text: summary.text,
+                };
+                if !sink(sentence) {
+                    return;
+                }
+            }
         }
     }
-    sink(ended_sentence());
 }
 
 /// `text` on one line with control characters dropped and whitespace
@@ -1232,6 +1306,168 @@ mod tests {
         deck.abort();
     }
 
+    /// Scenario (PR #1617 review): the deck broadcasts a permission prompt at
+    /// the moment it confirms the agent's reply stream. Reading subscribes to
+    /// the status stream before the reply stream, so the prompt is delivered
+    /// rather than falling between the two subscriptions.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reading_a_status_while_the_reply_stream_is_confirmed_is_not_lost() {
+        use dot_agent_deck::daemon_protocol::{
+            AttachResponse, CAP_TURN_REPLIES, KIND_EVENT, PROTOCOL_VERSION, read_frame,
+            write_frame, write_resp,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // What the deck broadcasts reaches only the status streams subscribed
+        // at that moment, as the daemon's broadcast does.
+        let (broadcast, _) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
+        let mut permission = status("agent-7", EventType::PermissionRequest);
+        permission.tool_name = Some("Bash".to_string());
+        let permission = serde_json::to_vec(&BroadcastMsg::Event(permission)).unwrap();
+        let deck = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let broadcast = broadcast.clone();
+                let permission = permission.clone();
+                tokio::spawn(async move {
+                    let Ok(Some((_, bytes))) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    match request["op"].as_str() {
+                        Some("hello") => {
+                            let hello = AttachResponse {
+                                capabilities: Some(vec![CAP_TURN_REPLIES.to_string()]),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            };
+                            let _ = write_resp(&mut stream, &hello).await;
+                        }
+                        Some("subscribe-events") => {
+                            let mut heard = broadcast.subscribe();
+                            let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                            while let Ok(frame) = heard.recv().await {
+                                let _ = write_frame(&mut stream, KIND_EVENT, &frame).await;
+                            }
+                        }
+                        Some("subscribe-turn-replies") => {
+                            let _ = broadcast.send(permission);
+                            let _ = write_resp(&mut stream, &AttachResponse::ok()).await;
+                            std::future::pending::<()>().await;
+                        }
+                        _ => {
+                            let _ = write_resp(&mut stream, &AttachResponse::err("unknown")).await;
+                        }
+                    }
+                });
+            }
+        });
+        let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
+        let mut events = source.subscribe(&target()).await.unwrap();
+        let heard = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("the prompt broadcast during the subscription was delivered")
+            .expect("stream live");
+        assert_eq!(
+            heard,
+            TurnEvent::Permission {
+                wants: "Bash".to_string()
+            }
+        );
+        deck.abort();
+    }
+
+    /// A summariser whose summaries wait until the test releases them, and
+    /// that records each request as it starts.
+    #[derive(Default)]
+    struct Slow {
+        started: Mutex<Vec<String>>,
+        release: tokio::sync::Notify,
+    }
+
+    impl TurnSummariser for Slow {
+        fn consented(&self) -> bool {
+            true
+        }
+
+        fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
+            self.started.lock().unwrap().push(request.reply.to_string());
+            let text = format!("summary of {}", request.reply);
+            Box::pin(async move {
+                self.release.notified().await;
+                Some(Summary {
+                    text,
+                    fallback: None,
+                })
+            })
+        }
+    }
+
+    /// Scenario (PR #1617 review): a turn finishes and its summary is slow to
+    /// come back; while it is being made the agent asks for permission and a
+    /// second turn finishes. The permission prompt is spoken at once, before
+    /// the summary; the second turn's summary is not started until the first
+    /// one's is spoken, so the summaries keep their order.
+    #[tokio::test]
+    async fn voice_reading_an_alert_is_not_held_behind_a_slow_summary() {
+        let summariser = Arc::new(Slow::default());
+        let (send, events) = mpsc::channel(8);
+        let (heard_tx, mut heard) = mpsc::unbounded_channel();
+        let reading = {
+            let summariser = Arc::clone(&summariser);
+            tokio::spawn(async move {
+                read_turns("tester", events, summariser.as_ref(), |sentence| {
+                    heard_tx.send(sentence).is_ok()
+                })
+                .await;
+            })
+        };
+        async fn next(heard: &mut mpsc::UnboundedReceiver<ReadingSentence>) -> ReadingSentence {
+            tokio::time::timeout(Duration::from_secs(5), heard.recv())
+                .await
+                .expect("a sentence in time")
+                .expect("reading live")
+        }
+        send.send(TurnEvent::Finished {
+            reply: "one".to_string(),
+        })
+        .await
+        .unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while summariser.started.lock().unwrap().is_empty() {
+            assert!(tokio::time::Instant::now() < until, "no summary started");
+            tokio::task::yield_now().await;
+        }
+        send.send(TurnEvent::Finished {
+            reply: "two".to_string(),
+        })
+        .await
+        .unwrap();
+        send.send(TurnEvent::Permission {
+            wants: "run cargo publish".to_string(),
+        })
+        .await
+        .unwrap();
+        let first = next(&mut heard).await;
+        assert_eq!(first.kind, ReadingSentenceKind::Permission);
+        assert_eq!(
+            *summariser.started.lock().unwrap(),
+            vec!["one".to_string()],
+            "the second summary waits for the first"
+        );
+
+        summariser.release.notify_one();
+        assert_eq!(next(&mut heard).await.text, "summary of one");
+        summariser.release.notify_one();
+        assert_eq!(next(&mut heard).await.text, "summary of two");
+        drop(send);
+        assert_eq!(next(&mut heard).await, ended_sentence());
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("reading ends")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn voice_reading_reads_events_in_order_until_the_sink_refuses() {
         let summariser = Recording::default();
@@ -1258,11 +1494,13 @@ mod tests {
             true
         })
         .await;
+        // The permission prompt is never held behind a summary; the
+        // summaries keep the order their turns finished in.
         assert_eq!(
             heard,
             vec![
-                "summary of one".to_string(),
                 "The tester is asking for permission: two.".to_string(),
+                "summary of one".to_string(),
                 "summary of three".to_string(),
                 READING_ENDED.to_string(),
             ],
