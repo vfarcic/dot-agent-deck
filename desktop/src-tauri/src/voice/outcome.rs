@@ -1590,6 +1590,21 @@ fn resolve_param(
         deck_identity: None,
         names: Vec::new(),
     };
+    // What follows the longest of `introductions` the transcript opens with,
+    // marked as that introduction: dictation's boundary when the model's own
+    // mark is not one to trust ([`MARKED_WHOLE_INTRODUCTIONS`],
+    // [`INFINITIVE_INTRODUCTIONS`]).
+    let typed_after =
+        |introductions: &[&'static str]| match opening_with(transcript.text(), introductions)
+            .and_then(|opening| Some((opening, strip_opening(transcript.text(), opening)?)))
+            .filter(|(_, rest)| !rest.trim().is_empty())
+        {
+            Some((opening, rest)) => Ok(ResolvedParam {
+                spoken: opening.to_string(),
+                ..param(rest.to_string(), rest.to_string())
+            }),
+            None => Err(Unmet::NoMatch),
+        };
     let choice_param = |found: ChoiceMatch| match found {
         ChoiceMatch::One { id, label } => Ok(param(id, label)),
         ChoiceMatch::None => Err(Unmet::NoMatch),
@@ -1663,6 +1678,22 @@ fn resolve_param(
         // whole difference between a model locating content and a model
         // supplying it.
         ParamKind::SpokenPrefix => match strip_opening(transcript.text(), spoken) {
+            // The model marked one word too late: "tell it to put" for "tell
+            // it to put END after the report", which `gpt-5-mini` did about
+            // one time in ten on `main` (issue #1496, found by the phrase
+            // fixtures), dropping the verb of what the user asked for. After
+            // "tell it to" or "ask it to" what follows is that request, which
+            // the row says belongs to the text, so the boundary is the
+            // introduction — found in OUR transcript, and what is typed is a
+            // longer slice of it, never the model's string.
+            Some(_)
+                if row.id == DICTATE_ROW
+                    && opening_with(transcript.text(), &INFINITIVE_INTRODUCTIONS)
+                        .and_then(|opening| strip_opening(spoken, opening))
+                        .is_some_and(|past| !past.trim().is_empty()) =>
+            {
+                typed_after(&INFINITIVE_INTRODUCTIONS)
+            }
             Some(rest) if !rest.trim().is_empty() => Ok(param(rest.to_string(), rest.to_string())),
             // The model marked the WHOLE utterance as the introduction, which
             // its row says never to do and `gpt-5-mini` was measured doing for
@@ -1675,16 +1706,7 @@ fn resolve_param(
             // name marked whole is not one of these introductions (Qodo on
             // PR #1529).
             Some(_) if row.id != DICTATE_ROW => Err(Unmet::NoMatch),
-            Some(_) => match opening_with(transcript.text(), &MARKED_WHOLE_INTRODUCTIONS)
-                .and_then(|opening| Some((opening, strip_opening(transcript.text(), opening)?)))
-                .filter(|(_, rest)| !rest.trim().is_empty())
-            {
-                Some((opening, rest)) => Ok(ResolvedParam {
-                    spoken: opening.to_string(),
-                    ..param(rest.to_string(), rest.to_string())
-                }),
-                None => Err(Unmet::NoMatch),
-            },
+            Some(_) => typed_after(&MARKED_WHOLE_INTRODUCTIONS),
             // Two situations, one refusal, because the user's position is
             // the same in both: nothing was typed. Either the marked words
             // are not how the utterance started, or they are the whole of
@@ -2931,6 +2953,12 @@ fn offered(
 /// ([`resolve_param`]'s `spoken_prefix` arm). Not a vocabulary: every other
 /// introduction still works the way it always has, through the model's mark.
 const MARKED_WHOLE_INTRODUCTIONS: [&str; 4] = ["tell it to", "ask it to", "tell it", "ask it"];
+
+/// The introductions among [`MARKED_WHOLE_INTRODUCTIONS`] that end in "to":
+/// what follows one is the request itself, so a mark that runs past one took
+/// words the user wanted typed. "tell it" and "ask it" are not here, because
+/// what follows them may still be introduction ("tell it that …").
+const INFINITIVE_INTRODUCTIONS: [&str; 2] = ["tell it to", "ask it to"];
 
 /// The other row a bare "go up" means, when the model picked `row` and `row`
 /// cannot run here: the New agent dialog's `go_to_parent` and the dashboard's
@@ -11114,6 +11142,51 @@ mod tests {
             matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
             "{outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn voice_outcome_dictation_marked_past_tell_it_to_types_the_request_whole() {
+        // Measured on `gpt-5-mini` (issue #1496): "tell it to put" for this
+        // utterance, which typed "END after the report" without its verb.
+        for (said, marked, introduction, typed) in [
+            (
+                "tell it to put END after the report",
+                "tell it to put",
+                "tell it to",
+                "put END after the report",
+            ),
+            (
+                "Ask it to summarise what it just did",
+                "ask it to summarise",
+                "ask it to",
+                "summarise what it just did",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("dictate_to_agent").with_param("prefix", marked),
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+                panic!("expected the words typed, got {outcome:?}");
+            };
+            assert_eq!(params[0].spoken, introduction);
+            assert_eq!(params[0].value, typed);
+        }
+
+        // Only past an introduction ending in "to": after "tell it" the
+        // model's mark may still be introduction, and stands as marked.
+        let said = "tell it that the build is green";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("dictate_to_agent").with_param("prefix", "tell it that"),
+        );
+        let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+        let VoiceOutcome::Dispatch { params, .. } = &outcome else {
+            panic!("expected the words typed, got {outcome:?}");
+        };
+        assert_eq!(params[0].spoken, "tell it that");
+        assert_eq!(params[0].value, "the build is green");
     }
 
     #[tokio::test]
