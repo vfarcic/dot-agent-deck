@@ -1642,9 +1642,10 @@ fn resolve_param(
                 .any(|word| AGENT_CATEGORY_WORDS.contains(&word.as_str()));
         (by_recency || bare_category).then(|| resolve_agent_ref_on(heard, agents, decks))
     };
-    // Whether the transcript names a fact of another agent that the agent
-    // `id` lacks ([`excluded_by_another`]).
-    let heard_against = |id: &str| {
+    // The transcript's facts as an agent reference reads them: its words
+    // ([`reference_words`]) less the ones that are not a fact an agent has to
+    // account for.
+    let heard_reference = || {
         let (mut said, content) = reference_words(&heard_facts);
         // A recency word is an ORDER, settled below, not a fact an agent
         // has to account for (Qodo on PR #1529).
@@ -1662,6 +1663,12 @@ fn resolve_param(
             }
         }
         let content: BTreeSet<String> = content.intersection(&said).cloned().collect();
+        (said, content)
+    };
+    // Whether the transcript names a fact of another agent that the agent
+    // `id` lacks ([`excluded_by_another`]).
+    let heard_against = |id: &str| {
+        let (said, content) = heard_reference();
         agents
             .iter()
             .find(|agent| agent.id == id)
@@ -1764,11 +1771,22 @@ fn resolve_param(
             // model dropped — "the stuck Codex agent" answered as "the one
             // that's stuck" — rules out the agents that lack it, and a recency
             // word picks among the agents in that state.
+            //
+            // And held to it on its own as well, whatever other agents there
+            // are: the state is the model's reading of the user's words rather
+            // than a name, so every other word the user said has to be one of
+            // the agent's own names ([`accounts_for_the_rest`]). With a single
+            // stuck Claude Code agent, "stop the stuck Codex agent" answered
+            // as "the one that's stuck" reaches nobody — no other agent is
+            // there to account for "Codex", and that is not a reason to stop
+            // the one that is not Codex.
             AgentRefMatch::None => {
+                let (said, content) = heard_reference();
                 let in_state: Vec<&DesktopAgent> =
                     agents_in_state(spoken, transcript.text(), agents)
                         .into_iter()
                         .filter(|agent| !heard_against(&agent.id))
+                        .filter(|agent| accounts_for_the_rest(agent, &content, &said))
                         .collect();
                 let (mut said, _) = reference_words(&heard_facts);
                 let in_state = match Recency::said(&mut said) {
@@ -3500,21 +3518,81 @@ fn excluded_by_another(
     said: &BTreeSet<String>,
     agents: &[DesktopAgent],
 ) -> bool {
-    let covered = |agent: &DesktopAgent| {
-        let mut covered = BTreeSet::new();
-        for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
-            let name_words = words(&normalize(&spoken_text(name)));
-            if !name_words.is_empty() && name_words.is_subset(said) {
-                covered.extend(name_words.intersection(content).cloned());
-            }
-        }
-        covered
-    };
-    let left_out: BTreeSet<String> = content.difference(&covered(agent)).cloned().collect();
+    let left_out: BTreeSet<String> = content
+        .difference(&covered_by(agent, content, said))
+        .cloned()
+        .collect();
     !left_out.is_empty()
-        && agents
-            .iter()
-            .any(|other| other.id != agent.id && !covered(other).is_disjoint(&left_out))
+        && agents.iter().any(|other| {
+            other.id != agent.id && !covered_by(other, content, said).is_disjoint(&left_out)
+        })
+}
+
+/// The words of `content` that `agent`'s names, shown or known, account for —
+/// a name counting when its every word is in `said`.
+fn covered_by(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut covered = BTreeSet::new();
+    for name in spoken_names(agent).iter().chain(&agent_facets(agent)) {
+        let name_words = words(&normalize(&spoken_text(name)));
+        if !name_words.is_empty() && name_words.is_subset(said) {
+            covered.extend(name_words.intersection(content).cloned());
+        }
+    }
+    covered
+}
+
+/// Words a reference by STATE carries that name no agent, beyond
+/// [`STATE_WORDS`] and [`STATE_FILLER`]: the courtesy around it, and the
+/// nouns a directory, a run or a daemon is introduced with ("in the
+/// prd-1487 run"), whose own names are what [`covered_by`] reads.
+const STATE_REFERENCE_CARRIERS: [&str; 17] = [
+    "me",
+    "please",
+    "now",
+    "just",
+    "can",
+    "could",
+    "would",
+    "you",
+    "go",
+    "right",
+    "dir",
+    "directory",
+    "folder",
+    "orchestration",
+    "run",
+    "mode",
+    "type",
+];
+
+/// Whether `agent`, found by state ([`agents_in_state`]), accounts for every
+/// other fact the transcript states — `content` and `said` as
+/// [`excluded_by_another`] takes them — by its own names alone (issue #1496).
+///
+/// [`excluded_by_another`] is comparative: it rules an agent out for a word
+/// ANOTHER agent's names account for, so with no such agent a dropped
+/// "Codex", directory or run rules nobody out. A state is the model's reading
+/// of the user's words, not a name, so the agents it finds are held to the
+/// rest of what the user said absolutely: a word that is not a state, filler
+/// or [`STATE_REFERENCE_CARRIERS`] has to be one of this agent's own names, or
+/// the recovery does not reach it.
+fn accounts_for_the_rest(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+) -> bool {
+    let facts: BTreeSet<String> = content
+        .iter()
+        .filter(|word| !STATE_WORDS.iter().any(|(state, _)| state == word))
+        .filter(|word| !STATE_FILLER.contains(&word.as_str()))
+        .filter(|word| !STATE_REFERENCE_CARRIERS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    facts.is_subset(&covered_by(agent, &facts, said))
 }
 
 /// `text`'s words as an agent reference reads them, and the ones of those
@@ -5196,6 +5274,85 @@ mod tests {
             matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
             "{outcome:?}"
         );
+    }
+
+    /// Scenario: the only agent is the blocked Claude Code agent in
+    /// `docs-site`, and the user asks for a stuck agent with a type, a
+    /// directory or a run it does not have; the model answers only "the one
+    /// that's stuck". No other agent accounts for the dropped words, and they
+    /// still rule the stuck one out, so nothing is opened or offered for
+    /// stopping — while its own type and directory, said, still reach it.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_named_by_state_alone_is_held_to_the_facts_the_user_said() {
+        let alone = || vec![stuck_fleet().remove(1)];
+        for (said, row, screen) in [
+            ("open the stuck Codex agent", "open_agent", Screen::Deck),
+            ("stop the stuck Codex agent", "stop_agent", Screen::Overview),
+            (
+                "open the stuck agent in billing",
+                "open_agent",
+                Screen::Deck,
+            ),
+            (
+                "stop the stuck agent in billing",
+                "stop_agent",
+                Screen::Overview,
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, screen, &alone(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                "{said:?} must not reach the only stuck agent: {outcome:?}"
+            );
+        }
+        for said in [
+            "open the stuck agent",
+            "open the stuck Claude Code agent",
+            "open the stuck agent in docs-site",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, Screen::Deck, &alone(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "agent-vega"),
+                "{said:?}: {outcome:?}"
+            );
+        }
+        // A run: the only stuck reviewer is in docs-1502, so naming prd-1487
+        // reaches nobody, and naming its own run reaches it.
+        let only = vec![in_titled_orchestration(
+            role_agent_in_state("review-docs", "reviewer", "error"),
+            "orch-docs-1502",
+            "review",
+            "docs-1502",
+        )];
+        for (said, reached) in [
+            ("open the stuck reviewer in the prd-1487 run", false),
+            ("open the stuck reviewer in the docs-1502 run", true),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", "the one that's stuck"),
+            );
+            let outcome = run(&resolver, Screen::Deck, &only, said).await;
+            if reached {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "review-docs"),
+                    "{said:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: two reviewers are stuck, one in the prd-1487 run and one in
