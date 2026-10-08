@@ -7136,6 +7136,27 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a real Codex process, a failed or quota-blocked Codex turn's reply, the desktop's handling of the ended stream, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
 
+##### voice/reading-reply/004 — A REAL interactive OpenCode turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine OpenCode plugin events).
+- **Agent:** REAL interactive OpenCode on the cheap test model, using the `prompt/voice-keys/005` harness with imported credentials.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by OpenCode; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, subagent filtering, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local OpenCode authentication and runs nowhere in CI.
+
+##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, genuine Codex Stop hook and rollout tailer).
+- **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; ChatGPT-login hosts can override the model with `DOT_AGENT_DECK_CODEX_TEST_MODEL`.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Codex; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window spanning multiple rollout polls, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
+
+##### voice/reading-reply/006 — A REAL interactive Pi Haiku turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+- **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine bundled Pi extension).
+- **Agent:** REAL interactive Pi on Anthropic `claude-haiku-4-5` with `--approve`, using the `pi/live/001` startup path where the daemon materializes the bundled extension in the isolated HOME.
+- **Asserts:** a client subscribes before submitting a directive to list fixture files; within 90 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Pi; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
+- **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, or other agents' reply sources.
+- **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Pi and `ANTHROPIC_API_KEY` and runs nowhere in CI.
+
 ### Test harness teardown (issue #1566)
 
 #### harness/teardown

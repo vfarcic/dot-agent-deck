@@ -18,8 +18,9 @@
 //! their input boxes are drawn differently. Pi is not covered — see the
 //! catalog's `prompt/voice-keys` section for why.
 //!
-//! `voice/reading-reply/002` reuses the interactive Claude harness to prove
-//! that a genuine Stop hook delivers the final reply to a subscribed client.
+//! `voice/reading-reply/002,004,005,006` reuse these interactive harnesses to prove
+//! that genuine turns deliver final replies to a subscribed client, with
+//! OpenCode, Codex and Pi delivering each turn only once.
 
 mod common;
 
@@ -304,6 +305,230 @@ fn reading_reply_002_real_claude_stop_delivers_sentinel_to_subscribed_client() {
         Duration::from_secs(2),
         |grid| grid.contains(SENTINEL),
     );
+}
+
+/// Subscribe before one genuine interactive turn and require the discovered
+/// fixture filename in both its final reply and the attached pane. Keep the
+/// stream open beyond two rollout polls to catch duplicate turn deliveries.
+fn exercise_reading_reply(
+    launch: &AgentLaunch,
+    deck: &TuiDeck,
+    agent_id: &str,
+    sentinel: &str,
+    reply_timeout: Duration,
+    input_cleared: Option<fn(&str) -> bool>,
+) {
+    use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("turn reply client runtime");
+    let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
+    let GatedQuery::Answered(mut replies) = runtime
+        .block_on(client.subscribe_turn_replies(agent_id))
+        .expect("subscribe before submitting the real agent's prompt")
+    else {
+        panic!("the current daemon must advertise turn-replies");
+    };
+
+    // Only the prefix is supplied: the agent must discover the full filename.
+    let mut writer = PaneWriter::attach(deck.attach_socket_path(), agent_id);
+    writer.write(
+        "Use your shell tool to run ls -1 in the current directory. Then reply with the full \
+         filename that starts with reading_reply_sentinel, verbatim. That is the whole task; \
+         do not change any files.",
+    );
+    deck.wait_until_grid_then_hold(
+        "the directive settled in the input box",
+        BEFORE_SUBMIT,
+        |grid| grid.contains("Use your shell tool"),
+    );
+    writer.write("\r");
+    if launch.resubmit_until_empty || input_cleared.is_some() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !deck.wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            input_cleared.map_or_else(|| grid.contains(launch.ready), |empty| empty(grid))
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "the prompt never left the input box:\n{}",
+                deck.snapshot_grid()
+            );
+            writer.write("\r");
+        }
+    }
+
+    let reply = runtime.block_on(async {
+        tokio::time::timeout(reply_timeout, replies.next_reply())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{} delivered no turn reply within {reply_timeout:?}; grid:\n{}",
+                    launch.name,
+                    deck.snapshot_grid()
+                )
+            })
+            .expect("decode the real agent's final reply")
+            .expect("the subscription must stay open until the turn ends")
+    });
+    assert_eq!(reply.agent_id, agent_id);
+    assert!(!reply.reply.failed, "the real turn failed: {reply:?}");
+    assert!(
+        reply.reply.text.contains(sentinel),
+        "the final reply must contain the discovered sentinel {sentinel:?}: {reply:?}"
+    );
+    assert!(
+        deck.wait_for_grid_string_within(sentinel, Duration::from_secs(30)),
+        "the sentinel reply must also be visible in the attached pane:\n{}",
+        deck.snapshot_grid()
+    );
+    let duplicate = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), replies.next_reply()).await
+    });
+    assert!(
+        duplicate.is_err(),
+        "{} must deliver exactly one reply for the turn; first={reply:?}, next={duplicate:?}; grid:\n{}",
+        launch.name,
+        deck.snapshot_grid()
+    );
+    assert_running(deck, agent_id, "the completed reading turn");
+}
+
+/// Scenario: Open a real interactive OpenCode pane on the cheap test model with a uniquely named sentinel file and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
+#[spec("voice/reading-reply/004")]
+#[test]
+fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client() {
+    skip_unless!(common::check_opencode_available());
+
+    const SENTINEL: &str = "reading_reply_sentinel_opencode_b6d9.txt";
+    let launch = AgentLaunch {
+        name: "reading-reply-opencode",
+        ready: "Ask anything",
+        resubmit_until_empty: false,
+    };
+    let command = format!("opencode --model {}", common::opencode_test_model());
+    let builder = TuiDeck::builder().with_imported_opencode_credentials();
+    let (deck, agent_id, _) = launch_agent(builder, "minimal", &launch, &command, SENTINEL);
+    exercise_reading_reply(
+        &launch,
+        &deck,
+        &agent_id,
+        SENTINEL,
+        Duration::from_secs(180),
+        None,
+    );
+}
+
+/// Scenario: Open a real interactive Codex pane on the cheap test model with a uniquely named sentinel file and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel and appear in the attached pane, with exactly one delivery during a five-second check even though Codex reports turn completion through its Stop hook and rollout.
+#[spec("voice/reading-reply/005")]
+#[test]
+fn reading_reply_005_real_codex_delivers_sentinel_once_to_subscribed_client() {
+    skip_unless!(common::check_codex_available());
+
+    const SENTINEL: &str = "reading_reply_sentinel_codex_e3a8.txt";
+    let launch = AgentLaunch {
+        name: "reading-reply-codex",
+        ready: "Ask Codex to do anything",
+        resubmit_until_empty: true,
+    };
+    let command = format!(
+        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
+        common::codex_test_model()
+    );
+    let builder = TuiDeck::builder()
+        .with_env("PATH", path_with_binary_dir())
+        .with_imported_codex_credentials();
+    let (deck, agent_id, _) = launch_agent(builder, "codex-live", &launch, &command, SENTINEL);
+    exercise_reading_reply(
+        &launch,
+        &deck,
+        &agent_id,
+        SENTINEL,
+        Duration::from_secs(180),
+        None,
+    );
+}
+
+/// Scenario: Open a real interactive Pi Haiku pane in a fixture containing a uniquely named sentinel, with the bundled extension installed by the daemon. Subscribe before asking Pi to discover the filename; its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
+#[spec("voice/reading-reply/006")]
+#[test]
+fn reading_reply_006_real_pi_delivers_sentinel_once_to_subscribed_client() {
+    let pi_available = std::process::Command::new("pi")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    skip_unless!(if !pi_available {
+        Err("pi CLI not installed (could not invoke pi --version)".to_string())
+    } else if std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err("ANTHROPIC_API_KEY not set — real Pi needs Anthropic auth".to_string())
+    });
+
+    const SENTINEL: &str = "reading_reply_sentinel_pi_a2f7.txt";
+    let launch = AgentLaunch {
+        name: "reading-reply-pi",
+        ready: "claude-haiku-4-5",
+        resubmit_until_empty: false,
+    };
+    // No initial prompt: subscribe before Pi starts the genuine turn. As in
+    // pi/live/001, daemon startup materializes the bundled extension in HOME.
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env("PATH", path_with_binary_dir())
+        .with_env(
+            "ANTHROPIC_API_KEY",
+            std::env::var("ANTHROPIC_API_KEY").expect("checked by Pi preflight"),
+        )
+        .with_continue_session(
+            launch.name,
+            "pi --provider anthropic --model claude-haiku-4-5 --approve",
+        )
+        .launch_with_fixture("minimal");
+    std::fs::write(deck.workdir().join(SENTINEL), "reading reply Pi sentinel\n")
+        .expect("write the sentinel file");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    assert!(
+        deck.wait_for_grid_string_within(launch.ready, Duration::from_secs(90)),
+        "the genuine interactive Pi UI must render before submitting; grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let record = record_named(&deck, launch.name);
+    // Leave room for the harness to dump the pane before nextest's 180s cap.
+    exercise_reading_reply(
+        &launch,
+        &deck,
+        &record.id,
+        SENTINEL,
+        Duration::from_secs(90),
+        Some(pi_input_cleared),
+    );
+}
+
+/// Pi can paint its footer before startup accepts Enter. Its input lies
+/// between the last two horizontal rules; submitted prompts move above them.
+fn pi_input_cleared(grid: &str) -> bool {
+    let input_rule =
+        |row: &str| row.contains("────────────────────") && !row.contains(['└', '┘', '┌', '┐']);
+    let mut rows = grid.lines().rev();
+    if !rows.any(input_rule) {
+        return false;
+    }
+    for row in rows {
+        if input_rule(row) {
+            return true;
+        }
+        if row.contains("Use your shell tool") || row.contains("reading_reply_sentinel") {
+            return false;
+        }
+    }
+    false
 }
 
 /// The highest number that opens a line of the pane — how far a numbered list
