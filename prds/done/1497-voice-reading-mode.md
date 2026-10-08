@@ -1,6 +1,6 @@
 # PRD #1497: Voice "reading on" — hear a short summary of the open agent's turns
 
-**Status**: In progress — M1 decided 2026-10-07
+**Status**: Complete — 2026-10-08
 **Priority**: Medium
 **Created**: 2026-10-02
 **Issue**: [#1497](https://github.com/vfarcic/dot-agent-deck/issues/1497)
@@ -77,13 +77,13 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 ## Milestones
 
 - [x] **M1: Decisions recorded.** (2026-10-07: D8–D12.) The open questions below answered with the maintainer and written into this document, including the CLAUDE.md rule 9 experimental-flag question for this new voice surface.
-- [ ] **M2: Daemon turn-end reply.** The daemon makes each finished turn's final reply available to clients for a given agent, from the agent's own data (Claude Code hooks, Codex session log, and whatever OpenCode provides), additive and capability-gated per rule 18, with rule 12 answered and the cross-version check run.
-- [ ] **M3: Summaries.** The desktop turns a final reply into one or two spoken-length sentences through the existing voice model connection, bounded in input and output, with a deterministic fallback when the model fails (e.g. "The tester finished its turn.").
-- [ ] **M4: Speech.** Provider text-to-speech where available, the OS voice otherwise; interrupt and replace-queue behaviour; the microphone does not hear the app's speech.
-- [ ] **M5: The reading mode.** `reading on` / `reading off` / `stop` rows, scoped to the open agent, the visible indicator, the Settings opt-in with its explanation, and the end conditions (pane closed, voice off). Permission prompts and errors are announced immediately.
-- [ ] **M6: Agent parity.** Claude Code, Codex and OpenCode covered, or the gap named per agent in the user docs (rule 20); Pi and Devin documented as covered or not.
-- [ ] **M7: Tests.** Unit tests for the summary prompt bounds and fallback, the mode's state machine and end conditions, and the daemon's turn-end reply for each covered agent from captured real payloads; a real-agent lane-2 test (rule 4) with an interactive Claude Code on a cheap model, asserting a turn-end summary event reaches the desktop after "reading on".
-- [ ] **M8: Docs.** `docs/desktop/voice.md` (what reading does, how to turn it on, privacy, per-agent coverage), developer docs for the daemon side under `docs/develop/`, and a changelog fragment (rule 19).
+- [x] **M2: Daemon turn-end reply.** The daemon makes each finished turn's final reply available to clients for a given agent, from the agent's own data (Claude Code hooks, Codex session log, and whatever OpenCode provides), additive and capability-gated per rule 18, with rule 12 answered and the cross-version check run. (Done: `CAP_TURN_REPLIES` / `SubscribeTurnReplies`, no `PROTOCOL_VERSION` bump, no contract break; Claude Code, Codex, OpenCode and Pi. Cross-version: the PR's `cross-version` CI job.)
+- [x] **M3: Summaries.** The desktop turns a final reply into one or two spoken-length sentences through the existing voice model connection, bounded in input and output, with a deterministic fallback when the model fails (e.g. "The tester finished its turn."). (Done.)
+- [x] **M4: Speech.** Provider text-to-speech where available, the OS voice otherwise; interrupt and replace-queue behaviour; the microphone does not hear the app's speech. (Done; echo handling per D8 as narrowed.)
+- [x] **M5: The reading mode.** `reading on` / `reading off` / `stop` rows, scoped to the open agent, the visible indicator, the Settings opt-in with its explanation, and the end conditions (pane closed, voice off). Permission prompts and errors are announced immediately. (Done; the interrupt row is `hush_reading`.)
+- [x] **M6: Agent parity.** Claude Code, Codex and OpenCode covered, or the gap named per agent in the user docs (rule 20); Pi and Devin documented as covered or not. (Done: Claude Code, Codex, OpenCode and Pi covered; Devin documented as expected but not verified.)
+- [x] **M7: Tests.** Unit tests for the summary prompt bounds and fallback, the mode's state machine and end conditions, and the daemon's turn-end reply for each covered agent from captured real payloads; a real-agent lane-2 test (rule 4) with an interactive Claude Code on a cheap model, asserting a turn-end summary event reaches the desktop after "reading on". (Done: unit tests, lane-1 `voice/reading-reply/001` and `/003`, lane-2 real-agent `voice/reading-reply/002` Claude, `/004` OpenCode, `/005` Codex, `/006` Pi.)
+- [x] **M8: Docs.** `docs/desktop/voice.md` (what reading does, how to turn it on, privacy, per-agent coverage), developer docs for the daemon side under `docs/develop/`, and a changelog fragment (rule 19). (Done: `docs/desktop/voice.md`, `docs/develop/turn-replies.md`, `changelog.d/1497.feature.md`.)
 
 ## Risks
 
