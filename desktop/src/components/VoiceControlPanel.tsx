@@ -1293,6 +1293,13 @@ interface VoiceControlPanelProps {
   /** PRD #1497 — told when reading mode starts or ends, so the host can mark
    * the pane being read. */
   onReadingChange?: (target: ReadingTarget | undefined) => void;
+  /**
+   * PRD #1497 — reading's Settings opt-in as the settings on screen hold it
+   * (`"on"` or `"off"`). Turned off, reading ends here at once — a drain
+   * still being said included, which the Rust side has no session left to
+   * end. Absent, nothing is ended on its account.
+   */
+  readingConsent?: string;
   /** PR #1451, round 3 — told when voice turns on or off, so the host can
    * share it with the lists that render differently while it is on. */
   onVoiceChange?: (on: boolean) => void;
@@ -1370,7 +1377,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, onReadingChange, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, onReadingChange, readingConsent, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -3870,6 +3877,11 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     void reader.mode.turnOff();
   }, [reader.mode, reportRefused]);
+  /* PRD #1497 — the Settings opt-in turned off ends reading, and cuts off
+     whatever of it is still being said, without waiting for the save. */
+  useEffect(() => {
+    if (readingConsent !== undefined && readingConsent !== "on") void reader.mode.consentOff();
+  }, [reader.mode, readingConsent]);
   /** PRD #1497 D6 — "stop" / "quiet": silence the app. Reading stays on. */
   const quietSpeech = useCallback(() => reader.mode.quiet(), [reader.mode]);
   /* PRD #1497 D11 — reading ends when the pane on screen stops being the

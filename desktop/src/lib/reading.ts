@@ -24,6 +24,13 @@
  * "Reading off." is queued. But nothing is cut off: what is being said and
  * what is already queued — that last summary among it — are heard first.
  *
+ * Until that speech has finished the session is *draining*, and everything
+ * that ends live reading still cuts the drain off the same way (PR #1617's
+ * review): "reading off" (answered as reading off, not as "Reading is not
+ * on."), "voice off", another pane, and the Settings opt-in turned off
+ * ({@link ReadingMode.consentOff}). "stop" and "quiet" silence it as they
+ * silence any speech.
+ *
  * # What it does NOT end
  *
  * "stop" and "quiet" silence the app's speech and leave reading on: the next
@@ -82,7 +89,7 @@ export interface ReadingModeDeps {
   start: (target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => Promise<ReadingStartDto>;
   /** End the subscription `start` answered with `session`. */
   stop: (session: number) => Promise<void>;
-  speech: Pick<SpeechQueue, "say" | "interrupt">;
+  speech: Pick<SpeechQueue, "say" | "interrupt" | "speaking" | "subscribe">;
   /** Told whenever the agent being read changes, for the pane's indicator. */
   onChange?: (target: ReadingTarget | undefined) => void;
 }
@@ -109,10 +116,17 @@ function sameAgent(a: { deckId: string; agentId: string } | undefined, b: { deck
 export class ReadingMode {
   private current: { target: ReadingTarget; session: number } | undefined;
   private starting: ReadingTarget | undefined;
+  /** The agent whose events closed while its last sentences are still being said. */
+  private draining: ReadingTarget | undefined;
   private generation = 0;
   private alerts = 0;
 
-  constructor(private readonly deps: ReadingModeDeps) {}
+  constructor(private readonly deps: ReadingModeDeps) {
+    // The drain is over once the queue has nothing left to say.
+    deps.speech.subscribe((speaking) => {
+      if (!speaking) this.draining = undefined;
+    });
+  }
 
   /** The agent being read, if reading is on. */
   get target(): ReadingTarget | undefined {
@@ -124,9 +138,12 @@ export class ReadingMode {
     return this.current !== undefined;
   }
 
-  /** Whether reading is on or starting. */
+  /**
+   * Whether reading is on, starting, or draining — its agent's events closed
+   * and its last sentences are still being said. What "reading off" ends.
+   */
   get active(): boolean {
-    return this.current !== undefined || this.starting !== undefined;
+    return this.current !== undefined || this.starting !== undefined || this.draining !== undefined;
   }
 
   /**
@@ -138,6 +155,9 @@ export class ReadingMode {
   async turnOn(target: ReadingTarget): Promise<ReadingTurnOn> {
     if (sameAgent(this.current?.target, target)) return { kind: "started", sentence: READING_ALREADY_ON };
     if (this.current !== undefined) await this.end(false);
+    // A drain is left to finish: those sentences are already queued, and the
+    // new session's own ending cuts them off with everything else.
+    this.draining = undefined;
     const generation = ++this.generation;
     this.starting = target;
     let answer: ReadingStartDto;
@@ -149,8 +169,9 @@ export class ReadingMode {
           return;
         }
         if (sentence.kind === "closed") {
-          // Nothing cut off: the last summary is already queued.
-          void this.end(true, false);
+          // Nothing cut off: the last summary is already queued, and is
+          // heard as a drain that everything ending reading still ends.
+          void this.end(true, true);
           return;
         }
         /* A turn's summary replaces a waiting summary for the same agent
@@ -187,14 +208,23 @@ export class ReadingMode {
 
   /** "reading off". Answers the sentence to show: {@link READING_OFF}, or {@link READING_ALREADY_OFF}. */
   async turnOff(): Promise<string> {
-    if (this.current === undefined && this.starting === undefined) return READING_ALREADY_OFF;
+    if (!this.active) return READING_ALREADY_OFF;
     await this.end(true);
     return READING_OFF;
   }
 
   /** "voice off": ends reading, saying so, if it was on. */
   async voiceOff(): Promise<void> {
-    if (this.current !== undefined || this.starting !== undefined) await this.end(true);
+    if (this.active) await this.end(true);
+  }
+
+  /**
+   * The Settings opt-in was turned off. The Rust side ends a live session
+   * itself (an `ended` sentence); this also reaches a start in progress and a
+   * drain, which have no session there to end.
+   */
+  async consentOff(): Promise<void> {
+    if (this.active) await this.end(true);
   }
 
   /**
@@ -202,7 +232,7 @@ export class ReadingMode {
    * it was turned on for — another agent's pane and no pane both end it.
    */
   async paneChanged(pane: { deckId: string; agentId: string } | undefined): Promise<void> {
-    const reading = this.current?.target ?? this.starting;
+    const reading = this.current?.target ?? this.starting ?? this.draining;
     if (reading === undefined || sameAgent(reading, pane)) return;
     await this.end(true);
   }
@@ -223,18 +253,20 @@ export class ReadingMode {
   /**
    * End the session, in this order: bump the generation so no late sentence
    * from it is queued again; cut off what is being said and drop everything
-   * queued (unless `interrupt` is false: the agent's events ended, and what
-   * was already handed to the speech queue is heard); then say "Reading
-   * off." (when `announce`); then stop the subscription.
+   * queued — a drain's included — unless `drain` (the agent's events ended,
+   * and what was already handed to the speech queue is heard, as a drain);
+   * then say "Reading off." (when `announce`); then stop the subscription.
    */
-  private async end(announce: boolean, interrupt = true): Promise<void> {
+  private async end(announce: boolean, drain = false): Promise<void> {
     this.generation += 1;
     this.starting = undefined;
+    this.draining = undefined;
     const ended = this.current;
     this.current = undefined;
     if (ended !== undefined) this.deps.onChange?.(undefined);
-    if (interrupt) this.deps.speech.interrupt();
+    if (!drain) this.deps.speech.interrupt();
     if (announce) this.deps.speech.say(READING_VOICE_KEY, READING_OFF);
+    if (drain && ended !== undefined && this.deps.speech.speaking) this.draining = ended.target;
     if (ended !== undefined) await this.deps.stop(ended.session);
   }
 }

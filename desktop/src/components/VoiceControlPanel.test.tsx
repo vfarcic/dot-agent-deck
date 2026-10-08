@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_PROMPT_KEYS } from "../data/fixture";
 import {
   DEFAULT_DESKTOP_SETTINGS,
+  DEFAULT_VOICE_SETTINGS,
   fixtureDesktopFeatures,
   type DesktopSettingsDto,
   type VoiceResultDto,
@@ -11,7 +12,7 @@ import {
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
-import { READING_START_FAILED } from "../lib/reading";
+import { READING_ALREADY_OFF, READING_START_FAILED } from "../lib/reading";
 
 const { terminalInvoke } = vi.hoisted(() => ({ terminalInvoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -2687,7 +2688,7 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     return result({ kind: "dispatch", transcript: said, action, invoke, params: [], sentence }, null, "local");
   }
 
-  async function startReading(start: () => Promise<{ kind: "started"; session: number }> = async () => ({ kind: "started", session: 41 })) {
+  async function startReading(start: () => Promise<{ kind: "started"; session: number }> = async () => ({ kind: "started", session: 41 }), consented = false) {
     const spoken = silentSynth();
     const steps: Parameters<typeof sequencedVoice>[0] = [{ outcome: heard("reading on") }];
     const voice = sequencedVoice(steps);
@@ -2702,6 +2703,14 @@ describe("voice reading mode (PRD #1497 M5)", () => {
       voiceReadingStop: vi.fn(async (session: number) => { stopped.push(session); }),
     };
     Object.assign(deck, reading);
+    if (consented) {
+      let document: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on" } };
+      deck.getSettings = vi.fn(async () => ({ settings: structuredClone(document), path: undefined }));
+      deck.saveSettings = vi.fn(async (next: DesktopSettingsDto) => {
+        document = structuredClone(next);
+        return structuredClone(document);
+      });
+    }
     render(<DeckShell runtime={deck} />);
     fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
     await turnVoiceOn(voice);
@@ -2716,6 +2725,40 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     };
     return { deck, reading, spoken, stopped, say, resolveVoice };
   }
+
+  /** The agent being read exits: its events close while the app is still saying "Reading on.", so reading is off but draining. */
+  async function closeEvents(reading: { voiceReadingStart: { mock: { calls: unknown[][] } } }) {
+    const onSentence = reading.voiceReadingStart.mock.calls[0][1] as (sentence: { kind: string; text: string }) => void;
+    await act(async () => { onSentence({ kind: "closed", text: "Reading off." }); });
+    await flush();
+    expect(screen.queryByTestId("agent-pane-reading")).toBeNull();
+  }
+
+  /** Scenario (PR #1617 round 3): the agent being read exits while the app is still speaking, so reading is off and its last sentences are draining; saying "reading off" then cuts the drain off and is answered as reading off, not as "Reading is not on.". */
+  it("answers reading off during a drain by ending it", async () => {
+    const { reading, spoken, say } = await startReading();
+    await closeEvents(reading);
+    const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
+    await say("reading off");
+    expect(vi.mocked(speechSynthesis.cancel).mock.calls.length).toBeGreaterThan(cancels);
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(READING_ALREADY_OFF);
+    expect(spoken.at(-1)).toBe("Reading off.");
+  });
+
+  /** Scenario (PR #1617 round 3): with Read turns aloud on, the agent being read exits while the app is still speaking; turning Read turns aloud off in Settings cuts the drain off at once and says "Reading off.". */
+  it("ends a drain when the Settings opt-in is turned off", async () => {
+    const { reading, spoken, say } = await startReading(undefined, true);
+    await closeEvents(reading);
+    await say("open settings");
+    fireEvent.click(screen.getByTestId("settings-section-voice"));
+    const group = screen.getByRole("radiogroup", { name: "Read turns aloud" });
+    expect(within(group).getByRole("radio", { name: "On" })).toBeChecked();
+    const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
+    await act(async () => { fireEvent.click(within(group).getByRole("radio", { name: "Off" })); });
+    await flush();
+    expect(vi.mocked(speechSynthesis.cancel).mock.calls.length).toBeGreaterThan(cancels);
+    expect(spoken.at(-1)).toBe("Reading off.");
+  });
 
   /** Scenario: with the Planner's pane open and voice on, saying "reading on" subscribes to that agent's turns, marks the pane with the name the pane shows, and the app says "Reading on." */
   it("starts reading for the open pane and marks it", async () => {

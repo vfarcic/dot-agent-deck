@@ -58,6 +58,32 @@ interface Waiting {
 /** Said when the webview has no speech synthesis at all. */
 export const NO_SYSTEM_VOICE = "this system has no speech voice";
 
+/**
+ * The provider's speech was refused rather than failed: the settings no
+ * longer permit it (reading's opt-in off, or another source) or the Commands
+ * connection changed (PR #1617's review). Never answered with the system
+ * voice, even under Auto — a refusal is not an outage.
+ */
+export class SpeechRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpeechRefusedError";
+  }
+}
+
+/**
+ * What `desktop_voice_speech_audio` rejected with, as an error: `{ kind:
+ * "refused" | "failed", message }`, the first a {@link SpeechRefusedError}.
+ */
+export function speechAudioError(cause: unknown): Error {
+  if (typeof cause === "object" && cause !== null && "kind" in cause && "message" in cause) {
+    const message = String(cause.message);
+    return cause.kind === "refused" ? new SpeechRefusedError(message) : new Error(message);
+  }
+  if (cause instanceof Error) return cause;
+  return new Error(typeof cause === "string" ? cause : "speech failed");
+}
+
 export class SpeechQueue {
   private waiting: Waiting[] = [];
   private current: AbortController | null = null;
@@ -145,7 +171,7 @@ export class SpeechQueue {
         try {
           await this.deps.provider.speak(text, signal);
         } catch (error) {
-          if (signal.aborted || !plan.fallbackToSystem) throw error;
+          if (signal.aborted || !plan.fallbackToSystem || error instanceof SpeechRefusedError) throw error;
           await this.deps.system.speak(text, signal);
         }
     }

@@ -12,6 +12,7 @@ import { ambiguousOrchestrationReason } from "./newAgent";
 import { clampZoom, DEFAULT_ZOOM } from "./zoom";
 import { answerChoiceLocally, type VoiceChoiceAnswerDto } from "./voiceChoice";
 import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListDto } from "./voiceNumbers";
+import { speechAudioError } from "./speech";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
@@ -4607,7 +4608,13 @@ export class TauriDeckBridge implements DeckBridge {
   async voiceSpeechAudio(text: string): Promise<ArrayBuffer> {
     const invoke = await this.getInvoke();
     // A raw `tauri::ipc::Response` arrives as an ArrayBuffer.
-    return invoke<ArrayBuffer>("desktop_voice_speech_audio", { text });
+    try {
+      return await invoke<ArrayBuffer>("desktop_voice_speech_audio", { text });
+    } catch (cause) {
+      // A refusal is told apart from a failure, so Auto never answers it
+      // with the system voice.
+      throw speechAudioError(cause);
+    }
   }
 
   async voiceReadingStart(target: import("./reading").ReadingTarget, onSentence: (sentence: import("./reading").ReadingSentenceDto) => void): Promise<import("./reading").ReadingStartDto> {

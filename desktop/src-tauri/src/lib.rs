@@ -2478,6 +2478,10 @@ async fn desktop_set_settings(
     base: Option<DesktopSettings>,
 ) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
     ensure_main_webview(&webview)?;
+    // Held from the write until its voice settings are in force, so the saves
+    // put them in force in the order they were written and an older save
+    // finishing late cannot act on settings a newer one replaced.
+    let order = voice_state.saves.lock().await;
     // On a blocking worker: the save is synchronous filesystem work — a read,
     // an `fsync`, a rename — and since #828 it can also wait up to
     // `SAVE_LOCK_WAIT` for another window's save to let go of the lock. None of
@@ -2492,11 +2496,9 @@ async fn desktop_set_settings(
     })?;
     let failure = match saved {
         Ok(written) => {
-            apply_selection(&app, &state, &written).await;
-            voice_state.reading.end_unless_consented(&written);
             voice_state
-                .speech
-                .publish(written.voice.clone().unwrap_or_default());
+                .put_saved_in_force(order, &written, apply_selection(&app, &state, &written))
+                .await;
             return Ok(written);
         }
         Err(failure) => failure,
@@ -2519,11 +2521,9 @@ async fn desktop_set_settings(
     else {
         return Err(message.into());
     };
-    apply_selection(&app, &state, &disk).await;
-    voice_state.reading.end_unless_consented(&disk);
     voice_state
-        .speech
-        .publish(disk.voice.clone().unwrap_or_default());
+        .put_saved_in_force(order, &disk, apply_selection(&app, &state, &disk))
+        .await;
     Err(crate::dto::DesktopSettingsSaveError::Partial(
         crate::dto::DesktopPartialSettingsSave {
             message,
@@ -2852,6 +2852,31 @@ pub(crate) struct VoiceState {
     /// PRD #1497 — the saved settings, published to the provider speech
     /// requests in flight so a save that no longer permits one cancels it.
     speech: voice::speech::SpeechRevocation,
+    /// PRD #1497 — orders settings saves until their voice settings are in
+    /// force ([`Self::put_saved_in_force`]).
+    saves: tokio::sync::Mutex<()>,
+}
+
+impl VoiceState {
+    /// A save wrote `settings`: reading ends unless it is still consented to,
+    /// and every provider speech request they do not permit is cancelled — at
+    /// once, before `deck_work` (retargeting the selection, which can wait on
+    /// a daemon) is awaited, since the settings are already on disk (PR
+    /// #1617's third review). `order` is released then, so the next save puts
+    /// its own settings in force after these and need not wait on the deck
+    /// work.
+    async fn put_saved_in_force(
+        &self,
+        order: tokio::sync::MutexGuard<'_, ()>,
+        settings: &DesktopSettings,
+        deck_work: impl std::future::Future<Output = ()>,
+    ) {
+        self.reading.end_unless_consented(settings);
+        self.speech
+            .publish(&settings.voice.clone().unwrap_or_default());
+        drop(order);
+        deck_work.await;
+    }
 }
 
 impl Default for VoiceState {
@@ -2865,6 +2890,7 @@ impl Default for VoiceState {
             hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
             reading: ReadingSessions::default(),
             speech: voice::speech::SpeechRevocation::default(),
+            saves: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -3909,20 +3935,25 @@ async fn voice_settings_now() -> Result<crate::settings::VoiceSettings, String> 
 /// reading mode's consent. A save while the request is in flight that turns
 /// the opt-in off or changes the connection cancels it
 /// ([`voice::speech::SpeechRevocation`]).
+///
+/// Each of those answers is a [`voice::speech::SpeechError::Refused`], told
+/// apart from a failure so the webview never speaks a refused sentence with
+/// the system voice instead.
 #[tauri::command]
 async fn desktop_voice_speech_audio(
     webview: Webview,
     voice_state: State<'_, VoiceState>,
     text: String,
-) -> Result<Response, String> {
-    ensure_main_webview(&webview)?;
+) -> Result<Response, voice::speech::SpeechError> {
+    use voice::speech::SpeechError;
+    ensure_main_webview(&webview).map_err(SpeechError::failed)?;
     // Four bytes a character at most, so this refuses nothing the character
     // bound would keep.
     if text.len() > voice::speech::MAX_SPEECH_INPUT_CHARS * 4 {
-        return Err("that is too long to speak".to_string());
+        return Err(SpeechError::failed("that is too long to speak"));
     }
-    let settings = voice_settings_now().await?;
-    voice::speech::provider_permitted(&settings)?;
+    let settings = voice_settings_now().await.map_err(SpeechError::failed)?;
+    voice::speech::provider_permitted(&settings).map_err(SpeechError::refused)?;
     let intent = settings.intent;
     // Before the last settings read (inside `synthesise`), so no save between
     // that read and the request is missed.
@@ -6049,6 +6080,56 @@ mod tests {
         assert_eq!(ended.load(Ordering::SeqCst), 0);
     }
 
+    /// Scenario (PR #1617's third review): with reading on and a provider
+    /// speech request in flight, the user turns Read turns aloud off and the
+    /// save's deck work (retargeting the selection against a daemon) is slow.
+    /// The reading session ends and the speech request is cancelled before
+    /// that deck work finishes, and the next save is not held behind it.
+    #[tokio::test]
+    async fn voice_reading_a_save_ends_reading_and_speech_before_its_deck_work() {
+        let voice_state = VoiceState::default();
+        let (_, aborted, ended) = held_session(&voice_state.reading);
+        let intent = crate::settings::IntentSettings::for_backend(
+            crate::settings::IntentBackend::OpenaiCompatible,
+        );
+        let mut revoked = Box::pin(voice_state.speech.revoked(intent.clone()));
+        let off = DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                intent,
+                reading: crate::settings::ReadingConsent::Off,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let order = voice_state.saves.lock().await;
+        let (finish_deck_work, deck_work) = tokio::sync::oneshot::channel::<()>();
+        let save = voice_state.put_saved_in_force(order, &off, async {
+            let _ = deck_work.await;
+        });
+        tokio::pin!(save);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut save)
+                .await
+                .is_err(),
+            "the deck work is still running"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut revoked)
+                .await
+                .ok(),
+            Some(voice::speech::PROVIDER_SPEECH_NOT_PERMITTED.to_string()),
+            "the speech request was not cancelled before the deck work finished"
+        );
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        wait_for(&aborted);
+        assert!(
+            voice_state.saves.try_lock().is_ok(),
+            "the next save waits on this one's deck work"
+        );
+        finish_deck_work.send(()).expect("the deck work is waiting");
+        save.await;
+    }
+
     /// Scenario (PR #1617 review): "reading on" is said twice in quick
     /// succession and the first start answers last. The later start is
     /// installed; the earlier one is refused as stale when it finally
@@ -7129,6 +7210,7 @@ mod tests {
                 ),
                 reading: ReadingSessions::default(),
                 speech: voice::speech::SpeechRevocation::default(),
+                saves: tokio::sync::Mutex::new(()),
             },
             stopped,
             counts,
@@ -7287,6 +7369,7 @@ mod tests {
             ),
             reading: ReadingSessions::default(),
             speech: voice::speech::SpeechRevocation::default(),
+            saves: tokio::sync::Mutex::new(()),
         };
 
         let (opened, _ticket) = voice_state

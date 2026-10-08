@@ -5,8 +5,10 @@ import {
   NO_SYSTEM_VOICE,
   PROVIDER_AUDIO_TOO_LONG,
   SpeechQueue,
+  SpeechRefusedError,
   providerPlaybackDeadlineMs,
   providerVoice,
+  speechAudioError,
   systemVoice,
   systemVoiceDeadlineMs,
   type AudioContextLike,
@@ -299,5 +301,19 @@ describe("providerVoice", () => {
   it("rejects when the audio cannot be fetched", async () => {
     const voice = providerVoice(() => Promise.reject(new Error("no key")), () => fakeContext().context);
     await expect(voice.speak("hello", new AbortController().signal)).rejects.toThrow("no key");
+  });
+});
+
+describe("speechAudioError", () => {
+  /** Scenario (PR #1617 round 3): the speech command's rejection names a refusal apart from a failure; a refusal becomes a SpeechRefusedError, which Auto never answers with the system voice, and anything else a plain error carrying its sentence. */
+  it("tells a refusal apart from a failure", () => {
+    const refused = speechAudioError({ kind: "refused", message: "not permitted" });
+    expect(refused).toBeInstanceOf(SpeechRefusedError);
+    expect(refused.message).toBe("not permitted");
+    const failed = speechAudioError({ kind: "failed", message: "the speech request failed" });
+    expect(failed).not.toBeInstanceOf(SpeechRefusedError);
+    expect(failed.message).toBe("the speech request failed");
+    expect(speechAudioError("plain").message).toBe("plain");
+    expect(speechAudioError(undefined).message).toBe("speech failed");
   });
 });

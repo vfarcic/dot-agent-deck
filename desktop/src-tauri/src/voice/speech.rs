@@ -172,66 +172,120 @@ pub fn permitted_on(settings: &VoiceSettings, intent: &IntentSettings) -> Result
     Ok(())
 }
 
-/// The settings each save writes, published to the speech requests in flight
-/// so a save that turns reading's opt-in off, or changes the Commands
-/// connection, cancels a request that already passed its last check (PR
-/// #1617's review).
+/// Why the provider's audio was not fetched, as the webview reads it.
 ///
-/// Every save publishes, and each request decides for itself
-/// ([`Self::revoked`]): the save path does not have to know which connection a
-/// request was prepared for. Each publish is a new generation of the watch
-/// channel, the counterpart of reading's `revoked_through`.
-pub struct SpeechRevocation {
-    saved: tokio::sync::watch::Sender<Option<VoiceSettings>>,
+/// A refusal — the settings no longer permit the provider's speech, or name
+/// another connection — is told apart from a failure because the webview must
+/// never answer a refusal with the system voice, even under **Auto**: that
+/// fallback is for an outage (PR #1617's review).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SpeechError {
+    Refused { message: String },
+    Failed { message: String },
 }
 
-impl Default for SpeechRevocation {
-    fn default() -> Self {
-        Self {
-            saved: tokio::sync::watch::Sender::new(None),
+impl SpeechError {
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self::Refused {
+            message: message.into(),
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
         }
     }
 }
 
+/// The saves each request in flight is held to, so a save that turns
+/// reading's opt-in off, or changes the Commands connection, cancels a request
+/// that already passed its last check (PR #1617's review).
+///
+/// Each request registers what it was prepared for ([`Self::revoked`]), and
+/// every save walks the registry ([`Self::publish`]), cancelling each request
+/// the saved settings do not permit — at the publish itself, so a later save
+/// that permits it again cannot take the cancellation back (PR #1617's third
+/// review: a watch channel kept only the latest value, so Off then On before
+/// the request next ran left it alive). The save path does not have to know
+/// which connection a request was prepared for.
+#[derive(Default)]
+pub struct SpeechRevocation {
+    in_flight: std::sync::Mutex<Vec<InFlightSpeech>>,
+}
+
+struct InFlightSpeech {
+    intent: IntentSettings,
+    cancel: tokio::sync::oneshot::Sender<String>,
+}
+
 impl SpeechRevocation {
-    /// A save wrote `settings`.
-    pub fn publish(&self, settings: VoiceSettings) {
-        self.saved.send_replace(Some(settings));
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, Vec<InFlightSpeech>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A save wrote `settings`: every request in flight they do not permit is
+    /// cancelled now, with why. Requests that finished are forgotten.
+    pub fn publish(&self, settings: &VoiceSettings) {
+        let mut in_flight = self.in_flight();
+        for request in std::mem::take(&mut *in_flight) {
+            if request.cancel.is_closed() {
+                continue;
+            }
+            match permitted_on(settings, &request.intent) {
+                Ok(()) => in_flight.push(request),
+                Err(refusal) => {
+                    let _ = request.cancel.send(refusal);
+                }
+            }
+        }
     }
 
     /// Resolves, with why, once a save after this call no longer permits a
     /// request prepared for `intent` ([`permitted_on`]); pending otherwise.
     ///
-    /// Subscribes when called, not when first polled, so a caller that calls
+    /// Registers when called, not when first polled, so a caller that calls
     /// this before its last settings read misses no save: one written before
     /// that read is in what it read, and one written after it is published
-    /// after this subscribed.
+    /// after this registered. Dropping the future unregisters it at the next
+    /// publish.
     pub fn revoked(&self, intent: IntentSettings) -> impl Future<Output = String> + Send + 'static {
-        let mut saved = self.saved.subscribe();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let mut in_flight = self.in_flight();
+        in_flight.retain(|request| !request.cancel.is_closed());
+        in_flight.push(InFlightSpeech { intent, cancel });
+        drop(in_flight);
         async move {
-            while saved.changed().await.is_ok() {
-                let refusal = saved
-                    .borrow_and_update()
-                    .as_ref()
-                    .and_then(|settings| permitted_on(settings, &intent).err());
-                if let Some(refusal) = refusal {
-                    return refusal;
-                }
+            match cancelled.await {
+                Ok(refusal) => refusal,
+                Err(_) => std::future::pending().await,
             }
-            std::future::pending().await
         }
+    }
+
+    /// How many requests are registered and not yet finished.
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.in_flight()
+            .iter()
+            .filter(|request| !request.cancel.is_closed())
+            .count()
     }
 }
 
 /// `work`, unless `revoked` resolves first: then `work` is dropped — with it
-/// any request it has in flight — and the answer is `revoked`'s reason.
+/// any request it has in flight — and the answer is a refusal with
+/// `revoked`'s reason.
 pub async fn unless_revoked<T>(
-    work: impl Future<Output = Result<T, String>>,
+    work: impl Future<Output = Result<T, SpeechError>>,
     revoked: impl Future<Output = String>,
-) -> Result<T, String> {
+) -> Result<T, SpeechError> {
     tokio::select! {
         biased;
-        reason = revoked => Err(reason),
+        reason = revoked => Err(SpeechError::refused(reason)),
         result = work => result,
     }
 }
@@ -272,21 +326,25 @@ pub async fn synthesise<P, F>(
     secrets: Arc<dyn SecretStore>,
     text: &str,
     still_permitted: P,
-) -> Result<Vec<u8>, String>
+) -> Result<Vec<u8>, SpeechError>
 where
     P: FnOnce() -> F,
     F: std::future::Future<Output = Result<(), String>>,
 {
     let Some(endpoint) = speech_endpoint(intent) else {
-        return Err(NO_PROVIDER_SPEECH.to_string());
+        return Err(SpeechError::failed(NO_PROVIDER_SPEECH));
     };
     if text.trim().is_empty() {
-        return Err("there is nothing to say".to_string());
+        return Err(SpeechError::failed("there is nothing to say"));
     }
-    let secret = endpoint_credential(&endpoint, &secrets).await?;
-    still_permitted().await?;
+    let secret = endpoint_credential(&endpoint, &secrets)
+        .await
+        .map_err(SpeechError::failed)?;
+    still_permitted().await.map_err(SpeechError::refused)?;
     let Some(client) = super::http::client() else {
-        return Err("speech could not start a secure connection".to_string());
+        return Err(SpeechError::failed(
+            "speech could not start a secure connection",
+        ));
     };
     let post = client
         .post(endpoint.as_str())
@@ -297,14 +355,14 @@ where
         .send()
         .await
         .map_err(|error| {
-            if error.is_timeout() {
+            SpeechError::failed(if error.is_timeout() {
                 format!(
                     "the speech service did not answer within {}s",
                     SPEECH_TIMEOUT.as_secs()
                 )
             } else {
                 "the speech request failed".to_string()
-            }
+            })
         })?;
     let status = response.status();
     let audio_type = response
@@ -314,13 +372,15 @@ where
         .is_some_and(is_mp3_type);
     let body = super::http::capped_body(response, MAX_AUDIO_BYTES)
         .await
-        .map_err(|error| match error {
-            super::http::BodyError::TooLarge => {
-                format!("the speech service answered with more than {MAX_AUDIO_BYTES} bytes")
-            }
-            super::http::BodyError::Transport => "the speech request failed".to_string(),
+        .map_err(|error| {
+            SpeechError::failed(match error {
+                super::http::BodyError::TooLarge => {
+                    format!("the speech service answered with more than {MAX_AUDIO_BYTES} bytes")
+                }
+                super::http::BodyError::Transport => "the speech request failed".to_string(),
+            })
         })?;
-    check_audio(status, audio_type, body)
+    check_audio(status, audio_type, body).map_err(SpeechError::failed)
 }
 
 /// Whether a `Content-Type` value names MP3 audio — the format asked for
@@ -542,7 +602,7 @@ mod tests {
         let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
         assert_eq!(
             synthesise(&anthropic(), Arc::clone(&secrets), "hello", permitted).await,
-            Err(NO_PROVIDER_SPEECH.to_string())
+            Err(SpeechError::failed(NO_PROVIDER_SPEECH))
         );
         // Off this machine with no key stored: refused by the keychain read,
         // so no request is made (the endpoint is unroutable on purpose).
@@ -554,7 +614,10 @@ mod tests {
         )
         .await
         .expect_err("no key");
-        assert!(error.contains("no key is stored"), "{error}");
+        assert!(
+            matches!(&error, SpeechError::Failed { message } if message.contains("no key is stored")),
+            "{error:?}"
+        );
     }
 
     /// A keychain whose read is where the user turns reading off: answering
@@ -607,7 +670,7 @@ mod tests {
                 provider_permitted(&settings_now())
             })
             .await,
-            Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string())
+            Err(SpeechError::refused(PROVIDER_SPEECH_NOT_PERMITTED))
         );
     }
 
@@ -664,7 +727,7 @@ mod tests {
                 permitted_on(&settings_now(), &old)
             })
             .await,
-            Err(SPEECH_CONNECTION_CHANGED.to_string())
+            Err(SpeechError::refused(SPEECH_CONNECTION_CHANGED))
         );
         // Another model at the same endpoint is the same connection.
         let other_model = IntentSettings {
@@ -692,7 +755,7 @@ mod tests {
 
     fn in_flight(
         dropped: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> impl Future<Output = Result<Vec<u8>, String>> {
+    ) -> impl Future<Output = Result<Vec<u8>, SpeechError>> {
         let guard = InFlight(Arc::clone(dropped));
         async move {
             let _guard = guard;
@@ -726,7 +789,7 @@ mod tests {
         ));
         assert_eq!(settle(&mut request).await, None, "the request is pending");
         // A save that changes nothing that matters to it does not cancel it.
-        revocation.publish(voice(
+        revocation.publish(&voice(
             SpeechSource::Auto,
             intent.clone(),
             ReadingConsent::On,
@@ -737,14 +800,14 @@ mod tests {
             "an unrelated save cancelled it"
         );
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
-        revocation.publish(voice(
+        revocation.publish(&voice(
             SpeechSource::Auto,
             intent.clone(),
             ReadingConsent::Off,
         ));
         assert_eq!(
             settle(&mut request).await,
-            Some(Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string()))
+            Some(Err(SpeechError::refused(PROVIDER_SPEECH_NOT_PERMITTED)))
         );
         drop(request);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
@@ -760,16 +823,100 @@ mod tests {
             None,
             "a save before it began cancelled it"
         );
-        revocation.publish(voice(
+        revocation.publish(&voice(
             SpeechSource::Auto,
             openai_at("https://gateway.example/v1/chat/completions"),
             ReadingConsent::On,
         ));
         assert_eq!(
             settle(&mut request).await,
-            Some(Err(SPEECH_CONNECTION_CHANGED.to_string()))
+            Some(Err(SpeechError::refused(SPEECH_CONNECTION_CHANGED)))
         );
         drop(request);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Scenario (PR #1617's third review): a speech request is in flight when
+    /// two saves land before it runs again — reading's opt-in turned off and
+    /// straight back on, or the connection changed and changed back. The
+    /// request is still cancelled: a save that does not permit it cancels it
+    /// at the save, and a later one that would permit it cannot take that
+    /// back. A request still permitted by both saves is left alone, and a
+    /// finished request is forgotten.
+    #[tokio::test]
+    async fn voice_speech_a_revoking_save_is_not_undone_by_a_later_one() {
+        let intent = openai();
+        let other = openai_at("https://gateway.example/v1/chat/completions");
+        for (name, first) in [
+            (
+                "opt-in off then on",
+                voice(SpeechSource::Auto, intent.clone(), ReadingConsent::Off),
+            ),
+            (
+                "connection away and back",
+                voice(SpeechSource::Auto, other.clone(), ReadingConsent::On),
+            ),
+            (
+                "provider, system, provider",
+                voice(SpeechSource::System, intent.clone(), ReadingConsent::On),
+            ),
+        ] {
+            let revocation = SpeechRevocation::default();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut request = Box::pin(unless_revoked(
+                in_flight(&dropped),
+                revocation.revoked(intent.clone()),
+            ));
+            assert_eq!(settle(&mut request).await, None, "{name}: pending");
+            // Both saves before the request is polled again.
+            revocation.publish(&first);
+            revocation.publish(&voice(
+                SpeechSource::Auto,
+                intent.clone(),
+                ReadingConsent::On,
+            ));
+            assert!(
+                matches!(
+                    settle(&mut request).await,
+                    Some(Err(SpeechError::Refused { .. }))
+                ),
+                "{name}: the revoking save was coalesced away"
+            );
+            drop(request);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst), "{name}");
+            assert_eq!(revocation.pending(), 0, "{name}");
+        }
+
+        // Permitted by every save: left alone, and forgotten once it ends.
+        let revocation = SpeechRevocation::default();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = Box::pin(unless_revoked(
+            in_flight(&dropped),
+            revocation.revoked(intent.clone()),
+        ));
+        let permitting = voice(SpeechSource::Provider, intent.clone(), ReadingConsent::On);
+        revocation.publish(&permitting);
+        revocation.publish(&permitting);
+        assert_eq!(settle(&mut request).await, None);
+        assert_eq!(revocation.pending(), 1);
+        drop(request);
+        assert_eq!(revocation.pending(), 0);
+        revocation.publish(&permitting);
+        assert!(revocation.in_flight().is_empty());
+    }
+
+    /// Scenario (PR #1617's third review): the webview reads a refusal and a
+    /// failure apart, so a refused request is never answered with the system
+    /// voice.
+    #[test]
+    fn voice_speech_error_serialises_as_the_webview_reads_it() {
+        assert_eq!(
+            serde_json::to_value(SpeechError::refused("no")).unwrap(),
+            json!({ "kind": "refused", "message": "no" })
+        );
+        assert_eq!(
+            serde_json::to_value(SpeechError::failed("down")).unwrap(),
+            json!({ "kind": "failed", "message": "down" })
+        );
     }
 }

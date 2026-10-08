@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SpeechPlanDto } from "./bridge";
 import { READING_ALREADY_OFF, READING_OFF, READING_ON, READING_START_FAILED, READING_VOICE_KEY, ReadingMode, type ReadingSentenceDto, type ReadingStartDto, type ReadingTarget } from "./reading";
-import { SpeechQueue, type SpeechVoice } from "./speech";
+import { SpeechQueue, SpeechRefusedError, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingTarget = { deckId: "deck-local", agentId: "tester", label: "tester" };
 const CODER: ReadingTarget = { deckId: "deck-local", agentId: "coder", label: "coder" };
@@ -9,7 +9,7 @@ const CODER: ReadingTarget = { deckId: "deck-local", agentId: "coder", label: "c
 /** A reading mode over recorded fakes; `answer` is what the next start answers. */
 function harness(answer: ReadingStartDto = { kind: "started", session: 7 }) {
   const said: [string, string][] = [];
-  const speech = { say: vi.fn((agent: string, text: string) => { said.push([agent, text]); }), interrupt: vi.fn() };
+  const speech = { say: vi.fn((agent: string, text: string) => { said.push([agent, text]); }), interrupt: vi.fn(), speaking: false, subscribe: () => () => false };
   const sinks: ((sentence: ReadingSentenceDto) => void)[] = [];
   let next: ReadingStartDto = answer;
   let gate: Promise<void> | undefined;
@@ -353,5 +353,103 @@ describe("ReadingMode ending with speech in flight (audit A-B3)", () => {
     await flush();
     expect(h.provider.fetched).toEqual(["Reading on.", permission]);
     expect(h.system.fetched).toEqual([]);
+  });
+  const drainEnds: [string, (mode: ReadingMode) => Promise<unknown>][] = [
+    ["reading off", (mode) => mode.turnOff()],
+    ["voice off", (mode) => mode.voiceOff()],
+    ["another agent's pane", (mode) => mode.paneChanged({ deckId: CODER.deckId, agentId: CODER.agentId })],
+    ["the pane closing", (mode) => mode.paneChanged(undefined)],
+    ["the Settings opt-in turned off", (mode) => mode.consentOff()],
+  ];
+  for (const [name, endIt] of drainEnds) {
+    /** Scenario (PR #1617 round 3): the agent's events close while a summary is being said and its last summary is queued, so reading is off but draining; ending it then cuts the drain off like live reading — the summary aborted, the queued one dropped, "Reading off." said once more — and "reading off" is answered as reading off. */
+    it(`cuts a drain off on ${name}`, async () => {
+      const h = speaking();
+      await h.mode.turnOn(TESTER);
+      await flush();
+      h.provider.finish(); // "Reading on."
+      await flush();
+      h.sinks[0]({ kind: "turn", text: "The tester finished: a summary." });
+      await flush();
+      h.sinks[0]({ kind: "permission", text: "The tester is asking for permission: run the tests." });
+      h.sinks[0]({ kind: "closed", text: "Reading off." });
+      await flush();
+      expect(h.mode.on).toBe(false);
+      expect(h.mode.active).toBe(true);
+
+      const answer = await endIt(h.mode);
+      if (name === "reading off") expect(answer).toBe(READING_OFF);
+      expect(h.provider.aborted).toEqual(["The tester finished: a summary."]);
+      expect(h.queue.pending.map((entry) => entry.text)).not.toContain("The tester is asking for permission: run the tests.");
+      await flush();
+      h.provider.finish(); // "Reading off."
+      await flush();
+      expect(h.provider.fetched).toEqual(["Reading on.", "The tester finished: a summary.", READING_OFF]);
+      expect(h.queue.speaking).toBe(false);
+      expect(h.mode.active).toBe(false);
+      expect(await h.mode.turnOff()).toBe(READING_ALREADY_OFF);
+    });
+  }
+
+  /** Scenario (PR #1617 round 3): "stop" during a drain silences it as it silences any speech, and the drain is then over: "reading off" answers that reading is not on. */
+  it("quiets a drain", async () => {
+    const h = speaking();
+    await h.mode.turnOn(TESTER);
+    await flush();
+    h.provider.finish();
+    await flush();
+    h.sinks[0]({ kind: "turn", text: "The tester finished: a summary." });
+    await flush();
+    h.sinks[0]({ kind: "closed", text: "Reading off." });
+    await flush();
+    h.mode.quiet();
+    await flush();
+    expect(h.provider.aborted).toEqual(["The tester finished: a summary."]);
+    expect(h.queue.speaking).toBe(false);
+    expect(await h.mode.turnOff()).toBe(READING_ALREADY_OFF);
+  });
+
+  /** Scenario (PR #1617 round 3): the drain ends by itself once the last sentence has been said; a pane change after it says nothing more. */
+  it("ends a drain once its speech is done", async () => {
+    const h = speaking();
+    await h.mode.turnOn(TESTER);
+    await flush();
+    h.provider.finish();
+    await flush();
+    h.sinks[0]({ kind: "closed", text: "Reading off." });
+    await flush();
+    expect(h.mode.active).toBe(true);
+    h.provider.finish(); // "Reading off."
+    await flush();
+    expect(h.mode.active).toBe(false);
+    await h.mode.paneChanged({ deckId: CODER.deckId, agentId: CODER.agentId });
+    await flush();
+    expect(h.provider.fetched).toEqual(["Reading on.", READING_OFF]);
+  });
+
+  /** Scenario (PR #1617 round 3): under Auto, the provider's speech is refused because the opt-in was turned off or the connection changed; the sentence is not said with the system voice instead — a refusal is not an outage. A provider failure still falls back. */
+  it("never answers a provider refusal with the system voice", async () => {
+    const plan: SpeechPlanDto = { kind: "provider", fallbackToSystem: true };
+    const system = new FetchingVoice();
+    const problems: string[] = [];
+    let refuse = true;
+    const queue = new SpeechQueue({
+      plan: () => Promise.resolve(plan),
+      provider: { speak: () => Promise.reject(refuse ? new SpeechRefusedError("not permitted") : new Error("outage")) },
+      system,
+      onProblem: (reason) => problems.push(reason),
+    });
+    queue.say("tester", "The tester finished: refused.");
+    await flush();
+    await flush();
+    expect(system.fetched).toEqual([]);
+    expect(problems).toEqual(["not permitted"]);
+    expect(queue.speaking).toBe(false);
+
+    refuse = false;
+    queue.say("tester", "The tester finished: fell back.");
+    await flush();
+    await flush();
+    expect(system.fetched).toEqual(["The tester finished: fell back."]);
   });
 });

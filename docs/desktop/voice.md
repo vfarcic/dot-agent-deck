@@ -231,7 +231,7 @@ Reading ends, and the app says "Reading off.", when you:
 - turn voice off;
 - or set **Read turns aloud** to **Off** in Settings.
 
-Whatever was being said is cut off when reading ends in one of those ways. It also ends when the agent exits, but then the app first finishes what it was saying, including the summary of the agent's last turn, and says "Reading off." after it.
+Whatever was being said is cut off when reading ends in one of those ways. It also ends when the agent exits, but then the app first finishes what it was saying, including the summary of the agent's last turn, and says "Reading off." after it. Until it has, any of the ways above still cuts it off, and "stop" or "quiet" silences it.
 
 The reading switches work in typing mode too, so a bare "reading on" or "reading off" said in typing mode switches reading rather than being typed. While reading is on or the app is speaking, the same goes for the "quiet" phrases.
 
@@ -241,7 +241,7 @@ The reading switches work in typing mode too, so a bare "reading on" or "reading
 
 | Choice | Voice |
 | --- | --- |
-| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. |
+| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. A sentence the service may no longer be sent, because **Read turns aloud** was turned off or the Commands service changed, is not said at all. |
 | **Provider** | Only the Commands service's text-to-speech. With the Anthropic API, nothing can speak, and the app says to choose Auto or System. |
 | **System** | Only this computer's voice. Nothing is sent to be spoken. |
 
