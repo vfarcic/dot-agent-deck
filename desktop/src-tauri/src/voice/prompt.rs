@@ -702,6 +702,8 @@ pub(crate) mod tests {
             vec![
                 "open_agent".to_string(),
                 "open_overview".to_string(),
+                "filter_dashboard".to_string(),
+                "clear_dashboard_filter".to_string(),
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
@@ -752,15 +754,19 @@ pub(crate) mod tests {
             param_names(&commands()),
             // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
             // which sits above the dictation pair in the table.
+            // The dashboard filter's facets (issue #1496) next, since its row
+            // sits right below `open_overview`.
             vec![
                 "agent".to_string(),
+                "kind".to_string(),
+                "status".to_string(),
+                "agent_type".to_string(),
+                "daemon".to_string(),
+                "text".to_string(),
                 "deck".to_string(),
                 "prefix".to_string(),
                 "dir".to_string(),
-                // The directory Filter box (PR #1451 round 3, change 5).
-                "text".to_string(),
                 "mode".to_string(),
-                "agent_type".to_string(),
                 "command".to_string(),
                 "orchestration".to_string(),
             ]

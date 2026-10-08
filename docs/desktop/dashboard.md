@@ -40,6 +40,23 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 
 **Restore defaults** in the Columns menu goes back to the four default columns. The choice is remembered by the app on this computer, in the app's own storage, not in the [settings file](settings.md#the-settings-file). The TUI has no column choice: its cards pick their density from the terminal's size.
 
+## Filter the dashboard
+
+To show only the agents you care about right now, use the filter at the top of the Dashboard:
+
+1. Type into **Filter agents** to show only agents whose name, orchestration role, orchestration, working directory or last prompt contains what you typed. Case does not matter.
+2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, or agents in the dispatcher, schedule or schedule: issues mode), **Status** (Working, Thinking, Waiting for input, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
+
+An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
+
+While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **WAITING**, **FAILED**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
+
+A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
+
+The filter stays while you move between screens and lasts until you clear it or quit the app; the next time the app starts, the Dashboard shows every agent. You can also set and clear it [by voice](voice.md#filtering-the-dashboard). The TUI's dashboard has no filter.
+
+![The Dashboard filtered to working agents: two daemons filtered to working agents: the line under the header reads Showing 3 of 6 agents · Working, with a remove control beside Working and a Show all button, while the counters above still count all six agents](/img/dashboard-filter-desktop.png)
+
 ## Statuses
 
 The desktop app shows four statuses. Each covers one or more of the words the TUI shows on its cards:

@@ -360,6 +360,8 @@ mod tests {
             vec![
                 "open_agent".to_string(),
                 "open_overview".to_string(),
+                "filter_dashboard".to_string(),
+                "clear_dashboard_filter".to_string(),
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
@@ -445,6 +447,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -640,6 +644,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
@@ -688,6 +694,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 // The shared rail offers Settings from the overview too.
@@ -739,6 +747,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), false),
                 ("open_overview".to_string(), false),
+                ("filter_dashboard".to_string(), false),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), false),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), false),

@@ -205,14 +205,107 @@ the Daemon selector is showing, in one list, with each one's status and activity
 selection — with the selector on one daemon it shows that daemon's agents only — so a request to
 select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
-button) or the overview, or asks which agents are running or what needs attention."""
+button) or the overview, or asks which agents are running or what needs attention. It keeps
+the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
+"reset" ask for the WHOLE dashboard, unfiltered, and are `clear_dashboard_filter`, which opens the
+dashboard too."""
 invoke      = "openOverview"
 screens     = ["deck", "overview"]
 unavailable_hint = "the agent dashboard opens from the rail once the agent's pane is closed"
 report      = "Opening the agent dashboard."
 asks_to     = "show the agent dashboard"
-try_saying  = "show everything"
+try_saying  = "show the dashboard"
 heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running", "attention"]
+
+# Issue #1496 — the agent dashboard's filter, by voice. Two rows, because the
+# two halves are asked for in different words and one of them takes no params.
+#
+# The split with the rows beside them is the point of both descriptions.
+# `open_agent` opens ONE agent's pane, and "see only the tester" is that row:
+# a singular agent named by itself. This row narrows the dashboard to a SET —
+# a plural, a category, a status, a type or a daemon ("show only the
+# dispatchers", "show me all working agents"). `open_overview` owned "show" +
+# "all" before this, and still opens the dashboard; "show everything" now
+# means the UNFILTERED dashboard wherever it is said, so it is
+# `clear_dashboard_filter`, which opens the dashboard as well and, with no
+# filter set, does exactly what `open_overview` does.
+#
+# Every facet is optional because a filter names any of them; a filter that
+# resolves none is refused in Rust rather than dispatched as "show all"
+# (`outcome::FILTER_DASHBOARD_ROW`). A filter replaces the one before it, so
+# what was said is what is shown. Not over the New agent dialog, whose
+# directory browser has its own "filter" and "clear the filter" rows.
+[[commands]]
+id          = "filter_dashboard"
+description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
+(orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
+status (working, thinking, waiting for input, idle, blocked, error), of an agent type (Claude Code,
+Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
+contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
+all working agents, show Codex agents, show the agents on build box, show only agents waiting for
+input, or filter by a name. Set only the facets the user named and leave the rest out; `kind`
+is the kind, `status` the status, `agent_type` the type, `daemon` the daemon, and `text` a name
+or words to match. Opening ONE agent — "open tester", "see only the tester", or one named by what
+it is doing, "show me the one that's stuck" — is `open_agent`, not this one; "show everything" or "clear the filter" is `clear_dashboard_filter`.
+While the New agent dialog shows a directory listing, "filter" is about its directories:
+`filter_directories`, not this one."""
+invoke      = "filterDashboard"
+screens     = ["deck", "overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the agent dashboard can be filtered once the agent's pane is closed"
+report      = "Filtering the agent dashboard."
+asks_to     = "filter the agent dashboard"
+try_saying  = "show only the dispatchers"
+heard_as    = ["filter", "show", "only", "agents", "status", "kind", "type"]
+
+  [[commands.params]]
+  name     = "kind"
+  kind     = "agent_kind"
+  optional = true
+
+  [[commands.params]]
+  name     = "status"
+  kind     = "agent_status"
+  optional = true
+
+  [[commands.params]]
+  name     = "agent_type"
+  kind     = "agent_type_ref"
+  optional = true
+
+  [[commands.params]]
+  name     = "daemon"
+  kind     = "deck_ref"
+  optional = true
+
+  [[commands.params]]
+  name     = "text"
+  kind     = "filter_text"
+  optional = true
+
+[[commands]]
+id          = "clear_dashboard_filter"
+description = """Clear the agent dashboard's filter and show the whole dashboard, every agent,
+unfiltered — opening the dashboard from any other screen as well. Only when the user asks for
+EVERYTHING, all agents or no filter: "show the dashboard" or "open the dashboard" is
+`open_overview`, even where that cannot run. Use for show everything, show
+all agents, show all, clear the filter, remove the filter, unfiltered, or reset. With no filter
+set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
+`filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
+prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
+While the New agent dialog shows a directory listing, "clear filter" and "clear the filter" empty
+its directory Filter box: `clear_directory_filter`, not this one."""
+invoke      = "clearDashboardFilter"
+requires    = ["new_agent_dialog_closed"]
+# Over the New agent dialog this row cannot run, and "clear the filter" there
+# is the directory browser's: a pick of it goes to that row when the dialog
+# shows a listing and the words ground it.
+unavailable_redirects = "clear_directory_filter"
+unavailable_hint = "the agent dashboard's filter can be cleared once the New agent dialog is closed"
+report      = "Showing every agent."
+asks_to     = "show the whole agent dashboard"
+try_saying  = "show everything"
+heard_as    = ["everything", "show all", "all agents", "clear", "remove", "reset", "unfiltered"]
 
 [[commands]]
 id          = "open_deck"

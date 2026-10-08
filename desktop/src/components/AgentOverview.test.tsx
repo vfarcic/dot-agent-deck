@@ -45,7 +45,10 @@ import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
-beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1"));
+beforeEach(() => {
+  window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+  window.sessionStorage.clear();
+});
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -306,6 +309,80 @@ function renderOverviewWithStoredColumns(stored: string | undefined, overrides: 
   else window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, stored);
   return render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
 }
+
+describe("dashboard filter controls", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  function filterFleet() {
+    const snapshot = createFixtureSnapshot("connected");
+    const seed = snapshot.agents[0];
+    snapshot.connection.name = "local-box";
+    snapshot.agents = [
+      { ...seed, id: "keep", displayName: "Keep sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "hide", displayName: "Hide sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "role", displayName: "Review worker", tab: { kind: "orchestration", name: "Release review", orchestrationId: "review-run", roleName: "reviewer", roleIndex: 0, isStartRole: true } },
+    ];
+    const remote: DeckSnapshot = {
+      ...snapshot,
+      connection: { ...snapshot.connection, deckId: "filter-remote", name: "build-box", socketPath: "build@remote" },
+      agents: [{ ...seed, id: "remote", daemonId: "filter-remote", displayName: "Remote sentinel", tab: { kind: "dashboard" } }],
+    };
+    return { snapshot, fleet: [snapshot, remote] };
+  }
+
+  /// Scenario: enter a name in the shipped dashboard header, without experimental features enabled. Show all stays visible even with no matches and restores every agent in one click; fleet instrument counts retain their unfiltered meaning.
+  it("shows Show all for an active filter and restores the full fleet in one click", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    const counts = screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(screen.getByText(/Showing 1 of 4 agents/)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent)).toEqual(counts);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "no-such-agent" } });
+    expect(screen.queryAllByTestId(/^overview-agent-/)).toHaveLength(0);
+    const showAll = screen.getByRole("button", { name: "Show all" });
+    expect(showAll).toBeVisible();
+    fireEvent.click(showAll);
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+  });
+
+  /// Scenario: select a name that excludes a whole daemon and an orchestration card. Both empty groups collapse to a visible no-matching-agents line instead of disappearing without explanation.
+  it("explains empty daemon and orchestration groups", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/build-box: no matching agents/i)).toBeVisible();
+    expect(screen.getByText(/Release review: no matching agents/i)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
+  /// Scenario: remove the active text facet with its own chip control. Its query empties and every previously hidden agent returns without using Show all.
+  it("removes the text facet through its chip", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Remove text filter" }));
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+  });
+
+  /// Scenario: hide the first row while voice numbers are visible and press 1. The first remaining visible row opens, even though it was not number 1 in the unfiltered fleet.
+  it("numbers and opens the filtered rows", () => {
+    const input = filterFleet();
+    const navigate = vi.fn();
+    render(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(input)} onNavigate={navigate} /></VoiceOn.Provider>);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Hide sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    const row = screen.getByTestId(`overview-agent-${agentDomKey(input.snapshot.agents[1])}`);
+    expect(row).toHaveTextContent("1");
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(navigate).toHaveBeenCalledWith({ kind: "agent", deckId: input.snapshot.agents[1].daemonId, agentId: "hide", from: "overview" });
+  });
+});
 
 /** The legend's labels, which is the columns as a reader sees them named. */
 function legendLabels(): (string | null)[] {

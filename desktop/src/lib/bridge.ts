@@ -21,6 +21,7 @@ import type { HandoffEdge,
   AgentStatus,
   AgentTab,
   AgentTypeId,
+  DaemonAgentStatus,
   DaemonProjectListing,
   DaemonResolvedProject,
   DeckAction,
@@ -262,7 +263,7 @@ export interface DesktopAgentDto {
    * daemon's, resolved from the registry of the process that forked the agent.
    */
   cliName?: string;
-  status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+  status: DaemonAgentStatus;
   activeTool?: { name: string; detail?: string };
   toolCount: number;
   /**
@@ -2107,6 +2108,8 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     promptKeys: agent.promptKeys,
     model: UNREPORTED,
     status,
+    // Issue #1496 — the word `status` merged, kept for the dashboard filter.
+    daemonStatus: agent.status,
     task: taskLine(agent),
     // Absent, not sentinel-encoded. The deck's own stand-in word is a legal
     // working directory (`src/agent_pty.rs` accepts any non-empty, bounded,
