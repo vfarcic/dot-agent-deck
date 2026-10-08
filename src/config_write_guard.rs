@@ -190,6 +190,11 @@ pub fn default_test_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// How many times [`resolve_for_containment`] resolves an entry again when it
+/// was missing and then present — another writer's rename landing between the
+/// two looks — before it refuses the path.
+const RESOLVE_RACE_RETRIES: u32 = 20;
+
 /// Resolve `dest` the way the writer's own open will: canonicalize the longest
 /// existing ancestor, then append what does not exist yet.
 fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
@@ -205,6 +210,7 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
     let absolute = std::path::absolute(dest)?;
     let mut existing = absolute.as_path();
     let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut raced = 0;
     loop {
         match std::fs::canonicalize(existing) {
             Ok(canonical) => {
@@ -215,10 +221,25 @@ fn resolve_for_containment(dest: &Path) -> io::Result<PathBuf> {
                 return Ok(resolved);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Something is there but does not resolve: a dangling symlink.
-                // A writer would follow or replace it; neither is judged here.
-                if std::fs::symlink_metadata(existing).is_ok() {
-                    return Err(refuse("an entry on the path exists but does not resolve"));
+                match std::fs::symlink_metadata(existing) {
+                    // A dangling symlink. A writer would follow or replace it;
+                    // neither is judged here.
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(refuse("an entry on the path exists but does not resolve"));
+                    }
+                    // Not a symlink, so it appeared between the two calls: a
+                    // concurrent writer's rename landed there, as eight
+                    // `codex_trust_008` writers did on a Windows runner.
+                    // Resolve it again, a bounded number of times.
+                    Ok(_) if raced < RESOLVE_RACE_RETRIES => {
+                        raced += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Ok(_) => {
+                        return Err(refuse("an entry on the path exists but does not resolve"));
+                    }
+                    Err(_) => {}
                 }
                 match existing.components().next_back() {
                     Some(Component::Normal(name)) => missing.push(name),
