@@ -3789,6 +3789,24 @@ impl OrchestrationSpawnMeta {
     }
 }
 
+/// Issue #463 test seam: whether this daemon serves an orchestration start with
+/// no `orchestration_id` the way a daemon before #463 did, instead of refusing
+/// it. The only way an L2 test can put such a record in front of a real TUI —
+/// the state a current TUI meets when it reattaches to an older daemon still
+/// running an old client's orchestration — is a daemon that accepted the start.
+///
+/// `false` in every build without the `e2e` feature, whatever the environment
+/// says: `cfg!` folds the read away there, so no release binary can be told to
+/// serve the retired shape. Under `e2e` it is opt-in per process with
+/// `DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION=1`. A start it lets
+/// through registers no role (`OrchestrationSpawnMeta` needs the token), which
+/// is what such a pane looks like to the routing maps of a current daemon.
+fn serves_tokenless_orchestration_for_test() -> bool {
+    cfg!(feature = "e2e")
+        && std::env::var_os("DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION")
+            .is_some_and(|v| v == "1")
+}
+
 /// Issue #1445: [`AttachRequest::RecordOrchestratorContext`]'s handling — check
 /// the report and, if it holds, move the orchestration's recorded context file
 /// to the one the re-arm published.
@@ -4295,6 +4313,7 @@ async fn handle_connection(
                 orchestration_id: None,
                 ..
             }) = tab_membership.as_ref()
+                && !serves_tokenless_orchestration_for_test()
             {
                 info!(
                     orchestration = %crate::config_validation::escape_id_for_log(name),
@@ -4521,8 +4540,9 @@ async fn handle_connection(
             // the identity keys on (see below).
             let orchestration_meta: Option<OrchestrationSpawnMeta> =
                 tab_membership.as_ref().and_then(|tm| match tm {
-                    // Issue #463: a token-less membership never gets here — it
-                    // was refused above — so the `Some` is the only shape left.
+                    // Issue #463: a token-less membership was refused above
+                    // (outside `serves_tokenless_orchestration_for_test`), and
+                    // one let through registers no role, as below.
                     TabMembership::Orchestration {
                         name,
                         role_name,
