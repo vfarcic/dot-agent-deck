@@ -175,6 +175,13 @@
 # picks this row for a daemon is refused by the resolver, since no agent is
 # called the build box; one that picks `switch_deck` for an agent is refused
 # the same way by `deck_ref`. Neither runs the wrong thing.
+#
+# The examples in the status-or-tool exception are for fixture
+# `open-agent-by-state` ("show me the one that's stuck"): without them the model
+# answered `agent` with the user's words, which name no agent, in 9 of 10 runs
+# against `gpt-5-mini` once PRD #1497 added its reading rows (2 of 10 on
+# `origin/main`, which has none). With them, 20 of 20, and every `open-agent*`
+# fixture 5 of 5 (2026-10-08).
 [[commands]]
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
@@ -185,8 +192,9 @@ dispatcher agent". The agent may be named as the screen shows it (a role like "t
 the user gave it), by anything `agents_on_screen` says about it — its mode, agent type,
 directory, orchestration, daemon or start order — or by what it was asked to do. Set `agent` to the
 user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one fixing the
-scroll"), except for an agent named by what it is doing now (its status or its tool): for that
-one, its `label`."""
+scroll"), except for an agent named by what it is doing now (its status or its tool), such as
+"the one that's stuck" or "whichever is waiting": for that one, the `label` of the agent whose
+`status` or `tool` fits, never the user's words."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
