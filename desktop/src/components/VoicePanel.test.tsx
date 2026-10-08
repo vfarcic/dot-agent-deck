@@ -677,6 +677,9 @@ describe("VoicePanel reading mode settings (PRD #1497 D4, D9)", () => {
     expect(screen.getByTestId("voice-reading-disclosure")).toHaveTextContent(READING_DISCLOSURE);
     expect(READING_DISCLOSURE).toMatch(/final reply .* sent to the Commands connection/);
     expect(READING_DISCLOSURE).toMatch(/speech service/);
+    // Audit A-B2: provider speech gets every sentence, the announcements included.
+    expect(READING_DISCLOSURE).toMatch(/every sentence the app speaks .*permission prompts .*error announcements.* sent to that provider's speech service/);
+    expect(READING_DISCLOSURE).not.toMatch(/without sending anything/);
     fireEvent.click(within(group).getByRole("radio", { name: "On" }));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on" } }));
   });

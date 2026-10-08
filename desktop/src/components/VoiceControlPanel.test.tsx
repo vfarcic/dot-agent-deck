@@ -2739,7 +2739,8 @@ describe("voice reading mode (PRD #1497 M5)", () => {
     await flush();
     expect(stopped).toEqual([41]);
     expect(screen.queryByTestId("agent-pane-reading")).toBeNull();
-    // "Reading on." is still being said, so "Reading off." waits behind it.
-    expect(spoken).toEqual(["Reading on."]);
+    // Audit A-B3: ending cuts off "Reading on." and drops anything queued
+    // before "Reading off." is said.
+    expect(spoken).toEqual(["Reading on.", "Reading off."]);
   });
 });

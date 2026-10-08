@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeechPlanDto } from "./bridge";
 import {
+  MAX_PROVIDER_AUDIO_SECONDS,
   NO_SYSTEM_VOICE,
+  PROVIDER_AUDIO_TOO_LONG,
   SpeechQueue,
+  providerPlaybackDeadlineMs,
   providerVoice,
   systemVoice,
   systemVoiceDeadlineMs,
@@ -223,7 +226,11 @@ describe("systemVoice", () => {
 });
 
 describe("providerVoice", () => {
-  function fakeContext() {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function fakeContext(duration?: number) {
     const started: string[] = [];
     const source = {
       buffer: null as AudioBuffer | null,
@@ -235,7 +242,7 @@ describe("providerVoice", () => {
     const context: AudioContextLike = {
       destination: {} as AudioNode,
       resume: () => Promise.resolve(),
-      decodeAudioData: () => Promise.resolve({} as AudioBuffer),
+      decodeAudioData: () => Promise.resolve((duration === undefined ? {} : { duration }) as AudioBuffer),
       createBufferSource: () => source as unknown as AudioBufferSourceNode,
     };
     return { context, source, started };
@@ -262,6 +269,31 @@ describe("providerVoice", () => {
     controller.abort();
     await expect(stopped).resolves.toBeUndefined();
     expect(started).toEqual(["start", "start", "stop"]);
+  });
+
+  /** Scenario (audit A-S2): decoded provider audio longer than the cap is refused before anything plays. */
+  it("refuses decoded audio longer than the cap", async () => {
+    const { context, started } = fakeContext(MAX_PROVIDER_AUDIO_SECONDS + 1);
+    const voice = providerVoice(() => Promise.resolve(new ArrayBuffer(4)), () => context);
+    await expect(voice.speak("hello", new AbortController().signal)).rejects.toThrow(PROVIDER_AUDIO_TOO_LONG);
+    expect(started).toEqual([]);
+  });
+
+  /** Scenario (audit A-S2): a source that never reports its end is stopped at the playback deadline, so it cannot hold the speech queue. */
+  it("stops playback that never reports its end at the deadline", async () => {
+    vi.useFakeTimers();
+    const { context, started } = fakeContext(3);
+    const voice = providerVoice(() => Promise.resolve(new ArrayBuffer(4)), () => context);
+    const done = voice.speak("hello", new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["start"]);
+    await vi.advanceTimersByTimeAsync(providerPlaybackDeadlineMs(3) - 1);
+    expect(started).toEqual(["start"]);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(done).resolves.toBeUndefined();
+    expect(started).toEqual(["start", "stop"]);
+    // A length the decoder did not report is given the cap.
+    expect(providerPlaybackDeadlineMs(Number.NaN)).toBe(providerPlaybackDeadlineMs(MAX_PROVIDER_AUDIO_SECONDS));
   });
 
   it("rejects when the audio cannot be fetched", async () => {

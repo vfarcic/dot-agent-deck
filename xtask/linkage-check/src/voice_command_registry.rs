@@ -116,6 +116,14 @@ const SCRATCH_LIST: &str = "SCRATCH_PHRASES";
 const INTERRUPT_ROW: &str = "interrupt_agent";
 const CLEAR_PROMPT_ROW: &str = "clear_prompt";
 const SCRATCH_ROW: &str = "scratch_that";
+/// PRD #1497 — reading mode's whole-utterance switches and the phrases that
+/// silence the app's speech, each backed by its own row.
+const READING_ON_LIST: &str = "READING_ON_PHRASES";
+const READING_OFF_LIST: &str = "READING_OFF_PHRASES";
+const QUIET_LIST: &str = "QUIET_PHRASES";
+const READING_ON_ROW: &str = "reading_on";
+const READING_OFF_ROW: &str = "reading_off";
+const QUIET_ROW: &str = "quiet";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -328,6 +336,9 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         (TYPING_STOP_LIST, INTERRUPT_ROW),
         (CLEAR_PROMPT_LIST, CLEAR_PROMPT_ROW),
         (SCRATCH_LIST, SCRATCH_ROW),
+        (READING_ON_LIST, READING_ON_ROW),
+        (READING_OFF_LIST, READING_OFF_ROW),
+        (QUIET_LIST, QUIET_ROW),
     ]
     .into_iter()
     .map(|(name, row_id)| (name, list(name, findings), row_id))
@@ -1476,6 +1487,9 @@ mod tests {
             "TYPING_STOP_PHRASES",
             "CLEAR_PROMPT_PHRASES",
             "SCRATCH_PHRASES",
+            "READING_ON_PHRASES",
+            "READING_OFF_PHRASES",
+            "QUIET_PHRASES",
         ] {
             let mut sources = checked_in();
             let original = sources.dictation_rs.clone();
@@ -1543,6 +1557,20 @@ mod tests {
         let mut opener_overlap = checked_in();
         insert_phrase(&mut opener_overlap.dictation_rs, "SCRATCH_PHRASES", "say");
         assert_reports(&check(&opener_overlap), "is in both");
+
+        // PRD #1497: a reading phrase its row does not name, and a quiet
+        // phrase that is also a typing-mode stop.
+        let mut unnamed_reading = checked_in();
+        insert_phrase(
+            &mut unnamed_reading.dictation_rs,
+            "READING_ON_PHRASES",
+            "narrate everything",
+        );
+        assert_reports(&check(&unnamed_reading), "narrate everything");
+
+        let mut quiet_overlap = checked_in();
+        insert_phrase(&mut quiet_overlap.dictation_rs, "QUIET_PHRASES", "stop it");
+        assert_reports(&check(&quiet_overlap), "is in both");
     }
 
     /// The masker is what makes every scan above safe, so it is pinned

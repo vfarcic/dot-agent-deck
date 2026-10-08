@@ -30,6 +30,7 @@ import {
 	buildWorkDoneArgv,
 	createReporter,
 	createSerialQueue,
+	createTurnReplyTracker,
 	DeckExecError,
 	execFailureMessage,
 	piEventReport,
@@ -139,14 +140,20 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	// Every report, with its retries, runs to completion before the next one
 	// starts, so the deck receives them in the order Pi emitted them.
 	const inOrder = createSerialQueue();
-	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> =>
-		inOrder(async () => {
-			const decided = piEventReport(eventName, event, ctx.cwd);
+	// PRD #1497: the run's last assistant reply, attached to `agent_settled`.
+	// Observed synchronously in each handler, so it follows Pi's event order.
+	const replies = createTurnReplyTracker();
+	const report = (eventName: string, event: unknown, ctx: ExtensionContext): Promise<void> => {
+		replies.observe(eventName, event);
+		const reply = eventName === "agent_settled" ? replies.take() : undefined;
+		return inOrder(async () => {
+			const decided = piEventReport(eventName, event, ctx.cwd, reply);
 			if (!decided) {
 				return;
 			}
 			await reporter.send(decided, ctx.signal);
 		});
+	};
 
 	// --- PRD #201: NATIVE prompt delivery on session_start ----------------
 	// Pull the seed/prompt the daemon prepared for this pane (`get-seed`) and,
@@ -208,6 +215,11 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("tool_execution_end", async (event, ctx) => {
 		await report("tool_execution_end", event, ctx);
+	});
+	// PRD #1497: each finished message, for the settled turn's final reply.
+	// Reports nothing by itself.
+	pi.on("message_end", (event) => {
+		replies.observe("message_end", event);
 	});
 	pi.on("agent_settled", async (event, ctx) => {
 		await report("agent_settled", event, ctx);

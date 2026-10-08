@@ -228,12 +228,40 @@ export interface AudioContextLike {
 }
 
 /**
+ * The longest provider audio played for one sentence, in seconds. The Rust
+ * side caps the bytes at about two minutes of MP3; a decoded clip longer than
+ * this is refused rather than played, whatever its bytes said.
+ */
+export const MAX_PROVIDER_AUDIO_SECONDS = 120;
+
+/** Added to a clip's own length before its playback is given up on. */
+export const PROVIDER_PLAYBACK_MARGIN_MS = 2_000;
+
+/** Said when decoded provider audio is longer than {@link MAX_PROVIDER_AUDIO_SECONDS}. */
+export const PROVIDER_AUDIO_TOO_LONG = "the speech service's audio is too long to play";
+
+/**
+ * How long a decoded clip of `seconds` may play before it is stopped: its own
+ * length (or the cap, for a length the decoder did not report) plus a margin,
+ * so a source that never reports its end cannot hold the queue.
+ */
+export function providerPlaybackDeadlineMs(seconds: number, maxSeconds = MAX_PROVIDER_AUDIO_SECONDS): number {
+  const length = Number.isFinite(seconds) && seconds >= 0 ? Math.min(seconds, maxSeconds) : maxSeconds;
+  return length * 1_000 + PROVIDER_PLAYBACK_MARGIN_MS;
+}
+
+/**
  * The Commands connection's text-to-speech: audio fetched Rust-side, decoded
  * and played with Web Audio. The context is created on first use and reused.
+ *
+ * Bounded twice after the Rust side's byte cap: a decoded clip longer than
+ * `maxSeconds` is refused before it plays, and playback is stopped at
+ * {@link providerPlaybackDeadlineMs} if the source never reports its end.
  */
 export function providerVoice(
   fetchAudio: (text: string) => Promise<ArrayBuffer>,
   makeContext: () => AudioContextLike = () => new AudioContext(),
+  maxSeconds = MAX_PROVIDER_AUDIO_SECONDS,
 ): SpeechVoice {
   let context: AudioContextLike | undefined;
   return {
@@ -245,23 +273,28 @@ export function providerVoice(
       await ctx.resume?.();
       const buffer = await ctx.decodeAudioData(audio);
       if (signal.aborted) return;
+      if (Number.isFinite(buffer.duration) && buffer.duration > maxSeconds) throw new Error(PROVIDER_AUDIO_TOO_LONG);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);
       await new Promise<void>((resolve) => {
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        const finish = () => {
+          clearTimeout(deadline);
+          signal.removeEventListener("abort", stop);
+          resolve();
+        };
         const stop = () => {
           try {
             source.stop();
           } catch {
             // Already stopped.
           }
-          resolve();
+          finish();
         };
         signal.addEventListener("abort", stop, { once: true });
-        source.onended = () => {
-          signal.removeEventListener("abort", stop);
-          resolve();
-        };
+        source.onended = finish;
+        deadline = setTimeout(stop, providerPlaybackDeadlineMs(buffer.duration, maxSeconds));
         source.start();
       });
     },

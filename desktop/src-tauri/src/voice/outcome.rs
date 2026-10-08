@@ -2022,11 +2022,14 @@ fn typing_mode_row<'t>(
 ///
 /// # The order
 ///
-/// 1. a way of silencing the app — [`QUIET_PHRASES`] always, and the bare
-///    *"stop"* forms ([`TYPING_STOP_PHRASES`]) while the app was speaking or
-///    while reading is on outside typing mode (in typing mode, with nothing
-///    being said, a bare *"stop"* keeps its meaning there: interrupt the
-///    agent) — dispatches `quiet`, which leaves reading on;
+/// 1. a way of silencing the app — [`QUIET_PHRASES`] while reading is on or
+///    the app was speaking, and the bare *"stop"* forms
+///    ([`TYPING_STOP_PHRASES`]) while the app was speaking or while reading is
+///    on outside typing mode (in typing mode, with nothing being said, a bare
+///    *"stop"* keeps its meaning there: interrupt the agent) — dispatches
+///    `quiet`, which leaves reading on. With reading off and nothing spoken,
+///    neither list is answered here, so *"hush"* said alone in typing mode is
+///    typed as it was before reading mode existed;
 /// 2. **while the app was speaking, anything else is dropped** (D8): the
 ///    microphone may be hearing the app, and the worst its echo may then do is
 ///    silence the app. Voice off included — say "stop" first;
@@ -2034,8 +2037,9 @@ fn typing_mode_row<'t>(
 ///    every mode.
 ///
 /// Every list is whole-utterance, less an edge politeness word, so *"start
-/// reading the logs"* is not a switch. The cost is the usual one: none of
-/// these can be dictated alone in typing mode. `None` for everything else, and
+/// reading the logs"* is not a switch. The cost is the usual one: the reading
+/// switches cannot be dictated alone in typing mode, and the quiet phrases
+/// cannot while reading is on or the app is speaking. `None` for everything else, and
 /// for a table without the row a phrase belongs to.
 fn reading_intercept(
     table: &CommandTable,
@@ -2058,9 +2062,10 @@ fn reading_intercept(
         }
     };
     let text = transcript.text();
+    let quiet_live = reading.speaking || reading.reading;
     let stops_quiet = reading.speaking || (reading.reading && !typing);
-    let quiets =
-        said_whole(text, QUIET_PHRASES) || (stops_quiet && said_whole(text, TYPING_STOP_PHRASES));
+    let quiets = (quiet_live && said_whole(text, QUIET_PHRASES))
+        || (stops_quiet && said_whole(text, TYPING_STOP_PHRASES));
     if quiets && let Some(row) = table.row(QUIET_ROW) {
         return Some(dispatch(row));
     }
@@ -13074,15 +13079,15 @@ mod tests {
         );
     }
 
-    /// Scenario: "quiet" silences the app's speech on any screen, and the
-    /// bare "stop" forms do too while reading is on outside typing mode; in
+    /// Scenario: "quiet" silences the app's speech on any screen while
+    /// reading is on, and the bare "stop" forms do too outside typing mode; in
     /// typing mode with nothing being spoken, "stop" keeps interrupting the
     /// agent, and with reading off it is not answered here.
     #[tokio::test]
     async fn voice_outcome_quiet_and_stop_silence_speech_without_ending_reading() {
         for screen in [Screen::Agent, Screen::Overview, Screen::Deck] {
             for said in ["quiet", "Be quiet.", "hush", "silence please", "shush"] {
-                let outcome = reading_answer(said, screen, false, NOT_READING).await;
+                let outcome = reading_answer(said, screen, false, READING).await;
                 assert_eq!(dispatched(&outcome), Some("quiet"), "{said:?}: {outcome:?}");
             }
         }
@@ -13096,6 +13101,40 @@ mod tests {
                 "{said:?} in typing mode: {typing:?}"
             );
         }
+    }
+
+    /// Scenario (review R-S2): with reading off and the app saying nothing,
+    /// "hush", "quiet", "silence", "be quiet" and "shush" said alone in typing
+    /// mode are typed into the agent's prompt as they were before reading mode
+    /// existed; the same "hush" while the app is speaking silences it, in
+    /// typing mode and out of it, and so does "hush" in typing mode while
+    /// reading is on.
+    #[tokio::test]
+    async fn voice_outcome_quiet_phrases_are_reserved_only_while_reading_or_speaking() {
+        for said in ["hush", "quiet", "silence", "be quiet", "shush"] {
+            let typed = reading_answer(said, Screen::Agent, true, NOT_READING).await;
+            assert_eq!(
+                dispatched(&typed),
+                Some("dictate_to_agent"),
+                "{said:?} with reading off and nothing spoken: {typed:?}"
+            );
+        }
+        let speaking_only = VoiceReadingState {
+            reading: false,
+            speaking: true,
+        };
+        for typing in [false, true] {
+            for state in [speaking_only, SPEAKING] {
+                let outcome = reading_answer("hush", Screen::Agent, typing, state).await;
+                assert_eq!(
+                    dispatched(&outcome),
+                    Some("quiet"),
+                    "hush (typing {typing}, {state:?}): {outcome:?}"
+                );
+            }
+        }
+        let reading = reading_answer("hush", Screen::Agent, true, READING).await;
+        assert_eq!(dispatched(&reading), Some("quiet"), "{reading:?}");
     }
 
     /// Scenario (D8): while the app is speaking, "stop" and "quiet" silence it

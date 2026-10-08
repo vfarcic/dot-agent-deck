@@ -237,6 +237,15 @@ enum Commands {
         /// (issue #1567). Sent by the bundled Pi extension on every report.
         #[arg(long = "reports-prompts")]
         reports_prompts: bool,
+        /// The final reply of the turn that just settled (with `--type
+        /// finished`), for the deck's reading mode (PRD #1497). Sent by the
+        /// bundled Pi extension; the daemon passes it only to clients reading
+        /// this agent, and never shows or stores it.
+        #[arg(long = "turn-reply", allow_hyphen_values = true)]
+        turn_reply: Option<String>,
+        /// The turn whose `--turn-reply` this is ended in an error.
+        #[arg(long = "turn-reply-failed")]
+        turn_reply_failed: bool,
     },
     /// Print the seed/prompt the daemon prepared for this pane, then clear it
     /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
@@ -1487,6 +1496,8 @@ fn main() -> ExitCode {
             tool_name,
             tool_detail,
             reports_prompts,
+            turn_reply,
+            turn_reply_failed,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
@@ -1516,6 +1527,13 @@ fn main() -> ExitCode {
             // stable session id derived from the pane so repeated events update
             // the same card. The daemon's `run_hook_loop` falls back to
             // `AgentEvent` and `apply_event` drives the card.
+            // PRD #1497: the settled turn's reply rides the line beside the
+            // event, never inside it, exactly as a hook's does.
+            let reply = dot_agent_deck::hook::agent_event_cli_turn_reply(
+                &event_type,
+                turn_reply,
+                turn_reply_failed,
+            );
             let event = dot_agent_deck::hook::build_agent_event_cli(
                 pane_id,
                 agent_id,
@@ -1530,7 +1548,11 @@ fn main() -> ExitCode {
             );
             // Issue #318: present this pane's hook capability token.
             let token = dot_agent_deck::hook_provenance::token_from_env();
-            let json = match dot_agent_deck::event::agent_event_line(&event, token.as_deref()) {
+            let json = match dot_agent_deck::hook::agent_event_cli_line(
+                &event,
+                token.as_deref(),
+                reply.as_ref(),
+            ) {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!("Failed to serialize agent-event: {e}");

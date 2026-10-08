@@ -1002,6 +1002,40 @@ pub fn build_agent_event_cli(
     }
 }
 
+/// PRD #1497: the final reply `dot-agent-deck agent-event --turn-reply` carries
+/// — the bundled Pi extension's last assistant text for a settled turn —
+/// bounded like every other route ([`crate::turn_reply::normalize`]). Only a
+/// turn end (`--type finished`, an [`EventType::Idle`]) carries one; on any
+/// other `--type`, and for a missing or blank text, it is `None`, so the line
+/// is sent exactly as before.
+pub fn agent_event_cli_turn_reply(
+    event_type: &EventType,
+    text: Option<String>,
+    failed: bool,
+) -> Option<crate::daemon_protocol::FinalReply> {
+    if *event_type != EventType::Idle {
+        return None;
+    }
+    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
+        turn_id: None,
+        text: text?,
+        failed,
+    })
+}
+
+/// The hook-socket line `dot-agent-deck agent-event` sends: `event` with this
+/// pane's token ([`crate::event::agent_event_line`]) and, beside it, the
+/// settled turn's `reply` under [`crate::turn_reply::TURN_REPLY_LINE_KEY`] —
+/// the shape a Claude-compatible hook's line takes, so the daemon reads both
+/// the same way.
+pub fn agent_event_cli_line(
+    event: &AgentEvent,
+    token: Option<&str>,
+    reply: Option<&crate::daemon_protocol::FinalReply>,
+) -> serde_json::Result<String> {
+    crate::event::agent_event_line(event, token).and_then(|line| with_turn_reply(line, reply))
+}
+
 /// The total-operation budget for a `delegate`'s reply — the same 5s
 /// [`GET_SEED_REQUEST_TIMEOUT`] gives `get-seed`, and the value that comment
 /// already names as this path's bound.
@@ -2044,6 +2078,79 @@ mod tests {
     }
 
     /// A lifecycle report with no detail is the frame it has always been.
+    /// PRD #1497: the Pi extension's `--turn-reply` on a `--type finished`
+    /// report becomes the line's `turn_reply`, which the daemon reads as it
+    /// reads a hook's; no other `--type` carries one, a blank text carries
+    /// none, and a line without one is the line it always was.
+    #[test]
+    fn agent_event_cli_turn_reply_rides_the_line_beside_a_settled_event() {
+        let finished = build_agent_event_cli(
+            "pane-7".into(),
+            Some("agent-3".into()),
+            EventType::Idle,
+            AgentEventDetail::default(),
+        );
+        let reply = agent_event_cli_turn_reply(
+            &EventType::Idle,
+            Some("All 42 tests pass.\n\nNothing changed.".into()),
+            false,
+        )
+        .expect("a settled turn's reply");
+        let line = agent_event_cli_line(&finished, Some("tok"), Some(&reply)).unwrap();
+        assert_eq!(
+            crate::turn_reply::reply_from_line(&line),
+            Some(crate::daemon_protocol::FinalReply {
+                turn_id: None,
+                text: "All 42 tests pass.\n\nNothing changed.".into(),
+                failed: false,
+            })
+        );
+        // The event itself is unchanged and still parses as one.
+        let parsed: AgentEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.event_type, EventType::Idle);
+        assert_eq!(parsed.agent_id.as_deref(), Some("agent-3"));
+
+        let failed = agent_event_cli_turn_reply(&EventType::Idle, Some("--boom".into()), true)
+            .expect("a failed turn's reply");
+        assert!(failed.failed);
+        assert_eq!(failed.text, "--boom");
+
+        for other in [
+            EventType::Thinking,
+            EventType::ToolStart,
+            EventType::WaitingForInput,
+        ] {
+            assert_eq!(
+                agent_event_cli_turn_reply(&other, Some("text".into()), false),
+                None,
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            agent_event_cli_turn_reply(&EventType::Idle, Some("  \n ".into()), false),
+            None
+        );
+        assert_eq!(
+            agent_event_cli_turn_reply(&EventType::Idle, None, false),
+            None
+        );
+        let plain = agent_event_cli_line(&finished, Some("tok"), None).unwrap();
+        assert_eq!(
+            plain,
+            crate::event::agent_event_line(&finished, Some("tok")).unwrap()
+        );
+        assert_eq!(crate::turn_reply::reply_from_line(&plain), None);
+    }
+
+    /// PRD #1497: an over-long reply is clamped to the daemon's bound before
+    /// it is sent, the same as every other route's.
+    #[test]
+    fn agent_event_cli_turn_reply_is_bounded() {
+        let long = "é".repeat(crate::daemon_protocol::MAX_TURN_REPLY_BYTES);
+        let reply = agent_event_cli_turn_reply(&EventType::Idle, Some(long), false).unwrap();
+        assert!(reply.text.len() <= crate::daemon_protocol::MAX_TURN_REPLY_BYTES);
+    }
+
     #[test]
     fn agent_event_cli_without_detail_keeps_the_legacy_frame() {
         let event = build_agent_event_cli(

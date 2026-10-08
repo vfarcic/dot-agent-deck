@@ -11,9 +11,12 @@
  * # When it ends (D11)
  *
  * "reading off", opening a different agent's pane, closing the pane, and
- * "voice off". Each ends it the same way — the subscription is stopped and
- * the app says "Reading off." — and none of them carries anything over: a
- * later "reading on" starts from that moment, never with a backlog (D3).
+ * "voice off" — and, from the Rust side, the Settings opt-in being turned off
+ * (an `ended` sentence). Each ends it the same way: what the app is saying is
+ * cut off and everything queued is dropped, then it says "Reading off.", then
+ * the subscription is stopped. None of them carries anything over: a sentence
+ * from the ended session is never queued again, and a later "reading on"
+ * starts from that moment, never with a backlog (D3).
  *
  * # What it does NOT end
  *
@@ -37,9 +40,13 @@ export type ReadingStartDto =
   | { kind: "not_enabled"; sentence: string }
   | { kind: "unavailable"; sentence: string };
 
-/** One sentence to speak, from `desktop_voice_reading_start`'s channel. */
+/**
+ * One sentence to speak, from `desktop_voice_reading_start`'s channel — or,
+ * as `ended`, word that the Rust side ended the session (the Settings opt-in
+ * was turned off), which ends reading mode here instead of being spoken.
+ */
 export interface ReadingSentenceDto {
-  kind: "turn" | "permission" | "blocked";
+  kind: "turn" | "permission" | "blocked" | "ended";
   text: string;
 }
 
@@ -127,6 +134,10 @@ export class ReadingMode {
     try {
       answer = await this.deps.start(target, (sentence) => {
         if (this.generation !== generation) return;
+        if (sentence.kind === "ended") {
+          void this.end(true);
+          return;
+        }
         /* A turn's summary replaces a waiting summary for the same agent
            (D6); each permission prompt or error waits under a key of its own,
            so nothing later drops what the user has to act on. */
@@ -179,7 +190,6 @@ export class ReadingMode {
    * without announcing it — nothing is left on screen to say it to.
    */
   async dispose(): Promise<void> {
-    this.deps.speech.interrupt();
     await this.end(false);
   }
 
@@ -188,12 +198,19 @@ export class ReadingMode {
     this.deps.speech.interrupt();
   }
 
+  /**
+   * End the session, in this order: bump the generation so no late sentence
+   * from it is queued again; cut off what is being said and drop everything
+   * queued; then say "Reading off." (when `announce`); then stop the
+   * subscription.
+   */
   private async end(announce: boolean): Promise<void> {
     this.generation += 1;
     this.starting = undefined;
     const ended = this.current;
     this.current = undefined;
     if (ended !== undefined) this.deps.onChange?.(undefined);
+    this.deps.speech.interrupt();
     if (announce) this.deps.speech.say(READING_VOICE_KEY, READING_OFF);
     if (ended !== undefined) await this.deps.stop(ended.session);
   }

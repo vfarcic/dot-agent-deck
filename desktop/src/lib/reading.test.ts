@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import type { SpeechPlanDto } from "./bridge";
 import { READING_ALREADY_OFF, READING_OFF, READING_ON, READING_VOICE_KEY, ReadingMode, type ReadingSentenceDto, type ReadingStartDto, type ReadingTarget } from "./reading";
+import { SpeechQueue, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingTarget = { deckId: "deck-local", agentId: "tester", label: "tester" };
 const CODER: ReadingTarget = { deckId: "deck-local", agentId: "coder", label: "coder" };
@@ -57,7 +59,7 @@ describe("ReadingMode (PRD #1497 M5)", () => {
 
   /** Scenario: when reading is not available for the agent (the daemon reports no turn ends), "reading on" says so plainly and reading stays off. */
   it("says plainly when reading is unavailable", async () => {
-    const sentence = "Reading is not available: this daemon does not report when an agent finishes a turn yet.";
+    const sentence = "Reading is not available: this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine.";
     const h = harness({ kind: "unavailable", sentence });
     expect(await h.mode.turnOn(TESTER)).toEqual({ kind: "refused", sentence });
     expect(h.mode.on).toBe(false);
@@ -183,5 +185,113 @@ describe("ReadingMode (PRD #1497 M5)", () => {
     expect(h.stop).toHaveBeenCalledWith(7);
     expect(h.speech.interrupt).toHaveBeenCalled();
     expect(h.said.length).toBe(before);
+  });
+
+  /** Scenario (audit A-B1): the Rust side ends the session because the Settings opt-in was turned off; reading mode ends here too — indicator cleared, speech interrupted, "Reading off." said, subscription stopped — and the ended sentence itself is never spoken. */
+  it("ends when the Rust side says the session ended", async () => {
+    const h = harness();
+    await h.mode.turnOn(TESTER);
+    h.sinks[0]({ kind: "ended", text: "Reading off." });
+    await Promise.resolve();
+    expect(h.mode.on).toBe(false);
+    expect(h.changes).toEqual([TESTER, undefined]);
+    expect(h.speech.interrupt).toHaveBeenCalledTimes(1);
+    expect(h.said.at(-1)).toEqual([READING_VOICE_KEY, READING_OFF]);
+    expect(h.said.filter(([key]) => key !== READING_VOICE_KEY)).toEqual([]);
+    expect(h.stop).toHaveBeenCalledWith(7);
+  });
+});
+
+/** A provider voice that records every sentence it is asked to fetch and play, and finishes only when the test says so. */
+class FetchingVoice implements SpeechVoice {
+  readonly fetched: string[] = [];
+  readonly aborted: string[] = [];
+  private finishers: (() => void)[] = [];
+
+  speak(text: string, signal: AbortSignal): Promise<void> {
+    this.fetched.push(text);
+    return new Promise((resolve) => {
+      signal.addEventListener("abort", () => {
+        this.aborted.push(text);
+        this.finishers = this.finishers.filter((finisher) => finisher !== resolve);
+        resolve();
+      });
+      this.finishers.push(resolve);
+    });
+  }
+
+  finish(): void {
+    this.finishers.shift()?.();
+  }
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Reading mode over a real speech queue whose provider voice is recorded. */
+function speaking(plan: SpeechPlanDto = { kind: "provider", fallbackToSystem: false }) {
+  const provider = new FetchingVoice();
+  const system = new FetchingVoice();
+  const queue = new SpeechQueue({ plan: () => Promise.resolve(plan), provider, system });
+  const sinks: ((sentence: ReadingSentenceDto) => void)[] = [];
+  const stop = vi.fn(async () => undefined);
+  const mode = new ReadingMode({
+    start: async (_target, onSentence) => {
+      sinks.push(onSentence);
+      return { kind: "started", session: 7 };
+    },
+    stop,
+    speech: queue,
+  });
+  return { mode, queue, provider, system, sinks, stop };
+}
+
+describe("ReadingMode ending with speech in flight (audit A-B3)", () => {
+  const ends: [string, (mode: ReadingMode) => Promise<unknown>][] = [
+    ["reading off", (mode) => mode.turnOff()],
+    ["another agent's pane", (mode) => mode.paneChanged({ deckId: CODER.deckId, agentId: CODER.agentId })],
+    ["the pane closing", (mode) => mode.paneChanged(undefined)],
+    ["voice off", (mode) => mode.voiceOff()],
+  ];
+  for (const [name, endIt] of ends) {
+    /** Scenario: a summary is being spoken by the provider and a private permission sentence is queued behind it when reading ends; the summary is aborted, the queued sentence is removed and never fetched, "Reading off." is the only thing left, and a late sentence from the ended session never re-enters the queue. */
+    it(`interrupts and clears the queue before saying Reading off on ${name}`, async () => {
+      const h = speaking();
+      await h.mode.turnOn(TESTER);
+      await flush();
+      h.provider.finish(); // "Reading on."
+      await flush();
+      h.sinks[0]({ kind: "turn", text: "The tester finished: a private summary." });
+      await flush();
+      h.sinks[0]({ kind: "permission", text: "The tester is asking for permission: read secrets.env." });
+      expect(h.provider.fetched.at(-1)).toBe("The tester finished: a private summary.");
+      expect(h.queue.pending.map((entry) => entry.text)).toEqual(["The tester is asking for permission: read secrets.env."]);
+
+      await endIt(h.mode);
+      expect(h.provider.aborted).toEqual(["The tester finished: a private summary."]);
+      expect(h.queue.pending.map((entry) => entry.text)).not.toContain("The tester is asking for permission: read secrets.env.");
+      expect(h.stop).toHaveBeenCalledWith(7);
+
+      // A sentence from the ended generation arrives late.
+      h.sinks[0]({ kind: "turn", text: "The tester finished: late news." });
+      await flush();
+      h.provider.finish();
+      await flush();
+      expect(h.provider.fetched).toEqual(["Reading on.", "The tester finished: a private summary.", READING_OFF]);
+      expect(h.queue.speaking).toBe(false);
+    });
+  }
+
+  /** Scenario (audit A-B2): under a provider speech source, a permission sentence — the agent's name and up to 120 characters of what it wants — is sent to the provider's speech like every other sentence, which is what Settings → Voice discloses. */
+  it("sends a permission sentence to the provider's speech when it is the source", async () => {
+    const h = speaking({ kind: "provider", fallbackToSystem: true });
+    await h.mode.turnOn(TESTER);
+    await flush();
+    h.provider.finish();
+    await flush();
+    const permission = `The tester is asking for permission: Bash: ${"x".repeat(100)}.`;
+    h.sinks[0]({ kind: "permission", text: permission });
+    await flush();
+    expect(h.provider.fetched).toEqual(["Reading on.", permission]);
+    expect(h.system.fetched).toEqual([]);
   });
 });

@@ -142,6 +142,28 @@ export function buildWorkDoneArgv(summary: string, done = false): string[] {
 export const DECLARE_PROMPT_REPORTS_FLAG = "--reports-prompts";
 
 /**
+ * The `agent-event` flags that carry a settled turn's final reply (PRD #1497):
+ * the text of Pi's last assistant message, and whether that message ended in
+ * an error. The deck reads a short summary of it aloud while reading mode is
+ * on, and never shows or stores it otherwise.
+ */
+export const TURN_REPLY_FLAG = "--turn-reply";
+export const TURN_REPLY_FAILED_FLAG = "--turn-reply-failed";
+
+/**
+ * The longest reply put on argv, in code points. The deck keeps at most 8 KiB
+ * of a reply, so this only keeps a very long one well clear of the OS's
+ * per-argument limit; it never decides what is read.
+ */
+export const MAX_TURN_REPLY_CHARS = 8192;
+
+/** A settled turn's final reply, as the extension reports it. */
+export interface TurnReply {
+	text: string;
+	failed: boolean;
+}
+
+/**
  * Build the argv for `dot-agent-deck agent-event`. Rejects any type the CLI
  * does not accept so a bogus `--type` can never reach it, and appends each
  * non-blank detail as its own flag in a fixed order. With no detail, a
@@ -156,6 +178,7 @@ export function buildAgentEventArgv(
 	type: string,
 	detail: AgentEventDetail = {},
 	declarePromptReports = false,
+	reply?: TurnReply,
 ): string[] {
 	if (!isAgentEventType(type)) {
 		throw new Error(
@@ -183,6 +206,14 @@ export function buildAgentEventArgv(
 	for (const [flag, value] of flags) {
 		if (typeof value === "string" && value.trim().length > 0) {
 			argv.push(`${flag}=${value}`);
+		}
+	}
+	// PRD #1497: LAST, and only when there is text — an older CLI's refusal
+	// of it is handled by `createReporter`, which drops the reply first.
+	if (reply !== undefined && reply.text.trim().length > 0) {
+		argv.push(`${TURN_REPLY_FLAG}=${clip(reply.text, MAX_TURN_REPLY_CHARS)}`);
+		if (reply.failed) {
+			argv.push(TURN_REPLY_FAILED_FLAG);
 		}
 	}
 	return argv;
@@ -356,10 +387,68 @@ export function piToolDetail(toolName: string, args: unknown): string | undefine
 	}
 }
 
+/**
+ * The final reply in one of Pi's messages (PRD #1497): the text blocks of an
+ * assistant message, joined, with its thinking and tool calls left out, and
+ * `failed` when the message ended in an error (`stopReason: "error"`). An
+ * errored message with no text carries its `errorMessage` instead. `undefined`
+ * for any other message, and for one with nothing to read.
+ */
+export function piAssistantReply(message: unknown): TurnReply | undefined {
+	const record = asRecord(message);
+	if (!record || record.role !== "assistant") {
+		return undefined;
+	}
+	const blocks = Array.isArray(record.content) ? record.content : [];
+	const text = blocks
+		.map((block) => asRecord(block))
+		.filter((block): block is Record<string, unknown> => block !== null && block.type === "text")
+		.map((block) => nonBlankString(block.text)?.trim())
+		.filter((part): part is string => part !== undefined)
+		.join("\n\n");
+	const failed = record.stopReason === "error";
+	const said = text.length > 0 ? text : failed ? nonBlankString(record.errorMessage)?.trim() : undefined;
+	return said === undefined ? undefined : { text: clip(said, MAX_TURN_REPLY_CHARS), failed };
+}
+
+/**
+ * Keeps the last assistant reply of the run Pi is in, for its `agent_settled`
+ * report (PRD #1497). `observe` is handed every `agent_start` and
+ * `message_end` in the order Pi emits them: a run starting forgets the last
+ * run's reply, and each assistant message with text replaces the one before,
+ * so what `take` answers at `agent_settled` is the run's final reply. `take`
+ * clears it, so a reply is reported once.
+ */
+export function createTurnReplyTracker(): {
+	observe: (eventName: string, event: unknown) => void;
+	take: () => TurnReply | undefined;
+} {
+	let last: TurnReply | undefined;
+	return {
+		observe(eventName, event) {
+			if (eventName === "agent_start") {
+				last = undefined;
+			} else if (eventName === "message_end") {
+				const reply = piAssistantReply(asRecord(event)?.message);
+				if (reply !== undefined) {
+					last = reply;
+				}
+			}
+		},
+		take() {
+			const reply = last;
+			last = undefined;
+			return reply;
+		},
+	};
+}
+
 /** What the extension reports for one Pi event: the `--type` and its detail. */
 export interface AgentEventReport {
 	type: AgentEventType;
 	detail: AgentEventDetail;
+	/** A settled turn's final reply (PRD #1497), on `agent_settled` only. */
+	reply?: TurnReply;
 }
 
 /**
@@ -371,7 +460,12 @@ export interface AgentEventReport {
  * `agent_start` that follows still moves the card to Thinking — and so does an
  * `input` Pi is not going to queue (see the `input` arm).
  */
-export function piEventReport(eventName: string, event: unknown, cwd: string | undefined): AgentEventReport | null {
+export function piEventReport(
+	eventName: string,
+	event: unknown,
+	cwd: string | undefined,
+	reply?: TurnReply,
+): AgentEventReport | null {
 	const detail: AgentEventDetail = {};
 	const dir = nonBlankString(cwd);
 	if (dir !== undefined) {
@@ -379,7 +473,8 @@ export function piEventReport(eventName: string, event: unknown, cwd: string | u
 	}
 	const state = piEventToAgentState(eventName);
 	if (state) {
-		return { type: state, detail };
+		// PRD #1497: only the settled turn carries its reply.
+		return eventName === "agent_settled" && reply !== undefined ? { type: state, detail, reply } : { type: state, detail };
 	}
 	const payload = asRecord(event) ?? {};
 	switch (eventName) {
@@ -444,12 +539,15 @@ export type ReportLevel = (typeof REPORT_LEVELS)[number];
 
 /**
  * The argv for `report` at `level`, or `null` when that level has nothing to
- * send for it — a detail report at `lifecycle`.
+ * send for it — a detail report at `lifecycle`. The report's reply (PRD
+ * #1497) is added only with `withReply`, and only at `declared`: the CLI that
+ * takes it is newer than the declaration, so a deck that cannot take the
+ * declaration cannot take the reply either.
  */
-export function reportArgvAt(report: AgentEventReport, level: ReportLevel): string[] | null {
+export function reportArgvAt(report: AgentEventReport, level: ReportLevel, withReply = false): string[] | null {
 	switch (level) {
 		case "declared":
-			return buildAgentEventArgv(report.type, report.detail, true);
+			return buildAgentEventArgv(report.type, report.detail, true, withReply ? report.reply : undefined);
 		case "detail":
 			return buildAgentEventArgv(report.type, report.detail);
 		case "lifecycle":
@@ -486,16 +584,26 @@ export class DeckExecError extends Error {
  * level alone and retries a lifecycle report once, bare, so the card keeps its
  * status. Every report is best-effort: nothing here throws. `signal` is handed
  * to every `run` for that report.
+ *
+ * A settled turn's reply (PRD #1497) rides on top of whatever level the
+ * session is at. The reply flags are the newest the extension sends, so a CLI
+ * that refuses any flag of a report carrying a reply cannot take the reply:
+ * the first such refusal drops the reply for the rest of the session and
+ * sends the report again at the same level, and only a refusal of that steps
+ * the level down. The levels themselves move exactly as they did before.
  */
 export function createReporter(run: (argv: string[], signal?: AbortSignal) => Promise<unknown>): {
 	send: (report: AgentEventReport, signal?: AbortSignal) => Promise<void>;
 	level: () => ReportLevel;
+	replies: () => boolean;
 } {
 	let level: ReportLevel = "declared";
+	let replies = true;
 	const send = async (report: AgentEventReport, signal?: AbortSignal): Promise<void> => {
 		let tried: ReportLevel | null = level;
+		let withReply = replies && report.reply !== undefined;
 		while (tried !== null) {
-			const argv = reportArgvAt(report, tried);
+			const argv = reportArgvAt(report, tried, withReply);
 			if (argv === null) {
 				return;
 			}
@@ -505,6 +613,11 @@ export function createReporter(run: (argv: string[], signal?: AbortSignal) => Pr
 				return;
 			} catch (err) {
 				if (err instanceof DeckExecError && isUnsupportedFlagFailure(err.outcome)) {
+					if (withReply) {
+						withReply = false;
+						replies = false;
+						continue;
+					}
 					tried = levelBelow(tried);
 					continue;
 				}
@@ -516,7 +629,7 @@ export function createReporter(run: (argv: string[], signal?: AbortSignal) => Pr
 			}
 		}
 	};
-	return { send, level: () => level };
+	return { send, level: () => level, replies: () => replies };
 }
 
 /**

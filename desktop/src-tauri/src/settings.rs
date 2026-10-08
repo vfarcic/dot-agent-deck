@@ -1230,8 +1230,9 @@ impl VoiceToken for SpeechSource {
 /// Whether reading mode may be turned on (PRD #1497 D4).
 ///
 /// Reading sends each finished turn's final reply to the Commands connection to
-/// be summarised — and the summary to the provider's speech service when that is
-/// the speech source — which is more than voice sends otherwise. So it is
+/// be summarised — and every sentence it speaks, permission prompts and error
+/// announcements included, to the provider's speech service when that is the
+/// speech source — which is more than voice sends otherwise. So it is
 /// **Off** until the user turns it on in Settings → Voice, and "reading on"
 /// refuses while it is off. A token rather than a `bool` so the settings field
 /// stays a closed enum like its neighbours, which is the shape the settings

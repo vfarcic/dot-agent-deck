@@ -127,10 +127,11 @@ const READING_CONSENT_LABELS: Record<string, string> = {
  * PRD #1497 D4 — what reading sends, shown under the switch. Each clause is
  * the code's: `voice::reading::read_turns` summarises a finished turn's final
  * reply through the Commands connection (`voice::summary::summarise_turn`),
- * and `desktop_voice_speech_audio` sends the sentence to that connection's
- * speech service when the Speech source picks it.
+ * and `desktop_voice_speech_audio` sends every spoken sentence — permission
+ * prompts and errors included — to that connection's speech service when the
+ * Speech source picks it.
  */
-export const READING_DISCLOSURE = "With reading on, saying “reading on” in an agent's pane makes the app speak a short summary of each turn that agent finishes. To write it, the agent's final reply for the turn is sent to the Commands connection above. When the voice comes from the provider, the summary is also sent to that provider's speech service. Permission prompts and errors are announced without sending anything.";
+export const READING_DISCLOSURE = "With reading on, saying “reading on” in an agent's pane makes the app speak a short summary of each turn that agent finishes. To write it, the agent's final reply for the turn is sent to the Commands connection above. Permission prompts and errors are announced without asking the model. When the voice comes from the provider, every sentence the app speaks — summaries, permission prompts (with up to 120 characters of what the agent wants to do) and error announcements — is sent to that provider's speech service; with this computer's voice, those sentences stay on this computer.";
 
 /** PRD #1497 D9 — the Speech source picker's options. */
 const SPEECH_SOURCE_LABELS: Record<string, string> = {

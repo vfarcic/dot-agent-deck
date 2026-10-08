@@ -2473,6 +2473,7 @@ async fn desktop_set_settings(
     app: AppHandle,
     webview: Webview,
     state: State<'_, DesktopState>,
+    voice_state: State<'_, VoiceState>,
     settings: DesktopSettings,
     base: Option<DesktopSettings>,
 ) -> Result<DesktopSettings, crate::dto::DesktopSettingsSaveError> {
@@ -2492,6 +2493,7 @@ async fn desktop_set_settings(
     let failure = match saved {
         Ok(written) => {
             apply_selection(&app, &state, &written).await;
+            voice_state.reading.end_unless_consented(&written);
             return Ok(written);
         }
         Err(failure) => failure,
@@ -2515,6 +2517,7 @@ async fn desktop_set_settings(
         return Err(message.into());
     };
     apply_selection(&app, &state, &disk).await;
+    voice_state.reading.end_unless_consented(&disk);
     Err(crate::dto::DesktopSettingsSaveError::Partial(
         crate::dto::DesktopPartialSettingsSave {
             message,
@@ -3866,7 +3869,7 @@ async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::Sp
     let settings = crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default();
-    Ok(voice::speech::plan(settings.speech, &settings.intent))
+    Ok(voice::speech::plan_for(&settings))
 }
 
 /// The provider's audio for one sentence of reading mode (PRD #1497 M4), as
@@ -3875,6 +3878,11 @@ async fn desktop_voice_speech_plan(webview: Webview) -> Result<voice::speech::Sp
 /// Spends the Commands connection's key, so the text is bounded here before
 /// anything is sent ([`voice::speech::MAX_SPEECH_INPUT_CHARS`] after a byte
 /// bound that refuses an oversized IPC argument outright).
+///
+/// Refused, with nothing sent, unless reading's Settings opt-in is on and the
+/// speech source resolves to the provider ([`voice::speech::provider_permitted`],
+/// checked against the settings as they are now): the webview cannot use this
+/// to send arbitrary text to the provider outside reading mode's consent.
 #[tauri::command]
 async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Response, String> {
     ensure_main_webview(&webview)?;
@@ -3886,6 +3894,7 @@ async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Re
     let settings = crate::settings::load_settings_without_decks()
         .voice
         .unwrap_or_default();
+    voice::speech::provider_permitted(&settings)?;
     let audio = voice::speech::synthesise(
         &settings.intent,
         Arc::new(KeychainSecretStore::new()),
@@ -3975,14 +3984,19 @@ async fn desktop_voice_reading_start(
         }
     };
     let agent = voice::summary::agent_name(&agent_label);
-    let session = voice_state
-        .reading
-        .start(tauri::async_runtime::spawn(async move {
-            voice::reading::read_turns(&agent, events, &SettingsSummariser, |sentence| {
+    let ender = on_sentence.clone();
+    let summariser = settings_summariser();
+    let session = voice_state.reading.start(
+        tauri::async_runtime::spawn(async move {
+            voice::reading::read_turns(&agent, events, &summariser, |sentence| {
                 on_sentence.send(sentence).is_ok()
             })
             .await;
-        }));
+        }),
+        Box::new(move || {
+            let _ = ender.send(voice::reading::ended_sentence());
+        }),
+    );
     Ok(ReadingStart::Started { session })
 }
 
@@ -4016,12 +4030,22 @@ enum ReadingStart {
     Unavailable { sentence: String },
 }
 
+/// Tells the webview a session ended on this side (a
+/// [`voice::reading::ReadingSentenceKind::Ended`] sentence down its channel).
+type ReadingEnder = Box<dyn FnOnce() + Send>;
+
 /// The one reading session a window has (PRD #1497 D11: reading is bound to
 /// one agent). Its turn events come from the agent's deck, subscribed per
 /// session ([`voice::reading::DaemonTurnEvents`]).
 pub(crate) struct ReadingSessions {
-    current: std::sync::Mutex<Option<(u64, tauri::async_runtime::JoinHandle<()>)>>,
+    current: std::sync::Mutex<Option<ReadingSession>>,
     next: std::sync::atomic::AtomicU64,
+}
+
+struct ReadingSession {
+    id: u64,
+    task: tauri::async_runtime::JoinHandle<()>,
+    ender: ReadingEnder,
 }
 
 impl Default for ReadingSessions {
@@ -4034,55 +4058,71 @@ impl Default for ReadingSessions {
 }
 
 impl ReadingSessions {
-    /// Make `task` the current session, ending any other, and name it.
-    fn start(&self, task: tauri::async_runtime::JoinHandle<()>) -> u64 {
-        let session = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut current = self
-            .current
+    fn current(&self) -> std::sync::MutexGuard<'_, Option<ReadingSession>> {
+        self.current
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, previous)) = current.replace((session, task)) {
-            previous.abort();
-        }
-        session
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// End `session` if it is the current one.
+    /// Make `task` the current session, ending any other, and name it.
+    /// `ender` is how [`Self::end_unless_consented`] tells the webview.
+    fn start(&self, task: tauri::async_runtime::JoinHandle<()>, ender: ReadingEnder) -> u64 {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(previous) = self.current().replace(ReadingSession { id, task, ender }) {
+            previous.task.abort();
+        }
+        id
+    }
+
+    /// End `session` if it is the current one. The webview asked, so it is
+    /// not told.
     fn stop(&self, session: u64) {
-        let mut current = self
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.as_ref().is_some_and(|(id, _)| *id == session)
-            && let Some((_, task)) = current.take()
+        let mut current = self.current();
+        if current.as_ref().is_some_and(|ended| ended.id == session)
+            && let Some(ended) = current.take()
         {
-            task.abort();
+            ended.task.abort();
+        }
+    }
+
+    /// Audit A-B1: the settings were saved, and with reading's opt-in off the
+    /// current session ends now — its task stops, so no further summary is
+    /// requested — and the webview is told, so it clears the indicator and
+    /// the queued speech.
+    fn end_unless_consented(&self, settings: &DesktopSettings) {
+        let consented = settings
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.reading == crate::settings::ReadingConsent::On);
+        if consented {
+            return;
+        }
+        let ended = self.current().take();
+        if let Some(ended) = ended {
+            ended.task.abort();
+            (ended.ender)();
         }
     }
 }
 
-/// The real [`voice::reading::TurnSummariser`]: the Commands connection as the
-/// settings name it when the turn ends, with its key from the keychain.
-struct SettingsSummariser;
-
-impl voice::reading::TurnSummariser for SettingsSummariser {
-    fn summarise<'a>(
-        &'a self,
-        request: voice::summary::TurnSummaryRequest<'a>,
-    ) -> voice::reading::SummaryFuture<'a> {
-        Box::pin(async move {
-            // Read per turn, for `desktop_voice_resolve`'s reason.
-            let settings = crate::settings::load_settings_without_decks()
+/// The real [`voice::reading::TurnSummariser`]: the settings read per call
+/// (so a revoked opt-in stops the very next request), and the Commands
+/// connection they name with its key from the keychain.
+fn settings_summariser() -> voice::reading::SettingsSummariser {
+    voice::reading::SettingsSummariser::new(
+        Box::new(|| {
+            crate::settings::load_settings_without_decks()
                 .voice
-                .unwrap_or_default();
-            voice::summary::summarise_turn(
-                &settings.intent,
+                .unwrap_or_default()
+        }),
+        Box::new(|intent| {
+            Box::new(voice::summary::HttpSummaryTransport::new(
+                voice::summary::protocol_for(intent),
                 Arc::new(KeychainSecretStore::new()),
-                request,
-            )
-            .await
-        })
-    }
+                intent.endpoint.clone(),
+            ))
+        }),
+    )
 }
 
 /// PRD #802 — what can be said on this screen, for the discovery overlay.
@@ -5785,6 +5825,76 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A reading session whose task runs until aborted, and records being
+    /// dropped (aborted) and its ender being called.
+    fn held_session(sessions: &ReadingSessions) -> (u64, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let aborted = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicUsize::new(0));
+        let guard = Dropped(Arc::clone(&aborted));
+        let told = Arc::clone(&ended);
+        let id = sessions.start(
+            tauri::async_runtime::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            }),
+            Box::new(move || {
+                told.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (id, aborted, ended)
+    }
+
+    fn wait_for(flag: &AtomicBool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the session task was not aborted"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Scenario (audit A-B1): with reading on, the user turns Read turns
+    /// aloud off in Settings and saves; the reading session's task is aborted
+    /// at once (no further summary can be requested) and the webview is told
+    /// once, so it clears the indicator and the queued speech. A save that
+    /// keeps the opt-in on leaves the session alone, and a stop the webview
+    /// asked for does not tell it again.
+    #[test]
+    fn voice_reading_a_settings_save_without_consent_ends_the_session() {
+        let consenting = |reading| DesktopSettings {
+            voice: Some(crate::settings::VoiceSettings {
+                reading,
+                ..crate::settings::VoiceSettings::default()
+            }),
+            ..DesktopSettings::default()
+        };
+        let sessions = ReadingSessions::default();
+        let (_, aborted, ended) = held_session(&sessions);
+        sessions.end_unless_consented(&consenting(crate::settings::ReadingConsent::On));
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+        assert!(!aborted.load(Ordering::SeqCst));
+
+        sessions.end_unless_consented(&consenting(crate::settings::ReadingConsent::Off));
+        wait_for(&aborted);
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+        // Nothing left to end: a second save says nothing more.
+        sessions.end_unless_consented(&DesktopSettings::default());
+        assert_eq!(ended.load(Ordering::SeqCst), 1);
+
+        let (id, aborted, ended) = held_session(&sessions);
+        sessions.stop(id);
+        wait_for(&aborted);
+        assert_eq!(ended.load(Ordering::SeqCst), 0);
+    }
 
     fn voice_listing(entries: usize) -> voice::VoiceDirectories {
         voice::VoiceDirectories {

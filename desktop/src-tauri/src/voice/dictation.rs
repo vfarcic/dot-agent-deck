@@ -250,10 +250,12 @@ pub const READING_OFF_PHRASES: [&str; 4] = [
 /// utterance. It cuts off what is being said and drops what is waiting, and
 /// leaves reading on.
 ///
-/// Answered locally on every screen and in every mode — the one list D8 lets
-/// through while the app is speaking, together with the bare *"stop"* forms
-/// ([`TYPING_STOP_PHRASES`]), which mean this only while speech is playing or
-/// reading is on outside typing mode (see `outcome::reading_intercept`).
+/// Answered locally on every screen and in every mode while reading is on or
+/// the app is speaking — the one list D8 lets through while the app is
+/// speaking, together with the bare *"stop"* forms ([`TYPING_STOP_PHRASES`]),
+/// which mean this only while speech is playing or reading is on outside
+/// typing mode (see `outcome::reading_intercept`). With reading off and
+/// nothing being said they are not reserved, so typing mode types them.
 pub const QUIET_PHRASES: [&str; 5] = ["quiet", "be quiet", "silence", "hush", "shush"];
 
 /// What empties the open agent's prompt while the dictation mode is on (PRD
@@ -683,7 +685,7 @@ mod tests {
     /// A newly shared phrase would make classification order determine an action.
     #[test]
     fn voice_dictation_reserved_phrase_lists_are_pairwise_disjoint() {
-        let lists: [(&str, &[&str]); 9] = [
+        let lists: [(&str, &[&str]); 12] = [
             ("dictation on", &DICTATION_ON_PHRASES),
             ("dictation off", &DICTATION_OFF_PHRASES),
             ("submit", &SUBMIT_PHRASES),
@@ -693,6 +695,9 @@ mod tests {
             ("clear prompt", &CLEAR_PROMPT_PHRASES),
             ("scratch", &SCRATCH_PHRASES),
             ("opener", &DICTATION_OPENERS),
+            ("reading on", &READING_ON_PHRASES),
+            ("reading off", &READING_OFF_PHRASES),
+            ("quiet", &QUIET_PHRASES),
         ];
         for (left_index, (left_name, left)) in lists.iter().enumerate() {
             for (right_name, right) in lists.iter().skip(left_index + 1) {

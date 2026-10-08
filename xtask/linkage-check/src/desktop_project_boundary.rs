@@ -177,6 +177,17 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     "features",
     "platform",
     "prompt_delivery",
+    // PRD #1497, argued rather than added quietly. Reading mode names ONE item
+    // here, `NOTIFICATION_TYPE_METADATA_KEY`: it tells a Claude-shaped
+    // permission prompt from the other `WaitingForInput` notifications on the
+    // agent's status stream, so a permission prompt is announced and an idle
+    // reminder is not. A desktop-side copy of the key's spelling would be a
+    // second copy to keep in step with the hook that writes it. Checked
+    // against this rule's lines: the module holds metadata keys, reason types
+    // and the rule for lifting a block; it resolves no project, reads no file
+    // at all, names no FORBIDDEN_SYMBOL or project-state literal, and contains
+    // no `std::env::current_dir` — all zero for it.
+    "quota_block",
     // PRD #741 M6, argued rather than added quietly. The desktop's settings
     // schema is built from this module's validating ssh-argument newtypes
     // (`Hostname`, `SshUser`, `KeyPath`, `HostAlias`, `RemoteSocketPath`), and

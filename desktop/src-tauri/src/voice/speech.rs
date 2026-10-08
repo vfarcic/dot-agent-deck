@@ -12,10 +12,19 @@
 //!
 //! An OpenAI-compatible connection whose endpoint is a `…/chat/completions`
 //! URL is taken to offer `…/audio/speech` beside it, which is OpenAI's own
-//! layout. Anthropic offers no text-to-speech at all. A server that speaks
+//! layout. Anthropic's API offers no text-to-speech endpoint today. A server that speaks
 //! chat completions but has no speech route (`llama.cpp`'s, for one) answers
 //! the speech request with an error, and under **Auto** that falls back to the
 //! system voice, so the guess costs one failed request rather than silence.
+//!
+//! # Nothing goes to the provider's speech without consent
+//!
+//! The provider's speech is reading mode's, so it is gated on reading's
+//! Settings opt-in (PRD #1497 D4) as well as on the speech source: with the
+//! opt-in off, [`plan_for`] answers the system voice whatever the source, and
+//! [`provider_permitted`] — which the speech command checks before every
+//! request — refuses. A webview asking for audio directly gets the same
+//! refusal.
 //!
 //! # The audio is fetched here and not in the webview
 //!
@@ -32,7 +41,7 @@ use serde_json::{Value, json};
 
 use crate::model_service::ServiceUrl;
 use crate::secrets::SecretStore;
-use crate::settings::{IntentBackend, IntentSettings, SpeechSource};
+use crate::settings::{IntentBackend, IntentSettings, ReadingConsent, SpeechSource, VoiceSettings};
 
 use super::remote::{authorise, endpoint_credential};
 use super::summary::protocol_for;
@@ -117,6 +126,30 @@ pub fn plan(source: SpeechSource, intent: &IntentSettings) -> SpeechPlan {
     }
 }
 
+/// Which source speaks under the whole voice settings: [`plan`], except that
+/// with reading's opt-in off nothing is sent to the provider's speech, so the
+/// system voice speaks whatever the source says.
+pub fn plan_for(settings: &VoiceSettings) -> SpeechPlan {
+    if settings.reading != ReadingConsent::On {
+        return SpeechPlan::System;
+    }
+    plan(settings.speech, &settings.intent)
+}
+
+/// Why the provider's speech must not be asked for under the settings.
+pub const PROVIDER_SPEECH_NOT_PERMITTED: &str = "the provider's speech is used only while Read turns aloud is on and the speech source is \
+     the provider's";
+
+/// Whether a sentence may be sent to the provider's speech: reading's opt-in
+/// is on and [`plan_for`] names the provider. Checked before every request,
+/// whoever asks.
+pub fn provider_permitted(settings: &VoiceSettings) -> Result<(), String> {
+    match plan_for(settings) {
+        SpeechPlan::Provider { .. } => Ok(()),
+        _ => Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string()),
+    }
+}
+
 /// `text` bounded to [`MAX_SPEECH_INPUT_CHARS`] at a word boundary.
 pub fn bounded_input(text: &str) -> String {
     let text = text.trim();
@@ -180,7 +213,7 @@ pub async fn synthesise(
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("audio/"));
+        .is_some_and(is_mp3_type);
     let body = super::http::capped_body(response, MAX_AUDIO_BYTES)
         .await
         .map_err(|error| match error {
@@ -192,7 +225,16 @@ pub async fn synthesise(
     check_audio(status, audio_type, body)
 }
 
-/// Accept a reply as audio only when it succeeded, says it is audio, and has
+/// Whether a `Content-Type` value names MP3 audio — the format asked for
+/// ([`OPENAI_SPEECH_FORMAT`]). Parameters are tolerated (`audio/mpeg;
+/// charset=…`); any other audio type is not, since the webview hands the bytes
+/// to a decoder and only MP3 was requested.
+pub fn is_mp3_type(value: &str) -> bool {
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    essence.eq_ignore_ascii_case("audio/mpeg") || essence.eq_ignore_ascii_case("audio/mp3")
+}
+
+/// Accept a reply as audio only when it succeeded, says it is MP3, and has
 /// some.
 fn check_audio(
     status: reqwest::StatusCode,
@@ -320,6 +362,77 @@ mod tests {
         assert!(check_audio(StatusCode::NOT_FOUND, true, vec![1]).is_err());
         assert!(check_audio(StatusCode::OK, false, vec![1]).is_err());
         assert!(check_audio(StatusCode::OK, true, Vec::new()).is_err());
+    }
+
+    /// Scenario (audit A-S2): only an MP3 media type is accepted for the
+    /// provider's audio, with or without parameters; another audio type, or a
+    /// type that merely starts like one, is refused.
+    #[test]
+    fn voice_speech_accepts_only_the_mp3_media_type() {
+        for accepted in [
+            "audio/mpeg",
+            "Audio/MPEG",
+            "audio/mpeg; charset=binary",
+            "audio/mp3",
+        ] {
+            assert!(is_mp3_type(accepted), "{accepted}");
+        }
+        for refused in [
+            "audio/wav",
+            "audio/ogg",
+            "audio/mpegurl",
+            "audio/",
+            "text/html",
+            "application/octet-stream",
+            "",
+        ] {
+            assert!(!is_mp3_type(refused), "{refused}");
+        }
+    }
+
+    fn voice(
+        source: SpeechSource,
+        intent: IntentSettings,
+        reading: ReadingConsent,
+    ) -> VoiceSettings {
+        VoiceSettings {
+            intent,
+            speech: source,
+            reading,
+            ..VoiceSettings::default()
+        }
+    }
+
+    /// Scenario (audit A-S1): the provider's speech is permitted only while
+    /// reading's opt-in is on and the source resolves to the provider — Auto
+    /// on a connection with speech, or Provider. With the opt-in off the plan
+    /// is the system voice whatever the source, and a direct request for
+    /// audio is refused.
+    #[test]
+    fn voice_speech_provider_needs_consent_and_a_provider_source() {
+        use ReadingConsent::{Off, On};
+        for (source, intent, reading, permitted) in [
+            (SpeechSource::Auto, openai(), On, true),
+            (SpeechSource::Provider, openai(), On, true),
+            (SpeechSource::System, openai(), On, false),
+            (SpeechSource::Auto, anthropic(), On, false),
+            (SpeechSource::Provider, anthropic(), On, false),
+            (SpeechSource::Auto, openai(), Off, false),
+            (SpeechSource::Provider, openai(), Off, false),
+            (SpeechSource::System, openai(), Off, false),
+        ] {
+            let settings = voice(source, intent.clone(), reading);
+            assert_eq!(
+                provider_permitted(&settings).is_ok(),
+                permitted,
+                "{source:?} on {intent:?} with reading {reading:?}"
+            );
+            if reading == Off {
+                assert_eq!(plan_for(&settings), SpeechPlan::System);
+            } else {
+                assert_eq!(plan_for(&settings), plan(source, &intent));
+            }
+        }
     }
 
     #[tokio::test]

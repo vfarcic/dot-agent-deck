@@ -40,6 +40,19 @@
 //! are announced at once, with a fixed sentence and **no model call**: the user
 //! has to act on them, and a sentence that names the agent and what it wants
 //! needs no summary.
+//!
+//! # Consent is read before every event, and revoking it ends reading
+//!
+//! Reading's Settings opt-in (D4) is what allows an agent's reply to leave the
+//! machine, so it is not only checked when "reading on" starts.
+//! [`read_turns`] asks the summariser before announcing each event
+//! ([`TurnSummariser::consented`]), and [`SettingsSummariser`] reads the
+//! settings again immediately before each summary request, sending nothing
+//! when the opt-in is off. Either way the session ends with a
+//! [`ReadingSentenceKind::Ended`] sentence, which the webview takes as
+//! "reading off": it clears the indicator and the queued speech. Saving the
+//! settings with the opt-in off ends the session at once, without waiting for
+//! a turn (`desktop_set_settings`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -52,7 +65,9 @@ use dot_agent_deck::event::{AgentEvent, BroadcastMsg, EventType};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use super::summary::{Summary, TurnKind, TurnSummaryRequest, spoken_name};
+use crate::settings::{IntentSettings, ReadingConsent, VoiceSettings};
+
+use super::summary::{Summary, SummaryTransport, TurnKind, TurnSummaryRequest, spoken_name};
 
 /// Why "reading on" cannot start on a deck whose daemon predates the reply
 /// stream (it does not advertise `turn-replies`). A fragment, rendered into
@@ -370,18 +385,16 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
 /// Why an agent of `agent_type` cannot be read, as a fragment, or `None` when
 /// its final reply reaches the daemon (CLAUDE.md rule 20).
 ///
-/// Claude Code and Codex report it in their `Stop` hooks (and Codex a failed
-/// turn's in its session log), and OpenCode through the deck's plugin. Devin's
-/// hooks go through the same Claude-compatible path, and its hook input names
-/// the same `last_assistant_message` field, so it is not refused here. Pi is
-/// the gap: the deck's Pi extension does not pass the agent's reply on.
+/// Every agent type the deck runs today reports it: Claude Code and Codex in
+/// their `Stop` hooks (and Codex a failed turn's in its session log), OpenCode
+/// through the deck's plugin, Pi through the deck's extension (the last
+/// assistant message's text on its settled report), and Devin, whose hooks go
+/// through the same Claude-compatible path and name the same
+/// `last_assistant_message` field. Kept as the one place a future agent type
+/// without a reply channel is named, so "reading on" says so in plain words.
 pub fn agent_gap(agent_type: &str) -> Option<String> {
-    match agent_type {
-        "pi" => Some(
-            "the deck does not receive Pi's replies yet, so it cannot read Pi's turns".to_string(),
-        ),
-        _ => None,
-    }
+    let _ = agent_type;
+    None
 }
 
 /// What "reading on" says when reading cannot run, from a source's or
@@ -401,6 +414,21 @@ pub enum ReadingSentenceKind {
     Permission,
     /// An error or quota block, announced at once.
     Blocked,
+    /// Reading ended on this side — its Settings opt-in was turned off. Not a
+    /// sentence to queue: the webview ends reading mode on it, clearing the
+    /// indicator and the queued speech, and says "Reading off."
+    Ended,
+}
+
+/// The text of the [`ReadingSentenceKind::Ended`] sentence.
+pub const READING_ENDED: &str = "Reading off.";
+
+/// The sentence that ends a reading session on this side.
+pub fn ended_sentence() -> ReadingSentence {
+    ReadingSentence {
+        kind: ReadingSentenceKind::Ended,
+        text: READING_ENDED.to_string(),
+    }
 }
 
 /// One sentence to speak, as the webview receives it — and the only thing
@@ -412,13 +440,61 @@ pub struct ReadingSentence {
     pub text: String,
 }
 
-/// The future a [`TurnSummariser`] returns.
-pub type SummaryFuture<'a> = Pin<Box<dyn Future<Output = Summary> + Send + 'a>>;
+/// The future a [`TurnSummariser`] returns: the summary, or `None` when
+/// reading's opt-in was off immediately before the request, so nothing was
+/// sent.
+pub type SummaryFuture<'a> = Pin<Box<dyn Future<Output = Option<Summary>> + Send + 'a>>;
 
-/// Summarises one turn. The real one is [`super::summary::summarise_turn`]
-/// over the Commands connection, read per turn; tests pass their own.
+/// Summarises one turn, and says whether reading may go on. The real one is
+/// [`SettingsSummariser`] over the settings and the Commands connection; tests
+/// pass their own.
 pub trait TurnSummariser: Send + Sync {
+    /// Whether reading's Settings opt-in is on now. Asked before every event.
+    fn consented(&self) -> bool;
+    /// Summarise one turn — or, with the opt-in off by the time the request
+    /// would go out, send nothing and answer `None`.
     fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a>;
+}
+
+/// The settings document's voice section, read when asked.
+pub type LoadVoiceSettings = Box<dyn Fn() -> VoiceSettings + Send + Sync>;
+
+/// A summary transport for the Commands connection the settings name.
+pub type ConnectTransport = Box<dyn Fn(&IntentSettings) -> Box<dyn SummaryTransport> + Send + Sync>;
+
+/// The real [`TurnSummariser`]: the settings read per call — so a changed
+/// connection applies to the next turn and a revoked opt-in stops the next
+/// request — and a transport to the Commands connection they name.
+pub struct SettingsSummariser {
+    load: LoadVoiceSettings,
+    connect: ConnectTransport,
+}
+
+impl SettingsSummariser {
+    pub fn new(load: LoadVoiceSettings, connect: ConnectTransport) -> Self {
+        Self { load, connect }
+    }
+}
+
+impl TurnSummariser for SettingsSummariser {
+    fn consented(&self) -> bool {
+        (self.load)().reading == ReadingConsent::On
+    }
+
+    fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
+        Box::pin(async move {
+            // Immediately before the request: the opt-in may have been turned
+            // off since this turn's event arrived.
+            let settings = (self.load)();
+            if settings.reading != ReadingConsent::On {
+                return None;
+            }
+            let transport = (self.connect)(&settings.intent);
+            Some(
+                super::summary::summarise_over(&settings.intent, transport.as_ref(), request).await,
+            )
+        })
+    }
 }
 
 /// The sentence for a permission prompt: "The coder is asking for permission:
@@ -444,24 +520,25 @@ pub fn blocked_sentence(agent: &str, cause: BlockCause) -> String {
     }
 }
 
-/// One event, as the sentence to speak.
+/// One event, as the sentence to speak — or `None` when the summariser found
+/// reading's opt-in off and sent nothing.
 pub async fn announce(
     agent: &str,
     event: TurnEvent,
     summariser: &dyn TurnSummariser,
-) -> ReadingSentence {
+) -> Option<ReadingSentence> {
     let (kind, reply) = match event {
         TurnEvent::Permission { wants } => {
-            return ReadingSentence {
+            return Some(ReadingSentence {
                 kind: ReadingSentenceKind::Permission,
                 text: permission_sentence(agent, &wants),
-            };
+            });
         }
         TurnEvent::Blocked { cause } => {
-            return ReadingSentence {
+            return Some(ReadingSentence {
                 kind: ReadingSentenceKind::Blocked,
                 text: blocked_sentence(agent, cause),
-            };
+            });
         }
         TurnEvent::Finished { reply } => (TurnKind::Finished, reply),
         TurnEvent::Failed { reply } => (TurnKind::Failed, reply),
@@ -472,11 +549,11 @@ pub async fn announce(
             kind,
             reply: &reply,
         })
-        .await;
-    ReadingSentence {
+        .await?;
+    Some(ReadingSentence {
         kind: ReadingSentenceKind::Turn,
         text: summary.text,
-    }
+    })
 }
 
 /// Read `events` until they end or `sink` refuses a sentence.
@@ -486,6 +563,10 @@ pub async fn announce(
 /// happened in. `sink` answers `false` when nobody is listening any more (the
 /// webview's channel closed), which ends the loop and drops `events` — the
 /// unsubscribe.
+///
+/// Before each event the summariser is asked whether reading's opt-in is
+/// still on, and the summary request asks again; when it is off, the loop
+/// sends [`ended_sentence`] and ends, so nothing more is announced or sent.
 pub async fn read_turns(
     agent: &str,
     mut events: TurnEvents,
@@ -493,7 +574,15 @@ pub async fn read_turns(
     mut sink: impl FnMut(ReadingSentence) -> bool,
 ) {
     while let Some(event) = events.recv().await {
-        let sentence = announce(agent, event, summariser).await;
+        let sentence = if summariser.consented() {
+            announce(agent, event, summariser).await
+        } else {
+            None
+        };
+        let Some(sentence) = sentence else {
+            sink(ended_sentence());
+            return;
+        };
         if !sink(sentence) {
             return;
         }
@@ -531,6 +620,10 @@ mod tests {
     }
 
     impl TurnSummariser for Recording {
+        fn consented(&self) -> bool {
+            true
+        }
+
         fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
             self.asked.lock().unwrap().push((
                 request.agent.to_string(),
@@ -539,10 +632,10 @@ mod tests {
             ));
             let text = format!("summary of {}", request.reply);
             Box::pin(async move {
-                Summary {
+                Some(Summary {
                     text,
                     fallback: None,
-                }
+                })
             })
         }
     }
@@ -557,7 +650,8 @@ mod tests {
             },
             &summariser,
         )
-        .await;
+        .await
+        .expect("announced");
         assert_eq!(sentence.kind, ReadingSentenceKind::Turn);
         assert_eq!(sentence.text, "summary of All 42 tests pass.");
         assert_eq!(
@@ -580,7 +674,8 @@ mod tests {
             },
             &summariser,
         )
-        .await;
+        .await
+        .expect("announced");
         assert_eq!(sentence.kind, ReadingSentenceKind::Turn);
         assert_eq!(summariser.asked.lock().unwrap()[0].1, TurnKind::Failed);
     }
@@ -595,7 +690,8 @@ mod tests {
             },
             &summariser,
         )
-        .await;
+        .await
+        .expect("announced");
         assert_eq!(permission.kind, ReadingSentenceKind::Permission);
         assert_eq!(
             permission.text,
@@ -608,7 +704,8 @@ mod tests {
             },
             &summariser,
         )
-        .await;
+        .await
+        .expect("announced");
         assert_eq!(quota.kind, ReadingSentenceKind::Blocked);
         assert_eq!(quota.text, "The coder hit a usage limit and stopped.");
         let error = announce(
@@ -618,7 +715,8 @@ mod tests {
             },
             &summariser,
         )
-        .await;
+        .await
+        .expect("announced");
         assert_eq!(error.text, "The reviewer stopped with an error.");
         assert!(summariser.asked.lock().unwrap().is_empty());
     }
@@ -843,10 +941,12 @@ mod tests {
         assert_eq!(status_turn_event(&status("a", EventType::Idle), "a"), None);
     }
 
+    /// Scenario (rule 20): every agent type the deck runs — Pi included,
+    /// through the deck's extension — reports its final reply, so none is
+    /// refused as a gap.
     #[test]
-    fn voice_reading_only_pi_is_a_named_gap() {
-        assert!(agent_gap("pi").is_some());
-        for covered in ["claude_code", "codex", "open_code", "devin"] {
+    fn voice_reading_no_agent_type_is_a_named_gap() {
+        for covered in ["claude_code", "codex", "open_code", "pi", "devin"] {
             assert_eq!(agent_gap(covered), None, "{covered}");
         }
     }
@@ -1058,5 +1158,132 @@ mod tests {
         .await;
         assert_eq!(heard, 1);
         assert!(send.is_closed());
+    }
+
+    /// A summary transport that records every body it is sent, as the
+    /// Commands connection would receive it, and answers with a summary.
+    #[derive(Clone, Default)]
+    struct Posts(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl SummaryTransport for Posts {
+        fn post(&self, body: serde_json::Value) -> super::super::summary::PostFuture<'_> {
+            self.0.lock().unwrap().push(body);
+            Box::pin(async {
+                Ok(serde_json::json!({ "choices": [{ "finish_reason": "stop",
+                    "message": { "content": "The tester finished: done." } }] }))
+            })
+        }
+    }
+
+    /// A [`SettingsSummariser`] over an opt-in the test flips and `posts`.
+    fn consent_gated(
+        consent: Arc<std::sync::atomic::AtomicBool>,
+        posts: Posts,
+    ) -> SettingsSummariser {
+        SettingsSummariser::new(
+            Box::new(move || VoiceSettings {
+                intent: IntentSettings::for_backend(
+                    crate::settings::IntentBackend::OpenaiCompatible,
+                ),
+                reading: if consent.load(std::sync::atomic::Ordering::SeqCst) {
+                    ReadingConsent::On
+                } else {
+                    ReadingConsent::Off
+                },
+                ..VoiceSettings::default()
+            }),
+            Box::new(move |_| Box::new(posts.clone())),
+        )
+    }
+
+    /// Scenario (audit A-B1): reading starts with the opt-in on and a
+    /// finished turn is summarised (one request); the opt-in is then turned
+    /// off, and the next finished turn sends nothing — zero further requests —
+    /// and the session ends with the "Reading off." sentence instead.
+    #[tokio::test]
+    async fn voice_reading_revoked_consent_sends_nothing_more_and_ends_reading() {
+        let consent = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let posts = Posts::default();
+        let summariser = consent_gated(Arc::clone(&consent), posts.clone());
+        let (send, events) = mpsc::channel(8);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let reading = tokio::spawn(async move {
+            read_turns("tester", events, &summariser, |sentence| {
+                sink.lock().unwrap().push(sentence);
+                true
+            })
+            .await;
+        });
+        send.send(TurnEvent::Finished {
+            reply: "first reply".to_string(),
+        })
+        .await
+        .unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while heard.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "the first turn was not read"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(posts.0.lock().unwrap().len(), 1);
+
+        consent.store(false, std::sync::atomic::Ordering::SeqCst);
+        send.send(TurnEvent::Finished {
+            reply: "second reply, which must not leave".to_string(),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("reading ends once consent is off")
+            .unwrap();
+        assert_eq!(
+            posts.0.lock().unwrap().len(),
+            1,
+            "a request after consent was revoked"
+        );
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_eq!(heard[0].kind, ReadingSentenceKind::Turn);
+        assert_eq!(heard[1], ended_sentence());
+        assert!(send.is_closed(), "the subscription was not dropped");
+    }
+
+    /// Scenario (audit A-B1): consent is read again immediately before the
+    /// summary request, so an opt-in turned off between the event and the
+    /// request still sends nothing; permission prompts are not announced
+    /// either once it is off.
+    #[tokio::test]
+    async fn voice_reading_summary_checks_consent_right_before_the_request() {
+        let consent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let posts = Posts::default();
+        let summariser = consent_gated(Arc::clone(&consent), posts.clone());
+        let summary = summariser
+            .summarise(TurnSummaryRequest {
+                agent: "tester",
+                kind: TurnKind::Finished,
+                reply: "a reply",
+            })
+            .await;
+        assert_eq!(summary, None);
+        assert!(posts.0.lock().unwrap().is_empty());
+
+        let (send, events) = mpsc::channel(8);
+        send.send(TurnEvent::Permission {
+            wants: "run cargo publish".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(send);
+        let mut heard = Vec::new();
+        read_turns("tester", events, &summariser, |sentence| {
+            heard.push(sentence);
+            true
+        })
+        .await;
+        assert_eq!(heard, vec![ended_sentence()]);
     }
 }
