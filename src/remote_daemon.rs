@@ -164,9 +164,18 @@ impl<E: SshExecutor> SshDaemonPort<E> {
 
     /// [`Self::probe`], killed at `budget` when that comes before the port's
     /// own probe deadline — for a caller with less time left than one whole
-    /// probe (PRD #1487, Qodo 4202262493).
+    /// probe (PRD #1487, Qodo 4202262493). With the production executor the
+    /// kill counts whole seconds, rounded down, and a budget under
+    /// [`Self::min_probe_budget`] starts nothing and is an error, so the probe
+    /// never runs past `budget`.
     pub fn probe_within(&self, budget: Duration) -> Result<DaemonProbe, RemoteDaemonError> {
         self.run_json("daemon probe --json", self.probe_deadline.min(budget))
+    }
+
+    /// The shortest budget [`Self::probe_within`] honours — the executor's
+    /// [`SshExecutor::min_bounded_run`].
+    pub fn min_probe_budget(&self) -> Duration {
+        self.executor.min_bounded_run()
     }
 
     /// `daemon restart-installed --json` on the remote: ask that machine's
@@ -540,6 +549,52 @@ mod tests {
             let elapsed = started.elapsed();
             assert!(
                 elapsed < Duration::from_secs(10),
+                "the probe ran past its budget: {elapsed:?}"
+            );
+            match result {
+                Err(RemoteDaemonError::Ssh(SshError::Other { detail, .. })) => assert!(
+                    detail.contains("did not finish within 1s"),
+                    "unexpected detail: {detail}"
+                ),
+                other => panic!("expected the budget to stop the probe, got {other:?}"),
+            }
+        }
+
+        /// Scenario: a caller with less than one second left probes. The
+        /// executor's kill counts whole seconds, so rather than granting the
+        /// session a whole second it refuses at once and starts nothing; a
+        /// fractional budget above a second is rounded down, never up (PRD
+        /// #1487, review item 13).
+        #[test]
+        fn a_probe_never_runs_past_a_fractional_budget() {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let marker = dir.path().join("started");
+            let p = port_running(
+                dir.path(),
+                &format!("touch '{}'\nexec sleep 600", marker.display()),
+            )
+            .with_deadlines(Duration::from_secs(60), Duration::from_secs(60));
+
+            let budget = Duration::from_millis(200);
+            let started = Instant::now();
+            let result = p.probe_within(budget);
+            let elapsed = started.elapsed();
+            assert!(elapsed < budget, "the refusal took {elapsed:?}");
+            match result {
+                Err(RemoteDaemonError::Ssh(SshError::Other { detail, .. })) => assert!(
+                    detail.contains("was not started"),
+                    "unexpected detail: {detail}"
+                ),
+                other => panic!("expected a sub-second budget to be refused, got {other:?}"),
+            }
+            assert!(!marker.exists(), "a session was started");
+
+            let budget = Duration::from_millis(1_900);
+            let started = Instant::now();
+            let result = p.probe_within(budget);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < budget,
                 "the probe ran past its budget: {elapsed:?}"
             );
             match result {

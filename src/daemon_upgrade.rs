@@ -464,6 +464,12 @@ pub trait DaemonPort {
         let _ = budget;
         self.probe()
     }
+    /// The shortest budget [`Self::probe_within`] can honour. The verify wait
+    /// starts no probe with less than this left, since the port would either
+    /// refuse it or run it past the budget. Zero by default.
+    fn min_probe_budget(&self) -> Duration {
+        Duration::ZERO
+    }
     /// Send the restart request. Must go through
     /// [`DaemonClient::restart_daemon`], which withholds it from a daemon that
     /// does not advertise it — `Unsupported` then means the daemon is too old.
@@ -923,10 +929,11 @@ fn wait_for_successor(
     let mut old_still_answering = false;
     loop {
         // Each probe gets only what is left of the wait, and none starts once
-        // it has run out: a remote probe can otherwise block well past the
-        // deadline (PRD #1487, Qodo 4202262493).
+        // less is left than the port can honour: a remote probe can otherwise
+        // block well past the deadline (PRD #1487, Qodo 4202262493 and review
+        // item 13).
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining.is_zero() || remaining < daemon.min_probe_budget() {
             break;
         }
         match daemon.probe_within(remaining) {
@@ -1216,6 +1223,10 @@ impl<E: SshExecutor> DaemonPort for SshDaemonPort<E> {
 
     fn probe_within(&self, budget: Duration) -> Result<Option<AttachResponse>, PortError> {
         remote_probe_answer(self, SshDaemonPort::probe_within(self, budget))
+    }
+
+    fn min_probe_budget(&self) -> Duration {
+        SshDaemonPort::min_probe_budget(self)
     }
 
     fn restart(
@@ -3016,6 +3027,128 @@ mod tests {
         };
         assert!(wait_for_successor(&port, &expected, &from, false, timing).is_err());
         assert_eq!(port.budgets.borrow().len(), 1);
+    }
+
+    /// A port shaped like the remote one: its kill counts whole seconds,
+    /// rounded down, so it cannot honour a budget under one second. It records
+    /// every budget it was given and answers with the old daemon after `delay`,
+    /// or gives up at its floored budget when that comes first.
+    struct WholeSecondPort {
+        delay: Duration,
+        budgets: RefCell<Vec<Duration>>,
+    }
+
+    impl DaemonPort for WholeSecondPort {
+        fn probe(&self) -> Probe {
+            self.probe_within(self.delay)
+        }
+        fn probe_within(&self, budget: Duration) -> Probe {
+            self.budgets.borrow_mut().push(budget);
+            let honoured = Duration::from_secs(budget.as_secs());
+            if honoured.is_zero() {
+                return Err("less than a second left, so nothing was started".into());
+            }
+            if honoured < self.delay {
+                std::thread::sleep(honoured);
+                return Err("no answer within the budget".into());
+            }
+            std::thread::sleep(self.delay);
+            Ok(Some(hello_from("0.1.0", "old", "old-process")))
+        }
+        fn min_probe_budget(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+        fn restart(&self, _req: &RestartDaemonRequest) -> Restart {
+            unreachable!("the verify wait sends no restart request")
+        }
+    }
+
+    /// PRD #1487, review item 13: a port that cannot honour a budget under one
+    /// second is given none. Once less than a second of the wait is left, the
+    /// wait ends instead of starting a probe that would run past the deadline.
+    #[test]
+    fn the_verify_wait_starts_no_probe_with_less_left_than_the_port_honours() {
+        let timing = Timing {
+            timeout: Duration::from_millis(1_500),
+            poll: Duration::from_millis(1),
+            settle: Duration::from_secs(60),
+        };
+        let from = OldDaemon {
+            build: Some("old".into()),
+            instance: Some("old-process".into()),
+        };
+        let port = WholeSecondPort {
+            delay: Duration::from_millis(600),
+            budgets: RefCell::new(Vec::new()),
+        };
+        let started = Instant::now();
+        let missing = wait_for_successor(
+            &port,
+            &Expect::Version("0.2.0".into()),
+            &from,
+            false,
+            timing,
+        )
+        .expect_err("the old daemon is never the successor");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timing.timeout,
+            "the wait overran its deadline: {elapsed:?}"
+        );
+        let budgets = port.budgets.borrow();
+        // One probe at ~1.5s left; after it ~0.9s is left, under the port's
+        // second, so no second probe starts.
+        assert_eq!(budgets.len(), 1, "{budgets:?}");
+        assert!(
+            budgets.iter().all(|b| *b >= Duration::from_secs(1)),
+            "{budgets:?}"
+        );
+        assert!(missing.old_still_answering);
+    }
+
+    /// The same wait through the real remote port and executor, with `ssh`
+    /// swapped for a stand-in that never answers: no probe outlives the wait,
+    /// though the executor's kill counts whole seconds.
+    #[cfg(unix)]
+    #[test]
+    fn the_verify_wait_over_a_silent_remote_returns_within_its_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_temp::tempdir().unwrap();
+        let script = dir.path().join("ssh");
+        crate::test_isolation::write_script(&script, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let port = SshDaemonPort::new(
+            upgrade_ssh_executor().with_program(&script),
+            crate::remote::SshTarget::parse("u@h", 22, None),
+            "~/.local/bin/dot-agent-deck",
+        )
+        .with_deadlines(Duration::from_secs(60), Duration::from_secs(60));
+        // The first probe is killed at 2s (2.9s rounded down); ~0.9s is then
+        // left, under the executor's second, so none follows it.
+        let timing = Timing {
+            timeout: Duration::from_millis(2_900),
+            poll: Duration::from_millis(1),
+            settle: Duration::from_secs(60),
+        };
+        let from = OldDaemon {
+            build: Some("old".into()),
+            instance: Some("old-process".into()),
+        };
+        let started = Instant::now();
+        let missing = wait_for_successor(
+            &port,
+            &Expect::Version("0.2.0".into()),
+            &from,
+            false,
+            timing,
+        )
+        .expect_err("a remote that never answers names no successor");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < timing.timeout,
+            "the wait overran its deadline: {elapsed:?}"
+        );
+        assert!(!missing.old_still_answering);
     }
 
     #[test]

@@ -425,7 +425,23 @@ pub trait SshExecutor {
         let _ = deadline;
         self.run_capped(target, command, max_capture_bytes)
     }
+
+    /// The shortest `deadline` [`run_capped_within`](Self::run_capped_within)
+    /// honours: a caller with less time left should not start a command. Zero
+    /// for this default, which ignores the deadline; the production
+    /// [`SystemSshExecutor`] counts whole seconds and returns
+    /// [`MIN_BOUNDED_REMOTE_RUN`].
+    fn min_bounded_run(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
+
+/// The shortest deadline [`SystemSshExecutor`]'s
+/// [`SshExecutor::run_capped_within`] honours. Its kill timer counts whole
+/// seconds, so a deadline is rounded down to one, and one under a second is
+/// refused without starting a session — a caller with less than this left
+/// should not start a remote command at all.
+pub const MIN_BOUNDED_REMOTE_RUN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Issue #858: seconds of headroom the laptop-side wallclock kill gets on top
 /// of the worst case the probe's own ssh options permit.
@@ -871,8 +887,9 @@ impl SshExecutor for SystemSshExecutor {
 
     /// Always bounded, whatever this executor was built for: both streams are
     /// capped at `max_capture_bytes` while they drain, and the session is
-    /// killed at `deadline` (or at this executor's own kill deadline, when it
-    /// has a shorter one). The ssh options the executor was built with — the
+    /// killed at `deadline` rounded down to whole seconds (or at this
+    /// executor's own kill deadline, when it has a shorter one). A deadline
+    /// under [`MIN_BOUNDED_REMOTE_RUN`] starts nothing and is an error. The ssh options the executor was built with — the
     /// upgrade path's keepalives, a jump host — are kept, so the command takes
     /// the same route as every other session to that deck (PRD #1487 audit A1).
     fn run_capped_within(
@@ -882,10 +899,23 @@ impl SshExecutor for SystemSshExecutor {
         max_capture_bytes: usize,
         deadline: std::time::Duration,
     ) -> Result<CappedOutput, SshError> {
-        // Whole seconds, at least one: `run_local_bounded`'s granularity.
-        let mut secs = deadline.as_secs().max(1);
+        // Whole seconds, rounded DOWN: `run_local_bounded`'s granularity. A
+        // deadline under one second cannot be honoured, so nothing is started
+        // rather than granting the session a whole second the caller does not
+        // have (PRD #1487, Qodo review item 13).
+        let mut secs = deadline.as_secs();
         if let Some(own) = self.kill_deadline_secs() {
             secs = secs.min(own);
+        }
+        if secs == 0 {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "{:.1}s left is less than the {}s a remote command needs, so it was not started",
+                    deadline.as_secs_f64(),
+                    MIN_BOUNDED_REMOTE_RUN.as_secs()
+                ),
+            });
         }
         let mut cmd = self.build_command(target, command);
         // Its own process group: a `ProxyCommand` or jump-route helper that
@@ -918,6 +948,10 @@ impl SshExecutor for SystemSshExecutor {
             },
             truncated: capture.truncated,
         })
+    }
+
+    fn min_bounded_run(&self) -> std::time::Duration {
+        MIN_BOUNDED_REMOTE_RUN
     }
 }
 
