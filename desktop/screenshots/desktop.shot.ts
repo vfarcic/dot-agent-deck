@@ -100,6 +100,21 @@ desktopScenario("settings-voice", async (page) => {
   await expect(page.getByTestId("settings-panel-voice")).toBeVisible();
 });
 
+// PRD #1497 — reading mode's two Settings rows, below the fold of
+// settings-voice: Read turns aloud with its disclosure, and Speech source.
+desktopScenario("settings-voice-reading", async (page) => {
+  await page.goto("/?fixture=1&state=docs");
+  await page.getByTestId("open-settings").click();
+  await page.getByTestId("settings-section-voice").click();
+  await expect(page.getByTestId("settings-panel-voice")).toBeVisible();
+  // The key row above the reading rows says the BROWSER PREVIEW has no
+  // credential store, which the app never shows, so it is left out of the shot.
+  await page.addStyleTag({ content: "[data-testid^='secret-problem-'] { display: none !important; }" });
+  await page.getByTestId("voice-speech-hint").scrollIntoViewIfNeeded();
+  await expect(page.getByTestId("voice-reading-disclosure")).toBeInViewport();
+  await expect(page.getByTestId("voice-speech-hint")).toBeInViewport();
+});
+
 // PRD #1260 — typing mode, desktop-only (the TUI has no voice). The fixture's
 // scripted microphone says "type on" once the Voice button is pressed with the
 // Desktop implementation agent's pane open; the image shows the mode marked on

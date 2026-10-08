@@ -1,6 +1,6 @@
 # Voice Control
 
-The desktop app can be driven by voice: open screens and agents, switch daemons, fill in and submit the New agent dialog, stop agents (after you confirm on screen), type or dictate into an agent, and interrupt the agent, clear its prompt or take back what you just dictated. The TUI has no voice control.
+The desktop app can be driven by voice: open screens and agents, switch daemons, fill in and submit the New agent dialog, stop agents (after you confirm on screen), type or dictate into an agent, interrupt the agent, clear its prompt or take back what you just dictated, and hear a short spoken summary of each turn an agent finishes. The TUI has no voice control.
 
 Voice needs two services, set in **Settings → Voice**: **Speech** turns your audio into text, and **Commands** turns that text into one of the app's commands. Read [What is sent where](#what-is-sent-where) before turning it on. Voice understands English: what you say is always transcribed as English, whatever your accent.
 
@@ -33,10 +33,10 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; silence the app's speech ("quiet"); turn voice off |
 | Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
-| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that) |
+| An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); turn [reading mode](#reading-mode) on and off |
 
 Say a daemon's name the way you would say it. The app picks the daemon you meant from the ones the **Daemon** selector lists, even when the transcription spells it differently: "Select mini PC, demon" reaches a daemon named `minipc`, and "Switch to InMotionDeck" one named `inmotion`. The same goes for directories, Mode chips and orchestrations. With **Names** set to **Withheld**, say the name as the screen shows it.
 
@@ -204,6 +204,57 @@ As with every command in a pane, nothing is pressed, and the app says why, if a 
 
 **Which agents support them.** Claude Code, Codex, OpenCode and Pi support all three. **Devin does not support any of them:** the app has no checked keys for interrupting Devin or for deleting text in its prompt, so each is refused with, for example, *Devin has no voice key to interrupt its turn.* The same refusal names an agent the app does not recognise, such as one started with a custom command, and any agent running under a daemon older than these commands; update that daemon to use them there.
 
+## Reading mode
+
+Reading mode lets you hear what an agent did without looking at its pane. While it is on, the app speaks a one-or-two-sentence summary of each turn that agent finishes, for example "The tester finished: all 42 tests pass, nothing changed." It also speaks, as soon as they happen, a permission prompt ("The coder is asking for permission: Bash: cargo publish."), an error that stops the agent ("The coder stopped with an error.") and a usage limit ("The coder hit a usage limit and stopped."). Every sentence names the agent, so you know which one it is about. The app never reads the agent's terminal or its full reply aloud, and the agent itself is not changed in any way.
+
+### Turn it on
+
+![Settings → Voice scrolled to reading mode: Read turns aloud set to Off with the explanation of what reading sends, and Speech source set to Auto with its description](/img/settings-voice-reading-desktop.png)
+
+1. **Allow it once.** Reading is off until you allow it: open **Settings → Voice** and set **Read turns aloud** to **On**. Read [What is sent where](#what-is-sent-where) first: with reading on, the agent's replies leave your machine.
+2. **Start it for an agent.** With voice on, open the agent's [pane](dashboard.md#the-agent-pane) and say "reading on" (or "start reading", "reading mode on", "read to me") on its own. The app says "Reading on.", and **Reading** *agent* is shown at the top of the pane.
+
+From then on, each turn that agent finishes is summarised and spoken. Nothing that happened before you said "reading on" is read, and only that one agent is read. If **Read turns aloud** is **Off**, "reading on" is refused and the app tells you to turn it on in Settings.
+
+The summary is written by the model you set under **Commands**, from the agent's final reply for the turn. If the model does not answer within about ten seconds, or its answer cannot be used, the app says a plain sentence instead, such as "The tester finished its turn." A turn the agent ends without writing a reply, such as one you interrupted, is not announced. When several turns end while the app is still speaking, the latest summary replaces one that was still waiting, so you hear where the agent is now rather than a backlog; a permission prompt or error is never dropped that way.
+
+### Stop the speech, or reading
+
+- Say "quiet" (or "be quiet", "silence", "hush", "shush") to cut off what the app is saying and drop anything waiting to be said. Reading stays on, and the next turn is read as usual. A bare "stop" (or "stop it", "stop that") does the same while the app is speaking, and while reading is on outside typing mode; in typing mode, when the app is not speaking, "stop" still [interrupts the agent](#interrupt-clear-and-scratch-that).
+- **While the app is speaking, only "stop" and "quiet" are heard.** Everything else you say is ignored, and the row beside the Voice button says only “stop” or “quiet” works while the app is speaking. This keeps the microphone from acting on the app's own voice. To give another command, say "stop" first, then the command. "Voice off" waits the same way, or press the Voice button.
+
+Reading ends, and the app says "Reading off.", when you:
+
+- say "reading off" (or "stop reading", "reading mode off", "done reading");
+- close the pane or open another agent's pane: reading never follows you to another agent, so say "reading on" again there;
+- turn voice off;
+- or set **Read turns aloud** to **Off** in Settings.
+
+It also ends when the agent exits. Whatever was being said is cut off when reading ends.
+
+The reading switches work in typing mode too, so a bare "reading on" or "reading off" said in typing mode switches reading rather than being typed. While reading is on or the app is speaking, the same goes for the "quiet" phrases.
+
+### Where the voice comes from
+
+**Speech source** in **Settings → Voice** chooses the voice:
+
+| Choice | Voice |
+| --- | --- |
+| **Auto** (default) | The Commands service's text-to-speech when it has one, otherwise this computer's voice. An **OpenAI-compatible API** has one; the **Anthropic API** does not. If the service's speech fails, the computer's voice says the sentence instead. |
+| **Provider** | Only the Commands service's text-to-speech. With the Anthropic API, nothing can speak, and the app says to choose Auto or System. |
+| **System** | Only this computer's voice. Nothing is sent to be spoken. |
+
+The service's voice uses the Commands endpoint and key: the app asks for speech at the same address with `/chat/completions` replaced by `/audio/speech`, with OpenAI's `gpt-4o-mini-tts` model and its `alloy` voice. A local OpenAI-compatible server is used for speech only if it answers there.
+
+**On Linux, the computer's voice is not always available.** It works when the system's WebKitGTK was built with speech synthesis and a speech engine is installed. Without one, the app says it could not speak because this system has no speech voice, or says nothing at all. Use an OpenAI-compatible Commands service with **Speech source** set to **Auto** or **Provider** instead.
+
+### Which agents can be read
+
+Turn summaries work for Claude Code, Codex, OpenCode and Pi. Devin reports its turns the same way Claude Code does, so reading is expected to work for it, but it has not been checked. Permission prompts, errors and usage limits are announced when the agent reports them, which is when its card shows **Needs Input**, **Error** or **Blocked**; [Session management](../session-management.md) says which agents report which. Pi asks no permission questions the deck can see, so none are announced for it.
+
+Reading needs a daemon that reports finished turns. Under an older one, "reading on" says "Reading is not available: this deck's daemon is too old to report finished turns." Update dot-agent-deck on the machine the daemon runs on. A Pi agent whose deck is older than reading keeps its status and card as before; only its turns cannot be read.
+
 ## Settings → Voice
 
 ![Settings → Voice with the default services: Speech on this machine, through a local speech container, and Commands through an OpenAI-compatible API, each with its Endpoint and Model, then Names set to Shared and Max tokens](/img/settings-voice-desktop.png)
@@ -215,6 +266,8 @@ As with every command in a pane, nothing is pressed, and the app says why, if a 
 | **Endpoint**, **Model** | The URL and model of each service. Choosing a service fills in its usual values; change them to use another provider or a local server. An endpoint must be `https`, or `http` to this machine (`localhost`, `127.x.x.x`, `::1`). | See below |
 | **Max tokens** | The longest answer the Commands model may give, 64 to 32768. A model that reasons spends part of this on its reasoning; raise it if answers come back cut off. | 4096 |
 | **Names** | **Shared** or **Withheld** (below). | Shared |
+| **Read turns aloud** | Whether "reading on" may start [reading mode](#reading-mode). Turning it **Off** also ends reading if it is on. | Off |
+| **Speech source** | Where reading mode's voice comes from: **Auto**, **Provider** or **System** (see [Where the voice comes from](#where-the-voice-comes-from)). | Auto |
 | **Speech key for** / **Commands key for** *host* | The API key for a service that needs one: paste it and press **Save**, then **Replace** or **Forget** it later. Shown for the OpenAI speech service, and for a Commands endpoint that is not on this machine. | None |
 
 The values each choice fills in:
@@ -226,7 +279,7 @@ The values each choice fills in:
 | Commands, OpenAI-compatible API | `https://api.openai.com/v1/chat/completions` | `gpt-5-mini` |
 | Commands, Anthropic API | `https://api.anthropic.com/v1/messages` | `claude-haiku-4-5` |
 
-These are stored in the `[voice]` table of the [settings file](settings.md#the-settings-file): `[voice.transcription]` with `backend` (`"local"` or `"remote"`), `endpoint` and `model`; `[voice.intent]` with `backend` (`"openai_compatible"` or `"anthropic"`), `endpoint`, `model` and `max_tokens`; and `labels` (`"shared"` or `"withheld"`). An endpoint or model left out takes the chosen backend's value above. A `"local"` speech backend with an endpoint off this machine is refused, and the app then treats the whole file as unreadable.
+These are stored in the `[voice]` table of the [settings file](settings.md#the-settings-file): `[voice.transcription]` with `backend` (`"local"` or `"remote"`), `endpoint` and `model`; `[voice.intent]` with `backend` (`"openai_compatible"` or `"anthropic"`), `endpoint`, `model` and `max_tokens`; `labels` (`"shared"` or `"withheld"`); `reading` (`"off"` or `"on"`); and `speech` (`"auto"`, `"provider"` or `"system"`). An endpoint or model left out takes the chosen backend's value above. A `"local"` speech backend with an endpoint off this machine is refused, and the app then treats the whole file as unreadable.
 
 Keys are stored in your operating system's credential store (the macOS Keychain, or the Secret Service on Linux), not in the settings file: one key for **Speech** and one for **Commands**. The panel says whether a key is stored, or that the credential store could not be reached.
 
@@ -234,9 +287,11 @@ Keys are stored in your operating system's credential store (the macOS Keychain,
 
 - **To the Speech service:** your audio, the model name and the language (English). With the default local container, it stays on this machine. The OpenAI speech option also sends your Speech key.
 - **To the Commands service, for each utterance it decides:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands (each command's id, description, parameter names and kinds, whether it can run on the current screen, and the hint shown when it cannot). When the endpoint is not on this machine, the request also carries your Commands API key.
-- **Decided on this machine, sending nothing:** an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; in an agent's pane with typing mode off, one that is in its entirety an [interrupt, clear or scratch phrase](#interrupt-clear-and-scratch-that) other than a bare "stop", which is answered by asking you to say "typing on" first; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; and "type on" and "type off" themselves. While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work (interrupt, clear the prompt and scratch that among them), handled on this machine. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". Silence sends nothing.
+- **Decided on this machine, sending nothing:** an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; in an agent's pane with typing mode off, one that is in its entirety an [interrupt, clear or scratch phrase](#interrupt-clear-and-scratch-that) other than a bare "stop", which is answered by asking you to say "typing on" first; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; "type on" and "type off" themselves; the [reading](#reading-mode) switches, such as "reading on" and "reading off"; while reading is on or the app is speaking, "quiet" and the other ways of silencing it; and anything said while the app is speaking, which is dropped unless it is "stop" or "quiet". While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work (interrupt, clear the prompt and scratch that among them), handled on this machine. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". Silence sends nothing.
 - **With Names shared**, each request also sends the names on screen: each agent on the selected daemon with its name, role, CLI name, status and running tool, its mode, its agent type, the name of its directory (with the directory above it when two agents' directories share a name), its orchestration's title, and the order the agents started in; the name of the daemon those agents are on; each daemon's name, and for a remote daemon with no name its ssh user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. The app adds no full filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path. When you name an agent by what it was last asked to do, the app compares your words with that agent's prompt on this machine; the prompt itself is not sent.
-- **With Names withheld**, none of those names is sent, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. Your words are still sent as heard.
+- **With Read turns aloud on**, while [reading mode](#reading-mode) is on, each turn the agent finishes sends to the Commands service the agent's final reply for that turn (at most 4,000 characters: a longer reply is sent as its beginning and its end), the agent's name and the app's fixed instructions, with the Commands key when the endpoint is not on this machine. Permission prompts, errors and usage limits are spoken without asking the model. No reply is sent while reading is off.
+- **To the speech service, when the voice comes from the Commands service** (see [Where the voice comes from](#where-the-voice-comes-from)): every sentence the app speaks, including summaries, permission prompts with up to 120 characters of what the agent wants to do, and error announcements, with the Commands key. With the computer's voice, those sentences stay on this computer. Nothing is sent to be spoken while **Read turns aloud** is off.
+- **With Names withheld**, none of those names is sent, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. Your words are still sent as heard. Reading mode still sends the name of the agent being read, because every sentence names it.
 
 The panel states the same thing beside the **Commands** setting.
 
@@ -271,4 +326,11 @@ What went wrong is shown beside the Voice button.
 | Words you did not say were typed into the prompt in typing mode | Speech from somewhere else, such as another person or a video playing, was heard as yours. | Nothing was sent: delete the words. Turn typing mode off while others are talking near the microphone. If it happened in a quiet room, report the text you saw. |
 | You said something and nothing happened, with nothing shown | The app took it for noise rather than speech, usually because it was very short or quiet. | Say it again a little louder or closer to the microphone. |
 | Answers are cut off or not understood with a reasoning model | **Max tokens** is too low for its reasoning. | Raise **Max tokens**. |
+| "Reading is turned off in Settings…" after "reading on" | **Read turns aloud** is **Off**. | Set it to **On** in **Settings → Voice**, then say "reading on" again. |
+| "Reading is not available: this deck's daemon is too old to report finished turns" | The daemon predates reading mode. | Update dot-agent-deck on the machine the daemon runs on. |
+| "Reading is not available: the deck did not answer" | The daemon could not be reached. | Check the daemon is running (see [Daemons](daemons.md)), then say "reading on" again. |
+| Everything you say is ignored with "only “stop” or “quiet” works while the app is speaking" | The app was speaking when you spoke. | Say "stop" or "quiet", then the command. |
+| "Could not speak: this system has no speech voice" | The computer's voice is not available, which happens on Linux without a speech engine. | Set **Speech source** to **Auto** or **Provider** with an OpenAI-compatible Commands service. |
+| "Could not speak: the Commands connection has no text-to-speech…" | **Speech source** is **Provider** with the Anthropic API. | Set **Speech source** to **Auto** or **System**. |
+| Reading is on but a turn was not announced | The turn ended without a written reply, for example because you interrupted it. | Nothing to do; the next turn with a reply is read. |
 | "no microphone was found on this machine", or "the microphone would not open (…)" | No input device, or the app may not use it. | Connect a microphone and check it is the system's input device; on macOS, allow the app under System Settings → Privacy & Security → Microphone. Then press **Voice** again. |
