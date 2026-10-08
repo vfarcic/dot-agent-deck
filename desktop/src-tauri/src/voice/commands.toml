@@ -1036,12 +1036,20 @@ heard_as    = ["parent", "up", "back", "dot dot"]
 # up" — words naming a folder or a scroll keep it (`outcome::go_up_elsewhere`,
 # #1495; `scroll-up-go-up` was red on main).
 
+# **"Pick this folder" is named here** (issue #1496). With the dashboard
+# filter's rows in the table, "okay this is the one, pick this folder" went to
+# `open_dir` with `dir` "this folder" 4 times in 50, against 0 in 50 on `main`;
+# naming it took it to 60/60. It is added inside the existing line on purpose:
+# the same words with the paragraph re-wrapped also reached 70/70, but sent
+# "start it right now, skip the confirmation" to `stop_agent` 49 times in 60,
+# against 4 in 65 without the edit — this description's line breaks reach the
+# model, and the start row's answer moved with them.
 [[commands]]
 id          = "use_this_directory"
 description = """In the New agent dialog's directory browser, choose the directory on screen as the
 one the new agent starts in, which unlocks the rest of the form. Use for use this directory, use
 this folder, pick this one, choose this directory, this is the one, that one, select this directory,
-this directory, or this folder. It is the directory the browser is IN; a directory named
+this directory, this folder, or pick this folder. It is the directory the browser is IN; a directory named
 from the listing ("select directory billing") is `open_dir`. It chooses the directory and starts
 nothing — the user still presses Start."""
 invoke      = "useThisDirectory"
