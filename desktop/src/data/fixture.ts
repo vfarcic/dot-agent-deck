@@ -1313,7 +1313,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   },
   {
     phrases: ["quiet", "be quiet", "silence", "hush", "shush"],
-    action: "quiet",
+    action: "hush_reading",
     invoke: "quietSpeech",
     screens: ["deck", "overview", "agent"],
     unavailableHint: "silencing the app's speech works anywhere",
@@ -1817,7 +1817,7 @@ function fixtureReadingIntercept(utterance: string, screen: VoiceScreen, typing:
     return { kind: "dispatch", transcript: utterance, action, invoke: row.invoke, params: [], sentence: row.report };
   };
   const stopsQuiet = reading.speaking || (reading.reading && !typing);
-  if (fixtureReserved(utterance, ["quiet"]) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("quiet");
+  if (fixtureReserved(utterance, ["hush_reading"]) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("hush_reading");
   if (reading.speaking) {
     return { kind: "dropped", transcript: utterance, sentence: `Heard: “${utterance.trim()}” — ${FIXTURE_DROPPED_WHILE_SPEAKING}.` };
   }

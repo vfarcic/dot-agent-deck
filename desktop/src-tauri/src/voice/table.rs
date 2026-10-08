@@ -1363,10 +1363,10 @@ mod tests {
                 ("clear_prompt", "clearAgentPrompt", vec!["agent"]),
                 ("scratch_that", "scratchLastDictation", vec!["agent"]),
                 // PRD #1497's reading pair targets the pane on screen, and
-                // `quiet` is callable everywhere: speech can outlive its pane.
+                // `hush_reading` is callable everywhere: speech can outlive its pane.
                 ("reading_on", "startReading", vec!["agent"]),
                 ("reading_off", "stopReading", vec!["agent"]),
-                ("quiet", "quietSpeech", vec![]),
+                ("hush_reading", "quietSpeech", vec![]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
                 // The directory browser inside that dialog — `overview`, plus
@@ -1986,7 +1986,7 @@ mod tests {
         // PRD #1541's three prompt commands because their whole-utterance
         // vocabulary is exactly what the agent screen answers locally outside
         // typing mode, which is what keeps the model from ever dispatching them.
-        // PRD #1497's reading pair for the dictation pair's reason, and `quiet`
+        // PRD #1497's reading pair for the dictation pair's reason, and `hush_reading`
         // because "silence" or "hush" said in passing must not cut the app off.
         assert_eq!(
             whole,
@@ -1999,7 +1999,7 @@ mod tests {
                 "scratch_that",
                 "reading_on",
                 "reading_off",
-                "quiet",
+                "hush_reading",
                 "discard_new_agent"
             ]
         );
@@ -2349,11 +2349,11 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        // `quiet` (PRD #1497 D6): speech can still be playing after the pane it
+        // `hush_reading` (PRD #1497 D6): speech can still be playing after the pane it
         // was about has closed, and "stop" or "quiet" always works.
         assert_eq!(
             everywhere,
-            vec!["close", "voice_off", "list_commands", "quiet"]
+            vec!["close", "voice_off", "list_commands", "hush_reading"]
         );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
@@ -2425,7 +2425,7 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
-                "quiet",
+                "hush_reading",
                 "next_page",
                 "previous_page"
             ]
@@ -2441,7 +2441,7 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
-                "quiet",
+                "hush_reading",
                 "open_new_agent",
                 "next_page",
                 "previous_page",
@@ -2471,7 +2471,7 @@ mod tests {
                 "scratch_that",
                 "reading_on",
                 "reading_off",
-                "quiet"
+                "hush_reading"
             ]
         );
     }

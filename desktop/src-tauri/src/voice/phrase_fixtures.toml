@@ -957,7 +957,7 @@ outcome = "dispatch"
 # `heard_as_whole` and answered by the local fast path (`reading_intercept`)
 # before any model call, so these pin the whole pipeline's answer for the
 # phrasings users say, and the `screens` column through the unavailable pair.
-# `quiet` has no `screens`: speech can still be playing after its pane closed.
+# `hush_reading` has no `screens`: speech can still be playing after its pane closed.
 [[fixtures]]
 name = "reading-on"
 utterance = "reading on"
@@ -1004,14 +1004,14 @@ outcome = "unavailable"
 name = "quiet-on-the-agent-screen"
 utterance = "quiet"
 screen = "agent"
-action = "quiet"
+action = "hush_reading"
 outcome = "dispatch"
 
 [[fixtures]]
 name = "quiet-be-quiet-on-the-overview"
 utterance = "Be quiet, please."
 screen = "overview"
-action = "quiet"
+action = "hush_reading"
 outcome = "dispatch"
 
 # PRD #1541 — the typing-mode prompt commands: interrupt the open agent's

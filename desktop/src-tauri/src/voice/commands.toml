@@ -88,7 +88,7 @@
 #                    switch changes how every later utterance is treated,
 #                    PRD #1541's three typing-mode prompt commands, which it
 #                    keeps out of the model's reach (see above those rows),
-#                    and PRD #1497's reading pair and `quiet`
+#                    and PRD #1497's reading pair and `hush_reading`
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
 #   heard_as_whole_while
@@ -510,7 +510,7 @@ id          = "voice_off"
 description = """Turn voice control off — close the microphone and stop listening, so nothing
 further is heard until the Voice button is pressed again. Use for voice off, turn off the voice,
 turn voice off, stop listening, stop voice control, stop voice, mute, mic off, or any request to stop
-LISTENING.
+LISTENING. A bare "mute" always means this, never `hush_reading`.
 This stops the microphone and nothing else: it changes no screen, closes no view, and stops no
 agent."""
 invoke      = "stopVoice"
@@ -832,12 +832,23 @@ heard_as_whole = ["reading off", "stop reading", "reading mode off", "done readi
 # "stop" forms (`voice::dictation::TYPING_STOP_PHRASES`) mean this only while
 # speech plays, or while reading is on outside typing mode, and are not in the
 # grounding below for `interrupt_agent`'s reason: elsewhere a bare "stop" keeps
-# the model's answer it has today.
+# the model's answer it has today. They are not in the description either:
+# `outcome::reading_intercept` answers them ahead of the model whenever they
+# mean this row, so the model never needs them.
+#
+# **The id is not `quiet`, and that was measured.** The model weighs the id as
+# well as the description: with this row called `quiet`, the phrase fixture
+# `voice-off-mute` ("mute", which is `voice_off`'s) came back `quiet` in 9 of 10
+# runs against `gpt-5-mini` with the first description and in 20 of 28 across
+# three rewordings, each saying in this row or `voice_off`'s that mute is not
+# this row; it passed 8 of 8 on `origin/main`, which has no such row. Called
+# `hush_reading` it passed 8 of 8 (2026-10-08). Do not rename it to a synonym
+# of mute or silence without rerunning that fixture.
 [[commands]]
-id          = "quiet"
-description = """Silence what the app is saying aloud: cut off the sentence being spoken and drop
-any waiting. Reading mode stays on. Use only when the WHOLE utterance is "quiet", "be quiet",
-"silence", "hush" or "shush" — or, while the app is speaking, "stop", "stop it" or "stop that"."""
+id          = "hush_reading"
+description = """Stop what the app is reading aloud in reading mode (an agent's turn summary,
+permission prompt or error). Use ONLY when the WHOLE utterance is exactly "quiet", "be quiet",
+"silence", "hush" or "shush"."""
 invoke      = "quietSpeech"
 unavailable_hint = "silencing the app's speech works anywhere"
 report      = "Quiet."
@@ -1333,6 +1344,13 @@ heard_as    = ["name", "call"]
 # description says in so many words that a command's own words are not a
 # request to start. The report quotes what was applied, because the field is
 # the thing the user checks before pressing Start.
+#
+# The description's last sentence is for "set the command" with no command in
+# it (fixture `set-new-agent-command-none-said`): the model answered
+# `name_new_agent` for it in 4 of 56 runs against `gpt-5-mini` with the table
+# on `origin/main`, and in 18 of 44 once PRD #1497 added its three rows, though
+# none of them is about the form. With the sentence it passed 12 of 12
+# (2026-10-08).
 [[commands]]
 id          = "set_new_agent_command"
 description = """In the New agent form, set the Command field — the command line the new agent
@@ -1344,7 +1362,8 @@ they did not say, and leave out the introducing words ("set the command to") and
 final full stop. It only fills the field and starts nothing, even when the command itself contains
 words like run, start or launch: the new agent starts only when the user then asks for that
 (`start_new_agent`). Not for choosing a kind of agent by name ("use claude" is
-`choose_agent_type`) and not for the Name field (`name_new_agent`)."""
+`choose_agent_type`) and not for the Name field (`name_new_agent`). An utterance about the
+command that names none ("set the command") is still this row, with `command` left empty."""
 invoke      = "setNewAgentCommand"
 screens     = ["overview"]
 requires    = ["new_agent_form"]

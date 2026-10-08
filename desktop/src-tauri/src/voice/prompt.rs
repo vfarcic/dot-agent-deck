@@ -717,7 +717,7 @@ pub(crate) mod tests {
                 "scratch_that".to_string(),
                 "reading_on".to_string(),
                 "reading_off".to_string(),
-                "quiet".to_string(),
+                "hush_reading".to_string(),
                 "open_new_agent".to_string(),
                 "open_dir".to_string(),
                 "go_to_parent".to_string(),

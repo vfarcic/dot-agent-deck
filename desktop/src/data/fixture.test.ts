@@ -301,9 +301,9 @@ it("refuses a preview scroll while the New agent dialog is open", () => {
 });
 
 describe("browser fixture reading rows (PRD #1497)", () => {
-  /** Scenario: the preview's reading rows carry Rust's own invoke, hint and report for `reading_on`, `reading_off` and `quiet`. */
+  /** Scenario: the preview's reading rows carry Rust's own invoke, hint and report for `reading_on`, `reading_off` and `hush_reading`. */
   it("has the same invoke, hint and report as commands.toml", () => {
-    for (const id of ["reading_on", "reading_off", "quiet"]) {
+    for (const id of ["reading_on", "reading_off", "hush_reading"]) {
       expect(fixtureSource).toContain(`invoke: "${rowField(id, "invoke")}"`);
       expect(fixtureSource).toContain(`unavailableHint: "${rowField(id, "unavailable_hint")}"`);
       expect(fixtureSource).toContain(`report: "${rowField(id, "report")}"`);
@@ -322,11 +322,11 @@ describe("browser fixture reading rows (PRD #1497)", () => {
   /** Scenario (D8): while the app is speaking, "stop" and "quiet" silence it and everything else is dropped; with reading on outside typing mode a bare "stop" silences it too. */
   it("honours only stop and quiet while the app speaks", () => {
     const speaking = { reading: true, speaking: true };
-    expect(resolveFixtureVoice("stop", "agent", true, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "quiet" });
-    expect(resolveFixtureVoice("quiet", "overview", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "quiet" });
+    expect(resolveFixtureVoice("stop", "agent", true, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
+    expect(resolveFixtureVoice("quiet", "overview", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
     expect(resolveFixtureVoice("reading off", "agent", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dropped" });
     expect(resolveFixtureVoice("open settings", "agent", false, false, false, false, speaking).outcome).toMatchObject({ kind: "dropped" });
-    expect(resolveFixtureVoice("stop", "agent", false, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "quiet" });
+    expect(resolveFixtureVoice("stop", "agent", false, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ kind: "dispatch", action: "hush_reading" });
     expect(resolveFixtureVoice("stop", "agent", true, false, false, false, { reading: true, speaking: false }).outcome).toMatchObject({ action: "interrupt_agent" });
   });
 });

@@ -692,7 +692,7 @@ mod tests {
                 "scratch_that",
                 "reading_on",
                 "reading_off",
-                "quiet",
+                "hush_reading",
                 "open_new_agent",
                 "open_dir",
                 "go_to_parent",

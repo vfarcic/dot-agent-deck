@@ -101,7 +101,7 @@ const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_RO
 /// dispatched by [`reading_intercept`] ahead of every other path.
 const READING_ON_ROW: &str = "reading_on";
 const READING_OFF_ROW: &str = "reading_off";
-const QUIET_ROW: &str = "quiet";
+const QUIET_ROW: &str = "hush_reading";
 /// What an utterance heard while the app was speaking is answered with, when
 /// it was not a way of silencing it (PRD #1497 D8).
 pub const DROPPED_WHILE_SPEAKING: &str = "only “stop” or “quiet” works while the app is speaking";
@@ -2027,7 +2027,7 @@ fn typing_mode_row<'t>(
 ///    ([`TYPING_STOP_PHRASES`]) while the app was speaking or while reading is
 ///    on outside typing mode (in typing mode, with nothing being said, a bare
 ///    *"stop"* keeps its meaning there: interrupt the agent) — dispatches
-///    `quiet`, which leaves reading on. With reading off and nothing spoken,
+///    `hush_reading`, which leaves reading on. With reading off and nothing spoken,
 ///    neither list is answered here, so *"hush"* said alone in typing mode is
 ///    typed as it was before reading mode existed;
 /// 2. **while the app was speaking, anything else is dropped** (D8): the
@@ -13088,12 +13088,20 @@ mod tests {
         for screen in [Screen::Agent, Screen::Overview, Screen::Deck] {
             for said in ["quiet", "Be quiet.", "hush", "silence please", "shush"] {
                 let outcome = reading_answer(said, screen, false, READING).await;
-                assert_eq!(dispatched(&outcome), Some("quiet"), "{said:?}: {outcome:?}");
+                assert_eq!(
+                    dispatched(&outcome),
+                    Some("hush_reading"),
+                    "{said:?}: {outcome:?}"
+                );
             }
         }
         for said in ["stop", "Stop it.", "stop that"] {
             let reading = reading_answer(said, Screen::Agent, false, READING).await;
-            assert_eq!(dispatched(&reading), Some("quiet"), "{said:?}: {reading:?}");
+            assert_eq!(
+                dispatched(&reading),
+                Some("hush_reading"),
+                "{said:?}: {reading:?}"
+            );
             let typing = reading_answer(said, Screen::Agent, true, READING).await;
             assert_eq!(
                 dispatched(&typing),
@@ -13128,13 +13136,13 @@ mod tests {
                 let outcome = reading_answer("hush", Screen::Agent, typing, state).await;
                 assert_eq!(
                     dispatched(&outcome),
-                    Some("quiet"),
+                    Some("hush_reading"),
                     "hush (typing {typing}, {state:?}): {outcome:?}"
                 );
             }
         }
         let reading = reading_answer("hush", Screen::Agent, true, READING).await;
-        assert_eq!(dispatched(&reading), Some("quiet"), "{reading:?}");
+        assert_eq!(dispatched(&reading), Some("hush_reading"), "{reading:?}");
     }
 
     /// Scenario (D8): while the app is speaking, "stop" and "quiet" silence it
@@ -13146,7 +13154,11 @@ mod tests {
         for typing in [false, true] {
             for said in ["stop", "quiet", "stop it"] {
                 let outcome = reading_answer(said, Screen::Agent, typing, SPEAKING).await;
-                assert_eq!(dispatched(&outcome), Some("quiet"), "{said:?}: {outcome:?}");
+                assert_eq!(
+                    dispatched(&outcome),
+                    Some("hush_reading"),
+                    "{said:?}: {outcome:?}"
+                );
             }
             for said in [
                 "The tester finished: all tests pass.",

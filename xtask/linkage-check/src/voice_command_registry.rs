@@ -123,7 +123,7 @@ const READING_OFF_LIST: &str = "READING_OFF_PHRASES";
 const QUIET_LIST: &str = "QUIET_PHRASES";
 const READING_ON_ROW: &str = "reading_on";
 const READING_OFF_ROW: &str = "reading_off";
-const QUIET_ROW: &str = "quiet";
+const QUIET_ROW: &str = "hush_reading";
 
 /// The rule sentence, quoted in every failure.
 ///
