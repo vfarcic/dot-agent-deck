@@ -2717,31 +2717,21 @@ const MARKED_WHOLE_INTRODUCTIONS: [&str; 4] = ["tell it to", "ask it to", "tell 
 /// `scroll_up` both claim "go up", and need exact complements (a parent
 /// directory on screen; the dialog closed), so a bare "go up" is whichever can
 /// run — the model picked `go_to_parent` on the dashboard every time
-/// (`scroll-up-go-up`, red on `main` after #1509). Only BARE: words that name
-/// a folder ("go up a directory") or a scroll ("scroll up a bit") ask for the
-/// row the model picked, and keep its refusal (Qodo on PR #1529, where a
-/// two-way `unavailable_redirects` grounded on "up" alone crossed them).
+/// (`scroll-up-go-up`, red on `main` after #1509). Only BARE: the whole
+/// utterance is "go up", "move up" or "up", a politeness word aside. Anything
+/// more ("go up a directory", "scroll up a bit", "go up to the top") asks for
+/// something the model's pick or another row answers, and keeps that pick's
+/// refusal (Qodo on PR #1529, where a two-way `unavailable_redirects`
+/// grounded on "up" alone crossed them).
 fn go_up_elsewhere(row: &str, text: &str) -> Option<&'static str> {
-    const FOLDER_WORDS: [&str; 9] = [
-        "parent",
-        "directory",
-        "directories",
-        "dir",
-        "folder",
-        "folders",
-        "level",
-        "dot",
-        "cd",
-    ];
-    const SCROLL_WORDS: [&str; 6] = ["scroll", "scrolling", "page", "above", "screen", "bit"];
-    let said = words(&normalize(&spoken_text(text)));
-    let names = |list: &[&str]| list.iter().any(|word| said.contains(*word));
-    if !said.contains("up") {
+    const BARE: [&str; 3] = ["go up", "move up", "up"];
+    let said = whole_utterance(text).join(" ");
+    if !BARE.contains(&said.as_str()) {
         return None;
     }
     match row {
-        "go_to_parent" if !names(&FOLDER_WORDS) && !names(&SCROLL_WORDS) => Some("scroll_up"),
-        "scroll_up" if !names(&SCROLL_WORDS) && !names(&FOLDER_WORDS) => Some("go_to_parent"),
+        "go_to_parent" => Some("scroll_up"),
+        "scroll_up" => Some("go_to_parent"),
         _ => None,
     }
 }
@@ -4897,10 +4887,18 @@ mod tests {
             &on_the_dashboard("go back", "go_to_parent").await,
             VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
         ));
-        // Words naming a folder keep the folder row's refusal.
+        // Only a bare "go up" crosses: words naming a folder, or the top,
+        // keep the folder row's refusal.
+        for said in ["go up a directory", "go up to the top"] {
+            assert!(
+                matches!(&on_the_dashboard(said, "go_to_parent").await,
+                    VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"),
+                "{said:?}"
+            );
+        }
         assert!(matches!(
-            &on_the_dashboard("go up a directory", "go_to_parent").await,
-            VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
+            &on_the_dashboard("Okay, go up please.", "go_to_parent").await,
+            VoiceOutcome::Dispatch { action, .. } if action == "scroll_up"
         ));
         let dialog = VoiceNewAgent { form: None };
         let browsing = listing(&["billing"], true);
