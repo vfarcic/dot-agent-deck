@@ -997,6 +997,10 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
         )
         .with_env("DOT_AGENT_DECK_LOG", log_name)
         .with_env("PATH", path_with_binary_dir())
+        // Above the test's 540s nextest window (`.config/nextest.toml`), so its
+        // daemon and agent are not reaped at the 300s harness default before
+        // the waits below can use it.
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "600")
         // The `dispatch` CLI runs from the test process naming the caller's
         // pane, as in `dispatch/014` and `/015` (issue #1077).
         .impersonating_pane_signals()
@@ -1106,11 +1110,18 @@ fn dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude()
             .and_then(|r| r.live)
             .is_some_and(|live| live.status == dot_agent_deck::state::SessionStatus::Idle)
     };
+    // Polled, so a turn that starts and ends inside the window restarts it
+    // rather than being slept through (Qodo, PR #1618).
+    const SUSTAINED_IDLE: Duration = Duration::from_secs(3);
+    let idle_since = std::cell::Cell::new(None::<std::time::Instant>);
     let settled_idle = common::wait_until(Duration::from_secs(120), || {
-        idle() && {
-            std::thread::sleep(Duration::from_secs(3));
-            idle()
+        if !idle() {
+            idle_since.set(None);
+            return false;
         }
+        let since = idle_since.get().unwrap_or_else(std::time::Instant::now);
+        idle_since.set(Some(since));
+        since.elapsed() >= SUSTAINED_IDLE
     });
     assert!(
         settled_idle,
