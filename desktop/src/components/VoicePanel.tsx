@@ -73,6 +73,8 @@ import {
   MIN_TOKEN_CEILING,
   VOICE_INTENT_BACKENDS,
   VOICE_LABEL_SHARING,
+  VOICE_READING_CONSENT,
+  VOICE_SPEECH_SOURCES,
   VOICE_STAGE_PRESETS,
   VOICE_TRANSCRIPTION_BACKENDS,
   type SecretStatusDto,
@@ -110,6 +112,38 @@ const INTENT_LABELS: Record<string, string> = {
 const LABEL_SHARING_LABELS: Record<string, string> = {
   shared: "Shared",
   withheld: "Withheld",
+};
+
+/**
+ * PRD #1497 D4 — the Read turns aloud row's options. "reading on" refuses
+ * while it is Off, and its spoken refusal names this row.
+ */
+const READING_CONSENT_LABELS: Record<string, string> = {
+  off: "Off",
+  on: "On",
+};
+
+/**
+ * PRD #1497 D4 — what reading sends, shown under the switch. Each clause is
+ * the code's: `voice::reading::read_turns` summarises a finished turn's final
+ * reply through the Commands connection (`voice::summary::summarise_turn`),
+ * and `desktop_voice_speech_audio` sends the sentence to that connection's
+ * speech service when the Speech source picks it.
+ */
+export const READING_DISCLOSURE = "With reading on, saying “reading on” in an agent's pane makes the app speak a short summary of each turn that agent finishes. To write it, the agent's final reply for the turn is sent to the Commands connection above. When the voice comes from the provider, the summary is also sent to that provider's speech service. Permission prompts and errors are announced without sending anything.";
+
+/** PRD #1497 D9 — the Speech source picker's options. */
+const SPEECH_SOURCE_LABELS: Record<string, string> = {
+  auto: "Auto",
+  provider: "Provider",
+  system: "System",
+};
+
+/** PRD #1497 D9 — what each Speech source does, shown under the picker. */
+const SPEECH_SOURCE_HINTS: Record<string, string> = {
+  auto: "The Commands connection's voice when it has one (OpenAI-compatible connections do, Anthropic does not), otherwise this computer's voice.",
+  provider: "The Commands connection's voice. Reading says so when the connection has none.",
+  system: "This computer's voice. Nothing is sent to be spoken.",
 };
 
 /**
@@ -245,6 +279,8 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
   // Per instance, for AppearancePanel's reason: two panels in one document
   // must not share the id a radiogroup is named by.
   const namesLabelId = useId();
+  const readingLabelId = useId();
+  const speechLabelId = useId();
 
   const saveVoice = (next: VoiceSettingsDto) => onSave({ ...settings, voice: next });
 
@@ -370,6 +406,48 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       {needsKey("intent", voice.intent) && (
         <SecretRow id="voice-intent" stage="intent" endpoint={voice.intent.endpoint} />
       )}
+
+      {/* PRD #1497 D4 — reading's opt-in, off by default, with what it sends
+          beside it: an agent's replies leave the machine only once this is
+          on. The same segmented shape as Names. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={readingLabelId}>Read turns aloud</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={readingLabelId}>
+          {VOICE_READING_CONSENT.map((token) => (
+            <label key={token} className={token === voice.reading ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-reading"
+                value={token}
+                checked={token === voice.reading}
+                onChange={() => saveVoice({ ...voice, reading: token })}
+              />
+              <span>{READING_CONSENT_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <p className="settings-hint" data-testid="voice-reading-disclosure">{READING_DISCLOSURE}</p>
+
+      {/* PRD #1497 D9 — where reading's voice comes from. */}
+      <div className="settings-row">
+        <span className="settings-row-label" id={speechLabelId}>Speech source</span>
+        <div className="segmented" role="radiogroup" aria-labelledby={speechLabelId}>
+          {VOICE_SPEECH_SOURCES.map((token) => (
+            <label key={token} className={token === voice.speech ? "is-selected" : ""}>
+              <input
+                type="radio"
+                name="voice-speech"
+                value={token}
+                checked={token === voice.speech}
+                onChange={() => saveVoice({ ...voice, speech: token })}
+              />
+              <span>{SPEECH_SOURCE_LABELS[token]}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <p className="settings-hint" data-testid="voice-speech-hint">{SPEECH_SOURCE_HINTS[voice.speech] ?? SPEECH_SOURCE_HINTS.auto}</p>
 
       {/* Rendered verbatim: `saveError` is a complete sentence composed by
           `useDesktopSettings`, because the same prop also carries "your

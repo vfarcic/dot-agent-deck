@@ -52,6 +52,7 @@ pub mod numbers;
 pub mod openai;
 pub mod outcome;
 pub mod prompt;
+pub mod reading;
 pub mod remote;
 pub mod resolver;
 pub mod schema;
@@ -347,6 +348,25 @@ pub struct VoiceDictationTarget {
     pub agent_id: String,
 }
 
+/// PRD #1497 — reading mode and the app's own speech, as the voice panel
+/// declares them with each utterance.
+///
+/// Like [`VoiceDictationTarget`], state the Rust side keeps no memory of: the
+/// panel holds the mode and the speech queue, so both travel with the
+/// utterance. `speaking` is whether the app's speech overlapped the recording
+/// this utterance came from — not merely whether it is speaking now, since a
+/// recording of the app's own voice ends after the voice does (D8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VoiceReadingState {
+    /// Reading mode is on for the pane on screen.
+    #[serde(default)]
+    pub reading: bool,
+    /// The app was speaking while this utterance was recorded.
+    #[serde(default)]
+    pub speaking: bool,
+}
+
 /// One entry of a closed set on screen: the id the dialog selects by, and the
 /// label it renders — which is what a user says.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -356,8 +376,8 @@ pub struct VoiceChoice {
     pub label: String,
 }
 pub use dictation::{
-    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, SUBMIT_PHRASES,
-    VOICE_OFF_PHRASES,
+    DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS, QUIET_PHRASES,
+    READING_OFF_PHRASES, READING_ON_PHRASES, SUBMIT_PHRASES, VOICE_OFF_PHRASES,
 };
 
 pub use capture::{
@@ -371,8 +391,9 @@ pub use hold::VoiceHold;
 pub use outcome::{
     ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
     VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
-    handle_utterance_with, handle_utterance_with_dictation, refuse_switch_beyond_selector,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    handle_utterance_with, handle_utterance_with_dictation, handle_utterance_with_modes,
+    refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref,
+    resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{

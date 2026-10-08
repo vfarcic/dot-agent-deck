@@ -46,8 +46,9 @@ use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
     CLEAR_PROMPT_PHRASES, DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES, DICTATION_OPENERS,
-    INTERRUPT_PHRASES, SCRATCH_PHRASES, SUBMIT_PHRASES, TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES,
-    VOICE_OFF_PHRASES, opening_with, strip_opening,
+    INTERRUPT_PHRASES, QUIET_PHRASES, READING_OFF_PHRASES, READING_ON_PHRASES, SCRATCH_PHRASES,
+    SUBMIT_PHRASES, TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES, VOICE_OFF_PHRASES, opening_with,
+    strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::resolver::{IntentError, IntentRequest, IntentResolver};
@@ -59,7 +60,7 @@ use super::table::{
 };
 use super::{
     DesktopAgent, Transcript, VoiceChoice, VoiceDeck, VoiceDictationTarget, VoiceDirectories,
-    VoiceNewAgent,
+    VoiceNewAgent, VoiceReadingState,
 };
 use crate::dto::{DesktopTab, safe_message};
 use crate::settings::LabelSharing;
@@ -96,6 +97,14 @@ const INTERRUPT_ROW: &str = "interrupt_agent";
 const CLEAR_PROMPT_ROW: &str = "clear_prompt";
 const SCRATCH_ROW: &str = "scratch_that";
 const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_ROW];
+/// PRD #1497 — reading mode's pair and the row that silences the app's speech,
+/// dispatched by [`reading_intercept`] ahead of every other path.
+const READING_ON_ROW: &str = "reading_on";
+const READING_OFF_ROW: &str = "reading_off";
+const QUIET_ROW: &str = "quiet";
+/// What an utterance heard while the app was speaking is answered with, when
+/// it was not a way of silencing it (PRD #1497 D8).
+pub const DROPPED_WHILE_SPEAKING: &str = "only “stop” or “quiet” works while the app is speaking";
 /// What a typing-mode prompt command said OUTSIDE typing mode is answered with
 /// (PRD #1541 M1 decision 4): nothing runs, and the row says how to reach it.
 /// A fragment, like a row's `unavailable_hint`; the sentence capitalises it.
@@ -317,6 +326,13 @@ pub enum VoiceOutcome {
     /// seam (M7), which is upstream of everything else here — so it is the one
     /// variant with no transcript to show.
     TranscriptionFailed { detail: String, sentence: String },
+    /// PRD #1497 D8 — heard while the app was speaking, and not a way of
+    /// silencing it, so nothing runs and nothing is sent anywhere. The
+    /// microphone may have heard the app's own voice.
+    Dropped {
+        transcript: Transcript,
+        sentence: String,
+    },
 }
 
 impl VoiceOutcome {
@@ -332,7 +348,8 @@ impl VoiceOutcome {
             | VoiceOutcome::ParamUnresolved { sentence, .. }
             | VoiceOutcome::ParamAmbiguous { sentence, .. }
             | VoiceOutcome::ResolutionFailed { sentence, .. }
-            | VoiceOutcome::TranscriptionFailed { sentence, .. } => sentence,
+            | VoiceOutcome::TranscriptionFailed { sentence, .. }
+            | VoiceOutcome::Dropped { sentence, .. } => sentence,
         }
     }
 
@@ -402,6 +419,14 @@ impl VoiceOutcome {
         Self::TranscriptionFailed {
             sentence: format!("Could not turn that into text ({detail})."),
             detail,
+        }
+    }
+
+    /// PRD #1497 D8 — see [`VoiceOutcome::Dropped`].
+    fn dropped(transcript: Transcript) -> Self {
+        Self::Dropped {
+            sentence: heard(&transcript, DROPPED_WHILE_SPEAKING),
+            transcript,
         }
     }
 
@@ -737,6 +762,49 @@ pub async fn handle_utterance_with_dictation(
     labels: LabelSharing,
     show_deck: bool,
 ) -> VoiceResult {
+    handle_utterance_with_modes(
+        resolver,
+        table,
+        screen,
+        agents,
+        decks,
+        directories,
+        new_agent,
+        dictation,
+        VoiceReadingState::default(),
+        transcript,
+        labels,
+        show_deck,
+    )
+    .await
+}
+
+/// [`handle_utterance_with_dictation`], with reading mode and the app's own
+/// speech declared too (PRD #1497) — which is what `desktop_voice_resolve`
+/// calls.
+///
+/// Reading's switches and the way of silencing the app are answered by
+/// [`reading_intercept`] before anything else, the dictation mode included;
+/// and while the app was speaking (`reading.speaking`), nothing else is
+/// answered at all: every other utterance is [`VoiceOutcome::Dropped`], with
+/// no backend call (D8).
+// Twelve: each piece of live state from its own owner, for
+// `handle_utterance_with`'s reason.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_utterance_with_modes(
+    resolver: &dyn IntentResolver,
+    table: &CommandTable,
+    screen: Screen,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+    directories: Option<&VoiceDirectories>,
+    new_agent: Option<&VoiceNewAgent>,
+    dictation: Option<&VoiceDictationTarget>,
+    reading: VoiceReadingState,
+    transcript: Transcript,
+    labels: LabelSharing,
+    show_deck: bool,
+) -> VoiceResult {
     let withheld = labels == LabelSharing::Withheld;
     let backend = resolver.backend_name();
     let finish = |outcome, resolve_ms| VoiceResult {
@@ -750,6 +818,15 @@ pub async fn handle_utterance_with_dictation(
     // and neither is worth spending on an empty string.
     if transcript.is_empty() {
         return finish(VoiceOutcome::no_match(transcript), None);
+    }
+
+    // Reading mode and the app's own speech (PRD #1497): ahead of the
+    // dictation mode, so "reading on" said while typing is not typed, and
+    // ahead of everything while the app was speaking (D8).
+    if let Some(outcome) =
+        reading_intercept(table, screen, dictation.is_some(), reading, &transcript)
+    {
+        return finish(outcome, None);
     }
 
     // The dictation mode (PRD #1260): answered here in full, whatever was said.
@@ -1938,6 +2015,69 @@ fn typing_mode_row<'t>(
     .into_iter()
     .find(|(_, phrases)| said_whole(text, phrases.iter().copied()))
     .and_then(|(row_id, _)| table.row(row_id))
+}
+
+/// PRD #1497 — reading mode's switches, silencing the app's speech, and D8's
+/// filter while it speaks, decided with no backend call.
+///
+/// # The order
+///
+/// 1. a way of silencing the app — [`QUIET_PHRASES`] always, and the bare
+///    *"stop"* forms ([`TYPING_STOP_PHRASES`]) while the app was speaking or
+///    while reading is on outside typing mode (in typing mode, with nothing
+///    being said, a bare *"stop"* keeps its meaning there: interrupt the
+///    agent) — dispatches `quiet`, which leaves reading on;
+/// 2. **while the app was speaking, anything else is dropped** (D8): the
+///    microphone may be hearing the app, and the worst its echo may then do is
+///    silence the app. Voice off included — say "stop" first;
+/// 3. [`READING_ON_PHRASES`] / [`READING_OFF_PHRASES`] dispatch their rows, in
+///    every mode.
+///
+/// Every list is whole-utterance, less an edge politeness word, so *"start
+/// reading the logs"* is not a switch. The cost is the usual one: none of
+/// these can be dictated alone in typing mode. `None` for everything else, and
+/// for a table without the row a phrase belongs to.
+fn reading_intercept(
+    table: &CommandTable,
+    screen: Screen,
+    typing: bool,
+    reading: VoiceReadingState,
+    transcript: &Transcript,
+) -> Option<VoiceOutcome> {
+    let dispatch = |row: &CommandRow| {
+        if !row.callable_on(screen) {
+            return VoiceOutcome::unavailable(transcript.clone(), row);
+        }
+        VoiceOutcome::Dispatch {
+            sentence: report(row, &[]),
+            transcript: transcript.clone(),
+            action: row.id.clone(),
+            invoke: row.invoke.clone(),
+            params: Vec::new(),
+            then_submit: false,
+        }
+    };
+    let text = transcript.text();
+    let stops_quiet = reading.speaking || (reading.reading && !typing);
+    let quiets =
+        said_whole(text, QUIET_PHRASES) || (stops_quiet && said_whole(text, TYPING_STOP_PHRASES));
+    if quiets && let Some(row) = table.row(QUIET_ROW) {
+        return Some(dispatch(row));
+    }
+    if reading.speaking {
+        return Some(VoiceOutcome::dropped(transcript.clone()));
+    }
+    for (phrases, row_id) in [
+        (&READING_ON_PHRASES[..], READING_ON_ROW),
+        (&READING_OFF_PHRASES[..], READING_OFF_ROW),
+    ] {
+        if said_whole(text, phrases.iter().copied())
+            && let Some(row) = table.row(row_id)
+        {
+            return Some(dispatch(row));
+        }
+    }
+    None
 }
 
 /// One utterance while the dictation mode is on (PRD #1260), decided with no
@@ -12842,5 +12982,160 @@ mod tests {
             matches!(on_a_deck, VoiceOutcome::Unavailable { .. }),
             "a named deck must not start the form: {on_a_deck:?}"
         );
+    }
+
+    /// PRD #1497 — one utterance through the reading intercept: the panel's
+    /// typing mode, reading mode and speech declared as given, on `screen`,
+    /// with a resolver that panics if anything reaches the Commands backend.
+    async fn reading_answer(
+        said: &str,
+        screen: Screen,
+        typing: bool,
+        reading: VoiceReadingState,
+    ) -> VoiceOutcome {
+        let target = typing_target();
+        handle_utterance_with_modes(
+            &NoCommandsResolver,
+            table(),
+            screen,
+            &fleet(),
+            &[],
+            None,
+            None,
+            typing.then_some(&target),
+            reading,
+            Transcript::new(said),
+            LabelSharing::Shared,
+            true,
+        )
+        .await
+        .outcome
+    }
+
+    fn dispatched(outcome: &VoiceOutcome) -> Option<&str> {
+        match outcome {
+            VoiceOutcome::Dispatch { action, .. } => Some(action),
+            _ => None,
+        }
+    }
+
+    const NOT_READING: VoiceReadingState = VoiceReadingState {
+        reading: false,
+        speaking: false,
+    };
+    const READING: VoiceReadingState = VoiceReadingState {
+        reading: true,
+        speaking: false,
+    };
+    const SPEAKING: VoiceReadingState = VoiceReadingState {
+        reading: true,
+        speaking: true,
+    };
+
+    /// Scenario: in an agent's pane, "reading on" and "reading off" and their
+    /// other phrasings switch reading mode locally, with or without typing mode
+    /// on — never typed into the prompt and never sent to the Commands backend.
+    #[tokio::test]
+    async fn voice_outcome_reading_on_and_off_are_answered_locally_in_every_mode() {
+        for typing in [false, true] {
+            for (said, action) in [
+                ("reading on", "reading_on"),
+                ("Start reading.", "reading_on"),
+                ("okay, read to me please", "reading_on"),
+                ("reading mode on", "reading_on"),
+                ("Reading off.", "reading_off"),
+                ("stop reading", "reading_off"),
+                ("done reading", "reading_off"),
+                ("reading mode off", "reading_off"),
+            ] {
+                let outcome = reading_answer(said, Screen::Agent, typing, NOT_READING).await;
+                assert_eq!(
+                    dispatched(&outcome),
+                    Some(action),
+                    "{said:?} (typing {typing}): {outcome:?}"
+                );
+            }
+        }
+        // Said in passing, it is dictation in typing mode, not a switch.
+        let typed =
+            reading_answer("start reading the logs", Screen::Agent, true, NOT_READING).await;
+        assert_eq!(dispatched(&typed), Some("dictate_to_agent"));
+    }
+
+    /// Scenario: "reading on" on the overview, with no agent's pane open, is
+    /// refused with the row's hint naming the pane it needs.
+    #[tokio::test]
+    async fn voice_outcome_reading_on_needs_an_agents_pane() {
+        let outcome = reading_answer("reading on", Screen::Overview, false, NOT_READING).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Unavailable { action, hint, .. }
+                if action == "reading_on" && hint.contains("agent's pane")),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario: "quiet" silences the app's speech on any screen, and the
+    /// bare "stop" forms do too while reading is on outside typing mode; in
+    /// typing mode with nothing being spoken, "stop" keeps interrupting the
+    /// agent, and with reading off it is not answered here.
+    #[tokio::test]
+    async fn voice_outcome_quiet_and_stop_silence_speech_without_ending_reading() {
+        for screen in [Screen::Agent, Screen::Overview, Screen::Deck] {
+            for said in ["quiet", "Be quiet.", "hush", "silence please", "shush"] {
+                let outcome = reading_answer(said, screen, false, NOT_READING).await;
+                assert_eq!(dispatched(&outcome), Some("quiet"), "{said:?}: {outcome:?}");
+            }
+        }
+        for said in ["stop", "Stop it.", "stop that"] {
+            let reading = reading_answer(said, Screen::Agent, false, READING).await;
+            assert_eq!(dispatched(&reading), Some("quiet"), "{said:?}: {reading:?}");
+            let typing = reading_answer(said, Screen::Agent, true, READING).await;
+            assert_eq!(
+                dispatched(&typing),
+                Some("interrupt_agent"),
+                "{said:?} in typing mode: {typing:?}"
+            );
+        }
+    }
+
+    /// Scenario (D8): while the app is speaking, "stop" and "quiet" silence it
+    /// in every mode, typing included, and every other utterance — a command,
+    /// "reading off", "voice off", words to type — is dropped with no backend
+    /// call and nothing dispatched.
+    #[tokio::test]
+    async fn voice_outcome_only_stop_and_quiet_are_honoured_while_the_app_speaks() {
+        for typing in [false, true] {
+            for said in ["stop", "quiet", "stop it"] {
+                let outcome = reading_answer(said, Screen::Agent, typing, SPEAKING).await;
+                assert_eq!(dispatched(&outcome), Some("quiet"), "{said:?}: {outcome:?}");
+            }
+            for said in [
+                "The tester finished: all tests pass.",
+                "reading off",
+                "voice off",
+                "open the reviewer",
+                "send it",
+                "type hello",
+            ] {
+                let outcome = reading_answer(said, Screen::Agent, typing, SPEAKING).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dropped { sentence, .. }
+                        if sentence.contains(DROPPED_WHILE_SPEAKING)),
+                    "{said:?} (typing {typing}): {outcome:?}"
+                );
+            }
+        }
+        // Speaking after reading ended ("Reading off" is still being said).
+        let after = reading_answer(
+            "open the reviewer",
+            Screen::Overview,
+            false,
+            VoiceReadingState {
+                reading: false,
+                speaking: true,
+            },
+        )
+        .await;
+        assert!(matches!(after, VoiceOutcome::Dropped { .. }), "{after:?}");
     }
 }

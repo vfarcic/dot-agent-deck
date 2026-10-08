@@ -460,11 +460,11 @@ describe("TauriDeckBridge", () => {
     const deckStep = [{ deckId: "deck-local" }, { deckId: "deck-build", reason: "No daemon is listening on the configured socket." }];
     bridge.declareVoiceScreen("overview", undefined, undefined, deckStep);
     await bridge.resolveVoice("new agent on the build box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent on the build box", screen: "overview", directories: null, newAgent: null, deckStep, endpoints: null, dictation: null, reading: null });
 
     bridge.declareVoiceScreen("overview");
     await bridge.resolveVoice("new agent");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "new agent", screen: "overview", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
   });
 
   /**
@@ -481,7 +481,7 @@ describe("TauriDeckBridge", () => {
     const endpoints = { remote: [{ id: "newbox01", host: "new-box", port: 22 }], selection: "local" };
     bridge.declareVoiceScreen("deck", undefined, undefined, undefined, endpoints);
     await bridge.resolveVoice("switch deck to the new box");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "switch deck to the new box", screen: "deck", directories: null, newAgent: null, deckStep: null, endpoints, dictation: null, reading: null });
   });
 
   /**
@@ -499,11 +499,31 @@ describe("TauriDeckBridge", () => {
     const dictation = { deckId: "deck-local", agentId: "coder" };
     bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, dictation);
     await bridge.resolveVoice("run the tests");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "run the tests", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation, reading: null });
 
     bridge.declareVoiceScreen("agent");
     await bridge.resolveVoice("type on");
-    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null });
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "type on", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
+  });
+
+  /**
+   * Scenario (PRD #1497): reading mode and whether the app was speaking,
+   * declared with an utterance, travel to `desktop_voice_resolve` as
+   * `reading`; a declaration without them sends `null` again.
+   */
+  it("sends the declared reading state with the utterance it was declared for", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    invoke.mockResolvedValue({ outcome: { kind: "no_match", sentence: "", transcript: "" } });
+
+    const reading = { reading: true, speaking: true };
+    bridge.declareVoiceScreen("agent", undefined, undefined, undefined, undefined, undefined, reading);
+    await bridge.resolveVoice("stop");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading });
+
+    bridge.declareVoiceScreen("agent");
+    await bridge.resolveVoice("stop");
+    expect(invoke).toHaveBeenLastCalledWith("desktop_voice_resolve", { utterance: "stop", screen: "agent", directories: null, newAgent: null, deckStep: null, endpoints: null, dictation: null, reading: null });
   });
 
   /**
@@ -3383,7 +3403,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // it are gone rather than carried. The sentinel assertion above is what
       // proves the value went; this pins the key set it was rebuilt to.
       if (normalized.voice) {
-        expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "labels", "speech", "transcription"]);
+        expect(Object.keys(normalized.voice).sort()).toEqual(["activation", "intent", "labels", "reading", "speech", "transcription"]);
         // Each stage is rebuilt to its own declared keys, so a key smuggled
         // one level down is gone with the rest. `endpoint` and `model` ARE
         // declared and are carried verbatim — deliberately, because coercing

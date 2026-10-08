@@ -238,7 +238,7 @@ pub fn lead(agent: &str, kind: TurnKind) -> String {
 
 /// "The tester", from a display name: one line, bounded, never empty, and
 /// without a doubled article for a name that already starts with one.
-fn spoken_name(agent: &str) -> String {
+pub fn spoken_name(agent: &str) -> String {
     let name = agent_name(agent);
     if name
         .get(..4)

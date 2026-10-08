@@ -2838,6 +2838,8 @@ pub(crate) struct VoiceState {
     /// (a spawned task outliving the command that started it) and every
     /// `spawn_blocking` below need.
     hold: voice::VoiceHold,
+    /// PRD #1497 — reading mode's one session and its turn-event source.
+    reading: ReadingSessions,
 }
 
 impl Default for VoiceState {
@@ -2849,6 +2851,7 @@ impl Default for VoiceState {
             // sentence for it already is. The sleep inhibit is the same: the
             // platform is not asked for anything until voice is switched on.
             hold: voice::VoiceHold::new(Arc::new(voice::CpalSource::new())),
+            reading: ReadingSessions::default(),
         }
     }
 }
@@ -3293,6 +3296,12 @@ fn selector_rows_beyond_voice(
 /// and trusted no further: the typing itself goes through the webview's own
 /// `sendTerminalInput` to the pane on screen, never to whatever this names.
 ///
+/// **`reading` is the seventh** (PRD #1497): whether reading mode is on and
+/// whether the app's speech overlapped this utterance, two booleans with
+/// nothing to bound. While the app was speaking only a way of silencing it is
+/// answered, and everything else is dropped with no Commands backend call
+/// ([`voice::handle_utterance_with_modes`]).
+///
 /// # One `ListAgents` per utterance
 ///
 /// [`get_snapshot`] fetches rather than reading a cache, which is one daemon
@@ -3321,6 +3330,7 @@ async fn desktop_voice_resolve(
     deck_step: Option<Vec<voice::VoiceDeckChoice>>,
     endpoints: Option<crate::settings::EndpointSettings>,
     dictation: Option<voice::VoiceDictationTarget>,
+    reading: Option<voice::VoiceReadingState>,
 ) -> Result<voice::VoiceResult, String> {
     ensure_main_webview(&webview)?;
     if utterance.len() > MAX_UTTERANCE_BYTES {
@@ -3360,6 +3370,7 @@ async fn desktop_voice_resolve(
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
             dictation: dictation.as_ref(),
+            reading: reading.unwrap_or_default(),
         },
         voice::Transcript::new(utterance),
         settings.labels,
@@ -3378,6 +3389,8 @@ struct VoiceDeclaration<'a> {
     deck_step: Option<&'a [voice::VoiceDeckChoice]>,
     endpoints: Option<&'a crate::settings::EndpointSettings>,
     dictation: Option<&'a voice::VoiceDictationTarget>,
+    /// PRD #1497 — reading mode and the app's own speech, two booleans.
+    reading: voice::VoiceReadingState,
 }
 
 /// [`desktop_voice_resolve`] once the live state is read: the decks voice
@@ -3402,7 +3415,7 @@ async fn resolve_declared_utterance(
     // lags it by a queued write — rather than only the ones the app observes,
     // which under a single-deck selection is the one deck already shown.
     let selections = selector_voice_decks(declared.endpoints, &mut decks, declared.deck_step);
-    let mut result = voice::handle_utterance_with_dictation(
+    let mut result = voice::handle_utterance_with_modes(
         resolver,
         voice::table(),
         screen,
@@ -3411,6 +3424,7 @@ async fn resolve_declared_utterance(
         declared.directories,
         declared.new_agent,
         declared.dictation,
+        declared.reading,
         transcript,
         labels,
         show_deck,
@@ -3507,6 +3521,7 @@ async fn desktop_voice_choice(
             deck_step: deck_step.as_deref(),
             endpoints: endpoints.as_ref(),
             dictation: None,
+            reading: voice::VoiceReadingState::default(),
         },
     ))
 }
@@ -3839,26 +3854,6 @@ fn voice_decks(
         .collect()
 }
 
-/// PRD #802 — what can be said on this screen, for the discovery overlay.
-///
-/// # It is the TABLE, annotated, and deliberately the same shape the model gets
-///
-/// The overlay's requirement is that it be *generated from the table, never a
-/// maintained list*, so this returns exactly what [`voice::annotate`] hands the
-/// intent backend: each row's `id`, its `description` and whether the current
-/// screen can run it. Handing the webview a second, prettier projection would
-/// be the maintained list under a better name — and the first time a row's
-/// wording changed, the overlay and the model would be telling the user and the
-/// model two different things.
-///
-/// **So the `description` a user reads here is a PROMPT**, written for a model
-/// and reviewed as an interface (`commands.toml` says so at the column). That
-/// is a real cost and it is the deliberate side of the trade: a separate
-/// user-facing column would read better and would be a second wording to keep
-/// in step, which is the whole defect class this table exists to close.
-///
-/// # No daemon round trip, no model, no state
-///
 /// How reading mode's next sentence is to be spoken (PRD #1497 D9):
 /// the provider's text-to-speech, the operating system's voice, or nothing
 /// and why. Read per call, for `desktop_voice_resolve`'s reason: a changed
@@ -3900,6 +3895,206 @@ async fn desktop_voice_speech_audio(webview: Webview, text: String) -> Result<Re
     Ok(Response::new(audio))
 }
 
+/// PRD #1497 M5 — start reading mode for one agent: its turns, permission
+/// prompts and errors become sentences sent down `on_sentence` until
+/// [`desktop_voice_reading_stop`], a later start, or the webview dropping the
+/// channel.
+///
+/// # What it refuses, in spoken words
+///
+/// The Settings opt-in first (D4): reading sends agent replies to the Commands
+/// connection, so with `[voice] reading` off it answers
+/// [`ReadingStart::NotEnabled`] and nothing is subscribed. Then the agent's
+/// type ([`voice::reading::agent_gap`]) and the turn-event source
+/// ([`voice::reading::TurnEventSource`], M2's seam), either of which answers
+/// [`ReadingStart::Unavailable`] with why.
+///
+/// # The reply stays here
+///
+/// Summaries are made Rust-side ([`voice::reading::read_turns`]) through the
+/// Commands connection, read per turn, so the agent's final reply never
+/// crosses into the webview — only the finished sentence does.
+#[tauri::command]
+async fn desktop_voice_reading_start(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    voice_state: State<'_, VoiceState>,
+    deck_id: String,
+    agent_id: String,
+    agent_label: String,
+    on_sentence: Channel<voice::reading::ReadingSentence>,
+) -> Result<ReadingStart, String> {
+    ensure_main_webview(&webview)?;
+    let bad = |value: &str| value.is_empty() || value.len() > MAX_VOICE_DECK_ID_BYTES;
+    if bad(&deck_id) || bad(&agent_id) || agent_label.len() > MAX_VOICE_DECK_ID_BYTES {
+        return Err("the agent sent with that command is not one a pane shows".to_string());
+    }
+    let settings = crate::settings::load_settings_without_decks()
+        .voice
+        .unwrap_or_default();
+    if settings.reading != crate::settings::ReadingConsent::On {
+        return Ok(ReadingStart::NotEnabled {
+            sentence: voice::reading::READING_NOT_ENABLED.to_string(),
+        });
+    }
+    let snapshot = get_snapshot(&state.daemon).await;
+    let agent_type = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .map(|agent| agent.agent_type.clone());
+    if let Some(gap) = agent_type.as_deref().and_then(voice::reading::agent_gap) {
+        return Ok(ReadingStart::Unavailable {
+            sentence: voice::reading::unavailable_sentence(&gap),
+        });
+    }
+    let target = voice::reading::ReadingTarget {
+        deck_id,
+        agent_id,
+        agent_type,
+    };
+    let events = match voice_state.reading.source.subscribe(&target).await {
+        Ok(events) => events,
+        Err(reason) => {
+            return Ok(ReadingStart::Unavailable {
+                sentence: voice::reading::unavailable_sentence(&reason),
+            });
+        }
+    };
+    let agent = voice::summary::agent_name(&agent_label);
+    let session = voice_state
+        .reading
+        .start(tauri::async_runtime::spawn(async move {
+            voice::reading::read_turns(&agent, events, &SettingsSummariser, |sentence| {
+                on_sentence.send(sentence).is_ok()
+            })
+            .await;
+        }));
+    Ok(ReadingStart::Started { session })
+}
+
+/// PRD #1497 M5 — end the reading session `session` started, if it is still
+/// the current one. Idempotent: a session already replaced or ended is left
+/// alone, so a late stop cannot end a newer session.
+#[tauri::command]
+async fn desktop_voice_reading_stop(
+    webview: Webview,
+    voice_state: State<'_, VoiceState>,
+    session: u64,
+) -> Result<(), String> {
+    ensure_main_webview(&webview)?;
+    voice_state.reading.stop(session);
+    Ok(())
+}
+
+/// What [`desktop_voice_reading_start`] answers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum ReadingStart {
+    /// Reading started; `session` is what stops it.
+    Started { session: u64 },
+    /// The Settings opt-in is off (D4).
+    NotEnabled { sentence: String },
+    /// Reading cannot run for this agent on this daemon.
+    Unavailable { sentence: String },
+}
+
+/// The one reading session a window has (PRD #1497 D11: reading is bound to
+/// one agent), and where its turn events come from.
+pub(crate) struct ReadingSessions {
+    /// The turn-event source — [`voice::reading::NoTurnEvents`] until PRD
+    /// #1497 M2 puts a daemon subscription here.
+    source: Arc<dyn voice::reading::TurnEventSource>,
+    current: std::sync::Mutex<Option<(u64, tauri::async_runtime::JoinHandle<()>)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Default for ReadingSessions {
+    fn default() -> Self {
+        Self {
+            source: Arc::new(voice::reading::NoTurnEvents),
+            current: std::sync::Mutex::new(None),
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
+impl ReadingSessions {
+    /// Make `task` the current session, ending any other, and name it.
+    fn start(&self, task: tauri::async_runtime::JoinHandle<()>) -> u64 {
+        let session = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, previous)) = current.replace((session, task)) {
+            previous.abort();
+        }
+        session
+    }
+
+    /// End `session` if it is the current one.
+    fn stop(&self, session: u64) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref().is_some_and(|(id, _)| *id == session)
+            && let Some((_, task)) = current.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+/// The real [`voice::reading::TurnSummariser`]: the Commands connection as the
+/// settings name it when the turn ends, with its key from the keychain.
+struct SettingsSummariser;
+
+impl voice::reading::TurnSummariser for SettingsSummariser {
+    fn summarise<'a>(
+        &'a self,
+        request: voice::summary::TurnSummaryRequest<'a>,
+    ) -> voice::reading::SummaryFuture<'a> {
+        Box::pin(async move {
+            // Read per turn, for `desktop_voice_resolve`'s reason.
+            let settings = crate::settings::load_settings_without_decks()
+                .voice
+                .unwrap_or_default();
+            voice::summary::summarise_turn(
+                &settings.intent,
+                Arc::new(KeychainSecretStore::new()),
+                request,
+            )
+            .await
+        })
+    }
+}
+
+/// PRD #802 — what can be said on this screen, for the discovery overlay.
+///
+/// # It is the TABLE, annotated, and deliberately the same shape the model gets
+///
+/// The overlay's requirement is that it be *generated from the table, never a
+/// maintained list*, so this returns exactly what [`voice::annotate`] hands the
+/// intent backend: each row's `id`, its `description` and whether the current
+/// screen can run it. Handing the webview a second, prettier projection would
+/// be the maintained list under a better name — and the first time a row's
+/// wording changed, the overlay and the model would be telling the user and the
+/// model two different things.
+///
+/// **So the `description` a user reads here is a PROMPT**, written for a model
+/// and reviewed as an interface (`commands.toml` says so at the column). That
+/// is a real cost and it is the deliberate side of the trade: a separate
+/// user-facing column would read better and would be a second wording to keep
+/// in step, which is the whole defect class this table exists to close.
+///
+/// # No daemon round trip, no model, no state
+///
 /// Unlike [`desktop_voice_resolve`] this reaches nothing: the table is
 /// `include_str!`d into the binary and the screen arrives as a parameter, so
 /// the answer is a pure function of the two. It costs no `ListAgents`, spends
@@ -5526,6 +5721,8 @@ pub fn run() {
             desktop_voice_status,
             desktop_voice_cancel,
             desktop_voice_resolve,
+            desktop_voice_reading_start,
+            desktop_voice_reading_stop,
             desktop_voice_choice,
             desktop_voice_number,
             desktop_voice_commands,
@@ -5842,6 +6039,7 @@ mod tests {
                 deck_step: None,
                 endpoints: Some(endpoints),
                 dictation: None,
+                reading: voice::VoiceReadingState::default(),
             },
             voice::Transcript::new(said),
             crate::settings::LabelSharing::Shared,
@@ -6040,6 +6238,7 @@ mod tests {
             deck_step: None,
             endpoints: Some(endpoints),
             dictation: None,
+            reading: voice::VoiceReadingState::default(),
         };
         assert_eq!(
             answer_declared_choice("two", "switch_deck", candidates, &[], &[], declared(&both)),
@@ -6582,6 +6781,7 @@ mod tests {
                     Arc::new(voice::CaptureSession::new(Arc::new(source))),
                     Arc::new(voice::WakeLock::new(Arc::new(inhibitor))),
                 ),
+                reading: ReadingSessions::default(),
             },
             stopped,
             counts,
@@ -6738,6 +6938,7 @@ mod tests {
                     voice::StubInhibitor::refusing(),
                 ))),
             ),
+            reading: ReadingSessions::default(),
         };
 
         let (opened, _ticket) = voice_state

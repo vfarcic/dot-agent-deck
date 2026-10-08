@@ -228,6 +228,18 @@ export type VoiceActionContext = {
   clearAgentPrompt: (target: VoiceDispatchTarget) => void;
   scratchLastDictation: (target: VoiceDispatchTarget) => void;
   /**
+   * PRD #1497 — enter reading mode for the pane on screen: from then on the
+   * app speaks a short summary of each turn that agent finishes, and its
+   * permission prompts and errors. The voice surface's, because the mode and
+   * the speech queue are its own state, and the mode ends with the pane (D11).
+   */
+  startReading: (target: VoiceDispatchTarget) => void;
+  /** Leave reading mode. The voice surface's, for {@link startReading}'s reason. */
+  stopReading: () => void;
+  /** PRD #1497 D6 — silence the app's speech now and drop what is waiting.
+   * Reading mode stays on. The voice surface's: the speech queue is its own. */
+  quietSpeech: () => void;
+  /**
    * Close the voice surface's own overlay.
    *
    * **Published only while that overlay is OPEN**, and that is the whole
@@ -544,6 +556,29 @@ export const VOICE_ACTIONS = {
     voice: true,
     needs: ["scratchLastDictation"],
     run: (context: Pick<VoiceActionContext, "scratchLastDictation">, target: VoiceDispatchTarget) => context.scratchLastDictation(target),
+  },
+
+  startReading: {
+    label: "Read the open agent's turns aloud until told to stop",
+    voice: true,
+    needs: ["startReading"],
+    /** Targets the pane on screen — the row declares no agent param and is
+        `screens = ["agent"]` — and ends when that pane does (PRD #1497 D11). */
+    run: (context: Pick<VoiceActionContext, "startReading">, target: VoiceDispatchTarget) => context.startReading(target),
+  },
+
+  stopReading: {
+    label: "Stop reading the open agent's turns aloud",
+    voice: true,
+    needs: ["stopReading"],
+    run: (context: Pick<VoiceActionContext, "stopReading">) => context.stopReading(),
+  },
+
+  quietSpeech: {
+    label: "Silence what the app is saying aloud",
+    voice: true,
+    needs: ["quietSpeech"],
+    run: (context: Pick<VoiceActionContext, "quietSpeech">) => context.quietSpeech(),
   },
 
   closeTopmost: {
@@ -1240,7 +1275,7 @@ export type VoiceDispatchContext = Pick<VoiceActionContext, "navigate" | "closeA
  * set's complement, so a screen that tried to serve one of these members would
  * not type-check, and neither would a panel that left one out.
  */
-export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
+export type VoicePanelContext = Pick<VoiceActionContext, "stopVoice" | "showVoiceCommands" | "typeIntoAgent" | "submitAgentPrompt" | "startDictation" | "stopDictation" | "interruptAgent" | "clearAgentPrompt" | "scratchLastDictation" | "startReading" | "stopReading" | "quietSpeech" | "dismissVoiceOverlay" | "reportNothingToClose" | "reportRefused">;
 /**
  * `Partial`, because a panel can serve one of these and not another.
  *

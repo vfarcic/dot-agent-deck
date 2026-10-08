@@ -1457,6 +1457,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    visible where the user is looking. Pinned to the pane's top edge, over the
    scrim's padding rather than over the tile's own header. */
 .agent-pane-dictating { position: absolute; z-index: 1; top: 0; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px); margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); background: var(--amber-ink); font-size: 11px; font-weight: 650; line-height: 14px; }
+/* PRD #1497 — reading mode, marked like typing mode; under that mark when
+   both are on. */
+.agent-pane-reading { position: absolute; z-index: 1; top: 0; left: 50%; transform: translateX(-50%); max-width: calc(100% - 28px); margin: 0; padding: 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 0 0 7px 7px; color: var(--on-accent); background: var(--teal-deep); font-size: 11px; font-weight: 650; line-height: 14px; }
+.agent-pane-reading.is-below { top: 14px; border-radius: 7px; }
 /* Every rule below is keyed off `data-presentation`, the seam M1 put on the
    tile, and every one of them exists to outrank something. The compound
    `.agent-tile[data-presentation="overlay"]` is (0,2,0) rather than the (0,1,0)

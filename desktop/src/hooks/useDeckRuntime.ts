@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFixtureSnapshot } from "../data/fixture";
 import { createDeckBridge, selectRuntimeMode } from "../lib/bridge";
-import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { DesktopSettingsDto, EndpointSettingsDto, RemoteEndpointDto, VoiceDictationTargetDto, VoiceDirectoriesDto, VoiceReadingStateDto, VoiceNewAgentDto, VoiceResolvedParamDto, VoiceScreen, VoiceSecretId } from "../lib/bridge";
+import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
@@ -400,7 +401,7 @@ export function useDeckRuntime(): DeckRuntimeState {
   /* Every declaration carries the New agent dialog's deck step, computed from
      the same `fleet` the dialog reads, so what voice says it preselected and
      what the dialog preselects are judged against one list. */
-  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation), [bridge]);
+  const declareVoiceScreen = useCallback((screen: VoiceScreen, directories?: VoiceDirectoriesDto, newAgent?: VoiceNewAgentDto, endpoints?: EndpointSettingsDto, dictation?: VoiceDictationTargetDto, reading?: VoiceReadingStateDto) => bridge.declareVoiceScreen(screen, directories, newAgent, voiceDeckStep(fleetRef.current), endpoints, dictation, reading), [bridge]);
   const resolveVoice = useCallback((utterance: string) => bridge.resolveVoice(utterance), [bridge]);
   const answerVoiceChoice = useCallback((utterance: string, action: string, offered: VoiceResolvedParamDto[]) => bridge.answerVoiceChoice(utterance, action, offered), [bridge]);
   const answerVoiceNumber = useCallback((utterance: string, heard: VoiceNumberedListDto, generation: number) => bridge.answerVoiceNumber(utterance, heard, generation), [bridge]);
@@ -409,6 +410,11 @@ export function useDeckRuntime(): DeckRuntimeState {
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
   const voiceCancel = useCallback(() => bridge.voiceCancel(), [bridge]);
+  // PRD #1497 — reading mode's speech and its turn sentences.
+  const voiceSpeechPlan = useCallback(() => bridge.voiceSpeechPlan(), [bridge]);
+  const voiceSpeechAudio = useCallback((text: string) => bridge.voiceSpeechAudio(text), [bridge]);
+  const voiceReadingStart = useCallback((target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => bridge.voiceReadingStart(target, onSentence), [bridge]);
+  const voiceReadingStop = useCallback((session: number) => bridge.voiceReadingStop(session), [bridge]);
 
   const sendTerminalInput = useCallback((target: AgentTarget, data: string, precondition?: () => boolean) => bridge.sendTerminalInput(target, data, precondition), [bridge]);
   const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
@@ -506,6 +512,10 @@ export function useDeckRuntime(): DeckRuntimeState {
     voiceStop,
     voiceStatus,
     voiceCancel,
+    voiceSpeechPlan,
+    voiceSpeechAudio,
+    voiceReadingStart,
+    voiceReadingStop,
     setZoom,
   };
 }

@@ -83,11 +83,12 @@
 #                    For a row whose action cannot be taken back, where an
 #                    unrelated occurrence of one ordinary word ("tell it to put
 #                    END after the report") must not be enough. Same own-words
-#                    rule. Seven rows use it — `submit_prompt`,
+#                    rule. Ten rows use it — `submit_prompt`,
 #                    `discard_new_agent`, the dictation mode's pair, whose
-#                    switch changes how every later utterance is treated, and
+#                    switch changes how every later utterance is treated,
 #                    PRD #1541's three typing-mode prompt commands, which it
-#                    keeps out of the model's reach (see above those rows)
+#                    keeps out of the model's reach (see above those rows),
+#                    and PRD #1497's reading pair and `quiet`
 #                    (`voice_table_whole_utterance_rows_are_the_deliberate_set`);
 #                    on an ordinary row it would make natural speech fail.
 #   heard_as_whole_while
@@ -785,6 +786,64 @@ heard_as_whole = [
   "scratch that", "scratch it", "scratch the last part", "scratch the last sentence",
   "scratch the last prompt", "delete that", "undo that",
 ]
+
+# PRD #1497 — the reading MODE: the app speaks a short summary of each turn the
+# open agent finishes, and its permission prompts and errors as they happen.
+#
+# Shaped like typing mode's pair: `heard_as_whole`, so only an utterance that IS
+# one of these phrases switches anything, and answered locally ahead of the
+# model in every mode (`outcome::reading_intercept`), so "reading on" said while
+# typing starts reading instead of being typed. No target param: the mode
+# targets the pane on screen and ends when that pane does (D11) — the panel owns
+# the state (`VoiceControlPanel.tsx`, `lib/reading.ts`). The Settings opt-in
+# (D4) is checked by the app when the mode starts, not here: a row cannot see a
+# setting, and the refusal is spoken.
+[[commands]]
+id          = "reading_on"
+description = """Start reading mode for the open agent: from now on the app speaks a short summary
+of each turn that agent finishes, and its permission prompts and errors as they happen. Use only
+when the WHOLE utterance is "reading on", "start reading", "reading mode on" or "read to me". It
+reads nothing already on screen."""
+invoke      = "startReading"
+screens     = ["agent"]
+unavailable_hint = "reading needs an agent's pane open — open one first"
+report      = "Reading on."
+asks_to     = "start reading the agent's turns aloud"
+try_saying  = "reading on"
+heard_as_whole = ["reading on", "start reading", "reading mode on", "read to me"]
+
+[[commands]]
+id          = "reading_off"
+description = """Stop reading mode, so the app no longer speaks the open agent's turns. Use only
+when the WHOLE utterance is "reading off", "stop reading", "reading mode off" or "done reading"."""
+invoke      = "stopReading"
+screens     = ["agent"]
+unavailable_hint = "reading is only on in an agent's pane"
+report      = "Reading off."
+asks_to     = "stop reading the agent's turns aloud"
+try_saying  = "reading off"
+heard_as_whole = ["reading off", "stop reading", "reading mode off", "done reading"]
+
+# PRD #1497 D6/D8 — silence the app's own speech. Callable on every screen,
+# because speech can still be playing after the pane it was about has closed,
+# and D6 is that "stop" or "quiet" always works. While the app is speaking it is
+# the ONLY thing an utterance can do (D8): the microphone can hear the app, and
+# the worst that echo may then cause is the app silencing itself. The bare
+# "stop" forms (`voice::dictation::TYPING_STOP_PHRASES`) mean this only while
+# speech plays, or while reading is on outside typing mode, and are not in the
+# grounding below for `interrupt_agent`'s reason: elsewhere a bare "stop" keeps
+# the model's answer it has today.
+[[commands]]
+id          = "quiet"
+description = """Silence what the app is saying aloud: cut off the sentence being spoken and drop
+any waiting. Reading mode stays on. Use only when the WHOLE utterance is "quiet", "be quiet",
+"silence", "hush" or "shush" — or, while the app is speaking, "stop", "stop it" or "stop that"."""
+invoke      = "quietSpeech"
+unavailable_hint = "silencing the app's speech works anywhere"
+report      = "Quiet."
+asks_to     = "silence the app's speech"
+try_saying  = "quiet"
+heard_as_whole = ["quiet", "be quiet", "silence", "hush", "shush"]
 
 # PRD #1223 — open the New agent dialog, and the first row with a `deck_ref`.
 #

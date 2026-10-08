@@ -1,4 +1,4 @@
-import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
+import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
@@ -1291,6 +1291,35 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     typingOnly: true,
   },
   {
+    // PRD #1497 — reading mode's switches and the way of silencing the app,
+    // `voice::dictation::READING_ON_PHRASES`, `READING_OFF_PHRASES` and
+    // `QUIET_PHRASES`, answered ahead of everything by
+    // {@link fixtureReadingIntercept} as `outcome::reading_intercept` answers
+    // them.
+    phrases: ["reading on", "start reading", "reading mode on", "read to me"],
+    action: "reading_on",
+    invoke: "startReading",
+    screens: ["agent"],
+    unavailableHint: "reading needs an agent's pane open — open one first",
+    report: "Reading on.",
+  },
+  {
+    phrases: ["reading off", "stop reading", "reading mode off", "done reading"],
+    action: "reading_off",
+    invoke: "stopReading",
+    screens: ["agent"],
+    unavailableHint: "reading is only on in an agent's pane",
+    report: "Reading off.",
+  },
+  {
+    phrases: ["quiet", "be quiet", "silence", "hush", "shush"],
+    action: "quiet",
+    invoke: "quietSpeech",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "silencing the app's speech works anywhere",
+    report: "Quiet.",
+  },
+  {
     // PR #1451 round 3, change 5 — the New agent browser's Filter box.
     // Matched by OPENER, `commands.toml`'s `heard_as` for the row; the text
     // is then picked out of the utterance by {@link fixtureFilterText} and
@@ -1458,9 +1487,13 @@ const FIXTURE_VOICE_TIE = {
  * would be the preview inventing a measurement, which is the same fabrication
  * `resolve_ms: None` exists to refuse on the Rust side.
  */
-export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false, newAgentDialog = false): VoiceResultDto {
+export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dictating = false, directoryListing = false, newAgentForm = false, newAgentDialog = false, reading: VoiceReadingStateDto = { reading: false, speaking: false }): VoiceResultDto {
   const spoken = utterance.trim().toLowerCase();
   const stub = { resolveMs: null, backend: "stub" } as const;
+  /* PRD #1497 — reading's switches, silencing the app, and D8's filter while
+     it speaks, ahead of the dictation mode as `reading_intercept` is. */
+  const readingAnswer = fixtureReadingIntercept(utterance, screen, dictating, reading);
+  if (readingAnswer) return { ...stub, outcome: readingAnswer };
   /* PRD #1260 — while the dictation mode is on the real pipeline asks no model
      and matches only the reserved whole utterances, typing everything else
      whole. The same rule here, over this module's own rows, in
@@ -1765,6 +1798,33 @@ function fixtureTrailingSend(utterance: string): string | undefined {
 }
 
 /** The first of `actions`, in order, whose row's phrases the whole utterance is. */
+/** `outcome::DROPPED_WHILE_SPEAKING`. */
+export const FIXTURE_DROPPED_WHILE_SPEAKING = "only “stop” or “quiet” works while the app is speaking";
+
+/**
+ * PRD #1497 — the preview's copy of `outcome::reading_intercept`: "quiet"
+ * always, the bare "stop" forms while the app was speaking or while reading
+ * is on outside typing mode; while the app was speaking, everything else is
+ * dropped (D8); then the reading switches, in every mode.
+ */
+function fixtureReadingIntercept(utterance: string, screen: VoiceScreen, typing: boolean, reading: VoiceReadingStateDto): VoiceResultDto["outcome"] | undefined {
+  const dispatch = (action: string): VoiceResultDto["outcome"] | undefined => {
+    const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);
+    if (!row) return undefined;
+    if (!row.screens.includes(screen)) {
+      return { kind: "unavailable", transcript: utterance, action, hint: row.unavailableHint, sentence: `Not here — ${row.unavailableHint}.` };
+    }
+    return { kind: "dispatch", transcript: utterance, action, invoke: row.invoke, params: [], sentence: row.report };
+  };
+  const stopsQuiet = reading.speaking || (reading.reading && !typing);
+  if (fixtureReserved(utterance, ["quiet"]) || (stopsQuiet && fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES))) return dispatch("quiet");
+  if (reading.speaking) {
+    return { kind: "dropped", transcript: utterance, sentence: `Heard: “${utterance.trim()}” — ${FIXTURE_DROPPED_WHILE_SPEAKING}.` };
+  }
+  const reserved = fixtureReserved(utterance, ["reading_on", "reading_off"]);
+  return reserved ? dispatch(reserved.action) : undefined;
+}
+
 function fixtureReserved(utterance: string, actions: readonly string[]): (typeof FIXTURE_VOICE_COMMANDS)[number] | undefined {
   for (const action of actions) {
     const row = FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.action === action);

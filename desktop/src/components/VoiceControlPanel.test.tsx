@@ -2653,3 +2653,93 @@ describe("voice control panel", () => {
     expect(voiceButton()).toHaveAttribute("aria-pressed", "false");
   });
 });
+
+describe("voice reading mode (PRD #1497 M5)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    window.localStorage.clear();
+    window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+    vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+      matches: false, media: query, onchange: null,
+      addListener: vi.fn(), removeListener: vi.fn(), addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
+    })));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  /** A system voice that starts each utterance and never finishes it, so the app stays "speaking". */
+  function silentSynth() {
+    const spoken: string[] = [];
+    vi.stubGlobal("SpeechSynthesisUtterance", class { onend: (() => void) | null = null; onerror: (() => void) | null = null; constructor(public text: string) {} });
+    vi.stubGlobal("speechSynthesis", { speak: vi.fn((utterance: { text: string }) => { spoken.push(utterance.text); }), cancel: vi.fn() });
+    return spoken;
+  }
+
+  function dispatchOf(said: string): VoiceResultDto {
+    const [action, invoke, sentence] = said === "reading on" ? ["reading_on", "startReading", "Reading on."]
+      : said === "reading off" ? ["reading_off", "stopReading", "Reading off."]
+      : ["open_settings", "openSettings", "Opening Settings."];
+    return result({ kind: "dispatch", transcript: said, action, invoke, params: [], sentence }, null, "local");
+  }
+
+  async function startReading() {
+    const spoken = silentSynth();
+    const steps: Parameters<typeof sequencedVoice>[0] = [{ outcome: heard("reading on") }];
+    const voice = sequencedVoice(steps);
+    const resolveVoice = vi.fn(async (said: string) => dispatchOf(said));
+    const deck = runtime(resolveVoice, voice);
+    const stopped: number[] = [];
+    const reading = {
+      declareVoiceScreen: vi.fn(),
+      voiceSpeechPlan: vi.fn(async () => ({ kind: "system" as const })),
+      voiceSpeechAudio: vi.fn(async () => new ArrayBuffer(0)),
+      voiceReadingStart: vi.fn(async () => ({ kind: "started" as const, session: 41 })),
+      voiceReadingStop: vi.fn(async (session: number) => { stopped.push(session); }),
+    };
+    Object.assign(deck, reading);
+    render(<DeckShell runtime={deck} />);
+    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    await turnVoiceOn(voice);
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+    await flush();
+    const say = async (said: string) => {
+      const before = voice.voiceStop.mock.calls.length;
+      steps.push({ outcome: heard(said) });
+      await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
+      await flush();
+      expect(voice.voiceStop).toHaveBeenCalledTimes(before + 1);
+    };
+    return { deck, reading, spoken, stopped, say, resolveVoice };
+  }
+
+  /** Scenario: with the Planner's pane open and voice on, saying "reading on" subscribes to that agent's turns, marks the pane with the name the pane shows, and the app says "Reading on." */
+  it("starts reading for the open pane and marks it", async () => {
+    const { reading, spoken } = await startReading();
+    expect(reading.voiceReadingStart).toHaveBeenCalledWith(expect.objectContaining({ agentId: "planner", label: "Plan / architecture" }), expect.any(Function));
+    expect(screen.getByTestId("agent-pane-reading")).toHaveTextContent("Reading Plan / architecture aloud");
+    expect(spoken).toEqual(["Reading on."]);
+  });
+
+  /** Scenario (D8): an utterance recorded while the app was speaking is declared with `speaking`, so Rust drops it unless it is "stop" or "quiet". */
+  it("declares the utterance heard while the app spoke", async () => {
+    const { reading, say } = await startReading();
+    await say("open settings");
+    const last = reading.declareVoiceScreen.mock.calls.at(-1)!;
+    expect(last[5]).toEqual({ reading: true, speaking: true });
+  });
+
+  /** Scenario (D11): closing the Planner's pane ends reading — the subscription stops, the mark goes, and the app says "Reading off." */
+  it("ends reading when the pane closes", async () => {
+    const { stopped, spoken } = await startReading();
+    await act(async () => { fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })); });
+    await flush();
+    expect(stopped).toEqual([41]);
+    expect(screen.queryByTestId("agent-pane-reading")).toBeNull();
+    // "Reading on." is still being said, so "Reading off." waits behind it.
+    expect(spoken).toEqual(["Reading on."]);
+  });
+});

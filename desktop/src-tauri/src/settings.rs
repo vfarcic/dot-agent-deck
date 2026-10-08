@@ -392,6 +392,9 @@ pub struct VoiceSettings {
     /// Where reading mode's voice comes from (PRD #1497 D9). See
     /// [`SpeechSource`].
     pub speech: SpeechSource,
+    /// Whether reading mode may be turned on at all (PRD #1497 D4). See
+    /// [`ReadingConsent`].
+    pub reading: ReadingConsent,
 }
 
 /// The endpoint the keyless local speech container listens on.
@@ -1224,6 +1227,43 @@ impl VoiceToken for SpeechSource {
     }
 }
 
+/// Whether reading mode may be turned on (PRD #1497 D4).
+///
+/// Reading sends each finished turn's final reply to the Commands connection to
+/// be summarised — and the summary to the provider's speech service when that is
+/// the speech source — which is more than voice sends otherwise. So it is
+/// **Off** until the user turns it on in Settings → Voice, and "reading on"
+/// refuses while it is off. A token rather than a `bool` so the settings field
+/// stays a closed enum like its neighbours, which is the shape the settings
+/// scanner admits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadingConsent {
+    /// "reading on" refuses and points at Settings.
+    #[default]
+    Off,
+    /// "reading on" may start reading.
+    On,
+}
+
+impl VoiceToken for ReadingConsent {
+    const TOKENS: &'static [&'static str] = &["off", "on"];
+    const LABEL: &'static str = "a reading setting";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "on" => Self::On,
+            _ => Self::default(),
+        }
+    }
+}
+
 macro_rules! voice_token_serde {
     ($($ty:ty),+ $(,)?) => {$(
         impl $ty {
@@ -1247,7 +1287,7 @@ macro_rules! voice_token_serde {
     )+};
 }
 
-// Five identical serde impls, written once. The macro generates NO struct and
+// Six identical serde impls, written once. The macro generates NO struct and
 // NO field — see [`VoiceToken`] for why that boundary matters to the
 // linkage-check scanner that reads this file as text.
 voice_token_serde!(
@@ -1255,7 +1295,8 @@ voice_token_serde!(
     IntentBackend,
     TranscriptionBackend,
     LabelSharing,
-    SpeechSource
+    SpeechSource,
+    ReadingConsent
 );
 
 /// The whole settings document.
@@ -4950,6 +4991,8 @@ mod tests {
                 // Absent too, so Auto: the connection's speech when it has
                 // one, else the system voice (PRD #1497 D9).
                 "speech": "auto",
+                // Absent too, so Off: reading is opt-in (PRD #1497 D4).
+                "reading": "off",
             })
         );
 
@@ -5758,6 +5801,13 @@ mod tests {
         );
         assert_eq!(SpeechSource::default(), SpeechSource::Auto);
         round_trips::<SpeechSource>();
+        assert_eq!(
+            <ReadingConsent as VoiceToken>::TOKENS,
+            ["off", "on"],
+            "keep this identical to VOICE_READING_CONSENT in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(ReadingConsent::default(), ReadingConsent::Off);
+        round_trips::<ReadingConsent>();
     }
 
     /// The preset endpoints and models are duplicated in
@@ -8203,6 +8253,7 @@ forms it is.";
                 },
                 labels: LabelSharing::Withheld,
                 speech: SpeechSource::Provider,
+                reading: ReadingConsent::On,
             }),
             ..DesktopSettings::default()
         }
@@ -9094,6 +9145,7 @@ user = \"dev\"
 activation = \"toggle\"
 labels = \"withheld\"
 speech = \"provider\"
+reading = \"on\"
 
 [voice.intent]
 backend = \"anthropic\"

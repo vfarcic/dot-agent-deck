@@ -952,6 +952,68 @@ screen = "agent"
 action = "voice_off"
 outcome = "dispatch"
 
+# PRD #1497 — the reading MODE's switches and the way of silencing the app's
+# speech. Like the dictation switches above, every one of these is
+# `heard_as_whole` and answered by the local fast path (`reading_intercept`)
+# before any model call, so these pin the whole pipeline's answer for the
+# phrasings users say, and the `screens` column through the unavailable pair.
+# `quiet` has no `screens`: speech can still be playing after its pane closed.
+[[fixtures]]
+name = "reading-on"
+utterance = "reading on"
+screen = "agent"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-read-to-me-politely"
+utterance = "Okay, read to me."
+screen = "agent"
+action = "reading_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-unavailable"
+utterance = "start reading"
+screen = "overview"
+action = "reading_on"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "reading-off"
+utterance = "Reading off."
+screen = "agent"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-stop-reading"
+utterance = "stop reading"
+screen = "agent"
+action = "reading_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-unavailable"
+utterance = "reading off"
+screen = "deck"
+action = "reading_off"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "quiet-on-the-agent-screen"
+utterance = "quiet"
+screen = "agent"
+action = "quiet"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "quiet-be-quiet-on-the-overview"
+utterance = "Be quiet, please."
+screen = "overview"
+action = "quiet"
+outcome = "dispatch"
+
 # PRD #1541 — the typing-mode prompt commands: interrupt the open agent's
 # turn, clear its prompt, scratch the last thing voice typed.
 #

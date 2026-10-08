@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, VoicePanel } from "./VoicePanel";
+import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, READING_DISCLOSURE, VoicePanel } from "./VoicePanel";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
@@ -71,6 +71,7 @@ const BOTH_KEYED = {
     transcription: VOICE_STAGE_PRESETS.transcription.remote,
     labels: "shared",
     speech: "auto",
+    reading: "off",
   },
 };
 
@@ -195,6 +196,7 @@ describe("VoicePanel", () => {
           transcription: VOICE_STAGE_PRESETS.transcription.remote,
           labels: "shared",
           speech: "auto",
+          reading: "off",
         },
       }),
     );
@@ -663,5 +665,29 @@ describe("VoicePanel", () => {
   it("renders a save error as the complete sentence it is", () => {
     renderPanel({}, { saveError: "Settings could not be saved." });
     expect(screen.getByRole("alert")).toHaveTextContent("Settings could not be saved.");
+  });
+});
+
+describe("VoicePanel reading mode settings (PRD #1497 D4, D9)", () => {
+  /** Scenario: Read turns aloud is Off by default with its privacy explanation beside it, and choosing On saves `reading = "on"` and nothing else. */
+  it("offers the reading opt-in, off by default, with what it sends", () => {
+    const { onSave } = renderPanel();
+    const group = screen.getByRole("radiogroup", { name: "Read turns aloud" });
+    expect(within(group).getByRole("radio", { name: "Off" })).toBeChecked();
+    expect(screen.getByTestId("voice-reading-disclosure")).toHaveTextContent(READING_DISCLOSURE);
+    expect(READING_DISCLOSURE).toMatch(/final reply .* sent to the Commands connection/);
+    expect(READING_DISCLOSURE).toMatch(/speech service/);
+    fireEvent.click(within(group).getByRole("radio", { name: "On" }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on" } }));
+  });
+
+  /** Scenario: the Speech source picker offers Auto, Provider and System with Auto chosen, and choosing System saves `speech = "system"`. */
+  it("offers the speech source picker", () => {
+    const { onSave } = renderPanel();
+    const group = screen.getByRole("radiogroup", { name: "Speech source" });
+    expect(within(group).getAllByRole("radio").map((radio) => (radio as HTMLInputElement).value)).toEqual(["auto", "provider", "system"]);
+    expect(within(group).getByRole("radio", { name: "Auto" })).toBeChecked();
+    fireEvent.click(within(group).getByRole("radio", { name: "System" }));
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, speech: "system" } }));
   });
 });

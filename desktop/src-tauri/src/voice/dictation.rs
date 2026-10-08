@@ -222,6 +222,40 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 /// and *"stop listening"* are different whole phrases and keep their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
 
+/// What starts reading mode for the open agent (PRD #1497), said as the whole
+/// utterance.
+///
+/// Whole-utterance equality for [`DICTATION_ON_PHRASES`]' reason: entering a
+/// mode must never ground on words said in passing — *"start reading the
+/// logs"* is not this. Answered locally in every mode, ahead of the dictation
+/// mode's own classification, so *"reading on"* said while typing starts
+/// reading rather than being typed.
+pub const READING_ON_PHRASES: [&str; 4] = [
+    "reading on",
+    "start reading",
+    "reading mode on",
+    "read to me",
+];
+
+/// What ends reading mode, said as the whole utterance (PRD #1497). Answered
+/// locally in every mode, like [`READING_ON_PHRASES`].
+pub const READING_OFF_PHRASES: [&str; 4] = [
+    "reading off",
+    "stop reading",
+    "reading mode off",
+    "done reading",
+];
+
+/// What silences the app's own speech (PRD #1497 D6, D8), said as the whole
+/// utterance. It cuts off what is being said and drops what is waiting, and
+/// leaves reading on.
+///
+/// Answered locally on every screen and in every mode — the one list D8 lets
+/// through while the app is speaking, together with the bare *"stop"* forms
+/// ([`TYPING_STOP_PHRASES`]), which mean this only while speech is playing or
+/// reading is on outside typing mode (see `outcome::reading_intercept`).
+pub const QUIET_PHRASES: [&str; 5] = ["quiet", "be quiet", "silence", "hush", "shush"];
+
 /// What empties the open agent's prompt while the dictation mode is on (PRD
 /// #1541), said as the whole utterance. Outside the mode on the agent screen
 /// these are answered with "say typing on first". *"clear the cache please and

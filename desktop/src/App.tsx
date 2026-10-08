@@ -196,6 +196,12 @@ export default function App() {
  * agent id alone: at most one pane is open, and it is that view's.
  */
 const PaneDictation = createContext<{ agentId: string; label: string } | undefined>(undefined);
+/**
+ * PRD #1497 — the agent the voice panel's reading mode is reading, for the
+ * pane to mark. Provided only while reading is on AND aimed at the pane on
+ * screen, for {@link PaneDictation}'s reason.
+ */
+const PaneReading = createContext<{ agentId: string; label: string } | undefined>(undefined);
 
 /**
  * PRD #1541 — told about every write the user makes into an agent's terminal
@@ -660,6 +666,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     () => (dictating && agentView && dictating.deckId === agentView.deckId && dictating.agentId === agentView.agentId ? { agentId: dictating.agentId, label: dictating.label } : undefined),
     [agentView, dictating],
   );
+  /** PRD #1497 — which agent the voice panel's reading mode is reading, for the pane's mark. */
+  // voice-registry-exempt: a mirror of the voice panel's own mode, written only by its report so the pane can mark it; the mode itself is entered through `VOICE_ACTIONS.startReading`
+  const [reading, setReading] = useState<{ deckId: string; agentId: string; label: string }>();
+  const paneReading = useMemo(
+    () => (reading && agentView && reading.deckId === agentView.deckId && reading.agentId === agentView.agentId ? { agentId: reading.agentId, label: reading.label } : undefined),
+    [agentView, reading],
+  );
   /** PR #1451, round 3 — whether voice is on, shared with the lists that render differently while it is. */
   // voice-registry-exempt: a mirror of the voice panel's own toggle, written only by its report so lists can render for it; voice itself is turned on by the panel's button
   const [voiceOn, setVoiceOn] = useState(false);
@@ -1014,13 +1027,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       <DialogNumbered.Provider value={dialogNumbered}>
       <VoiceChoiceOpen.Provider value={choiceOpen}>
       <PaneDictation.Provider value={paneDictation}>
+      <PaneReading.Provider value={paneReading}>
       <KeyboardInput.Provider value={noteKeyboard}>
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} onDictationChange={setDictating} onReadingChange={setReading} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
       </KeyboardInput.Provider>
+      </PaneReading.Provider>
       </PaneDictation.Provider>
       </VoiceChoiceOpen.Provider>
       </DialogNumbered.Provider>
@@ -1213,6 +1228,9 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
      voice row at the bottom of the window. */
   const dictation = useContext(PaneDictation);
   const dictatingHere = open && dictation !== undefined && dictation.agentId === tile.agent.id;
+  /* PRD #1497 — reading mode, marked the same way. */
+  const reading = useContext(PaneReading);
+  const readingHere = open && reading !== undefined && reading.agentId === tile.agent.id;
   return (
     <div
       ref={paneRef}
@@ -1232,6 +1250,13 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
         <p className="agent-pane-dictating" data-testid="agent-pane-dictating">
           {"Typing to "}
           {displayText(dictation.label, DISPLAY_LIMITS.name)}
+        </p>
+      )}
+      {readingHere && (
+        <p className={dictatingHere ? "agent-pane-reading is-below" : "agent-pane-reading"} data-testid="agent-pane-reading">
+          {"Reading "}
+          {displayText(reading.label, DISPLAY_LIMITS.name)}
+          {" aloud"}
         </p>
       )}
       <AgentTile
