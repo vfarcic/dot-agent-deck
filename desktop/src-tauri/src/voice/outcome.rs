@@ -4824,6 +4824,47 @@ mod tests {
         }
     }
 
+    /// Scenario: "go up" is said on the dashboard and the model answers
+    /// `go_to_parent`, the New agent dialog's directory row, which cannot run
+    /// there; the dashboard scrolls up instead (`scroll-up-go-up`, red on
+    /// `main`). Said over the dialog showing a parent directory and answered
+    /// as `scroll_up`, it goes up a directory. "Go back" on the dashboard
+    /// carries no word of `scroll_up`'s and is not turned into a scroll.
+    #[tokio::test]
+    async fn voice_outcome_go_up_is_the_row_that_can_run_here() {
+        let on_the_dashboard = |said: &'static str, row: &'static str| async move {
+            let resolver = StubResolver::new().answering(said, IntentAnswer::new(row));
+            run(&resolver, Screen::Overview, &fleet(), said).await
+        };
+        assert!(matches!(
+            &on_the_dashboard("go up", "go_to_parent").await,
+            VoiceOutcome::Dispatch { action, .. } if action == "scroll_up"
+        ));
+        assert!(matches!(
+            &on_the_dashboard("go back", "go_to_parent").await,
+            VoiceOutcome::Unavailable { action, .. } if action == "go_to_parent"
+        ));
+        let dialog = VoiceNewAgent { form: None };
+        let browsing = listing(&["billing"], true);
+        let resolver = StubResolver::new().answering("go up", IntentAnswer::new("scroll_up"));
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&browsing),
+            Some(&dialog),
+            Transcript::new("go up"),
+        )
+        .await
+        .outcome;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == "go_to_parent"),
+            "{outcome:?}"
+        );
+    }
+
     fn code_dir() -> VoiceDirectories {
         listing(
             &[
@@ -6496,9 +6537,24 @@ mod tests {
 
     #[tokio::test]
     async fn voice_outcome_go_to_parent_is_unavailable_at_a_root() {
+        // A listing is the New agent dialog's, so the dialog is declared open
+        // with it, as the webview declares them; under the dialog the
+        // dashboard's `scroll_up` cannot run either, so nothing redirects.
         let root = listing(&["home", "srv"], false);
+        let dialog = VoiceNewAgent { form: None };
         let resolver = StubResolver::new().answering("go up", IntentAnswer::new("go_to_parent"));
-        let outcome = run_with(&resolver, Screen::Overview, Some(&root), "go up").await;
+        let outcome = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Overview,
+            &fleet(),
+            &decks(),
+            Some(&root),
+            Some(&dialog),
+            Transcript::new("go up"),
+        )
+        .await
+        .outcome;
         assert_eq!(
             outcome.sentence(),
             "Not here — going up needs the New agent dialog showing a directory below the top; choose a daemon and open a directory first."

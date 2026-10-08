@@ -2890,6 +2890,8 @@ mod tests {
             vec![
                 ("switch_deck", "choose_deck"),
                 ("open_new_agent", "start_new_agent"),
+                ("go_to_parent", "scroll_up"),
+                ("scroll_up", "go_to_parent"),
                 ("start_new_agent", "open_new_agent"),
             ]
         );
