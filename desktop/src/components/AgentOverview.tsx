@@ -3,7 +3,7 @@ import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList,
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
-import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
+import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
@@ -2094,6 +2094,7 @@ function DashboardFilterControls({ filter, daemons }: { filter: DashboardFilter;
         data-testid="dashboard-filter-text"
         aria-label="Filter agents"
         placeholder="Filter agents"
+        maxLength={DASHBOARD_FILTER_TEXT_MAX}
         value={filter.text}
         onChange={(event) => setDashboardFilter({ ...filter, text: event.target.value })}
       />

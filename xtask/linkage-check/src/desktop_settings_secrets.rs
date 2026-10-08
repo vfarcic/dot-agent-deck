@@ -660,8 +660,10 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 7] = [
         true,
     ),
     // Issue #1496 — `sessionStorage`, not `localStorage`: the dashboard
-    // filter lasts for the window session. It holds facets and the text the
-    // user typed into the filter, never a credential.
+    // filter lasts for the window session. It holds the selected facet ids
+    // and the search text the user supplied, by typing or by voice, and
+    // does not automatically serialize settings credentials or agent
+    // prompts — though text a user types can be anything.
     (
         "DASHBOARD_FILTER_STORAGE_KEY",
         "dot-agent-deck.desktop.dashboard-filter.v1",

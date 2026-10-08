@@ -222,6 +222,13 @@ export function dashboardFilterFromParams(params: readonly { name: string; value
  */
 const DASHBOARD_FILTER_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.dashboard-filter.v1");
 
+/** The longest search text the filter keeps; anything past it is cut off when stored and when read back. */
+export const DASHBOARD_FILTER_TEXT_MAX = 200;
+
+function capped(text: string): string {
+  return text.slice(0, DASHBOARD_FILTER_TEXT_MAX);
+}
+
 let memory: string | null = null;
 /** Set once a write to storage failed, after which `memory` is the filter. */
 let storageFailed = false;
@@ -254,7 +261,7 @@ export function readStoredDashboardFilter(raw: string | null): DashboardFilter {
       statuses: known(strings(stored.statuses), DASHBOARD_STATUSES),
       agentTypes: known(strings(stored.agentTypes), DASHBOARD_AGENT_TYPES),
       daemonIds: strings(stored.daemonIds),
-      text: typeof stored.text === "string" ? stored.text : "",
+      text: typeof stored.text === "string" ? capped(stored.text) : "",
     };
   } catch {
     return clearDashboardFilter();
@@ -270,7 +277,8 @@ export function currentDashboardFilter(): DashboardFilter {
 
 /** Replace the window session's filter, and tell every screen showing it. */
 export function setDashboardFilter(filter: DashboardFilter): void {
-  const raw = dashboardFilterActive(filter) ? JSON.stringify(filter) : null;
+  const kept = { ...filter, text: capped(filter.text) };
+  const raw = dashboardFilterActive(kept) ? JSON.stringify(kept) : null;
   memory = raw;
   try {
     if (raw === null) window.sessionStorage.removeItem(DASHBOARD_FILTER_STORAGE_KEY);

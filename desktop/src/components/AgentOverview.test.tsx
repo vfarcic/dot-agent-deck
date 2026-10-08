@@ -382,6 +382,22 @@ describe("dashboard filter controls", () => {
     fireEvent.keyDown(document.body, { key: "1" });
     expect(navigate).toHaveBeenCalledWith({ kind: "agent", deckId: input.snapshot.agents[1].daemonId, agentId: "hide", from: "overview" });
   });
+
+  /// Scenario: filter a fleet whose agent's last prompt carries a sentinel, first by the agent's name and then by the sentinel itself. The window session's stored filter holds the sentinel only once the user typed it as the filter text — the fleet's prompts are never copied there.
+  it("stores an agent's prompt only when the user typed it as the filter text", () => {
+    const prompt = "PROMPT-SENTINEL-1496";
+    const input = filterFleet();
+    input.snapshot.agents[0] = { ...input.snapshot.agents[0], lastUserPrompt: `Fix ${prompt} now` };
+    renderOverviewWithStoredColumns(undefined, input);
+    const stored = () => Array.from({ length: window.sessionStorage.length }, (_, at) => window.sessionStorage.getItem(window.sessionStorage.key(at) ?? "") ?? "").join("\n");
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain("Keep sentinel");
+    expect(stored()).not.toContain(prompt);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: prompt } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain(prompt);
+  });
 });
 
 /** The legend's labels, which is the columns as a reader sees them named. */
