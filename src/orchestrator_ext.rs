@@ -148,11 +148,21 @@ pub fn default_extension_dir() -> Option<PathBuf> {
 /// (a temp dir in tests, the real `~/.pi/...` in the CLI); it never reads the
 /// environment.
 pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // PRD #1487: every destination is judged before the directory exists, so a
+    // refused test write creates nothing. Each file is judged on its own as
+    // well, because `std::fs::write` follows a symlink planted at its name.
+    crate::config_write_guard::ensure_config_write_allowed(target_dir)?;
+    for (name, _) in EXTENSION_FILES {
+        crate::config_write_guard::ensure_config_write_allowed(&target_dir.join(name))?;
+    }
     std::fs::create_dir_all(target_dir)?;
     let mut written = Vec::with_capacity(EXTENSION_FILES.len());
     for (name, contents) in EXTENSION_FILES {
         let path = target_dir.join(name);
-        std::fs::write(&path, contents)?;
+        // An identical file is not rewritten (PRD #1487).
+        if !std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
+            std::fs::write(&path, contents)?;
+        }
         written.push(path);
     }
     Ok(written)

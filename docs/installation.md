@@ -191,6 +191,8 @@ The deck learns each agent's status (Thinking, Working, Needs Input, and so on) 
 
 The hooks call the installed binary by its absolute path, so moving or deleting the binary breaks them until you reinstall them.
 
+The deck keeps one entry of its own per hook event. If you have more than one copy installed (for example Homebrew's and one in `~/.local/bin`, or the desktop app's bundled copy and a CLI), the hooks call the first installed copy that registered them, and starting any other copy leaves them alone rather than adding a second set or switching them over. They move to another copy only when the one they call is deleted (the next copy to start then takes its place) or when you run `dot-agent-deck hooks install` from the copy you prefer. Your own hooks, and their order, are left alone either way. When the hooks are already current, starting the deck leaves the agent's configuration file untouched, so Codex has nothing new to ask you to review. When a startup does change a file, the deck's log names the file and the binary the hooks now call ([Logs and diagnostics](troubleshooting.md#logs-and-diagnostics) says how to turn the log on).
+
 To install or reinstall by hand (for example, after installing an agent for the first time, or after moving the binary):
 
 ```bash
@@ -277,8 +279,8 @@ When it connects, the app checks whether it and the daemon can work together:
 | Situation | What the Dashboard shows | What to do |
 |---|---|---|
 | The two are compatible | Connects normally | Nothing |
-| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one. **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
-| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | Update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
+| One of them is older, and the app could misread some of what the daemon reports | **Incompatible daemon**, saying which of the two is older and that the app has not connected, with **Connect anyway** | Update the older one; for a remote daemon older than the app, press **Upgrade** ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)). **Connect anyway** connects until you quit the app, but some of what the daemon shows may be wrong. |
+| The two cannot work together | **Incompatible daemon**, saying which of the two is older, without Connect anyway | For a remote daemon older than the app, press **Upgrade**. Otherwise update the older one, then restart the daemon with the matching binary: `dot-agent-deck daemon restart`, then start it again with the TUI or `daemon serve` |
 
 **Technical details** under the message shows the exact versions on each side, which is what to include in a bug report.
 

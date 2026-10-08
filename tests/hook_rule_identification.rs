@@ -427,25 +427,9 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
     );
 }
 
-/// Scenario: Two genuinely different on-disk binaries that happen to share the
-/// literal basename `dot-agent-deck` (e.g. two separate local builds at
-/// different paths) must be treated as distinct deployments — installing the
-/// second must not collapse onto the first's rule, and reinstalling either must
-/// not wipe the other's. Unlike `_003`'s fictional paths (where
-/// `canonicalize` always fails), both paths here are real files, so this
-/// exercises the canonicalize-success branch `_003` cannot reach.
-///
-/// **Before you relax this test, read issue #1171.** This is the property that
-/// makes a second install of the deck — Homebrew's alongside `~/.local/bin`'s,
-/// say — keep BOTH rules, so every hook event is delivered once per rule. That
-/// was reported as a bug. It was resolved by making the duplication *loud*
-/// rather than by collapsing the rules here (`hooks install` now names every
-/// live same-named deck at another path — see `InstallOutcome::coexisting`),
-/// precisely because this test says the coexistence is deliberate. Changing it
-/// is therefore a policy decision about two-builds-side-by-side users, not a
-/// bug fix, and it re-opens #1171's question rather than closing it.
+/// Scenario: Install Claude hooks from two valid deck binaries at different paths, then reinstall the first. Each install replaces the prior deck command, leaving exactly one rule per event.
 #[test]
-fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
+fn hook_rule_identification_011_distinct_deck_installs_replace_each_other() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
     write_deck_binary(&build_a);
@@ -461,18 +445,17 @@ fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_two.len(),
-        2,
-        "two distinct on-disk builds sharing a basename must each keep their own \
-         rule; got {after_two:?}"
+        1,
+        "two valid deck installations must consolidate to one rule; got {after_two:?}"
     );
 
+    assert!(after_two[0].contains(build_b.to_str().unwrap()));
     install_to(&path, build_a.to_str().expect("build a path is utf8")).expect("install");
     let after_reinstall = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_reinstall.len(),
-        2,
-        "reinstalling one build must refresh its own rule, not wipe the other's; \
-         got {after_reinstall:?}"
+        1,
+        "reinstalling a deck must replace the previous installation; got {after_reinstall:?}"
     );
 }
 
@@ -528,16 +511,15 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
     }
 }
 
-/// Scenario: Two deck-owned rules exist, written by two distinct on-disk
-/// binaries sharing a basename (mirroring `_011`), alongside a coexisting
-/// non-deck user hook whose command names a path that never existed. One
-/// binary's file is then deleted from disk and install runs again via the
-/// surviving binary. The now-dead binary's rule must be pruned, the surviving
-/// binary's rule must remain, and the never-deck-owned user hook — whose
-/// command also names a nonexistent path — must be left untouched throughout:
-/// the prune applies only to rules already identified as deck-owned, never a
-/// general "delete anything pointing at a missing file" sweep, which would
-/// delete user hooks for tools not currently installed.
+/// Scenario: Install from one deck binary, then from a second sharing its
+/// basename (mirroring `_011`), beside a non-deck user hook whose command names
+/// a path that never existed; the second install replaces the first (one deck
+/// rule per event, PRD #1487). Delete the first binary and install again from
+/// the surviving one: no rule names the dead binary, the surviving binary's
+/// rule remains, and the never-deck-owned user hook — whose command also names
+/// a nonexistent path — is left untouched throughout, because consolidation
+/// applies only to rules already identified as deck-owned, never a general
+/// "delete anything pointing at a missing file" sweep.
 #[test]
 fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
@@ -575,9 +557,9 @@ fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     let after_two = rule_commands(&read_settings(&path), "PreToolUse");
     assert_eq!(
         after_two.len(),
-        3,
-        "two distinct on-disk builds plus the coexisting user hook must all be \
-         present before any file is deleted; got {after_two:?}"
+        2,
+        "the second deck install replaces the first, beside the untouched user \
+         hook; got {after_two:?}"
     );
 
     std::fs::remove_file(&build_a).expect("delete build a from disk");

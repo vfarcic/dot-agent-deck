@@ -429,18 +429,10 @@ fn read_json(path: &Path) -> Value {
         .unwrap_or_else(|e| panic!("parse {} as JSON: {e}\n{body}", path.display()))
 }
 
-/// Scenario: Seed `~/.codex/hooks.json` before launch with, under one installed
-/// event and one the deck no longer installs, a rule holding the deck's own
-/// command next to a user handler that carries no string `command` under the
-/// user's `matcher`, plus a second deck-owned rule pinning a different, still
-/// valid, seeded `dot-agent-deck`. Launch the real deck so its unattended
-/// startup install runs, and the user's handler, their `matcher` and the foreign
-/// valid pin must all survive unchanged — under the installed event with their
-/// POSITIONS unchanged too, since the deck refreshes its own command where it
-/// already sits.
+/// Scenario: Launch the real deck over Codex rules containing duplicate valid deck installations and a user handler. Startup consolidates the installed event to one deck command without changing the user handler index, and keeps the retired-event user handler.
 #[spec("hooks/install/006")]
 #[test]
-fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
+fn install_006_startup_consolidates_deck_pins_and_keeps_user_handler_indices() {
     let sandbox = harness_tempdir().expect("harness tempdir for the isolated HOME");
     let home = sandbox.path().join("home");
     let stub_bin = sandbox.path().join("stubbin");
@@ -454,11 +446,8 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
     let ours = format!("{durable} {CODEX_SUFFIX}");
 
     // A SECOND, genuinely different install: absolute, present, executable, and
-    // not under `target/`, so `pin_is_repairable` says the deck could have
-    // written it and `command_is_replaceable` must leave it alone. Sharing the
-    // `dot-agent-deck` basename is the point — that is what makes it a sibling
-    // rather than an unrelated user hook, and the pre-#730 code repointed it on
-    // every launch.
+    // not under `target/`. It must be consolidated on an installed event.
+    // Sharing the deck basename distinguishes it from an unrelated user hook.
     let foreign_path = home.join(".other").join("bin").join("dot-agent-deck");
     write_executable(&foreign_path, STUB_BODY);
     let foreign = format!(
@@ -522,16 +511,15 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
         ));
     }
     // And it must have refreshed its command IN PLACE rather than appending a
-    // rule beside the two seeded ones: the two survivors and nothing else.
+    // rule beside the seeded ones; a redundant deck-only group can disappear.
     // Before issue #1034 this expected three, because the install removed its
     // own command from the shared rule and re-added it at the end — which is
     // precisely what re-keyed the user's handler from `…:0:1` to `…:0:0` and
     // silently untrusted it.
     let installed = event_rules(&doc, "PreToolUse");
-    if installed.len() != 2 {
+    if installed.len() != 1 {
         problems.push(format!(
-            "PreToolUse: expected exactly the user's rule and the foreign pin's rule, with the \
-             deck's command refreshed inside the first rather than appended beside it, got \
+            "PreToolUse: expected exactly one refreshed deck rule with the user's handler, got \
              {}\n{installed:#?}",
             installed.len()
         ));
@@ -598,13 +586,13 @@ fn install_006_startup_install_keeps_sibling_handlers_and_valid_foreign_pins() {
             }
         }
 
-        // Issue #730's other half: a deck pin naming a DIFFERENT, still-usable
-        // install is not the deck's to repoint, so it is left exactly as it was
-        // and the launching deck's rule is added beside it.
-        if !rules.contains(&foreign_rule) {
+        // Consolidate the duplicate on installed events. The retired-event
+        // sweep still leaves the other installation's existing retired rule.
+        if (event == "PreToolUse" && rules.contains(&foreign_rule))
+            || (event == "SessionEnd" && !rules.contains(&foreign_rule))
+        {
             problems.push(format!(
-                "{event}: the deck-owned rule pinning the still-valid second install \
-                 `{foreign}` was repointed or removed\n{doc:#}"
+                "{event}: the still-valid second deck pin `{foreign}` violated the consolidation policy\n{doc:#}"
             ));
         }
     }

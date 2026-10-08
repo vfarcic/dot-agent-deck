@@ -401,6 +401,7 @@ fn make_session(
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
+        output_set_status: false,
     }
 }
 
@@ -2991,6 +2992,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
 
     // The live snapshot the daemon would have attached on reconnect.
     let snap = SessionSnapshot {
+        output_set_status: false,
         subagent_wait: None,
         status: SessionStatus::Working,
         agent_type: Some(AgentType::ClaudeCode),
@@ -3127,6 +3129,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                     rows: 0,
                     cols: 0,
                     live: Some(SessionSnapshot {
+                        output_set_status: false,
                         subagent_wait: None,
                         status: SessionStatus::Working,
                         agent_type: Some(AgentType::ClaudeCode),
@@ -3291,6 +3294,7 @@ async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner()
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
+        output_set_status: false,
     };
     let (buffer, _) =
         render_card_grid_to_buffer(&[(&session, Some(name))], Some(0), 0, now, 80, 20);
@@ -3408,6 +3412,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         subagent_wait: None,
         prompt_reports_unavailable: false,
         prompt_reports_declared: false,
+        output_set_status: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

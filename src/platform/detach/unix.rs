@@ -21,6 +21,16 @@ use std::path::Path;
 /// We do not wait for the child here — the spawned daemon stays up after this
 /// returns. Callers poll the attach socket to know when the daemon is ready.
 pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std::io::Result<u32> {
+    spawn_daemon_serve_detached_without_env(state_dir, exe, &[])
+}
+
+/// [`spawn_daemon_serve_detached_with_exe`], with each variable in `remove`
+/// left out of the child's otherwise inherited environment (PRD #1487).
+pub fn spawn_daemon_serve_detached_without_env(
+    state_dir: &Path,
+    exe: &Path,
+    remove: &[&str],
+) -> std::io::Result<u32> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
 
@@ -54,6 +64,9 @@ pub fn spawn_daemon_serve_detached_with_exe(state_dir: &Path, exe: &Path) -> std
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr);
+    for key in remove {
+        cmd.env_remove(key);
+    }
 
     // SAFETY: `pre_exec` runs in the child between fork and exec. Only
     // async-signal-safe libc calls are permitted here; `setsid(2)` is on

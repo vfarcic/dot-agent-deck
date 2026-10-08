@@ -1066,11 +1066,28 @@ pub fn update(
     which: DeckRef<'_>,
     f: impl FnOnce(&mut RemoteEntry),
 ) -> Result<Option<RemoteEntry>, RemoteConfigError> {
+    update_if(path, which, |_| Ok(()), f)
+}
+
+/// [`update`], applied only when `check` accepts the row as the file holds it
+/// now — read under the same lock the write takes, so nothing can change the
+/// row between the check and the write. A refusal writes nothing and is
+/// returned as it is.
+pub fn update_if<E>(
+    path: &Path,
+    which: DeckRef<'_>,
+    check: impl FnOnce(&RemoteEntry) -> Result<(), E>,
+    f: impl FnOnce(&mut RemoteEntry),
+) -> Result<Option<RemoteEntry>, E>
+where
+    E: From<RemoteConfigError>,
+{
     edit(path, |document| {
         let entries = document.entries()?;
         let Some(index) = entries.iter().position(|row| which.matches(row)) else {
             return Ok(None);
         };
+        check(&entries[index])?;
         let mut entry = entries[index].clone();
         f(&mut entry);
         // What `replace` will write, so the row returned is the row on disk.

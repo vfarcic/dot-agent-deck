@@ -93,6 +93,21 @@ desktopScenario("settings-daemons", async (page) => {
   await expect(page.getByLabel("Deck name")).toHaveValue("build");
 });
 
+// PRD #1487 — Upgrade on a remote daemon older than the app, stopped at the
+// question the daemon asks while agents are running: the fixture's `upgrade`
+// fleet, whose dev@build-box deck runs an older release with agents on it.
+desktopScenario("daemon-upgrade", async (page) => {
+  await page.goto("/?fixture=1&state=upgrade");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  const buildBox = page.getByTestId("daemon-group").filter({ has: page.getByTestId("daemon-identity").getByText("dev@build-box", { exact: true }) });
+  await buildBox.getByTestId("daemon-upgrade").click();
+  await page.getByTestId("upgrade-start").click();
+  await expect(page.getByTestId("upgrade-decision")).toBeVisible();
+  await expect(page.getByTestId("upgrade-stage-installing")).toHaveAttribute("data-state", "done");
+  await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
+});
+
 desktopScenario("settings-voice", async (page) => {
   await page.goto("/?fixture=1&state=docs");
   await page.getByTestId("open-settings").click();
