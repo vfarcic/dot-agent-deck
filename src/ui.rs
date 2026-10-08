@@ -27514,7 +27514,7 @@ mod tests {
         ];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27551,14 +27551,14 @@ mod tests {
         // Same (identity, role_index) must produce the same id so a
         // reconnect doesn't keep minting fresh placeholder cards on
         // every reattach.
-        let a = dead_slot_pane_id(&test_identity("/work", "tdd-cycle"), 4);
-        let b = dead_slot_pane_id(&test_identity("/work", "tdd-cycle"), 4);
+        let a = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
+        let b = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
         assert_eq!(a, b);
         // Different role_index → different id.
-        let c = dead_slot_pane_id(&test_identity("/work", "tdd-cycle"), 3);
+        let c = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 3);
         assert_ne!(a, c);
         // Different orchestration → different id.
-        let d = dead_slot_pane_id(&test_identity("/work", "other-cycle"), 4);
+        let d = dead_slot_pane_id(&test_identity("orch-tab-a", "other-cycle"), 4);
         assert_ne!(a, d);
         // is_dead_slot_pane_id accepts the synthesized id and rejects
         // a normal numeric pane id.
@@ -27591,18 +27591,19 @@ mod tests {
     }
 
     // Follow-up to 0d5e651 (auditor finding #4): the old format
-    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
-    // or orchestration_name contained hyphens. Two distinct tuples
-    // could produce the same synthetic id, which would then alias
-    // their placeholder sessions. Pin that the length-prefixed format
-    // disambiguates the textbook collision case.
+    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever a
+    // component contained hyphens. Two distinct identities could produce
+    // the same synthetic id, which would then alias their placeholder
+    // sessions. Pin that the length-prefixed format disambiguates the
+    // textbook collision case, now on the (token, name) pair the id is
+    // built from (issue #463).
     #[test]
     fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
-        // Under the old `-`-separated form both inputs formatted to
-        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
-        // they are guaranteed distinct.
-        let a = dead_slot_pane_id(&test_identity("/a", "b-c"), 1);
-        let b = dead_slot_pane_id(&test_identity("/a-b", "c"), 1);
+        // Under a `-`-separated form both inputs would format to
+        // `…a-b-c-1`. Under the length-prefixed form they are
+        // guaranteed distinct.
+        let a = dead_slot_pane_id(&test_identity("a", "b-c"), 1);
+        let b = dead_slot_pane_id(&test_identity("a-b", "c"), 1);
         assert_ne!(
             a, b,
             "differently-hyphenated (id, orchestration_name) pairs \
@@ -27630,7 +27631,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27644,7 +27645,7 @@ mod tests {
         // so the helper short-circuits on each iteration).
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27680,7 +27681,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -27692,7 +27693,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -27736,7 +27737,7 @@ mod tests {
             None,
         ];
         let assigned =
-            assign_synthetic_dead_slot_ids(&mut slots, &test_identity("/work", "tdd-cycle"));
+            assign_synthetic_dead_slot_ids(&mut slots, &test_identity("orch-tab-a", "tdd-cycle"));
         assert_eq!(
             assigned.len(),
             2,
@@ -27799,7 +27800,7 @@ mod tests {
         // dead slot. State must remain untouched.
         let synthetic_ids = assign_synthetic_dead_slot_ids(
             &mut role_pane_ids,
-            &test_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
         );
         assert_eq!(synthetic_ids.len(), 1, "exactly the role 2 slot is dead");
         assert!(state.sessions.is_empty(), "phase 1 must not seed sessions");
@@ -27922,7 +27923,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &test_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
