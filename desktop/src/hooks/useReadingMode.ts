@@ -42,6 +42,9 @@ export function useReadingMode(
   const onProblemRef = useRef(onProblem);
   onProblemRef.current = onProblem;
   const [reading, setReading] = useState<ReadingTarget>();
+  /* Settles once this window can hear another window's consent-off save
+     (below); reading starts only after it, and not at all if it rejects. */
+  const listening = useRef<Promise<void> | undefined>(undefined);
 
   const { mode, queue } = useMemo(() => {
     const speech = new SpeechQueue({
@@ -51,8 +54,13 @@ export function useReadingMode(
       onProblem: (reason) => onProblemRef.current?.(reason),
     });
     const reader = new ReadingMode({
-      start: (target, onSentence) => runtimeRef.current.voiceReadingStart?.(target, onSentence)
-        ?? Promise.resolve({ kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME }),
+      start: async (target, onSentence) => {
+        const start = runtimeRef.current.voiceReadingStart;
+        if (start === undefined) return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME };
+        // A rejection here is a start that failed: reading refuses, saying so.
+        await listening.current;
+        return start(target, onSentence);
+      },
       stop: (session) => runtimeRef.current.voiceReadingStop?.(session) ?? Promise.resolve(),
       speech,
       onChange: (target) => {
@@ -69,16 +77,20 @@ export function useReadingMode(
   }), [queue]);
   /* A save from any window that turned reading's opt-in off ends reading
      here too — a drain or a start in progress included, which the Rust side
-     has no session for (PR #1617's fourth review). */
+     has no session for (PR #1617's fourth review). Reading waits for this
+     listener, and a window that could not install it never reads: it would
+     not hear consent go off (PR #1617's fifth review). */
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
     let gone = false;
-    void runtimeRef.current.onVoiceReadingConsentOff?.(() => { void mode.consentOff(); })
+    const subscribe = runtimeRef.current.onVoiceReadingConsentOff;
+    const installed = (subscribe?.(() => { void mode.consentOff(); }) ?? Promise.reject(new Error("no consent-off listener")))
       .then((stop) => {
         if (gone) stop();
         else unsubscribe = stop;
-      })
-      .catch(() => undefined);
+      });
+    listening.current = installed;
+    installed.catch(() => undefined);
     return () => {
       gone = true;
       unsubscribe?.();
