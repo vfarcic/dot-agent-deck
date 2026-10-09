@@ -373,9 +373,11 @@ pub struct CodexTurnWatch {
 /// PRD #1497: the final reply a Codex rollout record carries — the
 /// `last_agent_message` of an `event_msg` whose payload is a `task_complete`,
 /// marked failed when that payload's `error` is an object. `None` for every
-/// other record, and when the message is missing, not a string, or blank. The
-/// text is cut to [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8
-/// boundary, and the payload's `turn_id` is kept.
+/// other record. A `task_complete` whose message is missing, not a string, or
+/// blank is still the turn's end, and answers an empty reply: the turn ended
+/// with nothing to read (audit A2). The text is cut to
+/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8 boundary, and
+/// the payload's `turn_id` is kept.
 pub fn extract_codex_turn_reply(record: &Value) -> Option<crate::daemon_protocol::FinalReply> {
     if record.get("type").and_then(Value::as_str) != Some("event_msg") {
         return None;
@@ -384,15 +386,20 @@ pub fn extract_codex_turn_reply(record: &Value) -> Option<crate::daemon_protocol
     if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
         return None;
     }
-    let text = payload.get("last_agent_message")?.as_str()?;
-    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
-        turn_id: payload
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        text: text.to_owned(),
-        failed: payload.get("error").is_some_and(Value::is_object),
-    })
+    let text = payload
+        .get("last_agent_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: text.to_owned(),
+            failed: payload.get("error").is_some_and(Value::is_object),
+        },
+    ))
 }
 
 impl CodexTurnWatch {

@@ -503,7 +503,10 @@ pub fn parse_geometry_frame(bytes: &[u8]) -> Option<(u16, u16)> {
 /// reaches the daemon beside a hook-socket event line rather than inside
 /// [`crate::event::AgentEvent`] (`crate::turn_reply::TURN_REPLY_LINE_KEY`),
 /// which an older daemon ignores. No existing field changed meaning, so no
-/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`.
+/// [`CONTRACT_BREAKS`] entry and no `.breaking.md`. The empty [`FinalReply`]
+/// that reports a turn with no reply (audit A2) was defined on that same
+/// unreleased stream before any build that serves it shipped, so it changed
+/// the meaning of nothing a released client reads either.
 ///
 /// # Where this constant is enforced
 ///
@@ -872,6 +875,11 @@ pub fn clamp_turn_reply(text: &str) -> &str {
 /// `StopFailure` hook's `last_assistant_message`, a Codex rollout's
 /// `task_complete`, the deck's OpenCode plugin at `session.idle` — never from
 /// terminal output.
+///
+/// **An empty `text` is the report of a turn that ended with no reply to
+/// read** ([`Self::is_empty`]), sent by the same producer and on the same
+/// stream as a reply with text would have been, so a subscriber hears of each
+/// reported turn end exactly once and in order (audit A2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalReply {
     /// The agent's own id for the turn, when it reports one (Codex does;
@@ -879,11 +887,19 @@ pub struct FinalReply {
     /// through two routes once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    /// The reply, at most [`MAX_TURN_REPLY_BYTES`].
+    /// The reply, at most [`MAX_TURN_REPLY_BYTES`]; empty when the turn ended
+    /// with nothing to read.
     pub text: String,
     /// The turn ended on an error rather than completing.
     #[serde(default)]
     pub failed: bool,
+}
+
+impl FinalReply {
+    /// Whether the turn ended with no reply to read.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
 }
 
 /// One [`FinalReply`] as the daemon streams it to an
@@ -1955,7 +1971,9 @@ pub enum AttachRequest {
     /// agent `id` names. The daemon answers an OK `RESP`, then writes one
     /// `KIND_EVENT` frame carrying a JSON [`TurnReply`] per turn of that agent
     /// that ends after the subscription opened — no reply from before it is
-    /// replayed — until either side closes the connection.
+    /// replayed — until either side closes the connection. A turn that ended
+    /// with nothing to read is a frame too, with an empty reply
+    /// ([`FinalReply::is_empty`]).
     ///
     /// The replies travel only on this stream: no [`BroadcastMsg`] carries
     /// them, so a client that never subscribes never receives an agent's reply

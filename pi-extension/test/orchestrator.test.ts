@@ -783,28 +783,31 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		assert.deepEqual(tracker.take(), { text: "All 42 tests pass.", failed: false });
 		assert.equal(tracker.take(), undefined, "a reply is reported once");
 
-		// A new run forgets a reply the last run never settled with.
+		// A new run forgets a reply the last run never settled with: it ended
+		// with nothing to read.
 		tracker.observe("message_end", assistant([{ type: "text", text: "stale" }]));
 		tracker.observe("agent_start", { type: "agent_start" });
-		assert.equal(tracker.take(), undefined);
+		assert.deepEqual(tracker.take(), { text: "", failed: false });
+		assert.equal(tracker.take(), undefined, "an empty turn end is reported once too");
 	});
 
 	test("a final assistant message with nothing to read leaves no earlier reply behind", () => {
 		const commentary = assistant([{ type: "text", text: "Running the tests." }]);
-		const finals: Array<[string, ReturnType<typeof assistant>]> = [
-			["thinking only", assistant([{ type: "thinking", thinking: "done", thinkingSignature: "sig" }])],
-			["a tool call only", assistant([{ type: "toolCall", id: "c", name: "bash", arguments: {} }])],
-			["empty", assistant([])],
-			["an error with no errorMessage", assistant([], { stopReason: "error" })],
+		const finals: Array<[string, ReturnType<typeof assistant>, boolean]> = [
+			["thinking only", assistant([{ type: "thinking", thinking: "done", thinkingSignature: "sig" }]), false],
+			["a tool call only", assistant([{ type: "toolCall", id: "c", name: "bash", arguments: {} }]), false],
+			["empty", assistant([]), false],
+			["an error with no errorMessage", assistant([], { stopReason: "error" }), true],
 		];
-		for (const [label, final] of finals) {
+		for (const [label, final, failed] of finals) {
 			const tracker = createTurnReplyTracker();
 			tracker.observe("agent_start", { type: "agent_start" });
 			tracker.observe("message_end", commentary);
 			tracker.observe("message_end", toolResult);
 			tracker.observe("message_end", final);
-			assert.equal(tracker.take(), undefined, `${label}: the earlier commentary is not the reply`);
+			assert.deepEqual(tracker.take(), { text: "", failed }, `${label}: the earlier commentary is not the reply; the turn ended with nothing to read`);
 		}
+		assert.equal(createTurnReplyTracker().take(), undefined, "no run, no turn end to report");
 		// A non-assistant message after the reply leaves it in place.
 		const tracker = createTurnReplyTracker();
 		tracker.observe("message_end", assistant([{ type: "text", text: "All 42 tests pass." }]));
@@ -831,17 +834,20 @@ describe("PRD #1497: the settled turn's final reply", () => {
 		assert.deepEqual(reportArgvAt(failed, "declared", true)?.slice(-2), [TURN_REPLY_STDIN_FLAG, TURN_REPLY_FAILED_FLAG]);
 		assert.equal(turnReplyStdin(settled!.reply), "All 42 tests pass.");
 		assert.equal(turnReplyStdin(failed.reply), "--boom");
-		assert.equal(turnReplyStdin({ text: " \n ", failed: false }), undefined);
+		assert.equal(turnReplyStdin({ text: " \n ", failed: false }), "", "a blank reply is an empty turn end");
 		assert.equal(turnReplyStdin(undefined), undefined);
 		// Without the reply, and below `declared`, the argv is what it always was.
 		assert.deepEqual(reportArgvAt(settled!, "declared"), ["agent-event", "--type", "finished", "--reports-prompts", "--cwd=/w"]);
 		assert.deepEqual(reportArgvAt(settled!, "detail", true), ["agent-event", "--type", "finished", "--cwd=/w"]);
 		assert.deepEqual(reportArgvAt(settled!, "lifecycle", true), ["agent-event", "--type", "finished"]);
+		// A blank reply still carries the flags: the turn ended with nothing to read.
 		assert.deepEqual(buildAgentEventArgv("finished", {}, true, { text: "   ", failed: true }), [
 			"agent-event",
 			"--type",
 			"finished",
 			"--reports-prompts",
+			TURN_REPLY_STDIN_FLAG,
+			TURN_REPLY_FAILED_FLAG,
 		]);
 	});
 

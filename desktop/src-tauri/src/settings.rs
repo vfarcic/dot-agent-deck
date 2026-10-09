@@ -400,6 +400,17 @@ pub struct VoiceSettings {
     pub reading_notice: ReadingNotice,
 }
 
+impl VoiceSettings {
+    /// Whether reading may subscribe to an agent and send its replies to be
+    /// summarised: the switch is on and its one-time notice has been shown
+    /// (audit A5). The webview records the notice only after it showed it and
+    /// queued it to be spoken, so no reply leaves before the user was told
+    /// where it goes. Speaking that notice is not gated on it.
+    pub fn reading_permitted(&self) -> bool {
+        self.reading == ReadingConsent::On && self.reading_notice == ReadingNotice::Shown
+    }
+}
+
 /// The endpoint the keyless local speech container listens on.
 ///
 /// PRD #802 measured this one: `ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu`

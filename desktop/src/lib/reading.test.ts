@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SpeechPlanDto } from "./bridge";
 import {
+  BUSY_RETRY_MS,
+  CAPACITY_FREED_RETRY_MS,
   DeckReader,
   isThisMachine,
   READING_OFF,
@@ -14,7 +16,7 @@ import {
   type ReadingStartDto,
   type ReadingTarget,
 } from "./reading";
-import { SpeechQueue, SpeechRefusedError, type SpeechText, type SpeechVoice } from "./speech";
+import { SpeechQueue, SpeechRefusedError, wordedNow, type SpeechText, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingAgent = { deckId: "deck-local", agentId: "tester", label: "tester", incarnation: 1 };
 const CODER: ReadingAgent = { deckId: "deck-local", agentId: "coder", label: "coder", incarnation: 2 };
@@ -23,7 +25,7 @@ const BUILDER: ReadingAgent = { deckId: "deck-build", agentId: "builder", label:
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** The words a queued sentence will be said with, asked now. */
-const words = (text: SpeechText) => (typeof text === "string" ? text : text());
+const words = (text: SpeechText) => wordedNow(text);
 
 /**
  * A reader over recorded fakes. Each start answers `answer(target)` (started,
@@ -31,7 +33,18 @@ const words = (text: SpeechText) => (typeof text === "string" ? text : text());
  */
 function harness(answer?: (target: ReadingTarget) => ReadingStartDto | Promise<ReadingStartDto>) {
   const said: [string, string][] = [];
-  const speech = { say: vi.fn((key: string, text: SpeechText) => { said.push([key, words(text)]); }), interrupt: vi.fn() };
+  const speech = {
+    say: vi.fn((key: string, text: SpeechText) => { said.push([key, words(text)]); }),
+    interrupt: vi.fn(),
+    drop: vi.fn((_match: (key: string) => boolean) => undefined),
+  };
+  /* Retries the reader schedules, run only when the test says so. */
+  const timers: { ms: number; run: () => void; cancelled: boolean }[] = [];
+  const schedule = (run: () => void, ms: number) => {
+    const timer = { ms, run, cancelled: false };
+    timers.push(timer);
+    return () => { timer.cancelled = true; };
+  };
   const sinks = new Map<string, (sentence: ReadingSentenceDto) => void>();
   let sessions = 0;
   const start = vi.fn(async (target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => {
@@ -41,9 +54,16 @@ function harness(answer?: (target: ReadingTarget) => ReadingStartDto | Promise<R
   const stop = vi.fn(async (_session: number) => undefined);
   const problems: string[] = [];
   let open: { deckId: string; agentId: string } | undefined;
-  const reader = new DeckReader({ start, stop, speech, openPane: () => open, onProblem: (sentence) => problems.push(sentence) });
+  const reader = new DeckReader({ start, stop, speech, openPane: () => open, onProblem: (sentence) => problems.push(sentence), schedule });
   return {
     reader, said, speech, start, stop, sinks, problems,
+    /** The retries waiting to run, by delay. */
+    waiting: () => timers.filter((timer) => !timer.cancelled).map((timer) => timer.ms),
+    /** Run every retry waiting now. */
+    runTimers: () => {
+      const due = timers.splice(0).filter((timer) => !timer.cancelled);
+      for (const timer of due) timer.run();
+    },
     open: (agent: ReadingTarget | undefined) => { open = agent; },
     started: () => start.mock.calls.map(([target]) => target.agentId),
   };
@@ -210,6 +230,83 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     expect(h.started()).toEqual(["tester", "tester"]);
     expect(h.said).toEqual([[READING_VOICE_KEY, READING_ON]]);
     expect(h.problems).toEqual([]);
+  });
+
+  /** Scenario (audit A1): Reading is turned on and a start reads the settings before the save reached the disk; the save's consent-on report arrives while that start is still being answered, and the start then answers that Reading is off. It is asked again at once, rather than waiting for a report that already came. */
+  it("retries a refusal answered after the save already reported Reading on", async () => {
+    let answerFirst!: (answer: ReadingStartDto) => void;
+    let calls = 0;
+    const h = harness(() => {
+      calls += 1;
+      if (calls === 1) return new Promise<ReadingStartDto>((resolve) => { answerFirst = resolve; });
+      return { kind: "started", session: 9 };
+    });
+    h.reader.update(true, [TESTER], false);
+    await flush();
+    h.reader.consentOn();
+    await flush();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    answerFirst({ kind: "not_enabled", sentence: "Reading is off." });
+    await flush();
+    expect(h.started()).toEqual(["tester", "tester"]);
+    expect(h.problems).toEqual([]);
+    // A refusal with no report since it began waits for the next one.
+    h.reader.update(true, [TESTER, CODER]);
+    await flush();
+    expect(h.start).toHaveBeenCalledTimes(3);
+  });
+
+  /** Scenario (audit A4): the deck already reports as many agents' turns as it can, so it refuses two of this window's agents; the limit is said once for the deck. Each refused agent is asked again on a growing delay while the deck stays full, and as soon as one of this window's sessions on that deck ends it is asked again shortly and is read. */
+  it("asks again for an agent refused while its deck was full", async () => {
+    const full = "Reading is not available: this deck is already reporting as many agents' turns as it can.";
+    let deckFull = true;
+    let session = 0;
+    const reviewer: ReadingAgent = { ...TESTER, agentId: "reviewer", label: "reviewer", incarnation: 4 };
+    const h = harness((target) => (deckFull && target.agentId !== "tester" ? { kind: "busy", sentence: full } : { kind: "started", session: ++session }));
+    h.reader.update(true, [TESTER, CODER, reviewer], false);
+    await flush();
+    expect(h.problems).toEqual([full]);
+    expect(h.waiting()).toEqual([BUSY_RETRY_MS[0], BUSY_RETRY_MS[0]]);
+    // Still full: asked again, on the next delay, and not said again.
+    h.runTimers();
+    await flush();
+    expect(h.started().filter((agent) => agent === "coder")).toHaveLength(2);
+    expect(h.waiting()).toEqual([BUSY_RETRY_MS[1], BUSY_RETRY_MS[1]]);
+    expect(h.problems).toEqual([full]);
+    // An update does not ask again early.
+    h.reader.update(true, [TESTER, CODER, reviewer]);
+    await flush();
+    expect(h.started().filter((agent) => agent === "coder")).toHaveLength(2);
+    // The tester exits: its session ends, which frees a reader on the deck.
+    deckFull = false;
+    h.sinks.get("tester")!({ kind: "closed", text: "" });
+    expect(h.waiting()).toEqual([CAPACITY_FREED_RETRY_MS, CAPACITY_FREED_RETRY_MS]);
+    h.runTimers();
+    await flush();
+    expect(h.started().filter((agent) => agent === "coder")).toHaveLength(3);
+    expect(h.reader.reading).toEqual(expect.arrayContaining([readingKey(CODER), readingKey(reviewer)]));
+    expect(h.waiting()).toEqual([]);
+  });
+
+  /** Scenario (audit A4): a deck that stays full is asked a bounded number of times; after the last delay the agent is asked again only when one of this window's sessions on that deck ends. Turning Reading off cancels what is waiting. */
+  it("bounds the retries of a deck that stays full", async () => {
+    const h = harness((target) => (target.agentId === "coder" ? { kind: "busy", sentence: "full" } : { kind: "started", session: 1 }));
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    for (let attempt = 0; attempt < BUSY_RETRY_MS.length; attempt += 1) {
+      h.runTimers();
+      await flush();
+    }
+    expect(h.started().filter((agent) => agent === "coder")).toHaveLength(BUSY_RETRY_MS.length + 1);
+    expect(h.waiting()).toEqual([]);
+    h.reader.update(true, [CODER]);
+    await flush();
+    expect(h.stop).toHaveBeenCalledWith(1);
+    expect(h.waiting()).toEqual([CAPACITY_FREED_RETRY_MS]);
+    h.reader.update(false, [CODER]);
+    h.runTimers();
+    await flush();
+    expect(h.started().filter((agent) => agent === "coder")).toHaveLength(BUSY_RETRY_MS.length + 1);
   });
 
   /** Scenario: the deck's daemon is too old to report finished turns; with three agents on it the reason is said and shown once, not once per agent, and no agent of that deck is subscribed again until its agents change. */
@@ -390,15 +487,36 @@ describe("DeckReader with speech in flight", () => {
   /** Scenario: the agent exits while its last summary is being said; the summary is heard to the end. */
   it("lets an exiting agent's last summary finish", async () => {
     const h = speaking();
-    h.reader.update(true, [TESTER], false);
+    h.reader.update(true, [TESTER], false, ["deck-local"]);
     await flush();
     h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: the last turn." });
     await flush();
-    h.sinks.get("tester")!({ kind: "closed", text: "Reading off." });
-    h.reader.update(true, []);
+    h.sinks.get("tester")!({ kind: "closed", text: "" });
+    h.reader.update(true, [], true, ["deck-local"]);
     await flush();
     expect(h.provider.aborted).toEqual([]);
     expect(h.queue.speaking).toBe(true);
+  });
+
+  /** Scenario (audit A7): the tester's summary is being said and the coder's waits when the user switches to another deck; the tester's is cut off, the coder's dropped unsaid, and the new deck's agent is read. A sentence about reading itself is kept. */
+  it("drops the old deck's speech when the deck changes", async () => {
+    const h = speaking();
+    h.reader.update(true, [TESTER, CODER], false, ["deck-local"]);
+    await flush();
+    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: old deck." });
+    await flush();
+    h.sinks.get("coder")!({ kind: "permission", text: "The coder is asking for permission." });
+    h.queue.say(READING_VOICE_KEY, "Reading is not available: the other deck did not answer.");
+    h.reader.update(true, [BUILDER], true, ["deck-build"]);
+    await flush();
+    expect(h.provider.aborted).toEqual(["The tester finished: old deck."]);
+    expect(h.queue.pending.map((entry) => words(entry.text))).toEqual([]);
+    expect(h.provider.fetched).toEqual(["The tester finished: old deck.", "Reading is not available: the other deck did not answer."]);
+    h.provider.finish();
+    await flush();
+    h.sinks.get("builder")!({ kind: "turn", text: "The builder finished: new deck." });
+    await flush();
+    expect(h.provider.fetched.at(-1)).toBe("The builder finished: new deck.");
   });
 
   /** Scenario (PR #1617 round 3): under Auto, the provider's speech is refused because the switch was turned off or the connection changed; the sentence is not said with the system voice instead. A provider failure still falls back. */

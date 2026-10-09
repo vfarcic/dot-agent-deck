@@ -249,9 +249,11 @@ fn an_unknown_type_is_refused_with_the_full_vocabulary() {
 /// PRD #1497 moved the reply off the command line: `--type finished
 /// --turn-reply-stdin` (and `--turn-reply-failed`) with the reply written to
 /// stdin. The line on the hook socket carries the reply under `turn_reply`
-/// beside an unchanged `Idle` event; with nothing on stdin, or on another
-/// `--type`, the line carries no reply; and the old `--turn-reply=<text>` form
-/// is refused as an unknown flag, so no reply can be put on argv.
+/// beside an unchanged `Idle` event; with nothing on stdin the line carries an
+/// empty reply, the turn ending with nothing to read; on another `--type`, or
+/// without the flag, the line carries no reply; and the old
+/// `--turn-reply=<text>` form is refused as an unknown flag, so no reply can be
+/// put on argv.
 #[test]
 fn a_settled_turns_reply_is_read_from_stdin_never_argv() {
     use dot_agent_deck::daemon_protocol::{FinalReply, MAX_TURN_REPLY_BYTES};
@@ -301,8 +303,16 @@ fn a_settled_turns_reply_is_read_from_stdin_never_argv() {
         .expect("stdin was written")
         .expect("the whole write is consumed, never refused");
 
-    // Nothing on stdin, and a report that is not a turn end, carry no reply.
+    // A turn end with nothing on stdin is a turn that ended with nothing to
+    // read: an empty reply (audit A2). A report that is not a turn end, and a
+    // turn end without the flag, carry none.
     let line = agent_event_line(&["--type", "finished", "--turn-reply-stdin"], None);
+    assert!(
+        reply_from_line(&line)
+            .expect("a flagged turn end is reported")
+            .is_empty()
+    );
+    let line = agent_event_line(&["--type", "finished"], None);
     assert_eq!(reply_from_line(&line), None);
     let line = agent_event_line(
         &["--type", "running", "--turn-reply-stdin"],

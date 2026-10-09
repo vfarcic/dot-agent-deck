@@ -1303,6 +1303,12 @@ interface VoiceControlPanelProps {
    */
   readingAgents?: readonly ReadingAgent[];
   /**
+   * PRD #1497 audit A7 — the decks being viewed (the selected one, or every
+   * observed deck under All Decks). What was still to be said about the
+   * agents of a deck that leaves this list is dropped.
+   */
+  readingDecks?: readonly string[];
+  /**
    * PRD #1497 decision 2 — save the switch, through the same save as Settings.
    * "reading on" and "reading off" call it.
    */
@@ -1386,7 +1392,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, readingDecks, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -3871,38 +3877,43 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!endDictation()) setProblem(VOICE_NOT_DICTATING);
   }, [endDictation]);
   /**
-   * PRD #1497 decision 3 — what reading reads, kept in step with the switch
-   * and the deck: every agent on the deck being viewed while the switch is
-   * on. The switch as first handed over (the settings as loaded) is not a
-   * change anyone made, so it says nothing; every later turn of it says
+   * PRD #1497 decisions 3 and 5 — what reading reads, kept in step with the
+   * switch and the deck: every agent on the deck being viewed while the
+   * switch is on. The switch as first handed over (the settings as loaded) is
+   * not a change anyone made, so it says nothing; every later turn of it says
    * "Reading on." or "Reading off.".
+   *
+   * The first time Reading is on, by voice or in Settings, the app shows and
+   * queues to say where replies go, and only then records that it did (audit
+   * A5). Until that record is in the settings, the reader is told the switch
+   * is off, so no agent is subscribed and no reply is summarised before the
+   * notice — in this one effect, in that order, rather than by the order two
+   * effects happen to run in; the Rust side refuses a start without the
+   * record as well. A record that does not reach the settings leaves reading
+   * off, and turning the switch off and on again shows the notice again.
    */
   const readingOn = reading?.on ?? false;
   const readingKnown = reading !== undefined;
-  const readingSeen = useRef(false);
-  useEffect(() => {
-    if (!readingKnown) return;
-    reader.reader.update(readingOn, readingAgents ?? [], readingSeen.current);
-    readingSeen.current = true;
-  }, [reader.reader, readingAgents, readingKnown, readingOn]);
-  /**
-   * PRD #1497 decision 5 — the first time Reading is on, by voice or in
-   * Settings, the app says and shows where replies go, then records that it
-   * did so it is not said again.
-   */
-  const noticeDue = readingOn && reading !== undefined && !reading.noticeShown;
+  const noticeShown = reading?.noticeShown ?? false;
   const noticeEndpoint = reading?.endpoint ?? "";
+  const readingSeen = useRef(false);
   const noticeSaid = useRef(false);
   const noticeShownRef = useRef(onReadingNoticeShown);
   noticeShownRef.current = onReadingNoticeShown;
   useEffect(() => {
-    if (!noticeDue || noticeSaid.current) return;
-    noticeSaid.current = true;
-    const notice = readingNotice(noticeEndpoint);
-    reader.queue.say(READING_NOTICE_VOICE_KEY, notice);
-    setProblem(notice);
-    noticeShownRef.current?.();
-  }, [noticeDue, noticeEndpoint, reader.queue]);
+    if (!readingKnown) return;
+    const noticeDue = readingOn && !noticeShown;
+    if (!readingOn) noticeSaid.current = false;
+    if (noticeDue && !noticeSaid.current) {
+      noticeSaid.current = true;
+      const notice = readingNotice(noticeEndpoint);
+      setProblem(notice);
+      reader.queue.say(READING_NOTICE_VOICE_KEY, notice);
+      noticeShownRef.current?.();
+    }
+    reader.reader.update(readingOn && !noticeDue, readingAgents ?? [], readingSeen.current, readingDecks);
+    readingSeen.current = true;
+  }, [noticeEndpoint, noticeShown, reader.queue, reader.reader, readingAgents, readingDecks, readingKnown, readingOn]);
   /**
    * PRD #1497 decision 2 — "reading on": turn the Settings switch on, from any
    * screen, through the same save as Settings. The reader says "Reading on."

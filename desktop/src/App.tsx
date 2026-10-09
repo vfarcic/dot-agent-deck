@@ -670,6 +670,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       if (deckId === undefined) return [];
       return deck.agents.map((agent) => ({ deckId, agentId: agent.id, label: agent.displayName, incarnation: agent.spawnedAtMs }));
     }), [allDecksSelected, runtime.fleet, selectedDeckId]);
+  /* Audit A7 — the decks being viewed, so what was still to be said about a
+     deck the user moved away from is dropped. Joined into one string so the
+     list keeps its identity while the fleet's other fields change. */
+  const readingDeckKey = (allDecksSelected
+    ? runtime.fleet.flatMap((deck) => (deck.connection.deckId === undefined ? [] : [deck.connection.deckId]))
+    : selectedDeckId === undefined ? [] : [selectedDeckId]
+  ).join("\u0000");
+  const readingDecks = useMemo(() => (readingDeckKey === "" ? [] : readingDeckKey.split("\u0000")), [readingDeckKey]);
   /* Decision 2 — "reading on" / "reading off" flip the switch through the
      same save as Settings' own row, so turning it off revokes what is in
      flight in exactly the same way. */
@@ -1045,7 +1053,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} />
         {screenNode}
-        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
+        <VoiceControlPanel runtime={runtime} screen={view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
       </KeyboardInput.Provider>
       </VoiceChoiceOpen.Provider>

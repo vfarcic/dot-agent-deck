@@ -693,6 +693,13 @@ const recordTurnError = (sessionId, error) => {{
 // neither a session event nor the client ever names stays replyless on
 // purpose: an unknown session might be a subagent's, and its text is not the
 // user's turn, so privacy wins over completeness.
+//
+// A known root's turn whose last assistant message has no text (it ended on a
+// tool call, or said nothing) is still its turn end, and its idle report says
+// so with an empty `reply`, so the deck can say the turn ended with nothing to
+// read. Only the first idle report of a turn carries either: the state is
+// consumed here, so the second report finds no assistant message and carries
+// none.
 const takeReply = (sessionId) => {{
   if (!sessionId) {{
     return {{}};
@@ -705,14 +712,11 @@ const takeReply = (sessionId) => {{
   if (!message || aborted) {{
     return {{}};
   }}
-  const text = Array.from(message.parts.values(), (part) => part.text).join("").trim();
-  if (!text) {{
-    return {{}};
-  }}
   if (sessionParents.get(sessionId) !== "") {{
     lookUpAncestry(sessionId);
     return {{}};
   }}
+  const text = Array.from(message.parts.values(), (part) => part.text).join("").trim();
   return failed ? {{ reply: text, reply_failed: true }} : {{ reply: text }};
 }};
 
@@ -2399,7 +2403,9 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
     /// `session.idle`, for a session whose `session.created` named it a root.
     /// The first idle report carries the LAST assistant
     /// message's text as `reply`, the second none; a turn that hit a
-    /// `session.error` carries `reply_failed`; an interrupted turn carries none.
+    /// `session.error` carries `reply_failed`; an interrupted turn carries none;
+    /// a turn whose last assistant message has no text carries an empty
+    /// `reply` on its first idle report only.
     #[cfg(unix)]
     #[test]
     fn opencode_plugin_attaches_the_last_assistant_reply_to_the_idle_report() {
@@ -2462,6 +2468,9 @@ await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
 await turn("s1", "m3", "half a sentence");
 await send("session.error", {{ sessionID: "s1", error: {{ name: "MessageAbortedError", data: {{}} }} }});
 await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await turn("s1", "m4", "");
+await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
+await send("session.idle", {{ sessionID: "s1" }});
 "#,
                 plugin.display()
             ),
@@ -2499,6 +2508,14 @@ await send("session.status", {{ sessionID: "s1", status: {{ type: "idle" }} }});
                     turn_id: None,
                     text: "I could not finish.".into(),
                     failed: true,
+                }),
+                None,
+                // Audit A2: a turn whose last assistant message says nothing
+                // is reported once, as ended with nothing to read.
+                Some(crate::daemon_protocol::FinalReply {
+                    turn_id: None,
+                    text: String::new(),
+                    failed: false,
                 }),
                 None,
             ],

@@ -13,7 +13,7 @@ mod common;
 use common::{TuiDeck, write_hook_line};
 use spec::spec;
 
-/// Scenario: Start a daemon-owned stand-in pane and send Claude hooks through the real hook CLI with that pane's own identity and capability. A client subscribing after the first completed turn must receive only later final replies, with the selected agent's identity and increasing sequence, without replaying the earlier reply or reading the terminal's sentinel.
+/// Scenario: Start a daemon-owned stand-in pane and send Claude hooks through the real hook CLI with that pane's own identity and capability. A client subscribing after the first completed turn must receive only later final replies, with the selected agent's identity and increasing sequence, without replaying the earlier reply or reading the terminal's sentinel; a later turn that ends with no final message, after a subagent's Stop, must arrive as exactly one empty reply.
 #[spec("voice/reading-reply/001")]
 #[cfg(unix)]
 #[test]
@@ -190,6 +190,42 @@ fn reading_reply_001_subscription_delivers_only_future_selected_agent_replies() 
                 .await
                 .is_err(),
             "each finished turn is delivered once"
+        );
+    });
+
+    // Audit A2: a subagent's Stop inside a turn is no turn end of the pane's
+    // agent, and the turn that then ends with no final message is one empty
+    // frame — the explicit "no reply to read" — not silence.
+    send_hook(
+        "UserPromptSubmit",
+        serde_json::json!({"prompt": "fourth synthetic turn"}),
+    );
+    send_hook(
+        "Stop",
+        serde_json::json!({"agent_id": "subagent-1497", "last_assistant_message": "SUBAGENT_ONLY_1497_e81f"}),
+    );
+    send_hook("Stop", serde_json::json!({}));
+    let empty = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), replies.next_reply())
+            .await
+            .expect("the empty turn is delivered promptly")
+            .expect("decode the empty turn")
+            .expect("reply stream live")
+    });
+    assert_eq!(empty.agent_id, agent_id);
+    assert!(
+        empty.reply.is_empty(),
+        "the turn ended with nothing to read, and no subagent text: {:?}",
+        empty.reply
+    );
+    assert!(!empty.reply.failed);
+    assert!(empty.sequence > second.sequence);
+    runtime.block_on(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), replies.next_reply())
+                .await
+                .is_err(),
+            "the empty turn is delivered once"
         );
     });
 }

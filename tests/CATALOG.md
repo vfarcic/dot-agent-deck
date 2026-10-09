@@ -7366,10 +7366,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 #### voice/reading-reply
 
-##### voice/reading-reply/001 — A per-agent reading subscription delivers final replies only for turns finished after reading starts.
+##### voice/reading-reply/001 — A per-agent reading subscription delivers final replies only for turns finished after reading starts, and a turn with no final reply as one empty reply.
 - **Layer:** L2 lane 1, PTY-attached (real binary and isolated daemon; production client library and hook CLI).
 - **Agent:** none (daemon-owned `cat` stand-in exporting its own hook capability; synthetic Claude Stop payloads).
-- **Asserts:** a Stop processed before subscription is not replayed; two later Stop payloads deliver their exact final-reply sentinels once, with the selected agent and pane ids, normal-turn outcomes, and increasing sequence numbers; unrelated terminal text is not included.
+- **Asserts:** a Stop processed before subscription is not replayed; two later Stop payloads deliver their exact final-reply sentinels once, with the selected agent and pane ids, normal-turn outcomes, and increasing sequence numbers; unrelated terminal text is not included; a subagent's Stop carrying a sentinel delivers nothing, and the turn that then ends with a Stop carrying no final message delivers exactly one empty reply (the explicit turn with nothing to read).
 - **Does not assert:** provider speech, desktop summarisation or reading controls, genuine agent work, other-agent filtering, permission/error announcement text, Codex rollout tailing, or OpenCode reply capture.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
 

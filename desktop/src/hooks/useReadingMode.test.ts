@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { READING_NOT_IN_THIS_RUNTIME, useReadingMode } from "./useReadingMode";
 import { READING_ON, type ReadingAgent } from "../lib/reading";
-import type { SpeechText } from "../lib/speech";
+import { wordedNow, type SpeechText } from "../lib/speech";
 
 const PLANNER: ReadingAgent = { deckId: "deck-00000000000000a1", agentId: "planner", label: "Plan / architecture" };
 
@@ -31,7 +31,7 @@ describe("useReadingMode", () => {
     const problems: string[] = [];
     const hook = renderHook(() => useReadingMode(runtime, () => undefined, undefined, (sentence) => problems.push(sentence)));
     const said: string[] = [];
-    vi.spyOn(hook.result.current.queue, "say").mockImplementation((_key, text: SpeechText) => { said.push(typeof text === "string" ? text : text()); });
+    vi.spyOn(hook.result.current.queue, "say").mockImplementation((_key, text: SpeechText) => { said.push(wordedNow(text)); });
     return { runtime, hook, said, problems, consentOn };
   }
 
@@ -61,6 +61,27 @@ describe("useReadingMode", () => {
     });
     expect(runtime.voiceReadingStart).not.toHaveBeenCalled();
     expect(problems).toEqual([READING_NOT_IN_THIS_RUNTIME]);
+  });
+
+  /** Scenario (audit A1): the consent-on listener is still registering when Reading is turned on; no agent is subscribed until it is in place, so a save reported on after a start read the settings cannot be missed. */
+  it("waits for the consent-on listener before reading starts", async () => {
+    const { runtime, hook } = mount(async () => () => undefined);
+    await act(async () => { await flush(); });
+    let installed!: (stop: () => void) => void;
+    runtime.onVoiceReadingConsentOn.mockImplementationOnce(() => new Promise((resolve) => { installed = resolve; }));
+    hook.unmount();
+    const again = renderHook(() => useReadingMode(runtime, () => undefined));
+    await act(async () => {
+      again.result.current.reader.update(true, [PLANNER]);
+      await flush();
+    });
+    expect(runtime.voiceReadingStart).not.toHaveBeenCalled();
+    await act(async () => {
+      installed(() => undefined);
+      await flush();
+    });
+    expect(runtime.voiceReadingStart).toHaveBeenCalledTimes(1);
+    again.unmount();
   });
 
   /** Scenario: a save left Reading on; the consent-on event reaches the reader, which retries a start refused before that save reached the disk. */

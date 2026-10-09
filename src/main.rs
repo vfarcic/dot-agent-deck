@@ -1564,7 +1564,8 @@ fn main() -> ExitCode {
             // PRD #1497: the settled turn's reply rides the line beside the
             // event, never inside it, exactly as a hook's does. It arrives on
             // stdin, read only for a turn end and never for longer than
-            // `TURN_REPLY_STDIN_TIMEOUT`.
+            // `TURN_REPLY_STDIN_TIMEOUT`. A flagged turn end whose stdin gave
+            // nothing is a turn that ended with nothing to read (audit A2).
             let turn_reply = (turn_reply_stdin
                 && event_type == dot_agent_deck::event::EventType::Idle)
                 .then(|| {
@@ -1572,8 +1573,8 @@ fn main() -> ExitCode {
                         std::io::stdin(),
                         dot_agent_deck::hook::TURN_REPLY_STDIN_TIMEOUT,
                     )
-                })
-                .flatten();
+                    .unwrap_or_default()
+                });
             let reply = dot_agent_deck::hook::agent_event_cli_turn_reply(
                 &event_type,
                 turn_reply,

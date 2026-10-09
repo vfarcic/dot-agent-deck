@@ -6,6 +6,13 @@
 //! (`crate::codex_rollout_tail`). Either way it is published here, and only
 //! [`crate::daemon_protocol::AttachRequest::SubscribeTurnReplies`] connections
 //! receive it — it never rides the daemon-wide `BroadcastMsg` stream.
+//!
+//! A turn that ended with nothing to read is published too, as a reply whose
+//! text is empty ([`crate::daemon_protocol::FinalReply::is_empty`]), from the
+//! same report that would have carried the text. So each turn end a producer
+//! reports reaches a subscriber as exactly one frame, in the order the turns
+//! ended, and a subscriber never has to guess from the agent's status and a
+//! timer whether a turn ended without a reply.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +53,7 @@ const MAX_TURN_ID_BYTES: usize = 256;
 pub const MAX_TURN_REPLY_SUBSCRIBERS: usize = 32;
 
 /// A turn reply as it appears on a hook-socket line, read leniently: a reply
-/// whose shape is wrong is no reply, and never costs the event.
+/// whose shape is wrong is no report of a turn end, and never costs the event.
 #[derive(Debug, Default, Deserialize)]
 struct PresentedTurnReply {
     #[serde(default)]
@@ -55,29 +62,32 @@ struct PresentedTurnReply {
 
 /// The [`FinalReply`] a hook-socket `line` carries under
 /// [`TURN_REPLY_LINE_KEY`], re-bounded — the socket accepts lines from any
-/// same-uid producer, not only the deck's hook CLI.
+/// same-uid producer, not only the deck's hook CLI. A reply with blank text is
+/// the report of a turn that ended with nothing to read.
 pub fn reply_from_line(line: &str) -> Option<FinalReply> {
     let value = serde_json::from_str::<PresentedTurnReply>(line)
         .ok()?
         .turn_reply?;
     let reply = serde_json::from_value::<FinalReply>(value).ok()?;
-    normalize(reply)
+    Some(normalize(reply))
 }
 
-/// `reply` with its text clamped and an over-long turn id dropped, or `None`
-/// when no text is left.
-pub fn normalize(reply: FinalReply) -> Option<FinalReply> {
+/// `reply` with its text clamped and an over-long turn id dropped. Blank text
+/// becomes empty: the turn ended with no reply to read, which is still a turn
+/// end to deliver.
+pub fn normalize(reply: FinalReply) -> FinalReply {
     let text = clamp_turn_reply(&reply.text);
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(FinalReply {
+    FinalReply {
         turn_id: reply
             .turn_id
             .filter(|t| !t.is_empty() && t.len() <= MAX_TURN_ID_BYTES),
-        text: text.to_owned(),
+        text: if text.trim().is_empty() {
+            String::new()
+        } else {
+            text.to_owned()
+        },
         failed: reply.failed,
-    })
+    }
 }
 
 /// The daemon's turn-reply fan-out. Held by
@@ -195,8 +205,9 @@ impl TurnReplyHub {
     /// Publish `reply` as `agent_id`'s, in `pane_id`, and return its sequence
     /// number — or `None` when `reply` names a turn already delivered for this
     /// agent (Codex reports a turn both through its `Stop` hook and in its
-    /// rollout). The caller has already checked that `agent_id` is the pane's
-    /// live owner.
+    /// rollout; whichever reaches here first is the turn's one frame, an empty
+    /// one included). The caller has already checked that `agent_id` is the
+    /// pane's live owner.
     pub fn publish(&self, agent_id: &str, pane_id: &str, reply: FinalReply) -> Option<u64> {
         if let Some(turn_id) = reply.turn_id.as_deref()
             && !self
@@ -297,10 +308,37 @@ mod tests {
         for bad in [
             serde_json::json!({TURN_REPLY_LINE_KEY: "text"}),
             serde_json::json!({TURN_REPLY_LINE_KEY: {"text": 3}}),
-            serde_json::json!({TURN_REPLY_LINE_KEY: {"text": "  "}}),
+            serde_json::json!({TURN_REPLY_LINE_KEY: {}}),
             serde_json::json!({"session_id": "s"}),
         ] {
             assert_eq!(reply_from_line(&bad.to_string()), None, "{bad}");
         }
+    }
+
+    /// PRD #1497 audit A2: a blank reply is the report of a turn that ended
+    /// with nothing to read. It is delivered as one empty frame, de-duplicated
+    /// by its turn id like any other, so a turn reported by two routes is one
+    /// frame whether or not it had text.
+    #[test]
+    fn a_turn_with_no_reply_is_one_empty_frame() {
+        let line =
+            serde_json::json!({TURN_REPLY_LINE_KEY: {"text": " \n ", "turn_id": "t1"}}).to_string();
+        let empty = reply_from_line(&line).expect("a blank reply is a turn end");
+        assert!(empty.is_empty());
+        assert_eq!(empty.text, "");
+        assert_eq!(empty.turn_id.as_deref(), Some("t1"));
+
+        let hub = TurnReplyHub::default();
+        let mut rx = hub.subscribe().unwrap().rx;
+        assert!(hub.publish("a", "p", empty).is_some());
+        assert_eq!(
+            hub.publish("a", "p", reply(Some("t1"), "late text for the same turn")),
+            None,
+            "the turn already has its frame"
+        );
+        assert!(hub.publish("a", "p", reply(None, "")).is_some());
+        assert!(rx.try_recv().unwrap().reply.is_empty());
+        assert!(rx.try_recv().unwrap().reply.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 }

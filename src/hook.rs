@@ -173,6 +173,7 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         .ok()
         .and_then(|payload| match agent {
             "opencode" => extract_opencode_turn_reply(&payload),
+            "codex" => extract_codex_hook_turn_reply(&payload),
             _ => extract_turn_reply(&payload),
         });
 
@@ -212,11 +213,12 @@ fn with_turn_reply(
 
 /// PRD #1497: the final reply a Claude-compatible hook payload carries — the
 /// `last_assistant_message` of a main-agent `Stop`, or of a `StopFailure`
-/// (marked failed). `None` for every other hook, for a `Stop` fired inside a
-/// subagent (one whose payload names an `agent_id`), and when the message is
-/// missing, not a string, or blank. The text is cut to
-/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8 boundary, and a
-/// `turn_id` (Codex reports one) is kept.
+/// (marked failed). `None` for every other hook and for a `Stop` fired inside
+/// a subagent (one whose payload names an `agent_id`). A main-agent turn end
+/// whose message is missing, not a string, or blank is still a turn end, and
+/// answers an empty reply (audit A2): the turn ended with nothing to read. The
+/// text is cut to [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] at a UTF-8
+/// boundary, and a `turn_id` (Codex reports one) is kept.
 pub fn extract_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
     let failed = match payload.get("hook_event_name").and_then(Value::as_str)? {
         "Stop" => false,
@@ -230,23 +232,44 @@ pub fn extract_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::Fin
     {
         return None;
     }
-    let text = payload.get("last_assistant_message")?.as_str()?;
-    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
-        turn_id: payload
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        text: text.to_owned(),
-        failed,
-    })
+    let text = payload
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            text: text.to_owned(),
+            failed,
+        },
+    ))
+}
+
+/// PRD #1497: [`extract_turn_reply`] for a Codex hook payload, except that a
+/// `Stop` that does not carry `last_assistant_message` at all reports nothing
+/// rather than an empty reply. Codex also reports each turn in its rollout
+/// (`crate::codex_rollout_tail`), and whichever report reaches the daemon
+/// first is the turn's one frame (`crate::turn_reply::TurnReplyHub::publish`),
+/// so a `Stop` that cannot say whether there was a reply must not claim there
+/// was none. A `null` or blank message is Codex saying there was none.
+pub fn extract_codex_hook_turn_reply(
+    payload: &Value,
+) -> Option<crate::daemon_protocol::FinalReply> {
+    payload.get("last_assistant_message")?;
+    extract_turn_reply(payload)
 }
 
 /// PRD #1497: the final reply the deck's OpenCode plugin attaches to the report
 /// of a session going idle (`session.idle`, or `session.status` with status
 /// `idle`) — the text of the session's last assistant message, under `reply`,
 /// with `reply_failed` set when the turn ended on a `session.error`
-/// (`crate::opencode_manage`). `None` for every other event and for a missing,
-/// non-string or blank reply.
+/// (`crate::opencode_manage`). `None` for every other event and for a missing
+/// or non-string `reply`, which the plugin leaves off an idle report that is
+/// not a known main session's turn end. A blank `reply` is that turn ending
+/// with nothing to read, and answers an empty reply (audit A2).
 pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_protocol::FinalReply> {
     let idle = match payload.get("event").and_then(Value::as_str)? {
         "session.idle" => true,
@@ -260,14 +283,16 @@ pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_prot
         return None;
     }
     let text = payload.get("reply")?.as_str()?;
-    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
-        turn_id: None,
-        text: text.to_owned(),
-        failed: payload
-            .get("reply_failed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: text.to_owned(),
+            failed: payload
+                .get("reply_failed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+    ))
 }
 
 fn read_stdin() -> Option<String> {
@@ -1058,10 +1083,13 @@ where
 
 /// PRD #1497: the final reply `dot-agent-deck agent-event --turn-reply-stdin`
 /// carries — the bundled Pi extension's last assistant text for a settled turn —
-/// bounded like every other route ([`crate::turn_reply::normalize`]). Only a
-/// turn end (`--type finished`, an [`EventType::Idle`]) carries one; on any
-/// other `--type`, and for a missing or blank text, it is `None`, so the line
-/// is sent exactly as before.
+/// bounded like every other route ([`crate::turn_reply::normalize`]). `text` is
+/// `None` when the report did not ask for a reply (no `--turn-reply-stdin`), and
+/// what stdin gave otherwise, empty included. Only a turn end (`--type
+/// finished`, an [`EventType::Idle`]) carries one; on any other `--type`, and
+/// without the flag, it is `None`, so the line is sent exactly as before. A
+/// turn end whose reply is blank answers an empty reply: the turn ended with
+/// nothing to read (audit A2).
 pub fn agent_event_cli_turn_reply(
     event_type: &EventType,
     text: Option<String>,
@@ -1070,11 +1098,13 @@ pub fn agent_event_cli_turn_reply(
     if *event_type != EventType::Idle {
         return None;
     }
-    crate::turn_reply::normalize(crate::daemon_protocol::FinalReply {
-        turn_id: None,
-        text: text?,
-        failed,
-    })
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text: text?,
+            failed,
+        },
+    ))
 }
 
 /// The hook-socket line `dot-agent-deck agent-event` sends: `event` with this
@@ -2268,10 +2298,13 @@ mod tests {
                 "{other:?}"
             );
         }
-        assert_eq!(
-            agent_event_cli_turn_reply(&EventType::Idle, Some("  \n ".into()), false),
-            None
-        );
+        // Audit A2: a flagged turn end with a blank reply is a turn that
+        // ended with nothing to read, reported as an empty reply; without the
+        // flag there is no reply at all.
+        let blank = agent_event_cli_turn_reply(&EventType::Idle, Some("  \n ".into()), false)
+            .expect("a turn end with nothing to read");
+        assert!(blank.is_empty());
+        assert!(!blank.failed);
         assert_eq!(
             agent_event_cli_turn_reply(&EventType::Idle, None, false),
             None

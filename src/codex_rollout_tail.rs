@@ -917,11 +917,17 @@ mod tests {
         assert!(replies[0].reply.failed);
         assert_eq!(replies[0].reply.text, "I could not finish.");
 
-        // A completion with no reply hands nothing.
+        // A completion with no reply hands an empty one, marked failed here:
+        // the turn ended with nothing to read (audit A2), and is still
+        // reported as a failure.
         tailers.apply(arm("r", &rollout, Some("turn-quiet")));
         append(&rollout, failure_lines("turn-quiet").as_bytes());
         assert_eq!(tailers.tick(live).len(), 1);
-        assert!(tailers.take_replies().is_empty());
+        let replies = tailers.take_replies();
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].reply.is_empty());
+        assert!(replies[0].reply.failed);
+        assert_eq!(replies[0].reply.turn_id.as_deref(), Some("turn-quiet"));
     }
 
     /// Issue #714 (audit A3): disarming — by a matching `Stop` or by the turn's

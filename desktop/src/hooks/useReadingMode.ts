@@ -45,6 +45,10 @@ export function useReadingMode(
   /* Settles once this window can hear a consent-off save (below); reading
      starts only after it, and not at all if it rejects. */
   const listening = useRef<Promise<void> | undefined>(undefined);
+  /* Settles once this window can hear a consent-on save, or could not
+     install that listener. Reading starts only after it too, so a save
+     reported on after a start read the settings is never missed (audit A1). */
+  const hearingOn = useRef<Promise<void> | undefined>(undefined);
 
   const { reader, queue } = useMemo(() => {
     const speech = new SpeechQueue({
@@ -65,6 +69,7 @@ export function useReadingMode(
         } catch {
           return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME, scope: "deck" as const };
         }
+        await hearingOn.current;
         return start(target, onSentence);
       },
       stop: (session) => runtimeRef.current.voiceReadingStop?.(session) ?? Promise.resolve(),
@@ -99,7 +104,7 @@ export function useReadingMode(
     const subscribeOn = runtimeRef.current.onVoiceReadingConsentOn;
     if (subscribeOn !== undefined) {
       // Asked inside a promise, so a seam that throws costs only the retry.
-      void Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => undefined);
+      hearingOn.current = Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => undefined);
     }
     return () => {
       gone = true;

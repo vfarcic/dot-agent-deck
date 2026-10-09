@@ -24,6 +24,14 @@
  * when that agent's pane is open at that moment (decision 4 of 2026-10-09),
  * and the moment it is queued may be long before.
  *
+ * The provider's audio takes a round trip to prepare, and the open pane can
+ * change during it, so a {@link Worded} sentence is worded again right before
+ * its audio plays (audit A6). When the wording changed, the audio for the
+ * sentence's `safe` form (the one naming the agent, right whichever pane is
+ * open) is prepared and played instead: a sentence without the name is never
+ * played once its agent's pane is no longer the open one. A refusal of that
+ * second request is still never answered with the system voice (D9).
+ *
  * # "Is speaking" (D8)
  *
  * {@link SpeechQueue.speaking} is true from the moment a sentence is taken off
@@ -45,9 +53,14 @@
 
 import type { DeckBridge, SpeechPlanDto } from "./bridge";
 
-/** One way of saying a sentence. Resolves when it has been said or stopped. */
+/**
+ * One way of saying a sentence. Resolves when it has been said or stopped.
+ * `recheck`, when given, is asked right before the audio plays: it answers
+ * the text to say instead when `text` is no longer the right wording, and
+ * `undefined` otherwise. A voice that says `text` at once may ignore it.
+ */
 export interface SpeechVoice {
-  speak(text: string, signal: AbortSignal): Promise<void>;
+  speak(text: string, signal: AbortSignal, recheck?: () => string | undefined): Promise<void>;
 }
 
 export interface SpeechQueueDeps {
@@ -59,8 +72,25 @@ export interface SpeechQueueDeps {
   onProblem?: (reason: string) => void;
 }
 
+/**
+ * A sentence worded when it is said: `say` answers the wording for that
+ * moment, and `safe` is the wording that is right at any moment (reading's
+ * sentence naming its agent), played when the moment changed while the audio
+ * for `say`'s answer was being prepared.
+ */
+export interface Worded {
+  say: () => string;
+  safe: string;
+}
+
 /** A sentence, or how to word it when it is said. */
-export type SpeechText = string | (() => string);
+export type SpeechText = string | (() => string) | Worded;
+
+/** `text` worded now. */
+export function wordedNow(text: SpeechText): string {
+  if (typeof text === "string") return text;
+  return typeof text === "function" ? text() : text.say();
+}
 
 interface Waiting {
   agent: string;
@@ -99,6 +129,8 @@ export function speechAudioError(cause: unknown): Error {
 export class SpeechQueue {
   private waiting: Waiting[] = [];
   private current: AbortController | null = null;
+  /** The key the sentence being said was queued under. */
+  private currentAgent: string | null = null;
   private active = false;
   private readonly listeners = new Set<(speaking: boolean) => void>();
 
@@ -137,6 +169,15 @@ export class SpeechQueue {
     this.current?.abort();
   }
 
+  /**
+   * Drop every waiting sentence whose key `match` accepts, and stop the one
+   * being said if its key does; every other sentence is kept, in order.
+   */
+  drop(match: (agent: string) => boolean): void {
+    this.waiting = this.waiting.filter((waiting) => !match(waiting.agent));
+    if (this.currentAgent !== null && match(this.currentAgent)) this.current?.abort();
+  }
+
   /** Be told when {@link speaking} changes. Returns the unsubscribe. */
   subscribe(listener: (speaking: boolean) => void): () => void {
     this.listeners.add(listener);
@@ -154,18 +195,18 @@ export class SpeechQueue {
     this.setActive(true);
     try {
       for (let next = this.waiting.shift(); next !== undefined; next = this.waiting.shift()) {
-        const text = (typeof next.text === "string" ? next.text : next.text()).trim();
-        if (text === "") continue;
         const controller = new AbortController();
         this.current = controller;
+        this.currentAgent = next.agent;
         try {
           // Raced against the abort so an interrupt ends the sentence here at
           // once, whatever the voice does about its own signal.
-          await Promise.race([this.speakOne(text, controller.signal), aborted(controller.signal)]);
+          await Promise.race([this.speakOne(next.text, controller.signal), aborted(controller.signal)]);
         } catch (error) {
           if (!controller.signal.aborted) this.deps.onProblem?.(reason(error));
         } finally {
           this.current = null;
+          this.currentAgent = null;
         }
       }
     } finally {
@@ -173,22 +214,40 @@ export class SpeechQueue {
     }
   }
 
-  private async speakOne(text: string, signal: AbortSignal): Promise<void> {
+  /**
+   * Say one sentence, worded as late as each source allows: the system voice
+   * speaks the moment it is handed the text, so it is worded then; the
+   * provider's audio is prepared first, so it is worded before and checked
+   * again right before it plays (see the module comment).
+   */
+  private async speakOne(entry: SpeechText, signal: AbortSignal): Promise<void> {
+    const word = () => wordedNow(entry).trim();
+    if (word() === "") return;
     const plan = await this.deps.plan();
     if (signal.aborted) return;
     switch (plan.kind) {
-      case "system":
-        return this.deps.system.speak(text, signal);
+      case "system": {
+        const text = word();
+        return text === "" ? undefined : this.deps.system.speak(text, signal);
+      }
       case "unavailable":
         this.deps.onProblem?.(plan.reason);
         return;
-      case "provider":
+      case "provider": {
+        const text = word();
+        if (text === "") return;
+        const recheck = () => {
+          if (word() === text) return undefined;
+          return typeof entry === "object" ? entry.safe.trim() : word();
+        };
         try {
-          await this.deps.provider.speak(text, signal);
+          await this.deps.provider.speak(text, signal, recheck);
         } catch (error) {
           if (signal.aborted || !plan.fallbackToSystem || error instanceof SpeechRefusedError) throw error;
-          await this.deps.system.speak(text, signal);
+          const now = word();
+          if (now !== "") await this.deps.system.speak(now, signal);
         }
+      }
     }
   }
 }
@@ -298,6 +357,11 @@ export function providerPlaybackDeadlineMs(seconds: number, maxSeconds = MAX_PRO
  * Bounded twice after the Rust side's byte cap: a decoded clip longer than
  * `maxSeconds` is refused before it plays, and playback is stopped at
  * {@link providerPlaybackDeadlineMs} if the source never reports its end.
+ *
+ * Right before a clip plays, `recheck` is asked whether its text is still the
+ * one to say; when it answers another, that text's audio is prepared and
+ * played instead, without asking again (the queue answers a wording that is
+ * right whatever happens next).
  */
 export function providerVoice(
   fetchAudio: (text: string) => Promise<ArrayBuffer>,
@@ -305,16 +369,27 @@ export function providerVoice(
   maxSeconds = MAX_PROVIDER_AUDIO_SECONDS,
 ): SpeechVoice {
   let context: AudioContextLike | undefined;
+  const prepare = async (text: string, signal: AbortSignal): Promise<{ ctx: AudioContextLike; buffer: AudioBuffer } | undefined> => {
+    const audio = await fetchAudio(text);
+    if (signal.aborted) return undefined;
+    context ??= makeContext();
+    const ctx = context;
+    await ctx.resume?.();
+    const buffer = await ctx.decodeAudioData(audio);
+    if (signal.aborted) return undefined;
+    if (Number.isFinite(buffer.duration) && buffer.duration > maxSeconds) throw new Error(PROVIDER_AUDIO_TOO_LONG);
+    return { ctx, buffer };
+  };
   return {
-    async speak(text, signal) {
-      const audio = await fetchAudio(text);
-      if (signal.aborted) return;
-      context ??= makeContext();
-      const ctx = context;
-      await ctx.resume?.();
-      const buffer = await ctx.decodeAudioData(audio);
-      if (signal.aborted) return;
-      if (Number.isFinite(buffer.duration) && buffer.duration > maxSeconds) throw new Error(PROVIDER_AUDIO_TOO_LONG);
+    async speak(text, signal, recheck) {
+      let prepared = await prepare(text, signal);
+      if (prepared === undefined) return;
+      const instead = recheck?.();
+      if (instead !== undefined && instead !== "" && instead !== text) {
+        prepared = await prepare(instead, signal);
+        if (prepared === undefined) return;
+      }
+      const { ctx, buffer } = prepared;
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       source.connect(ctx.destination);

@@ -304,6 +304,122 @@ describe("providerVoice", () => {
   });
 });
 
+describe("a sentence worded when it is said (audit A6)", () => {
+  /** A provider whose audio requests wait for the test, and a context that records which request's audio played. */
+  function deferredProvider() {
+    const fetched: string[] = [];
+    const answers: Array<(outcome: ArrayBuffer | Error) => void> = [];
+    const played: string[] = [];
+    const tags = new WeakMap<ArrayBuffer, string>();
+    const fetchAudio = (text: string) => {
+      fetched.push(text);
+      return new Promise<ArrayBuffer>((resolve, reject) => {
+        answers.push((outcome) => {
+          if (outcome instanceof Error) {
+            reject(outcome);
+            return;
+          }
+          tags.set(outcome, text);
+          resolve(outcome);
+        });
+      });
+    };
+    let source: { buffer: AudioBuffer | null; onended: (() => void) | null };
+    const context: AudioContextLike = {
+      destination: {} as AudioNode,
+      resume: () => Promise.resolve(),
+      decodeAudioData: (data) => Promise.resolve({ duration: 1, tag: tags.get(data) } as unknown as AudioBuffer),
+      createBufferSource: () => {
+        source = {
+          buffer: null,
+          onended: null,
+          connect: () => undefined,
+          start: () => played.push((source.buffer as unknown as { tag: string }).tag),
+          stop: () => undefined,
+        } as unknown as { buffer: AudioBuffer | null; onended: (() => void) | null };
+        return source as unknown as AudioBufferSourceNode;
+      },
+    };
+    return {
+      voice: providerVoice(fetchAudio, () => context),
+      fetched,
+      played,
+      answer: (outcome: ArrayBuffer | Error = new ArrayBuffer(4)) => answers.shift()!(outcome),
+      end: () => source.onended?.(),
+    };
+  }
+
+  /** Scenario: the tester's summary is taken up while the tester's pane is open, so its audio is prepared without the name; the user opens the coder's pane while that audio is being prepared. Right before playing, the wording is checked again, and the sentence naming the tester is prepared and played instead — the bare one never plays. */
+  it("plays the named form when the open pane changed while the audio was prepared", async () => {
+    const provider = deferredProvider();
+    const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: false }), provider: provider.voice, system: new ScriptedVoice() });
+    let open = true;
+    queue.say("tester", { say: () => (open ? "Finished: all tests pass." : "The tester finished: all tests pass."), safe: "The tester finished: all tests pass." });
+    await flush();
+    expect(provider.fetched).toEqual(["Finished: all tests pass."]);
+    open = false;
+    provider.answer();
+    await flush();
+    expect(provider.fetched).toEqual(["Finished: all tests pass.", "The tester finished: all tests pass."]);
+    expect(provider.played).toEqual([]);
+    provider.answer();
+    await flush();
+    expect(provider.played).toEqual(["The tester finished: all tests pass."]);
+    provider.end();
+    await flush();
+    expect(queue.speaking).toBe(false);
+
+    // Unchanged while it was prepared: played as prepared, with one request.
+    queue.say("tester", { say: () => "The tester finished: again.", safe: "The tester finished: again." });
+    await flush();
+    provider.answer();
+    await flush();
+    expect(provider.fetched.at(-1)).toBe("The tester finished: again.");
+    expect(provider.played.at(-1)).toBe("The tester finished: again.");
+  });
+
+  /** Scenario (D9): the request for the named form is refused (the switch was turned off meanwhile) under Auto; nothing is played, and the system voice does not say it instead. */
+  it("never answers a refused second request with the system voice", async () => {
+    const provider = deferredProvider();
+    const system = new ScriptedVoice();
+    const problems: string[] = [];
+    const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: true }), provider: provider.voice, system, onProblem: (reason) => problems.push(reason) });
+    let open = true;
+    queue.say("tester", { say: () => (open ? "Finished: x." : "The tester finished: x."), safe: "The tester finished: x." });
+    await flush();
+    open = false;
+    provider.answer();
+    await flush();
+    provider.answer(new SpeechRefusedError("not permitted"));
+    await flush();
+    await flush();
+    expect(provider.played).toEqual([]);
+    expect(system.said).toEqual([]);
+    expect(problems).toEqual(["not permitted"]);
+  });
+});
+
+describe("SpeechQueue.drop (audit A7)", () => {
+  /** Scenario: the queue says one deck's sentence and holds another deck's and one of its own; dropping the first deck's keys stops the sentence being said and removes its waiting one, and the rest are said in order. */
+  it("drops and stops only the sentences whose key matches", async () => {
+    const { queue, provider } = queueWith({ kind: "provider", fallbackToSystem: false });
+    queue.say("a\u0000tester", "old deck, being said");
+    await flush();
+    queue.say("a\u0000coder", "old deck, waiting");
+    queue.say("b\u0000builder", "new deck");
+    queue.say("\u0000reading", "about reading");
+    queue.drop((key) => key.startsWith("a\u0000"));
+    await flush();
+    expect(provider.stopped).toEqual(["old deck, being said"]);
+    expect(provider.said).toEqual(["old deck, being said", "new deck"]);
+    // The first finisher is the stopped sentence's, already settled.
+    provider.finish();
+    provider.finish();
+    await flush();
+    expect(provider.said).toEqual(["old deck, being said", "new deck", "about reading"]);
+  });
+});
+
 describe("speechAudioError", () => {
   /** Scenario (PR #1617 round 3): the speech command's rejection names a refusal apart from a failure; a refusal becomes a SpeechRefusedError, which Auto never answers with the system voice, and anything else a plain error carrying its sentence. */
   it("tells a refusal apart from a failure", () => {

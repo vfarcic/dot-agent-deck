@@ -28,11 +28,11 @@
 //! connections, in either order. [`coalesce`] holds one back for
 //! [`FAILURE_COALESCE_WINDOW`] so such a turn is announced once.
 //!
-//! A turn that ends with no reply never reaches the reply stream: the daemon
-//! publishes only replies with text in them. So the status stream's turn end
-//! (an `Idle` after the agent was seen working) is watched too, and a turn end
-//! that no reply arrives within [`NO_REPLY_HOLD`] of is announced as a turn
-//! with no reply to read (decision 7 of 2026-10-09).
+//! A turn that ends with no reply reaches the reply stream too, as an empty
+//! reply from the same report that would have carried the text (audit A2), so
+//! it is announced as a turn with no reply to read (decision 7 of 2026-10-09)
+//! in its place among the agent's turns, and never inferred from the agent's
+//! status and a timer.
 //!
 //! A source answers one subscription per [`ReadingTarget`] with a channel of
 //! [`TurnEvent`]s for that agent alone, from the moment of subscribing — never
@@ -75,7 +75,7 @@ use dot_agent_deck::event::{AgentEvent, BroadcastMsg, EventType};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::settings::{IntentSettings, ReadingConsent, VoiceSettings};
+use crate::settings::{IntentSettings, VoiceSettings};
 
 use super::summary::{
     RequestGate, Summary, SummaryFailure, SummaryTransport, TurnKind, TurnSummaryRequest,
@@ -119,14 +119,6 @@ pub const DECK_CHANGED: &str = "the deck changed while reading was starting";
 /// How long after [`coalesce`] announced one half of a failed turn it absorbs
 /// the other, so the turn is announced once.
 pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
-
-/// How long [`coalesce`] waits, after the agent's turn ended on the status
-/// stream, for that turn's reply before it announces a turn with no reply to
-/// read — and how recent a reply must be for a turn end to count as answered
-/// by it. The two leave the daemon together (the reply is published just
-/// before the status is broadcast, from one hook line), so this only has to
-/// cover two local connections' delivery, as [`FAILED_REPLY_HOLD`] does.
-pub const NO_REPLY_HOLD: Duration = Duration::from_secs(2);
 
 /// How long [`coalesce`] holds a failed reply that arrived before its turn's
 /// block status, so a usage limit can still replace it. Both halves leave the
@@ -273,11 +265,8 @@ impl TurnEventSource for DaemonTurnEvents {
                         let BroadcastMsg::Event(event) = message else {
                             continue;
                         };
-                        let incoming = status_turn_event(&event, &agent_id)
-                            .map(Incoming::Status)
-                            .or_else(|| turn_progress(&event, &agent_id));
-                        if let Some(incoming) = incoming
-                            && status_tx.send(incoming).await.is_err()
+                        if let Some(status) = status_turn_event(&event, &agent_id)
+                            && status_tx.send(Incoming::Status(status)).await.is_err()
                         {
                             return;
                         }
@@ -303,16 +292,12 @@ impl TurnEventSource for DaemonTurnEvents {
     }
 }
 
-/// What [`coalesce`] merges: a finished turn's reply, a status the agent
-/// reported, or where its turn is ([`turn_progress`]).
+/// What [`coalesce`] merges: a finished turn's reply — empty when the turn
+/// ended with nothing to read — or a status the agent reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     Reply(FinalReply),
     Status(TurnEvent),
-    /// The agent is working on a turn.
-    Working,
-    /// The agent's turn ended (an `Idle`), with or without a reply.
-    TurnEnded,
 }
 
 /// The status event `event` means for reading the agent `agent_id`, or `None`.
@@ -358,32 +343,6 @@ pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent
     }
 }
 
-/// Where the agent `agent_id`'s turn is, from a status `event`, or `None`:
-/// [`Incoming::Working`] for a sign of work (thinking, a tool, compacting, a
-/// subagent), [`Incoming::TurnEnded`] for an `Idle`. Only the agent's own
-/// reports: not an outside agent's unproven one, not the deck's own synthetic
-/// events, and not the terminal-output classifier's guesses.
-pub fn turn_progress(event: &AgentEvent, agent_id: &str) -> Option<Incoming> {
-    use dot_agent_deck::event::UNPROVEN_METADATA_KEY;
-    if event.agent_id.as_deref() != Some(agent_id)
-        || event.metadata.contains_key(UNPROVEN_METADATA_KEY)
-        || event.is_daemon_synthetic()
-        || event.is_wrapper_output_classified()
-    {
-        return None;
-    }
-    match event.event_type {
-        EventType::Thinking
-        | EventType::ToolStart
-        | EventType::ToolEnd
-        | EventType::Compacting
-        | EventType::SubagentStart
-        | EventType::SubagentStop => Some(Incoming::Working),
-        EventType::Idle => Some(Incoming::TurnEnded),
-        _ => None,
-    }
-}
-
 /// What a permission prompt asks to do: "Bash: cargo publish" from the tool and
 /// its detail, the prompt text an agent sent instead (OpenCode), or nothing.
 fn permission_wants(event: &AgentEvent) -> String {
@@ -408,23 +367,17 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// - **A failed reply first** is held for [`FAILED_REPLY_HOLD`]. A usage-limit
 ///   status within the hold replaces it — the usage limit says what the user
 ///   has to do — while an error status is absorbed into the failed turn's
-///   summary, which carries the agent's own words. With no status, the reply is
+///   summary, which carries the agent's own words; a failed reply with no
+///   words is replaced by the error instead. With no status, the reply is
 ///   announced when the hold runs out, and an error status within
 ///   [`FAILURE_COALESCE_WINDOW`] after that is still absorbed.
 ///
 /// The window is time, not turn identity: two distinct failed turns finishing
 /// within it are announced as one.
 ///
-/// # A turn with no reply
-///
-/// A [`Incoming::TurnEnded`] after an [`Incoming::Working`] is a turn that
-/// ended. When a reply arrived within [`NO_REPLY_HOLD`] before it, or arrives
-/// within [`NO_REPLY_HOLD`] after it, the reply is that turn's and is
-/// announced as usual; otherwise the turn is announced as finished with an
-/// empty reply, which is said as a turn with no reply to read. A turn end with
-/// no work seen before it (an agent settling at start, a second idle report
-/// for the same turn) is not a turn, and a block status ends the turn without
-/// one — it was announced already.
+/// A reply with no text is a turn that ended with nothing to read; it is
+/// merged exactly like one with text, so it is announced once, in its turn's
+/// place (audit A2).
 ///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
@@ -433,18 +386,8 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     let mut held: Option<(String, Instant)> = None;
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
-    // Whether the agent was seen working since its last turn end.
-    let mut in_turn = false;
-    // When the last reply arrived.
-    let mut last_reply: Option<Instant> = None;
-    // A turn that ended with no reply yet, and until when its reply may come.
-    let mut no_reply_due: Option<Instant> = None;
     loop {
-        let deadline = match (held.as_ref().map(|(_, until)| *until), no_reply_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let next = match deadline {
+        let next = match held.as_ref().map(|(_, until)| *until) {
             Some(until) => tokio::select! {
                 message = incoming.recv() => Some(message),
                 _ = sleep_until(until) => None,
@@ -469,42 +412,15 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     *announced = Some((Announced::Reply, now + FAILURE_COALESCE_WINDOW));
                 }
             };
-        let no_reply = |due: &mut Option<Instant>, emit: &mut Vec<TurnEvent>, all: bool| {
-            if due.is_some_and(|until| all || until <= now) {
-                *due = None;
-                emit.push(TurnEvent::Finished {
-                    reply: String::new(),
-                });
-            }
-        };
-        if matches!(next, Some(Some(Incoming::Reply(_)))) {
-            // This reply answers the turn waiting for one, if any.
-            last_reply = Some(now);
-            no_reply_due = None;
-        }
         match next {
-            // A hold ran out: announce the failed reply with no status, and a
-            // turn whose reply never came.
-            None => {
-                if held.as_ref().is_some_and(|(_, until)| *until <= now) {
-                    release_held(&mut held, &mut emit, &mut announced);
-                }
-                no_reply(&mut no_reply_due, &mut emit, false);
-            }
+            // The hold ran out: announce the failed reply with no status.
+            None => release_held(&mut held, &mut emit, &mut announced),
             Some(None) => {
                 release_held(&mut held, &mut emit, &mut announced);
-                no_reply(&mut no_reply_due, &mut emit, true);
                 for event in emit {
                     let _ = out.send(event).await;
                 }
                 return;
-            }
-            Some(Some(Incoming::Working)) => in_turn = true,
-            Some(Some(Incoming::TurnEnded)) => {
-                let answered = last_reply.is_some_and(|at| now.duration_since(at) <= NO_REPLY_HOLD);
-                if std::mem::take(&mut in_turn) && !answered && no_reply_due.is_none() {
-                    no_reply_due = Some(now + NO_REPLY_HOLD);
-                }
             }
             Some(Some(Incoming::Reply(reply))) if reply.failed => {
                 if !matches!(recent, Some(Announced::Status(_))) {
@@ -517,9 +433,6 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
             Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
-                // The block is the turn's end, and it is announced.
-                in_turn = false;
-                no_reply_due = None;
                 match (held.is_some(), cause, recent) {
                     // The usage limit replaces the held failed reply.
                     (true, BlockCause::Quota, _) => {
@@ -527,9 +440,18 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                         emit.push(TurnEvent::Blocked { cause });
                         announced = Some((Announced::Status(cause), now + FAILURE_COALESCE_WINDOW));
                     }
-                    // The error is the held failed reply's own turn.
+                    // The error is the held failed reply's own turn: said
+                    // as the reply's summary, which carries the agent's own
+                    // words — or, when the reply has none, as the error.
                     (true, BlockCause::Error, _) => {
-                        release_held(&mut held, &mut emit, &mut announced)
+                        if held.as_ref().is_some_and(|(reply, _)| reply.is_empty()) {
+                            held = None;
+                            emit.push(TurnEvent::Blocked { cause });
+                            announced =
+                                Some((Announced::Status(cause), now + FAILURE_COALESCE_WINDOW));
+                        } else {
+                            release_held(&mut held, &mut emit, &mut announced)
+                        }
                     }
                     // Already said: an error after this turn's failed reply or
                     // after any block, a usage limit after a usage limit.
@@ -695,7 +617,7 @@ impl SettingsSummariser {
 
 impl TurnSummariser for SettingsSummariser {
     fn consented(&self) -> bool {
-        (self.load)().reading == ReadingConsent::On
+        (self.load)().reading_permitted()
     }
 
     fn summarise<'a>(&'a self, request: TurnSummaryRequest<'a>) -> SummaryFuture<'a> {
@@ -703,7 +625,7 @@ impl TurnSummariser for SettingsSummariser {
             // Immediately before the request: the opt-in may have been turned
             // off since this turn's event arrived.
             let settings = (self.load)();
-            if settings.reading != ReadingConsent::On {
+            if !settings.reading_permitted() {
                 return None;
             }
             let gate: RequestGate = {
@@ -711,14 +633,14 @@ impl TurnSummariser for SettingsSummariser {
                 let intent = settings.intent.clone();
                 Arc::new(move || {
                     let now = load();
-                    now.reading == ReadingConsent::On && now.intent.same_connection(&intent)
+                    now.reading_permitted() && now.intent.same_connection(&intent)
                 })
             };
             let transport = (self.connect)(&settings.intent, gate);
             let summary =
                 super::summary::summarise_over(&settings.intent, transport.as_ref(), request).await;
             if summary.fallback == Some(SummaryFailure::NotPermitted)
-                && (self.load)().reading != ReadingConsent::On
+                && !(self.load)().reading_permitted()
             {
                 return None;
             }
@@ -975,6 +897,7 @@ fn one_line(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{ReadingConsent, ReadingNotice};
     use std::sync::Mutex;
 
     /// A summariser that records what it was asked and answers with a fixed
@@ -1270,148 +1193,62 @@ mod tests {
         })
     }
 
-    /// Scenario (decision 7 of 2026-10-09): the agent works and its turn ends
-    /// with no reply on the reply stream; once [`NO_REPLY_HOLD`] passes, the
-    /// turn is announced as finished with an empty reply — which is said as a
-    /// turn with no reply to read.
+    /// Scenario (decision 7 of 2026-10-09, audit A2): a turn that ended with
+    /// nothing to read reaches reading as an empty reply on the reply stream,
+    /// in its place among the agent's turns. It is announced once, as a
+    /// finished turn with an empty reply — said as a turn with no reply to
+    /// read — and nothing is announced for a turn the stream did not report,
+    /// however long reading waits. A failed turn with nothing to read is still
+    /// one announcement beside its block status.
     #[tokio::test(start_paused = true)]
-    async fn voice_reading_a_turn_that_ends_with_no_reply_is_announced() {
+    async fn voice_reading_a_turn_with_no_reply_is_announced_once_in_order() {
         let heard = coalesced(vec![
-            (Incoming::Working, SHORT),
-            (Incoming::TurnEnded, LONG),
+            (finished("first"), SHORT),
+            (finished(""), SHORT),
+            (finished("third"), LONG),
         ])
         .await;
         assert_eq!(
             heard,
-            vec![TurnEvent::Finished {
-                reply: String::new()
-            }]
-        );
-    }
-
-    /// Scenario (decision 7): a turn end answered by its reply — the reply
-    /// arriving just before the status, as the daemon publishes them, or just
-    /// after it, over the other connection — is announced once, as that
-    /// reply; and a turn end arriving with the stream's close is still said.
-    #[tokio::test(start_paused = true)]
-    async fn voice_reading_a_turn_end_with_its_reply_in_either_order_is_one_turn() {
-        let one_turn = vec![TurnEvent::Finished {
-            reply: "done".to_string(),
-        }];
-        for script in [
             vec![
-                (Incoming::Working, SHORT),
-                (finished("done"), SHORT),
-                (Incoming::TurnEnded, LONG),
-            ],
-            vec![
-                (Incoming::Working, SHORT),
-                (Incoming::TurnEnded, SHORT),
-                (finished("done"), LONG),
-            ],
-            // The status stream lagging: the reply before the work it ends.
-            vec![
-                (finished("done"), SHORT),
-                (Incoming::Working, SHORT),
-                (Incoming::TurnEnded, LONG),
-            ],
-        ] {
-            assert_eq!(coalesced(script.clone()).await, one_turn, "{script:?}");
-        }
-        let closing = coalesced(vec![
-            (Incoming::Working, SHORT),
-            (Incoming::TurnEnded, SHORT),
-        ])
-        .await;
-        assert_eq!(
-            closing,
-            vec![TurnEvent::Finished {
-                reply: String::new()
-            }]
-        );
-    }
-
-    /// Scenario (decision 7): a turn end with no work seen before it — the
-    /// agent settling at start, or a second idle report for the same turn —
-    /// is not a turn and is not announced; and a turn that ended in an error
-    /// is announced as the error only.
-    #[tokio::test(start_paused = true)]
-    async fn voice_reading_an_idle_that_ends_no_turn_is_not_announced() {
-        assert_eq!(
-            coalesced(vec![(Incoming::TurnEnded, LONG)]).await,
-            Vec::<TurnEvent>::new()
+                TurnEvent::Finished {
+                    reply: "first".to_string()
+                },
+                TurnEvent::Finished {
+                    reply: String::new()
+                },
+                TurnEvent::Finished {
+                    reply: "third".to_string()
+                },
+            ]
         );
         assert_eq!(
             coalesced(vec![
-                (Incoming::Working, SHORT),
-                (finished("done"), SHORT),
-                (Incoming::TurnEnded, SHORT),
-                (Incoming::TurnEnded, LONG),
-            ])
-            .await,
-            vec![TurnEvent::Finished {
-                reply: "done".to_string()
-            }]
-        );
-        assert_eq!(
-            coalesced(vec![
-                (Incoming::Working, SHORT),
                 (blocked(BlockCause::Error), SHORT),
-                (Incoming::TurnEnded, LONG),
+                (failed(""), LONG)
             ])
             .await,
             vec![TurnEvent::Blocked {
                 cause: BlockCause::Error
             }]
         );
-    }
-
-    /// Scenario (decision 7): the status events that mark a turn's progress
-    /// are the agent's own work and its idle, and nothing synthesised for it
-    /// or guessed from its terminal output.
-    #[test]
-    fn voice_reading_turn_progress_is_the_agents_own_work_and_idle() {
-        use dot_agent_deck::event::{
-            UNPROVEN_METADATA_KEY, WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
-            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
-        };
-        for working in [
-            EventType::Thinking,
-            EventType::ToolStart,
-            EventType::ToolEnd,
-        ] {
-            assert_eq!(
-                turn_progress(&status("coder", working), "coder"),
-                Some(Incoming::Working)
-            );
-        }
         assert_eq!(
-            turn_progress(&status("coder", EventType::Idle), "coder"),
-            Some(Incoming::TurnEnded)
+            coalesced(vec![
+                (failed(""), SHORT),
+                (blocked(BlockCause::Error), LONG)
+            ])
+            .await,
+            vec![TurnEvent::Blocked {
+                cause: BlockCause::Error
+            }],
+            "with no words of the agent's, the error says more"
         );
         assert_eq!(
-            turn_progress(&status("tester", EventType::Idle), "coder"),
-            None
+            coalesced(vec![(failed(""), LONG)]).await,
+            vec![TurnEvent::Failed {
+                reply: String::new()
+            }]
         );
-        assert_eq!(
-            turn_progress(&status("coder", EventType::ShellIdle), "coder"),
-            None
-        );
-        assert_eq!(
-            turn_progress(&status("coder", EventType::SessionStart), "coder"),
-            None
-        );
-        let mut unproven = status("coder", EventType::Idle);
-        unproven
-            .metadata
-            .insert(UNPROVEN_METADATA_KEY.to_string(), "1".to_string());
-        assert_eq!(turn_progress(&unproven, "coder"), None);
-        let mut guessed = status("coder", EventType::Idle);
-        guessed.metadata.insert(
-            WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
-            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
-        );
-        assert_eq!(turn_progress(&guessed, "coder"), None);
     }
 
     fn status(agent: &str, event_type: EventType) -> AgentEvent {
@@ -2009,10 +1846,55 @@ mod tests {
                 } else {
                     ReadingConsent::Off
                 },
+                reading_notice: ReadingNotice::Shown,
                 ..VoiceSettings::default()
             }),
             Box::new(move |_, _| Box::new(posts.clone())),
         )
+    }
+
+    /// Scenario (audit A5): Reading is on but its one-time notice has not
+    /// been recorded as shown. Reading is not consented to, and a summary
+    /// request sends nothing; once the notice is recorded, the same reply is
+    /// summarised.
+    #[tokio::test]
+    async fn voice_reading_sends_nothing_before_the_notice_was_shown() {
+        let shown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let posts = Posts::default();
+        let summariser = {
+            let shown = Arc::clone(&shown);
+            let posts = posts.clone();
+            SettingsSummariser::new(
+                Arc::new(move || VoiceSettings {
+                    intent: IntentSettings::for_backend(
+                        crate::settings::IntentBackend::OpenaiCompatible,
+                    ),
+                    reading: ReadingConsent::On,
+                    reading_notice: if shown.load(std::sync::atomic::Ordering::SeqCst) {
+                        ReadingNotice::Shown
+                    } else {
+                        ReadingNotice::Pending
+                    },
+                    ..VoiceSettings::default()
+                }),
+                Box::new(move |_, _| Box::new(posts.clone())),
+            )
+        };
+        let request = TurnSummaryRequest {
+            agent: "tester",
+            kind: TurnKind::Finished,
+            reply: "a reply that must not leave yet",
+        };
+        assert!(!summariser.consented());
+        assert_eq!(summariser.summarise(request).await, None);
+        assert!(
+            posts.0.lock().unwrap().is_empty(),
+            "a request before the notice"
+        );
+        shown.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(summariser.consented());
+        assert!(summariser.summarise(request).await.is_some());
+        assert_eq!(posts.0.lock().unwrap().len(), 1);
     }
 
     /// Scenario (audit A-B1): reading starts with the opt-in on and a
@@ -2295,6 +2177,7 @@ mod tests {
             flipped_during_the_keychain_read(Arc::clone(&changed), move |changed| VoiceSettings {
                 intent: if changed { new.clone() } else { old.clone() },
                 reading: ReadingConsent::On,
+                reading_notice: ReadingNotice::Shown,
                 ..VoiceSettings::default()
             })
         };
@@ -2319,6 +2202,7 @@ mod tests {
                 } else {
                     ReadingConsent::On
                 },
+                reading_notice: ReadingNotice::Shown,
                 ..VoiceSettings::default()
             });
         assert_eq!(summariser.summarise(request).await, None);

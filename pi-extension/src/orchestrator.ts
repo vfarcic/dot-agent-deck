@@ -227,9 +227,10 @@ export function buildAgentEventArgv(
 			argv.push(`${flag}=${value}`);
 		}
 	}
-	// PRD #1497: LAST, and only when there is text — an older CLI's refusal
-	// of it is handled by `createReporter`, which drops the reply first. Only
-	// the flags: the text goes on stdin (`turnReplyStdin`).
+	// PRD #1497: LAST, and only on a report that carries a reply (an empty
+	// one included: the turn ended with nothing to read) — an older CLI's
+	// refusal of it is handled by `createReporter`, which drops the reply
+	// first. Only the flags: the text goes on stdin (`turnReplyStdin`).
 	if (turnReplyStdin(reply) !== undefined) {
 		argv.push(TURN_REPLY_STDIN_FLAG);
 		if (reply!.failed) {
@@ -448,12 +449,16 @@ export function piAssistantReply(message: unknown): TurnReply | undefined {
 
 /**
  * The stdin a report carrying `reply` writes for {@link TURN_REPLY_STDIN_FLAG}:
- * its text, at most {@link MAX_TURN_REPLY_BYTES}, or `undefined` when there is
- * nothing to read (no reply, or a blank one), in which case no reply flag is
- * sent either.
+ * its text, at most {@link MAX_TURN_REPLY_BYTES} — empty for a reply with
+ * nothing to read, which the deck takes as the turn ending with no reply — or
+ * `undefined` when the report carries no reply, in which case no reply flag
+ * is sent either.
  */
 export function turnReplyStdin(reply: TurnReply | undefined): string | undefined {
-	return reply !== undefined && reply.text.trim().length > 0 ? clipUtf8(reply.text, MAX_TURN_REPLY_BYTES) : undefined;
+	if (reply === undefined) {
+		return undefined;
+	}
+	return reply.text.trim().length > 0 ? clipUtf8(reply.text, MAX_TURN_REPLY_BYTES) : "";
 }
 
 /**
@@ -463,29 +468,35 @@ export function turnReplyStdin(reply: TurnReply | undefined): string | undefined
  * run's reply, and each assistant message replaces the one before, so what
  * `take` answers at `agent_settled` is the run's final reply. An assistant
  * message with nothing to read (only thinking or tool calls, empty, or an
- * error with no message) replaces it too, with nothing: the commentary an
- * earlier message carried is not the turn's reply. `take` clears it, so a
- * reply is reported once.
+ * error with no message) replaces it too, with an empty reply: the commentary
+ * an earlier message carried is not the turn's reply, and the deck is told
+ * the turn ended with nothing to read (audit A2). `take` answers `undefined`
+ * only when no run or assistant message was seen since the last `take`, and
+ * clears what it answers, so each turn end is reported once.
  */
 export function createTurnReplyTracker(): {
 	observe: (eventName: string, event: unknown) => void;
 	take: () => TurnReply | undefined;
 } {
 	let last: TurnReply | undefined;
+	let ran = false;
 	return {
 		observe(eventName, event) {
 			if (eventName === "agent_start") {
 				last = undefined;
+				ran = true;
 			} else if (eventName === "message_end") {
 				const message = asRecord(event)?.message;
 				if (asRecord(message)?.role === "assistant") {
-					last = piAssistantReply(message);
+					last = piAssistantReply(message) ?? { text: "", failed: asRecord(message)?.stopReason === "error" };
+					ran = true;
 				}
 			}
 		},
 		take() {
-			const reply = last;
+			const reply = ran ? (last ?? { text: "", failed: false }) : undefined;
 			last = undefined;
+			ran = false;
 			return reply;
 		},
 	};

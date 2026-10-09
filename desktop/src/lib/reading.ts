@@ -13,11 +13,25 @@
  * — and this hands each to the speech queue. The agent's reply never reaches
  * here; only the sentence does.
  *
- * The reader is told the switch and the agents to read
- * ({@link DeckReader.update}) whenever either changes. An agent that appears
- * gets a session, one that goes has its session stopped, and a change of deck
- * is the same thing: the old deck's agents go and the new deck's come.
- * Changing panes or screens changes neither, so it never ends reading.
+ * The reader is told the switch, the agents to read and the deck being viewed
+ * ({@link DeckReader.update}) whenever any changes. An agent that appears
+ * gets a session and one that goes has its session stopped. A change of deck
+ * stops the old deck's sessions too, and also drops whatever the app still
+ * had to say about that deck's agents, cutting off a sentence about one of
+ * them mid-way (audit A7): the user is no longer looking at that deck. An
+ * agent that exits on the deck being viewed is different: its last summary is
+ * still heard. Changing panes or screens changes none of these, so it never
+ * ends reading.
+ *
+ * # Starts that are refused for now
+ *
+ * A start refused because the switch was not yet on on disk is tried again
+ * when a save reports it on, including when that report arrived while the
+ * start was still being answered (audit A1). A start refused because the
+ * agent's deck already serves as many readers as it allows (a deck limits how
+ * many agents all windows read at once) is tried again a bounded number of
+ * times, sooner when one of this window's sessions on that deck ends (audit
+ * A4); the limit is said once per deck.
  *
  * # Turning it off
  *
@@ -41,8 +55,9 @@
  *
  * Every sentence comes in two forms, naming the agent and not. Which one is
  * said is decided when the speech queue takes the sentence up to say it
- * ({@link DeckReader}'s `openPane`): the bare one when that agent's pane is
- * the one open at that moment, the named one otherwise.
+ * ({@link DeckReader}'s `openPane`), and checked again right before provider
+ * audio plays: the bare one when that agent's pane is the one open at that
+ * moment, the named one otherwise.
  */
 
 import type { SpeechQueue } from "./speech";
@@ -72,7 +87,9 @@ export type ReadingStartDto =
   /** `scope` is `deck` when it is about the whole deck — said once for it. */
   | { kind: "unavailable"; sentence: string; scope?: "agent" | "deck" }
   /** The agent left its deck before it could be read; nothing is said. */
-  | { kind: "gone" };
+  | { kind: "gone" }
+  /** The agent's deck serves as many readers as it allows: tried again later. */
+  | { kind: "busy"; sentence: string };
 
 /**
  * One sentence to speak, from `desktop_voice_reading_start`'s channel — or,
@@ -138,16 +155,28 @@ export function isThisMachine(host: string): boolean {
   return name === "localhost" || name.endsWith(".localhost") || name === "::1" || name === "0.0.0.0" || /^127(\.\d{1,3}){3}$/.test(name);
 }
 
+/**
+ * How long after a deck refused an agent for having as many readers as it
+ * allows that agent is asked again, one delay per attempt. Past the last, it
+ * is asked again only when one of this window's sessions on that deck ends.
+ */
+export const BUSY_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000];
+
+/** How long after one of this window's sessions on a deck ends its refused agents are asked again. */
+export const CAPACITY_FREED_RETRY_MS = 1_000;
+
 export interface DeckReaderDeps {
   /** Subscribe to one agent's turn events; each finished sentence arrives on `onSentence`. */
   start: (target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => Promise<ReadingStartDto>;
   /** End the subscription `start` answered with `session`. */
   stop: (session: number) => Promise<void>;
-  speech: Pick<SpeechQueue, "say" | "interrupt">;
+  speech: Pick<SpeechQueue, "say" | "interrupt" | "drop">;
   /** The agent whose pane is open right now, asked when a sentence is said. */
   openPane?: () => { deckId: string; agentId: string } | undefined;
   /** A sentence about reading itself that the voice row shows; it is spoken too. */
   onProblem?: (sentence: string) => void;
+  /** Run `run` after `ms`; answers how to cancel it. `setTimeout` when absent. */
+  schedule?: (run: () => void, ms: number) => () => void;
 }
 
 /** The key one agent incarnation is read under, and speaks under. */
@@ -164,6 +193,13 @@ interface Session {
 interface DeckProblem {
   /** The deck's agents when the problem was met; another set retries. */
   agents: string;
+}
+
+interface Busy {
+  /** How many times the deck refused it for having as many readers as it allows. */
+  attempts: number;
+  /** Cancels the retry waiting to run, if one is. */
+  cancel?: () => void;
 }
 
 /**
@@ -186,6 +222,12 @@ export class DeckReader {
   private closed = new Set<string>();
   /** Agents refused because the switch was not yet on on disk: tried again on {@link consentOn}. */
   private refused = new Set<string>();
+  /** How many times a save has reported the switch on; a start remembers it (audit A1). */
+  private consents = 0;
+  /** Agents refused because their deck has as many readers as it allows (audit A4). */
+  private busy = new Map<string, Busy>();
+  /** The decks being viewed, as last told. */
+  private viewedDecks: ReadonlySet<string> | undefined;
   /** Agents that cannot be read: not tried again while they are still listed. */
   private failed = new Set<string>();
   /** Decks whose daemon cannot be read: no agent of theirs is started. */
@@ -208,13 +250,21 @@ export class DeckReader {
   }
 
   /**
-   * The switch and the agents to read. A change of the switch says "Reading
-   * on." or "Reading off." when `announce` (not on the first render, which
-   * is not a change the user made); a change of agents starts and stops
-   * sessions.
+   * The switch, the agents to read and the decks being viewed (`decks`: one,
+   * or every observed deck under All Decks). A change of the switch says
+   * "Reading on." or "Reading off." when `announce` (not on the first render,
+   * which is not a change the user made); a change of agents starts and stops
+   * sessions; a deck that leaves `decks` also has what was still to be said
+   * about its agents dropped. Without `decks`, no speech is dropped.
    */
-  update(enabled: boolean, agents: readonly ReadingAgent[], announce = true): void {
+  update(enabled: boolean, agents: readonly ReadingAgent[], announce = true, decks?: readonly string[]): void {
     this.wanted = new Map(agents.map((agent) => [readingKey(agent), agent]));
+    if (decks !== undefined) {
+      const viewed = new Set(decks);
+      const left = [...(this.viewedDecks ?? [])].filter((deckId) => !viewed.has(deckId)).map((deckId) => `${deckId}\u0000`);
+      if (left.length > 0) this.deps.speech.drop((key) => left.some((prefix) => key.startsWith(prefix)));
+      this.viewedDecks = viewed;
+    }
     if (enabled !== this.enabled) {
       this.enabled = enabled;
       if (enabled) this.activate(announce);
@@ -239,6 +289,7 @@ export class DeckReader {
    * a save had turned it off while the switch here still shows it on.
    */
   consentOn(): void {
+    this.consents += 1;
     if (!this.enabled) return;
     if (!this.active) {
       this.activate(false);
@@ -292,6 +343,8 @@ export class DeckReader {
     this.closed.clear();
     this.refused.clear();
     this.failed.clear();
+    for (const busy of this.busy.values()) busy.cancel?.();
+    this.busy.clear();
     this.deckProblems.clear();
     this.deckSaid.clear();
   }
@@ -300,18 +353,55 @@ export class DeckReader {
     for (const [key, session] of [...this.sessions]) {
       if (this.wanted.has(key)) continue;
       this.sessions.delete(key);
-      if (session.session !== undefined) void this.deps.stop(session.session).catch(() => undefined);
+      if (session.session !== undefined) this.release(session);
     }
     for (const set of [this.closed, this.refused, this.failed]) {
       for (const key of [...set]) if (!this.wanted.has(key)) set.delete(key);
+    }
+    for (const [key, busy] of [...this.busy]) {
+      if (this.wanted.has(key)) continue;
+      busy.cancel?.();
+      this.busy.delete(key);
     }
     for (const [deckId, problem] of [...this.deckProblems]) {
       if (problem.agents !== this.deckAgents(deckId)) this.deckProblems.delete(deckId);
     }
     for (const [key, agent] of this.wanted) {
-      if (this.sessions.has(key) || this.closed.has(key) || this.refused.has(key) || this.failed.has(key) || this.deckProblems.has(agent.deckId)) continue;
+      if (this.sessions.has(key) || this.closed.has(key) || this.refused.has(key) || this.failed.has(key) || this.busy.has(key) || this.deckProblems.has(agent.deckId)) continue;
       void this.startOne(key, agent);
     }
+  }
+
+  /** Stop a running session, and once it has stopped, ask its deck's refused agents again. */
+  private release(session: Session): void {
+    const deckId = session.target.deckId;
+    void this.deps.stop(session.session!).catch(() => undefined).then(() => this.capacityFreed(deckId));
+  }
+
+  /** One of this window's sessions on `deckId` ended: its agents the deck refused for being full are asked again soon. */
+  private capacityFreed(deckId: string): void {
+    if (!this.active) return;
+    for (const [key, busy] of this.busy) {
+      const agent = this.wanted.get(key);
+      if (agent === undefined || agent.deckId !== deckId) continue;
+      busy.cancel?.();
+      busy.cancel = this.schedule(() => this.retryBusy(key), CAPACITY_FREED_RETRY_MS);
+    }
+  }
+
+  private retryBusy(key: string): void {
+    const busy = this.busy.get(key);
+    if (busy === undefined) return;
+    busy.cancel = undefined;
+    const agent = this.wanted.get(key);
+    if (!this.active || agent === undefined || this.sessions.has(key)) return;
+    void this.startOne(key, agent);
+  }
+
+  private schedule(run: () => void, ms: number): () => void {
+    if (this.deps.schedule !== undefined) return this.deps.schedule(run, ms);
+    const timer = setTimeout(run, ms);
+    return () => clearTimeout(timer);
   }
 
   /** The deck's agents as one comparable value. */
@@ -323,6 +413,7 @@ export class DeckReader {
     const record: Session = { target: agent };
     this.sessions.set(key, record);
     const current = () => this.sessions.get(key) === record;
+    const consents = this.consents;
     let answer: ReadingStartDto;
     try {
       answer = await this.deps.start({ deckId: agent.deckId, agentId: agent.agentId, label: agent.label }, (sentence) => {
@@ -336,14 +427,27 @@ export class DeckReader {
       return;
     }
     if (answer.kind === "started") {
-      if (current()) record.session = answer.session;
-      else void this.deps.stop(answer.session).catch(() => undefined);
+      if (current()) {
+        record.session = answer.session;
+        this.busy.get(key)?.cancel?.();
+        this.busy.delete(key);
+      } else {
+        void this.deps.stop(answer.session).catch(() => undefined);
+      }
       return;
     }
     if (!current()) return;
     this.sessions.delete(key);
     if (answer.kind === "not_enabled") {
-      this.refused.add(key);
+      /* A save reported the switch on while this start was being answered,
+         so its settings read may predate that save: ask again at once
+         (audit A1). Otherwise it waits for the next such report. */
+      if (this.consents !== consents) void this.startOne(key, agent);
+      else this.refused.add(key);
+      return;
+    }
+    if (answer.kind === "busy") {
+      this.full(key, agent, answer.sentence);
       return;
     }
     if (answer.kind === "gone") {
@@ -369,6 +473,20 @@ export class DeckReader {
     this.problem(answer.sentence);
   }
 
+  /** The deck refused `agent` for having as many readers as it allows: say so once for the deck, and ask again later. */
+  private full(key: string, agent: ReadingAgent, sentence: string): void {
+    const busy = this.busy.get(key) ?? { attempts: 0 };
+    busy.attempts += 1;
+    busy.cancel?.();
+    busy.cancel = undefined;
+    this.busy.set(key, busy);
+    const delay = BUSY_RETRY_MS[busy.attempts - 1];
+    if (delay !== undefined) busy.cancel = this.schedule(() => this.retryBusy(key), delay);
+    if (this.deckSaid.get(agent.deckId) === sentence) return;
+    this.deckSaid.set(agent.deckId, sentence);
+    this.problem(sentence);
+  }
+
   private heard(key: string, record: Session, sentence: ReadingSentenceDto): void {
     if (sentence.kind === "ended") {
       this.consentOff();
@@ -378,10 +496,11 @@ export class DeckReader {
       // Nothing cut off: the last summary is already queued and is heard.
       this.sessions.delete(key);
       this.closed.add(key);
+      this.capacityFreed(record.target.deckId);
       return;
     }
     const { deckId, agentId } = record.target;
-    const text = () => {
+    const say = () => {
       const open = this.deps.openPane?.();
       return open !== undefined && open.deckId === deckId && open.agentId === agentId ? (sentence.bare ?? sentence.text) : sentence.text;
     };
@@ -389,7 +508,7 @@ export class DeckReader {
        and only that agent's: another agent's news is never dropped for it.
        Each permission prompt or error waits under a key of its own, so
        nothing later drops what the user has to act on. */
-    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000alert\u0000${++this.alerts}`, text);
+    this.deps.speech.say(sentence.kind === "turn" ? key : `${key}\u0000alert\u0000${++this.alerts}`, { say, safe: sentence.text });
   }
 
   private problem(sentence: string): void {

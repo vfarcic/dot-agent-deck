@@ -3,7 +3,7 @@
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, CAP_TURN_REPLIES, DAEMON_CAPABILITIES, MAX_TURN_REPLY_BYTES,
 };
-use dot_agent_deck::hook::extract_turn_reply;
+use dot_agent_deck::hook::{extract_codex_hook_turn_reply, extract_turn_reply};
 use dot_agent_deck::quota_signals::extract_codex_turn_reply;
 use serde_json::{Value, json};
 
@@ -25,12 +25,13 @@ fn claude_stop_reply_is_extracted() {
     assert!(!reply.failed);
 }
 
-/// Scenario: Decode Stop payloads whose last assistant message is missing, null, or an unexpected JSON type. They must produce no reply without losing the hook to a panic or parse error.
+/// Scenario: Decode Stop payloads whose last assistant message is missing, null, blank, or an unexpected JSON type. Each is still the main turn's end and must produce exactly one empty reply, the report of a turn with nothing to read, without losing the hook to a panic or parse error.
 #[test]
-fn claude_stop_without_reply_is_tolerated() {
+fn claude_stop_without_reply_is_an_empty_turn_end() {
     for extra in [
         json!({}),
         json!({"last_assistant_message": null}),
+        json!({"last_assistant_message": " \n "}),
         json!({"last_assistant_message": {"text": "unexpected"}}),
     ] {
         let mut payload =
@@ -39,11 +40,30 @@ fn claude_stop_without_reply_is_tolerated() {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        assert!(
-            extract_turn_reply(&payload).is_none(),
-            "no string reply in {payload}"
-        );
+        let reply = extract_turn_reply(&payload)
+            .unwrap_or_else(|| panic!("a main-agent Stop is a turn end: {payload}"));
+        assert!(reply.is_empty(), "nothing to read in {payload}");
+        assert!(!reply.failed);
     }
+}
+
+/// Scenario: Decode Codex Stop payloads. One that carries no last-assistant-message field at all must report nothing, so the rollout's report of the same turn decides; one whose message is null or blank must report the turn as ended with nothing to read; one with text keeps it.
+#[test]
+fn codex_stop_reports_an_empty_turn_only_when_it_says_so() {
+    let stop = json!({"session_id": "codex-session", "hook_event_name": "Stop"});
+    assert_eq!(extract_codex_hook_turn_reply(&stop), None);
+    for message in [Value::Null, json!("  ")] {
+        let mut payload = stop.clone();
+        payload["last_assistant_message"] = message;
+        let reply = extract_codex_hook_turn_reply(&payload).expect("Codex said there was none");
+        assert!(reply.is_empty(), "{payload}");
+    }
+    let mut payload = stop;
+    payload["last_assistant_message"] = json!("Done.");
+    assert_eq!(
+        extract_codex_hook_turn_reply(&payload).map(|r| r.text),
+        Some("Done.".to_string())
+    );
 }
 
 /// Scenario: Supply a last-assistant-message field on a tool, notification, and subagent hook, and on a Stop explicitly attributed to a subagent. None may be read as the pane's main turn ending.
@@ -105,18 +125,23 @@ fn codex_task_complete_captured_reply_is_extracted() {
     assert!(!reply.failed);
 }
 
-/// Scenario: Remove the reply from a captured completion and change its record or event type. These shapes must not produce a reply from tool output or other non-completion data.
+/// Scenario: Remove the reply from a captured completion, then change its record or event type. The completion with no reply must report its turn as ended with nothing to read, keeping its turn id; the other shapes must not produce a reply from tool output or other non-completion data.
 #[test]
-fn codex_reply_ignores_noncompletion_and_absent_reply() {
+fn codex_reply_ignores_noncompletion_and_reports_absent_reply_as_empty() {
     let original: Value = serde_json::from_str(CAPTURED_CODEX_COMPLETE).unwrap();
     let mut absent = original.clone();
     absent["payload"]
         .as_object_mut()
         .unwrap()
         .remove("last_agent_message");
-    assert!(extract_codex_turn_reply(&absent).is_none());
+    let empty = extract_codex_turn_reply(&absent).expect("a completion is a turn end");
+    assert!(empty.is_empty());
+    assert_eq!(
+        empty.turn_id.as_deref(),
+        Some("01a0fd0c-4a03-7cf1-bd44-5dd82f4e99a9")
+    );
     absent["payload"]["last_agent_message"] = Value::Null;
-    assert!(extract_codex_turn_reply(&absent).is_none());
+    assert!(extract_codex_turn_reply(&absent).unwrap().is_empty());
     for event in ["task_started", "agent_message", "turn_aborted"] {
         let mut record = original.clone();
         record["payload"]["type"] = event.into();
