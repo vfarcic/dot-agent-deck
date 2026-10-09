@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { READING_NOT_IN_THIS_RUNTIME, useReadingMode } from "./useReadingMode";
-import { READING_ON, type ReadingAgent } from "../lib/reading";
+import { NOT_ENABLED_RETRY_MS, READING_ON, type ReadingAgent } from "../lib/reading";
 import { wordedNow, type SpeechText } from "../lib/speech";
 
 const PLANNER: ReadingAgent = { deckId: "deck-00000000000000a1", agentId: "planner", label: "Plan / architecture" };
@@ -99,5 +99,37 @@ describe("useReadingMode", () => {
       await flush();
     });
     expect(runtime.voiceReadingStart).toHaveBeenCalledTimes(2);
+  });
+
+  /** Scenario (PR #1617's Qodo review): the consent-on listener fails to register and the first start reads the settings before Reading's save reached the disk; the reader asks again on its own, and the agent's next turn is read. */
+  it("still reads when the consent-on listener could not be installed", async () => {
+    vi.useFakeTimers();
+    try {
+      const { runtime, hook } = mount(async () => () => undefined);
+      runtime.onVoiceReadingConsentOn.mockImplementation(async () => { throw new Error("event API unavailable"); });
+      hook.unmount();
+      const again = renderHook(() => useReadingMode(runtime, () => undefined));
+      const heard: string[] = [];
+      vi.spyOn(again.result.current.queue, "say").mockImplementation((_key, text: SpeechText) => { heard.push(wordedNow(text)); });
+      let sink: ((sentence: { kind: "turn"; text: string }) => void) | undefined;
+      runtime.voiceReadingStart
+        .mockImplementationOnce(async () => ({ kind: "not_enabled", sentence: "Reading is off." }) as never)
+        .mockImplementationOnce((async (_target: unknown, onSentence: typeof sink) => {
+          sink = onSentence;
+          return { kind: "started" as const, session: 8 };
+        }) as never);
+      await act(async () => {
+        again.result.current.reader.update(true, [PLANNER], false);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(runtime.voiceReadingStart).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(NOT_ENABLED_RETRY_MS[0]); });
+      expect(runtime.voiceReadingStart).toHaveBeenCalledTimes(2);
+      sink!({ kind: "turn", text: "The planner finished: the plan is ready." });
+      expect(heard).toEqual(["The planner finished: the plan is ready."]);
+      again.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -29,7 +29,11 @@
  *
  * A start refused because the switch was not yet on on disk is tried again
  * when a save reports it on, including when that report arrived while the
- * start was still being answered (audit A1). A start refused because the
+ * start was still being answered (audit A1). A window that could not install
+ * the listener those reports arrive on ({@link DeckReader.consentOnUnheard})
+ * asks again on a bounded schedule instead, and once that runs out says the
+ * refusal, so reading never waits silently on a report that cannot reach it
+ * (PR #1617's Qodo review). A start refused because the
  * agent's deck already serves as many readers as it allows (a deck limits how
  * many agents all windows read at once) is tried again a bounded number of
  * times, sooner when one of this window's sessions on that deck ends (audit
@@ -164,6 +168,14 @@ export function isThisMachine(host: string): boolean {
  */
 export const BUSY_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000];
 
+/**
+ * How long after a start was refused because the switch was not yet on on
+ * disk that agent is asked again, one delay per attempt — only in a window
+ * that cannot hear a save report the switch on. Past the last, the refusal is
+ * said and the agent waits for the switch to be turned off and on again.
+ */
+export const NOT_ENABLED_RETRY_MS: readonly number[] = [500, 2_000, 5_000, 15_000];
+
 /** How long after one of this window's sessions on a deck ends its refused agents are asked again. */
 export const CAPACITY_FREED_RETRY_MS = 1_000;
 
@@ -240,6 +252,10 @@ export class DeckReader {
   private refused = new Set<string>();
   /** How many times a save has reported the switch on; a start remembers it (audit A1). */
   private consents = 0;
+  /** Whether a save reporting the switch on can reach this window ({@link consentOnUnheard}). */
+  private hearsConsentOn = true;
+  /** Agents refused because the switch was not yet on on disk, asked again on {@link NOT_ENABLED_RETRY_MS}: only while {@link hearsConsentOn} is false. */
+  private unconfirmed = new Map<string, Busy>();
   /** Agents refused because their deck has as many readers as it allows (audit A4). */
   private busy = new Map<string, Busy>();
   /** The decks being viewed, as last told. */
@@ -315,6 +331,22 @@ export class DeckReader {
     this.reconcile();
   }
 
+  /**
+   * This window could not install the listener {@link consentOn} is called
+   * from, so no save will ever report the switch on here. A start refused
+   * because the switch was not yet on on disk is then asked again on
+   * {@link NOT_ENABLED_RETRY_MS} instead of waiting for that report.
+   */
+  consentOnUnheard(): void {
+    this.hearsConsentOn = false;
+    if (!this.active) return;
+    for (const key of [...this.refused]) {
+      const agent = this.wanted.get(key);
+      this.refused.delete(key);
+      if (agent !== undefined) this.unconfirmedRefusal(key, agent, undefined);
+    }
+  }
+
   /** "stop" / "quiet": silence the app now. Reading stays on. */
   quiet(): void {
     this.deps.speech.interrupt();
@@ -360,8 +392,9 @@ export class DeckReader {
     this.closed.clear();
     this.refused.clear();
     this.failed.clear();
-    for (const busy of this.busy.values()) busy.cancel?.();
+    for (const pending of [...this.busy.values(), ...this.unconfirmed.values()]) pending.cancel?.();
     this.busy.clear();
+    this.unconfirmed.clear();
     this.deckProblems.clear();
     this.deckSaid.clear();
   }
@@ -389,16 +422,18 @@ export class DeckReader {
     for (const set of [this.closed, this.refused, this.failed]) {
       for (const key of [...set]) if (!this.wanted.has(key)) set.delete(key);
     }
-    for (const [key, busy] of [...this.busy]) {
-      if (this.wanted.has(key)) continue;
-      busy.cancel?.();
-      this.busy.delete(key);
+    for (const pendings of [this.busy, this.unconfirmed]) {
+      for (const [key, pending] of [...pendings]) {
+        if (this.wanted.has(key)) continue;
+        pending.cancel?.();
+        pendings.delete(key);
+      }
     }
     for (const [deckId, problem] of [...this.deckProblems]) {
       if (problem.agents !== this.deckAgents(deckId)) this.deckProblems.delete(deckId);
     }
     for (const [key, agent] of this.wanted) {
-      if (this.sessions.has(key) || this.closed.has(key) || this.refused.has(key) || this.failed.has(key) || this.busy.has(key) || this.deckProblems.has(agent.deckId)) continue;
+      if (this.sessions.has(key) || this.closed.has(key) || this.refused.has(key) || this.failed.has(key) || this.busy.has(key) || this.unconfirmed.has(key) || this.deckProblems.has(agent.deckId)) continue;
       void this.startOne(key, agent);
     }
   }
@@ -447,9 +482,14 @@ export class DeckReader {
   }
 
   private retryBusy(key: string): void {
-    const busy = this.busy.get(key);
-    if (busy === undefined) return;
-    busy.cancel = undefined;
+    this.retry(this.busy, key);
+  }
+
+  /** Ask `key` again, if it is still waiting in `pendings` and still wanted. */
+  private retry(pendings: Map<string, Busy>, key: string): void {
+    const pending = pendings.get(key);
+    if (pending === undefined) return;
+    pending.cancel = undefined;
     const agent = this.wanted.get(key);
     if (!this.active || agent === undefined || this.sessions.has(key)) return;
     void this.startOne(key, agent);
@@ -486,8 +526,10 @@ export class DeckReader {
     if (answer.kind === "started") {
       if (current()) {
         record.session = answer.session;
-        this.busy.get(key)?.cancel?.();
-        this.busy.delete(key);
+        for (const pendings of [this.busy, this.unconfirmed]) {
+          pendings.get(key)?.cancel?.();
+          pendings.delete(key);
+        }
       } else {
         void this.deps.stop(answer.session).catch(() => undefined);
       }
@@ -498,9 +540,11 @@ export class DeckReader {
     if (answer.kind === "not_enabled") {
       /* A save reported the switch on while this start was being answered,
          so its settings read may predate that save: ask again at once
-         (audit A1). Otherwise it waits for the next such report. */
+         (audit A1). Otherwise it waits for the next such report, or, where
+         no such report can arrive, is asked again on a schedule. */
       if (this.consents !== consents) void this.startOne(key, agent);
-      else this.refused.add(key);
+      else if (this.hearsConsentOn) this.refused.add(key);
+      else this.unconfirmedRefusal(key, agent, answer.sentence);
       return;
     }
     if (answer.kind === "busy") {
@@ -540,6 +584,30 @@ export class DeckReader {
     const delay = BUSY_RETRY_MS[busy.attempts - 1];
     if (delay !== undefined) busy.cancel = this.schedule(() => this.retryBusy(key), delay);
     if (this.deckSaid.get(agent.deckId) === sentence) return;
+    this.deckSaid.set(agent.deckId, sentence);
+    this.problem(sentence);
+  }
+
+  /**
+   * `agent` was refused because the switch was not yet on on disk, in a
+   * window no save can report the switch on to: ask again after the next
+   * delay of {@link NOT_ENABLED_RETRY_MS}, and once those run out, stop asking
+   * and say the refusal (`sentence`) once for the deck.
+   */
+  private unconfirmedRefusal(key: string, agent: ReadingAgent, sentence: string | undefined): void {
+    const pending = this.unconfirmed.get(key) ?? { attempts: 0 };
+    pending.attempts += 1;
+    pending.cancel?.();
+    pending.cancel = undefined;
+    const delay = NOT_ENABLED_RETRY_MS[pending.attempts - 1];
+    if (delay !== undefined) {
+      this.unconfirmed.set(key, pending);
+      pending.cancel = this.schedule(() => this.retry(this.unconfirmed, key), delay);
+      return;
+    }
+    this.unconfirmed.delete(key);
+    this.refused.add(key);
+    if (sentence === undefined || this.deckSaid.get(agent.deckId) === sentence) return;
     this.deckSaid.set(agent.deckId, sentence);
     this.problem(sentence);
   }

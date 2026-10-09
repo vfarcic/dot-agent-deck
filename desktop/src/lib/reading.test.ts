@@ -6,6 +6,7 @@ import {
   DeckReader,
   EXITED_DRAIN_MS,
   isThisMachine,
+  NOT_ENABLED_RETRY_MS,
   READING_OFF,
   READING_ON,
   READING_VOICE_KEY,
@@ -256,6 +257,61 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     h.reader.update(true, [TESTER, CODER]);
     await flush();
     expect(h.start).toHaveBeenCalledTimes(3);
+  });
+
+  /** Scenario (PR #1617's Qodo review): this window could not install the consent-on listener, so no save can report Reading on to it. A start refused as not enabled is asked again on a schedule rather than waiting, and is read once the save has reached the disk; a waiting retry is not kept for an agent that has gone. */
+  it("asks again for a not-enabled refusal when no consent-on report can arrive", async () => {
+    let enabled = false;
+    let session = 0;
+    const h = harness(() => (enabled ? { kind: "started", session: ++session } : { kind: "not_enabled", sentence: "Reading is off." }));
+    h.reader.consentOnUnheard();
+    h.reader.update(true, [TESTER, CODER], false);
+    await flush();
+    expect(h.started()).toEqual(["tester", "coder"]);
+    expect(h.waiting()).toEqual([NOT_ENABLED_RETRY_MS[0], NOT_ENABLED_RETRY_MS[0]]);
+    h.reader.update(true, [TESTER], false);
+    expect(h.waiting()).toEqual([NOT_ENABLED_RETRY_MS[0]]);
+    enabled = true;
+    h.runTimers();
+    await flush();
+    expect(h.started()).toEqual(["tester", "coder", "tester"]);
+    expect(h.waiting()).toEqual([]);
+    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: green.", bare: "Finished: green." });
+    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "The tester finished: green."]);
+    expect(h.problems).toEqual([]);
+  });
+
+  /** Scenario (PR #1617's Qodo review): no consent-on report can reach this window and the switch stays off on disk; the reader asks again on a growing delay, and once those run out it says the refusal once, so reading does not wait silently. Turning Reading off and on again asks afresh. */
+  it("says a not-enabled refusal once its retries run out", async () => {
+    let enabled = false;
+    const h = harness(() => (enabled ? { kind: "started", session: 1 } : { kind: "not_enabled", sentence: "Reading is off." }));
+    h.reader.consentOnUnheard();
+    h.reader.update(true, [TESTER], false);
+    await flush();
+    for (const delay of NOT_ENABLED_RETRY_MS) {
+      expect(h.waiting()).toEqual([delay]);
+      expect(h.problems).toEqual([]);
+      h.runTimers();
+      await flush();
+    }
+    expect(h.start).toHaveBeenCalledTimes(NOT_ENABLED_RETRY_MS.length + 1);
+    expect(h.waiting()).toEqual([]);
+    expect(h.problems).toEqual(["Reading is off."]);
+    h.reader.update(false, [TESTER], false);
+    enabled = true;
+    h.reader.update(true, [TESTER], false);
+    await flush();
+    expect(h.start).toHaveBeenCalledTimes(NOT_ENABLED_RETRY_MS.length + 2);
+    expect(h.reader.reading).toEqual([readingKey(TESTER)]);
+  });
+
+  /** Scenario: a window that hears consent-on reports schedules nothing for a not-enabled refusal; it waits for the report instead. */
+  it("schedules no retry for a not-enabled refusal while consent-on reports can arrive", async () => {
+    const h = harness(() => ({ kind: "not_enabled", sentence: "Reading is off." }));
+    h.reader.update(true, [TESTER], false);
+    await flush();
+    expect(h.waiting()).toEqual([]);
+    expect(h.problems).toEqual([]);
   });
 
   /** Scenario (audit A4): the deck already reports as many agents' turns as it can, so it refuses two of this window's agents; the limit is said once for the deck. Each refused agent is asked again on a growing delay while the deck stays full, and as soon as one of this window's sessions on that deck ends it is asked again shortly and is read. */

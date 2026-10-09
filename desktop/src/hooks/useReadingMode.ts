@@ -46,8 +46,9 @@ export function useReadingMode(
      starts only after it, and not at all if it rejects. */
   const listening = useRef<Promise<void> | undefined>(undefined);
   /* Settles once this window can hear a consent-on save, or could not
-     install that listener. Reading starts only after it too, so a save
-     reported on after a start read the settings is never missed (audit A1). */
+     install that listener and has told the reader so. Reading starts only
+     after it too, so a save reported on after a start read the settings is
+     never missed (audit A1). */
   const hearingOn = useRef<Promise<void> | undefined>(undefined);
 
   const { reader, queue } = useMemo(() => {
@@ -101,10 +102,16 @@ export function useReadingMode(
     const installed = (subscribeOff?.(() => { reader.consentOff(); }) ?? Promise.reject(new Error("no consent-off listener"))).then(keep);
     listening.current = installed;
     installed.catch(() => undefined);
+    /* A window that cannot hear a save report the switch on still reads: the
+       reader asks a refused agent again on its own schedule instead of
+       waiting for that report (PR #1617's Qodo review). It is told before
+       any start runs, since starts wait for this. Asked inside a promise, so
+       a seam that throws counts as one that rejected. */
     const subscribeOn = runtimeRef.current.onVoiceReadingConsentOn;
     if (subscribeOn !== undefined) {
-      // Asked inside a promise, so a seam that throws costs only the retry.
-      hearingOn.current = Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => undefined);
+      hearingOn.current = Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => { reader.consentOnUnheard(); });
+    } else {
+      reader.consentOnUnheard();
     }
     return () => {
       gone = true;
