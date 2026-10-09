@@ -77,7 +77,8 @@
 //!   does an arm naming only the same rollout; an arm for another turn or a
 //!   different rollout replaces it; and its completion or abort, a later
 //!   reply-less `Stop` for it and the drain that follows, its rollout's path
-//!   no longer naming the file, or the agent's exit closes it. See
+//!   no longer naming the file (on Unix; elsewhere only a path that no longer
+//!   resolves is noticed), or the agent's exit closes it. See
 //!   [`MAX_ENDED_TURNS`].
 //!
 //!   A turn that never reaches a `Stop` and writes no record (a Codex that
@@ -186,8 +187,9 @@ const MAX_PENDING_BYTES: usize = 1024 * 1024;
 /// turn's. Repeated arms of that turn keep the watch, as does an arm naming
 /// only the same rollout; an arm for another turn or a different rollout
 /// replaces it; its completion or abort, a later reply-less `Stop` for it and
-/// the drain that follows, its rollout's path no longer naming the file, or
-/// the agent's exit closes it. That is accepted rather than ordered: it needs
+/// the drain that follows, its rollout's path no longer naming the file (on
+/// Unix; elsewhere only a path that no longer resolves is noticed), or the
+/// agent's exit closes it. That is accepted rather than ordered: it needs
 /// one arm of a sequential Codex session overtaken by four of that session's
 /// later turn ends, and it costs at most one held file descriptor per agent
 /// and the possible displacement of a newer turn's watch.
@@ -865,11 +867,13 @@ fn read_tailer(
         return (None, None);
     }
     open.offset += buf.len() as u64;
-    // A read that came back short of `want` hit the end of the file below the
-    // length just checked: the file was truncated between the check and the
-    // read, to where this read stopped. For a retiring watch nothing past it
-    // is left to read, so what was read is still fed to the watch and the
-    // file is then closed.
+    // A read that came back short of `want` met the end of the file before the
+    // boundary just checked, so the file was truncated after the check. That
+    // shows only the end this read met; the file can grow again before the
+    // tick ends. For a retiring watch the complete lines that were read are
+    // still fed to the watch and the file is then closed without waiting for
+    // later growth, so bytes rewritten or appended past that end may be
+    // skipped for this one retiring turn.
     let shrank_while_retiring = tailer.retiring.is_some() && (buf.len() as u64) < want;
 
     let Some(watch) = tailer.watch.as_mut() else {
