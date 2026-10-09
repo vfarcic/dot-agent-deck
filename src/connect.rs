@@ -423,77 +423,99 @@ pub fn probe_remote_version(
     // install_path because non-interactive ssh shells typically don't have
     // ~/.local/bin on PATH (same fix as ea8c748).
     let cmd = format!("{install_path} --version");
-    let result = executor.run_capped(target, &cmd, PROBE_VERSION_CAP);
-    match result {
-        Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        // A stream that reached its cap is a prefix, and `parse_version_output`
-        // reads only the FIRST two tokens — so a status-0 remote emitting
-        // exactly `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
-        // `dot-agent-deck <version>` pair would otherwise PASS on the strength
-        // of output we know we stopped reading (PRD #345 second audit).
-        // Refusing to trust a truncated handshake is strictly safer for
-        // `connect` too, not only for the doctor.
-        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+    match classify_version_probe(executor.run_capped(target, &cmd, PROBE_VERSION_CAP)) {
+        Ok(version) => Ok(version),
+        Err(VersionProbeFailure::Ssh(ssh_err)) => Err(map_probe_ssh_error(name, ssh_err)),
+        Err(VersionProbeFailure::Truncated) => Err(RemoteConnectError::ProbeOutputTruncated {
             name: name.to_string(),
             probe: "--version",
             cap: PROBE_VERSION_CAP,
         }),
-        Ok(capped) => {
-            let output = capped.output;
-            // Exit 127 (and the typical bash "command not found" message) is
-            // the canonical "binary missing" signal. We also treat any
-            // non-zero exit whose stderr mentions "not found" as missing —
-            // some shells use 126/127 inconsistently for permission vs
-            // missing.
-            if output.status == 127
-                || output.stderr.to_ascii_lowercase().contains("not found")
-                || output.stderr.to_ascii_lowercase().contains("no such file")
-            {
-                return Err(RemoteConnectError::RemoteBinaryMissing {
-                    name: name.to_string(),
-                    install_path: install_path.to_string(),
-                });
-            }
-            // Any other non-zero exit means the remote ran *something* and
-            // it failed; surface it as a host-unreachable-style error so the
-            // user sees the underlying message rather than a misleading
-            // "binary missing" hint.
-            if output.status != 0 {
-                // The remote wrote this. It reaches a terminal verbatim (and
-                // `remote doctor` quotes the first 200 characters of it into
-                // its report), so a malicious remote binary or shell startup
-                // file could otherwise smuggle CSI/OSC sequences that repaint
-                // the screen, retitle the terminal or forge a hyperlink —
-                // including over the diagnostic's own conclusions. Escape,
-                // don't strip: the user should be able to SEE that the remote
-                // sent something peculiar.
-                let detail = if output.stderr.trim().is_empty() {
-                    format!("ssh exited with status {}", output.status)
-                } else {
-                    crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
-                };
-                return Err(RemoteConnectError::HostUnreachable {
-                    name: name.to_string(),
-                    detail,
-                });
-            }
-            match parse_version_output(&output.stdout) {
-                // PRD #161 M1.2: no laptop↔remote comparison — just surface
-                // the remote version for the newer-only nudge decision.
-                Some(remote_version) => Ok(remote_version),
-                None => {
-                    // Status was 0 but stdout doesn't look like a version
-                    // line — e.g. `dot-agent-deck` was replaced with a stub
-                    // script. Treat as binary-missing because `remote
-                    // upgrade` is the right recovery path.
-                    Err(RemoteConnectError::RemoteBinaryMissing {
-                        name: name.to_string(),
-                        install_path: install_path.to_string(),
-                    })
-                }
-            }
-        }
+        Err(VersionProbeFailure::BinaryMissing) => Err(RemoteConnectError::RemoteBinaryMissing {
+            name: name.to_string(),
+            install_path: install_path.to_string(),
+        }),
+        // Any other non-zero exit means the remote ran *something* and it
+        // failed; surface it as a host-unreachable-style error so the user
+        // sees the underlying message rather than a misleading "binary
+        // missing" hint.
+        Err(VersionProbeFailure::Failed { detail }) => Err(RemoteConnectError::HostUnreachable {
+            name: name.to_string(),
+            detail,
+        }),
     }
+}
+
+/// Why the binary-version probe (`<install_path> --version` over ssh) produced
+/// no version: [`classify_version_probe`]'s classification, shared by
+/// [`probe_remote_version`] and the desktop's remote start
+/// ([`crate::daemon_start`], issue #1490) so the two cannot disagree about what
+/// a reply means.
+#[derive(Debug)]
+pub enum VersionProbeFailure {
+    /// ssh itself failed: unreachable, authentication, host key.
+    Ssh(SshError),
+    /// A stream reached its cap, so the reply is a prefix and was not parsed.
+    Truncated,
+    /// ssh succeeded and the remote shell found no deck binary at the path
+    /// (or something that does not print a deck version line).
+    BinaryMissing,
+    /// The remote ran something and it failed; `detail` is its stderr,
+    /// escaped for a terminal.
+    Failed { detail: String },
+}
+
+/// Whether a remote command's exit `status` and `stderr` say the binary it
+/// named is not there. Exit 127 (and the typical bash "command not found"
+/// message) is the canonical signal; any non-zero exit whose stderr mentions
+/// "not found" or "no such file" counts too, because some shells use 126/127
+/// inconsistently for permission vs missing.
+pub fn is_missing_binary(status: i32, stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    status == 127 || stderr.contains("not found") || stderr.contains("no such file")
+}
+
+/// Classify what one binary-version probe returned: the remote's version, or
+/// why there is none. See [`probe_remote_version`] for the failure modes.
+pub fn classify_version_probe(
+    result: Result<crate::remote::CappedOutput, SshError>,
+) -> Result<String, VersionProbeFailure> {
+    let capped = result.map_err(VersionProbeFailure::Ssh)?;
+    // A stream that reached its cap is a prefix, and `parse_version_output`
+    // reads only the FIRST two tokens — so a status-0 remote emitting exactly
+    // `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
+    // `dot-agent-deck <version>` pair would otherwise PASS on the strength of
+    // output we know we stopped reading (PRD #345 second audit). Refusing to
+    // trust a truncated handshake is strictly safer for `connect` too, not
+    // only for the doctor.
+    if capped.truncated {
+        return Err(VersionProbeFailure::Truncated);
+    }
+    let output = capped.output;
+    if is_missing_binary(output.status, &output.stderr) {
+        return Err(VersionProbeFailure::BinaryMissing);
+    }
+    if output.status != 0 {
+        // The remote wrote this. It reaches a terminal verbatim (and `remote
+        // doctor` quotes the first 200 characters of it into its report), so a
+        // malicious remote binary or shell startup file could otherwise smuggle
+        // CSI/OSC sequences that repaint the screen, retitle the terminal or
+        // forge a hyperlink — including over the diagnostic's own conclusions.
+        // Escape, don't strip: the user should be able to SEE that the remote
+        // sent something peculiar.
+        let detail = if output.stderr.trim().is_empty() {
+            format!("ssh exited with status {}", output.status)
+        } else {
+            crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
+        };
+        return Err(VersionProbeFailure::Failed { detail });
+    }
+    // PRD #161 M1.2: no laptop↔remote comparison — just surface the remote
+    // version for the newer-only nudge decision. Status 0 but stdout that does
+    // not look like a version line (e.g. `dot-agent-deck` replaced with a stub
+    // script) is binary-missing, because `remote upgrade` is the right
+    // recovery path.
+    parse_version_output(&output.stdout).ok_or(VersionProbeFailure::BinaryMissing)
 }
 
 /// Maximum bytes of stdout the protocol probe accepts before declaring the

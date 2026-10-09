@@ -6,7 +6,7 @@ This page takes you from nothing to one agent running in the deck, then points t
 
 - **The daemon** runs in the background and owns the agents: their processes, terminals and statuses. The first `dot-agent-deck` run starts it; you do not start it yourself.
 - **The TUI** (`dot-agent-deck`) is a terminal client of that daemon. Quitting it can leave the agents running.
-- **The desktop app** (alpha) is a second client of the same daemon. An agent started from either client shows up in both. It covers the dashboard, starting agents, several daemons at once, settings and voice control; see [Desktop app](desktop/index.md). It connects to a daemon but does not start one, so start with the TUI.
+- **The desktop app** (alpha) is a second client of the same daemon. An agent started from either client shows up in both. It covers the dashboard, starting agents, several daemons at once, settings and voice control; see [Desktop app](desktop/index.md). It can start a daemon itself; this guide starts with the TUI.
 
 The deck tracks the status of five agents: [Claude Code](https://www.anthropic.com/claude-code) (`claude`), [OpenCode](https://opencode.ai) (`opencode`), [Pi](https://github.com/earendil-works/pi) (`pi`), [Codex](https://github.com/openai/codex) (`codex`) and [Devin](https://devin.ai) (`devin`). A pane can run any other command too, without status tracking.
 
@@ -55,7 +55,7 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 
 ![The TUI with no agents: “No active agents. Press Ctrl+n to create an agent.” above the command bar, which starts with a COMMAND chip](/img/dashboard-empty-tui.png)
 
-**Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**. If it says **Daemon disconnected**, no daemon is running; start one and press **Reconnect**.
+**Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**. If it says **Daemon disconnected** with **Start daemon**, no daemon is running; press **Start daemon** and confirm.
 
 ![The desktop app's dashboard with no agents: “No agents are running yet” and a New agent button](/img/dashboard-empty-desktop.png)
 

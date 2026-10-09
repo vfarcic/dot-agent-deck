@@ -3197,7 +3197,8 @@ use crate::orchestrator_context::{
 // ---------------------------------------------------------------------------
 
 /// One orchestration bucket from [`partition_hydrated_panes`]:
-/// the role slots for a single `(cwd, orchestration_name)` pairing. Each
+/// the role slots for a single orchestration tab, keyed by its per-tab
+/// [`crate::state::OrchestrationIdentity`]. Each
 /// entry carries the role's index, pane id, and the role identity
 /// metadata (`role_name`, `is_start_role`) the daemon echoed back via
 /// `TabMembership::Orchestration`. The hydration glue expands this to a
@@ -3219,13 +3220,13 @@ pub struct OrchestrationHydrationBucket {
     pub display_title: Option<String>,
     /// PRD #140 M3.0: the per-tab instance token this bucket was keyed on —
     /// `TabMembership::Orchestration.orchestration_id`, echoed back by the
-    /// daemon on every surviving role pane of the tab. `None` is a token-less
-    /// (pre-#140) client, in which case the bucket was keyed on the legacy
-    /// `(name, cwd)` tuple. Retained on the bucket (rather than consumed and
-    /// dropped by the partition) so the rebuild can re-derive the SAME
-    /// [`crate::state::OrchestrationIdentity`] the key used — see
-    /// [`Self::identity`].
-    pub orchestration_id: Option<String>,
+    /// daemon on every surviving role pane of the tab. Retained on the bucket
+    /// (rather than consumed and dropped by the partition) so the rebuild can
+    /// re-derive the SAME [`crate::state::OrchestrationIdentity`] the key
+    /// used — see [`Self::identity`]. Issue #463: never absent — a pane whose
+    /// membership carries no token is not bucketed at all
+    /// ([`HydrationRejection::TokenlessOrchestration`]).
+    pub orchestration_id: String,
     pub role_slots: Vec<OrchestrationRoleSlot>,
     /// Issue #1395 item 1: the per-publish context file the daemon recorded for
     /// this orchestration, read off its start-role pane's record or its start
@@ -3247,15 +3248,9 @@ impl OrchestrationHydrationBucket {
     /// buckets and anything derived per-bucket must be namespaced per-identity
     /// or it aliases across them (see [`dead_slot_pane_id`]).
     pub fn identity(&self) -> crate::state::OrchestrationIdentity {
-        match &self.orchestration_id {
-            Some(id) => crate::state::OrchestrationIdentity::Instance {
-                id: id.clone(),
-                name: self.orchestration_name.clone(),
-            },
-            None => crate::state::OrchestrationIdentity::NameCwd {
-                name: self.orchestration_name.clone(),
-                cwd: self.cwd.clone(),
-            },
+        crate::state::OrchestrationIdentity {
+            id: self.orchestration_id.clone(),
+            name: self.orchestration_name.clone(),
         }
     }
 }
@@ -3472,6 +3467,24 @@ fn legacy_mode_hydration_warning(mode_names: &[&str]) -> Option<String> {
     Some(format!(
         "Workspace modes were removed (#1199): panes started under mode(s) {names} were placed \
          on the dashboard as plain panes."
+    ))
+}
+
+/// Issue #463: the one `session_warnings` line for the hydrated panes whose
+/// orchestration membership carried no `orchestration_id`, naming each
+/// orchestration once. `None` when there were none.
+fn tokenless_orchestration_hydration_warning(orchestration_names: &[&str]) -> Option<String> {
+    if orchestration_names.is_empty() {
+        return None;
+    }
+    let names = orchestration_names
+        .iter()
+        .map(|n| crate::config_validation::escape_id_for_log(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Panes of orchestration(s) {names} were started by a client older than v0.35.0, which \
+         is no longer supported (#463), and were placed on the dashboard as plain panes."
     ))
 }
 
@@ -3723,6 +3736,18 @@ pub enum HydrationRejection {
         agent_id: String,
         pane_id: String,
     },
+    /// Issue #463: the daemon echoed a `TabMembership::Orchestration` with no
+    /// `orchestration_id` — a pane a client predating v0.35.0 started, which a
+    /// daemon before #463 accepted. Such clients are no longer supported and
+    /// there is no per-tab identity to rebuild the tab under, so the pane lands
+    /// on the dashboard as a plain card, and the hydration site tells the user
+    /// why.
+    TokenlessOrchestration {
+        cwd: String,
+        orchestration_name: String,
+        agent_id: String,
+        pane_id: String,
+    },
 }
 
 /// Output of [`partition_hydrated_panes`]: separates hydrated panes into
@@ -3755,18 +3780,20 @@ pub struct HydrationPartition {
 ///   [`HydrationRejection::LegacyWorkspaceMode`] record (issue #1199: the
 ///   variant is deprecated and only an older TUI produces it). Cwd defaults
 ///   to `""` when the daemon record omits it (older daemon shape).
+/// - `Some(Orchestration { orchestration_id: None, .. })` → dashboard, plus a
+///   [`HydrationRejection::TokenlessOrchestration`] record (issue #463: only a
+///   client predating v0.35.0 produces it, and those are no longer supported).
 /// - `Some(Orchestration { name, role_index })` → orchestration bucket
 ///   keyed by the same [`crate::state::OrchestrationIdentity`] the daemon
-///   routes on (PRD #140 M3.0): a per-tab `orchestration_id` token keys
-///   `Instance { id, name }`, and its absence falls back to the legacy
-///   `NameCwd { name, cwd }` tuple. Each bucket collects
+///   routes on (PRD #140 M3.0): the per-tab `orchestration_id` token plus the
+///   name. Each bucket collects
 ///   `(role_index, pane_id)` and may be sparse (a role can be missing if
 ///   its agent died before the TUI reattached); the dispatcher expands
 ///   this to a `Vec<Option<String>>` of full role-count length.
 ///
 /// Ordering is stable: dashboard panes preserve input order, and
-/// orchestration buckets preserve the order in which their (cwd, name)
-/// pairing was first seen so the user's mental "which tab opened first"
+/// orchestration buckets preserve the order in which their identity
+/// was first seen so the user's mental "which tab opened first"
 /// model survives reconnect (TabManager appends in iteration order).
 pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition {
     let mut out = HydrationPartition::default();
@@ -3800,30 +3827,47 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
             }
             Some(TabMembership::Orchestration {
                 name,
+                orchestration_cwd,
+                orchestration_id: None,
+                ..
+            }) => {
+                // Issue #463: no per-tab token, so no identity to rebuild a
+                // tab under — the `(name, cwd)` fallback that used to key such
+                // a pane is retired. Record the reason for the caller to
+                // report and route the pane to the dashboard as a plain card,
+                // as a legacy workspace-mode pane is.
+                out.rejections
+                    .push(HydrationRejection::TokenlessOrchestration {
+                        cwd: orchestration_cwd.clone().unwrap_or(cwd),
+                        orchestration_name: name.clone(),
+                        agent_id: h.agent_id.clone(),
+                        pane_id: h.pane_id.clone(),
+                    });
+                out.dashboard_pane_ids.push(h.pane_id.clone());
+            }
+            Some(TabMembership::Orchestration {
+                name,
                 role_index,
                 role_name,
                 is_start_role,
                 orchestration_cwd,
                 display_title,
-                // PRD #140 M3.0: the per-tab instance token IS part of the
-                // hydration bucket key (see `key` below) so two
-                // same-`(name, cwd)` tabs rebuild as two tabs instead of
-                // merging into one and orphaning half the panes.
-                orchestration_id,
+                // PRD #140 M3.0: the per-tab instance token IS the hydration
+                // bucket key (see `key` below) so two same-`(name, cwd)` tabs
+                // rebuild as two tabs instead of merging into one and
+                // orphaning half the panes.
+                orchestration_id: Some(orchestration_id),
             }) => {
-                // Round-12 reviewer #1: bucket by `(orchestration_cwd,
-                // name)` — the same identity tuple the daemon uses for
-                // `pane_orchestration_map`. Round-9 #2 made each role
-                // pane's own cwd independent (workers can live in
-                // sub-directories of the orchestration); using the
-                // per-pane cwd here would split a 3-role orchestration
-                // across 3 buckets on reattach. The orchestration_cwd
-                // field is shared across roles, so all three end up in
-                // one bucket.
+                // Round-12 reviewer #1: the bucket's cwd is the shared
+                // `orchestration_cwd`, not the pane's own. Round-9 #2 made each
+                // role pane's own cwd independent (workers can live in
+                // sub-directories of the orchestration), so the per-pane cwd
+                // differs across the roles of one tab; the orchestration_cwd
+                // field is shared across roles and names the project whose
+                // config the rebuild loads.
                 //
                 // Older daemons/clients (pre-round-11) omit the field;
-                // fall back to per-pane cwd to keep the partition
-                // behaviour stable for that legacy data, but log a
+                // fall back to per-pane cwd for that legacy data, but log a
                 // debug breadcrumb so a stale producer is visible.
                 let bucket_cwd = match orchestration_cwd {
                     Some(c) => c.clone(),
@@ -3840,25 +3884,15 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
                     }
                 };
                 // PRD #140 M3.0: mirror the daemon's `pane_orchestration_map`
-                // construct site (`daemon_protocol.rs` StartAgent) exactly — a
-                // stamped `orchestration_id` keys the tab by INSTANCE, and only
-                // its absence falls back to the legacy `(name, cwd)` tuple. Two
-                // tabs of the same orchestration in the same directory carry
+                // construct site (`daemon_protocol.rs` StartAgent) exactly — the
+                // stamped `orchestration_id` keys the tab by INSTANCE. Two tabs
+                // of the same orchestration in the same directory carry
                 // byte-identical `(name, cwd)` pairs, so without the token they
                 // merged into one bucket on reattach and half the role panes were
-                // orphaned to the dashboard. Mixed variants are never equal
-                // (derived `PartialEq`), which is the right answer here too: a
-                // tokened and a token-less pane came from different clients and
-                // there is no evidence they shared a tab.
-                let key = match orchestration_id {
-                    Some(id) => crate::state::OrchestrationIdentity::Instance {
-                        id: id.clone(),
-                        name: name.clone(),
-                    },
-                    None => crate::state::OrchestrationIdentity::NameCwd {
-                        name: name.clone(),
-                        cwd: bucket_cwd.clone(),
-                    },
+                // orphaned to the dashboard.
+                let key = crate::state::OrchestrationIdentity {
+                    id: orchestration_id.clone(),
+                    name: name.clone(),
                 };
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
@@ -3935,34 +3969,28 @@ pub fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPartition
 /// the two tabs' distinct dead roles shared ONE `AppState.sessions` placeholder
 /// card (the second `insert_placeholder_session` overwrote the first, and the
 /// surviving card rendered in both tabs' card grids). Keying on the identity
-/// means the `Instance` token partitions the ids exactly as it partitions the
-/// routing groups; a token-less (`NameCwd`) bucket keeps the pre-review byte
-/// format, so legacy reconnects reproduce the same ids as before.
+/// means the per-tab token partitions the ids exactly as it partitions the
+/// routing groups.
 ///
 /// Follow-up to 0d5e651 (auditor finding #4): the variable-width
 /// components are length-prefixed so distinct identities can never
-/// collide. The previous `-`-separated form was ambiguous whenever cwd
-/// or orchestration_name contained hyphens: e.g. (cwd="/a", name="b-c",
-/// idx=1) and (cwd="/a-b", name="c", idx=1) both produced
-/// `__dead-slot__-/a-b-c-1`.
+/// collide. The previous `-`-separated form was ambiguous whenever a
+/// component contained hyphens: e.g. (cwd="/a", name="b-c", idx=1) and
+/// (cwd="/a-b", name="c", idx=1) both produced `__dead-slot__-/a-b-c-1`.
 pub fn dead_slot_pane_id(
     identity: &crate::state::OrchestrationIdentity,
     role_index: usize,
 ) -> String {
-    match identity {
-        // The `i-` discriminator can never be confused with the `NameCwd` arm
-        // below, whose first component is always a decimal length.
-        crate::state::OrchestrationIdentity::Instance { id, name } => format!(
-            "{DEAD_SLOT_PREFIX}i-{id_len}-{id}-{name_len}-{name}-{role_index}",
-            id_len = id.len(),
-            name_len = name.len(),
-        ),
-        crate::state::OrchestrationIdentity::NameCwd { name, cwd } => format!(
-            "{DEAD_SLOT_PREFIX}{cwd_len}-{cwd}-{name_len}-{name}-{role_index}",
-            cwd_len = cwd.len(),
-            name_len = name.len(),
-        ),
-    }
+    // The `i-` discriminator kept the instance form apart from the retired
+    // token-less form (issue #463), whose first component was a decimal
+    // length; it stays so the ids a live tab already minted do not change
+    // under it.
+    let crate::state::OrchestrationIdentity { id, name } = identity;
+    format!(
+        "{DEAD_SLOT_PREFIX}i-{id_len}-{id}-{name_len}-{name}-{role_index}",
+        id_len = id.len(),
+        name_len = name.len(),
+    )
 }
 
 /// Reserved prefix for synthetic dead-slot pane ids produced by
@@ -6278,6 +6306,20 @@ fn surface_one_orchestration(
         return;
     }
 
+    // Issue #463: no per-tab token means no identity to build the tab under —
+    // the same reason hydration leaves a token-less pane on the dashboard. Every
+    // producer in a daemon of this protocol stamps one, so this is a surface
+    // from a membership a client older than v0.35.0 started.
+    let Some(orchestration_id) = surface.orchestration_id.clone() else {
+        tracing::warn!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface carries no orchestration_id (a client older than \
+             v0.35.0, no longer supported, #463); not building a tab for it"
+        );
+        return;
+    };
+
     // Reuse the hydration partition's config resolution: the local project
     // config when present, else a minimal config synthesised from the surface's
     // role metadata (same as a remote reconnect whose local config is absent).
@@ -6292,9 +6334,9 @@ fn surface_one_orchestration(
         // directory. `pane spawn` (issue #868) broke that premise — it spawns
         // into the CALLING orchestration's own (non-unique) cwd — so the
         // daemon's `OrchestrationSurface` now carries the PRD #140 per-tab
-        // `Instance` token as an additive field (both producers populate it)
-        // and this bucket carries it through.
-        orchestration_id: surface.orchestration_id.clone(),
+        // token as an additive field (both producers populate it) and this
+        // bucket carries it through.
+        orchestration_id,
         role_slots: surface
             .roles
             .iter()
@@ -6673,7 +6715,7 @@ fn surface_one_orchestration(
         &surface.cwd,
         role_pane_ids.clone(),
         bucket.display_title.as_deref(),
-        bucket.orchestration_id.as_deref(),
+        Some(bucket.orchestration_id.as_str()),
         Some(orch_idx),
     ) {
         Ok((tab_index, _)) => {
@@ -13535,6 +13577,7 @@ pub fn run_tui(
         // (M2.12 fixup reviewer #3: partition stays I/O-free; logging
         // lives at the hydration call site).
         let mut legacy_mode_names: Vec<&str> = Vec::new();
+        let mut tokenless_orchestration_names: Vec<&str> = Vec::new();
         for rejection in &partition.rejections {
             match rejection {
                 HydrationRejection::LegacyWorkspaceMode {
@@ -13555,9 +13598,33 @@ pub fn run_tui(
                         legacy_mode_names.push(mode_name);
                     }
                 }
+                HydrationRejection::TokenlessOrchestration {
+                    cwd,
+                    orchestration_name,
+                    agent_id,
+                    pane_id,
+                } => {
+                    let (safe_cwd, safe_name) =
+                        legacy_mode_hydration_log_fields(cwd, orchestration_name);
+                    tracing::warn!(
+                        cwd = %safe_cwd,
+                        orchestration = %safe_name,
+                        agent_id = %agent_id,
+                        pane_id = %pane_id,
+                        "hydration: orchestration pane carries no orchestration_id (started by a client older than v0.35.0, no longer supported, #463); placing it on the dashboard"
+                    );
+                    if !tokenless_orchestration_names.contains(&orchestration_name.as_str()) {
+                        tokenless_orchestration_names.push(orchestration_name);
+                    }
+                }
             }
         }
         if let Some(warning) = legacy_mode_hydration_warning(&legacy_mode_names) {
+            ui.session_warnings.push(warning);
+        }
+        if let Some(warning) =
+            tokenless_orchestration_hydration_warning(&tokenless_orchestration_names)
+        {
             ui.session_warnings.push(warning);
         }
         // Cache cwd → project config so the lookup happens once per
@@ -13728,7 +13795,7 @@ pub fn run_tui(
                 &bucket.cwd,
                 role_pane_ids.clone(),
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
                 Some(start_role_index),
             ) {
                 Ok((tab_index, _)) => {
@@ -24954,7 +25021,7 @@ mod tests {
             cwd: "/work".into(),
             orchestration_name: "team".into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: Vec::new(),
             context_path,
         };
@@ -26864,6 +26931,21 @@ mod tests {
 
     /// Issue #1199: the hydration site turns those records into ONE
     /// `session_warnings` line naming the mode(s), and none when there were none.
+    /// Issue #463: the hydration warning for panes a client older than v0.35.0
+    /// started is one line naming each orchestration, says why they are on the
+    /// dashboard, and escapes a hostile name.
+    #[test]
+    fn tokenless_orchestration_hydration_warning_is_one_line_naming_the_orchestrations() {
+        assert_eq!(tokenless_orchestration_hydration_warning(&[]), None);
+        let line = tokenless_orchestration_hydration_warning(&["tdd-cycle", "evil\u{1b}[2J\nx"])
+            .expect("a warning when any pane carried no orchestration_id");
+        assert!(!line.contains('\n'), "one line: {line:?}");
+        assert!(!line.contains('\u{1b}'), "escaped: {line:?}");
+        assert!(line.contains("tdd-cycle"), "{line}");
+        assert!(line.contains("v0.35.0") && line.contains("#463"), "{line}");
+        assert!(line.contains("dashboard"), "{line}");
+    }
+
     #[test]
     fn legacy_mode_hydration_warning_is_one_line_naming_the_modes() {
         assert_eq!(legacy_mode_hydration_warning(&[]), None);
@@ -26977,7 +27059,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -26991,7 +27073,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27005,7 +27087,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27040,7 +27122,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             );
             pane.orchestrator_context_path = Some(PathBuf::from(path));
@@ -27070,8 +27152,9 @@ mod tests {
     /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
     /// giving each tab's orchestrator and coder panes a distinct shared
     /// instance id. The tokened records must rebuild as two two-pane buckets,
-    /// while otherwise-identical legacy records without ids retain the
-    /// one-bucket fallback.
+    /// while otherwise-identical records without ids (a client older than
+    /// v0.35.0, issue #463) rebuild no tab: every pane lands on the dashboard
+    /// and each is reported as a token-less orchestration pane.
     #[test]
     fn partition_separates_same_name_cwd_orchestrations_by_instance_id() {
         fn orchestration_panes(ids: [Option<&str>; 2]) -> Vec<HydratedPane> {
@@ -27102,15 +27185,33 @@ mod tests {
         }
 
         let legacy = partition_hydrated_panes(&orchestration_panes([None, None]));
-        assert_eq!(
-            legacy.orchestration_buckets.len(),
-            1,
-            "legacy memberships without orchestration_id keep the (name, cwd) fallback"
+        assert!(
+            legacy.orchestration_buckets.is_empty(),
+            "memberships without orchestration_id rebuild no tab (issue #463); got {:?}",
+            legacy.orchestration_buckets
         );
         assert_eq!(
-            legacy.orchestration_buckets[0].role_slots.len(),
-            4,
-            "the legacy fallback keeps all four panes in its single bucket"
+            legacy.dashboard_pane_ids,
+            vec![
+                "pane-0-orchestrator".to_string(),
+                "pane-0-coder".to_string(),
+                "pane-1-orchestrator".to_string(),
+                "pane-1-coder".to_string(),
+            ],
+            "every token-less pane lands on the dashboard, in input order"
+        );
+        assert_eq!(legacy.rejections.len(), 4);
+        assert!(
+            legacy.rejections.iter().all(|r| matches!(
+                r,
+                HydrationRejection::TokenlessOrchestration {
+                    cwd,
+                    orchestration_name,
+                    ..
+                } if cwd == "/work/project" && orchestration_name == "tdd-cycle"
+            )),
+            "each token-less pane is reported with its orchestration and cwd: {:?}",
+            legacy.rejections
         );
 
         let tokened = partition_hydrated_panes(&orchestration_panes([
@@ -27226,7 +27327,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None, // leading slot omits the title
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27240,7 +27341,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: Some("My Custom Run".into()),
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27253,10 +27354,12 @@ mod tests {
         );
     }
 
-    /// Negative-case mirror of the above: two panes with the same
-    /// orchestration name but distinct orchestration_cwds must end
-    /// up in DIFFERENT buckets — the round-11 #C collision-fix
-    /// invariant carried through the hydration partition.
+    /// Negative-case mirror of the above: two tabs with the same
+    /// orchestration name but distinct orchestration_cwds end up in
+    /// DIFFERENT buckets, each under its own orchestration_cwd — the
+    /// round-11 #C collision-fix invariant carried through the hydration
+    /// partition. Issue #463: the bucket key is the per-tab token, which
+    /// two tabs never share, so it is the token that splits them.
     #[test]
     fn partition_separates_orchestrations_by_orchestration_cwd_not_pane_cwd() {
         let panes = vec![
@@ -27271,7 +27374,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-a".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-a".to_string()),
                 }),
             ),
             hydrated(
@@ -27285,7 +27388,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-b".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-b".to_string()),
                 }),
             ),
         ];
@@ -27295,6 +27398,12 @@ mod tests {
             2,
             "distinct orchestration_cwds must split into distinct buckets"
         );
+        let cwds: Vec<&str> = p
+            .orchestration_buckets
+            .iter()
+            .map(|b| b.cwd.as_str())
+            .collect();
+        assert_eq!(cwds, vec!["/home/u/project-a", "/home/u/project-b"]);
     }
 
     /// Legacy data path: a pre-round-11 daemon emits orchestration
@@ -27314,7 +27423,7 @@ mod tests {
                 is_start_role: true,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
         )];
         let p = partition_hydrated_panes(&panes);
@@ -27336,7 +27445,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27350,7 +27459,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27370,14 +27479,13 @@ mod tests {
             && !s.is_start_role));
     }
 
-    /// PRD #140 review: test shorthand for the LEGACY (token-less) routing
-    /// identity — the `OrchestrationIdentity` shape a pre-#140 client's
-    /// hydration bucket carries, and the one the dead-slot id namespace used to
-    /// be hard-coded to.
-    fn legacy_identity(cwd: &str, name: &str) -> crate::state::OrchestrationIdentity {
-        crate::state::OrchestrationIdentity::NameCwd {
+    /// Test shorthand for a routing identity. Issue #463: this used to build
+    /// the retired token-less `(name, cwd)` identity; the dead-slot tests that
+    /// used it only need SOME identity, so it now builds a tokened one.
+    fn test_identity(id: &str, name: &str) -> crate::state::OrchestrationIdentity {
+        crate::state::OrchestrationIdentity {
+            id: id.to_string(),
             name: name.to_string(),
-            cwd: cwd.to_string(),
         }
     }
 
@@ -27409,7 +27517,7 @@ mod tests {
         ];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27446,14 +27554,14 @@ mod tests {
         // Same (identity, role_index) must produce the same id so a
         // reconnect doesn't keep minting fresh placeholder cards on
         // every reattach.
-        let a = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
-        let b = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4);
+        let a = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
+        let b = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 4);
         assert_eq!(a, b);
         // Different role_index → different id.
-        let c = dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 3);
+        let c = dead_slot_pane_id(&test_identity("orch-tab-a", "tdd-cycle"), 3);
         assert_ne!(a, c);
         // Different orchestration → different id.
-        let d = dead_slot_pane_id(&legacy_identity("/work", "other-cycle"), 4);
+        let d = dead_slot_pane_id(&test_identity("orch-tab-a", "other-cycle"), 4);
         assert_ne!(a, d);
         // is_dead_slot_pane_id accepts the synthesized id and rejects
         // a normal numeric pane id.
@@ -27469,7 +27577,7 @@ mod tests {
     /// happen.
     #[test]
     fn dead_slot_pane_id_is_namespaced_by_orchestration_instance() {
-        let instance = |id: &str| crate::state::OrchestrationIdentity::Instance {
+        let instance = |id: &str| crate::state::OrchestrationIdentity {
             id: id.to_string(),
             name: "tdd-cycle".to_string(),
         };
@@ -27482,31 +27590,26 @@ mod tests {
         );
         // Still idempotent per identity, so a reconnect reuses the same card.
         assert_eq!(tab_a, dead_slot_pane_id(&instance("orch-tab-a"), 4));
-        // A tokened id can never collide with a token-less one, whatever the
-        // cwd/name spelling — the two variants are different routing groups.
-        assert_ne!(
-            tab_a,
-            dead_slot_pane_id(&legacy_identity("/work", "tdd-cycle"), 4)
-        );
         assert!(is_dead_slot_pane_id(&tab_a) && is_dead_slot_pane_id(&tab_b));
     }
 
     // Follow-up to 0d5e651 (auditor finding #4): the old format
-    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever cwd
-    // or orchestration_name contained hyphens. Two distinct tuples
-    // could produce the same synthetic id, which would then alias
-    // their placeholder sessions. Pin that the length-prefixed format
-    // disambiguates the textbook collision case.
+    // `__dead-slot__-{cwd}-{name}-{idx}` was ambiguous whenever a
+    // component contained hyphens. Two distinct identities could produce
+    // the same synthetic id, which would then alias their placeholder
+    // sessions. Pin that the length-prefixed format disambiguates the
+    // textbook collision case, now on the (token, name) pair the id is
+    // built from (issue #463).
     #[test]
     fn dead_slot_pane_id_disambiguates_hyphenated_inputs() {
-        // Under the old `-`-separated form both inputs formatted to
-        // `__dead-slot__-/a-b-c-1`. Under the length-prefixed form
-        // they are guaranteed distinct.
-        let a = dead_slot_pane_id(&legacy_identity("/a", "b-c"), 1);
-        let b = dead_slot_pane_id(&legacy_identity("/a-b", "c"), 1);
+        // Under a `-`-separated form both inputs would format to
+        // `…a-b-c-1`. Under the length-prefixed form they are
+        // guaranteed distinct.
+        let a = dead_slot_pane_id(&test_identity("a", "b-c"), 1);
+        let b = dead_slot_pane_id(&test_identity("a-b", "c"), 1);
         assert_ne!(
             a, b,
-            "differently-hyphenated (cwd, orchestration_name) tuples \
+            "differently-hyphenated (id, orchestration_name) pairs \
              must produce distinct synthetic ids"
         );
     }
@@ -27531,7 +27634,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27545,7 +27648,7 @@ mod tests {
         // so the helper short-circuits on each iteration).
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27581,7 +27684,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -27593,7 +27696,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some("p-orch".to_string()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity(cwd, orchestration_name),
+            &test_identity("orch-tab-a", orchestration_name),
             cwd,
             &mut state,
         );
@@ -27637,7 +27740,7 @@ mod tests {
             None,
         ];
         let assigned =
-            assign_synthetic_dead_slot_ids(&mut slots, &legacy_identity("/work", "tdd-cycle"));
+            assign_synthetic_dead_slot_ids(&mut slots, &test_identity("orch-tab-a", "tdd-cycle"));
         assert_eq!(
             assigned.len(),
             2,
@@ -27700,7 +27803,7 @@ mod tests {
         // dead slot. State must remain untouched.
         let synthetic_ids = assign_synthetic_dead_slot_ids(
             &mut role_pane_ids,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
         );
         assert_eq!(synthetic_ids.len(), 1, "exactly the role 2 slot is dead");
         assert!(state.sessions.is_empty(), "phase 1 must not seed sessions");
@@ -27823,7 +27926,7 @@ mod tests {
         let mut slots: Vec<Option<String>> = vec![Some(real_pane.clone()), None];
         fill_dead_slots_with_placeholders(
             &mut slots,
-            &legacy_identity("/work", "tdd-cycle"),
+            &test_identity("orch-tab-a", "tdd-cycle"),
             "/work",
             &mut state,
         );
@@ -27886,7 +27989,8 @@ mod tests {
 
     #[test]
     fn partition_separates_orchestrations_by_cwd() {
-        // Same orchestration name, different cwds — two separate tabs.
+        // Same orchestration name, different cwds — two separate tabs, each
+        // with its own per-tab token.
         let panes = vec![
             hydrated(
                 "1",
@@ -27899,7 +28003,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-a".to_string()),
                 }),
             ),
             hydrated(
@@ -27913,7 +28017,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-tab-b".to_string()),
                 }),
             ),
         ];
@@ -27944,7 +28048,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -27980,7 +28084,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -27994,7 +28098,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -28040,7 +28144,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -28054,7 +28158,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -28152,7 +28256,7 @@ mod tests {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
             )
             .expect("synthesised-config hydration must succeed");
         assert_eq!(tab_index, 1, "first non-dashboard tab is at index 1");
@@ -28185,7 +28289,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
             hydrated(
@@ -28199,7 +28303,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
             ),
         ];
@@ -28301,7 +28405,7 @@ mod tests {
             cwd: "/remote/proj".into(),
             orchestration_name: "review".into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: vec![
                 OrchestrationRoleSlot {
                     role_index: 0,
@@ -44954,7 +45058,7 @@ mod config_drift_tests {
             cwd: "/work/proj".into(),
             orchestration_name: name.into(),
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: "orch-test-0".into(),
             role_slots: slots
                 .iter()
                 .map(|(i, r)| OrchestrationRoleSlot {
@@ -45080,9 +45184,9 @@ mod config_drift_tests {
         ];
         let _ = assign_synthetic_dead_slot_ids(
             &mut ids,
-            &crate::state::OrchestrationIdentity::NameCwd {
+            &crate::state::OrchestrationIdentity {
+                id: "orch-test-0".to_string(),
                 name: "review".into(),
-                cwd: "/w".into(),
             },
         );
         let ids: Vec<String> = ids.into_iter().map(|p| p.expect("filled")).collect();

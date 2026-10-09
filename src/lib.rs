@@ -20,6 +20,8 @@ pub mod daemon_attach;
 pub mod daemon_client;
 pub mod daemon_protocol;
 pub mod daemon_restart;
+// Issue #1490: why a deck is not connected, and starting its daemon.
+pub mod daemon_start;
 pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;

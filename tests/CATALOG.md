@@ -4031,7 +4031,7 @@ without depending on the config struct API.
 - **Layer:** fast integration (the daemon's real `AttachRequest::StartAgent` handler, reached over the attach socket through `DaemonClient::start_agent` exactly as the TUI and the desktop reach it, against an in-process daemon; no LLM and no `e2e` feature gate).
 - **Agent:** none — `cat` stand-ins; what is under test is the accept/refuse decision, not an agent.
 - **Asserts:** tab A's start role starts under `proj-orchestrator-1`; tab B — same orchestration, same directory, same title, different per-tab token — is refused with an error that starts with `START_ERR_ORCHESTRATION_TITLE_IN_USE` and names the title, and no pane was spawned for it; tab A's own role 1 still starts (a tab is N `StartAgent` calls and must never collide with the title its role 0 just took); tab B under a different title starts (control: the refusal is about the title, not about a second tab of one orchestration in one directory, which PRD #140 supports); and eight clients starting eight tabs under one fresh title concurrently produce exactly one success and seven title refusals. Verified load-bearing one change at a time: without the per-tab scope role 1 is refused; without counting an in-flight start as a holder all eight concurrent starts succeed.
-- **Does not assert:** what a client does with the refusal (`/009` at L1, `/010` on the real binary); the daemon's own spawn paths (dispatch, a scheduled fire, issue dispatch), which since issue #1339 pass the same check but take a suffixed title instead of being refused (`orchestration/dispatch/005`, and `a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); a legacy client with no per-tab token, which is scoped by `(name, cwd)` like its delegate routing.
+- **Does not assert:** what a client does with the refusal (`/009` at L1, `/010` on the real binary); the daemon's own spawn paths (dispatch, a scheduled fire, issue dispatch), which since issue #1339 pass the same check but take a suffixed title instead of being refused (`orchestration/dispatch/005`, and `a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); a client with no per-tab token, whose start the daemon refuses before this check runs (`orchestration/identity/011`).
 - **Platform coverage:** mac+linux (unix-only — PTY stand-ins over a Unix socket).
 
 ##### orchestration/identity/008 — A run title is keyed by the RESOLVED title plus the orchestration cwd, and a title whose every pane has exited can be claimed again (issue #555).
@@ -4054,6 +4054,13 @@ without depending on the config struct API.
 - **Asserts:** with the form open on `orch-deck` and the orchestration selected, the Name field shows `<folder>-orchestrator-1`; a rival `StartAgent` under exactly that title (same orchestration and canonical cwd, its own per-tab token) sent over the deck's attach socket succeeds; pressing Enter then brings up "already in use by a live orchestration" with the name still shown and `[Submit]` gone, and `ListAgents` holds no pane of ours under that title; typing `-b` clears the warning and Enter closes the form and starts the orchestration under `<folder>-orchestrator-1-b`. Verified load-bearing: with the daemon's check disabled the refusal never appears.
 - **Does not assert:** the concurrent-instant race (`/007`); the rival's own tab surfacing in this TUI; an older TUI against this daemon, which gets the refusal as a plain `Orchestration failed: …` status line (the cross-version run recorded on the PR).
 - **Platform coverage:** mac+linux (the L2 harness is unix-only).
+
+##### orchestration/identity/011 — The daemon refuses an orchestration start whose membership carries no per-tab `orchestration_id`, the shape only a client older than v0.35.0 sends (issue #463).
+- **Layer:** fast integration (the daemon's real `AttachRequest::StartAgent` handler over the attach socket through `DaemonClient::start_agent`, against an in-process daemon, as `orchestration/identity/007`; no LLM and no `e2e` feature gate).
+- **Agent:** none — `cat` stand-ins; what is under test is the accept/refuse decision.
+- **Asserts:** a token-less orchestration start with a role name, and one with an empty role name, are each refused with an error that starts with `START_ERR_ORCHESTRATION_ID_REQUIRED`, names `v0.35.0` and says nothing was started; no pane is spawned for either and neither registers a role (`pane_orchestration_map` and `pane_role_map` stay empty); control: the same start carrying a token starts and registers the pane under that token and the orchestration name. Verified load-bearing: with the daemon's refusal disabled the first token-less start succeeds and the test fails.
+- **Does not assert:** a real pre-v0.35.0 TUI against this daemon (the refusal reaches it as a plain error on the wire it already decodes); `start-prepared-agent`, which is normalised into the same handler arm before the check; the TUI's handling of a token-less record a daemon before #463 accepted (`partition_separates_same_name_cwd_orchestrations_by_instance_id` in `src/ui.rs`).
+- **Platform coverage:** mac+linux (unix-only — PTY stand-ins over a Unix socket).
 
 #### orchestration/guard
 
@@ -4550,14 +4557,14 @@ without depending on the config struct API.
 - **Fixture:** `tests/fixtures/orchestration-route` — one `[[orchestrations]] name = "route-iso"` with THREE roles (`orchestrator` start + `coder` + `reviewer`), all REAL interactive Haiku `claude` (`--allowedTools Bash Read Write`, no `-p`), workers at `clear = false` so their agent ids and scrollback stay stable across the delegate. Three roles rather than two because `.dot-agent-deck/worker-task-{role}.md` / `work-done-{role}.md` are keyed by ROLE within a cwd (PRD #140 keeps that layer explicitly out of scope), so two same-cwd tabs sharing a role name share those files: driving tab A through `coder` and tab B through `reviewer` makes every no-cross-delivery check a presence/absence question about a pane that would otherwise have received NOTHING, and makes the two work-done feedback strings role-qualified and thus distinguishable inside one orchestrator pane — no occurrence-counting in a redrawing agent TUI.
 - **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across the two tabs; four short turns actually run (two orchestrators delegate, two workers create one file each). Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when the `claude` CLI/credentials are absent.
 - **Asserts:** the second open of the same orchestration in the same directory renders PRD #140 M4.0's non-blocking same-cwd warning pointing at `/worktree-prd` (the M4.0 surface, live in the real form rather than through the L1 render seam); the daemon reports two orchestration tabs with DISTINCT `orchestration_id`s and three role panes each; then, with a task started in EACH tab CONCURRENTLY (the issue's own repro, and the state in which the pre-#140 `HashSet`-ordered work-done lookup was most non-deterministic), tab A's delegate pointer `worker-task-coder.md` lands in tab A's `coder` pane and NEVER in tab B's identically-named `coder` pane; tab A's coder really does its own task (uniquely-named sentinel `route_alpha_5f3c.txt` plus the daemon-written `.dot-agent-deck/work-done-coder.md`); its work-done feedback (`Worker coder has completed their task`) reaches tab A's orchestrator pane and NEVER tab B's; and symmetrically for tab B → `reviewer` (`worker-task-reviewer.md`, `route_beta_9d21.txt`, `work-done-reviewer.md`, `Worker reviewer has completed their task`), with a final sweep re-checking all four absences after both chains have run.
-- **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the `NameCwd` older-client fallback (M5.2, the cross-version manual test); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
+- **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the token-less older-client path (retired by issue #463, whose daemon refusal is `orchestration/identity/011`); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** four short interactive Haiku turns (two delegates, two one-file tasks) — well under Decision 23's <$0.05/run bound.
 
-##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group, while a token-less (pre-#140) pair still rebuilds as ONE (PRD #140 M3.1).
+##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group (PRD #140 M3.1).
 - **Layer:** L1/synthetic (warm in-process daemon + real attach socket, no PTY-attached binary and no LLM). Drives the production reattach chain end to end: `start_agent` stores `TabMembership` on the daemon's `AgentRecord` → `EmbeddedPaneController::hydrate_from_daemon` reads it back through `ListAgents` + `validate_tab_membership` → `partition_hydrated_panes` buckets by `OrchestrationIdentity` → `resolve_orch_config_for_hydration` / `OrchestrationConfig::synthesize_from_bucket_metadata` → `TabManager::open_orchestration_tab_with_existing_role_panes`. Synthetic is the right tier because the claim is about a hydration round trip, not about agent behaviour; the real-agent two-tab case is `orchestration/route/001`, which never detaches.
-- **Agent:** none (six `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A, tab B, and a token-less legacy pair, all sharing one orchestration name and one cwd). Since issue #555 tabs A and B carry distinct run titles (`route-iso-orchestrator-1`/`-2`, as the form suggests them), because the daemon refuses a second tab under a resolved title another live tab holds in the same directory; the titles are no part of the identity asserted here.
-- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields THREE buckets (tab A, tab B, legacy) rather than one merged bucket, each holding exactly its own two panes; the two tokened buckets' `OrchestrationIdentity`s differ while the token-less bucket falls back to `NameCwd { name, cwd }`; rebuilding every bucket produces three orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tokened tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card — while the legacy identity keeps the pre-review byte format.
+- **Agent:** none (four `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A and tab B, sharing one orchestration name and one cwd). Until issue #463 a third, token-less pair stood in for a pre-#140 client; the daemon now refuses that start (`orchestration/identity/011`). Since issue #555 tabs A and B carry distinct run titles (`route-iso-orchestrator-1`/`-2`, as the form suggests them), because the daemon refuses a second tab under a resolved title another live tab holds in the same directory; the titles are no part of the identity asserted here.
+- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields TWO buckets (tab A, tab B) rather than one merged bucket, each holding exactly its own two panes; the two buckets' `OrchestrationIdentity`s differ; rebuilding every bucket produces two orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
@@ -4745,6 +4752,13 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; a warm `daemon serve` is seeded over the attach protocol with `TabMembership::Mode`).
 - **Agent:** none (`sleep 600`; no LLM).
 - **Asserts:** the hydrated agent is visible as a dashboard card, the old mode name is absent from the tab strip, and the deck stays responsive through a clean detach. The post-exit terminal stream contains the hydration `session_warnings` line naming the old mode.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/024 — An orchestration agent a client older than v0.35.0 started reattaches as a plain dashboard card, and this build's daemon refuses to start one (issue #463).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; two warm `daemon serve` processes seeded over the attach protocol with a `TabMembership::Orchestration` carrying no `orchestration_id`). The second daemon runs with `DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION=1`, an `e2e`-only switch that makes it serve that start the way a daemon before #463 did — the only way to put such a record in front of a real TUI, since this build's daemon refuses it.
+- **Agent:** none (`sleep 600`; no LLM).
+- **Asserts:** the first daemon, with no switch, refuses the start with an error starting `START_ERR_ORCHESTRATION_ID_REQUIRED` and naming `v0.35.0`, and runs no agent; against the second, the hydrated agent is a dashboard card (`No agent · old-orchestrator`, `1 agent(s)`), the orchestration name is absent from the screen (no tab was rebuilt), and the post-detach terminal stream carries the hydration `session_warnings` line naming the orchestration. Verified load-bearing: without the warning push the test fails.
+- **Does not assert:** a real pre-v0.35.0 TUI's display of the refusal (that binary is not built here); a live `OrchestrationSurface` with no token, which builds no tab and is only logged; routing for such a pane, which registers no role.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -5006,6 +5020,40 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Asserts:** after `remote remove` removes a second row, the first row still has its `id`, `user`, `jump_host`, `socket`, and unknown `some_future_field` values in valid TOML.
 - **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
 - **Platform coverage:** mac+linux+windows.
+
+### Starting a deck daemon (issue #1490)
+
+#### remote/start
+
+##### remote/start/001 — A stopped remote daemon starts at its configured socket.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** the initial reason is not-running; start returns Started; the daemon answers Hello and probes as running at a deliberately non-default configured socket, leaving the inherited default unused.
+- **Does not assert:** a real SSH server, desktop rendering, authentication or real-agent work.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/002 — Starting a running remote daemon preserves its single process.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** a second start returns AlreadyRunning; the original daemon still answers Hello; exactly one daemon spawn and one Attach protocol listening line are recorded.
+- **Does not assert:** concurrent start requests, a real SSH server or desktop rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/003 — Missing installs and unreachable remote hosts explain the failure.
+- **Layer:** L2 (lane 1, shared start functions, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** probes and starts classify a missing binary as not-installed with a remote add remedy, and an SSH connection refusal as host-unreachable naming the host; the suggested action is Reconnect and no daemon spawns.
+- **Does not assert:** real network failure, SSH authentication or host-key verification.
+- **Platform coverage:** linux+mac.
+
+#### lifecycle/daemon-start
+
+##### lifecycle/daemon-start/001 — A local start launches one real daemon at its owned socket.
+- **Layer:** L2 (lane 1, shared local start functions and real daemon subprocess).
+- **Agent:** none.
+- **Asserts:** a stopped endpoint becomes a running daemon answering Hello; a second start returns AlreadyRunning without invoking spawn; one daemon spawn and attach listener are recorded.
+- **Does not assert:** local TUI lazy-spawn, desktop rendering or concurrent start requests.
+- **Platform coverage:** linux+mac.
 
 ### Remote upgrade and connect (PRD #1487)
 

@@ -51,7 +51,7 @@ A daemon the deck starts in the background also writes its standard output and e
 
 The desktop app writes no log file of its own. The log to collect is the **daemon's**, and the daemon has to be started with `DOT_AGENT_DECK_LOG` set. Restarting only the app does not turn the log on, because the app does not restart the daemon. The desktop app is built for macOS (Apple Silicon) and Linux (amd64); there is no Windows build.
 
-The app connects to a daemon you started (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)), so start that daemon with logging on:
+Start the daemon yourself with logging on, rather than with the app's **Start daemon** (see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)):
 
 1. If a daemon is already running, stop it with `dot-agent-deck daemon stop`. It refuses while agents are running, so finish or close them first; see [Recycling the daemon](#recycling-the-daemon).
 2. Start a daemon with the variable set, in a terminal:
@@ -552,7 +552,7 @@ It tells apart two causes whose ssh error messages are identical: `AllowTcpForwa
 
 *Applies to the desktop app.*
 
-- **Daemon disconnected** (`No daemon is listening on the configured socket.`): no daemon answered. Start one as described in [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon), then press **Reconnect**. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
+- **Daemon disconnected**: the app is not connected to that daemon, and the sentence under the title says why. When it says no daemon is running there, press **Start daemon**; otherwise press **Reconnect**. [Daemons → Start a daemon from the app](desktop/daemons.md#start-a-daemon-from-the-app) lists what a failed start says and what to do. A daemon started on its own with `dot-agent-deck daemon serve` exits after 30 seconds with no clients, agents or pending schedules; to keep it up while you start the app, run `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve`.
 - **Incompatible daemon** (for example `This daemon is older than this app, and the two cannot work together.`): the daemon and the app are different versions, usually after upgrading one of the two, and the message says which one is older. Update that one so both run the same version and press **Reconnect**: for a remote daemon older than the app, press **Upgrade** in the message, which installs the app's version there and restarts the daemon, asking before it stops any running agent ([Daemons → Upgrade a remote daemon](desktop/daemons.md#upgrade-a-remote-daemon)); for a local daemon, [recycle it](#recycling-the-daemon) from the matching binary. When the message says the app has not connected because it could misread what the daemon reports, the app also offers **Connect anyway**, which uses the daemon as it is until you quit the app. **Technical details** under the message shows the exact versions. If it still cannot connect, for example because the daemon stopped answering in the meantime, the daemon's card says why and what to do next.
 
 See [Daemons](desktop/daemons.md) for adding and testing daemons in the app.
