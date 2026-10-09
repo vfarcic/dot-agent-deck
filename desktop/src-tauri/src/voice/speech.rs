@@ -620,11 +620,11 @@ mod tests {
 
     #[test]
     fn voice_speech_request_is_bounded() {
-        let body = request_body("The tester finished: done.");
+        let body = request_body("Tester: done.");
         assert_eq!(body["model"], OPENAI_SPEECH_MODEL);
         assert_eq!(body["voice"], OPENAI_SPEECH_VOICE);
         assert_eq!(body["response_format"], "mp3");
-        assert_eq!(body["input"], "The tester finished: done.");
+        assert_eq!(body["input"], "Tester: done.");
 
         let long = "word ".repeat(1_000);
         let bounded = bounded_input(&long);
@@ -740,7 +740,7 @@ mod tests {
         );
         for source in [SpeechSource::Auto, SpeechSource::Provider] {
             let pending = notice_pending(source, intent.clone());
-            for text in ["Finished: all 42 tests pass.", "", elsewhere.as_str()] {
+            for text in ["All 42 tests pass.", "", elsewhere.as_str()] {
                 assert_eq!(
                     speech_permitted(&pending, text),
                     Err(READING_NOTICE_NOT_SHOWN.to_string()),
@@ -768,7 +768,7 @@ mod tests {
             std::sync::atomic::AtomicBool::new(true),
         )));
         let pending = notice_pending(SpeechSource::Provider, intent.clone());
-        let reply = "Finished: the secret is 42.";
+        let reply = "The secret is 42.";
         assert_eq!(
             synthesise(&intent, secrets, reply, || async {
                 permitted_on(&pending, &intent, reply)
@@ -792,7 +792,7 @@ mod tests {
         let notice_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut reply = Box::pin(unless_revoked(
             in_flight(&reply_dropped),
-            revocation.revoked(intent.clone(), "Finished: all tests pass."),
+            revocation.revoked(intent.clone(), "All tests pass."),
         ));
         let mut said = Box::pin(unless_revoked(
             in_flight(&notice_dropped),

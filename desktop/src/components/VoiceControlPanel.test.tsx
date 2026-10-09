@@ -2822,9 +2822,9 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
   /** Scenario (decision 2): saying "reading off" turns the switch off through the same save, stops every agent's session, cuts speech off and says "Reading off."; the indicator goes. */
   it("turns Reading off by voice and stops every session", async () => {
     const h = await mount({ reading: "on", notice: "shown" });
-    await act(async () => { h.sinks.get(h.agents[0])!({ kind: "turn", text: "The agent finished: being said." }); });
+    await act(async () => { h.sinks.get(h.agents[0])!({ kind: "turn", text: "Agent: being said." }); });
     await flush();
-    expect(h.spoken).toEqual(["The agent finished: being said."]);
+    expect(h.spoken).toEqual(["Agent: being said."]);
     const cancels = vi.mocked(speechSynthesis.cancel).mock.calls.length;
     await h.say("reading off");
     expect(h.document().voice?.reading).toBe("off");
@@ -2877,11 +2877,11 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     const h = await mount({ reading: "on", notice: "shown", openPane: true });
     const other = h.agents.find((agent) => agent !== "planner")!;
     await act(async () => {
-      h.sinks.get("planner")!({ kind: "turn", text: "The planner finished: planned.", bare: "Finished: planned." });
-      h.sinks.get(other)!({ kind: "turn", text: `The ${other} finished: built.`, bare: "Finished: built." });
+      h.sinks.get("planner")!({ kind: "turn", text: "Planner: planned.", bare: "Planned." });
+      h.sinks.get(other)!({ kind: "turn", text: `${other}: built.`, bare: "Built." });
     });
     await flush();
-    expect(h.spoken[0]).toBe("Finished: planned.");
+    expect(h.spoken[0]).toBe("Planned.");
     expect(h.reader.voiceReadingStart).toHaveBeenCalledTimes(h.agents.length);
   });
 

@@ -2588,6 +2588,8 @@ mod tests {
                     "speaking on",
                     "start speaking",
                     "dictate on",
+                    "writing on",
+                    "start writing",
                 ],
             ),
             (
@@ -2605,6 +2607,8 @@ mod tests {
                     "speaking off",
                     "stop speaking",
                     "dictate off",
+                    "writing off",
+                    "stop writing",
                 ],
             ),
         ] {

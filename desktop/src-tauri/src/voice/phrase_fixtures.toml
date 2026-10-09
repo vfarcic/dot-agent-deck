@@ -869,6 +869,35 @@ screen = "agent"
 action = "dictation_off"
 outcome = "dispatch"
 
+# PRD #1497 R3-2 — the writing phrasings, each with its counterpart.
+[[fixtures]]
+name = "dictation-on-writing-on"
+utterance = "Writing on."
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-on-start-writing"
+utterance = "start writing"
+screen = "agent"
+action = "dictation_on"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-writing-off"
+utterance = "writing off"
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dictation-off-stop-writing"
+utterance = "Stop writing."
+screen = "agent"
+action = "dictation_off"
+outcome = "dispatch"
+
 # A switch phrase said INSIDE a sentence is not a switch. The first three go
 # through the local `type` opener; the last three reach the model, through an
 # opener no list holds, with a reserved phrase in the middle of what is to be

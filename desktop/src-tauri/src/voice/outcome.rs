@@ -1501,7 +1501,9 @@ impl Unmet {
                     Some(listed(&labels_of(matches))),
                 ),
                 Unmet::LabelsWithheld => (
-                    format!("Settings \u{2192} Voice \u{2192} Names withholds {noun} names"),
+                    format!(
+                        "Settings \u{2192} Voice \u{2192} Send on-screen names keeps {noun} names on this computer"
+                    ),
                     None,
                 ),
                 Unmet::DeckUnavailable { label, reason } => (deck_unavailable(label, reason), None),
@@ -7711,8 +7713,8 @@ mod tests {
         );
         assert_eq!(
             outcome.sentence(),
-            "Opening the New agent dialog. Settings \u{2192} Voice \u{2192} Names withholds daemon \
-             names, so none is preselected."
+            "Opening the New agent dialog. Settings \u{2192} Voice \u{2192} Send on-screen names \
+             keeps daemon names on this computer, so none is preselected."
         );
 
         // One the user did not say is not caught, whatever withheld it.
@@ -11369,6 +11371,54 @@ mod tests {
             );
             assert_eq!(resolver.calls(), 1, "{said} was answered locally");
         }
+    }
+
+    /// Scenario: in an agent's pane the user says "writing on" or "start
+    /// writing" and typing mode starts, and "writing off" or "stop writing"
+    /// ends it, all answered locally (PRD #1497 R3-2). "Write the tests" still
+    /// opens with the `write` opener and types "the tests" instead.
+    #[tokio::test]
+    async fn voice_outcome_writing_on_and_off_switch_mode_and_write_still_dictates() {
+        for (said, action) in [
+            ("writing on", "dictation_on"),
+            ("Start writing.", "dictation_on"),
+            ("writing off", "dictation_off"),
+            ("stop writing", "dictation_off"),
+        ] {
+            let resolver = NoCommandsResolver;
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action: got, params, .. }
+                if got == action && params.is_empty()),
+                "{said}: {:?}",
+                answer.outcome
+            );
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+        let resolver = CountingResolver::default();
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Transcript::new("write the tests"),
+        )
+        .await;
+        assert_eq!(typed(&answer.outcome), "the tests");
+        assert_eq!(resolver.calls(), 0);
     }
 
     /// Scenario: a declared dictation target keeps every utterance local to
@@ -15074,7 +15124,7 @@ mod tests {
                 );
             }
             for said in [
-                "The tester finished: all tests pass.",
+                "Tester: all tests pass.",
                 "reading off",
                 "voice off",
                 "open the reviewer",

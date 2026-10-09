@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, READING_DISCLOSURE, VoicePanel } from "./VoicePanel";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, LABEL_SHARING_HINT, READING_DISCLOSURE, VoicePanel } from "./VoicePanel";
 import {
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_VOICE_SETTINGS,
@@ -206,79 +208,80 @@ describe("VoicePanel", () => {
 
   /**
    * PRD #1223, audit finding A1: the panel says what each command sends to
-   * the Commands endpoint, and the Names row decides whether the names on
-   * screen are part of it.
+   * the Commands endpoint, and the Send on-screen names row (PRD #1497 R3-3)
+   * decides whether the names on screen are part of it. Since R3-1 each text
+   * is one short sentence; the full detail is the docs page's, guarded below.
    */
-  /** Scenario: Says what each command sends, and changes the sentence with the Names row. */
-  it("says what each command sends, and changes the sentence with the Names row", () => {
+  /** Scenario: Settings → Voice says in one sentence what each command sends and in another whether the names on screen go too; the row is called Send on-screen names, On by default with its hint under it, and choosing Off saves `labels = "withheld"`. */
+  it("says what each command sends, and changes the sentence with the Send on-screen names row", () => {
     const { onSave } = renderPanel({ voice: undefined });
     const disclosure = screen.getByTestId("voice-intent-disclosure");
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_SHARED);
-    // Issue #1426: a remote daemon is called by its name, and by its address
-    // only when it has none.
-    expect(disclosure).toHaveTextContent("every daemon's name, and for a remote daemon with no name its SSH user, host and any non-default port instead");
-    expect(disclosure).toHaveTextContent("up to 200 directory names");
-    // PRD #1223, closing audit F3: the always-sent components are named, and
-    // the narrow fact Shared keeps is stated as exactly that.
-    expect(disclosure).toHaveTextContent("every command's id, description, parameter names and kinds");
-    expect(disclosure).toHaveTextContent("the hint shown when it cannot");
-    expect(disclosure).toHaveTextContent("the model name and token limit");
-    expect(disclosure).toHaveTextContent("your Commands API key in its authentication header");
-    // PRD #1260 and #1261: every locally decided case is named — the typing
-    // mode's phrases and everything said in it, and an answer to a choice.
-    expect(disclosure).toHaveTextContent("“type on” and “type off” said on their own");
-    expect(disclosure).toHaveTextContent("everything said while typing mode is on");
-    // PRD #1541: the prompt commands said on their own in an agent's pane are
-    // decided here too — outside typing mode they only ask for "typing on".
-    expect(disclosure).toHaveTextContent("in an agent’s pane, “interrupt”, “clear the prompt”, “scratch that” and the other prompt commands said on their own");
-    expect(disclosure).toHaveTextContent("while a numbered choice is on offer, an answer to it");
-    expect(disclosure).toHaveTextContent("Anything else said while a choice is on offer closes it and is sent as usual.");
-    // PRD #1223, closing audit G2: the negations are about the app-observed
-    // names only, and the words spoken are said to be always sent.
-    // PRD #1223, closing audit H2: stated as FIELD provenance — the app adds
-    // no such field — because a name is arbitrary text and can itself be a
-    // path; and the words go with a command that REACHES the endpoint, since
-    // the locally decided ones named above send nothing.
-    // Issue #1495: a directory's NAME goes, its path does not, and no prompt
-    // text goes at all — a task is matched on this machine (review on PR #1529).
-    expect(disclosure).not.toHaveTextContent("last prompt");
-    expect(disclosure).toHaveTextContent("the name of its working directory (with the name of the folder above it when two agents' directories share a name)");
-    expect(disclosure).toHaveTextContent("This app adds no field of its own for a full filesystem path, a daemon or agent id, prompt text or a tool's arguments");
-    expect(disclosure).toHaveTextContent("a name is whatever it was set to, so a name can itself be a path.");
-    expect(disclosure).toHaveTextContent("Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.");
-    expect(disclosure).not.toHaveTextContent("Those names include no filesystem path");
-    expect(disclosure).not.toHaveTextContent("always sent as heard");
-    expect(disclosure).not.toHaveTextContent("It sends no filesystem path");
-    expect(disclosure).not.toHaveTextContent("no prompt you typed");
-    expect(disclosure).not.toHaveTextContent("Never a path, an id");
-    const names = screen.getByRole("radiogroup", { name: "Names" });
-    expect(within(names).getByLabelText("Shared")).toBeChecked();
+    expect(INTENT_DISCLOSURE).toBe("Each command not decided on this computer sends what you said and this app's command list to the Commands service.");
+    expect(INTENT_DISCLOSURE_SHARED).toBe("It also sends the names on screen: agents, daemons, directories, modes and orchestrations.");
+    for (const sentence of [INTENT_DISCLOSURE, INTENT_DISCLOSURE_SHARED, INTENT_DISCLOSURE_WITHHELD, READING_DISCLOSURE]) {
+      expect(sentence.match(/[.!?](\s|$)/g), sentence).toHaveLength(1);
+    }
+    const names = screen.getByRole("radiogroup", { name: "Send on-screen names" });
+    expect(within(names).getByLabelText("On")).toBeChecked();
+    expect(screen.getByTestId("voice-labels-hint")).toHaveTextContent(LABEL_SHARING_HINT);
+    expect(LABEL_SHARING_HINT).toBe("Lets commands like \u201copen the tester\u201d find the agent, daemon or folder you name. Off keeps those names on this computer, and commands that need one are refused.");
 
-    fireEvent.click(within(names).getByLabelText("Withheld"));
+    fireEvent.click(within(names).getByLabelText("Off"));
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } }),
     );
   });
 
-  it("says what a withheld Names row costs", () => {
+  /** Scenario: with Send on-screen names Off, the panel says none of the names on screen are sent, beside what every command still sends, and the row shows Off. */
+  it("says what Send on-screen names Off leaves out", () => {
     renderPanel({ voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } });
     const disclosure = screen.getByTestId("voice-intent-disclosure");
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE_WITHHELD);
     expect(disclosure).not.toHaveTextContent(INTENT_DISCLOSURE_SHARED);
     // It withholds the names, not the request: the always-sent part stays.
     expect(disclosure).toHaveTextContent(INTENT_DISCLOSURE);
-    expect(disclosure).not.toHaveTextContent("sends nothing else");
-    // PRD #1223, closing audit G2: withholding removes the observed names, not
-    // the user's own words, and says so rather than implying a redaction.
-    expect(disclosure).toHaveTextContent("none of the names this app reads from the screen");
-    // Closing audit H2: scoped to the commands that reach the endpoint — the
-    // always-sent paragraph beside it names the ones decided on this machine.
-    expect(disclosure).toHaveTextContent("It does not redact your words: every command that reaches the endpoint still carries them as heard.");
-    expect(disclosure).not.toHaveTextContent("what you speak is still sent as heard");
-    expect(disclosure).not.toHaveTextContent("always sent as heard");
-    expect(disclosure).not.toHaveTextContent("sends none of the names on screen");
-    expect(within(screen.getByRole("radiogroup", { name: "Names" })).getByLabelText("Withheld")).toBeChecked();
+    expect(INTENT_DISCLOSURE_WITHHELD).toBe("It sends none of the names on screen.");
+    expect(within(screen.getByRole("radiogroup", { name: "Send on-screen names" })).getByLabelText("Off")).toBeChecked();
+  });
+
+  /**
+   * PRD #1497 R3-1 moved the detail the panel's long texts carried to
+   * `docs/desktop/voice.md`. Each fact they stated is checked here against the
+   * page, so shortening the panel did not quietly drop it — PRD #1223's
+   * closing audits F3, G2 and H2 and PRD #1497's audit A-B2 among them.
+   */
+  /** Scenario: the Voice docs page still says, field by field, what each command and each finished turn sends where, now that the panel says it in one sentence. */
+  it("keeps the full detail of what is sent on the docs page", () => {
+    const page = readFileSync(resolve("../docs/desktop/voice.md"), "utf8");
+    const sent = page.slice(page.indexOf("## What is sent where"), page.indexOf("## When it does not work"));
+    for (const fact of [
+      // What every command sends (closing audit F3).
+      "the words it heard, the app's fixed instructions and answer format, the model name and token limit",
+      "each command's id, description, parameter names and kinds, whether it can run on the current screen, and the hint shown when it cannot",
+      "When the endpoint is not on this machine, the request also carries your Commands API key",
+      // What is decided on this machine.
+      "**Decided on this machine, sending nothing:**",
+      "\"type on\" and \"type off\" themselves",
+      "While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all",
+      "a number, a listed name or a way of cancelling it",
+      // What On adds (issue #1426, #1495), and the provenance scope (H2).
+      "for a remote daemon with no name its ssh user, host and any non-default port instead",
+      "up to 200 directory names",
+      "the name of its directory (with the directory above it when two agents' directories share a name)",
+      "The app adds no full filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path.",
+      // Words go either way (G2), and what Off costs.
+      "Your words are sent as heard either way",
+      "commands that need an agent, daemon, directory, mode, agent type or orchestration are refused",
+      // Reading (D4, audit A-B2).
+      "that agent's final reply for the turn",
+      "Permission prompts, errors and usage limits are spoken without asking the model.",
+      "every sentence the app speaks, including summaries, permission prompts with up to 120 characters of what the agent wants to do, and error announcements",
+      "With the computer's voice, those sentences stay on this computer.",
+    ]) {
+      expect(sent, fact).toContain(fact);
+    }
   });
 
   /**
@@ -671,19 +674,15 @@ describe("VoicePanel", () => {
 });
 
 describe("VoicePanel reading settings (PRD #1497 D4, D9)", () => {
-  /** Scenario (decision 1 of 2026-10-09): the switch is named Reading, Off by default, with what it does and sends beside it — including that "reading on" and "reading off" also switch it — and choosing On saves `reading = "on"` and nothing else. */
+  /** Scenario (decision 1 of 2026-10-09): the switch is named Reading, Off by default, with one sentence beside it saying what it sends where, and choosing On saves `reading = "on"` and nothing else. */
   it("offers the Reading switch, off by default, with what it does and sends", () => {
     const { onSave } = renderPanel();
     const group = screen.getByRole("radiogroup", { name: "Reading" });
     expect(within(group).getByRole("radio", { name: "Off" })).toBeChecked();
     expect(screen.getByTestId("voice-reading-disclosure")).toHaveTextContent(READING_DISCLOSURE);
-    expect(READING_DISCLOSURE).toMatch(/final reply .* sent to the Commands connection/);
-    expect(READING_DISCLOSURE).toMatch(/every agent on the deck you are viewing/);
-    expect(READING_DISCLOSURE).toMatch(/Saying “reading on” or “reading off” also turns it on or off/);
-    expect(READING_DISCLOSURE).toMatch(/speech service/);
-    // Audit A-B2: provider speech gets every sentence, the announcements included.
-    expect(READING_DISCLOSURE).toMatch(/every sentence the app speaks .*permission prompts .*error announcements.* sent to that provider's speech service/);
-    expect(READING_DISCLOSURE).not.toMatch(/without sending anything/);
+    // PRD #1497 R3-1: one sentence saying what goes where; the docs page has
+    // the rest (guarded above).
+    expect(READING_DISCLOSURE).toBe("A finished turn's reply is sent to the Commands service to be summarised; with the provider's voice, the sentences the app speaks go to its speech service.");
     fireEvent.click(within(group).getByRole("radio", { name: "On" }));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ voice: { ...DEFAULT_VOICE_SETTINGS, reading: "on" } }));
   });

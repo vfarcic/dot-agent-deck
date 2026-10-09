@@ -745,8 +745,8 @@ id          = "dictation_on"
 description = """Start typing mode for the open agent: from now on everything the user says is
 typed into that agent's prompt until they stop it. Use only when the WHOLE utterance is "type on",
 "typing on", "start typing", "dictation on", "start dictation", "keep typing", "talking on",
-"start talking", "speaking on", "start speaking" or "dictate on". Nothing is sent
-while typing — sending is `submit_prompt`. A request to type particular words is
+"start talking", "speaking on", "start speaking", "dictate on", "writing on" or "start writing".
+Nothing is sent while typing — sending is `submit_prompt`. A request to type particular words is
 `dictate_to_agent`, not this."""
 invoke      = "startDictation"
 screens     = ["agent"]
@@ -756,15 +756,16 @@ asks_to     = "start typing to the agent"
 try_saying  = "type on"
 heard_as_whole = [
   "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
-  "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+  "talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on",
+  "start writing",
 ]
 
 [[commands]]
 id          = "dictation_off"
 description = """Stop typing mode, so utterances are commands again. Use only when the WHOLE
 utterance is "type off", "typing off", "stop typing", "dictation off", "stop dictation",
-"done typing", "talking off", "stop talking", "speaking off", "stop speaking" or "dictate off". It
-sends nothing: whatever was typed stays in the agent's prompt."""
+"done typing", "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+"writing off" or "stop writing". It sends nothing: whatever was typed stays in the agent's prompt."""
 invoke      = "stopDictation"
 screens     = ["agent"]
 unavailable_hint = "typing mode is only on in an agent's pane"
@@ -773,7 +774,8 @@ asks_to     = "stop typing to the agent"
 try_saying  = "type off"
 heard_as_whole = [
   "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
-  "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+  "talking off", "stop talking", "speaking off", "stop speaking", "dictate off", "writing off",
+  "stop writing",
 ]
 
 # PRD #802 D6 — press Enter in the open agent's prompt.

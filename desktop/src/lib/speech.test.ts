@@ -58,9 +58,9 @@ function queueWith(plan: SpeechPlanDto, problems: string[] = []) {
 describe("SpeechQueue", () => {
   it("speaks with the source the plan names", async () => {
     const onSystem = queueWith({ kind: "system" });
-    onSystem.queue.say("tester", "The tester finished: done.");
+    onSystem.queue.say("tester", "Tester: done.");
     await flush();
-    expect(onSystem.system.said).toEqual(["The tester finished: done."]);
+    expect(onSystem.system.said).toEqual(["Tester: done."]);
     expect(onSystem.provider.said).toEqual([]);
 
     const onProvider = queueWith({ kind: "provider", fallbackToSystem: true });
@@ -354,28 +354,28 @@ describe("a sentence worded when it is said (audit A6)", () => {
     const provider = deferredProvider();
     const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: false }), provider: provider.voice, system: new ScriptedVoice() });
     let open = true;
-    queue.say("tester", { say: () => (open ? "Finished: all tests pass." : "The tester finished: all tests pass."), safe: "The tester finished: all tests pass." });
+    queue.say("tester", { say: () => (open ? "All tests pass." : "Tester: all tests pass."), safe: "Tester: all tests pass." });
     await flush();
-    expect(provider.fetched).toEqual(["Finished: all tests pass."]);
+    expect(provider.fetched).toEqual(["All tests pass."]);
     open = false;
     provider.answer();
     await flush();
-    expect(provider.fetched).toEqual(["Finished: all tests pass.", "The tester finished: all tests pass."]);
+    expect(provider.fetched).toEqual(["All tests pass.", "Tester: all tests pass."]);
     expect(provider.played).toEqual([]);
     provider.answer();
     await flush();
-    expect(provider.played).toEqual(["The tester finished: all tests pass."]);
+    expect(provider.played).toEqual(["Tester: all tests pass."]);
     provider.end();
     await flush();
     expect(queue.speaking).toBe(false);
 
     // Unchanged while it was prepared: played as prepared, with one request.
-    queue.say("tester", { say: () => "The tester finished: again.", safe: "The tester finished: again." });
+    queue.say("tester", { say: () => "Tester: again.", safe: "Tester: again." });
     await flush();
     provider.answer();
     await flush();
-    expect(provider.fetched.at(-1)).toBe("The tester finished: again.");
-    expect(provider.played.at(-1)).toBe("The tester finished: again.");
+    expect(provider.fetched.at(-1)).toBe("Tester: again.");
+    expect(provider.played.at(-1)).toBe("Tester: again.");
   });
 
   /** Scenario (D9): the request for the named form is refused (the switch was turned off meanwhile) under Auto; nothing is played, and the system voice does not say it instead. */
@@ -385,7 +385,7 @@ describe("a sentence worded when it is said (audit A6)", () => {
     const problems: string[] = [];
     const queue = new SpeechQueue({ plan: () => Promise.resolve({ kind: "provider", fallbackToSystem: true }), provider: provider.voice, system, onProblem: (reason) => problems.push(reason) });
     let open = true;
-    queue.say("tester", { say: () => (open ? "Finished: x." : "The tester finished: x."), safe: "The tester finished: x." });
+    queue.say("tester", { say: () => (open ? "X." : "Tester: x."), safe: "Tester: x." });
     await flush();
     open = false;
     provider.answer();

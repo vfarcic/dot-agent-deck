@@ -123,7 +123,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "settings-voice-reading",
-        description: "Desktop Voice settings scrolled to reading: the Reading switch with what it does and sends, and the Speech source picker.",
+        description: "Desktop Voice settings scrolled to reading: the Reading switch with the sentence saying what it sends where, and the Speech source picker.",
         clients: &[Client::Desktop],
     },
     Scenario {

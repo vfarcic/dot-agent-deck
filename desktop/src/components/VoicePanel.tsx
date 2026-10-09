@@ -106,13 +106,24 @@ const INTENT_LABELS: Record<string, string> = {
 };
 
 /**
- * The Names row's options (PRD #1223, audit finding A1): whether each command
- * sends the names on screen to the Commands endpoint.
+ * The Send on-screen names row's options (PRD #1223, audit finding A1; named
+ * by PRD #1497 R3-3): whether each command sends the names on screen to the
+ * Commands endpoint. The stored tokens are still `shared` and `withheld`.
  */
 const LABEL_SHARING_LABELS: Record<string, string> = {
-  shared: "Shared",
-  withheld: "Withheld",
+  shared: "On",
+  withheld: "Off",
 };
+
+/**
+ * What the Send on-screen names row does, under it (PRD #1497 R3-3). Off is
+ * `LabelSharing::Withheld`: `prompt::state` sends no observed names, and every
+ * row that `needs_labels` is refused with `LABELS_WITHHELD_HINT`
+ * (`voice::schema::annotate_for`, `outcome::handle_utterance_with`) rather
+ * than resolved — so a command that needs one is refused, not answered from
+ * the name as the screen shows it.
+ */
+export const LABEL_SHARING_HINT = "Lets commands like \u201copen the tester\u201d find the agent, daemon or folder you name. Off keeps those names on this computer, and commands that need one are refused.";
 
 /**
  * PRD #1497 — the Reading row's options: reading's only state (decision 1 of
@@ -124,15 +135,16 @@ const READING_CONSENT_LABELS: Record<string, string> = {
 };
 
 /**
- * PRD #1497 D4 — what reading does and sends, shown under the switch. Each
- * clause is the code's: the voice panel reads every agent on the deck being
- * viewed while the switch is on (`DeckReader`), `voice::reading::read_turns`
- * summarises a finished turn's final reply through the Commands connection
- * (`voice::summary::summarise_turn`), and `desktop_voice_speech_audio` sends
- * every spoken sentence — permission prompts and errors included — to that
- * connection's speech service when the Speech source picks it.
+ * PRD #1497 D4 — what reading sends, shown under the switch, in one sentence
+ * (R3-1); `docs/desktop/voice.md`'s "What is sent where" has the full detail.
+ * Each clause is the code's: `voice::reading::read_turns` summarises a
+ * finished turn's final reply through the Commands connection
+ * (`voice::summary::summarise_turn`; an empty reply sends nothing, hence "A"
+ * rather than "Each"), and `desktop_voice_speech_audio` sends every spoken
+ * sentence to that connection's speech service when the Speech source picks
+ * it.
  */
-export const READING_DISCLOSURE = "While Reading is on, the app speaks a short summary of each turn every agent on the deck you are viewing finishes, on any screen, and their permission prompts and errors as they happen. Saying “reading on” or “reading off” also turns it on or off. To write a summary, the agent's final reply for the turn is sent to the Commands connection above. Permission prompts and errors are announced without asking the model. When the voice comes from the provider, every sentence the app speaks — summaries, permission prompts (with up to 120 characters of what the agent wants to do) and error announcements — is sent to that provider's speech service; with this computer's voice, those sentences stay on this computer.";
+export const READING_DISCLOSURE = "A finished turn's reply is sent to the Commands service to be summarised; with the provider's voice, the sentences the app speaks go to its speech service.";
 
 /** PRD #1497 D9 — the Speech source picker's options. */
 const SPEECH_SOURCE_LABELS: Record<string, string> = {
@@ -149,57 +161,34 @@ const SPEECH_SOURCE_HINTS: Record<string, string> = {
 };
 
 /**
- * What every command sends, whatever the Names row says (PRD #1223, closing
- * audit F3). Verified against the code rather than summarised from it: the
- * transcript is `IntentRequest`'s `transcript`; the instructions and answer
- * format are `schema::TOOL_INSTRUCTIONS` and the response schema both request
- * builders attach; the model name and token limit are the settings' `model`
- * and `max_tokens`; the command list is `prompt::commands_state` — each row's
- * id, description, params (name and kind), `callable` flag and unavailable
- * hint; the key is `RemoteResolver::run`'s `x-api-key` / `Authorization`
- * header, never read for a loopback endpoint; and what is decided on this
- * machine is `outcome::local_intercept` (an opener, a submit phrase said on
- * its own less edge politeness, the typing mode's on and off phrases, PRD
- * #1541's interrupt / clear / scratch phrases said on their own on the agent
- * screen, and a close said on its own over the New agent dialog),
- * `dictation_intercept`
- * (everything while the typing mode is on) and `voice::choice::answer` (an
- * answer to a numbered choice, PRD #1261 — a non-answer closes the choice and
- * goes on to the endpoint like any other utterance). The same list as
- * `docs/desktop/voice.md`'s. A change to any of those owes this text an
- * update.
+ * What every command sends, whatever the Send on-screen names row says (PRD
+ * #1223, closing audit F3), in one sentence (PRD #1497 R3-1). The full list —
+ * the transcript (`IntentRequest`'s `transcript`), the instructions and answer
+ * format, the model name and token limit, the command list
+ * (`prompt::commands_state`), the key for an endpoint off this machine
+ * (`RemoteResolver::run`), and what is decided on this machine
+ * (`outcome::local_intercept`, `dictation_intercept`, `voice::choice::answer`)
+ * — is `docs/desktop/voice.md`'s "What is sent where", and a change to any of
+ * those owes that page an update. "Not decided on this computer" is what keeps
+ * this sentence true of the utterances those intercepts answer, which send
+ * nothing.
  */
-export const INTENT_DISCLOSURE = "Each command sends the Commands endpoint the words heard, this app's fixed instructions and answer format, the model name and token limit, and this app's command list: every command's id, description, parameter names and kinds, whether it can run on the screen you are on, and the hint shown when it cannot. When the endpoint is not on this machine, the request also carries your Commands API key in its authentication header. Some utterances are decided on this machine and send nothing: a dictation that starts with a recognised opener (\u201ctype \u2026\u201d); a submit phrase such as \u201csend it\u201d said on its own, with a word such as \u201cokay\u201d or \u201cplease\u201d around it; \u201ctype on\u201d and \u201ctype off\u201d said on their own; in an agent\u2019s pane, \u201cinterrupt\u201d, \u201cclear the prompt\u201d, \u201cscratch that\u201d and the other prompt commands said on their own, which outside typing mode only ask you to say \u201ctyping on\u201d first; while the New agent dialog is open, a way of closing it said on its own, such as \u201cclose\u201d; everything said while typing mode is on; and, while a numbered choice is on offer, an answer to it \u2014 its number, one of its names, or \u201ccancel\u201d. Anything else said while a choice is on offer closes it and is sent as usual.";
+export const INTENT_DISCLOSURE = "Each command not decided on this computer sends what you said and this app's command list to the Commands service.";
 
 /**
- * What Names = Shared adds — `prompt::state`, field by field. The narrow fact
- * it closes on is the one to keep true: `prompt::state` carries labels and
- * names only, never an entry's `path`, a deck's `id` or an agent's `id`.
- *
- * **Scoped to that payload, and it says so** (PRD #1223, closing audit G2).
- * The transcript goes with every request and can hold anything the user said,
- * so "it sends no path" is false of the REQUEST; it is true only of the names
- * this app observed and added. The last sentence is there so nobody reads the
- * one before it as a statement about their words.
- *
- * **And scoped to FIELDS, not content** (closing audit H2). What the code
- * guarantees is provenance: `prompt::state` adds no path, id, prompt or
- * tool-argument field (issue #1495 added a working directory's NAME, never its
- * path, and matches a reference by task against the prompt on this machine). It cannot promise a name holds none of those — a name is
- * whatever it was set to, and `is_valid_display_name` admits `/`, so an agent
- * renamed `/home/alice/private` sends that string verbatim. Likewise "your
- * words" go with every request that REACHES the endpoint, not with every
- * utterance: `INTENT_DISCLOSURE`'s own last sentence names the ones decided on
- * this machine, which send nothing.
+ * What Send on-screen names = On adds — `prompt::state`'s observed names (PRD
+ * #1223), in one sentence (PRD #1497 R3-1). The field-by-field list, and the
+ * point that a name is whatever it was set to and can itself be a path, are
+ * in `docs/desktop/voice.md`'s "What is sent where".
  */
-export const INTENT_DISCLOSURE_SHARED = "With Names shared it also sends the names on screen: each agent on the selected daemon with its role, CLI name, live status and the tool it is running, its mode, its agent type, the name of its working directory (with the name of the folder above it when two agents' directories share a name), its orchestration's title and the order the agents started in, and the name of the daemon they are on; every daemon's name, and for a remote daemon with no name its SSH user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. This app adds no field of its own for a full filesystem path, a daemon or agent id, prompt text or a tool's arguments \u2014 but a name is whatever it was set to, so a name can itself be a path. Every command that reaches the endpoint also carries your words as heard, which may contain anything you say.";
+export const INTENT_DISCLOSURE_SHARED = "It also sends the names on screen: agents, daemons, directories, modes and orchestrations.";
 
 /**
- * What Names = Withheld leaves out, and what it costs. Withholding drops the
- * observed-names turn from the request; it does not redact the transcript
- * (PRD #1223, closing audit G2), which is why the second sentence exists.
+ * What Send on-screen names = Off leaves out (PRD #1497 R3-1): the
+ * observed-names turn. It does not redact the transcript (PRD #1223, closing
+ * audit G2) — your words still go as heard, which the docs page says.
  */
-export const INTENT_DISCLOSURE_WITHHELD = "With Names withheld it sends none of the names this app reads from the screen, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. It does not redact your words: every command that reaches the endpoint still carries them as heard.";
+export const INTENT_DISCLOSURE_WITHHELD = "It sends none of the names on screen.";
 
 /** The token the speech backend takes when it authenticates with a key. */
 const KEYED = "remote";
@@ -354,9 +343,10 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
           `docs/develop/desktop-gui.md`'s bar here for the reason the speech
           hint does: the endpoint may be hosted, and what a user's own deck
           labels and directory names are sent to is a consequence they act on
-          (the Names row below). Every clause is checked against the code:
-          `voice::prompt::state` and `commands_state`, `outcome::local_intercept`,
-          and `DIRECTORY_NAMES_SHOWN` (200). */}
+          (the Send on-screen names row below). One short sentence each since
+          PRD #1497 R3-1; the clause-by-clause list, checked against
+          `voice::prompt::state`, `commands_state`, `outcome::local_intercept`
+          and `DIRECTORY_NAMES_SHOWN` (200), is `docs/desktop/voice.md`'s. */}
       <p className="settings-hint" data-testid="voice-intent-disclosure">
         {INTENT_DISCLOSURE}
         {" "}{voice.labels === "withheld" ? INTENT_DISCLOSURE_WITHHELD : INTENT_DISCLOSURE_SHARED}
@@ -365,9 +355,10 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
       {/* Two short exclusive options, so a segmented control rather than a
           select — `desktop-gui.md`'s cardinality rule, with AppearancePanel's
           span + `aria-labelledby` radiogroup shape. The consequence of each is
-          the disclosure sentence above, which changes with it. */}
+          the hint under it and the disclosure sentence above, which changes
+          with it. */}
       <div className="settings-row">
-        <span className="settings-row-label" id={namesLabelId}>Names</span>
+        <span className="settings-row-label" id={namesLabelId}>Send on-screen names</span>
         <div className="segmented" role="radiogroup" aria-labelledby={namesLabelId}>
           {VOICE_LABEL_SHARING.map((token) => (
             <label key={token} className={token === voice.labels ? "is-selected" : ""}>
@@ -383,6 +374,7 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
           ))}
         </div>
       </div>
+      <p className="settings-hint" data-testid="voice-labels-hint">{LABEL_SHARING_HINT}</p>
 
       {/* Commands only. A transcription is as long as the audio was, so a
           ceiling on the speech stage would bound nothing the user chose.

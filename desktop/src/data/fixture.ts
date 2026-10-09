@@ -1289,7 +1289,8 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     // the opener row, as `local_intercept` checks them.
     phrases: [
       "type on", "typing on", "start typing", "dictation on", "start dictation", "keep typing",
-      "talking on", "start talking", "speaking on", "start speaking", "dictate on",
+      "talking on", "start talking", "speaking on", "start speaking", "dictate on", "writing on",
+      "start writing",
     ],
     action: "dictation_on",
     invoke: "startDictation",
@@ -1300,7 +1301,8 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
   {
     phrases: [
       "type off", "typing off", "stop typing", "dictation off", "stop dictation", "done typing",
-      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off",
+      "talking off", "stop talking", "speaking off", "stop speaking", "dictate off", "writing off",
+      "stop writing",
     ],
     action: "dictation_off",
     invoke: "stopDictation",

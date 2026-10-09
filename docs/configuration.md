@@ -283,7 +283,7 @@ level = 1.0
 | `zoom.level` | number | `1.0` | `0.75`, `0.9`, `1.0`, `1.1`, `1.25`, `1.5`, `1.75`, `2.0`, `2.5`, `3.0`; another number is snapped to the nearest |
 | `endpoints.selection` | string | `"local"` | `"local"`, `"all"` (every daemon at once), or the `id` of a remote deck in `remotes.toml` |
 | `voice.activation` | string | `"toggle"` | `"toggle"` |
-| `voice.labels` | string | `"shared"` | `"shared"`, `"withheld"` |
+| `voice.labels` | string | `"shared"` | `"shared"`, `"withheld"`: the [Send on-screen names](desktop/voice.md#settings--voice) switch, On or Off |
 | `voice.reading` | string | `"off"` | `"off"`, `"on"` (turns [reading](desktop/voice.md#reading) on: the app reads your agents' turns aloud); an unrecognised value means `"off"` |
 | `voice.reading_notice` | string | `"pending"` | `"pending"`, `"shown"`: whether the app has said where replies go, which it does the first time reading is turned on; an unrecognised value means `"pending"` |
 | `voice.speech` | string | `"auto"` | `"auto"`, `"provider"`, `"system"`: where reading's voice comes from; an unrecognised value means `"auto"` |

@@ -141,7 +141,7 @@ pub const TRAILING_SEND_PHRASES: [&str; 4] = ["send", "send it", "submit", "pres
 /// Every entry has its counterpart in [`DICTATION_OFF_PHRASES`] (#1544): a
 /// phrasing that enters the mode but has no matching exit would be typed into
 /// the prompt when the user says it to leave.
-pub const DICTATION_ON_PHRASES: [&str; 11] = [
+pub const DICTATION_ON_PHRASES: [&str; 13] = [
     "type on",
     "typing on",
     "start typing",
@@ -153,6 +153,8 @@ pub const DICTATION_ON_PHRASES: [&str; 11] = [
     "speaking on",
     "start speaking",
     "dictate on",
+    "writing on",
+    "start writing",
 ];
 
 /// What leaves the dictation mode, said as the whole utterance.
@@ -167,7 +169,7 @@ pub const DICTATION_ON_PHRASES: [&str; 11] = [
 /// could be meant as voice off: it is the counterpart of *"start talking"*, and
 /// heard as an exit it costs nothing a user cannot see — the mode ends, the
 /// microphone stays open, and *"voice off"* still turns it off.
-pub const DICTATION_OFF_PHRASES: [&str; 11] = [
+pub const DICTATION_OFF_PHRASES: [&str; 13] = [
     "type off",
     "typing off",
     "stop typing",
@@ -179,6 +181,8 @@ pub const DICTATION_OFF_PHRASES: [&str; 11] = [
     "speaking off",
     "stop speaking",
     "dictate off",
+    "writing off",
+    "stop writing",
 ];
 
 /// What turns voice off while the dictation mode is on, said as the whole
@@ -537,6 +541,8 @@ mod tests {
             "speaking on",
             "start speaking",
             "dictate on",
+            "writing on",
+            "start writing",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_ON_PHRASES),
@@ -559,6 +565,8 @@ mod tests {
             "speaking off",
             "stop speaking",
             "dictate off",
+            "writing off",
+            "stop writing",
         ] {
             assert!(
                 whole_utterance_is(phrase, &DICTATION_OFF_PHRASES),

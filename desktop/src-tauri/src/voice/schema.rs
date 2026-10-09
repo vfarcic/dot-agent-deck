@@ -195,7 +195,7 @@ pub struct AnnotatedParam {
 /// is shown and the refusal a user reads (`Not here — <hint>.`).
 pub const LABELS_WITHHELD_HINT: &str = "naming an agent, daemon, directory, mode, agent type or \
     orchestration needs the command backend to see those names, and Settings → \
-    Voice → Names withholds them";
+    Voice → Send on-screen names is off";
 
 /// Whether this row needs the observed labels at all: it declares a REQUIRED
 /// param whose kind [`ParamKind::names_something_observed`]. An optional one

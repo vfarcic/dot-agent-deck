@@ -81,8 +81,8 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     expect(h.started()).toEqual(["tester", "coder"]);
     expect(h.said).toEqual([[READING_VOICE_KEY, READING_ON]]);
     expect(h.reader.on).toBe(true);
-    h.sinks.get("coder")!({ kind: "turn", text: "The coder finished: done.", bare: "Finished: done." });
-    expect(h.said.at(-1)).toEqual([readingKey(CODER), "The coder finished: done."]);
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: done.", bare: "Done." });
+    expect(h.said.at(-1)).toEqual([readingKey(CODER), "Coder: done."]);
   });
 
   /** Scenario: the app opens with Reading already on; the agents are read, and nothing is announced — the switch did not change. */
@@ -151,7 +151,7 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     expect(h.speech.interrupt).toHaveBeenCalledTimes(1);
     expect(h.said.at(-1)).toEqual([READING_VOICE_KEY, READING_OFF]);
     expect(h.stop.mock.calls.map(([session]) => session).sort()).toEqual([1, 2]);
-    late({ kind: "turn", text: "The tester finished: late news." });
+    late({ kind: "turn", text: "Tester: late news." });
     expect(h.said.at(-1)).toEqual([READING_VOICE_KEY, READING_OFF]);
     expect(h.reader.on).toBe(false);
   });
@@ -170,7 +170,7 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     release();
     await flush();
     expect(h.stop).toHaveBeenCalledWith(5);
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: late." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: late." });
     expect(h.said.at(-1)).toEqual([READING_VOICE_KEY, READING_OFF]);
   });
 
@@ -194,12 +194,12 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     const h = harness();
     h.reader.update(true, [TESTER, CODER], false);
     await flush();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: the last turn." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: the last turn." });
     h.sinks.get("tester")!({ kind: "closed", text: "Reading off." });
     h.reader.update(true, [TESTER, CODER]);
     await flush();
     expect(h.speech.interrupt).not.toHaveBeenCalled();
-    expect(h.said).toEqual([[readingKey(TESTER), "The tester finished: the last turn."]]);
+    expect(h.said).toEqual([[readingKey(TESTER), "Tester: the last turn."]]);
     expect(h.start).toHaveBeenCalledTimes(2);
     expect(h.reader.on).toBe(true);
   });
@@ -276,8 +276,8 @@ describe("DeckReader (PRD #1497, decisions 1–3 of 2026-10-09)", () => {
     await flush();
     expect(h.started()).toEqual(["tester", "coder", "tester"]);
     expect(h.waiting()).toEqual([]);
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: green.", bare: "Finished: green." });
-    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "The tester finished: green."]);
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: green.", bare: "Green." });
+    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "Tester: green."]);
     expect(h.problems).toEqual([]);
   });
 
@@ -499,20 +499,20 @@ describe("DeckReader with speech in flight", () => {
     const h = speaking();
     h.reader.update(true, [TESTER, CODER], false);
     await flush();
-    h.sinks.get("coder")!({ kind: "turn", text: "The coder finished: first.", bare: "Finished: first." });
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: first.", bare: "First." });
     await flush();
     h.open(TESTER);
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: all tests pass.", bare: "Finished: all tests pass." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: all tests pass.", bare: "All tests pass." });
     h.open(CODER);
     h.provider.finish();
     await flush();
-    expect(h.provider.fetched).toEqual(["The coder finished: first.", "The tester finished: all tests pass."]);
+    expect(h.provider.fetched).toEqual(["Coder: first.", "Tester: all tests pass."]);
 
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: second.", bare: "Finished: second." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: second.", bare: "Second." });
     h.open(TESTER);
     h.provider.finish();
     await flush();
-    expect(h.provider.fetched.at(-1)).toBe("Finished: second.");
+    expect(h.provider.fetched.at(-1)).toBe("Second.");
   });
 
   /** Scenario (D6, shared across agents): while one sentence is being said, the tester finishes two turns and the coder one; the tester's newer summary replaces its older one, the coder's is kept, and they are heard in order. */
@@ -522,10 +522,10 @@ describe("DeckReader with speech in flight", () => {
     await flush();
     h.sinks.get("coder")!({ kind: "permission", text: "The coder is asking for permission." });
     await flush();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: one." });
-    h.sinks.get("coder")!({ kind: "turn", text: "The coder finished: theirs." });
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: two." });
-    expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["The tester finished: two.", "The coder finished: theirs."]);
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: one." });
+    h.sinks.get("coder")!({ kind: "turn", text: "Coder: theirs." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: two." });
+    expect(h.queue.pending.map((entry) => words(entry.text))).toEqual(["Tester: two.", "Coder: theirs."]);
   });
 
   /** Scenario: a summary is being said and a permission prompt is queued when Reading is turned off; the summary is aborted, the prompt dropped unsaid, and "Reading off." is all that is left. */
@@ -533,13 +533,13 @@ describe("DeckReader with speech in flight", () => {
     const h = speaking();
     h.reader.update(true, [TESTER], false);
     await flush();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: a private summary." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: a private summary." });
     await flush();
     h.sinks.get("tester")!({ kind: "permission", text: "The tester is asking for permission: read secrets.env." });
     h.reader.update(false, [TESTER]);
     await flush();
-    expect(h.provider.aborted).toEqual(["The tester finished: a private summary."]);
-    expect(h.provider.fetched).toEqual(["The tester finished: a private summary.", READING_OFF]);
+    expect(h.provider.aborted).toEqual(["Tester: a private summary."]);
+    expect(h.provider.fetched).toEqual(["Tester: a private summary.", READING_OFF]);
   });
 
   /** Scenario: the agent exits while its last summary is being said; the summary is heard to the end. */
@@ -547,7 +547,7 @@ describe("DeckReader with speech in flight", () => {
     const h = speaking();
     h.reader.update(true, [TESTER], false, ["deck-local"]);
     await flush();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: the last turn." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: the last turn." });
     await flush();
     h.sinks.get("tester")!({ kind: "closed", text: "" });
     h.reader.update(true, [], true, ["deck-local"]);
@@ -565,14 +565,14 @@ describe("DeckReader with speech in flight", () => {
     await flush();
     expect(h.stop).not.toHaveBeenCalled();
     expect(h.waiting()).toEqual([EXITED_DRAIN_MS]);
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: all 42 tests pass." });
-    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "The tester finished: all 42 tests pass."]);
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: all 42 tests pass." });
+    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "Tester: all 42 tests pass."]);
     h.sinks.get("tester")!({ kind: "closed", text: "" });
     expect(h.reader.reading).toEqual([readingKey(CODER)]);
     expect(h.waiting()).toEqual([]);
     expect(h.stop).not.toHaveBeenCalled();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: late." });
-    expect(h.said.map(([, text]) => text)).not.toContain("The tester finished: late.");
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: late." });
+    expect(h.said.map(([, text]) => text)).not.toContain("Tester: late.");
   });
 
   /** Scenario (re-audit R2): an exited agent's `closed` never comes; its session is stopped once EXITED_DRAIN_MS passes, and a sentence after that is not said. */
@@ -586,7 +586,7 @@ describe("DeckReader with speech in flight", () => {
     h.runTimers();
     await flush();
     expect(h.stop).toHaveBeenCalledWith(1);
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: too late." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: too late." });
     expect(h.said).toEqual([]);
   });
 
@@ -600,8 +600,8 @@ describe("DeckReader with speech in flight", () => {
     await flush();
     expect(moved.stop).toHaveBeenCalledWith(1);
     expect(moved.waiting()).toEqual([]);
-    moved.sinks.get("tester")!({ kind: "turn", text: "The tester finished: old deck." });
-    expect(moved.said.map(([, text]) => text)).not.toContain("The tester finished: old deck.");
+    moved.sinks.get("tester")!({ kind: "turn", text: "Tester: old deck." });
+    expect(moved.said.map(([, text]) => text)).not.toContain("Tester: old deck.");
 
     const off = harness();
     off.reader.update(true, [TESTER], false, ["deck-local"]);
@@ -611,7 +611,7 @@ describe("DeckReader with speech in flight", () => {
     await flush();
     expect(off.stop).toHaveBeenCalledWith(1);
     expect(off.waiting()).toEqual([]);
-    off.sinks.get("tester")!({ kind: "turn", text: "The tester finished: after off." });
+    off.sinks.get("tester")!({ kind: "turn", text: "Tester: after off." });
     expect(off.said).toEqual([[READING_VOICE_KEY, READING_OFF]]);
   });
 
@@ -638,20 +638,20 @@ describe("DeckReader with speech in flight", () => {
     const h = speaking();
     h.reader.update(true, [TESTER, CODER], false, ["deck-local"]);
     await flush();
-    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: old deck." });
+    h.sinks.get("tester")!({ kind: "turn", text: "Tester: old deck." });
     await flush();
     h.sinks.get("coder")!({ kind: "permission", text: "The coder is asking for permission." });
     h.queue.say(READING_VOICE_KEY, "Reading is not available: the other deck did not answer.");
     h.reader.update(true, [BUILDER], true, ["deck-build"]);
     await flush();
-    expect(h.provider.aborted).toEqual(["The tester finished: old deck."]);
+    expect(h.provider.aborted).toEqual(["Tester: old deck."]);
     expect(h.queue.pending.map((entry) => words(entry.text))).toEqual([]);
-    expect(h.provider.fetched).toEqual(["The tester finished: old deck.", "Reading is not available: the other deck did not answer."]);
+    expect(h.provider.fetched).toEqual(["Tester: old deck.", "Reading is not available: the other deck did not answer."]);
     h.provider.finish();
     await flush();
-    h.sinks.get("builder")!({ kind: "turn", text: "The builder finished: new deck." });
+    h.sinks.get("builder")!({ kind: "turn", text: "Builder: new deck." });
     await flush();
-    expect(h.provider.fetched.at(-1)).toBe("The builder finished: new deck.");
+    expect(h.provider.fetched.at(-1)).toBe("Builder: new deck.");
   });
 
   /** Scenario (PR #1617 round 3): under Auto, the provider's speech is refused because the switch was turned off or the connection changed; the sentence is not said with the system voice instead. A provider failure still falls back. */
@@ -666,7 +666,7 @@ describe("DeckReader with speech in flight", () => {
       system,
       onProblem: (reason) => problems.push(reason),
     });
-    queue.say("tester", "The tester finished: refused.");
+    queue.say("tester", "Tester: refused.");
     await flush();
     await flush();
     expect(system.fetched).toEqual([]);
@@ -674,10 +674,10 @@ describe("DeckReader with speech in flight", () => {
     expect(queue.speaking).toBe(false);
 
     refuse = false;
-    queue.say("tester", "The tester finished: fell back.");
+    queue.say("tester", "Tester: fell back.");
     await flush();
     await flush();
-    expect(system.fetched).toEqual(["The tester finished: fell back."]);
+    expect(system.fetched).toEqual(["Tester: fell back."]);
   });
 });
 
