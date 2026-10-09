@@ -27,8 +27,10 @@
 # that file through `vals`, which fails without access. It sticks: a re-run
 # without the flag keeps it while the marked block it wrote is in ~/.bashrc. To
 # turn it off, delete that block and re-run. Either way a deck daemon that is
-# already running keeps the environment it started with, so its agents see the
-# change only once it is restarted.
+# already running keeps the environment it started with, and so does the
+# successor of an in-app daemon restart: its agents see the change only once it
+# is stopped and a new one is started from a fresh login (`dot-agent-deck
+# connect` from your machine does that), not from a shell opened before the run.
 
 set -euo pipefail
 
@@ -275,7 +277,7 @@ check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow i
 check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
 [ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
 if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
-  echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it restarts."
+  echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
 fi
 if ! id -nG | tr ' ' '\n' | grep -qx docker; then
   echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."
