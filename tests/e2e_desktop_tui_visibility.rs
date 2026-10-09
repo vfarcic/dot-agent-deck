@@ -473,6 +473,7 @@ fn start_plain_from_desktop(daemon: &DaemonProc, cwd: String, pane_id: &str, dis
             agent_type: AgentType::from_command(Some(PLAIN_COMMAND)),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("desktop-shaped StartAgent over the attach socket");

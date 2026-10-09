@@ -213,6 +213,7 @@ async fn handle_connection(
                 prompt_keys: None,
                 crashed: None,
                 orchestrator_context_path: None,
+                authoring_kind: None,
             });
             write_resp(&mut stream, &AttachResponse::with_id(id))
                 .await
@@ -313,6 +314,7 @@ fn orchestration_record(
         prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     }
 }
 

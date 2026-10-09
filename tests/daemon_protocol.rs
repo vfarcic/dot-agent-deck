@@ -191,6 +191,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -215,6 +216,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             agent_type: Some(AgentType::Codex),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -239,6 +241,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -442,6 +445,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -502,11 +506,12 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -542,7 +547,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         },
     )
     .await;
@@ -561,7 +566,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
-            orchestration_id: None,
+            orchestration_id: Some("orch-test-0".to_string()),
         })
     );
     server.registry.shutdown_all();
@@ -595,6 +600,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 
@@ -708,6 +714,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 
@@ -739,6 +746,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
@@ -774,6 +782,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -800,6 +809,7 @@ fn agent_record_omits_agent_type_when_none() {
         prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -925,6 +935,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -941,6 +952,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);
@@ -1023,6 +1035,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 authoring_kind: None,
+                client_seeded_kind: None,
                 remember_command: false,
             },
         )
@@ -1657,7 +1670,7 @@ fn prepared_start_payload(
                 is_start_role,
                 orchestration_cwd: cwd.map(str::to_string),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }
         }),
         agent_type: None,
@@ -2309,7 +2322,7 @@ async fn the_client_routes_a_presented_token_onto_the_prepared_verb() {
                     is_start_role: true,
                     orchestration_cwd: Some(prepared.path.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
                 ..StartAgentOptions::default()
             },
@@ -2662,6 +2675,38 @@ async fn hello_advertises_the_project_capabilities() {
             .iter()
             .any(|c| c == "guarded_send" || c == "guarded-send"),
         "guarded_send stays its own field: {advertised:?}"
+    );
+}
+
+/// PRD #1487: the live `Hello` reply names the daemon process, the same on
+/// every connection to it — an upgrade tells the old daemon from its
+/// successor by it.
+#[tokio::test]
+async fn hello_names_the_daemon_process() {
+    let server = start_server().await;
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut s = UnixStream::connect(&server.path).await.unwrap();
+        write_request(
+            &mut s,
+            &AttachRequest::Hello {
+                client_version: PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await;
+        let resp = read_response(&mut s).await;
+        assert!(resp.ok);
+        seen.push(
+            resp.instance_id
+                .expect("Hello must name the daemon process"),
+        );
+    }
+    assert_eq!(seen[0], seen[1], "one process, one identity");
+    assert_eq!(seen[0].len(), 32, "{:?}", seen[0]);
+    assert_eq!(
+        Some(seen[0].as_str()),
+        dot_agent_deck::daemon_protocol::daemon_instance_id()
     );
 }
 
@@ -4501,6 +4546,7 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -5204,6 +5250,7 @@ async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 

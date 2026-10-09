@@ -115,10 +115,19 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     `agents_on_screen` carries each agent's LIVE state as the daemon holds it: \
     `status` is the daemon's own word for what it is doing (`working`, `thinking`, \
     `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
-    `tool` is what it is running right now. A user refers to an agent by state as \
-    readily as by name — \"the one that is stuck\", \"whichever is waiting\" — so \
-    resolve such a reference against those fields and answer with that agent's \
-    `label`. A param that names an entry of a list below — a daemon, a \
+    `tool` is what it is running right now. It also carries what the deck knows \
+    about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
+    working directory's name), `orchestration` (its run's title) and `newest_rank` \
+    (1 is the agent that started last); `agents_daemon` is the daemon they are all \
+    on. A user refers to an agent by state as readily as by name — \"the one that \
+    is stuck\" — so resolve such a reference against those fields and answer with \
+    that agent's `label`. For an agent the user named by mode, agent type, \
+    directory, orchestration, daemon, start order or what it was asked to do — \
+    \"the dispatcher\", \"the Codex agent\", \"the one in billing\", \"the newest \
+    agent\", \"the one fixing the scroll\" — answer with the words the user used \
+    and let the app resolve them; the app matches a task against each agent's \
+    last prompt itself. \
+    A param that names an entry of a list below — a daemon, a \
     directory, a Mode chip, an agent type or an orchestration — is answered, \
     when the user named the entry, with its name exactly as listed, even when \
     the transcript spells it differently: split or run together (\"mini PC\" for \
@@ -351,6 +360,8 @@ mod tests {
             vec![
                 "open_agent".to_string(),
                 "open_overview".to_string(),
+                "filter_dashboard".to_string(),
+                "clear_dashboard_filter".to_string(),
                 "open_deck".to_string(),
                 "close".to_string(),
                 "open_settings".to_string(),
@@ -436,6 +447,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -631,6 +644,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), true),
@@ -679,6 +694,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), true),
                 ("open_overview".to_string(), true),
+                ("filter_dashboard".to_string(), true),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), true),
                 ("close".to_string(), true),
                 // The shared rail offers Settings from the overview too.
@@ -730,6 +747,8 @@ mod tests {
             vec![
                 ("open_agent".to_string(), false),
                 ("open_overview".to_string(), false),
+                ("filter_dashboard".to_string(), false),
+                ("clear_dashboard_filter".to_string(), true),
                 ("open_deck".to_string(), false),
                 ("close".to_string(), true),
                 ("open_settings".to_string(), false),

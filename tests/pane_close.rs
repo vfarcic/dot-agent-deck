@@ -335,6 +335,7 @@ async fn handle_connection(
                         prompt_keys: None,
                         crashed: None,
                         orchestrator_context_path: None,
+                        authoring_kind: None,
                     }]
                 })
                 .unwrap_or_default();

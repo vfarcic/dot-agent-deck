@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::untrusted_text::strip_control_and_bidi;
+use crate::version::parse_version_output;
 
 /// GitHub releases base URL used to download `dot-agent-deck` binaries onto
 /// remote hosts. Kept as a re-export under this crate-local name because three
@@ -43,6 +44,13 @@ pub struct SshTarget {
     pub user: Option<String>,
     pub port: u16,
     pub key: Option<PathBuf>,
+    /// PRD #1487 (Risk 4): a `Host` name from `~/.ssh/config` to reach the deck
+    /// through, as `ssh -J <alias>` — the deck list's `jump_host`, so `remote
+    /// upgrade` takes the route the desktop tunnel uses. Emitted by
+    /// [`SystemSshExecutor::build_command`] only when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`]; `connect`'s
+    /// [`crate::connect::build_connect_command`] still ignores it.
+    pub jump: Option<String>,
 }
 
 impl SshTarget {
@@ -56,6 +64,7 @@ impl SshTarget {
             user,
             port,
             key,
+            jump: None,
         }
     }
 
@@ -83,12 +92,29 @@ impl SshTarget {
     /// `-i` is deliberately absent: host-key verification happens before
     /// authentication, so naming a key buys nothing here, and leaving it out
     /// keeps a `--key` path out of a rendered message.
+    ///
+    /// The jump host is named when the session takes one (Qodo 4202060288):
+    /// without `-J` the remedy reaches the deck by a different route than the
+    /// one that failed, or not at all.
     pub fn host_key_remedy(&self) -> String {
-        if self.port == DEFAULT_SSH_PORT {
-            format!("ssh {}", self.user_host())
-        } else {
-            format!("ssh -p {} {}", self.port, self.user_host())
+        let mut line = String::from("ssh");
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
         }
+        if self.port != DEFAULT_SSH_PORT {
+            line.push_str(&format!(" -p {}", self.port));
+        }
+        line.push(' ');
+        line.push_str(&self.user_host());
+        line
+    }
+
+    /// [`Self::jump`] when it validates as a
+    /// [`crate::remote_tunnel::HostAlias`], the form every ssh session and
+    /// every printed command uses; an invalid value (a hand-edited registry)
+    /// is dropped, as [`SystemSshExecutor::build_command`] drops it.
+    pub fn valid_jump(&self) -> Option<crate::remote_tunnel::HostAlias> {
+        crate::remote_tunnel::HostAlias::parse(self.jump.as_deref()?).ok()
     }
 
     /// A command line the user can paste to run `remote_command` on this
@@ -102,7 +128,9 @@ impl SshTarget {
     /// to expand, not the laptop's, whose home can be a different path (PR
     /// #1373 review). A destination
     /// that starts with `-` is preceded by `--` so ssh cannot read it as an
-    /// option (PR #1373 review).
+    /// option (PR #1373 review). The jump host rides along as `-J`, in the
+    /// position [`SystemSshExecutor::build_command`] passes it, so the line
+    /// takes the deck's route (Qodo 4202060288).
     pub fn command_line(&self, remote_command: &str) -> String {
         let mut line = String::from("ssh");
         if self.port != DEFAULT_SSH_PORT {
@@ -110,6 +138,9 @@ impl SshTarget {
         }
         if let Some(key) = &self.key {
             line.push_str(&format!(" -i {}", shell_word(&key.to_string_lossy())));
+        }
+        if let Some(jump) = self.valid_jump() {
+            line.push_str(&format!(" -J {}", shell_word(jump.as_str())));
         }
         let destination = self.user_host();
         if destination.starts_with('-') {
@@ -126,7 +157,7 @@ impl SshTarget {
 
 /// `word` as one POSIX shell word: unchanged when it is made only of
 /// characters no shell treats specially, single-quoted otherwise.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -217,7 +248,7 @@ pub enum SshError {
 /// receives a stripped value, so its escape became a second line of defence
 /// and the doctor quotes the residue rather than the escaped original. See its
 /// doc comment — that trade is recorded there.
-fn scrub_remote_text(s: &str) -> String {
+pub(crate) fn scrub_remote_text(s: &str) -> String {
     strip_control_and_bidi(s, true).trim().to_string()
 }
 
@@ -371,7 +402,46 @@ pub trait SshExecutor {
         }
         Ok(CappedOutput { output, truncated })
     }
+
+    /// [`run_capped`](Self::run_capped) under a laptop-side wall-clock
+    /// `deadline` of the call's own, whatever the executor was built for.
+    ///
+    /// PRD #1487 audit A1: the remote-upgrade executor is deliberately built
+    /// with no wall-clock kill, because a release download may legitimately
+    /// take minutes. The short plumbing commands that reach the remote daemon
+    /// run on the same ssh target and jump route, but a reply to one of them is
+    /// a few KiB and arrives in seconds, so they must be bounded per command:
+    /// both streams capped while they drain, and the session killed at
+    /// `deadline`. The production [`SystemSshExecutor`] does exactly that; this
+    /// default, for fakes whose transport is already bounded, ignores
+    /// `deadline` and falls back to [`run_capped`](Self::run_capped).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        let _ = deadline;
+        self.run_capped(target, command, max_capture_bytes)
+    }
+
+    /// The shortest `deadline` [`run_capped_within`](Self::run_capped_within)
+    /// honours: a caller with less time left should not start a command. Zero
+    /// for this default, which ignores the deadline; the production
+    /// [`SystemSshExecutor`] counts whole seconds and returns
+    /// [`MIN_BOUNDED_REMOTE_RUN`].
+    fn min_bounded_run(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
+
+/// The shortest deadline [`SystemSshExecutor`]'s
+/// [`SshExecutor::run_capped_within`] honours. Its kill timer counts whole
+/// seconds, so a deadline is rounded down to one, and one under a second is
+/// refused without starting a session — a caller with less than this left
+/// should not start a remote command at all.
+pub const MIN_BOUNDED_REMOTE_RUN: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Issue #858: seconds of headroom the laptop-side wallclock kill gets on top
 /// of the worst case the probe's own ssh options permit.
@@ -446,6 +516,14 @@ pub struct SystemSshExecutor {
     /// capping a slow-but-alive transfer. `None` keeps the original behavior.
     /// Mutually exclusive with `wallclock_timeout` by construction.
     keepalive: Option<SshKeepalive>,
+    /// Issue #1490: force `StrictHostKeyChecking=yes`, so a session refuses a
+    /// host whose key is not already trusted instead of following a permissive
+    /// user `Host` block. See [`Self::requiring_known_host_key`].
+    require_known_host_key: bool,
+    /// The ssh client to run: `ssh`, found on `PATH`. Only a unit test points
+    /// it elsewhere, at a stand-in that misbehaves the way a hostile remote
+    /// would, so the production executor's own bounds are what get exercised.
+    program: std::ffi::OsString,
 }
 
 /// PRD #161 FIX 3: ssh keepalive parameters for the remote-upgrade executor.
@@ -466,6 +544,8 @@ impl SystemSshExecutor {
             wallclock_timeout: None,
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -478,6 +558,8 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: false,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -496,6 +578,8 @@ impl SystemSshExecutor {
             wallclock_timeout: Some(secs),
             observation: true,
             keepalive: None,
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
     }
 
@@ -516,7 +600,34 @@ impl SystemSshExecutor {
                 interval,
                 count_max,
             }),
+            require_known_host_key: false,
+            program: "ssh".into(),
         }
+    }
+
+    /// Make every session of this executor an **observation** session — the
+    /// [`apply_observation_options`] flags, the one list of them — whatever
+    /// bounds it was built with. [`Self::for_observation`] is this over the
+    /// wallclock cap; issue #1490's desktop checks and start use it over the
+    /// keepalive bounds, because they run unattended against a deck the app
+    /// is not connected to and need to authenticate to the host, never to
+    /// delegate a credential to it.
+    pub fn observing(mut self) -> Self {
+        self.observation = true;
+        self
+    }
+
+    /// Force `StrictHostKeyChecking=yes` (issue #1490), the host-key policy the
+    /// desktop's tunnel forces ([`crate::remote_tunnel`]'s `forced_options`).
+    /// A session to a host whose key is not already trusted then fails with
+    /// [`SshError::HostKeyVerificationFailed`] instead of following a user
+    /// `Host` block's `accept-new` or `no` — so a desktop check or start
+    /// cannot silently accept a key the tunnel would then refuse. Not part of
+    /// [`apply_observation_options`], whose docs say why `remote doctor` must
+    /// still work against a host it has never connected to.
+    pub fn requiring_known_host_key(mut self) -> Self {
+        self.require_known_host_key = true;
+        self
     }
 
     /// The laptop-side wallclock deadline this executor arms on each ssh
@@ -529,15 +640,26 @@ impl SystemSshExecutor {
         self.wallclock_timeout.map(wallclock_kill_secs)
     }
 
+    /// Run `program` instead of `ssh` — a test's stand-in for a misbehaving
+    /// remote. Everything else about the executor stays as built.
+    #[cfg(test)]
+    pub(crate) fn with_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
+        self.program = program.into();
+        self
+    }
+
     /// Build the `ssh` command without spawning it. Exposed for tests so we
     /// can verify argument quoting without forking a subprocess.
     pub fn build_command(&self, target: &SshTarget, remote_command: &str) -> Command {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(&self.program);
         // BatchMode=yes makes ssh fail fast on missing keys/known_hosts
         // instead of hanging on a TTY prompt. Users who haven't trusted the
         // host yet will see an actionable error rather than the deck CLI
         // wedging.
         cmd.arg("-o").arg("BatchMode=yes");
+        if self.require_known_host_key {
+            cmd.arg("-o").arg("StrictHostKeyChecking=yes");
+        }
         if self.observation {
             apply_observation_options(&mut cmd);
         }
@@ -571,6 +693,22 @@ impl SystemSshExecutor {
         cmd.arg("-p").arg(target.port.to_string());
         if let Some(key) = &target.key {
             cmd.arg("-i").arg(key);
+        }
+        // PRD #1487: the deck list's jump host, validated as the tunnel
+        // validates it — a name from the user's ssh config, nothing an option
+        // or a `ProxyCommand` could reinterpret. A value that fails the check
+        // (a hand-edited registry) is dropped with a warning rather than passed.
+        if let Some(jump) = &target.jump {
+            match crate::remote_tunnel::HostAlias::parse(jump) {
+                Ok(alias) => {
+                    cmd.arg("-J").arg(alias.as_str());
+                }
+                Err(e) => tracing::warn!(
+                    target: "remote",
+                    error = %e,
+                    "ignoring an invalid jump host for this ssh session"
+                ),
+            }
         }
         cmd.arg("--");
         cmd.arg(target.user_host());
@@ -782,6 +920,75 @@ impl SshExecutor for SystemSshExecutor {
             truncated,
         })
     }
+
+    /// Always bounded, whatever this executor was built for: both streams are
+    /// capped at `max_capture_bytes` while they drain, and the session is
+    /// killed at `deadline` rounded down to whole seconds (or at this
+    /// executor's own kill deadline, when it has a shorter one). A deadline
+    /// under [`MIN_BOUNDED_REMOTE_RUN`] starts nothing and is an error. The ssh options the executor was built with — the
+    /// upgrade path's keepalives, a jump host — are kept, so the command takes
+    /// the same route as every other session to that deck (PRD #1487 audit A1).
+    fn run_capped_within(
+        &self,
+        target: &SshTarget,
+        command: &str,
+        max_capture_bytes: usize,
+        deadline: std::time::Duration,
+    ) -> Result<CappedOutput, SshError> {
+        // Whole seconds, rounded DOWN: `run_local_bounded`'s granularity. A
+        // deadline under one second cannot be honoured, so nothing is started
+        // rather than granting the session a whole second the caller does not
+        // have (PRD #1487, Qodo review item 13).
+        let mut secs = deadline.as_secs();
+        if let Some(own) = self.kill_deadline_secs() {
+            secs = secs.min(own);
+        }
+        if secs == 0 {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "{:.1}s left is less than the {}s a remote command needs, so it was not started",
+                    deadline.as_secs_f64(),
+                    MIN_BOUNDED_REMOTE_RUN.as_secs()
+                ),
+            });
+        }
+        let mut cmd = self.build_command(target, command);
+        // Its own process group: a `ProxyCommand` or jump-route helper that
+        // outlives the session is killed with it (PRD #1487 re-check R1).
+        let capture = run_local_bounded_owning_group(&mut cmd, secs, max_capture_bytes).map_err(
+            |source| SshError::Io {
+                target: target.user_host(),
+                source,
+            },
+        )?;
+        let Some(status) = capture.status else {
+            return Err(SshError::Other {
+                target: target.user_host(),
+                detail: format!(
+                    "the remote command did not finish within {secs}s, so it was stopped"
+                ),
+            });
+        };
+        let status = status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&capture.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&capture.stderr).into_owned();
+        if status == 255 {
+            return Err(classify_ssh_error(target, &stderr));
+        }
+        Ok(CappedOutput {
+            output: SshOutput {
+                status,
+                stdout,
+                stderr,
+            },
+            truncated: capture.truncated,
+        })
+    }
+
+    fn min_bounded_run(&self) -> std::time::Duration {
+        MIN_BOUNDED_REMOTE_RUN
+    }
 }
 
 /// What one bounded local subprocess run produced.
@@ -804,6 +1011,24 @@ pub struct LocalCapture {
     pub timed_out: bool,
 }
 
+/// How long a stream may stay open after the child [`run_local_bounded`]
+/// spawned has exited. A process that exited has said everything it will say —
+/// what it wrote is already in the pipe — so a stream still open past this is
+/// held by a descendant that inherited it (a `ProxyCommand`, a jump-route
+/// helper, a wrapper, a `ControlPersist` master started with `-v`), and waiting
+/// on it would put that descendant's lifetime in charge of the call's.
+const POST_EXIT_STREAM_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a cancelled stream reader gets to drain what is already buffered
+/// and close its pipe. On Unix the reader is non-blocking and stops within one
+/// poll tick; where it cannot be made non-blocking it is abandoned after this.
+const READER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// After a cancel, a reader keeps reading only what the kernel already holds
+/// — at most a pipe buffer, which Linux caps at 1 MiB — so a descendant that
+/// keeps writing cannot keep a cancelled reader alive.
+const FINAL_DRAIN_BYTES: usize = 1024 * 1024;
+
 /// Spawn `cmd`, enforce a laptop-side wallclock kill at `secs` seconds, and
 /// bound the in-memory capture of each stream at `max_capture_bytes`.
 ///
@@ -820,27 +1045,42 @@ pub struct LocalCapture {
 ///   remote binary or wrapping shell could observe local input for up to the
 ///   deadline.
 /// - Pipes stdout/stderr and drains them concurrently in two helper threads
-///   while the main loop polls `child.try_wait()`. This is what
+///   while the main loop polls the child for exit. This is what
 ///   `Command::output()` does internally, and it's required for any child
 ///   producing more output than a single pipe buffer (~64 KiB on Linux):
 ///   without concurrent draining, the child blocks in `write(2)` before it
-///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
+///   can exit, the poll keeps reporting it running, and the wallclock fires
 ///   even though the child wasn't actually stalled.
 /// - Applies `max_capture_bytes` to *each* stream independently — stdout and
 ///   stderr are separate attack vectors, and a hostile peer that floods stderr
 ///   drives memory growth just as easily as one that floods stdout. A drainer
-///   stops reading altogether at its cap; if the child keeps writing it fills
-///   the kernel pipe buffer, blocks in `write(2)`, and the deadline reaps it.
-/// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
+///   stops reading altogether at its cap and closes its pipe, so a child that
+///   keeps writing dies of `SIGPIPE`/`EPIPE` or is reaped at the deadline.
+/// - Polls the child every 50ms until the deadline — on Unix with
+///   `waitid(…, WNOWAIT)`, which observes the exit without reaping, so the
+///   child is reaped exactly once, after the last signal (see [`Leader`]).
+///   Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
-/// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
-///   return `timed_out: true`. **The kill reaches the child only.** `ssh -G`
-///   evaluates `Match exec`, so a config with `Match exec "sleep 30"` has
-///   already forked a descendant that this does not signal; such a descendant
-///   is orphaned and reaped by init when it exits on its own. The bound this
-///   helper offers is on *our* wait and *our* memory, not on what the user's
-///   own configuration chose to spawn.
+/// - **The deadline bounds the streams, not only the child** (PRD #1487
+///   re-check R1). A descendant that inherited a stream keeps its write end
+///   open after the child exits or is killed, so "wait for EOF" can outlive any
+///   deadline. The call therefore never joins a reader unconditionally: once
+///   the child has exited, a stream still open after
+///   [`POST_EXIT_STREAM_GRACE`] is cancelled, and at the deadline both are.
+///   A cancelled reader drains what is already buffered and closes its pipe —
+///   on Unix it reads non-blocking under `poll(2)`, so it notices the cancel
+///   within a tick; elsewhere a reader still blocked after
+///   [`READER_STOP_GRACE`] is abandoned rather than joined, and exits when the
+///   last writer closes.
+/// - On deadline: SIGKILL the child, then reap it, and
+///   return `timed_out: true`. **Here the kill reaches the child only.**
+///   `ssh -G` evaluates `Match exec`, so a config with `Match exec "sleep 30"`
+///   has already forked a descendant that this does not signal; such a
+///   descendant is orphaned and reaped by init when it exits on its own. The
+///   bound this helper offers is on *our* wait and *our* memory, not on what
+///   the user's own configuration chose to spawn.
+///   [`run_local_bounded_owning_group`] is the variant that also kills them.
 /// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
 ///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
 ///   loop and leak the child — probe callers already clamp to a sane upper
@@ -850,98 +1090,136 @@ pub fn run_local_bounded(
     secs: u64,
     max_capture_bytes: usize,
 ) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, false)
+}
+
+/// [`run_local_bounded`], with the child started in a process group of its own
+/// on Unix, so that whatever it spawns into that group is killed with it.
+///
+/// The group is sent `SIGKILL` whenever the call ends with any of it possibly
+/// still running: at the deadline, and when the child has exited but a stream
+/// is still held open past [`POST_EXIT_STREAM_GRACE`] — the shape of a
+/// `ProxyCommand` or jump-route helper outliving its `ssh`. The child itself is
+/// reaped here, and only after that signal: until then it is kept an unreaped
+/// zombie, so the group id it names cannot have been reused by the time the
+/// signal is sent ([`Leader`]). A killed descendant is not our child and is
+/// reaped by whoever inherited it. A descendant that left the group (`setsid`, as a
+/// `ControlPersist` master does) is not signalled, and the call still returns
+/// on time because its readers are cancelled rather than joined.
+///
+/// Not the default, because a child in its own group no longer receives the
+/// terminal's `Ctrl+C`: this is for short plumbing commands whose lifetime the
+/// caller owns outright (PRD #1487's remote upgrade), not for the
+/// user-interruptible install pipeline. On non-Unix hosts it is
+/// [`run_local_bounded`].
+pub fn run_local_bounded_owning_group(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+) -> std::io::Result<LocalCapture> {
+    run_local_bounded_in(cmd, secs, max_capture_bytes, true)
+}
+
+fn run_local_bounded_in(
+    cmd: &mut Command,
+    secs: u64,
+    max_capture_bytes: usize,
+    own_group: bool,
+) -> std::io::Result<LocalCapture> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    if own_group {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
+    let mut leader = Leader::new(child, own_group);
 
     // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
-    // `None` so the uncapped install path keeps its plain `read_to_end`
-    // instead of looping through the chunked capped drainer for nothing.
+    // `None` so the uncapped install path reads without a byte limit.
     let cap = (max_capture_bytes != usize::MAX).then_some(max_capture_bytes);
-    let stdout_handle = child
+    let stdout = leader
+        .child
         .stdout
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
-    let stderr_handle = child
+        .map(|s| PipeReader::spawn(s, cap));
+    let stderr = leader
+        .child
         .stderr
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
+        .map(|s| PipeReader::spawn(s, cap));
+    let readers: Vec<&PipeReader> = stdout.iter().chain(stderr.iter()).collect();
 
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(secs))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
     let poll_interval = Duration::from_millis(50);
 
-    let join_pipes = |stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
-                      stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>|
-     -> (Vec<u8>, Vec<u8>) {
-        let stdout = stdout_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        (stdout, stderr)
-    };
+    // The child is observed here but never reaped: it stays a zombie, holding
+    // its pid — and so its group id — until `leader.reap()` below, which comes
+    // after the last signal this call sends (PRD #1487 final audit F1).
+    let mut exited_at: Option<Instant> = None;
+    let mut timed_out = false;
+    loop {
+        if exited_at.is_none() {
+            match leader.has_exited() {
+                Ok(true) => exited_at = Some(Instant::now()),
+                Ok(false) => {}
+                Err(source) => {
+                    leader.abandon(&source);
+                    PipeReader::stop_all(&readers);
+                    return Err(source);
+                }
+            }
+        }
+        let streams_closed = readers.iter().all(|r| r.is_done());
+        if exited_at.is_some() && streams_closed {
+            break;
+        }
+        let now = Instant::now();
+        let held_after_exit = exited_at.is_some_and(|at| {
+            at.checked_add(POST_EXIT_STREAM_GRACE)
+                .is_none_or(|limit| now >= limit)
+        });
+        if now >= deadline || held_after_exit {
+            // Something this call started may still be running: the child
+            // itself, or a descendant holding one of its streams open. Best
+            // effort, secondary errors ignored — SIGKILL is unblockable, so
+            // the reap below returns, and the readers are cancelled, never
+            // joined.
+            leader.kill();
+            timed_out = exited_at.is_none();
+            PipeReader::stop_all(&readers);
+            break;
+        }
+        std::thread::sleep(poll_interval);
+    }
+    // The only reap, after every signal: from here on the pid and the group id
+    // may belong to someone else, and `reap` consumes the leader so nothing
+    // can signal them.
+    let reaped = leader.reap();
+    let status = if timed_out { None } else { Some(reaped?) };
 
+    let stdout = stdout.map(|r| r.take()).unwrap_or_default();
+    let stderr = stderr.map(|r| r.take()).unwrap_or_default();
     // A drainer stops exactly AT its cap, so a stream that reached it is a
     // prefix of what the child wanted to say. An output that happens to be
     // exactly `max_capture_bytes` long is reported truncated too; that errs
     // toward "I could not read all of it", which is the safe direction for
     // every caller here.
-    let truncated = |stdout: &[u8], stderr: &[u8]| {
-        stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes
-    };
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Child already exited; close the pipes by joining the
-                // drain threads (they will see EOF once the kernel reaps
-                // the writers).
-                let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                let truncated = truncated(&stdout, &stderr);
-                return Ok(LocalCapture {
-                    status: Some(status),
-                    stdout,
-                    stderr,
-                    truncated,
-                    timed_out: false,
-                });
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best-effort cleanup: ignore secondary errors. SIGKILL
-                    // is unblockable so the child is guaranteed to be
-                    // reaped, and `wait` collects the zombie. Joining the
-                    // drain threads after kill ensures their pipe handles
-                    // don't outlive this function.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                    let truncated = truncated(&stdout, &stderr);
-                    return Ok(LocalCapture {
-                        status: None,
-                        stdout,
-                        stderr,
-                        truncated,
-                        timed_out: true,
-                    });
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = join_pipes(stdout_handle, stderr_handle);
-                return Err(source);
-            }
-        }
-    }
+    let truncated = stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes;
+    Ok(LocalCapture {
+        status,
+        stdout,
+        stderr,
+        truncated,
+        timed_out,
+    })
 }
 
 /// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds,
@@ -988,40 +1266,342 @@ fn run_with_wallclock_kill(
     }
 }
 
-/// Drain a child-process pipe into a `Vec<u8>`, optionally capping how much
-/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
-/// the helper returns immediately once that bound is hit — no further `read`
-/// syscalls are issued. If the child keeps writing it will fill the kernel
-/// pipe buffer and then block in `write(2)`; the surrounding wallclock kill
-/// is the documented fallback that reaps such children. Errors are
-/// swallowed: a half-read pipe still returns the bytes that did land,
-/// matching the behavior `Command::output()` exhibits when the kernel closes
-/// the writer.
-fn drain_pipe<R: std::io::Read>(mut reader: R, cap: Option<usize>) -> Vec<u8> {
-    match cap {
-        None => {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
+/// The child [`run_local_bounded_in`] spawned, and the process group it owns
+/// when the call is [`run_local_bounded_owning_group`].
+///
+/// The group id is the child's pid, so it names this call's group only while
+/// the kernel keeps that pid: while the child runs, and after it exits for as
+/// long as it stays an unreaped zombie. A group signal sent after the reap
+/// could reach a stranger's group once the number is reused, and a descendant
+/// that left the group with `setsid` while holding a stream keeps the call
+/// waiting through exactly that window, with no member left to hold the id
+/// (PRD #1487 final audit F1). So the child's exit is observed without reaping
+/// it (`waitid(…, WNOWAIT)`), every signal is sent before [`Leader::reap`], and
+/// `reap` consumes the value, so no signal can follow it.
+struct Leader {
+    child: std::process::Child,
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+}
+
+impl Leader {
+    fn new(child: std::process::Child, own_group: bool) -> Self {
+        #[cfg(unix)]
+        {
+            let pgid = own_group
+                .then(|| libc::pid_t::try_from(child.id()).ok())
+                .flatten()
+                .filter(|&pgid| group_is_signalable(pgid));
+            Self { child, pgid }
         }
-        Some(cap) => {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                if buf.len() >= cap {
-                    break;
-                }
-                let needed = cap - buf.len();
-                let take = chunk.len().min(needed);
-                match reader.read(&mut chunk[..take]) {
-                    Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
-            }
-            buf
+        #[cfg(not(unix))]
+        {
+            let _ = own_group;
+            Self { child }
         }
     }
+
+    /// Whether the child has exited. On Unix it is left unreaped, so its pid
+    /// and group id stay reserved until [`Leader::reap`].
+    fn has_exited(&mut self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            exited_unreaped(self.child.id())
+        }
+        // No process groups here; std keeps the status for `reap` to return.
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().map(|status| status.is_some())
+        }
+    }
+
+    /// SIGKILL the child and, when this call owns one, its whole group. Safe
+    /// to aim at the group because the child has not been reaped: whether it
+    /// is running or a zombie, its pid — the group id — is still its own.
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.filter(|&pgid| group_is_signalable(pgid)) {
+            #[cfg(all(test, unix))]
+            leader_seam::record(leader_seam::Event::GroupSignal {
+                leader_unreaped: leader_seam::unreaped(self.child.id()),
+            });
+            // SAFETY: killpg takes plain integers and has no memory effects.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+    }
+
+    /// Give up after the child's exit could not be observed. No group signal:
+    /// the failure may mean something else reaped the child (a process that
+    /// ignores `SIGCHLD` has its children reaped automatically), and then
+    /// neither its pid nor its group id is ours any more. `ECHILD` says exactly
+    /// that, so nothing is signalled; any other failure kills the child alone
+    /// and reaps it, as before.
+    fn abandon(mut self, err: &std::io::Error) {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            return;
+        }
+        let _ = err;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Reap the child — the last thing done with it. Consumes the leader, so
+    /// no signal can be sent after the pid and group id are released.
+    fn reap(mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(all(test, unix))]
+        leader_seam::record(leader_seam::Event::Reap);
+        self.child.wait()
+    }
+}
+
+/// Whether child `pid` has exited, observed without reaping it.
+#[cfg(unix)]
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid out-parameter, and
+        // `waitid` writes no more than one. `WNOWAIT` leaves the child
+        // waitable, so this neither reaps it nor changes what a later wait
+        // sees; `WNOHANG` returns at once with `si_pid` still 0 when the child
+        // has not exited.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `waitid` filled `info` (or left it zeroed).
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Defence in depth for a group signal: `killpg(0)` would signal the caller's
+/// own group, `1` is init's, and a non-positive id is not a group at all.
+/// Whatever produced `pgid`, these are never this call's to kill.
+#[cfg(unix)]
+fn group_is_signalable(pgid: libc::pid_t) -> bool {
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    pgid > 1 && pgid != unsafe { libc::getpgrp() }
+}
+
+/// What [`Leader`] did, in order, so a test can assert that no group signal
+/// follows the reap, and that the kernel still held the child at the moment
+/// of each signal. Recording is per thread and off until a test turns it on.
+#[cfg(all(test, unix))]
+mod leader_seam {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Event {
+        /// The group was signalled; `leader_unreaped` is the kernel's answer,
+        /// at that moment, to whether the child was still waitable.
+        GroupSignal {
+            leader_unreaped: bool,
+        },
+        Reap,
+    }
+
+    thread_local! {
+        static EVENTS: RefCell<Option<Vec<Event>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(event: Event) {
+        EVENTS.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
+                events.push(event);
+            }
+        });
+    }
+
+    /// Run `f` with recording on, and return what it recorded.
+    pub(super) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
+        EVENTS.with(|events| *events.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        let recorded = EVENTS.with(|events| events.borrow_mut().take().unwrap_or_default());
+        (out, recorded)
+    }
+
+    /// Whether child `pid` is still waitable — running, or an unreaped zombie.
+    pub(super) fn unreaped(pid: u32) -> bool {
+        super::exited_unreaped(pid).is_ok()
+    }
+}
+
+/// One stream's drainer: a helper thread that reads the pipe into a shared
+/// buffer, so the caller can stop waiting for it — and still keep what it
+/// read — without joining the thread.
+struct PipeReader {
+    shared: std::sync::Arc<PipeShared>,
+}
+
+#[derive(Default)]
+struct PipeShared {
+    buf: std::sync::Mutex<Vec<u8>>,
+    /// Set by the reader once it has stopped and closed its pipe.
+    done: std::sync::atomic::AtomicBool,
+    /// Set by the caller to ask the reader to drain what is buffered and stop.
+    cancel: std::sync::atomic::AtomicBool,
+}
+
+impl PipeReader {
+    fn spawn<R>(pipe: R, cap: Option<usize>) -> Self
+    where
+        R: std::io::Read + PipeFd + Send + 'static,
+    {
+        let shared = std::sync::Arc::new(PipeShared::default());
+        let thread_shared = std::sync::Arc::clone(&shared);
+        std::thread::spawn(move || {
+            drain_pipe(pipe, cap, &thread_shared);
+            thread_shared
+                .done
+                .store(true, std::sync::atomic::Ordering::Release);
+        });
+        Self { shared }
+    }
+
+    fn is_done(&self) -> bool {
+        self.shared.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Cancel every reader, then give them [`READER_STOP_GRACE`] together to
+    /// drain and close. A reader still running after that is abandoned: it
+    /// owns nothing but its pipe and its share of the buffer.
+    fn stop_all(readers: &[&PipeReader]) {
+        for reader in readers {
+            reader
+                .shared
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let until = std::time::Instant::now() + READER_STOP_GRACE;
+        while !readers.iter().all(|r| r.is_done()) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// What this stream delivered so far.
+    fn take(self) -> Vec<u8> {
+        let mut buf = self
+            .shared
+            .buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *buf)
+    }
+}
+
+/// Drain a child-process pipe into `shared.buf`, optionally capping how much
+/// is retained. When `cap` is `Some(n)`, at most `n` bytes are buffered and
+/// the helper stops — closing the pipe — once that bound is hit. Errors end
+/// the drain: a half-read pipe still keeps the bytes that did land, matching
+/// the behavior `Command::output()` exhibits when the kernel closes the writer.
+///
+/// On Unix the pipe is read non-blocking under `poll(2)`, so a cancel is
+/// noticed within a tick even while a quiet descendant holds the write end;
+/// after a cancel the reader takes what the kernel already holds (at most
+/// [`FINAL_DRAIN_BYTES`]) and stops. Elsewhere the read blocks, and a cancel
+/// is only noticed between reads.
+fn drain_pipe<R: std::io::Read + PipeFd>(mut pipe: R, cap: Option<usize>, shared: &PipeShared) {
+    use std::sync::atomic::Ordering;
+
+    let nonblocking = pipe.set_nonblocking();
+    let mut chunk = [0u8; 8192];
+    let mut after_cancel = 0usize;
+    let mut len = 0usize;
+    loop {
+        let cancelled = shared.cancel.load(Ordering::Acquire);
+        if cancelled && (!nonblocking || after_cancel >= FINAL_DRAIN_BYTES) {
+            break;
+        }
+        let room = cap.map_or(chunk.len(), |cap| cap.saturating_sub(len));
+        if room == 0 {
+            break;
+        }
+        let take = chunk.len().min(room);
+        match pipe.read(&mut chunk[..take]) {
+            Ok(0) => break,
+            Ok(n) => {
+                shared
+                    .buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+                len += n;
+                if cancelled {
+                    after_cancel += n;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if cancelled {
+                    // Everything the kernel held has been read.
+                    break;
+                }
+                pipe.wait_readable(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    drop(pipe);
+}
+
+/// The two things [`drain_pipe`] needs from a pipe beyond `Read`, which only
+/// Unix can provide; elsewhere both are no-ops and the read blocks.
+trait PipeFd {
+    /// Switch the read end to non-blocking. `false` when that failed or is
+    /// not supported, in which case reads block.
+    fn set_nonblocking(&self) -> bool;
+    /// Wait up to `timeout` for the pipe to become readable (or closed).
+    fn wait_readable(&self, timeout: std::time::Duration);
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        let fd = self.as_raw_fd();
+        // SAFETY: fcntl on a descriptor this value owns; F_GETFL/F_SETFL have
+        // no memory effects. O_NONBLOCK is per open file description, and the
+        // child's write end is a different one, so the child is unaffected.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+        }
+    }
+
+    fn wait_readable(&self, timeout: std::time::Duration) {
+        let mut pfd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid pollfd, count 1; an EINTR return is just an early
+        // wake-up, and the caller reads again either way.
+        unsafe {
+            libc::poll(&mut pfd, 1, millis);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl<T> PipeFd for T {
+    fn set_nonblocking(&self) -> bool {
+        false
+    }
+
+    fn wait_readable(&self, _timeout: std::time::Duration) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1682,18 @@ impl RemoteEntry {
         if let Some(user) = &self.user {
             target.user = Some(user.clone());
         }
+        target.jump = self.jump_host.clone();
         target
+    }
+
+    /// Whether `other` reaches the same daemon this row does: the same ssh
+    /// route (host, login, port, key and jump host) and the same daemon
+    /// socket. What an upgrade captured at its start is compared with the row
+    /// it is about to record into, so a row moved to another machine in the
+    /// meantime is refused rather than written over (PRD #1487, Greptile
+    /// 4208066970).
+    pub fn same_route(&self, other: &RemoteEntry) -> bool {
+        self.ssh_target() == other.ssh_target() && self.socket == other.socket
     }
 
     /// The deck binary to invoke on the remote, spelled for the remote shell:
@@ -1114,6 +1705,11 @@ impl RemoteEntry {
         self.binary
             .as_ref()
             .map_or(REMOTE_INSTALL_PATH, RemoteBinaryPath::as_str)
+    }
+
+    /// [`Self::remote_binary`] as the validated type a remote command takes.
+    pub fn deck_binary(&self) -> RemoteDeckBinary {
+        RemoteDeckBinary::recorded_or_default(self.binary.as_ref())
     }
 }
 
@@ -1173,6 +1769,64 @@ impl TryFrom<String> for RemoteBinaryPath {
 impl From<RemoteBinaryPath> for String {
     fn from(path: RemoteBinaryPath) -> Self {
         path.0
+    }
+}
+
+/// The deck binary a remote command runs, as a type that can hold only a value
+/// safe to put **unquoted** at the start of a remote shell command (issue
+/// #1490): the default install or a validated [`RemoteBinaryPath`]. A raw
+/// string enters only through [`TryFrom<&str>`], which refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteDeckBinary {
+    /// [`REMOTE_INSTALL_PATH`], the `~/.local/bin` install. Its leading `~` is
+    /// deliberately left unquoted so the remote shell expands it to the remote
+    /// user's home; quoting it would name a directory literally called `~`.
+    DefaultInstall,
+    /// A recorded absolute path, such as a Homebrew install.
+    Path(RemoteBinaryPath),
+}
+
+impl RemoteDeckBinary {
+    /// The deck-list row's recorded binary, or the default install when it
+    /// records none.
+    pub fn recorded_or_default(recorded: Option<&RemoteBinaryPath>) -> Self {
+        recorded.map_or(Self::DefaultInstall, |path| Self::Path(path.clone()))
+    }
+
+    /// The binary as spelled for the remote shell, ready to interpolate
+    /// unquoted.
+    pub fn as_shell_word(&self) -> &str {
+        match self {
+            Self::DefaultInstall => REMOTE_INSTALL_PATH,
+            Self::Path(path) => path.as_str(),
+        }
+    }
+}
+
+impl From<RemoteBinaryPath> for RemoteDeckBinary {
+    fn from(path: RemoteBinaryPath) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl TryFrom<&str> for RemoteDeckBinary {
+    type Error = String;
+
+    /// [`REMOTE_INSTALL_PATH`] exactly, or an absolute path
+    /// [`RemoteBinaryPath`] accepts. Anything else — whitespace, a shell
+    /// metacharacter, a relative path, any other `~` spelling — is refused.
+    fn try_from(binary: &str) -> Result<Self, Self::Error> {
+        if binary == REMOTE_INSTALL_PATH {
+            Ok(Self::DefaultInstall)
+        } else {
+            RemoteBinaryPath::try_from(binary.to_string()).map(Self::Path)
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteDeckBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_shell_word())
     }
 }
 
@@ -1317,6 +1971,21 @@ pub enum RemoteAddError {
     },
     #[error("Installed binary reports `{actual}` but expected `{expected}`.")]
     VersionMismatch { actual: String, expected: String },
+    /// The install had already put a build at `binary` — the download moved
+    /// into place, or `brew upgrade` succeeded — when the version check that
+    /// follows failed (`source`). Nothing is rolled back, so the binary is no
+    /// longer the one that was there before (PRD #1487 review). `on_disk` is
+    /// the version the check read, when it read one, and otherwise
+    /// [`UNVERIFIED_BUILD`].
+    #[error(
+        "{binary} on the remote was replaced, but the new binary did not pass its version check: {source} What is installed there now is {on_disk}. Run the install again; if the check keeps failing, run `{binary} --version` on the remote to see what it reports."
+    )]
+    ReplacedButUnverified {
+        binary: String,
+        on_disk: String,
+        #[source]
+        source: Box<RemoteAddError>,
+    },
     #[error("`dot-agent-deck hooks install` on remote failed (exit {status}): {stderr}")]
     HooksInstallFailed { status: i32, stderr: String },
     #[error(
@@ -1405,12 +2074,6 @@ fn detect_platform(uname_stdout: &str) -> Option<&'static str> {
     }
 }
 
-/// Pull the version number out of `dot-agent-deck --version` output.
-/// Expected shape: `dot-agent-deck X.Y.Z` (possibly with trailing whitespace).
-fn parse_version_output(stdout: &str) -> Option<String> {
-    stdout.split_whitespace().nth(1).map(|s| s.to_string())
-}
-
 /// Install (or version-check, with `no_install`) the remote binary and assert
 /// it reports the expected version. Shared between `add` and `upgrade` — the
 /// only piece that's identical between the two flows. Caller is responsible
@@ -1464,21 +2127,38 @@ fn install_and_verify(
             ),
         });
     }
-    let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
-    if v.status != 0 {
-        return Err(RemoteAddError::VersionMismatch {
-            actual: format!("(exit {}) {}", v.status, scrub_remote_text(&v.stderr)),
-            expected: version.to_string(),
-        });
+    // The download is in place from here on: a failed check no longer means
+    // "nothing changed", so it says what replaced the binary.
+    remote_binary_version(executor, target, REMOTE_INSTALL_PATH, version)
+        .and_then(|actual| {
+            if actual == version {
+                Ok(())
+            } else {
+                Err(RemoteAddError::VersionMismatch {
+                    actual,
+                    expected: version.to_string(),
+                })
+            }
+        })
+        .map_err(|e| replaced_but_unverified(REMOTE_INSTALL_PATH, e))
+}
+
+/// What a remote's binary is called once a build replaced it and its version
+/// check failed without reading a version.
+pub const UNVERIFIED_BUILD: &str = "an unverified build";
+
+/// Wrap a version-check failure that came after the install put a new binary at
+/// `binary`, keeping the version the check read when it read a valid one.
+fn replaced_but_unverified(binary: &str, check: RemoteAddError) -> RemoteAddError {
+    let on_disk = match &check {
+        RemoteAddError::VersionMismatch { actual, .. } => validate_version_string(actual).ok(),
+        _ => None,
+    };
+    RemoteAddError::ReplacedButUnverified {
+        binary: binary.to_string(),
+        on_disk: on_disk.unwrap_or_else(|| UNVERIFIED_BUILD.to_string()),
+        source: Box::new(check),
     }
-    let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
-    if actual != version {
-        return Err(RemoteAddError::VersionMismatch {
-            actual: scrub_remote_text(&actual),
-            expected: version.to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// How the deck is installed on a remote, as [`detect_install`] found it.
@@ -1731,7 +2411,16 @@ fn install_or_upgrade(
         }
     }
 
-    let landed = remote_binary_version(executor, target, binary.as_str(), version)?;
+    // After a `brew upgrade` that succeeded, Homebrew may have replaced the
+    // binary, so a failed check says so; without one nothing changed.
+    let landed =
+        remote_binary_version(executor, target, binary.as_str(), version).map_err(|e| {
+            if run_brew_upgrade {
+                replaced_but_unverified(binary.as_str(), e)
+            } else {
+                e
+            }
+        })?;
     // `--no-install` is a pre-flight that the remote already runs the
     // requested version, on this path as on the `~/.local/bin` one; it is
     // only when this command installs through Homebrew that a different
@@ -2077,6 +2766,40 @@ pub enum RemoteUpgradeError {
     /// keep the `?` ergonomics for `SshError` and `RemoteConfigError`.
     #[error(transparent)]
     Inner(#[from] RemoteAddError),
+    /// The deck list's row for this remote no longer reaches the machine the
+    /// upgrade installed on: it was removed and re-added, or edited, for
+    /// another address while the upgrade ran (PRD #1487, Greptile
+    /// 4208066970). Nothing is recorded over the row.
+    #[error(
+        "the deck list's row for '{name}' was changed to reach a different machine while the upgrade ran, so the result was not recorded over it. Check the row with `dot-agent-deck remote list` and run the upgrade again."
+    )]
+    RouteChanged { name: String },
+    /// The new build is already in place on the remote, and a step after it —
+    /// reinstalling the hooks, or recording it in the deck list — failed. The
+    /// binary is not rolled back; running the upgrade again finishes the rest.
+    #[error("{installed_version} was installed, but {step} failed: {source}")]
+    AfterInstall {
+        installed_version: String,
+        step: &'static str,
+        #[source]
+        source: Box<RemoteUpgradeError>,
+    },
+}
+
+impl RemoteUpgradeError {
+    /// What is in place when this error happened, if the install had already
+    /// replaced the binary: the version it finished with, or — when the check
+    /// after the replacement failed — the version that check read, or
+    /// [`UNVERIFIED_BUILD`].
+    pub fn installed_version(&self) -> Option<&str> {
+        match self {
+            Self::AfterInstall {
+                installed_version, ..
+            } => Some(installed_version),
+            Self::Inner(RemoteAddError::ReplacedButUnverified { on_disk, .. }) => Some(on_disk),
+            _ => None,
+        }
+    }
 }
 
 impl From<SshError> for RemoteUpgradeError {
@@ -2111,17 +2834,37 @@ pub fn upgrade_reporting_to(
     out: &mut dyn std::io::Write,
 ) -> Result<RemoteEntry, RemoteUpgradeError> {
     // 1. Version validation BEFORE any ssh call (mirrors `add`).
-    let version = validate_version_string(&opts.version)?;
+    validate_version_string(&opts.version)?;
 
     // 2. Lookup. Unknown name short-circuits before any ssh work.
     let registry = RemotesFile::load(remotes_path)?;
     let existing = registry
         .remotes
-        .iter()
+        .into_iter()
         .find(|r| r.name == opts.name)
         .ok_or_else(|| RemoteUpgradeError::UnknownName {
             name: opts.name.clone(),
         })?;
+    upgrade_entry_reporting_to(opts, &existing, executor, remotes_path, out)
+}
+
+/// [`upgrade_reporting_to`] against `existing`, the row the caller already
+/// read, instead of reading it again by name — so the install goes to the
+/// machine the caller's other commands (its probe and restart) go to. The
+/// result is recorded only while the row named `opts.name` still reaches that
+/// machine ([`RemoteEntry::same_route`]); a row moved elsewhere in the
+/// meantime is refused with [`RemoteUpgradeError::RouteChanged`] (PRD #1487,
+/// Greptile 4208066970).
+pub fn upgrade_entry_reporting_to(
+    opts: &UpgradeOptions,
+    existing: &RemoteEntry,
+    executor: &dyn SshExecutor,
+    remotes_path: &Path,
+    out: &mut dyn std::io::Write,
+) -> Result<RemoteEntry, RemoteUpgradeError> {
+    // 1. Version validation BEFORE any ssh call (mirrors `add`).
+    let version = validate_version_string(&opts.version)?;
+
     let target = existing.ssh_target();
     let was_homebrew = existing.install.as_deref() == Some(INSTALL_HOMEBREW);
 
@@ -2166,8 +2909,18 @@ pub fn upgrade_reporting_to(
     //    otherwise `remote upgrade` reports success while leaving the remote
     //    on stale hooks. Mirrors the same step in `add()` so both paths stay
     //    in lockstep. Runs BEFORE the registry update so a hook-install failure
-    //    fails loud rather than persisting half-finished state.
-    install_remote_hooks(executor, &target, &installed, out)?;
+    //    fails loud rather than persisting half-finished state. The binary is
+    //    already in place by now, so a failure from here on says so.
+    let after_install = |step: &'static str| {
+        let installed_version = installed.version.clone();
+        move |source: RemoteUpgradeError| RemoteUpgradeError::AfterInstall {
+            installed_version,
+            step,
+            source: Box::new(source),
+        }
+    };
+    install_remote_hooks(executor, &target, &installed, out)
+        .map_err(|e| after_install("reinstalling the hooks")(e.into()))?;
 
     // 6. Update registry. `added_at` stays at the original registration
     //    timestamp; `upgraded_at` records the most recent upgrade so users
@@ -2175,19 +2928,34 @@ pub fn upgrade_reporting_to(
     //    install method and binary are re-recorded on every upgrade, which is
     //    what moves an entry written before issue #1372 onto the method that
     //    actually owns the remote's install.
+    //    Only while the row still reaches the machine this run installed on:
+    //    one moved to another address since `existing` was read is refused
+    //    rather than stamped with a version that machine does not run.
     let now = chrono::Utc::now().to_rfc3339();
-    let updated = crate::deck_list::update(
+    let updated = crate::deck_list::update_if(
         remotes_path,
         crate::deck_list::DeckRef::Name(&opts.name),
+        |entry| {
+            if entry.same_route(existing) {
+                Ok(())
+            } else {
+                Err(RemoteUpgradeError::RouteChanged {
+                    name: opts.name.clone(),
+                })
+            }
+        },
         |entry| {
             entry.version = installed.version.clone();
             entry.upgraded_at = Some(now);
             entry.install = Some(installed.method.to_string());
             entry.binary = installed.binary.clone();
         },
-    )?
-    .ok_or_else(|| RemoteUpgradeError::UnknownName {
-        name: opts.name.clone(),
+    )
+    .map_err(after_install("recording it in the deck list"))?
+    .ok_or_else(|| {
+        after_install("recording it in the deck list")(RemoteUpgradeError::UnknownName {
+            name: opts.name.clone(),
+        })
     })?;
 
     let _ = writeln!(
@@ -2249,6 +3017,34 @@ mod tests {
         assert_eq!(option, "ssh -- -oProxyCommand=id 'rm x'");
     }
 
+    /// Scenario: a deck reached through a jump host prints its remedy and its
+    /// cleanup commands with `-J <jump host>`, in the place the real session
+    /// passes it, so a pasted command takes the deck's route; a jump host that
+    /// does not validate is left out of both, as the session leaves it out
+    /// (PRD #1487, Qodo 4202060288).
+    #[test]
+    fn printed_commands_take_the_jump_host_the_session_takes() {
+        let mut routed = SshTarget::parse("u@h", 2222, Some(PathBuf::from("/k/id")));
+        routed.jump = Some("bastion".to_string());
+        assert_eq!(
+            routed.command_line("rm x"),
+            "ssh -p 2222 -i /k/id -J bastion u@h 'rm x'"
+        );
+        assert_eq!(routed.host_key_remedy(), "ssh -J bastion -p 2222 u@h");
+        let session = SystemSshExecutor::default().build_command(&routed, "rm x");
+        let args: Vec<String> = session
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let jump_at = args.iter().position(|a| a == "-J").expect("-J is passed");
+        assert_eq!(args[jump_at + 1], "bastion");
+
+        let mut hostile = SshTarget::parse("u@h", 22, None);
+        hostile.jump = Some("-oProxyCommand=id".to_string());
+        assert_eq!(hostile.command_line("rm x"), "ssh u@h 'rm x'");
+        assert_eq!(hostile.host_key_remedy(), "ssh u@h");
+    }
+
     #[test]
     fn ssh_target_parse_without_user() {
         let t = SshTarget::parse("hetzner-1.example.com", 22, None);
@@ -2267,6 +3063,7 @@ mod tests {
             user: Some("user;rm -rf /".to_string()),
             port: 2222,
             key: Some(PathBuf::from("/tmp/key id_rsa")),
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "uname -s -m; echo $(id)");
         let args = args_of(&cmd);
@@ -2294,6 +3091,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2316,6 +3114,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::new().build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2341,6 +3140,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_wallclock_timeout(7).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2398,6 +3198,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::for_observation(9).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2448,6 +3249,134 @@ mod tests {
         );
     }
 
+    /// Issue #1490 audit A1: `observing()` over the keepalive bounds applies
+    /// the one observation list, and `requiring_known_host_key()` adds the
+    /// tunnel's host-key policy — neither is applied unless asked for.
+    #[test]
+    fn system_ssh_executor_observing_with_keepalive_requires_a_known_host_key() {
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+            jump: None,
+        };
+        let observing = SystemSshExecutor::with_keepalive(10, 15, 8)
+            .observing()
+            .requiring_known_host_key();
+        let args = args_of(&observing.build_command(&target, "echo hi"));
+        let mut observation_only = Command::new("ssh");
+        apply_observation_options(&mut observation_only);
+        for expected in args_of(&observation_only)
+            .iter()
+            .filter(|arg| *arg != "-o")
+            .map(String::as_str)
+            .chain([
+                "StrictHostKeyChecking=yes",
+                "BatchMode=yes",
+                "ConnectTimeout=10",
+                "ServerAliveInterval=15",
+                "ServerAliveCountMax=8",
+            ])
+        {
+            assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
+        }
+        // Keepalive-bounded, not wallclock-killed.
+        assert_eq!(observing.kill_deadline_secs(), None);
+
+        let plain =
+            args_of(&SystemSshExecutor::with_keepalive(10, 15, 8).build_command(&target, "x"));
+        assert!(
+            !plain
+                .iter()
+                .any(|a| a.starts_with("StrictHostKeyChecking") || a == "ForwardAgent=no"),
+            "an ordinary keepalive session honours the user's Host block: {plain:?}"
+        );
+    }
+
+    /// Issue #1490 audit A2: a raw string becomes a remote command's binary
+    /// only through `RemoteDeckBinary::try_from`, which accepts the default
+    /// install and a safe absolute path and refuses whitespace, every shell
+    /// metacharacter, relative paths and any other `~` spelling.
+    #[test]
+    fn remote_deck_binary_refuses_anything_a_shell_would_reinterpret() {
+        assert_eq!(
+            RemoteDeckBinary::try_from(REMOTE_INSTALL_PATH),
+            Ok(RemoteDeckBinary::DefaultInstall)
+        );
+        assert_eq!(
+            RemoteDeckBinary::DefaultInstall.as_shell_word(),
+            "~/.local/bin/dot-agent-deck",
+            "the default keeps its `~` for the remote shell to expand"
+        );
+        let homebrew = RemoteDeckBinary::try_from("/opt/homebrew/bin/dot-agent-deck").unwrap();
+        assert_eq!(homebrew.as_shell_word(), "/opt/homebrew/bin/dot-agent-deck");
+        for refused in [
+            "",
+            "/",
+            "dot-agent-deck",
+            "bin/dot-agent-deck",
+            "~/bin/dot-agent-deck",
+            "~other/.local/bin/dot-agent-deck",
+            "/opt/my bin/dot-agent-deck",
+            "/opt/bin/dot-agent-deck\t",
+            "/opt/bin/dot-agent-deck\n",
+            "/opt/bin/dot-agent-deck;rm -rf ~",
+            "/opt/bin/dot-agent-deck&&id",
+            "/opt/bin/dot-agent-deck|id",
+            "/opt/bin/$(id)",
+            "/opt/bin/`id`",
+            "/opt/bin/$HOME",
+            "/opt/bin/dot-agent-deck>x",
+            "/opt/bin/dot-agent-deck<x",
+            "/opt/bin/'dot-agent-deck'",
+            "/opt/bin/\"dot-agent-deck\"",
+            "/opt/bin/dot*",
+            "/opt/bin/dot?",
+            "/opt/bin/\\dot",
+            "/opt/bin/(dot)",
+            "/opt/bin/{dot}",
+            "/opt/bin/dot#x",
+            "/opt/bin/dot!x",
+        ] {
+            assert!(
+                RemoteDeckBinary::try_from(refused).is_err(),
+                "{refused:?} must be refused"
+            );
+        }
+        let row = RemoteEntry {
+            binary: Some(
+                RemoteBinaryPath::try_from("/opt/homebrew/bin/dot-agent-deck".to_string()).unwrap(),
+            ),
+            ..entry_with_binary_none()
+        };
+        assert_eq!(row.deck_binary(), homebrew);
+        assert_eq!(
+            entry_with_binary_none().deck_binary(),
+            RemoteDeckBinary::DefaultInstall
+        );
+    }
+
+    fn entry_with_binary_none() -> RemoteEntry {
+        RemoteEntry {
+            name: "mac".to_string(),
+            kind: "ssh".to_string(),
+            host: "user@mac".to_string(),
+            port: 22,
+            key: None,
+            version: "0.1.0".to_string(),
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            upgraded_at: None,
+            last_connected: None,
+            install: None,
+            binary: None,
+            id: None,
+            user: None,
+            jump_host: None,
+            socket: None,
+        }
+    }
+
     #[test]
     fn system_ssh_executor_with_keepalive_sets_alive_options_without_count_max_1() {
         // PRD #161 FIX 3: the remote-UPGRADE executor sets ConnectTimeout +
@@ -2460,6 +3389,7 @@ mod tests {
             user: None,
             port: 22,
             key: None,
+            jump: None,
         };
         let cmd = SystemSshExecutor::with_keepalive(30, 15, 8).build_command(&target, "echo hi");
         let args = args_of(&cmd);
@@ -2878,6 +3808,104 @@ mod tests {
         );
     }
 
+    /// A check that read no version after the binary moved — it exited
+    /// non-zero — reports an unverified build rather than a version, on both
+    /// the download path and after a `brew upgrade`. Under `--no-install`, and
+    /// on `remote add`'s Homebrew path, nothing was replaced, so the plain
+    /// mismatch stands and no version is claimed.
+    #[test]
+    fn a_replaced_binary_that_reads_no_version_is_an_unverified_build() {
+        let target = SshTarget::parse("user@host", 22, None);
+        let version_fails = || SshOutput {
+            status: 126,
+            stdout: String::new(),
+            stderr: "cannot execute binary file".to_string(),
+        };
+
+        let executor = ScriptedSsh::new([ssh_ok(""), version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+        )
+        .expect_err("a failed version check must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == REMOTE_INSTALL_PATH && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+        let upgrade_err = RemoteUpgradeError::Inner(err);
+        assert_eq!(upgrade_err.installed_version(), Some(UNVERIFIED_BUILD));
+        let msg = upgrade_err.to_string();
+        assert!(msg.contains("cannot execute binary file"), "{msg}");
+        assert!(msg.contains("an unverified build"), "{msg}");
+
+        let brew_probe = || ssh_ok("local-bin=\nhomebrew=/opt/homebrew\nformula=dot-agent-deck\n");
+        let executor = ScriptedSsh::new([brew_probe(), ssh_ok(""), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            true,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check after brew upgrade must fail");
+        assert!(
+            matches!(
+                &err,
+                RemoteAddError::ReplacedButUnverified { binary, on_disk, .. }
+                    if binary == "/opt/homebrew/bin/dot-agent-deck" && on_disk == UNVERIFIED_BUILD
+            ),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([brew_probe(), version_fails()]);
+        let err = install_or_upgrade(
+            &executor,
+            &target,
+            "mac",
+            "darwin-arm64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("a failed version check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+
+        let executor = ScriptedSsh::new([version_fails()]);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            true,
+        )
+        .expect_err("a failed --no-install check must fail");
+        assert!(
+            matches!(err, RemoteAddError::VersionMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(RemoteUpgradeError::Inner(err).installed_version(), None);
+    }
+
     /// Issue #1350: `remote add` refuses an unsafe address with the rules the
     /// shared deck list enforces, before any ssh call — an empty script panics
     /// on the first one — and writes nothing.
@@ -3016,6 +4044,151 @@ mod tests {
                 "{label}: expected the stripped residue in {msg:?}"
             );
         }
+    }
+
+    /// Scenario: a child that starts a quiet descendant inheriting its
+    /// streams, prints one line and exits. The plain runner does not own the
+    /// descendant, so it does not kill it — but it stops waiting for the
+    /// streams shortly after the child exits instead of until the descendant
+    /// does, and keeps the line (PRD #1487 re-check R1).
+    #[cfg(unix)]
+    #[test]
+    fn run_local_bounded_does_not_wait_on_a_descendant_after_the_child_exits() {
+        let started = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 600 & echo \"pid=$!\""]);
+        let capture = run_local_bounded(&mut cmd, 60, 4096).unwrap();
+        let elapsed = started.elapsed();
+        let stdout = String::from_utf8(capture.stdout).unwrap();
+        if let Some(pid) = stdout
+            .trim()
+            .strip_prefix("pid=")
+            .and_then(|p| p.parse::<libc::pid_t>().ok())
+        {
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "the call waited on the descendant: {elapsed:?}"
+        );
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out && !capture.truncated);
+        assert!(stdout.starts_with("pid="), "the line was lost: {stdout:?}");
+    }
+
+    /// Run `script` under `/bin/sh` through the group-owning runner with the
+    /// leader seam recording, and return the capture, what the runner did to
+    /// the leader, and the pid the script printed as `pid=<n>`, if any.
+    #[cfg(unix)]
+    fn run_owning_group_recorded(
+        script: &str,
+        secs: u64,
+    ) -> (LocalCapture, Vec<leader_seam::Event>, Option<libc::pid_t>) {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]);
+        let (capture, events) =
+            leader_seam::capture(|| run_local_bounded_owning_group(&mut cmd, secs, 4096));
+        let capture = capture.unwrap();
+        let pid = String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("pid=")?.trim().parse().ok());
+        (capture, events, pid)
+    }
+
+    /// The order every group-owning run that signals must keep: one group
+    /// signal, sent while the kernel still held the child, then the one reap.
+    #[cfg(unix)]
+    fn assert_signalled_before_reaping(events: &[leader_seam::Event], label: &str) {
+        use leader_seam::Event;
+        assert_eq!(
+            events,
+            [
+                Event::GroupSignal {
+                    leader_unreaped: true
+                },
+                Event::Reap
+            ],
+            "{label}: the group must be signalled while the leader is unreaped, then reaped once"
+        );
+    }
+
+    /// Scenario: the escaped-writer interleaving from PRD #1487's final audit
+    /// (F1) — the child starts a descendant that leaves its process group with
+    /// `setsid` while keeping stdout open, prints a line and exits. The call
+    /// waits out the stream grace and signals the group; that signal must go
+    /// out while the exited child is still an unreaped zombie holding the
+    /// group id, and the child is reaped only afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owning_group_signals_an_escapees_old_group_only_before_reaping_its_leader() {
+        if Command::new("setsid")
+            .arg("true")
+            .status()
+            .map_or(true, |s| !s.success())
+        {
+            eprintln!("SKIP: no `setsid` on this host");
+            return;
+        }
+        let (capture, events, pid) =
+            run_owning_group_recorded("setsid sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // Out of reach of the group kill, so this test cleans it up.
+            // SAFETY: plain signal to the pid this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(pid.is_some(), "the line was lost: {:?}", capture.stdout);
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert!(!capture.timed_out);
+        assert_signalled_before_reaping(&events, "escapee");
+    }
+
+    /// Scenario: a descendant that stays in the group holds the streams after
+    /// the child exits, and, separately, a child that never exits. Both end
+    /// in a group signal; in both the signal precedes the only reap and finds
+    /// the child still unreaped.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_never_signals_after_reaping_its_leader() {
+        let (capture, events, pid) =
+            run_owning_group_recorded("sleep 600 &\necho \"pid=$!\"\nexit 0", 60);
+        if let Some(pid) = pid {
+            // SAFETY: plain signal to the pid this test started; it is
+            // already dead if the group kill reached it.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(capture.status.is_some_and(|s| s.success()));
+        assert_signalled_before_reaping(&events, "held after exit");
+
+        let (capture, events, _) = run_owning_group_recorded("exec sleep 600", 1);
+        assert!(capture.timed_out && capture.status.is_none());
+        assert_signalled_before_reaping(&events, "deadline");
+    }
+
+    /// Scenario: a child that prints a line and exits with nothing left
+    /// holding its streams. Nothing could still be running, so the group is
+    /// not signalled at all; the child is reaped once and its status kept.
+    #[cfg(unix)]
+    #[test]
+    fn owning_group_reaps_a_clean_exit_without_signalling() {
+        let (capture, events, _) = run_owning_group_recorded("echo pid=0; exit 3", 60);
+        assert_eq!(capture.status.and_then(|s| s.code()), Some(3));
+        assert_eq!(events, [leader_seam::Event::Reap]);
+    }
+
+    /// Scenario: the defence-in-depth check on a group id. Zero (the caller's
+    /// own group to `killpg`), one (init's), a negative number, and the
+    /// caller's own group are refused; an ordinary other id is allowed.
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_refuses_ids_that_are_never_this_calls() {
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let own = unsafe { libc::getpgrp() };
+        for refused in [0, 1, -1, -own, own] {
+            assert!(!group_is_signalable(refused), "{refused} must be refused");
+        }
+        let other = if own == i32::MAX { own - 1 } else { own + 1 };
+        assert!(group_is_signalable(other.max(2)));
     }
 }
 
@@ -3413,6 +4586,59 @@ mod homebrew_remote_tests {
         }
     }
 
+    /// PRD #1487 review: the release lands and then `hooks install` fails. The
+    /// binary is not rolled back, so the error says the new version is
+    /// installed and which later step failed — never that nothing changed —
+    /// and the deck list still records the version it had.
+    #[test]
+    fn a_failure_after_the_binary_landed_names_the_installed_version_and_the_step() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        // The release that lands reports its version, but its hook install fails.
+        let landed = "#!/bin/sh\ncase \"$1\" in\n--version) echo \"dot-agent-deck 0.43.0\" ;;\nhooks) echo 'hooks: settings.json is not writable' >&2; exit 3 ;;\nesac\n";
+        write_script(
+            &remote.root.join("stubs/curl"),
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do\nif [ \"$1\" = -o ]; then out=\"$2\"; fi\nshift\ndone\ncat > \"$out\" <<'EOF'\n{landed}EOF\n"
+            ),
+        );
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.43.0", false);
+        let err = result.expect_err("a failed hook install must fail the upgrade");
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::AfterInstall { step: "reinstalling the hooks", source, .. }
+                    if matches!(**source, RemoteUpgradeError::Inner(RemoteAddError::HooksInstallFailed { .. }))
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("0.43.0 was installed, but reinstalling the hooks failed:"),
+            "{msg}"
+        );
+        assert!(msg.contains("settings.json is not writable"), "{msg}");
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
+
+        // A failure before anything landed carries no installed version.
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", true);
+        assert_eq!(
+            result.expect_err("version mismatch").installed_version(),
+            None
+        );
+    }
+
     /// Control: a remote with no Homebrew install keeps today's behaviour —
     /// the release binary lands in `~/.local/bin` — and says so in the entry.
     #[test]
@@ -3446,6 +4672,116 @@ mod homebrew_remote_tests {
         assert_eq!(entry.install.as_deref(), Some(INSTALL_LOCAL_BIN));
         assert_eq!(entry.binary, None);
         assert_eq!(entry.remote_binary(), REMOTE_INSTALL_PATH);
+    }
+
+    /// Scenario: an upgrade starts against the deck-list row it read for
+    /// `mac` (`user@mac`), and while it runs that row is removed and re-added
+    /// for another machine (`user@elsewhere`). Every ssh command still goes to
+    /// the machine the upgrade started on, and the result is refused rather
+    /// than recorded over the moved row — the error says so in plain words and
+    /// that the build was installed (PRD #1487, Greptile 4208066970).
+    #[test]
+    fn an_upgrade_whose_row_moves_to_another_machine_mid_run_installs_on_the_first_and_records_nothing()
+     {
+        struct MovesTheRow<'a> {
+            inner: SandboxShell,
+            targets: std::cell::RefCell<Vec<SshTarget>>,
+            registry: &'a Path,
+        }
+        impl SshExecutor for MovesTheRow<'_> {
+            fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
+                if self.targets.borrow().is_empty() {
+                    // Another client removes `mac` and adds it back for a
+                    // different machine, while this upgrade is under way.
+                    let mut file = RemotesFile::load(self.registry).unwrap();
+                    file.remotes[0].host = "user@elsewhere".to_string();
+                    file.save(self.registry).unwrap();
+                }
+                self.targets.borrow_mut().push(target.clone());
+                self.inner.run(target, command)
+            }
+        }
+
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let pinned = remote.entry();
+        let executor = MovesTheRow {
+            inner: remote.shell(BrewAt::PrefixOnly),
+            targets: Default::default(),
+            registry: &remote.registry,
+        };
+        let opts = UpgradeOptions {
+            name: "mac".to_string(),
+            version: "0.43.0".to_string(),
+            no_install: false,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+        let mut out = Vec::new();
+        let error =
+            upgrade_entry_reporting_to(&opts, &pinned, &executor, &remote.registry, &mut out)
+                .expect_err("a row moved to another machine must not be recorded over");
+
+        let targets = executor.targets.borrow();
+        assert!(!targets.is_empty());
+        assert!(
+            targets.iter().all(|t| *t == pinned.ssh_target()),
+            "every command must reach the machine the upgrade started on: {targets:?}"
+        );
+        assert!(
+            matches!(
+                &error,
+                RemoteUpgradeError::AfterInstall { source, .. }
+                    if matches!(**source, RemoteUpgradeError::RouteChanged { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(error.installed_version(), Some("0.43.0"));
+        let message = error.to_string();
+        assert!(
+            message.contains("was changed to reach a different machine"),
+            "{message}"
+        );
+        let row = remote.entry();
+        assert_eq!(row.host, "user@elsewhere", "the re-added row is kept");
+        assert_eq!(row.version, "0.40.0", "nothing recorded over it");
+        assert_eq!(row.upgraded_at, None);
+    }
+
+    /// A row whose route is unchanged is the same machine: [`RemoteEntry::same_route`]
+    /// ignores what an upgrade itself records, and notices every address field.
+    #[test]
+    fn same_route_compares_the_address_and_socket_only() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: None,
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+        let base = remote.entry();
+        let mut recorded = base.clone();
+        recorded.version = "0.43.0".into();
+        recorded.upgraded_at = Some("2026-10-07T00:00:00Z".into());
+        recorded.install = Some(INSTALL_LOCAL_BIN.into());
+        assert!(base.same_route(&recorded));
+        let moved: [fn(&mut RemoteEntry); 6] = [
+            |e| e.host = "user@elsewhere".into(),
+            |e| e.port = 2222,
+            |e| e.key = Some("/k/id".into()),
+            |e| e.user = Some("other".into()),
+            |e| e.jump_host = Some("bastion".into()),
+            |e| e.socket = Some("/run/other.sock".into()),
+        ];
+        for change in moved {
+            let mut other = base.clone();
+            change(&mut other);
+            assert!(!base.same_route(&other), "{other:?}");
+        }
     }
 
     /// The state the bug leaves behind — a Homebrew install AND a
@@ -3636,6 +4972,51 @@ mod homebrew_remote_tests {
         let entry = remote.entry();
         assert_eq!(entry.version, "0.40.0");
         assert_eq!(entry.install, None);
+    }
+
+    /// PRD #1487 review (Qodo 4200041523): the download moved into place and
+    /// then failed its version check. The binary is not rolled back, so the
+    /// error says it was replaced and carries the version the check read —
+    /// which the upgrade outcome reports as installed — and the registry is
+    /// left as it was.
+    #[test]
+    fn a_download_that_lands_the_wrong_version_says_the_binary_was_replaced() {
+        let remote = Remote::new(Fixture {
+            brew: None,
+            local_bin: Some("0.40.0"),
+            tap: "0.43.0",
+            brew_upgrade_fails: false,
+        });
+        remote.register_legacy_entry("0.40.0");
+
+        let (result, _) = remote.upgrade(BrewAt::PrefixOnly, "0.44.0", false);
+        let err = result.expect_err("a version check that fails must fail the command");
+        let msg = err.to_string();
+
+        assert!(
+            matches!(
+                &err,
+                RemoteUpgradeError::Inner(RemoteAddError::ReplacedButUnverified { on_disk, source, .. })
+                    if on_disk == "0.43.0"
+                        && matches!(**source, RemoteAddError::VersionMismatch { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.installed_version(), Some("0.43.0"));
+        assert!(msg.contains("was replaced"), "{msg}");
+        assert!(
+            msg.contains("reports `0.43.0` but expected `0.44.0`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("What is installed there now is 0.43.0"),
+            "{msg}"
+        );
+        assert_eq!(
+            remote.version_of(&remote.local_bin_copy()),
+            "dot-agent-deck 0.43.0"
+        );
+        assert_eq!(remote.entry().version, "0.40.0");
     }
 
     /// An entry written before #1372 has neither field and runs

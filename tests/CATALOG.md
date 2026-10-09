@@ -744,7 +744,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 ##### status/blocked/023 — A real OpenCode API failure ends as Error (issue #714).
 - **Layer:** L2, lane 2, PTY-attached (`tests/e2e_quota_blocked_live.rs`).
 - **Agent:** real interactive OpenCode with a listed model that this account's provider rejects with HTTP 400; developer credentials required.
-- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked.
+- **Asserts:** a submitted prompt produces an Error event through the installed plugin and a rendered Error card, never Blocked. Then waits for the `Idle` events OpenCode sends as the failed run ends and requires the card to still read Error for 3 s afterwards (issue #1493 controls found them repainting it Idle; `status/blocked/027` pins the rule at L1).
 - **Does not assert:** a real quota-exhausted account.
 - **Platform coverage:** mac+linux.
 
@@ -768,6 +768,13 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Asserts:** a submitted prompt, whose failed turn Codex reports through no hook, produces a Codex Error event from the daemon's rollout tailer (not one from `wrap`'s stdout classifier) and a rendered Error card that never shows Blocked.
 - **Does not assert:** that the card half discriminates on its own — for this failure `wrap` also emits an Error, because Codex renders the provider's raw JSON body and its `"type":"error"` is the wrapper's Codex error marker (status/blocked/018 asserts the card for a failure without it); a real quota-exhausted account; any Codex failure other than a rejected model.
 - **Platform coverage:** mac+linux.
+
+##### status/blocked/027 — An OpenCode Error survives the `session.idle` that ends its failed run.
+- **Layer:** L1 (`AppState::apply_event`, `src/state.rs`), with the hook mapping pinned by `hook::tests::an_opencode_abort_is_idle_and_other_errors_stay_errors`.
+- **Agent:** synthetic OpenCode and Claude Code frames on one pane.
+- **Asserts:** OpenCode Thinking → Error followed by four Idles stays Error (the shape a real failed OpenCode 1.18.34 run sends: four Idles within 4 ms of the Error, which is what turned `status/blocked/023` red); the next Thinking moves it on and a later Idle reads Idle; control — a Claude Code Error followed by Idle reads Idle. Found while running the controls for issue #1493.
+- **Does not assert:** a real OpenCode (`status/blocked/023`); that OpenCode publishes an interrupted turn as `MessageAbortedError` — read from the OpenCode binary's own TUI, which skips that name.
+- **Platform coverage:** mac+linux+windows.
 
 #### status/agent-event
 
@@ -1018,6 +1025,7 @@ The status-line messages the glossary (#1045, PR #1342) reworded, pinned so a la
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
 - **Agent:** a real interactive `claude --model claude-haiku-4-5-20251001 --allowedTools Bash` pane, spawned through the normal Ctrl+N new-pane flow with per-folder trust pre-seeded — never sent a prompt, left at its own idle prompt exactly as a user who opened a pane and stepped away would leave it.
 - **Asserts:** after confirming, by polling the real process table (`process_table()` + `descendants()`, walked from the test binary's own pid so a concurrent test's own processes can't be mistaken for this one's), that the agent genuinely has live children (its MCP servers and whatever else Claude Code keeps alive) — a precondition, since "an agent with no children proves nothing here" — the test waits a margin past the daemon's 500ms shell-activity poll and then asserts the dashboard's rendered card badge reads `Idle`, not `Working`. It re-samples the process table at the same moment to confirm the children are STILL alive (not just before the badge check) and logs their argv as the evidence for what was actually running. It then also runs `descendant_shell_activity()` directly against that live table and asserts it independently agrees (`Some(false)`) — the M2 fixture claim (`003`), proven here against a live process table rather than a captured one.
+- **Precondition, skipped rather than failed (issue #1493):** only a child seen in two samples at least 5 s apart counts, because Claude Code's short-lived boot processes (`ssh … git@github.com`, `dpkg-query --search`, `git` fetches) used to satisfy the precondition and die before the sample, failing the run about half the time. When no child lasts within 30 s, or the children die before the sample, the test prints `SKIP:` (a failure under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`): such a run proves nothing. The Claude process itself is found by reading every descendant's argv, since the production sampler no longer reads the argv of a session leader on its own terminal.
 - **Does not assert:** which specific MCP servers are present — that is whatever the operator's real `~/.claude.json` configures (carried into the seeded test HOME by `seed_claude_trust_in_home`), logged for evidence rather than asserted by name, since a hardcoded expected set would tie the test to one machine's configuration. Does not assert anything about a busy pane (`006`, `005`) or about agent kinds other than Claude.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
@@ -2389,12 +2397,37 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
 - **Platform coverage:** linux.
 
-##### hooks/install/006 — The unattended startup install leaves a user's sibling handler, their `matcher`, and a still-valid foreign deck pin exactly as it found them.
+##### hooks/install/006 — The unattended startup install consolidates valid deck pins while keeping user handlers at their existing indices.
 - **Layer:** L2.
 - **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; two stub executables stand in for the launching install and a second one).
-- **Asserts:** with `~/.codex/hooks.json` seeded BEFORE launch so the real binary's startup install is what rewrites it, under both an installed event (`PreToolUse`) and one the deck does not install (`SessionEnd`, which reaches `install_impl`'s retired-event sweep): a rule holding the deck's own command next to a user handler carrying no string `command` keeps both that handler and its `matcher`; and a deck-owned rule pinning a different, absolute, executable, non-`target/` `dot-agent-deck` is left byte-identical rather than repointed. The two events diverge on WHERE the deck's command ends up, which is issue #1034 — under the installed event it is refreshed at the index it already occupied, the array gains no rule, and the user's handler stays at `…:0:1`; under the retired event, where there is nothing to refresh it with, it is swept out of the user's rule as before and that event gains no fresh deck rule. Issue #730, plus the Greptile P1 on PR #1029 — the emptiness test that dropped a rule whose only survivor carried no string `command`.
+- **Asserts:** real startup consolidates the installed `PreToolUse` event to one current deck command, refreshing it in place while the user's handler stays at `…:0:1` with its matcher. A second valid deck pin is removed from that installed event. Under retired `SessionEnd`, the user's handler and the other installation's existing rule survive the current installation's retired-event sweep.
 - **Does not assert:** the Claude, OpenCode or Devin writers (the strip is shared and unit-covered for all four in `agent_hook_config`'s `mod tests`); the trust write, which needs a `codex app-server` the stub does not implement; that a repointed pin would actually have been detected by Codex.
 - **Platform coverage:** linux.
+
+#### hooks/containment
+
+##### hooks/containment/001 — A real Codex wrapper writes only its sandbox home, and repeat startup leaves current definitions untouched.
+- **Layer:** L2, lane 1 (real binary with a pane id, piped input/output).
+- **Agent:** none (`/bin/true` stands in for the wrapped child).
+- **Asserts:** hooks are installed in an owned sandbox and name its installed binary; a second automatic install preserves bytes, inode and mtime. Separate fake operator Codex, Claude, Devin, OpenCode and Pi files preserve bytes, inode and mtime.
+- **Does not assert:** real Codex trust screens, PTY rendering, or model execution.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/002 — A test-marked real wrapper without an owned root refuses before directory creation.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** omitting the owned root creates no Codex home, temporary file or backup; separate fake operator configs are unchanged.
+- **Does not assert:** a fatal wrapper exit; automatic installation may warn and continue to its child.
+- **Platform coverage:** mac+linux.
+
+##### hooks/containment/003 — A CODEX_HOME override cannot escape the wrapper's owned root through a symlink.
+- **Layer:** L2, lane 1 (real binary with a pane id).
+- **Agent:** none (`/bin/true`).
+- **Asserts:** a symlink from the sandbox to a separate fake operator home cannot rewrite hooks or trust config, create a backup or leave a temporary file. All fake operator configs keep bytes, inode and mtime.
+- **Does not assert:** other agents' environment overrides (covered by the shared config-writer unit tests), races replacing symlinks during a write, or a real agent trust dialog.
+- **Platform coverage:** mac+linux.
+
+#### hooks/install (continued)
 
 ##### hooks/install/007 — A deck run from a SCRATCH COPY of itself pins the install, never the copy (issue #1140).
 - **Layer:** fast real-binary-subprocess integration (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`; no PTY, no daemon, no LLM, no `e2e` feature gate).
@@ -2577,6 +2610,65 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/wire-restart
+
+##### lifecycle/wire-restart/001 — An idle daemon restarts onto its installed target without confirmation.
+- **Layer:** L2 (lane 1, real headless `daemon serve` at an isolated endpoint).
+- **Agent:** none.
+- **Asserts:** Hello advertises `restart-daemon`; the production client helper returns Accepted with an empty stopping set and a verified target version; the original process exits cleanly; a wrapper atomically installed at the daemon's captured startup path launches a different successor PID that answers Hello at the same endpoint.
+- **Does not assert:** two independently compiled release versions, SSH installation, CLI prompts, desktop or TUI rendering; the wrapper executes a retained copy of the same test build.
+- **Platform coverage:** linux+mac (Unix sockets and executable install fixtures).
+
+##### lifecycle/wire-restart/002 — Live agents and orchestration roles require explicit confirmation and remain untouched.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** three synthetic `cat` stand-ins, one ordinary agent and two orchestration roles.
+- **Asserts:** repeated unconfirmed requests return NeedsConfirmation with stale false and every stable agent identity, label, pane and cwd, plus both roles and the orchestrator marker; the original daemon stays alive, no successor launches, ListAgents retains the same identities and both roles, and each stand-in PID remains running.
+- **Does not assert:** confirmation UI, real-agent work or installed release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/003 — Returning the matching confirmed set stops the disclosed work and replaces the daemon.
+- **Layer:** L2 (lane 1, real headless daemon and installed-target fixture).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** returning the daemon's disclosed set with reversed agent and role order yields Accepted naming the full stop set; the original daemon exits, every named stand-in PID stops, and a different successor PID answers Hello with empty agent and role inventories.
+- **Does not assert:** UI consent, real-agent behavior, two-release handover or client-spawned successor mode.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/004 — A newly spawned identity makes an earlier confirmation stale without stopping work.
+- **Layer:** L2 (lane 1, real headless daemon and production wire client).
+- **Agent:** four synthetic `cat` stand-ins, including two roles and two ordinary agents sharing a display name.
+- **Asserts:** after one extra agent starts, returning the earlier set yields NeedsConfirmation with stale true and all four identities plus both roles; the original daemon, each stand-in PID and the role map remain alive, and no successor launches.
+- **Does not assert:** removed or reassigned roles, perpetual mutation retry limits, UI consent or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/005 — Failed install-target verification preserves the daemon and all live work.
+- **Layer:** L2 (lane 1, owned startup executable atomically replaced under a real headless daemon).
+- **Agent:** three synthetic `cat` stand-ins, including two orchestration roles.
+- **Asserts:** a non-executable target yields Refused/TargetMissing; an executable whose version probe exits 23 yields Refused/TargetDidNotAnswer; verification refuses before asking for consent, with an explanation, while the original daemon PID, agent identities, live stand-in PIDs and role map remain unchanged.
+- **Does not assert:** Homebrew resolution, verification timeout, wrong architecture, expected-version mismatch, UI or real agents.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/006 — Concurrent restart requests accept exactly one handover.
+- **Layer:** L2 (lane 1, two production clients against a real headless daemon).
+- **Agent:** none.
+- **Asserts:** while the first request is inside a filesystem-gated installed-target version probe, a second returns Refused/InProgress before the gate opens; the first then returns Accepted, the original daemon exits, and one recorded successor PID answers Hello at the original endpoint.
+- **Does not assert:** client UI deduplication, real-agent teardown or cross-release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/007 — A termination signal after the restart released its sockets, but before the successor is decided, stops the daemon and starts no successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon from an owned install path; the `e2e`-only successor-plan gate holds it between releasing its sockets and deciding its plan).
+- **Agent:** none.
+- **Asserts:** the restart is accepted; at the gate a SIGTERM is claimed as a stop (the daemon logs that the stop overrides the accepted restart); once the gate opens the daemon exits with status 0, no successor PID is ever recorded, and nothing answers at the endpoint.
+- **Does not assert:** the five-second settlement for a pending wire stop (`daemon_restart::tests::the_plan_waits_for_a_pending_stop_to_settle`); a supervised daemon's exit status.
+- **Platform coverage:** linux+mac.
+
+##### lifecycle/wire-restart/008 — After the daemon committed to its restart, a first signal is logged and a second force-exits it, even while it re-verifies its successor (PRD #1487 audit A2).
+- **Layer:** L2 (lane 1, a real headless daemon; the successor-plan gate, then an installed build replaced at the gate whose `--version` blocks on a file).
+- **Agent:** none.
+- **Asserts:** with the daemon committed and blocked re-verifying the replaced build, a first SIGTERM is logged as arriving after the commit and not acted on; a second SIGTERM ends the process with status 143; no successor PID is recorded.
+- **Does not assert:** what happens to a successor that was already spawned when the signal arrived (it runs on its own); Windows' Ctrl-C delivery.
+- **Platform coverage:** linux+mac.
+
+
 #### lifecycle/wire-stop
 
 ##### lifecycle/wire-stop/001 — `StopDaemon` REFUSES over the wire while orchestration roles are live, and carries the panes, the roles and both renderings back (issue #1049).
@@ -2633,6 +2725,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** the outcome is `WireStopOutcome::AcceptedNotConfirmed`, not `Stopped`. A daemon that exits CLOSES its socket, so its peer sees EOF; silence is a stalled peer and proves nothing, which is why a stalled probe resets the consecutive-unreachable count rather than advancing it. Reporting success for a daemon the caller cannot see is the precise defect #1049 was filed about — over `ssh -L` the PID path printed "Daemon stopped gracefully (pid N)" having killed the tunnel.
 - **Does not assert:** the three-probe confirmation threshold in isolation; the request-timeout half (`lifecycle/wire-stop/007`).
+- **Platform coverage:** linux+mac (`#![cfg(unix)]`).
+
+##### lifecycle/wire-stop/009 — A forced `StopDaemon` names every agent and orchestration role it destroys before it drains them (PRD #1487 audit D1).
+- **Layer:** L1/synthetic (real attach socket served by the production `serve_attach_with_counter`, real stand-in children, `AppState` holding live roles, the daemon's `tracing` output captured on a current-thread runtime).
+- **Agent:** none (three `sleep 30` stand-ins: two role panes and a plain one).
+- **Asserts:** the `force: true` stop is accepted and drains the registry, and the daemon's log carries the issue #1109 teardown inventory under the `stop-daemon` path — the three agents, both roles, which one is the orchestrator — which the wire stop used to omit, logging only counts.
+- **Does not assert:** the inventory's wording (`lifecycle/teardown-inventory/001`); that it precedes the drain beyond the inventory being non-empty, which only holds when it does (`lifecycle/teardown-inventory/002`).
 - **Platform coverage:** linux+mac (`#![cfg(unix)]`).
 
 
@@ -2780,11 +2879,12 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** that the prompt names the agent by its *display* name specifically (loose match — with `running_agents` omitted the label comes from `list_agents()`, so the display name OR a non-zero "(N agent(s) running)" header is accepted); exact prompt wording.
 - **Platform coverage:** mac+linux.
 
-##### lifecycle/handshake/008 — A daemon whose `Hello` omits `capabilities` makes a project-aware client WITHHOLD the project verbs, and the withheld verb never reaches the wire (PRD #819 M5 capability negotiation).
+##### lifecycle/handshake/008 — Capability-absent project and restart verbs are withheld before the wire.
 - **Layer:** L2 (lane 1 — a real `DaemonClient` against a protocol-faithful synthetic daemon on its own Unix socket; no binary is spawned).
 - **Agent:** none (a scripted in-process daemon thread; the production `Hello` handler calls `AttachResponse::with_capabilities()` unconditionally and takes no argument, so no real daemon can be asked to omit the field, and a production env knob on the `DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS` model would fake the thing being measured).
 - **Asserts:** against a `Hello` with no `capabilities` key, `DaemonCapabilities::is_advertised()` is false, `require_capability` declines all three of `list-projects` / `resolve-project` / `prepare-orchestration` with a `ClientError::Server` naming the capability, the real M6 call sites `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration` each fail with that same decline, and — the core claim — the scripted daemon's own request log holds the single `hello` and nothing else, so no project verb reached the wire and the `unknown variant …` refusal text was never read. Against a second scripted daemon that DOES advertise, the same `DaemonClient::list_projects` proceeds: all three capabilities are permitted, `list-projects` appears in that daemon's log after one handshake, and the scripted listing comes back.
 - **Does not assert:** any TUI or desktop surface (PRD #819 leaves the TUI's project-resolution sites out of scope, so the client methods are driven directly rather than through a UI); the daemon-side behaviour of the verbs themselves (`project/resolve/001`, `project/launch/001`–`002`); the fallback for an omitted `running_agents`, which is `lifecycle/handshake/007`'s separate claim.
+- **Also asserts:** the production `DaemonClient::restart_daemon` returns Unsupported against both an omitted capabilities field and a present set lacking `restart-daemon`; two calls on the same handle each add exactly one fresh Hello to the peer's request log, with no restart or fallback stop frame.
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/handshake/009 — A daemon on a different attach protocol with a live agent: declining the restart prompt refuses to attach, names both protocol numbers, and leaves the daemon and its agent running (issue #405).
@@ -3645,7 +3745,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 ##### orchestration/delegate/042 — A task pointer swallowed by a silent worker's boot is retried into the same process (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real deck TUI, daemon, delegate CLI, and managed worker PTY; no model or credential).
-- **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path.
+- **Agent:** a Python stand-in declared as `opencode`, which takes raw PTY input and consumes it for 3.5 seconds before accepting lines; it sends no hook event, so delegation uses the declared no-signal readiness path. Enters raw mode with `TCSANOW` rather than `tty.setraw`'s flushing default, so a pointer that beats a slow start is not silently dropped before the scenario begins (see `orchestration/delegate/045`).
 - **Asserts:** the first pointer actually appears in the stand-in's discarded-byte log during boot; after its ready point a retry delivers the pointer, and a unique proof renders in the attached worker pane. The accepting PID equals the replacement worker's PID, the launch log contains only the initial spawn and the one `clear = true` replacement, and that replacement remains alive.
 - **Second case, production timings (issue #1381):** `delegate_042_default_timings_recover_pointer_lost_to_a_loaded_opencode_boot` runs the same delegation with the daemon's own defaults — the 8 s no-signal hold, the default retry schedule and the default silence window — against a stand-in whose boot takes at least 12 s (the loaded-box figure the hold's doc comment records) and lasts until 4 s after its first input, so a slow runner cannot hand it the first pointer once it is already listening. It asserts the daemon logged its no-signal hold at the shipped `buffer_ms=8000`, and that the pointer was swallowed during that boot, arriving at least 7.5 s after the delegate was sent; the booted process then accepts it exactly once, sends OpenCode's `session.created` and `session.prompt` through the real hook CLI, shows its proof in the attached pane and receives no input afterwards; and the orchestrator is never told the worker went quiet. With the retry disabled (`DOT_AGENT_DECK_DELEGATE_RETRY_SCHEDULE_MS=0`, delivery as it was before issue #1383) the same case goes red with #1381's symptom: the pointer is in the discarded-byte log and the worker sits idle on its `Ask anything` screen with an empty input line.
 - **Does not assert:** a real OpenCode boot distribution, model execution of the task file, or acknowledgement protocol details.
@@ -3660,14 +3760,14 @@ without depending on the config struct API.
 
 ##### orchestration/delegate/044 — A visible composer gets submit-only retries (issues #1383 and #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
-- **Agent:** a Python stand-in declared as `opencode` that renders typed bytes but temporarily ignores Enter, with no hook events.
+- **Agent:** a Python stand-in declared as `opencode` that renders typed bytes but temporarily ignores Enter, with no hook events. Enters raw mode with `TCSANOW` rather than `tty.setraw`'s flushing default, so a pointer that beats a slow start is not silently dropped before the scenario begins (see `orchestration/delegate/045`).
 - **Asserts:** the worker eventually renders proof of accepting the task in its attached pane; its raw PTY log contains the task pointer exactly once after the complete retry schedule; the accepting PID is the same replacement worker and no further process launches.
 - **Does not assert:** a real agent's composer layout or model execution.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
 
 ##### orchestration/delegate/045 — A hookless worker's acknowledgement retires retries and its silence watch (issue #1383).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`; real CLI and hook socket).
-- **Agent:** a Python stand-in declared as `opencode` that reads its real task file and invokes `dot-agent-deck ack` twice, emitting no agent hook events.
+- **Agent:** a Python stand-in declared as `opencode` that reads its real task file and invokes `dot-agent-deck ack` twice, emitting no agent hook events. It enters raw mode with `TCSANOW`: `tty.setraw`'s default `TCSAFLUSH` discarded a pointer that arrived before a slow start reached that line, failing the test on a starved machine with only the Enter probes received (reproduced by delaying the stand-in 3 s: red with the flush, green without).
 - **Asserts:** the task file names the pointer's delivery id in its ack header; both ack invocations exit zero; the raw PTY log contains one pointer after the full retry schedule; and the attached orchestrator pane receives no silent-worker notice.
 - **Does not assert:** an LLM following the task-file instruction or a real agent's hook delivery.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
@@ -3689,7 +3789,7 @@ without depending on the config struct API.
 
 ##### orchestration/delegate/048 — A Codex composer recovers an unsubmitted pointer (issue #1243).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_retry_in_place.rs`).
-- **Agent:** Python stand-in declared as `codex`, emitting a real `SessionStart` hook and rendering the `›` composer before dropping its first Enter.
+- **Agent:** Python stand-in declared as `codex`, emitting a real `SessionStart` hook and rendering the `›` composer before dropping its first Enter; on the accepting Enter it posts a native `UserPromptSubmit`, as a trusted real Codex does. Until issue #1493 it posted nothing and its acceptance was proved by the wrapper classifying its printed completion line, which only worked because that was the stand-in's first newline-terminated output; a Codex pane's classified output is no longer delivery evidence.
 - **Asserts:** the pointer reaches the worker, a later Enter submits it in the same process, the attached pane shows completion, the pointer was typed exactly once, exactly two Enter bytes reached the worker, and no input byte arrived after acceptance. The stand-in records each raw input byte with a timestamp relative to acceptance.
 - **Does not assert:** a real Codex model turn or the provider's actual composer implementation.
 - **Platform coverage:** mac+linux (Unix PTY and Python 3).
@@ -3910,7 +4010,7 @@ without depending on the config struct API.
 - **Layer:** fast integration (the daemon's real `AttachRequest::StartAgent` handler, reached over the attach socket through `DaemonClient::start_agent` exactly as the TUI and the desktop reach it, against an in-process daemon; no LLM and no `e2e` feature gate).
 - **Agent:** none — `cat` stand-ins; what is under test is the accept/refuse decision, not an agent.
 - **Asserts:** tab A's start role starts under `proj-orchestrator-1`; tab B — same orchestration, same directory, same title, different per-tab token — is refused with an error that starts with `START_ERR_ORCHESTRATION_TITLE_IN_USE` and names the title, and no pane was spawned for it; tab A's own role 1 still starts (a tab is N `StartAgent` calls and must never collide with the title its role 0 just took); tab B under a different title starts (control: the refusal is about the title, not about a second tab of one orchestration in one directory, which PRD #140 supports); and eight clients starting eight tabs under one fresh title concurrently produce exactly one success and seven title refusals. Verified load-bearing one change at a time: without the per-tab scope role 1 is refused; without counting an in-flight start as a holder all eight concurrent starts succeed.
-- **Does not assert:** what a client does with the refusal (`/009` at L1, `/010` on the real binary); the daemon's own spawn paths (dispatch, a scheduled fire, issue dispatch), which since issue #1339 pass the same check but take a suffixed title instead of being refused (`orchestration/dispatch/005`, and `a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); a legacy client with no per-tab token, which is scoped by `(name, cwd)` like its delegate routing.
+- **Does not assert:** what a client does with the refusal (`/009` at L1, `/010` on the real binary); the daemon's own spawn paths (dispatch, a scheduled fire, issue dispatch), which since issue #1339 pass the same check but take a suffixed title instead of being refused (`orchestration/dispatch/005`, and `a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); a client with no per-tab token, whose start the daemon refuses before this check runs (`orchestration/identity/011`).
 - **Platform coverage:** mac+linux (unix-only — PTY stand-ins over a Unix socket).
 
 ##### orchestration/identity/008 — A run title is keyed by the RESOLVED title plus the orchestration cwd, and a title whose every pane has exited can be claimed again (issue #555).
@@ -3933,6 +4033,13 @@ without depending on the config struct API.
 - **Asserts:** with the form open on `orch-deck` and the orchestration selected, the Name field shows `<folder>-orchestrator-1`; a rival `StartAgent` under exactly that title (same orchestration and canonical cwd, its own per-tab token) sent over the deck's attach socket succeeds; pressing Enter then brings up "already in use by a live orchestration" with the name still shown and `[Submit]` gone, and `ListAgents` holds no pane of ours under that title; typing `-b` clears the warning and Enter closes the form and starts the orchestration under `<folder>-orchestrator-1-b`. Verified load-bearing: with the daemon's check disabled the refusal never appears.
 - **Does not assert:** the concurrent-instant race (`/007`); the rival's own tab surfacing in this TUI; an older TUI against this daemon, which gets the refusal as a plain `Orchestration failed: …` status line (the cross-version run recorded on the PR).
 - **Platform coverage:** mac+linux (the L2 harness is unix-only).
+
+##### orchestration/identity/011 — The daemon refuses an orchestration start whose membership carries no per-tab `orchestration_id`, the shape only a client older than v0.35.0 sends (issue #463).
+- **Layer:** fast integration (the daemon's real `AttachRequest::StartAgent` handler over the attach socket through `DaemonClient::start_agent`, against an in-process daemon, as `orchestration/identity/007`; no LLM and no `e2e` feature gate).
+- **Agent:** none — `cat` stand-ins; what is under test is the accept/refuse decision.
+- **Asserts:** a token-less orchestration start with a role name, and one with an empty role name, are each refused with an error that starts with `START_ERR_ORCHESTRATION_ID_REQUIRED`, names `v0.35.0` and says nothing was started; no pane is spawned for either and neither registers a role (`pane_orchestration_map` and `pane_role_map` stay empty); control: the same start carrying a token starts and registers the pane under that token and the orchestration name. Verified load-bearing: with the daemon's refusal disabled the first token-less start succeeds and the test fails.
+- **Does not assert:** a real pre-v0.35.0 TUI against this daemon (the refusal reaches it as a plain error on the wire it already decodes); `start-prepared-agent`, which is normalised into the same handler arm before the check; the TUI's handling of a token-less record a daemon before #463 accepted (`partition_separates_same_name_cwd_orchestrations_by_instance_id` in `src/ui.rs`).
+- **Platform coverage:** mac+linux (unix-only — PTY stand-ins over a Unix socket).
 
 #### orchestration/guard
 
@@ -4390,7 +4497,7 @@ without depending on the config struct API.
 
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
-- **Agent:** a REAL interactive Claude Code (Haiku) as the dispatched unit, launched through a **wrapper script** (`default_command = "agent-wrapper"`), never prompted — it only has to be running when the close lands, so the cost is one cold boot and no turns. The caller pane is `cat`; it is the caller, not the thing under test. The wrapper is load-bearing, not convenience: it mirrors the reported config, where every command is `devbox run agent-<role>`, which the deck cannot infer an agent type from and therefore does not wrap. A bare `claude` IS recognised and takes a different path through the session machinery — which is exactly why an earlier `cat`-based version of this test passed while the reported bug was live.
+- **Agent:** a REAL interactive Claude Code (Haiku) as the dispatched unit, launched through a **wrapper script** (`default_command = "agent-wrapper"`), never prompted — it only has to be running when the close lands, so the cost is one cold boot and no turns. The caller pane is started with no command (a shell); it is the caller, not the thing under test, and it has no command for the unit to copy, so the unit starts `default_command` (issue #1602). The wrapper is load-bearing, not convenience: it mirrors the reported config, where every command is `devbox run agent-<role>`, which the deck cannot infer an agent type from and therefore does not wrap. A bare `claude` IS recognised and takes a different path through the session machinery — which is exactly why an earlier `cat`-based version of this test passed while the reported bug was live.
 - **Stand-in, named:** a PATH `git` stub that sleeps on `status --porcelain` (and ONLY on that — the dispatch's own `git worktree add` runs at full speed). It supplies the one property of a real dispatched worktree a fixture cannot cheaply have: an agent has been working in it, so the status walk takes seconds, not milliseconds.
 - **Asserts:** the dispatched agent really starts (its own PTY prints the Claude Code banner — NOT the card's `ClaudeCode` badge, which is inferred from the command at spawn and is on the card before the agent has executed anything); the CALLER card (which owns no worktree) closes on its first confirm — the control, so a later failure is attributable to the dispatched card specifically; then, after ONE confirmed close, NO card for the dispatched worktree remains. Matched on the worktree basename from the card's `Dir:` line rather than on its title, because the ghost card is titled `pane-sched-…` and a name-bound needle misses it.
 - **Why it exists:** a user reported closing a dispatched agent leaving its card behind. It reproduced THREE independent defects, and the failure message distinguishes the first two by whether the daemon still holds the agent: (a) a daemon-spawned card has no local pane until focused, so `close_pane` returned `Pane <id> not found`, the PRD #92 F4 policy preserved the card, and the agent kept running; (b) with that fixed, the daemon still awaited the worktree cleanup before answering, blowing the TUI's 5s `CTRL_W_STOP_TIMEOUT`; (c) with BOTH fixed and a real agent behind a non-inferable command, the close removed only the session its card was built from and left the pane's *other* session rendering as a ghost card badged `No agent` — the symptom as reported. Reverting any one fix alone turns this test red (verified).
@@ -4413,6 +4520,15 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
+#### dispatch/single
+
+##### dispatch/single/001 — A `--single` unit runs the command its dispatcher was started with, as its dispatcher's agent, instead of the deck's `default_command` (issue #1602).
+- **Layer:** L2 PTY-attached, lane 1 (`TuiDeck` on the `minimal` fixture) driving the real new-pane form with a typed Command, then the REAL `dot-agent-deck dispatch --single` CLI through the deck's hook socket.
+- **Agent:** none. Two shell stand-ins that each record `<which>|<cwd>` to a launch log and then `exec cat`: the deck's `default_command`, and the caller's Command — a launcher whose name reveals no agent, standing in for `devbox run agent`, which announces itself as Claude Code through a real `dot-agent-deck hook` call only when an untracked marker sits in its directory. The marker is written after the fixture commit, so the caller announces and the unit, whose worktree is a HEAD checkout, does not. Not demo-reel-eligible.
+- **Asserts:** precondition, the caller registers, prints its ready marker and is recorded as Claude Code; the dispatch CLI succeeds; the launcher starts in the unit's worktree and the default command never starts anywhere; the unit's `ListAgents` record carries `agent_type = claude_code`, which only the dispatcher could have supplied because the unit never announced. Verified RED against the code before the fix: the launch log read `default|<worktree>`.
+- **Does not assert:** that a scheduled (no-pane) single spawn still uses `default_command` — `scheduler/dispatch/004` pins that path, which does not go through `dispatch`; the precedence order itself (`dispatch::tests::a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent`, `…_falls_back_to_default_then_claude`); that the registry keeps the configured command rather than the wrapped exec line (`agent_pty::spawn_tests::configured_launch_of_reports_the_configured_command_and_its_agent`); a real agent or a real `devbox run`.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
@@ -4420,14 +4536,14 @@ without depending on the config struct API.
 - **Fixture:** `tests/fixtures/orchestration-route` — one `[[orchestrations]] name = "route-iso"` with THREE roles (`orchestrator` start + `coder` + `reviewer`), all REAL interactive Haiku `claude` (`--allowedTools Bash Read Write`, no `-p`), workers at `clear = false` so their agent ids and scrollback stay stable across the delegate. Three roles rather than two because `.dot-agent-deck/worker-task-{role}.md` / `work-done-{role}.md` are keyed by ROLE within a cwd (PRD #140 keeps that layer explicitly out of scope), so two same-cwd tabs sharing a role name share those files: driving tab A through `coder` and tab B through `reviewer` makes every no-cross-delivery check a presence/absence question about a pane that would otherwise have received NOTHING, and makes the two work-done feedback strings role-qualified and thus distinguishable inside one orchestrator pane — no occurrence-counting in a redrawing agent TUI.
 - **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across the two tabs; four short turns actually run (two orchestrators delegate, two workers create one file each). Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when the `claude` CLI/credentials are absent.
 - **Asserts:** the second open of the same orchestration in the same directory renders PRD #140 M4.0's non-blocking same-cwd warning pointing at `/worktree-prd` (the M4.0 surface, live in the real form rather than through the L1 render seam); the daemon reports two orchestration tabs with DISTINCT `orchestration_id`s and three role panes each; then, with a task started in EACH tab CONCURRENTLY (the issue's own repro, and the state in which the pre-#140 `HashSet`-ordered work-done lookup was most non-deterministic), tab A's delegate pointer `worker-task-coder.md` lands in tab A's `coder` pane and NEVER in tab B's identically-named `coder` pane; tab A's coder really does its own task (uniquely-named sentinel `route_alpha_5f3c.txt` plus the daemon-written `.dot-agent-deck/work-done-coder.md`); its work-done feedback (`Worker coder has completed their task`) reaches tab A's orchestrator pane and NEVER tab B's; and symmetrically for tab B → `reviewer` (`worker-task-reviewer.md`, `route_beta_9d21.txt`, `work-done-reviewer.md`, `Worker reviewer has completed their task`), with a final sweep re-checking all four absences after both chains have run.
-- **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the `NameCwd` older-client fallback (M5.2, the cross-version manual test); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
+- **Does not assert:** WHICH pane wrote a shared coordination file — `worker-task-{role}.md` / `work-done-{role}.md` are role-and-cwd keyed by design (PRD #140 "Deferred: full same-directory isolation"), so the routing proof is the per-pane delegate/work-done delivery, not the file contents; the hydration round trip of two same-`(name, cwd)` tabs across a detach/reattach (M3.1, covered by the `partition_hydrated_panes` unit tests); the token-less older-client path (retired by issue #463, whose daemon refusal is `orchestration/identity/011`); the exact task text each orchestrator forwards (only the literal sentinel filename has to survive LLM phrasing); the deterministic routing decision itself (mutation-checked unit tests on `delegate_targets` / `orchestrator_for_worker` in `src/state.rs`).
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** four short interactive Haiku turns (two delegates, two one-file tasks) — well under Decision 23's <$0.05/run bound.
 
-##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group, while a token-less (pre-#140) pair still rebuilds as ONE (PRD #140 M3.1).
+##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group (PRD #140 M3.1).
 - **Layer:** L1/synthetic (warm in-process daemon + real attach socket, no PTY-attached binary and no LLM). Drives the production reattach chain end to end: `start_agent` stores `TabMembership` on the daemon's `AgentRecord` → `EmbeddedPaneController::hydrate_from_daemon` reads it back through `ListAgents` + `validate_tab_membership` → `partition_hydrated_panes` buckets by `OrchestrationIdentity` → `resolve_orch_config_for_hydration` / `OrchestrationConfig::synthesize_from_bucket_metadata` → `TabManager::open_orchestration_tab_with_existing_role_panes`. Synthetic is the right tier because the claim is about a hydration round trip, not about agent behaviour; the real-agent two-tab case is `orchestration/route/001`, which never detaches.
-- **Agent:** none (six `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A, tab B, and a token-less legacy pair, all sharing one orchestration name and one cwd). Since issue #555 tabs A and B carry distinct run titles (`route-iso-orchestrator-1`/`-2`, as the form suggests them), because the daemon refuses a second tab under a resolved title another live tab holds in the same directory; the titles are no part of the identity asserted here.
-- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields THREE buckets (tab A, tab B, legacy) rather than one merged bucket, each holding exactly its own two panes; the two tokened buckets' `OrchestrationIdentity`s differ while the token-less bucket falls back to `NameCwd { name, cwd }`; rebuilding every bucket produces three orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tokened tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card — while the legacy identity keeps the pre-review byte format.
+- **Agent:** none (four `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A and tab B, sharing one orchestration name and one cwd). Until issue #463 a third, token-less pair stood in for a pre-#140 client; the daemon now refuses that start (`orchestration/identity/011`). Since issue #555 tabs A and B carry distinct run titles (`route-iso-orchestrator-1`/`-2`, as the form suggests them), because the daemon refuses a second tab under a resolved title another live tab holds in the same directory; the titles are no part of the identity asserted here.
+- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields TWO buckets (tab A, tab B) rather than one merged bucket, each holding exactly its own two panes; the two buckets' `OrchestrationIdentity`s differ; rebuilding every bucket produces two orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card.
 - **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
 - **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
 
@@ -4615,6 +4731,13 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; a warm `daemon serve` is seeded over the attach protocol with `TabMembership::Mode`).
 - **Agent:** none (`sleep 600`; no LLM).
 - **Asserts:** the hydrated agent is visible as a dashboard card, the old mode name is absent from the tab strip, and the deck stays responsive through a clean detach. The post-exit terminal stream contains the hydration `session_warnings` line naming the old mode.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/024 — An orchestration agent a client older than v0.35.0 started reattaches as a plain dashboard card, and this build's daemon refuses to start one (issue #463).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; two warm `daemon serve` processes seeded over the attach protocol with a `TabMembership::Orchestration` carrying no `orchestration_id`). The second daemon runs with `DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION=1`, an `e2e`-only switch that makes it serve that start the way a daemon before #463 did — the only way to put such a record in front of a real TUI, since this build's daemon refuses it.
+- **Agent:** none (`sleep 600`; no LLM).
+- **Asserts:** the first daemon, with no switch, refuses the start with an error starting `START_ERR_ORCHESTRATION_ID_REQUIRED` and naming `v0.35.0`, and runs no agent; against the second, the hydrated agent is a dashboard card (`No agent · old-orchestrator`, `1 agent(s)`), the orchestration name is absent from the screen (no tab was rebuilt), and the post-detach terminal stream carries the hydration `session_warnings` line naming the orchestration. Verified load-bearing: without the warning push the test fails.
+- **Does not assert:** a real pre-v0.35.0 TUI's display of the refusal (that binary is not built here); a live `OrchestrationSurface` with no token, which builds no tab and is only logged; routing for such a pane, which registers no role.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -4877,6 +5000,123 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** a real SSH operation, concurrent writers, or byte-for-byte formatting preservation.
 - **Platform coverage:** mac+linux+windows.
 
+### Starting a deck daemon (issue #1490)
+
+#### remote/start
+
+##### remote/start/001 — A stopped remote daemon starts at its configured socket.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** the initial reason is not-running; start returns Started; the daemon answers Hello and probes as running at a deliberately non-default configured socket, leaving the inherited default unused.
+- **Does not assert:** a real SSH server, desktop rendering, authentication or real-agent work.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/002 — Starting a running remote daemon preserves its single process.
+- **Layer:** L2 (lane 1, shared start functions, real daemon binary, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** a second start returns AlreadyRunning; the original daemon still answers Hello; exactly one daemon spawn and one Attach protocol listening line are recorded.
+- **Does not assert:** concurrent start requests, a real SSH server or desktop rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/start/003 — Missing installs and unreachable remote hosts explain the failure.
+- **Layer:** L2 (lane 1, shared start functions, sandbox SSH shell shim).
+- **Agent:** none.
+- **Asserts:** probes and starts classify a missing binary as not-installed with a remote add remedy, and an SSH connection refusal as host-unreachable naming the host; the suggested action is Reconnect and no daemon spawns.
+- **Does not assert:** real network failure, SSH authentication or host-key verification.
+- **Platform coverage:** linux+mac.
+
+#### lifecycle/daemon-start
+
+##### lifecycle/daemon-start/001 — A local start launches one real daemon at its owned socket.
+- **Layer:** L2 (lane 1, shared local start functions and real daemon subprocess).
+- **Agent:** none.
+- **Asserts:** a stopped endpoint becomes a running daemon answering Hello; a second start returns AlreadyRunning without invoking spawn; one daemon spawn and attach listener are recorded.
+- **Does not assert:** local TUI lazy-spawn, desktop rendering or concurrent start requests.
+- **Platform coverage:** linux+mac.
+
+### Remote upgrade and connect (PRD #1487)
+
+#### remote/upgrade
+
+##### remote/upgrade/001 — TTY upgrades restart idle daemons without a question.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, real sandboxed daemon, SSH shell shim and deterministic download).
+- **Agent:** none.
+- **Asserts:** idle upgrade installs and restarts without asking; restarted summary names from/to versions; a different installed successor PID answers on the same endpoint.
+- **Does not assert:** independently compiled releases, SSH authentication, real-agent work or desktop UI. Old/new debug build stamps distinguish processes executing one retained Cargo build; synthetic PTY coverage is not reel-eligible.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/002 — Piped live upgrades install and keep the current daemon.
+- **Layer:** L2 (lane 1, real CLI with piped stdout and sandboxed SSH installer/daemon).
+- **Agent:** three synthetic cat stand-ins.
+- **Asserts:** no question or hang; exit 0 after installation; live work keeps the original daemon and role map, with a visible installed-not-restarted explanation naming blockers.
+- **Does not assert:** real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/003 — JSON upgrades emit structured outcomes with correct exit codes.
+- **Layer:** L2 (lane 1, real CLI and sandboxed installer/daemon).
+- **Agent:** synthetic cat stand-ins in the live case.
+- **Asserts:** stdout parses as one UpgradeOutcome with kebab-case restarted, installed-not-restarted and failed tags; restarted carries from/to versions; live no-one-to-ask reason contains every agent and role; installation failure names the installing stage and download reason; process outcomes and exit codes agree.
+- **Does not assert:** exact JSON whitespace, every shared outcome variant, real SSH or release compatibility.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/004 — An older daemon is installed over without receiving a restart frame.
+- **Layer:** L2 (lane 1, real CLI/installer and protocol-faithful Unix-socket old peer).
+- **Agent:** none.
+- **Asserts:** installation succeeds and CLI exits 0; output explains that the daemon is too old to restart itself and gives a remedy; the old peer remains reachable, receives only Hello frames and no successor starts.
+- **Does not assert:** genuine previous-release compatibility (cargo xver owns that), real SSH or TTY rendering.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/005 — Installation failure identifies its stage and preserves live work.
+- **Layer:** L2 (lane 1, real CLI/daemon and deterministic failing download).
+- **Agent:** three synthetic cat stand-ins, including two orchestration roles.
+- **Asserts:** exit nonzero; visible installing-stage reason; installed bytes, original daemon PID/build, agent identities/PIDs and role map remain unchanged.
+- **Does not assert:** restart/verification-stage failures (wire-restart/005 and shared-function coverage own those), real SSH or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/006 — A TTY restart question discloses live agents and roles and honors both choices.
+- **Layer:** L2 (lane 1, real CLI under portable-pty, sandboxed SSH installer and real daemon).
+- **Agent:** three synthetic cat stand-ins, including an orchestrator and coder role.
+- **Asserts:** installation finishes before the question; prompt names all labels, panes, roles, orchestration and orchestrator; Enter preserves the original daemon, agent identities/PIDs and role map; r stops the named work and replaces the daemon.
+- **Does not assert:** real SSH, release compatibility or real-agent work; no reel marker for stand-ins.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/007 — An idle daemon restarts without a TTY.
+- **Layer:** L2 (lane 1, real CLI with piped stdout, sandboxed SSH installer and real daemon).
+- **Agent:** none.
+- **Asserts:** installation and silent restart complete with exit 0 and from/to versions despite no TTY; successor has a new PID/build and answers on the same endpoint (D6 ruling).
+- **Does not assert:** real SSH or independently compiled releases.
+- **Platform coverage:** linux+mac.
+
+##### remote/upgrade/008 — Interactive Haiku keeps working after Keep, then a named restart stops it. [reel]
+- **Layer:** L2 (PTY-attached TUI and upgrade CLI; lane 2, real interactive Claude Haiku).
+- **Agent:** Claude Code (Haiku, interactive; imported credentials, onboarding and cwd trust seeded).
+- **Asserts:** unique file contents absent from the prompt render in the agent's live pane before upgrade; the restart question names that agent and pane; Keep preserves its identity and PID and it reads a new sentinel afterward; Restart now stops the sole disclosed agent, replaces the daemon build at the same endpoint, and connect renders the new empty dashboard.
+- **Does not assert:** real SSH authentication, release-download compatibility, desktop behavior, or survival of a role map (covered synthetically by /006).
+- **Platform coverage:** mac+linux (Unix); credentials required locally, never run in CI.
+
+#### remote/connect
+
+##### remote/connect/001 — Upgrade-and-connect choices render the attached daemon without repeated consent.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, SSH shell shim, real daemon).
+- **Agent:** three synthetic cat stand-ins in the live cases.
+- **Asserts:** y at Upgrade and connect installs; live restart question names all agents and roles; Enter connects to the old daemon with preserved live work and renders its upgrade-team tab with lead and coder cards; r connects to a different successor at the installed build and renders its empty dashboard; neither asks a second remote handshake question and the shared outcome is visible.
+- **Does not assert:** private shared-function routing, independently compiled releases, SSH authentication, real-agent work or desktop UI; no reel marker for synthetic coverage.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/002 — Declining the upgrade still connects to the existing daemon.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty and sandboxed SSH).
+- **Agent:** none.
+- **Asserts:** N and Enter at Upgrade and connect reach the empty dashboard, preserving original daemon PID/build and installed bytes; hooks/install and restart questions do not run.
+- **Does not assert:** live-work decline policy, real SSH, independently compiled releases or real-agent behavior.
+- **Platform coverage:** linux+mac.
+
+##### remote/connect/003 — An idle upgrade-and-connect reaches the new daemon without a second question.
+- **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, sandboxed SSH and real daemon).
+- **Agent:** none.
+- **Asserts:** y installs and restarts the idle remote, a different PID/build answers, the empty dashboard renders, the shared restarted outcome is visible and no second handshake consent appears.
+- **Does not assert:** real SSH, independently compiled releases, real-agent work or desktop UI.
+- **Platform coverage:** linux+mac.
+
 ### Remote diagnostics (PRD #345)
 
 #### remote/doctor
@@ -4991,7 +5231,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### codex/wrap/001 — A synthetic Codex session runs through the real wrapper, daemon event stream, and PTY-attached dashboard (PRD #20 M7).
 - **Layer:** L2 PTY-attached (`TuiDeck`, real binary + daemon, deterministic shell stand-in, no authentication or LLM).
-- **Agent:** synthetic stand-in wrapped with `dot-agent-deck wrap --agent codex`. It paints interactive-TUI-shaped text rather than JSON, and ends its turn by piping a native `Stop` payload to `dot-agent-deck hook --agent codex` — what real Codex's installed hooks do. Until issue #540 it printed `codex exec --json` records and relied on the wrapper reading `turn.completed` as Idle, a path the spawned interactive `codex` never reaches.
+- **Agent:** synthetic stand-in wrapped with `dot-agent-deck wrap --agent codex`. It paints interactive-TUI-shaped text rather than JSON, reports the line it is sent as a native `UserPromptSubmit` (since issue #1493 the card's Thinking comes from that, not from the painted text), and ends its turn by piping a native `Stop` payload to `dot-agent-deck hook --agent codex` — what real Codex's installed hooks do. Until issue #540 it printed `codex exec --json` records and relied on the wrapper reading `turn.completed` as Idle, a path the spawned interactive `codex` never reaches.
 - **Asserts:** the painted lines become typed Codex `AgentEvent`s carrying `AGENT_EVENT_SCHEMA_VERSION`; because the wrapper is inside a daemon-managed pane, events declare `Pty/Live`; `WriteAndSubmit` returns Applied and the child records the submitted line; the Idle is the native hook's on the same pane (not a wrapper-classified event), and the rendered card visibly shows the Codex identity and transitions Thinking → Idle.
 - **Does not assert:** model authentication or Codex CLI behavior (covered by `codex/live/001`); that the Idle came from the hook rather than from the wrapper — the stand-in stays alive for 30 s after it, so no exit-time Idle can arrive inside the test's wait.
 - **Platform coverage:** mac+linux.
@@ -5086,8 +5326,15 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast real-binary subprocess integration: the real `hooks install --agent codex`, an isolated Codex home, a seeded durable deck, and a deterministic `codex app-server` stand-in.
 - **Agent:** `hooks.json` seeded with three user rules under `PreToolUse`; `[hooks.state]` seeded with two deck-hash records at positions the stand-in does not list — `pre_tool_use:2:0`, which the file holds, and `pre_tool_use:9:0`, which it does not; the listing names only the deck's hook, so the sweep runs.
 - **Asserts:** the record at `2:0` survives and the one at `9:0` is removed — the shape a listing taken before a concurrent deck process rewrote `hooks.json` and trusted a new position produces, where the listing alone would call the fresh record stale. RED with the file check reverted.
-- **Does not assert:** a real concurrent process (the ordering argument is on `sweep_stale_deck_trust_records`); the lost update any two concurrent `config.toml` writers have, which predates the sweep.
+- **Does not assert:** a real concurrent process (the ordering argument is on `sweep_stale_deck_trust_records`); the lost update two concurrent `config.toml` writers used to have, which the cross-process lock closes (`codex/trust/008`).
 - **Platform coverage:** mac+linux (unix-only test file).
+
+##### codex/trust/008 — Concurrent deck processes recording Codex hook trust keep every record (issue #1493 follow-up).
+- **Layer:** L1/fast, real separate processes (`src/codex_hooks_manage.rs`): the test re-executes its own binary eight times, each child (`trust_race_child_writer`) recording twenty trust records through `edit_trust_state` into one shared temp Codex home.
+- **Agent:** none; the deck's trust write as eight starting Codex panes run it.
+- **Asserts:** all 160 `[hooks.state."<key>"]` records are in `config.toml` afterwards, and no `.tmp.` file is left beside it. RED before the fix: 127 of 160 records lost to a concurrent writer's rename.
+- **Does not assert:** Codex's own writes to `config.toml` (`/hooks` in its UI), which take no part in the deck's lock; the Claude and Devin writers, which share the lock helper (`agent_hook_config::lock_config`) and its unit tests (`the_config_lock_*`, `stale_temp_pid_recognises_only_the_deck_temp_shape`) but have no multi-process test of their own.
+- **Platform coverage:** mac+linux+windows.
 
 #### codex/spawn
 
@@ -5167,7 +5414,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive Codex on the cheap test model, launched through a recorder script named `codex` ahead of PATH with isolated credentials and a fresh Codex home, workspace-write sandbox, no approvals, network-enabled sandbox configuration, and low reasoning effort; launch passes through the normal Wrapper strategy seam.
-- **Asserts:** the launcher handles both the deck's `app-server` trust probe and the interactive agent without receiving `--dangerously-bypass-hook-trust`; the fresh home trusts exactly the deck's ten scoped hook keys; the prompt is typed only after Codex's own composer placeholder paints, and the Enter is confirmed to have been taken as a submit (the placeholder returns) before any hook assertion begins; those hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with sentinel command detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
+- **Asserts:** with the composer painted and no prompt sent, the dashboard card reads Idle and nothing else for 6 s (issue #1493: it read Working); the launcher handles both the deck's `app-server` trust probe and the interactive agent without receiving `--dangerously-bypass-hook-trust`; the fresh home trusts exactly the deck's ten scoped hook keys; the prompt is typed only after Codex's own composer placeholder paints, and the Enter is confirmed to have been taken as a submit (the placeholder returns) before any hook assertion begins; those hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with sentinel command detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, and keeps showing only Idle for 6 s after the turn, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
 - **Readiness gate (issue #730).** Until 2026-09-12 the pre-typing gate was the model name on the grid, which is not a Codex signal: traced byte-for-byte through the input chain it matched 5.6 ms after the new-pane form closed, 225 ms *before* the `wrap` process hosting Codex had even forked. The prompt was therefore typed into a pane whose PTY was still in cooked mode, so the line discipline echoed it back (satisfying the prompt-visible wait) and `ICANON`/`ICRNL` fused the whole 192-byte line onto a single LF, erasing `ui::SUBMIT_DEBOUNCE`'s 150 ms gap; Codex read that as newline-in-input, no turn started, and — since its interactive hooks fire at turn start — nothing fired. Observed submission rate 1 in 5. The gate is now Codex's composer placeholder, the same boundary `state::NO_SIGNAL_READINESS_BUFFER` measured for OpenCode. The Enter is additionally retried until the composer visibly empties: with the gate in place the deck was traced delivering a clean standalone `\r` 150 ms after the last prompt byte and Codex still ignored it, and a real `codex` 0.149.0 driven directly on a pty submits at every gap from 20 ms up, so the residual loss is Codex's own post-composer initialisation rather than anything in the deck's input chain.
 - **Does not assert:** stdout JSONL classification (covered by `codex/wrap/001`) or exact model prose.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
@@ -5218,14 +5465,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 ##### codex/hooks/008 — A surplus copy of this binary's own deck rule is dropped without moving the user (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and keeps the vacated rule object in place as an empty one so no later index moves.
-- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test.
+- **Asserts:** given a duplicate shape a pre-#1034 install could leave behind — two of this binary's own deck rules with a user's rule between them — one install removes the surplus deck command, leaves the user's rule at the `group_idx` it started at, and drops the vacated rule because it is trailing, so nothing after it moves (PRD #1487; an interior vacated rule is kept as an empty one, pinned by `agent_hook_config`'s consolidation unit tests).
+- **Does not assert:** that duplicates can still be created (this install path creates none); the trust write itself (`codex/trust/002`–`003`). That a kept-but-empty rule really does consume its `group_idx` is measured rather than assumed — probed against codex-cli 0.149.0 in both shapes the sweep can leave, `{"hooks": []}` and a bare `{}`, where the handlers either side reported `pre_tool_use:0:0` and `pre_tool_use:2:0` with no warnings and no errors — but that is a property of Codex, not of this test, whose vacated rule is trailing and therefore dropped.
 - **Platform coverage:** mac+linux.
 
 ##### codex/hooks/009 — A legacy flat deck rule is swept without disturbing the nested ones (issue #1034).
 - **Layer:** L1/fast in-process `install_to` against an isolated Codex home.
 - **Agent:** none (`hooks.json` is the subject; no `codex` process is involved).
-- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx` and the rule the flat command vacated is kept so no later index moves. Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
+- **Asserts:** across the two arrangements the in-place refresh answers differently — the legacy flat `{"command": …}` deck rule reached BEFORE any nested deck handler, and one reached after it — a single install leaves the deck's command present exactly once either way. In the trailing arm, where a nested handler is claimed and refreshed in place, the user's rule additionally keeps its `group_idx`, and the trailing rule the flat command vacated is dropped, which moves nothing (PRD #1487). Removing a flat `command` is measurably safe: on 0.149.0 a rule carrying no `hooks` array contributes no listed entry at all, so it holds no trust key of its own — which also means it never ran, so the sweep is tidying rather than a duplicate-fire fix.
 - **Does not assert:** that the leading arm preserves positions — it deliberately does not, since an unclaimed array falls back to the pre-#1034 strip-then-append path; how Codex would index a handler inside a flat rule if it ever supported one (it lists none today, which is why that shape claims nothing).
 - **Platform coverage:** mac+linux.
 
@@ -5258,6 +5505,29 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** exact model phrasing or token usage.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
+
+#### codex/status
+
+##### codex/status/001 — A deck-launched Codex whose hooks are trusted shows the status its hooks report, not its output: Idle until the first prompt and Idle again after its turn (issue #1493).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_codex_status.rs`, `#![cfg(all(feature = "e2e", unix))]`): the real deck, daemon and `dot-agent-deck wrap`, the dashboard card read off the rendered grid.
+- **Agent:** stand-in `tests/fixtures/codex-synthetic/codex-status-standin.sh` wrapped as Codex, with the `codex-synthetic` app-server stand-in on `PATH` listing the deck's hooks so the wrapper records trust for them. Like real Codex it takes the terminal out of cooked mode before it paints, so the wrapper announces its interface ready ahead of the boot paint and never reports that output settled — without that, the wrapper's settle start would repaint the card Idle and hide an output-derived status. It paints TUI-shaped redraw lines on boot and again after its turn, and walks one turn through Codex's native hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `Stop` piped to `dot-agent-deck hook --agent codex`), one step per file the test creates.
+- **Asserts:** the card reads Idle and nothing else after the boot paint, held for 2 s; then Thinking on the prompt, Working with the tool's command on the card, Needs Input on the permission prompt, Thinking once the tool ends, Idle on Stop, and still Idle, held for 2 s, after the post-turn redraw. RED before the fix with `● Working` at the first check: the daemon's shell-activity monitor counted the wrapper's own child, which leads a session on a terminal of its own, as a detached shell command. Each half of the fix is load-bearing: with the nested-terminal rule in `platform::proc::scan` disabled it reads `● Working`, and with `AppState::apply_event`'s Codex rule disabled it reads `● Thinking` (the boot paint classified as activity).
+- **Does not assert:** a real Codex (`codex/hooks/001`); the untrusted case (`codex/status/003`); a quota or failed turn (`status/blocked/018`).
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### codex/status/002 — Codex's native hooks decide its card, and the wrapper's output-derived frames only move it when the prompt hook is declared unavailable (issue #1493).
+- **Layer:** L1 (`AppState::apply_event`, `src/state.rs`).
+- **Agent:** synthetic Codex frames on one pane: the wrapper's fork start and classified output, interleaved with a whole turn of native hook events.
+- **Asserts:** trusted — Idle before any prompt despite a classified Thinking, Thinking, Working with the `Bash` tool, Needs Input held against a classified Thinking, Thinking after the tool, Idle on Stop and still Idle after classified Thinking/Idle redraws, one card throughout; untrusted (frames carry `wrapper_prompt_reports_unavailable`) — classified Thinking reads Thinking, classified Idle returns it to Idle, and neither repaints a hook's Needs Input; control — a non-Codex wrapped agent keeps its output-derived Thinking.
+- **Does not assert:** that the wrapper emits the quiet-output Idle (`wrap::tests::quiet_output_reports_idle_once_and_new_output_reports_working`, `codex/status/003`); the shell-activity monitor (`platform::proc::scan::tests::a_nested_terminal_session_is_not_busy_but_what_it_detaches_is`).
+- **Platform coverage:** mac+linux+windows.
+
+##### codex/status/003 — A Codex whose hooks the deck could not get trusted reads Thinking while it draws and Idle once its output goes quiet, not Working for its whole life (issue #1493).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_codex_status.rs`).
+- **Agent:** stand-in `tests/fixtures/codex-synthetic/codex-quiet-standin.sh` wrapped as Codex on a `PATH` with no `codex` at all (`<deck bin dir>:/usr/bin:/bin`), so the trust step cannot run; it reports nothing through any hook and paints in two bursts.
+- **Asserts:** the card reads Idle after the boot paint has gone quiet (held for 2 s), Thinking during the second burst, and Idle again after it. RED with the wrapper's quiet-output tick disabled (Thinking for good after the second burst), and with the detector not marked quiet on the wrapper's output-settled start (no Thinking for the second burst).
+- **Does not assert:** the length of the quiet window beyond "settles within the wait" (`wrap::tests::quiet_output_reports_idle_once_and_new_output_reports_working` pins the rule); a real Codex in this state.
+- **Platform coverage:** mac+linux (unix-only file).
 
 #### codex/worker
 
@@ -5430,7 +5700,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 ##### pane/restart/014 — After `pane restart`, a late `SessionStart` from the REPLACED generation cannot take the role's card back in an attached TUI (issue #320).
 - **Layer:** L2 (PTY-attached real binary: real daemon, real TUI, the real `pane restart` CLI; hook frames posted on the real hook socket).
-- **Agent:** none (`cat` stand-ins for both roles; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
+- **Agent:** none (`cat` for the orchestrator and coder's restarted generation; coder's first generation is a shell loop in the `pane-restart-late-start` fixture that exits only when the test creates `coder-may-exit`, so the test reads its id before it exits even on a starved runner; the hook frames stand in for a hook-emitting agent's, naming the daemon's real registry ids for coder's two generations).
 - **Asserts:** with coder restarted so the daemon has published two generations on its pane, the new generation's `SessionStart` draws its prompt on coder's card; a late `SessionStart` from the replaced generation, followed on the same connection by a barrier frame on the orchestrator's pane, leaves the live generation's prompt on screen and never draws the replaced generation's. The barrier is on another pane on purpose: one from coder's live generation would re-retire a wrongly restored card and hide the defect. Verified load-bearing: with the daemon's generation stamp removed the replaced generation's prompt is drawn and the test fails.
 - **Does not assert:** a real agent's hook (`orchestration/delegate/014` covers a real Claude worker through a `clear = true` respawn); the late non-start frame stamped newer, or the incoming generation's older-stamped first frame, which `daemon::hook_ingestion_tests` pins at the ingestion seam and `status/supersede/019` / `/020` at the card layer.
 - **Platform coverage:** mac+linux (the e2e tier is Unix-only).
@@ -6154,8 +6424,8 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 
 ##### scheduler/spawn/010 — On the scheduler's gate, a wrapper's STRONG interface fact that lands while the weak fact's buffer is running re-prices that buffer from the strong fact's arrival instead of letting it run out on the weak fact's schedule (issue #724).
 - **Layer:** fast synthetic PTY integration (the real `crate::spawn::spawn` primitive against an in-process daemon, with the REAL `dot-agent-deck wrap` rewrite at the common spawn boundary; no LLM and no `e2e` feature gate).
-- **Agent:** a `codex`-named stand-in that paints a nonce banner, stays in COOKED mode for 3.5 s, then runs `stty raw -echo` and `exec cat`. It answers the deck's `codex app-server` hook-listing probe at once, because a stand-in that played its dwell for the probe too delays the pane's start by that long. `DOT_AGENT_DECK_SESSION_START_WAIT_MS=2000` shortens the scheduler's readiness wait so its expiry falls between the two facts, and `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=4000` pins both buffers to one value so the bound below does not depend on the strong fact hitting a 1000 ms target.
-- **Asserts:** the control that the pane is one the daemon spawned as a wrapper host; the control that the weak fact was stamped inside the wait, so the wait's expiry released the gate on it; the control that the strong fact was stamped after the wait could have expired, which keeps the run from being vacuous (a strong fact inside the wait releases the gate on itself and passes the bound with or without re-pricing). Then the bound: the prompt reached the pane at least 4000 ms after the strong fact. Measured **2.47 s** before the fix, which is the weak fact's buffer ending on schedule.
+- **Agent:** a `codex`-named stand-in that paints a nonce banner and stays in COOKED mode until a fixture file permits `stty raw -echo` and `exec cat`. It answers the deck's `codex app-server` hook-listing probe at once. The real wrapper emits both interface facts; none are synthesized. A paused current-thread runtime waits for the weak fact on wall time before advancing the `DOT_AGENT_DECK_SESSION_START_WAIT_MS=2000` readiness wait, then permits raw mode 300 ms into the buffer. `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=4000` pins both buffers to one value.
+- **Asserts:** the pane is a daemon-spawned wrapper host; real child startup spends none of the virtual readiness wait; no prompt is written at release and no strong fact has yet arrived, so the strong fact cannot release the gate directly. The prompt remains absent at the original weak-buffer deadline and 10 ms before the full strong buffer elapses, then appears after the repriced deadline. This replaces the former two-second child-startup race while retaining real-wrapper coverage and the full 4000 ms lower bound.
 - **Verified load-bearing:** making `weak_fact_buffer_reprice` answer `None` turns it red at **2.47 s**, and so does leaving `released_on_settled_guess` unset on the window-expiry release.
 - **Does not assert:** the default-valued re-price (1000 ms weak, 5000 ms strong), the never-earlier `max`, which events may re-price, or the forged-marker refusal, all pinned by `hold_readiness_buffer`'s unit tests in `src/state.rs`; the delegate seam (`orchestration/delegate/039`); a real Codex producing this timing, which on the production wait needs the strong fact to land in the one second after a 30 s window.
 - **Platform coverage:** mac+linux (unix-only — POSIX shell, `stty`, and pty line discipline).
@@ -6250,14 +6520,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/014 — Concurrent single-agent dispatch seeds survive a deterministic boot-window swallow and are confirmed after retry, whether the producer identifies itself before or after the write.
-- **Layer:** L2 synthetic PTY-attached (real deck and daemon, five real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM). The deck-selected executable is named `claude` so `AgentType::from_command` resolves its frozen spawn record as ClaudeCode — the ordinary `default_command = "claude …"` production shape. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s so the fallback write path is reached in seconds rather than the production 30 s.
+- **Layer:** L2 synthetic PTY-attached (real deck and daemon, five real dispatch worktrees, scripted Claude-shaped stand-ins that post hooks through the real CLI; no LLM). The deck-selected executable is named `claude` so `AgentType::from_command` resolves its frozen spawn record as ClaudeCode — the ordinary `default_command = "claude …"` production shape. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s so the fallback write path is reached in seconds rather than the production 30 s. The caller pane the `dispatch` CLI runs from is started with no command (a shell): since issue #1602 a `--single` unit runs its dispatcher's own command, and the `cat` caller this used to open gave every unit `cat`, so no stand-in ran.
 - **Agent:** four one-write-swallowing hook stand-ins retain the existing controls, including `seed-late-claim`, which withholds its genuine start for 6 s to stage issue #570. The fifth pane (`seed-two-write-flush`) is a deterministic two-stage launcher: a `wrapper_fork` start declares standing, the launcher consumes attempts 1 and 2 while emitting only non-generational reporting evidence between them, then stage two posts a genuine Claude start and emits `UserPromptSubmit` for later non-empty input. Every stand-in reads a WHOLE pane submission rather than a line, because a multi-line payload reaches the pane as one bracketed paste and an agent TUI treats it as one input (issue #1182): reading a line at a time was equivalent only while every dispatch payload was single-line, and once PRD #220 Phase 2 appended the completion instruction it shredded one payload into eight `submissions`, none of them confirmable.
 - **Asserts:** as a PRECONDITION, before any delivery assertion, that the daemon logged each stand-in's first `SessionStart` before any terminal delivery line for that pane (`not retrying`, `stopped without confirmation`, `abandoning`) — `seed-<pane id>` for four panes, and `launcher-<pane id>` for `seed-two-write-flush`, whose genuine start follows two payload writes and so belongs to the delivery path rather than to its precondition. A retry is armed by that announcement, and without the check a stand-in that never announced itself failed after the whole wait as `confirmed=false`, blaming the delivery path (issue #531); on failure it names the pane, the stand-in's own `stand-in-readiness.log` trail and the `SessionStart` lines the daemon did log. Then, that all five concurrent `dispatch --single` panes durably expose the dispatch payload built around their own seed — the caller's task verbatim, then the daemon's appended completion instruction — and the written/unconfirmed/confirmed lifecycle under distinct delivery IDs. The original four each retain their swallowed-first-write recovery contract; the fifth records exactly two `swallowed|<prompt>` lines followed by exactly one `confirmed|<prompt>`, requires a `prompt written to pane` line carrying `attempt=3` for its pane (rather than the state-set helper that erases attempt counts), and forbids any deadline `abandoning` line. RED before issue #666's implementation: attempts 3–8 are empty probes and the fifth pane abandons with `attempts=8`.
 - **Does not assert:** the retry's internal state representation or real-agent boot behavior (covered by `scheduler/dispatch/015`); the sub-150 ms production window in which #570 was actually observed (the late claim is staged as strictly post-write instead); the refusal side for a pane the deck cannot vouch for (covered by `scheduler/dispatch/016`).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/dispatch/015 — Three concurrent real interactive Claude dispatches each genuinely submit their seed prompt.
-- **Layer:** L2 REAL PTY-attached (real deck and daemon, three sibling dispatch worktrees, imported isolated credentials, and project trust pre-seeded for every predicted worktree). A bootstrap launcher mirrors the field report's nested `devbox` startup seam: it announces an explicitly launcher-origin (`wrapper_fork`) `SessionStart`, consumes attempt 1, posts identified non-generational reporting evidence so the standing launcher remains eligible for the bounded replacement, consumes attempt 2 while the real agent is not yet running, then `exec`s Claude. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s, as `scheduler/dispatch/014` does, because this scenario cannot satisfy that gate before its first write.
+- **Layer:** L2 REAL PTY-attached (real deck and daemon, three sibling dispatch worktrees, imported isolated credentials, and project trust pre-seeded for every predicted worktree). A bootstrap launcher mirrors the field report's nested `devbox` startup seam: it announces an explicitly launcher-origin (`wrapper_fork`) `SessionStart`, consumes attempt 1, posts identified non-generational reporting evidence so the standing launcher remains eligible for the bounded replacement, consumes attempt 2 while the real agent is not yet running, then `exec`s Claude. `DOT_AGENT_DECK_SESSION_START_WAIT_MS` pins the readiness gate to 3 s, as `scheduler/dispatch/014` does, because this scenario cannot satisfy that gate before its first write. The caller pane is started with no command (a shell), for the reason `scheduler/dispatch/014` records (issue #1602).
 - **Scheduling:** exclusive (issue #664). `.config/nextest.toml` gives it `threads-required = "num-test-threads"`, a high `priority` and one retry. Three real cold boots against a 60 s production deadline are unusually sensitive to what the rest of the machine is doing — measured green alone at 32.2 s and red in a full `cargo test-e2e` at 174.1 s, two panes `Error` with their deliveries abandoned. Reserving the pool reproduces the `-j 1` condition that was measured green; the priority makes that reservation free by taking it at run start rather than draining the tier's 250-320 s tail; the single retry covers load that is not the tier's at all (a full-pool run still failed with the 15-minute load average at 58 on 16 cores, from sibling agent worktrees building), and leaves a genuine regression failing both attempts and a recovered run reported as FLAKY.
 - **Agent:** REAL interactive Claude Code ×3 pinned to `claude-haiku-4-5-20251001` with `--allowedTools Bash` and no `-p`, reached through the deterministic two-write-swallowing bootstrap launcher; runtime-skipped when the CLI or credentials are absent and flaky-tolerant in the lane-2 tier The launcher consumes whole bracketed-paste submissions rather than lines, for the reason `scheduler/dispatch/014` records.
 - **Asserts:** all three bootstrap launchers record exactly two swallowed copies of their distinct seed; after Claude's native start, each delivery must log a payload write at some attempt greater than 2, avoid deadline abandonment, and durably expose the sentinel-bearing seed through Claude's native `UserPromptSubmit` — which reports it inside Claude Code's `<pasted_content id="…">` envelope rather than verbatim, the shape issue #1182 taught the daemon's confirmation matcher to read. RED before issue #666's implementation: all three emit only probes after attempt 2 and abandon at `attempts=8`. The isolated RED measurement left 56.20 s of the production deadline after attempt 2 in every pane, so the deterministic staging retains ample real-agent boot margin within the existing exclusive test.
@@ -6347,6 +6617,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (`cat` targets, synthesized `SessionStart` events).
 - **Asserts:** each pane is announced ready with one `SessionStart`, and its writer emits a second `SessionStart` as the first attempt's erases land, after that attempt's own pre-write drain and before the retry's. In the pane where that event names a NEW conversation, the retry writes nothing (the byte log is one payload plus its erases). In the control pane, where it names the SAME conversation, the retry goes ahead (two payload-plus-erases sequences, then the attempts run out). In a third pane the writer floods 40 same-conversation events into a 16-slot bus between the attempts, and the retry's drain stops on `lagged-event-stream` with nothing written. The control and the flooded pane get a "was not delivered" `DeliveryNotice`; the generation-changed pane does not, exactly as a first write the drain stops is not, because the daemon drops a notice addressed to a conversation that is no longer current (`src/daemon.rs`, the delivery-notice sink). A lag stop lost the evidence rather than finding the target gone, so it is reported, still bound to its conversation. A fourth pane is typed OpenCode, which declares no pre-prompt readiness signal, so its delivery is never bound to a conversation; flooded the same way, its retry stops and it gets NO notice, because an unbound notice would land on whatever conversation owns the card, a successor included. Measured red with the retry skipping the pre-write drain (the changed and flooded panes take a second payload), with the lag stop unreported (the flooded pane's notice missing), and with the lag stop reported while unbound (the unbound pane gets a notice).
 - **Does not assert:** the daemon's notice sink itself (the test's sink records every notice; that the daemon would also drop one bound to the old conversation is why the stop publishes none); a successful retry under an event bus (the confirmation loop it hands over to is the one a first write gets, covered by `scheduler/dispatch/014`–`021`); a draft typed between the attempts (the retry's draft wait is the first write's, `scheduler/dispatch/024`); an agent replaced between the attempts.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/028 — A prompt whose line breaks are not plain LF reaches a REAL interactive Claude as exactly one submitted turn, on the dispatch path and on the desktop/TUI submit path (issue #1616).
+- **Layer:** L2 REAL PTY-attached (real deck and daemon, one dispatch worktree, imported isolated credentials, project trust pre-seeded for the predicted worktree). The caller pane is started with no command (a shell), so the `--single` unit runs the configured `default_command` rather than its dispatcher's (issue #1602).
+- **Agent:** REAL interactive Claude Code pinned to `claude-haiku-4-5-20251001` with `--allowedTools Bash Write` and no `-p` (`Write` because a `--single` unit writes its report with its file-writing tool, and a permission prompt would hold the first turn open); runtime-skipped when the CLI or credentials are absent, flaky-tolerant lane 2.
+- **Asserts:** phase 1 — `dispatch --single --task-file` with a task file written with CRLF line endings (a blank line, a trailing line break) that asks the agent to `cat` a sentinel file: the card's last prompt names the sentinel (a turn started), the agent prints the file's contents (which appear in no prompt), and the daemon's delivery log for that pane has the delivery confirmed, exactly one payload write and no `re-submitting` line. Phase 2 — once the card reads Idle and stays Idle, a follow-up whose two lines are separated by a bare CR goes through the guarded `write-and-submit` RPC the desktop's `submit_text` and the TUI use (named with the conversation id the daemon answers an unnamed write with): it must start a turn of its own and the agent must print the second sentinel's contents. Measured RED before the fix, each phase for its own reason: phase 1 confirmed nothing, logged `re-submitting` from attempt 1 and wrote the payload twice, typing the whole task into the pane of an agent already working on it (Claude Code reports a CRLF paste as LF, so the raw comparison never matched); phase 2 left the follow-up in Claude's composer under "Removed 1 invisible character · review and press Enter to send", no turn started.
+- **Does not assert:** the other separators the fix covers (VT, FF, NEL, LS, PS — measured held by Claude Code 2.1.294 the same way, pinned at the encoder by `pane_input::tests::encode_pane_payload_writes_every_line_break_as_lf`); the matcher's normalization for the truncated and enveloped report shapes (`prompt_delivery::tests::a_prompt_with_crlf_or_cr_line_breaks_is_confirmed_by_its_lf_report`); other invisible characters Claude Code holds a prompt for (a BOM, a zero-width space), which the deck does not change; Codex, OpenCode and Pi, which were measured submitting a bare-CR prompt rather than holding it.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/pi

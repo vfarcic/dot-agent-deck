@@ -792,10 +792,19 @@ pub(crate) fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEven
         metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
+    // OpenCode publishes the user interrupting a turn as a `session.error`
+    // named `MessageAbortedError` — its own TUI skips exactly that name rather
+    // than showing an error — so it is the turn ending, not a failure. That
+    // matters since an Error card stays Error through the `session.idle` that
+    // follows it (`AppState::apply_event`).
+    if input.event == "session.error" && input.error_name.as_deref() == Some("MessageAbortedError")
+    {
+        event_type = EventType::Idle;
+    }
     // Issue #714: a `session.error` whose structured fields name a provider
     // quota or credit refusal is a block; every other one stays `Error`. See
     // `crate::quota_signals::classify_opencode_error`.
-    if input.event == "session.error" {
+    if input.event == "session.error" && event_type == EventType::Error {
         let fields = crate::quota_signals::OpenCodeErrorFields {
             error_name: input.error_name,
             response_markers: input.response_markers,
@@ -3101,6 +3110,29 @@ mod tests {
         assert_eq!(
             map_opencode_event_type("session.deleted", None),
             Some(EventType::SessionEnd)
+        );
+    }
+
+    /// OpenCode publishes an interrupted turn as a `session.error` named
+    /// `MessageAbortedError`; that is the turn ending, so it reads Idle, while
+    /// any other `session.error` stays Error.
+    #[test]
+    fn an_opencode_abort_is_idle_and_other_errors_stay_errors() {
+        let aborted: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"MessageAbortedError"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_opencode_event(aborted).unwrap().event_type,
+            EventType::Idle
+        );
+        let failed: OpenCodeHookInput = serde_json::from_str(
+            r#"{"session_id":"oc","event":"session.error","error_name":"UnknownError"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            build_opencode_event(failed).unwrap().event_type,
+            EventType::Error
         );
     }
 

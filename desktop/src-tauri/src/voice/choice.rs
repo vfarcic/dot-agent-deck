@@ -68,7 +68,11 @@ fn kind_nouns(kind: ParamKind) -> &'static [&'static str] {
         ParamKind::OrchestrationRef => &["orchestration", "run"],
         ParamKind::ModeRef => &["mode", "chip"],
         ParamKind::AgentTypeRef => &["agent", "type"],
-        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => &[],
+        ParamKind::SpokenPrefix
+        | ParamKind::FilterText
+        | ParamKind::CommandText
+        | ParamKind::AgentKind
+        | ParamKind::AgentStatus => &[],
     }
 }
 
@@ -551,7 +555,11 @@ fn by_name(
                 resolve_agent_type_ref(utterance, &choices)
             })
         }
-        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => Found::None,
+        ParamKind::SpokenPrefix
+        | ParamKind::FilterText
+        | ParamKind::CommandText
+        | ParamKind::AgentKind
+        | ParamKind::AgentStatus => Found::None,
     };
     match found {
         Found::One(value) => match offered.iter().find(|candidate| candidate.value == value) {
@@ -638,7 +646,11 @@ pub(super) fn names_of(kind: ParamKind, value: &str, live: &ChoiceLive) -> Vec<S
             .iter()
             .find(|choice| choice.id == value)
             .map(agent_type_names),
-        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => None,
+        ParamKind::SpokenPrefix
+        | ParamKind::FilterText
+        | ParamKind::CommandText
+        | ParamKind::AgentKind
+        | ParamKind::AgentStatus => None,
     };
     names.unwrap_or_default()
 }
@@ -721,7 +733,11 @@ fn names_something(
         ParamKind::ModeRef | ParamKind::AgentTypeRef => form_choices(kind, live)
             .iter()
             .any(|choice| is(&choice.label)),
-        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
+        ParamKind::SpokenPrefix
+        | ParamKind::FilterText
+        | ParamKind::CommandText
+        | ParamKind::AgentKind
+        | ParamKind::AgentStatus => false,
     }
 }
 
@@ -742,7 +758,11 @@ fn still_live(candidate: &ResolvedParam, live: &ChoiceLive) -> ChoiceAnswer {
         ParamKind::ModeRef | ParamKind::AgentTypeRef => form_choices(candidate.kind, live)
             .iter()
             .any(|choice| choice.id == value),
-        ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
+        ParamKind::SpokenPrefix
+        | ParamKind::FilterText
+        | ParamKind::CommandText
+        | ParamKind::AgentKind
+        | ParamKind::AgentStatus => false,
     };
     if present {
         ChoiceAnswer::Selected(candidate.clone())

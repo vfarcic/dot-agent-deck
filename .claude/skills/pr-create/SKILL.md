@@ -90,6 +90,8 @@ Report and stop: PR URL, check status, each finding and what you did about it, e
 
 It *is* a bypass when your caller has a gate of its own after this step. The orchestrated PRD workflow is exactly that shape: `.dot-agent-deck.toml` runs this skill at step 5, then builds a demo reel at step 6, then asks the **user** for an explicit merge go-ahead at step 7. Arming here would land the PR the moment the approval arrived — during step 6, with nobody present — and nothing later can un-arm it, because re-running this skill only arms it again.
 
+**Auto-merge also skips the overlap check** (`/issue-queue`'s "The overlap check before a merge", `.claude/skills/issue-queue/SKILL.md`): GitHub merges when the approval lands, and nobody looks then at what `main` gained meanwhile in the files this PR changes. Running the check before arming, and updating the branch when it lists anything, covers only what `main` holds at that moment.
+
 So the default is **do not arm**; arm only when you are the last gate. If you were told to stop before merge, that is your answer: report and leave it disarmed.
 
 ## Reference

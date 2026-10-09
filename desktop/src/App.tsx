@@ -8,6 +8,7 @@ import {
   Check,
   CheckCircle2,
   ChevronRight,
+  CircleArrowUp as ArrowUpCircleIcon,
   CircleStop,
   Command,
   FolderGit2,
@@ -35,6 +36,7 @@ import { AgentOverview, DASHBOARD_COVERED, modalOpen } from "./components/AgentO
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
+import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
 import { SelectDeckNote } from "./components/SelectDeckNote";
@@ -44,7 +46,8 @@ import { VoiceControlPanel, type VoicePane } from "./components/VoiceControlPane
 import { SettingsBridgeProvider } from "./lib/settingsBridge";
 import { DISPLAY_LIMITS, deckName, displayActivity, displayText } from "./lib/displayText";
 import { voicePaneAgent } from "./lib/promptKeys";
-import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "./lib/connectionRemedy";
+import { CONNECT_ANYWAY_BODY, disconnectedDetails, disconnectedRemedy, incompatibleRemedy, startDaemonConfirmCopy } from "./lib/connectionRemedy";
+import { upgradeOffered } from "./lib/upgrade";
 import { ConnectionDetail } from "./components/ConnectionDetail";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
@@ -63,13 +66,14 @@ import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoice
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
 import { agentKey } from "./lib/agentKey";
+import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
 import { applyAppearance } from "./lib/appearance";
 import { desktopOrchestrationPlatformIssue } from "./lib/platform";
 import { selectsAllDecks } from "./lib/endpoints";
 import { deckScreenSnapshot } from "./lib/deckScreen";
-import { LaunchCleanupError } from "./lib/actionError";
+import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
@@ -155,6 +159,8 @@ const OPEN_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "openDeck";
  * `VoiceDispatchTarget.deckSelection`.
  */
 const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
+/** Issue #1496 — the one entry whose params are the dashboard filter's facets. */
+const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -831,6 +837,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(namedAgentType ? { agentTypeId: namedAgentType.value } : {}),
       ...(declaredForm ? { declaredForm: { deckId: declaredForm.deckId, path: declaredForm.path } } : {}),
       ...(namedOrchestration ? { orchestrationAgentId: namedOrchestration.value } : {}),
+      ...(outcome.invoke === FILTER_DASHBOARD_INVOKE ? { dashboardFilter: dashboardFilterFromParams(outcome.params) } : {}),
     };
     let moved = false;
     const context: VoiceDispatchContext = {
@@ -1377,15 +1384,23 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const helpOpen = overlays.open.shortcuts ?? false;
   // voice-registry-exempt: the shortcut sheet is a `ShellOverlay` and not a `DeckOverlay` — no registry entry opens it; `?` and the rail's bottom button do
   const setHelpOpen = (open: boolean) => setOverlay("shortcuts", open);
-  /* Issue #1234: a sentence only. The roles a failed launch could not confirm
+  /* Issue #1234: a sentence, with a failure's technical detail beside it, and
+     nothing else. The roles a failed launch could not confirm
      are stopped are the runtime's `cleanupWarnings`, which outlive any notice. */
-  const [notice, setNotice] = useState<string>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  const [noticeState, setNoticeState] = useState<{ message: string; detail?: string }>(); // voice-registry-exempt: the toast's sentence, reporting what an action did
+  /* PR #1623 review: a failure's technical detail rides beside its sentence
+     rather than inside it, so the sentence stays equal to the one `runAction`
+     recorded as `runtime.error` and `dismissToast` can match the two. */
+  const notice = noticeState?.message;
+  const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
+  const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
      or closes, exactly as the overview reports its own: the voice panel's gate
      refuses a pane write while one is open, and an opening one ends the
-     dictation mode. */
-  const confirmationOpen = confirm !== undefined;
+     dictation mode. The Upgrade / Replace daemon dialog counts as one: it
+     asks whether to stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
@@ -1612,11 +1627,31 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * was refused; `error` without it is the app's own bridge failing.
    */
   const incompatibleDaemon = snapshot.connection.status === "error" && snapshot.connection.daemonDetected === true;
-  const replaceable = mode === "live" && !remoteDeck && incompatibleDaemon;
-  const offersReplace = replaceable && snapshot.connection.runningAgentCount === 0;
+  /*
+   * PRD #1487 D10: Replace daemon runs the shared upgrade procedure, so it is
+   * no longer withheld while agents run — the daemon names every agent and
+   * role a restart would stop and the dialog asks first. The rest of its
+   * gating is unchanged: live mode, the local deck, an incompatible daemon.
+   */
+  const offersReplace = mode === "live" && !remoteDeck && incompatibleDaemon && Boolean(runtime.upgradeDaemon);
+  /*
+   * PRD #1487 D8/D9: Upgrade, on a remote deck the crate says runs an older
+   * release. In the banner beside Connect anyway when the daemon was refused
+   * or connected anyway; on the top bar otherwise.
+   */
+  const offersUpgrade = upgradeOffered(snapshot.connection) && Boolean(runtime.upgradeDaemon);
+  const upgradeInBanner = offersUpgrade && (incompatibleDaemon || snapshot.connection.buildStampMismatchOnly === true);
   const offersConnectAnyway = mode === "live" && snapshot.connection.status === "error" && snapshot.connection.buildStampMismatchOnly === true;
+  /*
+    Issue #1490: a disconnected deck offers ONE remedy, the one its reason
+    names. A deck without a reason (fixture data, an older snapshot) keeps the
+    old pair: Start daemon on a local deck, beside Reconnect.
+  */
+  const disconnectedReason = snapshot.connection.status === "disconnected" ? snapshot.connection.disconnectedReason : undefined;
+  const offersStart = mode === "live" && snapshot.connection.status === "disconnected" && disconnectedRemedy(snapshot.connection, remoteDeck ? "reconnect" : "start-daemon") === "start-daemon";
+  const offersReconnect = !(offersStart && disconnectedReason !== undefined);
   const bannerRemedy = incompatibleDaemon
-    ? incompatibleRemedy(snapshot.connection, { replaceDaemon: offersReplace, replaceWithheld: replaceable && !offersReplace, connectAnyway: offersConnectAnyway, reconnect: true })
+    ? incompatibleRemedy(snapshot.connection, { upgrade: upgradeInBanner, replaceDaemon: offersReplace, connectAnyway: offersConnectAnyway, reconnect: true })
     : undefined;
 
   const coordinator = snapshot.agents.find((agent) => agent.isStartRole);
@@ -1795,15 +1830,22 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     });
   };
 
+  /**
+   * PRD #1487 D10: Replace daemon is the shared upgrade procedure on the local
+   * deck — the daemon decides what a restart would stop, and the dialog asks
+   * before stopping any of it.
+   */
   const requestRestartDaemon = () => {
-    if (!snapshot.connection.daemonDetected || snapshot.connection.runningAgentCount !== 0) return;
-    setConfirm({
-      title: "Replace the incompatible daemon?",
-      body: "The daemon now running reports no live agents. Agent Deck will stop it and start the exact build bundled with this desktop app.",
-      label: "Replace daemon",
-      busyLabel: "Replacing…",
-      action: async () => { await perform({ type: "restart_daemon" }, "Matching daemon started and reconnected."); },
-    });
+    const deckId = snapshot.connection.deckId;
+    if (!offersReplace || deckId === undefined) return;
+    setUpgrade({ deckId, deckName: deckName(snapshot.connection), kind: "replace" });
+  };
+
+  /** PRD #1487 D9: Upgrade on a remote deck whose daemon is older than this app. */
+  const requestUpgrade = () => {
+    const deckId = snapshot.connection.deckId;
+    if (!offersUpgrade || deckId === undefined) return;
+    setUpgrade({ deckId, deckName: deckName(snapshot.connection), kind: "upgrade", offer: snapshot.connection.upgradeOffer });
   };
 
   /**
@@ -1840,18 +1882,28 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     });
   };
 
+  /** Issue #1490: the deck shown here, local or remote, on the host its reason names. */
   const requestStartDaemon = () => {
+    const deckId = snapshot.connection.deckId;
+    const host = snapshot.connection.disconnectedReason?.host ?? "this machine";
     setConfirm({
-      title: "Start the local daemon?",
-      body: "Agent Deck will start the daemon on this machine and reconnect this control room. No agent is started until you explicitly activate an orchestration.",
+      ...startDaemonConfirmCopy(host),
       label: "Start daemon",
       busyLabel: "Starting…",
       action: async () => {
         try {
-          await runtime.runAction({ type: "start_daemon" });
-          setNotice("Local daemon started and control channel reconnected.");
+          await runtime.runAction({ type: "start_daemon", ...(deckId === undefined ? {} : { deckId }) });
+          setNotice(remoteDeck ? `Daemon started on ${host} and connected.` : "Local daemon started and control channel reconnected.");
         } catch (cause) {
-          setNotice(cause instanceof Error ? cause.message : String(cause));
+          // PR #1623 review: a failed start's technical detail — the spawn
+          // error, what ssh printed — is said with its sentence, not dropped.
+          // It travels as the notice's detail rather than appended to its
+          // sentence, so the sentence still equals the one `runAction` recorded
+          // and `dismissToast` takes both. `runtime.error` is shared, so nothing
+          // here clears it: a newer failure recorded there before this catch
+          // ran says something else and must survive (PR #1623 review).
+          const message = cause instanceof Error ? cause.message : String(cause);
+          setNotice(message, cause instanceof StartDaemonError ? cause.detail : undefined);
         }
       },
     });
@@ -2067,6 +2119,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               title={mode === "live" ? "Whole-run pause is not yet exposed by the daemon" : snapshot.paused ? "Resume fixture run" : "Pause fixture run"}
               onClick={() => void perform({ type: snapshot.paused ? "resume_run" : "pause_run" }, snapshot.paused ? "Fixture resumed." : "Fixture paused.")}
             >{snapshot.paused ? <Play size={14} /> : <Pause size={14} />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
+            {offersUpgrade && !upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon" title={`Upgrade the daemon on ${deckName(snapshot.connection)} to this app's version`} onClick={requestUpgrade}><ArrowUpCircleIcon size={14} /><span>Upgrade</span></button>}
             <button
               className="button danger compact"
               data-testid="stop-run"
@@ -2097,15 +2150,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {(snapshot.connection.status !== "connected" || snapshot.connection.buildStampMismatchOnly || snapshot.connection.selectionFallback) && (
           <div className={`connection-banner connection-${snapshot.connection.status}`} role="alert">
             {snapshot.connection.status === "loading" ? <RefreshCw className="spin" size={16} /> : <ShieldAlert size={16} />}
-            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a daemon from a different version") : incompatibleDaemon ? "Incompatible daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{bannerRemedy && <span data-testid="connection-banner-remedy">{bannerRemedy}</span>}<ConnectionDetail detail={snapshot.connection.detail} />{/*
+            <div><strong>{snapshot.connection.status === "loading" ? "Establishing control channel" : snapshot.connection.status === "connected" ? (snapshot.connection.selectionFallback ? "Using the daemon on this machine" : "Connected to a daemon from a different version") : incompatibleDaemon ? "Incompatible daemon" : snapshot.connection.status === "error" ? "Desktop bridge error" : "Daemon disconnected"}</strong><span data-testid="connection-banner-message">{disconnectedReason ? displayText(disconnectedReason.message, DISPLAY_LIMITS.message) : snapshot.connection.message && displayText(snapshot.connection.message, DISPLAY_LIMITS.message)}</span>{bannerRemedy && <span data-testid="connection-banner-remedy">{bannerRemedy}</span>}<ConnectionDetail detail={disconnectedReason ? disconnectedDetails(snapshot.connection, { message: true }) : snapshot.connection.detail} />{/*
               PRD #741 M7. The stored selection could not be honoured, so the
               app is on the local deck — and it says which of the two reasons it
               was. This is why the banner's condition now includes it: a
               `NoRemoteSocket` fallback leaves the app CONNECTED, so without this
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
-            */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Start and Replace are absent, said once, where they would have been. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{mode === "live" && !remoteDeck && snapshot.connection.status === "disconnected" && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}<button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button></div>}
+            */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Stop and Replace are absent on a remote deck, said once. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
 
@@ -2217,13 +2270,14 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
+      {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
           above the sentence — since issue #1234 from the runtime's own queue,
           whether the sentence is a notice or the runtime's error. The overview
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} />
     </div>
   );
 }
@@ -2249,7 +2303,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -2271,7 +2325,7 @@ function Toast({ message, onDismiss, warnings, onDismissWarning }: { message?: s
         <div className="toast" data-testid="toast" role="status">
           <AlertTriangle size={15} />
           <div className="toast-body">
-            <span>{displayText(message, DISPLAY_LIMITS.message)}</span>
+            <span>{displayText(message, DISPLAY_LIMITS.message)}{detail ? ` (${displayText(detail, DISPLAY_LIMITS.detail)})` : null}</span>
           </div>
           <button aria-label="Dismiss message" onClick={onDismiss}><X size={14} /></button>
         </div>

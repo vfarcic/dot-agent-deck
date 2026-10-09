@@ -48,7 +48,55 @@ pub enum ClientError {
     SocketMissing(PathBuf),
     #[error("malformed daemon response: {0}")]
     Malformed(String),
+    /// PRD #1487: the daemon did not answer within the bound, before the
+    /// request itself was sent — see [`DaemonClient::restart_daemon`].
+    #[error("no answer from the daemon within {0:?}")]
+    TimedOut(std::time::Duration),
+    /// PRD #1487: the request was sent, or may have been, and then no answer
+    /// was read — the connection broke, the reply was cut off, or the bound
+    /// ran out. Unknown whether the daemon acted on it, so a caller checks
+    /// before it says which — see [`DaemonClient::restart_daemon`].
+    #[error(
+        "no answer was read after the request was sent ({0}); unknown whether the daemon acted on it"
+    )]
+    Unanswered(String),
 }
+
+/// PRD #1487: what [`DaemonClient::restart_daemon`] asks for. Mirrors the
+/// fields of [`crate::daemon_protocol::AttachRequest::RestartDaemon`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestartDaemonRequest {
+    /// The set the user confirmed; `None` on the first ask.
+    pub confirm: Option<crate::daemon_protocol::RestartStopSet>,
+    /// The version the client just installed.
+    pub expected_version: Option<String>,
+    /// Who starts the successor.
+    pub successor: crate::daemon_protocol::RestartSuccessor,
+}
+
+/// PRD #1487: the bound on one `restart-daemon` round trip. Before it answers,
+/// the daemon may spend up to [`crate::daemon_restart::RESTART_VERIFY_TIMEOUT`]
+/// checking the installed build and then up to
+/// [`crate::agent_pty::RESPAWN_SETTLE_TIMEOUT`] waiting for respawns to settle,
+/// so this is that sum plus [`RESTART_REPLY_MARGIN`] for the round trip itself
+/// — a reply sent in the daemon's worst case still arrives inside it.
+pub const RESTART_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_secs()
+        + crate::agent_pty::RESPAWN_SETTLE_TIMEOUT.as_secs()
+        + RESTART_REPLY_MARGIN.as_secs(),
+);
+
+/// What [`RESTART_REQUEST_TIMEOUT`] allows on top of the daemon's worst case
+/// before it answers: the handshake, the stop-set read and the reply itself.
+pub const RESTART_REPLY_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+// The bound must outlast everything the daemon may do before it answers, or
+// an accepted restart can be reported as a failure (PRD #1487 review).
+const _: () = assert!(
+    RESTART_REQUEST_TIMEOUT.as_millis()
+        > crate::daemon_restart::RESTART_VERIFY_TIMEOUT.as_millis()
+            + crate::agent_pty::RESPAWN_SETTLE_TIMEOUT.as_millis()
+);
 
 /// Where a daemon lives, from a client's point of view (PRD #741 M2).
 ///
@@ -748,6 +796,26 @@ pub struct StartAgentOptions {
     /// payload so older daemons keep accepting the request (and, receiving no
     /// seed, drive the unchanged PTY-injection path).
     pub seed: Option<String>,
+}
+
+/// Issue #1496: which authoring kind a start names, and who seeds it — the
+/// two `start-agent` fields [`DaemonClient`]'s start methods fill. At most one
+/// is `Some`; the daemon refuses a start carrying both.
+#[derive(Debug, Clone, Copy, Default)]
+struct StartKind {
+    /// The daemon composes and delivers this kind's seed (PRD #1223 M7).
+    authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    /// The caller delivers this kind's seed itself; the daemon records it.
+    client_seeded_kind: Option<crate::authoring_seeds::AuthoringKind>,
+}
+
+impl StartKind {
+    fn daemon_seeded(kind: crate::authoring_seeds::AuthoringKind) -> Self {
+        Self {
+            authoring_kind: Some(kind),
+            client_seeded_kind: None,
+        }
+    }
 }
 
 impl Default for StartAgentOptions {
@@ -1566,6 +1634,7 @@ impl DaemonClient {
                     prompt_keys: None,
                     crashed: None,
                     orchestrator_context_path: None,
+                    authoring_kind: None,
                 })
                 .collect(),
             schedule_revision,
@@ -1611,7 +1680,8 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
-        self.send_start_agent(opts, None, false).await
+        self.send_start_agent(opts, StartKind::default(), false)
+            .await
     }
 
     /// Issue #1540 — [`Self::start_agent`] for a start submitted from a **New
@@ -1646,9 +1716,33 @@ impl DaemonClient {
         &self,
         opts: StartAgentOptions,
     ) -> Result<FormStart, ClientError> {
+        self.start_client_seeded_form_agent(opts, None).await
+    }
+
+    /// Issue #1496 — [`Self::start_form_agent`] for a form start whose agent
+    /// is an authoring agent the CALLER seeds itself (the TUI's `schedule`,
+    /// `schedule: issues` and `dispatcher` options): the start carries `kind`
+    /// as `client_seeded_kind`, so the daemon records it on the agent's
+    /// [`crate::agent_pty::AgentRecord::authoring_kind`] and every client can
+    /// say what kind of agent it is. `None` is [`Self::start_form_agent`].
+    ///
+    /// Not gated: an older daemon drops the field and starts the agent as an
+    /// ordinary one, recording no kind, which is what it did before.
+    pub async fn start_client_seeded_form_agent(
+        &self,
+        opts: StartAgentOptions,
+        kind: Option<crate::authoring_seeds::AuthoringKind>,
+    ) -> Result<FormStart, ClientError> {
         let keeper = LastCommandKeeper::from_capabilities(&self.capabilities().await?);
         let agent_id = self
-            .send_start_agent(opts, None, keeper == LastCommandKeeper::Daemon)
+            .send_start_agent(
+                opts,
+                StartKind {
+                    authoring_kind: None,
+                    client_seeded_kind: kind,
+                },
+                keeper == LastCommandKeeper::Daemon,
+            )
             .await?;
         Ok(FormStart {
             agent_id,
@@ -1671,7 +1765,11 @@ impl DaemonClient {
         }
         let keeper = LastCommandKeeper::from_capabilities(&capabilities);
         let agent_id = self
-            .send_start_agent(opts, Some(kind), keeper == LastCommandKeeper::Daemon)
+            .send_start_agent(
+                opts,
+                StartKind::daemon_seeded(kind),
+                keeper == LastCommandKeeper::Daemon,
+            )
             .await?;
         Ok(GatedQuery::Answered(FormStart {
             agent_id,
@@ -1776,20 +1874,24 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        self.send_start_agent(opts, Some(kind), false)
+        self.send_start_agent(opts, StartKind::daemon_seeded(kind), false)
             .await
             .map(GatedQuery::Answered)
     }
 
-    /// The one `start-agent` sender. `authoring_kind` is `Some` only from the
-    /// authoring starts, after their capability check, and `remember_command`
-    /// is `true` only from the form starts, after theirs.
+    /// The one `start-agent` sender. `kind.authoring_kind` is `Some` only from
+    /// the authoring starts, after their capability check, and
+    /// `remember_command` is `true` only from the form starts, after theirs.
     async fn send_start_agent(
         &self,
         opts: StartAgentOptions,
-        authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        kind: StartKind,
         remember_command: bool,
     ) -> Result<String, ClientError> {
+        let StartKind {
+            authoring_kind,
+            client_seeded_kind,
+        } = kind;
         let (mut rd, mut wr) = self.connect().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
@@ -1802,6 +1904,7 @@ impl DaemonClient {
             agent_type: opts.agent_type,
             seed: opts.seed,
             authoring_kind,
+            client_seeded_kind,
             remember_command,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
@@ -2842,6 +2945,21 @@ impl DaemonClient {
             tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut rd)).await;
         match read_result {
             Ok(Ok(Some((kind, _payload)))) if kind == KIND_SHUTDOWN_ACK => Ok(()),
+            // PRD #1487 (audit A1): a daemon that has committed to a restart
+            // refuses the stop with an error reply instead of acknowledging
+            // it, because it cannot stop instead. Report what it said.
+            Ok(Ok(Some((kind, payload)))) if kind == KIND_RESP => {
+                match serde_json::from_slice::<AttachResponse>(&payload) {
+                    Ok(resp) if !resp.ok => Err(ClientError::Server(
+                        resp.error
+                            .unwrap_or_else(|| "the daemon refused the stop".to_string()),
+                    )),
+                    _ => Err(ClientError::Server(format!(
+                        "expected KIND_SHUTDOWN_ACK (0x{KIND_SHUTDOWN_ACK:02x}), got a reply the \
+                         stop cannot be read from"
+                    ))),
+                }
+            }
             Ok(Ok(Some((kind, _)))) => Err(ClientError::Server(format!(
                 "expected KIND_SHUTDOWN_ACK (0x{:02x}), got kind 0x{:02x} — daemon may predate PROTOCOL_VERSION 2",
                 KIND_SHUTDOWN_ACK, kind
@@ -2856,6 +2974,147 @@ impl DaemonClient {
                     .to_string(),
             )),
         }
+    }
+
+    /// PRD #1487: ask the daemon to restart — onto the build installed at its
+    /// own path, or for this client to spawn its own build — under the daemon's
+    /// live-agent policy. **The only sender of
+    /// [`AttachRequest::RestartDaemon`]**; every production path reaches the
+    /// verb through here, so no call site carries its own capability check.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_RESTART_DAEMON`]**: answers
+    /// [`GatedQuery::Unsupported`] and sends nothing. The decision is taken from
+    /// THIS call's own `Hello` (as [`Self::start_authoring_agent`] does), never
+    /// from the cache — the whole point of the verb is that the daemon behind
+    /// the endpoint gets replaced, so a set captured earlier may describe a
+    /// different process.
+    ///
+    /// The whole call — the capability handshake and the restart round trip —
+    /// is bounded by one [`RESTART_REQUEST_TIMEOUT`] deadline, so a daemon that
+    /// accepts the connection and never answers `Hello` cannot hang an upgrade.
+    /// What a failure means depends on when it happened. Up to and including
+    /// the connection the frame goes out on, the request was not sent: those
+    /// failures are themselves (running out is [`ClientError::TimedOut`]).
+    /// From the first byte of the frame on, the daemon may have acted on it, so
+    /// a broken connection, a cut-off or unreadable reply, and running out are
+    /// all [`ClientError::Unanswered`]. An `ok = false` reply with no `restart`
+    /// field is [`GatedQuery::Unsupported`] when the daemon then holding the
+    /// endpoint does not advertise the capability — the endpoint changed to an
+    /// older daemon after the `Hello`, and it refused the frame unparsed — and
+    /// [`ClientError::Server`] otherwise. The cached capability set is dropped
+    /// after any answer, since an accepted restart replaces the daemon.
+    pub async fn restart_daemon(
+        &self,
+        req: RestartDaemonRequest,
+    ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, ClientError> {
+        self.restart_daemon_within(req, RESTART_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::restart_daemon`] under a caller-chosen deadline, so tests can
+    /// prove the bound without waiting out the production one.
+    async fn restart_daemon_within(
+        &self,
+        req: RestartDaemonRequest,
+        limit: std::time::Duration,
+    ) -> Result<GatedQuery<crate::daemon_protocol::RestartDaemonReply>, ClientError> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let capabilities = tokio::time::timeout_at(deadline, self.fresh_capabilities())
+            .await
+            .map_err(|_| ClientError::TimedOut(limit))??;
+        if !capabilities.supports(crate::daemon_protocol::CAP_RESTART_DAEMON) {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let frame = AttachRequest::RestartDaemon {
+            confirm: req.confirm,
+            expected_version: req.expected_version,
+            successor: req.successor,
+        };
+        let (mut rd, mut wr) = tokio::time::timeout_at(deadline, self.connect())
+            .await
+            .map_err(|_| ClientError::TimedOut(limit))??;
+        // From here on the daemon may act on the request whatever becomes of
+        // the reply, so no failure below says it did not.
+        let resp = match tokio::time::timeout_at(deadline, issue_command(&mut rd, &mut wr, &frame))
+            .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(ClientError::Unanswered(e.to_string())),
+            Err(_) => {
+                return Err(ClientError::Unanswered(format!(
+                    "no reply within {}s",
+                    limit.as_secs()
+                )));
+            }
+        };
+        self.invalidate_capabilities();
+        match resp.restart {
+            Some(reply) => Ok(GatedQuery::Answered(reply)),
+            None if !resp.ok => {
+                // A daemon with the verb answers every request it parsed with a
+                // `restart` field, so a bare refusal is either a daemon that
+                // could not parse the frame — one that replaced the capable
+                // daemon after the `Hello` above (Qodo 4200693865) — or a fault.
+                // The daemon reads one frame per connection, so the check and
+                // the frame cannot share one, and serde's `unknown variant`
+                // text is not a contract this client matches. Ask whoever holds
+                // the endpoint now instead: if it does not advertise the verb,
+                // the frame was refused unparsed and nothing acted on it, which
+                // is `Unsupported`, so the caller's older-daemon path applies.
+                let now = tokio::time::timeout_at(deadline, self.fresh_capabilities()).await;
+                if let Ok(Ok(now)) = now
+                    && !now.supports(crate::daemon_protocol::CAP_RESTART_DAEMON)
+                {
+                    return Ok(GatedQuery::Unsupported);
+                }
+                Err(ClientError::Server(
+                    resp.error.unwrap_or_else(|| "restart-daemon failed".into()),
+                ))
+            }
+            None => Err(ClientError::Malformed(
+                "restart-daemon ok but no restart reply".into(),
+            )),
+        }
+    }
+
+    /// PRD #1487: the running daemon's `Hello` reply, or `Ok(None)` when no
+    /// daemon is listening at this endpoint. **Never lazy-spawns** — a client
+    /// connect never does — so it is safe for "is one running, and which build"
+    /// questions before and after a restart. Unbounded; callers bound it.
+    ///
+    /// "Not running" is a connect that finds no endpoint or is refused; any
+    /// other transport failure, or an `ok = false` handshake, is `Err`.
+    pub async fn probe_running(&self) -> Result<Option<AttachResponse>, ClientError> {
+        let (mut rd, mut wr) = match self.connect().await {
+            Ok(halves) => halves,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "handshake failed while probing".into()),
+            ));
+        }
+        self.store_capabilities_from_hello(&resp);
+        Ok(Some(resp))
     }
 
     /// Issue #1049: stop the deck this client is pointed at, over the wire, with
@@ -5465,6 +5724,105 @@ start = true
         registry.close_agent(&id).unwrap();
     }
 
+    /// Issue #1496, against the real dispatch: an accepted authoring start
+    /// leaves its kind on the agent's record as `ListAgents` answers it —
+    /// whether the daemon seeds it (`authoring_kind`, the desktop's start) or
+    /// the client does (`client_seeded_kind`, the TUI's) — while an ordinary
+    /// start carries none, and a start naming both kinds is refused with
+    /// nothing started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_authoring_start_records_its_kind_on_the_agent() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let (_dir, path, registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let start = |pane: &str| StartAgentOptions {
+            command: Some("cat".into()),
+            cwd: Some("/tmp".into()),
+            env: vec![(crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+            ..StartAgentOptions::default()
+        };
+
+        let plain = client
+            .start_agent(start("plain-1496"))
+            .await
+            .expect("plain start");
+        let GatedQuery::Answered(daemon_seeded) = client
+            .start_authoring_agent(start("dispatcher-1496"), AuthoringKind::Dispatcher)
+            .await
+            .expect("authoring start")
+        else {
+            panic!("a daemon at this build advertises `authoring-kind`");
+        };
+        let client_seeded = client
+            .start_client_seeded_form_agent(
+                start("issues-1496"),
+                Some(AuthoringKind::ScheduleIssues),
+            )
+            .await
+            .expect("client-seeded form start")
+            .agent_id;
+        let unseeded_form = client
+            .start_client_seeded_form_agent(start("form-1496"), None)
+            .await
+            .expect("plain form start")
+            .agent_id;
+
+        let (mut rd, mut wr) = client.connect().await.expect("connect");
+        let both = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::StartAgent {
+                command: Some("cat".into()),
+                cwd: Some("/tmp".into()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                    "both-1496".into(),
+                )],
+                display_name: None,
+                tab_membership: None,
+                agent_type: None,
+                seed: None,
+                authoring_kind: Some(AuthoringKind::Schedule),
+                client_seeded_kind: Some(AuthoringKind::Schedule),
+                remember_command: false,
+            },
+        )
+        .await
+        .expect("the daemon answers");
+        assert!(!both.ok, "a start naming both kinds is refused");
+        assert!(
+            both.error
+                .as_deref()
+                .is_some_and(|error| error.contains("nothing was started")),
+            "{both:?}"
+        );
+
+        let kinds: std::collections::HashMap<String, Option<AuthoringKind>> = client
+            .list_agents()
+            .await
+            .expect("list agents")
+            .into_iter()
+            .map(|record| (record.id, record.authoring_kind))
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            4,
+            "the refused start started nothing: {kinds:?}"
+        );
+        assert_eq!(kinds[&plain], None);
+        assert_eq!(kinds[&unseeded_form], None);
+        assert_eq!(kinds[&daemon_seeded], Some(AuthoringKind::Dispatcher));
+        assert_eq!(kinds[&client_seeded], Some(AuthoringKind::ScheduleIssues));
+
+        for id in kinds.keys() {
+            registry.close_agent(id).unwrap();
+        }
+    }
+
     /// PRD #1223 audit A2, against the real dispatch: an authoring start whose
     /// `cwd` carries a control byte is refused before anything spawns, while a
     /// plain start with the very same `cwd` keeps today's behaviour and starts.
@@ -5877,6 +6235,325 @@ start = true
         );
     }
 
+    /// PRD #1487: a synthetic daemon that answers `hello` with `hello` and
+    /// counts every other frame by op, answering `restart-daemon` with an idle
+    /// `Accepted`. Returns the socket, the server task and the op log.
+    #[cfg(unix)]
+    async fn restart_fake_daemon(
+        hello: AttachResponse,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("restart-fake.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let ops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_ops = ops.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream).await.expect("read frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                let op = request["op"].as_str().unwrap_or_default().to_string();
+                server_ops.lock().unwrap().push(op.clone());
+                let response = if op == "hello" {
+                    hello.clone()
+                } else {
+                    let mut r = AttachResponse::ok();
+                    r.restart = Some(crate::daemon_protocol::RestartDaemonReply::Accepted {
+                        from_version: "0.0.1".into(),
+                        to_version: None,
+                        successor: crate::daemon_protocol::RestartSuccessor::ClientSpawns,
+                        stopping: Default::default(),
+                    });
+                    r
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write response");
+            }
+        });
+        (dir, path, server, ops)
+    }
+
+    /// PRD #1487: a daemon whose `Hello` does not name `restart-daemon` — one
+    /// advertising other verbs, and one advertising nothing at all — is sent no
+    /// restart frame; the helper answers `Unsupported`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_withholds_without_the_capability() {
+        for hello in [
+            hello_advertising(&[crate::daemon_protocol::CAP_STOP_DAEMON]),
+            AttachResponse::hello(PROTOCOL_VERSION),
+        ] {
+            let (dir, path, server, ops) = restart_fake_daemon(hello).await;
+            let client = DaemonClient::new(path);
+            let result = client
+                .restart_daemon(RestartDaemonRequest::default())
+                .await
+                .expect("a withheld request is an outcome, not an error");
+            server.await.unwrap();
+            drop(dir);
+            assert_eq!(result, GatedQuery::Unsupported);
+            assert_eq!(
+                *ops.lock().unwrap(),
+                vec!["hello".to_string()],
+                "only the handshake may reach a daemon without the capability"
+            );
+        }
+    }
+
+    /// PRD #1487: with the capability, the helper decides from its own fresh
+    /// `Hello` — a stale cached set saying otherwise does not stop it — sends the
+    /// frame, and returns the daemon's reply.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_sends_when_this_calls_hello_advertises_it() {
+        let (dir, path, server, ops) = restart_fake_daemon(hello_advertising(&[
+            crate::daemon_protocol::CAP_RESTART_DAEMON,
+        ]))
+        .await;
+        let client = DaemonClient::new(path);
+        // A cache captured from some earlier daemon that lacked the verb.
+        client.store_capabilities_from_hello(&AttachResponse::hello(PROTOCOL_VERSION));
+        let result = client
+            .restart_daemon(RestartDaemonRequest {
+                successor: crate::daemon_protocol::RestartSuccessor::ClientSpawns,
+                ..Default::default()
+            })
+            .await
+            .expect("restart round trip");
+        server.await.unwrap();
+        drop(dir);
+        assert!(matches!(
+            result,
+            GatedQuery::Answered(crate::daemon_protocol::RestartDaemonReply::Accepted { .. })
+        ));
+        assert_eq!(
+            *ops.lock().unwrap(),
+            vec!["hello".to_string(), "restart-daemon".to_string()]
+        );
+        assert!(
+            client.cached_capabilities().is_none(),
+            "an answered restart drops the cache, since the daemon is being replaced"
+        );
+    }
+
+    /// PRD #1487: a daemon that accepts the connection but never answers its
+    /// `Hello` cannot hang a restart — the capability handshake runs under the
+    /// same deadline as the restart exchange, and running out is `TimedOut`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_times_out_on_a_daemon_that_never_answers_hello() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("silent.sock");
+            let listener = bind_attach_listener(&path).expect("bind silent daemon");
+            (dir, path, listener)
+        };
+        // Accept and hold every connection, reading nothing and writing nothing.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok(stream) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = DaemonClient::new(path);
+        let limit = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.restart_daemon_within(RestartDaemonRequest::default(), limit),
+        )
+        .await
+        .expect("restart_daemon must not hang on a silent daemon");
+        server.abort();
+        drop(dir);
+        assert!(
+            matches!(result, Err(ClientError::TimedOut(d)) if d == limit),
+            "a silent handshake is a timeout, got {result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): once the restart frame has gone
+    /// out, the daemon may act on it whatever becomes of the reply. A daemon
+    /// that reads the frame and closes the connection, and one that reads it
+    /// and never answers, are both `Unanswered` — never a plain failure.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_is_unanswered_when_the_reply_is_lost_after_the_send() {
+        for hold in [false, true] {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("lossy.sock");
+                let listener = bind_attach_listener(&path).expect("bind lossy daemon");
+                (dir, path, listener)
+            };
+            let restart_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = restart_seen.clone();
+            let server = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    if request["op"] == "hello" {
+                        let hello =
+                            hello_advertising(&[crate::daemon_protocol::CAP_RESTART_DAEMON]);
+                        crate::daemon_protocol::write_resp(&mut stream, &hello)
+                            .await
+                            .expect("write hello");
+                        continue;
+                    }
+                    seen.store(true, Ordering::SeqCst);
+                    if hold {
+                        held.push(stream);
+                    }
+                }
+            });
+            let client = DaemonClient::new(path);
+            let limit = std::time::Duration::from_millis(500);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.restart_daemon_within(RestartDaemonRequest::default(), limit),
+            )
+            .await
+            .expect("restart_daemon must not hang");
+            server.abort();
+            drop(dir);
+            assert!(
+                restart_seen.load(Ordering::SeqCst),
+                "the frame reached the daemon"
+            );
+            assert!(
+                matches!(result, Err(ClientError::Unanswered(_))),
+                "hold={hold}: a lost reply after the send is unanswered, got {result:?}"
+            );
+        }
+    }
+
+    /// Scenario: the daemon that answers the first `Hello` advertises
+    /// `restart-daemon`, but by the time the frame arrives an older daemon holds
+    /// the endpoint: it refuses the frame as an unknown variant and its own
+    /// `Hello` names no such capability. The restart is `Unsupported`, so the
+    /// caller's older-daemon fallback applies. A daemon that still advertises the
+    /// verb after a bare refusal stays a plain failure (PRD #1487, Qodo
+    /// 4200693865).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_daemon_refused_unparsed_by_a_swapped_in_older_daemon_is_unsupported() {
+        for still_capable in [false, true] {
+            let (dir, path, listener) = {
+                let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("swapped.sock");
+                let listener = bind_attach_listener(&path).expect("bind swapped daemon");
+                (dir, path, listener)
+            };
+            let ops = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let server_ops = ops.clone();
+            let server = tokio::spawn(async move {
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let op = request["op"].as_str().unwrap_or_default().to_string();
+                    let hellos_before = server_ops
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|o| *o == "hello")
+                        .count();
+                    server_ops.lock().unwrap().push(op.clone());
+                    let response = if op == "hello" {
+                        if hellos_before == 0 || still_capable {
+                            hello_advertising(&[crate::daemon_protocol::CAP_RESTART_DAEMON])
+                        } else {
+                            hello_advertising(&[crate::daemon_protocol::CAP_STOP_DAEMON])
+                        }
+                    } else {
+                        AttachResponse::err("malformed request: unknown variant `restart-daemon`")
+                    };
+                    crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .expect("write response");
+                }
+            });
+            let client = DaemonClient::new(path);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.restart_daemon(RestartDaemonRequest::default()),
+            )
+            .await
+            .expect("restart_daemon must not hang");
+            server.abort();
+            drop(dir);
+            assert_eq!(
+                *ops.lock().unwrap(),
+                vec![
+                    "hello".to_string(),
+                    "restart-daemon".to_string(),
+                    "hello".to_string()
+                ],
+                "still_capable={still_capable}: the endpoint is re-probed after a bare refusal"
+            );
+            if still_capable {
+                assert!(
+                    matches!(result, Err(ClientError::Server(_))),
+                    "a daemon still advertising the verb refused it: a failure, got {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("an older daemon's refusal is an outcome"),
+                    GatedQuery::Unsupported
+                );
+            }
+        }
+    }
+
+    /// PRD #1487 review (Qodo 4200422524): with no daemon to connect to, the
+    /// request never went out, and the error says nothing about an unknown
+    /// outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_daemon_that_could_not_connect_is_not_unanswered() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = DaemonClient::new(dir.path().join("absent.sock"));
+        let result = client.restart_daemon(RestartDaemonRequest::default()).await;
+        assert!(
+            matches!(&result, Err(e) if !matches!(e, ClientError::Unanswered(_))),
+            "{result:?}"
+        );
+    }
+
+    /// PRD #1487: `probe_running` reports "nothing running" for an endpoint
+    /// with no listener, rather than an error — and never starts one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_running_reports_none_when_no_daemon_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.sock");
+        let client = DaemonClient::new(path.clone());
+        assert!(client.probe_running().await.unwrap().is_none());
+        assert!(!path.exists(), "a probe must not lazy-spawn a daemon");
+    }
+
     // -----------------------------------------------------------------------
     // PRD #819 M5: the client-side capability helper.
     //
@@ -6278,6 +6955,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -6343,6 +7021,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -6371,6 +7050,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(

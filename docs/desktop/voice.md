@@ -33,14 +33,14 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off |
-| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that) |
 
 Say a daemon's name the way you would say it. The app picks the daemon you meant from the ones the **Daemon** selector lists, even when the transcription spells it differently: "Select mini PC, demon" reaches a daemon named `minipc`, and "Switch to InMotionDeck" one named `inmotion`. The same goes for directories, Mode chips and orchestrations. With **Names** set to **Withheld**, say the name as the screen shows it.
 
-While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). The dashboard shows every daemon and agent whether voice is on or off, and you can scroll it by voice; see [Scrolling the dashboard](#scrolling-the-dashboard). In the New agent dialog and on the Daemons screen, a list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
+To open an agent, say "open", "show", "select", "go to" or "switch to" and name it the way you think of it; see [Naming an agent](#naming-an-agent). While voice is on, the agents, daemons, directories and modes on screen are numbered, and saying a number chooses one; see [Choosing by number](#choosing-by-number). The dashboard shows every daemon and agent whether voice is on or off, and you can scroll it by voice; see [Scrolling the dashboard](#scrolling-the-dashboard). In the New agent dialog and on the Daemons screen, a list too long for the window is shown a page at a time, so everything you can choose is on screen; see [Long lists are shown in pages](#long-lists-are-shown-in-pages). When what you said matches more than one thing on screen, the app lists the matches for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things).
 
 A command that names an agent, such as "stop the planner" or "close the review orchestration", runs nothing, and the app says why, if you switch daemons or that agent is replaced by a new one under the same name while the app is still working out what you said (which the app can tell only when the daemon reports when each agent started). Say it again to act on the agent that is there now.
 
@@ -49,6 +49,50 @@ A command that names an agent, such as "stop the planner" or "close the review o
 Nothing is typed or sent, and the app says why, if a confirmation is open, if the pane is showing another tab instead of the agent's terminal, or if the pane on screen is no longer the one you were looking at when you spoke — for example because you opened another agent while the app was still working out what you said. Once the words are typed, the send is called off, and the app says so, if before it happens you close the pane, open another screen or agent, switch daemons, or a confirmation opens: the words stay in the agent's prompt, unsent. It is also called off if the agent in the pane is replaced by a new one. Telling a replacement apart needs a daemon that reports when each agent started; with one that does not, the app cannot tell a replacement from the original agent.
 
 **While voice is on, the app keeps the computer from going to sleep from inactivity**, because speaking produces no keyboard or mouse input. The display can still turn off. On Linux this goes through systemd-logind; a desktop environment whose power manager ignores logind may still suspend.
+
+## Naming an agent
+
+You do not have to say an agent's exact name. Say what you know about it:
+
+| You can name it by | For example |
+| --- | --- |
+| Its name or role, as the screen shows it | "open tester", "show me the orchestrator" |
+| Its mode | "select dispatcher agent", "go to the dispatcher" |
+| Its agent type | "switch to the Codex agent", "open the OpenCode one" |
+| Its directory | "open the agent in billing" |
+| Its orchestration | "show the reviewer in the PRD 1487 orchestration" |
+| The daemon it is on | "open the Codex agent on the local daemon" |
+| What it was last asked to do | "show me the one fixing the scroll" |
+| When it started | "open the newest agent", "open the oldest one" |
+| What it is doing now | "show me the one that's stuck" |
+
+You can combine them, as in "the newest reviewer". A name the screen shows wins: "open tester" opens the agent called tester even if another agent runs in a mode called tester. A directory is named by its own name, not its full path.
+
+"Select", "go to" and "switch to" open an agent when you name an agent. When you name a daemon, as in "select the build box daemon", they switch which daemon the app shows instead.
+
+If what you said fits more than one agent, for example "open the Claude agent" with two Claude Code agents running, the app lists them for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things). "When it started" needs a daemon that reports when each agent started; if one of the agents you meant has no start time, the app lists them instead of guessing.
+
+Voice reaches the agents of the daemon the app shows. With **All daemons** selected, it reaches the agents on this machine; to name an agent on another daemon, switch to that daemon first, or say the agent's number on the dashboard (see [Choosing by number](#choosing-by-number)). Naming another daemon in a command for an agent, such as "the Codex agent on build box" while the agents voice can reach are on this machine, opens nothing, and the app says that no agent matches.
+
+## Filtering the dashboard
+
+To show only some agents on the [dashboard](dashboard.md#filter-the-dashboard), say which ones, from the dashboard or the Daemons screen:
+
+| You can filter by | For example |
+| --- | --- |
+| Kind | "show me all orchestration agents", "show only the dispatchers" |
+| Status | "show me all working agents", "show only agents waiting for input" |
+| Agent type | "show Codex agents" |
+| Daemon | "show the agents on build box" |
+| A name or other words | "filter by billing" |
+
+The app opens the dashboard with that filter set, exactly as if you had chosen it in the dashboard's filter, and says what it filtered by, for example *Filtering the agent dashboard. Status: Working.* A new filter replaces the one before it. A part the app did not catch is left out, and the app says so; when it catches none, the filter is left as it was.
+
+**Going back to everything is always one step.** Say "show everything", "show all agents", "clear the filter", "remove the filter" or "reset", from any screen: the filter is cleared and the whole dashboard is shown, opening it if you were somewhere else. With no filter set, "show everything" just opens the dashboard, as it always has. "Show the dashboard" opens the dashboard and keeps the filter as it is.
+
+Naming one agent still opens that agent: "open tester" and "see only the tester" open the tester's pane rather than filtering the dashboard.
+
+While the dashboard is filtered, the numbers count only the rows it shows, so "one" opens the first row on screen.
 
 ## Filtering directories
 
@@ -211,7 +255,7 @@ Keys are stored in your operating system's credential store (the macOS Keychain,
 - **To the Speech service:** your audio, the model name and the language (English). With the default local container, it stays on this machine. The OpenAI speech option also sends your Speech key.
 - **To the Commands service, for each utterance it decides:** the words it heard, the app's fixed instructions and answer format, the model name and token limit, and the app's list of commands (each command's id, description, parameter names and kinds, whether it can run on the current screen, and the hint shown when it cannot). When the endpoint is not on this machine, the request also carries your Commands API key.
 - **Decided on this machine, sending nothing:** an utterance that starts with the word "type", "write", "say" or "dictate" followed by words to type; one that is, in its entirety, "end", "send", "send it", "submit", "enter" or "press enter" (case, punctuation and a word such as "okay" or "please" before or after it ignored); while the New agent dialog is open, one that is in its entirety a way of closing it, such as "close", "cancel" or "close new agent"; in an agent's pane with typing mode off, one that is in its entirety an [interrupt, clear or scratch phrase](#interrupt-clear-and-scratch-that) other than a bare "stop", which is answered by asking you to say "typing on" first; while a [numbered list](#when-a-command-matches-several-things) is open, a number, a listed name or a way of cancelling it; while the lists on screen show [numbers](#choosing-by-number), a number on its own or after the list's name, such as "three" or "select directory 13"; and "type on" and "type off" themselves. While [typing mode](#typing-mode) is on, nothing you say is sent to the Commands service at all: it is typed into the agent or, for the few phrases that still work (interrupt, clear the prompt and scratch that among them), handled on this machine. Everything else goes to the Commands service, including other ways of saying submit such as "go ahead". Silence sends nothing.
-- **With Names shared**, each request also sends the names on screen: each agent on the selected daemon with its name, role, CLI name, status and running tool; each daemon's name, and for a remote daemon with no name its ssh user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. The app adds no filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path.
+- **With Names shared**, each request also sends the names on screen: each agent on the selected daemon with its name, role, CLI name, status and running tool, its mode, its agent type, the name of its directory (with the directory above it when two agents' directories share a name), its orchestration's title, and the order the agents started in; the name of the daemon those agents are on; each daemon's name, and for a remote daemon with no name its ssh user, host and any non-default port instead; while the New agent dialog shows a directory, up to 200 directory names from it and whether it has a parent; the dialog's Mode chips (including the project's orchestration names) and agent entries; and each orchestration's title and roles. The app adds no full filesystem path, id, prompt text or tool argument of its own, but a name is whatever it was set to, and can itself be a path. When you name an agent by what it was last asked to do, the app compares your words with that agent's prompt on this machine; the prompt itself is not sent.
 - **With Names withheld**, none of those names is sent, so the commands that name an agent, daemon, directory, mode, agent type or orchestration are unavailable. Your words are still sent as heard.
 
 The panel states the same thing beside the **Commands** setting.
@@ -227,6 +271,7 @@ What went wrong is shown beside the Voice button.
 | The credential store could not be reached | No keychain or Secret Service is available (for example a Linux session with no Secret Service provider), or it is locked. | Unlock it, or install and start a Secret Service provider such as GNOME Keyring; or use services on this machine, which need no key. |
 | A command is refused as not available here | It works on another screen. | Say "what can I say?" to see where each command works. |
 | Commands that name agents or directories never work | **Names** is set to **Withheld**. | Set it to **Shared**, or use the screen instead. |
+| "Open the agent on build box" opens nothing with **All daemons** selected | Voice reaches the agents of the daemon the app shows, and under **All daemons** that is this machine. | Switch to that daemon first, or say the agent's number on the dashboard. |
 | A command runs nothing and says the agent, daemon, screen or list changed | What it was about changed while the app was working out what you said, or after a numbered list appeared. | Say the command again. |
 | A spoken number chooses nothing and says the numbers on screen changed | The list changed while you were saying it. | Look at the new numbers and say it again. |
 | "no daemon matches …" | None of the configured daemons is called what was heard, for example a nickname. | Say the daemon's name as the **Daemon** selector shows it, or open the selector and say its number. |

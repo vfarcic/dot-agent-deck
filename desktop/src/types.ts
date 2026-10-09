@@ -24,6 +24,9 @@ export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped" | "blocked";
 
+/** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
+export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+
 /**
  * Issue #714: why an agent is `blocked` — the agent reported that its provider
  * refused it for an exhausted usage limit or credit pool. `detail` is the
@@ -214,7 +217,60 @@ export interface ConnectionView {
    */
   clientBuildVersion?: string;
   daemonBuildVersion?: string;
+  /**
+   * PRD #1487 D8 — whether to offer **Upgrade** for this deck, worked out by
+   * the desktop crate from the daemon's version (`daemon_upgrade::upgrade_offer`)
+   * so nothing here compares versions. Read it through `upgradeOffered`.
+   * Absent in fixture scenarios that do not play an older daemon.
+   */
+  upgradeOffer?: import("./lib/upgrade").UpgradeOffer;
+  /**
+   * Issue #1490 — why this deck is not connected, and the ONE control to offer
+   * for it, decided in Rust (`dot_agent_deck::daemon_start`): render
+   * **Start daemon** when `action` is `"start-daemon"` and **Reconnect** when it
+   * is `"reconnect"`, never both. Present on a live `"disconnected"` deck;
+   * absent otherwise, and in fixture scenarios that do not play one.
+   */
+  disconnectedReason?: DisconnectedReason;
 }
+
+/**
+ * Issue #1490 — why a deck the app is not connected to is not connected.
+ *
+ * - `"not-running"`: no daemon runs at the deck's socket → `action` is
+ *   `"start-daemon"`.
+ * - `"running-not-connected"`: a daemon runs there and the app is not
+ *   connected to it → `"reconnect"`.
+ * - `"unknown"`: the app cannot tell (the host is unreachable, ssh refused the
+ *   login, the deck is not installed there, or the first check has not
+ *   answered yet) → `"reconnect"`, and `message` says why.
+ *
+ * `message` is the sentence to show, `detail` the technical half for a
+ * disclosure, and `host` the machine the daemon runs on as the confirm dialog
+ * names it: `"this machine"` for a local deck, `user@host[:port]` for a remote
+ * one.
+ */
+export interface DisconnectedReason {
+  kind: "not-running" | "running-not-connected" | "unknown";
+  action: "start-daemon" | "reconnect";
+  message: string;
+  /** What kind of problem, when `kind` is `"unknown"`. */
+  failure?: StartDaemonFailure;
+  detail?: string;
+  host: string;
+}
+
+/** Issue #1490 — what stopped a start, or a check of whether a daemon runs. */
+export type StartDaemonFailure =
+  | "host-unreachable"
+  | "auth-failed"
+  | "host-key-not-trusted"
+  | "not-installed"
+  | "too-old"
+  | "did-not-answer"
+  | "start-failed"
+  | "check-failed"
+  | "not-checked-yet";
 
 /**
  * One project the DAEMON knows about (PRD #819 M6).
@@ -638,6 +694,13 @@ export interface AgentSession {
   /** HONEST. */
   status: AgentStatus;
   /**
+   * HONEST. The daemon's own status word, before `status` merges Working
+   * with Thinking and Idle with Waiting for input — which the dashboard
+   * filter keeps apart (issue #1496). Absent in fixture mode, whose agents
+   * have only `status`.
+   */
+  daemonStatus?: DaemonAgentStatus;
+  /**
    * HONEST — the daemon's `lastUserPrompt`, else a restatement of `activeTool`,
    * else a placeholder saying the daemon reported neither.
    *
@@ -745,6 +808,13 @@ export interface AgentSession {
    * rule and forks only the wording.
    */
   spawnedAtMs?: number;
+  /**
+   * HONEST. Issue #1496 — the authoring kind the daemon recorded for this
+   * agent (`AgentRecord.authoring_kind`): a dispatcher, a schedule or a
+   * schedule-issues agent, which is otherwise an ordinary dashboard pane.
+   * Absent for every other agent and from a daemon predating the field.
+   */
+  authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
   /** HONEST. */
@@ -925,9 +995,14 @@ export type DeckAction =
   | { type: "resume_run" }
   | { type: "approve_run" }
   | { type: "advance_fixture" }
-  | { type: "start_daemon" }
+  /**
+   * Start the daemon of deck `deckId` (issue #1490), on this machine or on a
+   * remote deck's host over ssh, then connect to it. Absent means the selected
+   * deck. Resolves once the deck is connected; rejects with the sentence to
+   * show otherwise.
+   */
+  | { type: "start_daemon"; deckId?: string }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "restart_daemon" }
   /**
    * Connect anyway (issue #801). `deckId` names the deck whose refusal the
    * user pressed it on (issue #1472); the crate connects to THAT deck and
@@ -1232,6 +1307,19 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /**
+   * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
+   * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the
+   * stages and the live-agent question for THIS run; the promise resolves with
+   * the outcome (including "kept running" and "failed while …", which are
+   * answers, not errors) and rejects only when the upgrade could not start.
+   *
+   * Optional, and absence is a real state: a render-only test runtime offers
+   * no upgrade rather than a button that does nothing.
+   */
+  upgradeDaemon?: (deckId: string, onEvent: (event: import("./lib/upgrade").UpgradeEvent) => void) => Promise<import("./lib/upgrade").UpgradeOutcome>;
+  /** Answer question `questionId` of the upgrade `upgradeId`. */
+  decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /**
    * Issue #1042 — the last NON-DELIVERED `SendResult` the guarded send verb
    * returned, per agent id. An agent with no entry has nothing unresolved.
