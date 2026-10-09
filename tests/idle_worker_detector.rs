@@ -310,7 +310,7 @@ impl IdleHarness {
         // PRD #140: the daemon's routing identity. `Instance` is what a current
         // client produces — two tabs of one orchestration in one directory are
         // told apart by this token, not by `(name, cwd)`.
-        let orchestration = OrchestrationIdentity::Instance {
+        let orchestration = OrchestrationIdentity {
             id: ORCHESTRATION_INSTANCE.to_string(),
             name: ORCHESTRATION.to_string(),
         };

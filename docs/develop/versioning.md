@@ -48,6 +48,20 @@ Detection is layered — there is deliberately **no** mechanical CI schema/snaps
    **The desktop's remote decks lean on this harder than anything else does.** For a deck reached over ssh the build stamp is not a refusal and never was under PRD #741 M8; since #801 it is not a refusal for a *local* deck either. `PROTOCOL_VERSION` still gates every connection exactly as it did, but for a *semantic* break this fragment, its `CONTRACT_BREAKS` entry, and the manual test below are the whole of what stands behind it.
 3. **A cross-version manual test** (see below) for any PR that touches the daemon, the protocol, orchestration, or hooks.
 
+## Which older clients are supported
+
+**Clients older than v0.35.0 are not supported against a current daemon** (maintainer decision, 2026-10-08, recorded on [#463](https://github.com/vfarcic/dot-agent-deck/issues/463)). v0.35.0 is the first release carrying PRD #140's per-tab orchestration token (`TabMembership::Orchestration.orchestration_id`), which every client built from this repository stamps on every orchestration role it starts: the TUI (`src/tab.rs`), the daemon's own spawn paths (`src/spawn.rs`) and the desktop (`desktop/src-tauri/src/lib.rs`).
+
+Until #463 the daemon kept a fallback for a client that sent no token: it routed that client's panes on the round-11 `(name, orchestration_cwd)` tuple, the `NameCwd` variant of the routing identity. That fallback is retired, and what replaced it is a refusal rather than a deletion. Deleting the variant alone would have left a token-less pane with no identity at all, which is one merged routing group rather than a clean failure; and the daemon does not act on `client_version`, so a check in the client would not stop an old TUI. So:
+
+- **The daemon refuses** an orchestration `StartAgent` (and `StartPreparedAgent`, which shares its handler) whose membership carries no `orchestration_id`, with an error prefixed `START_ERR_ORCHESTRATION_ID_REQUIRED` (`orchestration-id-required`) that names the v0.35.0 cut-off. Nothing is started. Test: `orchestration/identity/011`.
+- **The TUI places a token-less orchestration record on the dashboard** instead of rebuilding a tab for it, with one session warning naming the orchestration. Only a daemon from before #463 can hold such a record, since it accepted the start this daemon refuses.
+- **The routing identity is the token** (`OrchestrationIdentity { id, name }`), with no second variant.
+
+The wire is unchanged: `orchestration_id` stays an optional field, so this is a same-wire semantic break rather than a `PROTOCOL_VERSION` bump — `changelog.d/463.breaking.md` and the `CONTRACT_BREAKS` entry `463-orchestration-start-requires-instance-token`. A bump would have refused every current pairing at the connection to catch a request shape only a pre-v0.35.0 client sends, while the refusal catches exactly that request. Since v0.44.0 ([#405](https://github.com/vfarcic/dot-agent-deck/issues/405)) a current TUI already refuses a daemon on another attach protocol, so the old-daemon/new-client half of the pairing was closed before this.
+
+**What "supported" means here**, so the next cut-off is argued the same way: a supported older client is one whose requests a current daemon serves with its documented meaning. The cross-version check in rule 12 pairs a branch with the **previous release**, which is always inside the supported window; a pairing older than the window is not a test this repository owes. Moving the cut-off is a maintainer decision and is recorded in this section.
+
 ## The 0.x bump policy
 
 While the major version is `0`, the bump rules are deliberately shifted down one level from standard SemVer so the **minor digit tracks compatibility**, not features:

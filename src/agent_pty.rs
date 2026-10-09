@@ -592,9 +592,13 @@ pub enum TabMembership {
         /// instance token is what makes each tab its own routing group.
         ///
         /// `Option<String>` with `#[serde(default, skip_serializing_if)]` so
-        /// older peers round-trip cleanly: a client predating this field
-        /// sends nothing and the daemon falls back to the `(name, cwd)`
-        /// identity, exactly the pre-#140 behaviour.
+        /// the wire shape is unchanged for older peers. Issue #463: a daemon
+        /// no longer serves an orchestration start whose membership omits it
+        /// — such a client predates v0.35.0 and is no longer supported — and
+        /// refuses it with
+        /// [`crate::daemon_protocol::START_ERR_ORCHESTRATION_ID_REQUIRED`]
+        /// rather than falling back to the `(name, cwd)` identity, which
+        /// cannot tell two tabs of one orchestration in one directory apart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orchestration_id: Option<String>,
     },
@@ -6317,11 +6321,9 @@ pub struct OutstandingDelegation {
 /// PRD #126: the orchestration membership of the live agent on a pane, as
 /// [`AgentPtyRegistry::pane_orchestration`] reads it back out of the registry's
 /// `tab_membership`. Deliberately the raw membership fields rather than a
-/// [`crate::state::OrchestrationIdentity`]: the daemon folds
-/// `orchestration_cwd.or(StartAgent.cwd)` into that identity's `NameCwd` variant
-/// at `StartAgent` time, and re-deriving it here from the membership alone would
-/// invent a *different* cwd for the same pane and turn a healthy revalidation
-/// into a refusal. The comparison rules live in
+/// [`crate::state::OrchestrationIdentity`]: a membership may carry no token,
+/// which an identity cannot represent, and the comparison has to say what that
+/// means rather than have it decided here. The comparison rules live in
 /// [`crate::state::orchestration_still_matches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneOrchestration {
@@ -25520,11 +25522,11 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         // PRD #140: the record carries the daemon's routing identity, so the
         // fixture uses the same `Instance` token shape a current client stamps.
-        let orch = crate::state::OrchestrationIdentity::Instance {
+        let orch = crate::state::OrchestrationIdentity {
             id: "instance-1".to_string(),
             name: "orch".to_string(),
         };
-        let other_orch = crate::state::OrchestrationIdentity::Instance {
+        let other_orch = crate::state::OrchestrationIdentity {
             id: "instance-2".to_string(),
             name: "other".to_string(),
         };

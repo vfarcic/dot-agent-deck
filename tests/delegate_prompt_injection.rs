@@ -680,9 +680,9 @@ async fn wait_for_replacement_agent(
 
 #[cfg(unix)]
 fn register_orchestration(state: &mut AppState, cwd: &str) {
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd.to_string(),
     };
     state
         .pane_role_map
@@ -795,9 +795,9 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     // StartAgent path records for a live orchestration tab: an
     // orchestrator pane (the only valid delegate source) and a worker
     // pane in the SAME orchestration.
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
     let mut state = AppState::default();
     state

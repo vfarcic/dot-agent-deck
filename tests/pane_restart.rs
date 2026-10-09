@@ -100,7 +100,7 @@ async fn fixture(worker_command: &str) -> Fixture {
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -406,11 +406,11 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
 
     {
         let mut state = daemon.state.write().await;
-        let identity_a = OrchestrationIdentity::Instance {
+        let identity_a = OrchestrationIdentity {
             id: "restart-iso-instance-a".to_string(),
             name: ORCHESTRATION.to_string(),
         };
-        let identity_b = OrchestrationIdentity::Instance {
+        let identity_b = OrchestrationIdentity {
             id: "restart-iso-instance-b".to_string(),
             name: ORCHESTRATION.to_string(),
         };
@@ -1344,7 +1344,7 @@ async fn prepared_fixture(
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };

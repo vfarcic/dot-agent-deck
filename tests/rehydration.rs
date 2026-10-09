@@ -1263,6 +1263,9 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
     let client = DaemonClient::new(server.path.clone());
 
     let orchestration_name = "tdd-cycle";
+    // Issue #463: the daemon refuses an orchestration membership without its
+    // per-tab token, so every role carries the tab's one token.
+    const ORCHESTRATION_ID: &str = "orch-tdd-cycle-0";
     let cwd = server._dir.path().to_string_lossy().into_owned();
     let role_names = ["orchestrator", "coder", "reviewer", "auditor", "release"];
     let mut spawned_ids: Vec<String> = Vec::new();
@@ -1281,7 +1284,7 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
                     display_title: None,
-                    orchestration_id: None,
+                    orchestration_id: Some(ORCHESTRATION_ID.to_string()),
                 }),
                 ..Default::default()
             })
@@ -1349,13 +1352,13 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
             Some(h.agent_id.clone()),
         );
     }
-    // Token-less spawn above → the LEGACY `(name, cwd)` routing identity, which
-    // is what namespaces the synthetic dead-slot id (PRD #140 review).
-    let legacy_identity = OrchestrationIdentity::NameCwd {
+    // The tab's routing identity is what namespaces the synthetic dead-slot id
+    // (PRD #140 review).
+    let identity = OrchestrationIdentity {
+        id: ORCHESTRATION_ID.to_string(),
         name: orchestration_name.to_string(),
-        cwd: cwd.clone(),
     };
-    fill_dead_slots_with_placeholders(&mut role_pane_ids, &legacy_identity, &cwd, &mut state);
+    fill_dead_slots_with_placeholders(&mut role_pane_ids, &identity, &cwd, &mut state);
 
     // Every role slot is now filled.
     assert!(
@@ -1366,7 +1369,7 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
     let dead_id = role_pane_ids[4].as_deref().unwrap();
     assert_eq!(
         dead_id,
-        dead_slot_pane_id(&legacy_identity, 4),
+        dead_slot_pane_id(&identity, 4),
         "dead slot id must be the deterministic synthetic"
     );
     assert!(is_dead_slot_pane_id(dead_id));
@@ -1432,13 +1435,11 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
 /// Scenario: Spawn two orchestration tabs' worth of role agents
 /// (`orchestrator` + `coder` each) on a warm daemon with byte-identical
 /// orchestration `name` and `orchestration_cwd`, told apart only by their
-/// per-tab `orchestration_id`, plus a third token-less pair standing in for a
-/// pre-#140 client, then detach and reattach by hydrating a fresh controller.
-/// Asserts the reattach rebuilds the two tokened pairs as TWO distinct
+/// per-tab `orchestration_id`, then detach and reattach by hydrating a fresh
+/// controller. Asserts the reattach rebuilds the two pairs as TWO distinct
 /// orchestration tabs with disjoint role panes (each keeping its own routing
-/// group) while the token-less pair still merges into ONE tab, and that a dead
-/// role slot in each tokened tab mints its own placeholder card instead of the
-/// two tabs aliasing one.
+/// group), and that a dead role slot in each tab mints its own placeholder card
+/// instead of the two tabs aliasing one.
 #[spec("orchestration/route/002")]
 #[test]
 fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs() {
@@ -1458,26 +1459,18 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     let orchestration_name = "route-iso";
     let cwd = server._dir.path().to_string_lossy().into_owned();
     let role_names = ["orchestrator", "coder"];
-    // Tab A and Tab B carry distinct per-tab tokens; the third pair carries
-    // none, standing in for a client that predates PRD #140.
+    // Tab A and Tab B carry distinct per-tab tokens. Issue #463: there used to
+    // be a third, token-less pair standing in for a client that predates PRD
+    // #140; the daemon now refuses that start (`orchestration/identity/011`).
     //
     // Issue #555: the two tokened tabs carry distinct run TITLES, as the
     // `Ctrl+n` form's `<folder>-orchestrator-N` suggestion gives them. Two tabs
     // under one resolved title in one directory are two indistinguishable tab
     // labels, which the daemon now refuses; what this test is about is the
     // per-tab token, and the titles are no part of the identity it checks.
-    let tabs: [(&str, Option<&str>, Option<&str>); 3] = [
-        (
-            "a",
-            Some("orch-inst-aaaa1111"),
-            Some("route-iso-orchestrator-1"),
-        ),
-        (
-            "b",
-            Some("orch-inst-bbbb2222"),
-            Some("route-iso-orchestrator-2"),
-        ),
-        ("legacy", None, None),
+    let tabs: [(&str, &str, &str); 2] = [
+        ("a", "orch-inst-aaaa1111", "route-iso-orchestrator-1"),
+        ("b", "orch-inst-bbbb2222", "route-iso-orchestrator-2"),
     ];
 
     let mut spawned_ids: Vec<String> = Vec::new();
@@ -1498,8 +1491,8 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                         role_name: (*role_name).to_string(),
                         is_start_role: role_index == 0,
                         orchestration_cwd: Some(cwd.clone()),
-                        display_title: display_title.map(str::to_string),
-                        orchestration_id: orchestration_id.map(str::to_string),
+                        display_title: Some(display_title.to_string()),
+                        orchestration_id: Some(orchestration_id.to_string()),
                     }),
                     ..Default::default()
                 })
@@ -1522,8 +1515,8 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     };
     assert_eq!(
         hydrated.len(),
-        6,
-        "all six role panes across the three tabs should hydrate; got {hydrated:?}"
+        4,
+        "all four role panes across the two tabs should hydrate; got {hydrated:?}"
     );
 
     // The token survived the daemon echo + `validate_tab_membership` on every
@@ -1537,10 +1530,8 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         };
         let expected = if h.pane_id.starts_with("pane-a-") {
             Some("orch-inst-aaaa1111".to_string())
-        } else if h.pane_id.starts_with("pane-b-") {
-            Some("orch-inst-bbbb2222".to_string())
         } else {
-            None
+            Some("orch-inst-bbbb2222".to_string())
         };
         assert_eq!(
             *orchestration_id, expected,
@@ -1558,9 +1549,9 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     );
     assert_eq!(
         partition.orchestration_buckets.len(),
-        3,
+        2,
         "two tokened tabs must rebuild as TWO buckets (not one merged bucket of \
-         four panes) and the token-less pair as ONE; got {:?}",
+         four panes); got {:?}",
         partition
             .orchestration_buckets
             .iter()
@@ -1568,19 +1559,18 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
             .collect::<Vec<_>>()
     );
 
-    let bucket_for = |token: Option<&str>| {
+    let bucket_for = |token: &str| {
         partition
             .orchestration_buckets
             .iter()
-            .find(|b| b.orchestration_id.as_deref() == token)
+            .find(|b| b.orchestration_id == token)
             .unwrap_or_else(|| panic!("no bucket for orchestration_id {token:?}"))
     };
-    let bucket_a = bucket_for(Some("orch-inst-aaaa1111"));
-    let bucket_b = bucket_for(Some("orch-inst-bbbb2222"));
-    let bucket_legacy = bucket_for(None);
+    let bucket_a = bucket_for("orch-inst-aaaa1111");
+    let bucket_b = bucket_for("orch-inst-bbbb2222");
 
-    for (label, bucket) in [("A", bucket_a), ("B", bucket_b), ("legacy", bucket_legacy)] {
-        // Same name, same cwd across all three — the identity is doing the work,
+    for (label, bucket) in [("A", bucket_a), ("B", bucket_b)] {
+        // Same name, same cwd across both — the identity is doing the work,
         // not the tuple.
         assert_eq!(bucket.orchestration_name, orchestration_name);
         assert_eq!(bucket.cwd, cwd);
@@ -1617,28 +1607,12 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
             "pane-b-orchestrator".to_string()
         ]
     );
-    assert_eq!(
-        panes_of(bucket_legacy),
-        vec![
-            "pane-legacy-coder".to_string(),
-            "pane-legacy-orchestrator".to_string(),
-        ]
-    );
 
-    // The routing group each rebuilt tab retains: distinct for the two tokened
-    // tabs, the legacy `(name, cwd)` fallback for the token-less one.
+    // The routing group each rebuilt tab retains: distinct for the two tabs.
     assert_ne!(
         bucket_a.identity(),
         bucket_b.identity(),
         "the two tokened tabs must remain distinct routing groups after reattach"
-    );
-    assert_eq!(
-        bucket_legacy.identity(),
-        OrchestrationIdentity::NameCwd {
-            name: orchestration_name.to_string(),
-            cwd: cwd.clone(),
-        },
-        "a token-less bucket must fall back to the legacy (name, cwd) identity"
     );
 
     // ---- Rebuild the tabs, exactly as the hydration loop in `ui.rs` does.
@@ -1662,12 +1636,12 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
             )
             .expect("rebuilding an orchestration tab from its bucket should succeed");
     }
 
-    // Three orchestration tabs (plus the dashboard), each owning its own two
+    // Two orchestration tabs (plus the dashboard), each owning its own two
     // role panes and nothing else.
     let orchestration_tabs: Vec<&dot_agent_deck::tab::Tab> = tab_manager
         .tabs()
@@ -1676,16 +1650,14 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
         .collect();
     assert_eq!(
         orchestration_tabs.len(),
-        3,
-        "reattach must rebuild three distinct orchestration tabs"
+        2,
+        "reattach must rebuild two distinct orchestration tabs"
     );
     for pane_id in [
         "pane-a-orchestrator",
         "pane-a-coder",
         "pane-b-orchestrator",
         "pane-b-coder",
-        "pane-legacy-orchestrator",
-        "pane-legacy-coder",
     ] {
         let owning: Vec<usize> = tab_manager
             .tabs()
@@ -1741,18 +1713,6 @@ async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
     assert_eq!(
         placeholder_cards, 2,
         "each partitioned tab's dead role needs its OWN placeholder card"
-    );
-    // The legacy (token-less) identity keeps the pre-review byte format, so an
-    // older client's reconnect still reproduces the same id it always did.
-    assert_eq!(
-        dead_slot_pane_id(&bucket_legacy.identity(), 1),
-        dead_slot_pane_id(
-            &OrchestrationIdentity::NameCwd {
-                name: orchestration_name.to_string(),
-                cwd: cwd.clone(),
-            },
-            1
-        )
     );
 
     drop(tab_manager);
@@ -2089,7 +2049,7 @@ async fn dispatch_005_a_dispatched_orchestration_keeps_its_tab_label_across_reat
                 &bucket.cwd,
                 role_pane_ids,
                 bucket.display_title.as_deref(),
-                bucket.orchestration_id.as_deref(),
+                Some(bucket.orchestration_id.as_str()),
             )
             .expect("rebuilding an orchestration tab from its bucket should succeed");
         labels.push((
@@ -2289,7 +2249,7 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
                     display_title: Some(display_title.to_string()),
-                    orchestration_id: None,
+                    orchestration_id: Some("orch-test-0".to_string()),
                 }),
                 ..Default::default()
             })
