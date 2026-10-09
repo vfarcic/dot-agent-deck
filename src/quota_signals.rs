@@ -314,6 +314,9 @@ pub enum CodexLineOutcome {
     Nothing,
     /// The watched turn completed without an error; stop watching.
     TurnEnded,
+    /// PRD #1497 re-audit R3: the watched turn was interrupted (a
+    /// `turn_aborted` record); stop watching. It carries no reply.
+    TurnAborted,
     /// The watched turn ended on an error: `Blocked` for the provider's usage
     /// limit, `Error` for anything else (issue #1359).
     Failed {
@@ -360,7 +363,8 @@ struct CodexRateLimits {
 /// healthy sessions), any other `codex_error_info`, a `task_complete` for any
 /// other turn, and a line that is not JSON. Never an error: a `task_complete`
 /// whose `error` is absent or `null`, and every other record type — an
-/// interrupted turn is a `turn_aborted`, not a `task_complete`.
+/// interrupted turn is a `turn_aborted`, not a `task_complete`, and ends the
+/// watch as [`CodexLineOutcome::TurnAborted`] with no reply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexTurnWatch {
     turn_id: String,
@@ -427,6 +431,7 @@ impl CodexTurnWatch {
     /// what decides.
     pub fn line_is_candidate(line: &[u8]) -> bool {
         contains(line, b"\"task_complete\"")
+            || contains(line, b"\"turn_aborted\"")
             || contains(line, b"\"task_started\"")
             || contains(line, b"\"token_count\"")
     }
@@ -460,6 +465,9 @@ impl CodexTurnWatch {
                     self.rate_limits = Some(parse_codex_rate_limits(limits));
                 }
                 CodexLineOutcome::Nothing
+            }
+            Some("turn_aborted") if turn == Some(self.turn_id.as_str()) => {
+                CodexLineOutcome::TurnAborted
             }
             Some("task_complete") if turn == Some(self.turn_id.as_str()) => {
                 self.reply = extract_codex_turn_reply(&record);

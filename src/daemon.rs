@@ -2216,10 +2216,14 @@ fn publish_hook_turn_reply(
 /// it — but only a `Stop` whose hook `line` carried the turn's final reply
 /// ([`crate::turn_reply::reply_from_line`]). A `Stop` without one leaves the
 /// turn armed, so its `task_complete` is still read for the reply (PRD #1497
-/// re-audit R3) and disarms it then. A hook CLI older than PRD #1497 attaches
-/// no reply to any `Stop`, so under one every Codex turn is disarmed that way;
-/// `crate::codex_rollout_tail`'s module doc says what bounds a turn whose
-/// `task_complete` never comes. Only for an event whose pane and agent
+/// re-audit R3) and disarms it then, but it queues
+/// [`crate::codex_rollout_tail::ArmCommand::StoppedWithoutReply`], which retires
+/// the watch with nothing delivered if that record has not come within
+/// [`crate::codex_rollout_tail::DRAIN_AFTER_STOP`]. A hook CLI older than PRD
+/// #1497 attaches no reply to any `Stop`, so under one every Codex turn takes
+/// that path. A `Stop` that names no turn queues nothing.
+/// `crate::codex_rollout_tail`'s module doc lists every way a watch ends.
+/// Only for an event whose pane and agent
 /// name the pane's LIVE owner, so a payload can never make the daemon read a
 /// file on another pane's behalf. The file itself is opened and read by
 /// [`run_codex_rollout_monitor`], never here.
@@ -2248,13 +2252,18 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent, line
                 return;
             };
             // The rollout is the turn's only report of its reply when the
-            // `Stop` carried none (`crate::hook::extract_codex_hook_turn_reply`).
+            // `Stop` carried none (`crate::hook::extract_codex_hook_turn_reply`),
+            // so the watch stays armed, but only for the bounded drain.
             if crate::turn_reply::reply_from_line(line).is_none() {
-                return;
-            }
-            ArmCommand::Disarm {
-                agent_id: agent_id.to_string(),
-                turn_id,
+                ArmCommand::StoppedWithoutReply {
+                    agent_id: agent_id.to_string(),
+                    turn_id,
+                }
+            } else {
+                ArmCommand::Disarm {
+                    agent_id: agent_id.to_string(),
+                    turn_id,
+                }
             }
         }
         crate::event::EventType::SessionStart | crate::event::EventType::Thinking
@@ -5230,6 +5239,98 @@ mod hook_ingestion_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario (PRD #1497 re-audit R3): a Codex turn `t1` is armed and its
+    /// `Stop` arrives without a reply, but Codex never writes the turn's
+    /// `task_complete`. The `Stop` queues the bounded drain; once
+    /// `DRAIN_AFTER_STOP` has passed the next poll retires the watch, closes
+    /// the rollout and hands nothing, and a `task_complete` written later is
+    /// not read.
+    #[test]
+    fn codex_stop_without_a_reply_retires_the_watch_after_the_drain() {
+        use crate::codex_rollout_tail::{
+            ArmCommand, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
+            CodexRolloutTailers, DRAIN_AFTER_STOP,
+        };
+        use std::io::Write as _;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-drain".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T11-00-00-dr.jsonl");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&rollout)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        append("{\"type\":\"session_meta\"}\n");
+        let event = |event_type| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-drain".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                rollout.to_string_lossy().into_owned(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
+            event
+        };
+        let live = |pane: &str, agent: &str| registry.is_live_owner(pane, agent);
+        let mut tailers = CodexRolloutTailers::default();
+
+        queue_codex_rollout_arm(&registry, &event(crate::event::EventType::Thinking), "");
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle),
+            r#"{"event_type":"idle"}"#,
+        );
+        let queued = registry.codex_rollout_arms().drain();
+        assert!(
+            matches!(&queued[..], [ArmCommand::Arm(_), ArmCommand::StoppedWithoutReply { turn_id, .. }] if turn_id == "t1"),
+            "{queued:?}"
+        );
+        for command in queued {
+            tailers.apply(command);
+        }
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.is_armed(&owner), "the drain has only just begun");
+        assert!(tailers.holds_file(&owner));
+
+        let after_drain = std::time::Instant::now() + DRAIN_AFTER_STOP;
+        assert!(tailers.tick_at(after_drain, live).is_empty());
+        assert!(
+            !tailers.is_armed(&owner),
+            "no task_complete within the drain"
+        );
+        assert!(!tailers.holds_file(&owner), "the rollout is closed");
+        assert!(tailers.take_replies().is_empty());
+
+        append(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\",\"last_agent_message\":\"Too late.\"}}\n",
+        );
+        assert!(tailers.tick(live).is_empty());
+        assert!(
+            tailers.take_replies().is_empty(),
+            "the retired turn hands nothing"
+        );
+        registry.shutdown_all();
+    }
+
     /// Issue #1359 (Qodo on PR #1375): a poll that found turn `t1`'s failure
     /// can finish after Codex's next `UserPromptSubmit` has put the card on
     /// Thinking. That failure is stale and must not repaint the card. The hook
@@ -5452,7 +5553,9 @@ mod hook_ingestion_tests {
             .iter()
             .map(|c| match c {
                 ArmCommand::Arm(req) => (req.path.as_deref(), req.turn_id.as_deref()),
-                ArmCommand::Disarm { .. } => panic!("no Stop was sent: {c:?}"),
+                ArmCommand::Disarm { .. } | ArmCommand::StoppedWithoutReply { .. } => {
+                    panic!("no Stop was sent: {c:?}")
+                }
             })
             .collect();
         assert_eq!(

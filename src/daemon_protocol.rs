@@ -879,8 +879,10 @@ pub fn clamp_turn_reply(text: &str) -> &str {
 /// **An empty `text` is the report of a turn that ended with no reply to
 /// read** ([`Self::is_empty`]), sent by the same producer and on the same
 /// stream as a reply with text would have been, so a turn end is reported
-/// whether or not it has text to read (audit A2). A turn reported through two
-/// routes that both carry its [`Self::turn_id`] is delivered once.
+/// whether or not it has text to read (audit A2). A reply carrying the same
+/// [`Self::turn_id`] as the agent's last delivered turn is not delivered
+/// again; the daemon remembers only that last turn per agent, so an earlier
+/// turn reported again is delivered again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalReply {
     /// The agent's own id for the turn, when it reports one (Codex does;

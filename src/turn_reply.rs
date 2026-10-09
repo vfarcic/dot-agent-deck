@@ -11,10 +11,15 @@
 //! text is empty ([`crate::daemon_protocol::FinalReply::is_empty`]), from the
 //! same report that would have carried the text. So each turn end a producer
 //! reports is published as one frame, and a subscriber never has to guess from
-//! the agent's status and a timer whether a turn ended without a reply. A turn
-//! reported through two routes that both name its turn id is delivered once
-//! ([`TurnReplyHub::publish`]); a reply without a turn id is always delivered,
-//! and a subscriber that falls behind has its stream ended as lagged.
+//! the agent's status and a timer whether a turn ended without a reply. A
+//! reply naming the same turn id as the agent's last delivered turn is dropped
+//! ([`TurnReplyHub::publish`]), which keeps a Codex turn reported by both its
+//! `Stop` hook and its rollout to one frame when the two reports arrive back to
+//! back. Only that last turn is remembered, per agent and for the most recent
+//! [`MAX_REMEMBERED_TURNS`] agents, so a report naming an earlier turn, or
+//! coming from an agent forgotten past that bound, is delivered again. A reply
+//! without a turn id is always delivered, and a subscriber that falls behind
+//! has its stream ended as lagged.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -205,11 +210,13 @@ impl TurnReplyHub {
     }
 
     /// Publish `reply` as `agent_id`'s, in `pane_id`, and return its sequence
-    /// number — or `None` when `reply` names a turn already delivered for this
+    /// number — or `None` when `reply` names the turn last delivered for this
     /// agent (Codex reports a turn both through its `Stop` hook and in its
     /// rollout; whichever reaches here first is the turn's one frame, an empty
-    /// one included). The caller has already checked that `agent_id` is the
-    /// pane's live owner.
+    /// one included, as long as no other turn of the agent's was delivered in
+    /// between and the agent was not forgotten past [`MAX_REMEMBERED_TURNS`]).
+    /// The caller has already checked that `agent_id` is the pane's live
+    /// owner.
     pub fn publish(&self, agent_id: &str, pane_id: &str, reply: FinalReply) -> Option<u64> {
         if let Some(turn_id) = reply.turn_id.as_deref()
             && !self

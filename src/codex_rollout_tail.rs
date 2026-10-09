@@ -26,15 +26,27 @@
 //! * **Disarming.** On the watched turn's `task_complete` (with or without an
 //!   error), a Codex `Stop` naming that turn and carrying its final reply, or
 //!   a newer arm. A `Stop` without the reply leaves the turn armed, since its
-//!   `task_complete` is then the only report of the reply (PRD #1497), so the
-//!   file stays open until that record is read or the next arm. That is every
-//!   `Stop` a hook CLI older than PRD #1497 sends, since it attaches no reply,
-//!   so under such a hook each turn is disarmed by its `task_complete`. A turn
-//!   whose `task_complete` never comes (an interrupted turn writes
-//!   `turn_aborted`; a crashed Codex writes nothing) stays armed until the
-//!   agent's next arm, a new rollout path, or the agent's exit: there is one
-//!   tailer per agent and one watch per tailer, so an idle agent holds at most
-//!   one open rollout. Disarming closes the file and keeps only its path, so a
+//!   `task_complete` is then the only report of the reply (PRD #1497). That is
+//!   every `Stop` a hook CLI older than PRD #1497 sends, since it attaches no
+//!   reply, so under such a hook each turn is normally disarmed by its
+//!   `task_complete`. A watch whose `task_complete` does not come is retired,
+//!   delivering nothing (PRD #1497 re-audit R3), by whichever comes first of:
+//!   - the watched turn's `turn_aborted` record (an interrupted turn);
+//!   - [`DRAIN_AFTER_STOP`] after a reply-less `Stop` naming the watched turn
+//!     ([`ArmCommand::StoppedWithoutReply`]): the turn is no longer running,
+//!     so only its `task_complete` is still awaited. A turn with no `Stop` yet
+//!     is never timed out, however long it runs;
+//!   - the rollout's path no longer naming the file the watch holds open —
+//!     unlinked, or replaced by another file — noticed by the first tick
+//!     after it happens (Unix compares device and inode; elsewhere only a path
+//!     that no longer resolves is noticed, and a replaced one is left to the
+//!     other bounds);
+//!   - the agent's next arm, a new rollout path, or the agent's exit.
+//!
+//!   A turn that never reaches a `Stop` and writes no record (a Codex that
+//!   crashed mid-turn) is bounded by the last of these alone: there is one
+//!   tailer per agent and one watch per tailer, so an agent holds at most one
+//!   open rollout. Disarming closes the file and keeps only its path, so a
 //!   disarmed Codex pane holds no file descriptor; the next arm re-opens it,
 //!   validating it again. A tailer is dropped when its agent is no longer the
 //!   live owner of its pane, and the whole set when the daemon's monitor task
@@ -51,7 +63,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::quota_signals::{CodexLineOutcome, CodexTurnWatch, FailureOutcome};
 
@@ -88,6 +100,19 @@ pub fn admissible_turn_id(turn_id: &str) -> bool {
 
 /// How often the daemon polls its armed tailers.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a watch waits for its turn's `task_complete` after a reply-less
+/// `Stop` named that turn ([`ArmCommand::StoppedWithoutReply`]) before it is
+/// retired with nothing delivered (PRD #1497 re-audit R3).
+///
+/// Measured on the development machine on 2026-10-09 over 312 Codex turns
+/// whose `Stop` reached the daemon (`deck.log`'s `Received event … Idle`
+/// against the `task_complete` record's own `timestamp` in its rollout): the
+/// record was written a median of 3 ms after the daemon received the `Stop`,
+/// 1.7 s at the 99th percentile and 2.7 s at the most. Thirty seconds is about
+/// ten times that maximum, and fifteen [`POLL_INTERVAL`]s, so a slow flush or
+/// a backlog of up to 15 [`MAX_READ_PER_TICK`] reads still lands inside it.
+pub const DRAIN_AFTER_STOP: Duration = Duration::from_secs(30);
 
 /// The most one tailer reads in one tick.
 pub const MAX_READ_PER_TICK: u64 = 1024 * 1024;
@@ -126,6 +151,11 @@ pub enum ArmCommand {
     /// turn ended normally and its reply is reported. A watch for any other
     /// turn is left armed.
     Disarm { agent_id: String, turn_id: String },
+    /// A Codex `Stop` for `turn_id` that carried no reply: the turn has
+    /// stopped running, so its watch keeps waiting for the `task_complete`
+    /// only for [`DRAIN_AFTER_STOP`] (PRD #1497 re-audit R3). A watch for any
+    /// other turn is left as it is.
+    StoppedWithoutReply { agent_id: String, turn_id: String },
 }
 
 impl ArmCommand {
@@ -133,7 +163,10 @@ impl ArmCommand {
     /// counts.
     pub fn byte_len(&self) -> usize {
         match self {
-            ArmCommand::Disarm { agent_id, turn_id } => agent_id.len() + turn_id.len(),
+            ArmCommand::Disarm { agent_id, turn_id }
+            | ArmCommand::StoppedWithoutReply { agent_id, turn_id } => {
+                agent_id.len() + turn_id.len()
+            }
             ArmCommand::Arm(req) => {
                 req.pane_id.len()
                     + req.agent_id.len()
@@ -244,7 +277,7 @@ impl CodexRolloutArms {
                 ArmCommand::Arm(req) => {
                     req.agent_id == agent_id && req.turn_id.as_deref().is_some_and(|t| t != turn_id)
                 }
-                ArmCommand::Disarm { .. } => false,
+                ArmCommand::Disarm { .. } | ArmCommand::StoppedWithoutReply { .. } => false,
             })
     }
 
@@ -279,6 +312,10 @@ struct Tailer {
     watch: Option<CodexTurnWatch>,
     /// Start the next read [`BACK_WINDOW`] before the end of the file.
     rewind: bool,
+    /// When a reply-less `Stop` for the watched turn was applied — the start
+    /// of its [`DRAIN_AFTER_STOP`]. `None` while the turn has reached no such
+    /// `Stop`; reset with every new watch.
+    stopped_at: Option<Instant>,
 }
 
 /// Every Codex agent's tailer, keyed by the registry `agent_id` (so a respawn
@@ -309,6 +346,18 @@ impl CodexRolloutTailers {
                     tailer.open = None;
                 }
             }
+            ArmCommand::StoppedWithoutReply { agent_id, turn_id } => {
+                if let Some(tailer) = self.tailers.get_mut(&agent_id)
+                    && tailer
+                        .watch
+                        .as_ref()
+                        .is_some_and(|w| w.turn_id() == turn_id)
+                {
+                    // The first such Stop starts the drain; a repeat does not
+                    // extend it.
+                    tailer.stopped_at.get_or_insert_with(Instant::now);
+                }
+            }
             ArmCommand::Arm(req) => {
                 let existing = self
                     .tailers
@@ -328,6 +377,7 @@ impl CodexRolloutTailers {
                         open: None,
                         watch: None,
                         rewind: false,
+                        stopped_at: None,
                     },
                 };
                 let mut tailer = tailer;
@@ -335,6 +385,7 @@ impl CodexRolloutTailers {
                 if let Some(turn) = req.turn_id {
                     tailer.watch = Some(CodexTurnWatch::new(turn));
                     tailer.rewind = true;
+                    tailer.stopped_at = None;
                 }
                 self.tailers.insert(req.agent_id, tailer);
             }
@@ -354,6 +405,12 @@ impl CodexRolloutTailers {
             .is_some_and(|t| t.watch.is_some())
     }
 
+    /// Whether `agent_id`'s tailer holds its rollout open. For tests and
+    /// diagnostics.
+    pub fn holds_file(&self, agent_id: &str) -> bool {
+        self.tailers.get(agent_id).is_some_and(|t| t.open.is_some())
+    }
+
     /// Whether any tailer exists for `agent_id`. For tests and diagnostics.
     pub fn has_tailer(&self, agent_id: &str) -> bool {
         self.tailers.contains_key(agent_id)
@@ -361,9 +418,22 @@ impl CodexRolloutTailers {
 
     /// One poll: drop every tailer whose `(pane_id, agent_id)` is no longer a
     /// live owner, then read what each armed tailer's rollout has gained since
-    /// the last tick and return the failed turns found. Does file I/O; the
-    /// daemon runs it on a blocking thread, outside every lock of its own.
+    /// the last tick and return the failed turns found. A watch still armed
+    /// after its read is then retired if its rollout's path no longer names
+    /// the open file, or if its [`DRAIN_AFTER_STOP`] has run out. Does file
+    /// I/O; the daemon runs it on a blocking thread, outside every lock of its
+    /// own.
     pub fn tick(&mut self, is_live_owner: impl Fn(&str, &str) -> bool) -> Vec<CodexTurnFailure> {
+        self.tick_at(Instant::now(), is_live_owner)
+    }
+
+    /// [`Self::tick`] with `now` as the current time, which the drain after a
+    /// reply-less `Stop` is measured against.
+    pub fn tick_at(
+        &mut self,
+        now: Instant,
+        is_live_owner: impl Fn(&str, &str) -> bool,
+    ) -> Vec<CodexTurnFailure> {
         self.tailers
             .retain(|agent_id, tailer| is_live_owner(&tailer.pane_id, agent_id));
         let mut failures = Vec::new();
@@ -429,6 +499,33 @@ impl CodexRolloutTailers {
                     outcome,
                     message,
                 });
+            }
+            if tailer.watch.is_none() {
+                continue;
+            }
+            let retire = if tailer
+                .stopped_at
+                .is_some_and(|stopped| now.saturating_duration_since(stopped) >= DRAIN_AFTER_STOP)
+            {
+                Some("no task_complete within the drain after a reply-less Stop")
+            } else if tailer
+                .open
+                .as_ref()
+                .is_some_and(|open| !path_still_names(&tailer.path, &open.file))
+            {
+                Some("the rollout was unlinked or replaced")
+            } else {
+                None
+            };
+            if let Some(reason) = retire {
+                tracing::debug!(
+                    agent_id = %agent_id,
+                    reason,
+                    "codex rollout: retired a watch without a task_complete"
+                );
+                tailer.watch = None;
+                tailer.open = None;
+                tailer.stopped_at = None;
             }
         }
         failures
@@ -526,7 +623,7 @@ fn read_tailer(
         };
         match outcome {
             CodexLineOutcome::Nothing => {}
-            CodexLineOutcome::TurnEnded => ended = true,
+            CodexLineOutcome::TurnEnded | CodexLineOutcome::TurnAborted => ended = true,
             CodexLineOutcome::Failed { outcome, message } => {
                 found = Some((outcome, message));
                 ended = true;
@@ -548,6 +645,29 @@ fn read_tailer(
         tailer.open = None;
     }
     (found, reply)
+}
+
+/// Whether `path` still names `file`, the rollout a watch holds open: false
+/// once the file was unlinked (it has no links left) or the path resolves to
+/// nothing or, on Unix, to another file (device and inode differ). Elsewhere a
+/// path replaced by another file still answers true.
+fn path_still_names(path: &str, file: &File) -> bool {
+    let Ok(at_path) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(held) = file.metadata() else {
+            return false;
+        };
+        held.nlink() > 0 && held.dev() == at_path.dev() && held.ino() == at_path.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, at_path);
+        true
+    }
 }
 
 /// Validate and open the rollout at `path` — see the module doc's path-safety
@@ -1009,14 +1129,39 @@ mod tests {
         }
     }
 
-    /// PRD #1497: since a Codex `Stop` without a reply no longer disarms its
-    /// turn — and a hook CLI older than this release attaches a reply to no
-    /// `Stop` at all — a watch can outlive its turn when no `task_complete`
-    /// ever comes (an interrupted turn writes `turn_aborted`; a crash writes
-    /// nothing). What bounds it: one tailer per agent, one watch per tailer,
-    /// replaced by the agent's next arm or by a new rollout path, and dropped
-    /// with the agent. So an idle agent holds at most one open rollout, and
-    /// none once it exits.
+    fn stopped(agent: &str, turn: &str) -> ArmCommand {
+        ArmCommand::StoppedWithoutReply {
+            agent_id: agent.into(),
+            turn_id: turn.into(),
+        }
+    }
+
+    fn aborted(turn: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{t}","reason":"interrupted","started_at":1785699168,"completed_at":1785699173,"duration_ms":5090}}}}"#,
+                "\n"
+            ),
+            t = turn
+        )
+    }
+
+    fn completed(turn: &str, text: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"type":"event_msg","payload":{{"type":"task_complete","turn_id":"{t}","last_agent_message":"{m}"}}}}"#,
+                "\n"
+            ),
+            t = turn,
+            m = text
+        )
+    }
+
+    /// PRD #1497: one tailer per agent and one watch per tailer, replaced by
+    /// the agent's next arm or by a new rollout path, and dropped with the
+    /// agent. So turns that never write a record (a Codex that crashed
+    /// mid-turn) leave an agent holding at most one open rollout, and none
+    /// once it exits.
     #[test]
     fn a_watch_whose_task_complete_never_comes_is_bounded_per_agent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1026,26 +1171,12 @@ mod tests {
             |t: &CodexRolloutTailers| t.tailers.values().filter(|t| t.open.is_some()).count();
         let mut tailers = CodexRolloutTailers::default();
 
-        // An interrupted turn: no task_complete, so the watch stays armed.
-        tailers.apply(arm("s", &rollout, Some("turn-1")));
-        append(
-            &rollout,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}}"#,
-                "\n"
-            )
-            .as_bytes(),
-        );
-        assert!(tailers.tick(live).is_empty());
-        assert!(tailers.take_replies().is_empty());
-        assert!(tailers.is_armed("s"));
-        assert_eq!(open_files(&tailers), 1);
-
-        // Many more turns that never complete: still one tailer, one file.
-        for turn in 2..200 {
+        // Many turns that never complete: still one tailer, one file.
+        for turn in 1..200 {
             tailers.apply(arm("s", &rollout, Some(&format!("turn-{turn}"))));
             assert!(tailers.tick(live).is_empty());
         }
+        assert!(tailers.is_armed("s"));
         assert_eq!(tailers.tailers.len(), 1);
         assert_eq!(open_files(&tailers), 1);
 
@@ -1062,6 +1193,183 @@ mod tests {
         assert!(tailers.tick(|_, _| false).is_empty());
         assert!(!tailers.has_tailer("s"));
         assert_eq!(open_files(&tailers), 0);
+    }
+
+    /// PRD #1497 re-audit R3: after a reply-less `Stop` for the watched turn,
+    /// the watch waits [`DRAIN_AFTER_STOP`] for the turn's `task_complete` and
+    /// is then retired: the file is closed, and the turn's later
+    /// `task_complete` hands no reply and no failure. A repeated `Stop` does
+    /// not extend the drain, and a `Stop` for another turn does not start one.
+    #[test]
+    fn a_reply_less_stop_retires_the_watch_after_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T07-00-00-d.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("d", &rollout, Some("turn-1")));
+        assert!(tailers.tick(live).is_empty());
+
+        tailers.apply(stopped("d", "turn-other"));
+        assert!(
+            tailers.tailers["d"].stopped_at.is_none(),
+            "a Stop for another turn starts no drain"
+        );
+        let before = Instant::now();
+        tailers.apply(stopped("d", "turn-1"));
+        let started = tailers.tailers["d"].stopped_at.expect("the drain started");
+        assert!(started >= before);
+        tailers.apply(stopped("d", "turn-1"));
+        assert_eq!(
+            tailers.tailers["d"].stopped_at,
+            Some(started),
+            "a repeated Stop does not extend the drain"
+        );
+
+        assert!(
+            tailers
+                .tick_at(started + DRAIN_AFTER_STOP - Duration::from_secs(1), live)
+                .is_empty()
+        );
+        assert!(tailers.is_armed("d"), "still within the drain");
+        assert!(tailers.holds_file("d"));
+
+        assert!(tailers.tick_at(started + DRAIN_AFTER_STOP, live).is_empty());
+        assert!(!tailers.is_armed("d"), "the drain ran out");
+        assert!(!tailers.holds_file("d"), "and the file is closed");
+        assert!(tailers.take_replies().is_empty(), "nothing is delivered");
+
+        // The turn's task_complete arriving afterwards is not read.
+        append(&rollout, completed("turn-1", "Late.").as_bytes());
+        append(&rollout, failure_lines("turn-1").as_bytes());
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.take_replies().is_empty());
+        assert!(!tailers.holds_file("d"));
+
+        // A new watch starts with no drain, even after one ran out.
+        tailers.apply(arm("d", &rollout, Some("turn-2")));
+        assert!(tailers.tailers["d"].stopped_at.is_none());
+    }
+
+    /// PRD #1497 re-audit R3: a turn that has reached no `Stop` is still
+    /// running, and is never timed out however long it runs; its
+    /// `task_complete` still yields its reply once and disarms.
+    #[test]
+    fn a_turn_with_no_stop_is_never_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T08-00-00-n.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("n", &rollout, Some("turn-1")));
+        let now = Instant::now();
+        for days in [0u64, 1, 30, 365] {
+            let later = now + Duration::from_secs(days * 24 * 3600) + DRAIN_AFTER_STOP;
+            assert!(tailers.tick_at(later, live).is_empty());
+            assert!(tailers.is_armed("n"), "a running turn after {days} days");
+            assert!(tailers.holds_file("n"));
+        }
+
+        append(
+            &rollout,
+            completed("turn-1", "All 42 tests pass.").as_bytes(),
+        );
+        assert!(tailers.tick(live).is_empty());
+        let replies = tailers.take_replies();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].reply.text, "All 42 tests pass.");
+        assert!(!tailers.is_armed("n"));
+        assert!(!tailers.holds_file("n"));
+    }
+
+    /// PRD #1497 re-audit R3: an interrupted turn writes `turn_aborted`, not a
+    /// `task_complete`. That record, for the watched turn, retires the watch
+    /// and closes the file with nothing delivered — the hub announces no
+    /// interrupted turn — whether or not a reply-less `Stop` came first.
+    /// Another turn's `turn_aborted` leaves the watch armed.
+    #[test]
+    fn a_turn_aborted_record_disarms_and_closes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T09-00-00-a.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+
+        tailers.apply(arm("a", &rollout, Some("turn-1")));
+        assert!(tailers.tick(live).is_empty());
+        append(&rollout, aborted("turn-other").as_bytes());
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.is_armed("a"), "another turn's abort is not ours");
+
+        append(&rollout, aborted("turn-1").as_bytes());
+        assert!(tailers.tick(live).is_empty(), "an abort is no failure");
+        assert!(tailers.take_replies().is_empty(), "and hands no reply");
+        assert!(!tailers.is_armed("a"));
+        assert!(!tailers.holds_file("a"));
+
+        // After a reply-less Stop, likewise, well inside the drain.
+        tailers.apply(arm("a", &rollout, Some("turn-2")));
+        assert!(tailers.tick(live).is_empty());
+        tailers.apply(stopped("a", "turn-2"));
+        append(&rollout, aborted("turn-2").as_bytes());
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.take_replies().is_empty());
+        assert!(!tailers.is_armed("a"));
+        assert!(!tailers.holds_file("a"));
+    }
+
+    /// PRD #1497 re-audit R3: a watched rollout that is unlinked, or whose path
+    /// is replaced by another file, while its agent stays alive is closed by
+    /// the next tick rather than held — what the old file still had to say is
+    /// read first. The replacement is not read for the old watch.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlinked_or_replaced_rollout_is_closed_on_the_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Unlinked.
+        let rollout = dir.path().join("rollout-2026-10-09T10-00-00-u.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("u", &rollout, Some("turn-1")));
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.holds_file("u"));
+        std::fs::remove_file(&rollout).unwrap();
+        assert!(tailers.tick(live).is_empty());
+        assert!(!tailers.holds_file("u"), "an unlinked rollout is closed");
+        assert!(!tailers.is_armed("u"));
+        assert!(tailers.take_replies().is_empty());
+
+        // Replaced: the path now names another file, which carries the
+        // watched turn's completion; the old file is closed and the new one
+        // is not read for this watch.
+        let rollout = dir.path().join("rollout-2026-10-09T10-00-01-r.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("r", &rollout, Some("turn-1")));
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.holds_file("r"));
+        let replacement = dir.path().join("replacement.tmp");
+        append(
+            &replacement,
+            completed("turn-1", "From the new file.").as_bytes(),
+        );
+        std::fs::rename(&replacement, &rollout).unwrap();
+        assert!(tailers.tick(live).is_empty());
+        assert!(!tailers.holds_file("r"), "a replaced rollout is closed");
+        assert!(!tailers.is_armed("r"));
+        assert!(tailers.take_replies().is_empty());
+
+        // A completion the old file got before the swap is still read.
+        let rollout = dir.path().join("rollout-2026-10-09T10-00-02-k.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let mut tailers = CodexRolloutTailers::default();
+        tailers.apply(arm("k", &rollout, Some("turn-1")));
+        assert!(tailers.tick(live).is_empty());
+        append(&rollout, completed("turn-1", "Written before.").as_bytes());
+        std::fs::remove_file(&rollout).unwrap();
+        assert!(tailers.tick(live).is_empty());
+        let replies = tailers.take_replies();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].reply.text, "Written before.");
+        assert!(!tailers.holds_file("k"));
     }
 
     /// Issue #714 (audit A1): the arm queue is bounded by total bytes as well
