@@ -11,7 +11,7 @@ import {
 
 // These are existing daemon facts, including its distinct status values.
 // No fixture-only model, token, worktree or duration fields are involved.
-type FilterAgent = Pick<DesktopAgentDto, "id" | "displayName" | "tab" | "cwd" | "lastUserPrompt" | "status" | "agentType"> & { daemonId: string };
+type FilterAgent = Pick<DesktopAgentDto, "id" | "displayName" | "tab" | "cwd" | "lastUserPrompt" | "status" | "agentType" | "authoringKind"> & { daemonId: string };
 
 function agent(id: string, overrides: Partial<FilterAgent> = {}): FilterAgent {
   return {
@@ -121,6 +121,37 @@ describe("dashboard filter", () => {
     const before = structuredClone(active);
     expect(removeDashboardFilterFacet(active, facet)).toEqual({ ...active, [facet]: facet === "text" ? "" : [] });
     expect(active).toEqual(before);
+  });
+});
+
+describe("dashboard filter kinds follow what the daemon recorded", () => {
+  // What a current client's authoring agents look like on the wire: a plain
+  // dashboard pane, told apart only by the kind the daemon recorded when it
+  // accepted the start. The legacy `mode` tab only comes from an older TUI.
+  const fleet: FilterAgent[] = [
+    agent("dispatcher", { authoringKind: "dispatcher" }),
+    agent("schedule", { authoringKind: "schedule" }),
+    agent("issues", { authoringKind: "schedule-issues" }),
+    agent("legacy-dispatcher", { tab: { kind: "mode", name: "dispatcher" } }),
+    agent("role", { tab: { kind: "orchestration", name: "Release", roleName: "coder", roleIndex: 0, isStartRole: true, orchestrationId: "run-b" } }),
+    agent("plain"),
+  ];
+
+  /// Scenario: filter a fleet of dashboard panes the daemon recorded as a dispatcher, a schedule and a schedule-issues agent, beside a legacy dispatcher mode pane, an orchestration role and a plain agent. Each authoring kind shows its own agents, Single agents shows only the plain one, and Orchestration roles only the role.
+  it.each([
+    ["dispatcher", ["dispatcher", "legacy-dispatcher"]],
+    ["schedule", ["schedule"]],
+    ["schedule-issues", ["issues"]],
+    ["single", ["plain"]],
+    ["orchestration", ["role"]],
+  ] as const)("shows only the %s kind", (kind, expected) => {
+    expect(ids(filter({ kinds: [kind] }), fleet)).toEqual(expected);
+  });
+
+  /// Scenario: say "show only the dispatchers", which reaches the dashboard as a `filter_dashboard` dispatch with `kind` = `dispatcher`. The spoken filter shows the agent the daemon recorded as a dispatcher.
+  it("agrees for a voice kind param", () => {
+    const spoken = dashboardFilterFromParams([{ name: "kind", value: "dispatcher" }]);
+    expect(ids(spoken, fleet)).toEqual(["dispatcher", "legacy-dispatcher"]);
   });
 });
 

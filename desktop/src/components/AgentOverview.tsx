@@ -44,7 +44,7 @@ export type OverviewAgent = Pick<
   AgentSession,
   "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
   /* Issue #1496 — read by the dashboard filter, not rendered. */
-  | "agentType" | "daemonStatus"
+  | "agentType" | "daemonStatus" | "authoringKind"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -71,7 +71,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind } = agent;
   return {
     id,
     daemonId,
@@ -80,6 +80,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     status,
     agentType,
     daemonStatus,
+    authoringKind,
     cwd,
     activeTool,
     activeToolDetail,

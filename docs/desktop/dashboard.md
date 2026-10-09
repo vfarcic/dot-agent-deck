@@ -45,7 +45,9 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 To show only the agents you care about right now, use the filter at the top of the Dashboard:
 
 1. Type into **Filter agents** to show only agents whose name, orchestration role, orchestration, working directory or last prompt contains what you typed. Case does not matter.
-2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, or agents in the dispatcher, schedule or schedule: issues mode), **Status** (Working, Thinking, Waiting for input, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
+2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, dispatchers, schedule agents or schedule: issues agents), **Status** (Working, Thinking, Waiting for input, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
+
+Dispatchers, schedule agents and schedule: issues agents are the agents started with the **dispatcher**, **schedule** and **schedule: issues** modes of [New agent](new-agent.md), in the desktop app or the TUI. An agent started that way by an earlier release of the deck is listed under single agents.
 
 An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
 

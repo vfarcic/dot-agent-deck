@@ -24,9 +24,10 @@ export interface DashboardFilter {
 }
 
 /**
- * What kind of agent a row is: an orchestration role, a single agent (one on
- * the dashboard tab), or one of three modes, named by the mode tab it is on.
- * `schedule-issues` is the `schedule: issues` tab, which `schedule` is not.
+ * What kind of agent a row is: an orchestration role, one of the three
+ * authoring kinds (dispatcher, schedule, schedule-issues), or a single agent.
+ * The authoring kinds share their ids with the daemon's
+ * `AgentRecord.authoring_kind`; `schedule-issues` is not `schedule`.
  */
 export type DashboardKind = "orchestration" | "single" | "dispatcher" | "schedule" | "schedule-issues";
 
@@ -41,7 +42,7 @@ export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "id
 export type DashboardFilterFacet = keyof DashboardFilter;
 
 /** The facts an agent is filtered on, in the daemon's vocabulary. */
-export type DashboardFilterFacts = Pick<DesktopAgentDto, "id" | "displayName" | "cwd" | "lastUserPrompt"> & {
+export type DashboardFilterFacts = Pick<DesktopAgentDto, "id" | "displayName" | "cwd" | "lastUserPrompt" | "authoringKind"> & {
   tab: AgentTab;
   daemonId: string;
   status?: DesktopAgentDto["status"];
@@ -89,11 +90,23 @@ export function removeDashboardFilterFacet(filter: DashboardFilter, facet: Dashb
   return { ...filter, [facet]: facet === "text" ? "" : [] };
 }
 
-function kindOf(tab: AgentTab): DashboardKind | undefined {
+/**
+ * The kind of `agent`, from the facts in order: an orchestration role; else the
+ * authoring kind the daemon recorded when it accepted the start, which is how
+ * a dispatcher or schedule agent started by any current client arrives — an
+ * ordinary dashboard pane; else the name of a legacy mode tab, which only an
+ * older TUI sends; else a single agent.
+ */
+function kindOf(agent: DashboardFilterFacts): DashboardKind | undefined {
+  const tab = agent.tab;
   if (tab.kind === "orchestration") return "orchestration";
-  if (tab.kind === "dashboard") return "single";
-  const mode = normalize(tab.name);
-  return DASHBOARD_KINDS.find((kind) => kind.mode === mode)?.id;
+  const authoring = DASHBOARD_KINDS.find((kind) => kind.id === agent.authoringKind);
+  if (authoring) return authoring.id;
+  if (tab.kind === "mode") {
+    const mode = normalize(tab.name);
+    return DASHBOARD_KINDS.find((kind) => kind.mode === mode)?.id;
+  }
+  return "single";
 }
 
 /** The filter status for each status column, for a daemon word the filter does not offer by name. */
@@ -137,7 +150,7 @@ function searchable(agent: DashboardFilterFacts): string[] {
 /** Whether `agent` matches every active facet of `filter`. */
 export function matchesDashboardFilter(agent: DashboardFilterFacts, filter: DashboardFilter): boolean {
   if (filter.kinds.length) {
-    const kind = kindOf(agent.tab);
+    const kind = kindOf(agent);
     if (!kind || !filter.kinds.includes(kind)) return false;
   }
   if (filter.statuses.length) {

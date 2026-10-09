@@ -1,5 +1,5 @@
 import type { VoiceCommandDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
-import type { AgentProfile, AgentSession, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
 
@@ -471,6 +471,8 @@ export interface FixtureStartedAgent {
   cwd?: string;
   rows?: number;
   cols?: number;
+  /** Issue #1496: recorded on the agent, as the live daemon records it. */
+  authoringKind?: AuthoringKind;
 }
 
 /**
@@ -504,6 +506,7 @@ export function createFixtureStartedAgent(started: FixtureStartedAgent): AgentSe
     worktree: "Unavailable",
     writeLease: "unknown",
     spawnedAtMs: Date.now(),
+    ...(started.authoringKind ? { authoringKind: started.authoringKind } : {}),
     rows: started.rows ?? 24,
     cols: started.cols ?? 80,
     toolCount: 0,

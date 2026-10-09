@@ -808,6 +808,13 @@ export interface AgentSession {
    * rule and forks only the wording.
    */
   spawnedAtMs?: number;
+  /**
+   * HONEST. Issue #1496 — the authoring kind the daemon recorded for this
+   * agent (`AgentRecord.authoring_kind`): a dispatcher, a schedule or a
+   * schedule-issues agent, which is otherwise an ordinary dashboard pane.
+   * Absent for every other agent and from a daemon predating the field.
+   */
+  authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
   /** HONEST. */

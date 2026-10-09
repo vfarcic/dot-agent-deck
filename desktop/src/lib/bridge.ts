@@ -16,6 +16,7 @@ import { answerNumberLocally, type VoiceNumberAnswerDto, type VoiceNumberedListD
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBlocked,
+  AuthoringKind,
   AgentSession,
   AgentTarget,
   AgentStatus,
@@ -307,6 +308,13 @@ export interface DesktopAgentDto {
    * checks rather than trusts.
    */
   spawnedAtMs?: number;
+  /**
+   * Issue #1496: the authoring kind the daemon recorded for this agent when it
+   * accepted the start — a dispatcher, a schedule or a schedule-issues agent —
+   * whichever client started it. Absent for every other agent and from a
+   * daemon predating the field, whose authoring agents read as single agents.
+   */
+  authoringKind?: AuthoringKind;
   /**
    * Issue #714: why the agent is `blocked` — present only beside
    * `status: "blocked"`. `detail` is the agent's own error message, scrubbed by
@@ -2133,6 +2141,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     lastUserPrompt: agent.lastUserPrompt,
     lastActivityMs: agent.lastActivityMs,
     spawnedAtMs: agent.spawnedAtMs,
+    authoringKind: agent.authoringKind,
     ...(status === "blocked" && agent.blocked ? { blocked: blockedFromDto(agent.blocked) } : {}),
     rows: agent.rows,
     cols: agent.cols,
@@ -2597,6 +2606,7 @@ class FixtureDeckBridge implements DeckBridge {
         cwd: action.cwd,
         rows: action.rows,
         cols: action.cols,
+        authoringKind: action.authoringKind,
       }),
     ];
     // PRD #1223 M4: the live crate's rule — recorded once the deck accepted the

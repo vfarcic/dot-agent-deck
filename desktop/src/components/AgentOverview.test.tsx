@@ -40,7 +40,8 @@ import { DeckShell, DeckSurface } from "../App";
 import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
-import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
+import { filterDashboardAgents } from "../lib/dashboardFilter";
 import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
@@ -1509,6 +1510,22 @@ describe("AgentOverview", () => {
     const { container } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: "unknown", tab: { kind: "dashboard" } }) });
     expect(document.querySelector(".overview-lease")).toBeNull();
     expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toContain("unknown");
+  });
+
+  /**
+   * Scenario (issue #1496): a dispatcher started by a current client arrives
+   * as an ordinary dashboard pane carrying the authoring kind the daemon
+   * recorded. The dashboard row keeps that kind, so the Dispatchers filter
+   * shows it and Single agents does not.
+   */
+  it("keeps the daemon's authoring kind on the row the dashboard filter reads", () => {
+    const [agent] = createFixtureSnapshot("crowded").agents;
+    const dispatcher = toOverviewAgent({ ...(agent as AgentSession), tab: { kind: "dashboard" }, authoringKind: "dispatcher" });
+    expect(dispatcher.authoringKind).toBe("dispatcher");
+    const only = (kind: "dispatcher" | "single") =>
+      filterDashboardAgents([dispatcher], { kinds: [kind], statuses: [], agentTypes: [], daemonIds: [], text: "" }, overviewFilterFacts);
+    expect(only("dispatcher")).toEqual([dispatcher]);
+    expect(only("single")).toEqual([]);
   });
 
   /**
