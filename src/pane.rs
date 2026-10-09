@@ -379,6 +379,12 @@ pub struct AgentSpawnOptions<'a> {
     /// every other start — orchestration roles, restores and anything else —
     /// so none of them ever becomes the deck's last command.
     pub remember_command: bool,
+    /// Issue #1496: the authoring kind of a New agent form start whose seed
+    /// the TUI delivers itself (a `schedule`, `schedule: issues` or
+    /// `dispatcher` card), so the daemon records it on the agent. Read only
+    /// with `remember_command`, the form start it belongs to; `None` for every
+    /// other start.
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -394,6 +400,7 @@ impl Default for AgentSpawnOptions<'_> {
             agent_type: None,
             seed: None,
             remember_command: false,
+            authoring_kind: None,
         }
     }
 }

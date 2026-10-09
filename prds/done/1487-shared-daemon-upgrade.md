@@ -1,6 +1,6 @@
 # PRD #1487: Upgrade daemons from any client with one shared implementation
 
-**Status**: Draft — not started
+**Status**: Complete
 **Priority**: Medium
 **Created**: 2026-10-02
 **Issue**: [#1487](https://github.com/vfarcic/dot-agent-deck/issues/1487)
@@ -55,15 +55,45 @@ Split the procedure by who owns each half, and join the halves in one shared fun
 - **D4 — Never strand the user** (carried from PRD #161's D4). A failed install or a refused restart leaves the user connected to the daemon they had, with the reason on screen.
 - **D5 — The restart policy for live agents is the daemon's** and is decided in M1 (Open Question 1). Whatever it is, the daemon names every agent and orchestration role a restart would stop before stopping any, and never discards orchestration role maps silently (rule 15).
 
+## M1 decisions (maintainer, 2026-10-02)
+
+- **D6 — The upgrade combines `remote upgrade` and `connect` (OQ1).** Today the two halves exist in two commands: `remote upgrade` installs only (binary + hooks + `remotes.toml`), and `connect` offers that install (`Upgrade and connect? [y/N]`) and then, on attach, the build-version handshake restarts an idle daemon silently or lists the live agents and asks (`s` restarts and stops them, any other key keeps the current daemon). The shared function is exactly that combination, and it keeps `connect`'s existing policy rather than inventing one:
+  - **Install** as `remote upgrade` does.
+  - **No live agents or roles:** restart onto the new build without asking.
+  - **Live agents or orchestration roles:** the daemon names every agent and role a restart would stop; the user chooses **Restart now** (stops exactly those) or **Keep current daemon** (new binary installed, old daemon still running, and the client says so). Orchestration roles follow the same choice — named, never silent — rather than a hard refusal.
+  - **No one to answer** (CLI without a TTY): install and keep the current daemon, as `connect` does non-interactively today.
+  - What moves is only the mechanism: the restart becomes a capability-gated daemon request (D3) instead of the remote TUI terminating the daemon from outside, so a client with no remote TUI (the desktop) can trigger it. The "Restart now" choice is sent with the named set, and the daemon refuses again if the set it holds no longer matches.
+- **D7 — One result type (OQ2).** One serde-serializable outcome type in the root crate — restarted (from → to); installed but not restarted (with the agents/roles that blocked it, or that the user kept it); installed, but the daemon is too old to restart itself; failed (stage + plain-language reason) — plus stage progress events (installing, restarting, verifying). The CLI prints it, the TUI and desktop render it.
+- **D8 — When the action is offered.** Only when the daemon's version is **older** than the client's — the same newer-only rule `connect` uses (`laptop_is_newer`). Hidden when the versions are equal (a differing build stamp at the same release is not a mismatch), when the daemon is newer than the client (the card may say so; upgrading the app is out of scope), and when the daemon's version is unknown.
+- **D9 — Surfaces (OQ3).** Desktop: an **Upgrade** action on a remote daemon's card on the Dashboard and the Daemons screen, and in the version-mismatch banner in place of a dead end. CLI: `remote upgrade` gains D6's restart offer as a terminal prompt. TUI: the `connect` prompt only, rebuilt on the shared function — the TUI has no other per-remote daemon view to put an action in, so the prompt is the parity surface (rule 22). "Upgrade all" is a follow-up issue, not this PRD.
+- **D10 — Local Replace daemon (OQ4).** Moves onto the same shared path, so it gains the same live-agent policy.
+- **D11 — Version (OQ5).** Always the client's own version, as `connect` does. No "latest release" offer.
+- **D12 — Experimental flag (rule 9).** No. The action ships visible by default: it replaces the refusal-plus-**Connect anyway** dead end users hit on every release with a breaking fragment.
+
 ## Milestones
 
-- [ ] **M1 — Decisions recorded.** Open Questions 1–4 answered with the maintainer and written into this document: the restart policy for live agents, the result shape, the desktop and TUI surfaces, and whether the local Replace daemon joins the shared path. The rule 9 experimental-flag answer for the new desktop surface recorded.
-- [ ] **M2 — The daemon restart request.** Capability-gated request on the daemon that restarts into its newly installed binary under the M1 policy, with its structured answer; client-library helper that checks the capability before sending. Rule 12 answered explicitly and the cross-version check run (`cargo xver`, both directions).
-- [ ] **M3 — The shared orchestrating function.** Install → restart request → structured result, covering both install methods and the too-old-daemon fallback; unit tests over a fake SSH executor and a fake daemon for every outcome.
-- [ ] **M4 — CLI and TUI on the shared function.** `remote upgrade` and `connect`'s upgrade prompt both call it; the binary-swap-only contract in `src/connect.rs` is replaced by the new one; TUI parity per rule 22 delivered or its absence justified in this document.
-- [ ] **M5 — Desktop Upgrade action.** The action on a remote daemon's card, progress, outcome, live-agent choice and plain-language failures (rule 21), every button doing something visible (the #1472 lesson); vitest and Playwright coverage.
-- [ ] **M6 — End-to-end coverage.** A PTY-attached L2 test that upgrades a daemon and sees it restarted on the new build, a test with live agents exercising the M1 policy, and a test against an older daemon without the capability (rule 4).
-- [ ] **M7 — Docs.** User docs for both clients (rules 21 and 22, the docs-screenshots-review skill, screenshots of the desktop action) and developer docs for the request and the shared function; changelog fragments as users see the change (rule 19).
+- [x] **M1 — Decisions recorded.** Open Questions 1–4 answered with the maintainer and written into this document: the restart policy for live agents, the result shape, the desktop and TUI surfaces, and whether the local Replace daemon joins the shared path. The rule 9 experimental-flag answer for the new desktop surface recorded.
+- [x] **M2 — The daemon restart request.** Capability-gated request on the daemon that restarts into its newly installed binary under the M1 policy, with its structured answer; client-library helper that checks the capability before sending. Rule 12 answered explicitly and the cross-version check run (`cargo xver`, both directions). **Done:** capability-gated `restart-daemon`, sent only by `DaemonClient::restart_daemon`; no `PROTOCOL_VERSION` bump; `cargo xver` forward and reverse pass.
+- [x] **M3 — The shared orchestrating function.** Install → restart request → structured result, covering both install methods and the too-old-daemon fallback; unit tests over a fake SSH executor and a fake daemon for every outcome. **Done:** one orchestrating function covering both install methods and the too-old-daemon fallback, tested over a fake SSH executor and a fake daemon.
+- [x] **M4 — CLI and TUI on the shared function.** `remote upgrade` and `connect`'s upgrade prompt both call it; the binary-swap-only contract in `src/connect.rs` is replaced by the new one; TUI parity per rule 22 delivered or its absence justified in this document. **Done:** `remote upgrade` and `connect` call the shared function; the binary-swap-only contract is replaced.
+- [x] **M5 — Desktop Upgrade action.** The action on a remote daemon's card, progress, outcome, live-agent choice and plain-language failures (rule 21), every button doing something visible (the #1472 lesson); vitest and Playwright coverage. **Done:** Upgrade action on cards, the Daemons screen and the mismatch banner; vitest and Playwright `upgrade.spec.ts`.
+- [x] **M6 — End-to-end coverage.** A PTY-attached L2 test that upgrades a daemon and sees it restarted on the new build, a test with live agents exercising the M1 policy, and a test against an older daemon without the capability (rule 4). **Done:** lane-1 files plus the real-Haiku lane-2 test `remote/upgrade/008`.
+- [x] **M7 — Docs.** User docs for both clients (rules 21 and 22, the docs-screenshots-review skill, screenshots of the desktop action) and developer docs for the request and the shared function; changelog fragments as users see the change (rule 19). **Done:** user docs for both clients and developer docs; changelog fragments `1487.feature.md` and `1487.bugfix.md`.
+
+## Delivered
+
+All of M1–M7 shipped in one PR. `remote upgrade` installs the matching build on a remote and restarts its daemon; `connect` uses the same function; the desktop has an Upgrade action on daemon cards, the Daemons screen and the mismatch banner; and the local **Replace daemon** goes through the same path. A hook-config fix was folded in at the maintainer's request after a test run polluted the operator's real `~/.codex/hooks.json`: test-write containment is armed by default under nextest, there is one deck entry per event, a no-op is not a write, custom cargo target directories are detected, and automatic installs keep a live installed entry (an explicit `hooks install` replaces it).
+
+Decisions taken during the run:
+
+- Replace daemon has no experimental gate and drops its zero-agents condition.
+- Local Replace uses `ClientSpawns`.
+- An older local daemon without the capability falls back to the PID stop, after asking.
+- The remote restart goes over SSH.
+- Idle with no TTY restarts without asking.
+- Supervised daemons exit 75 so their service manager restarts them.
+
+Deferred (D9): upgrading all daemons at once, tracked in [#1600](https://github.com/vfarcic/dot-agent-deck/issues/1600).
 
 ## Risks
 

@@ -38,6 +38,21 @@ desktopScenario("dashboard-fleet", async (page) => {
   await expect(page.getByText("API implementation", { exact: true })).toBeVisible();
 });
 
+// Issue #1496 — desktop-only: the TUI's dashboard has no filter. The same two
+// daemons as `dashboard-fleet`, filtered to Working through the Filter menu.
+desktopScenario("dashboard-filter", async (page) => {
+  await overview(page, "docs-fleet");
+  await page.getByTestId("deck-selector-toggle").click();
+  await page.getByTestId("deck-selector-option-all").click();
+  await expect(page.getByTestId("daemon-group")).toHaveCount(2);
+  await page.getByTestId("dashboard-filter-toggle").click();
+  await page.getByTestId("dashboard-filter-statuses-working").check();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("dashboard-filter-menu")).toHaveCount(0);
+  await expect(page.getByTestId("dashboard-filter-line")).toContainText("Working");
+  await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
+});
+
 /** Select the fixture project's directory in the shared New agent form. */
 async function projectInNewAgent(page: Page): Promise<void> {
   await overview(page, "docs");
@@ -91,6 +106,21 @@ desktopScenario("settings-daemons", async (page) => {
   await expect(page.getByTestId("settings-panel-decks")).toBeVisible();
   await expect(page.getByTestId("deck-choice-deck0000000000aa")).toContainText("build-box");
   await expect(page.getByLabel("Deck name")).toHaveValue("build");
+});
+
+// PRD #1487 — Upgrade on a remote daemon older than the app, stopped at the
+// question the daemon asks while agents are running: the fixture's `upgrade`
+// fleet, whose dev@build-box deck runs an older release with agents on it.
+desktopScenario("daemon-upgrade", async (page) => {
+  await page.goto("/?fixture=1&state=upgrade");
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
+  const buildBox = page.getByTestId("daemon-group").filter({ has: page.getByTestId("daemon-identity").getByText("dev@build-box", { exact: true }) });
+  await buildBox.getByTestId("daemon-upgrade").click();
+  await page.getByTestId("upgrade-start").click();
+  await expect(page.getByTestId("upgrade-decision")).toBeVisible();
+  await expect(page.getByTestId("upgrade-stage-installing")).toHaveAttribute("data-state", "done");
+  await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
 });
 
 desktopScenario("settings-voice", async (page) => {

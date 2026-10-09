@@ -2267,6 +2267,44 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).not.toHaveBeenCalled();
   });
 
+  /** A remote deck whose daemon the app offers to upgrade (PRD #1487), with an
+   * upgrade that never finishes, so its dialog stays open. */
+  function startUpgradable(initialView: { kind: "deck" } | { kind: "overview" }) {
+    const voice = microphone([]);
+    const resolveVoice: ResolveVoice = vi.fn(async (said: string) => (said === "type on" ? modeOn : inModeText(said)));
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = { ...snapshot.connection, deckKind: "remote", upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" } };
+    const upgradeDaemon = vi.fn(() => new Promise<never>(() => {}));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], upgradeDaemon } as Partial<DeckRuntimeState>);
+    render(<AppDeckShell runtime={deck} initialView={initialView} />);
+    return { voice, deck };
+  }
+
+  /** Scenario: with Coder's pane open and spoken typing on, pressing Upgrade
+   * (on the deck screen's top bar, or on the overview's deck card) opens the
+   * restart question. Typing ends as it does for any confirmation, and words
+   * spoken while that dialog is open never reach Coder's terminal. */
+  it.each([
+    ["the deck screen", { kind: "deck" } as const, "upgrade-daemon"],
+    ["the overview", { kind: "overview" } as const, "daemon-upgrade"],
+  ])("ends dictation when the Upgrade dialog opens on %s", async (_screen, initialView, button) => {
+    const { voice, deck } = startUpgradable(initialView);
+    await enter(voice);
+    expect(screen.getByTestId("voice-dictating")).toHaveTextContent(/typing to coder/i);
+
+    fireEvent.click(screen.getByTestId(button));
+    expect(screen.getByTestId("upgrade-dialog")).toBeVisible();
+    await flush();
+    expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
+    expect(screen.queryByTestId("voice-dictating")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Typing mode off — a confirmation is open. Nothing was sent to coder.");
+
+    voice.deliver("restart it now");
+    await completeUtterance();
+    await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
+    expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+  });
+
   /** Scenario: Stop typing while a spoken send is still resolving. Its late
    * answer must not press Enter or leave a send countdown behind. */
   it("drops an in-flight send after Stop typing", async () => {

@@ -327,6 +327,67 @@ pub struct DesktopConnection {
     /// the wire, like [`Self::build_stamp_mismatch_only`]: the dialog branches
     /// on it to decide whether a control EXISTS.
     pub listing_options: bool,
+    /// Whether to offer **Upgrade** for this deck (PRD #1487 D8), from
+    /// `daemon_upgrade::upgrade_offer` over the handshake's daemon version —
+    /// the one place the newer-only rule lives, so the webview never compares
+    /// versions itself. `offered` only when the daemon's release is older than
+    /// this app's; `unknown` when nothing answered or the version is unreadable.
+    pub upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer,
+    /// Why this deck is not connected, and the one control to offer for it
+    /// (issue #1490): **Start daemon** when no daemon is running there,
+    /// **Reconnect** when one is or when the app cannot tell. Decided by
+    /// `dot_agent_deck::daemon_start`; the webview only presents it.
+    ///
+    /// Present on every snapshot whose `status` is `disconnected` that the
+    /// live bridge builds, and absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnected_reason: Option<DisconnectedReasonDto>,
+}
+
+/// [`DesktopConnection::disconnected_reason`] on the wire.
+///
+/// `kind` is the state (`not-running`, `running-not-connected`, `unknown`),
+/// `action` the control it earns (`start-daemon` or `reconnect`), `message`
+/// the sentence to show, `detail` the technical half for a disclosure, and
+/// `host` the machine the daemon runs on, as the confirm dialog names it
+/// ("this machine", or `user@host[:port]`). `failure` names the problem when
+/// `kind` is `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisconnectedReasonDto {
+    pub kind: &'static str,
+    pub action: dot_agent_deck::daemon_start::DisconnectedAction,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<dot_agent_deck::daemon_start::StartFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub host: String,
+}
+
+impl DisconnectedReasonDto {
+    /// The DTO for `reason` on `endpoint`'s deck. Every string is sanitized:
+    /// the detail can quote what a remote printed.
+    pub(crate) fn new(
+        endpoint: &Endpoint,
+        reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+    ) -> Self {
+        use dot_agent_deck::daemon_start::DisconnectedReason;
+        let host = dot_agent_deck::daemon_start::host_label(endpoint);
+        let (kind, failure) = match reason {
+            DisconnectedReason::NotRunning => ("not-running", None),
+            DisconnectedReason::RunningNotConnected => ("running-not-connected", None),
+            DisconnectedReason::Unknown(problem) => ("unknown", Some(problem.failure)),
+        };
+        Self {
+            kind,
+            action: reason.action(),
+            message: safe_message(reason.summary(&host)),
+            failure,
+            detail: reason.detail().map(safe_message),
+            host: safe_message(host),
+        }
+    }
 }
 
 /// The three endpoint-shaped fields of [`DesktopConnection`], **for one deck**.
@@ -500,6 +561,16 @@ pub struct DesktopAgent {
     /// command with a reason in every one of those cases.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_keys: Option<DesktopPromptKeys>,
+    /// Issue #1496: the authoring kind this agent was started as —
+    /// `dispatcher`, `schedule` or `schedule-issues` — **as the daemon recorded
+    /// it** (`AgentRecord::authoring_kind`), whichever client started it. The
+    /// dashboard's kind filter reads it: an authoring agent is otherwise an
+    /// ordinary dashboard pane, with nothing in `tab` to tell it apart.
+    ///
+    /// Absent for every other agent and from a daemon predating the field,
+    /// whose authoring agents the webview then shows as single agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring_kind: Option<AuthoringKind>,
     pub tab: DesktopTab,
 }
 
@@ -742,7 +813,6 @@ pub enum DesktopAction {
         #[serde(default)]
         force: bool,
     },
-    RestartDaemon,
     /// Relax the build-stamp comparison for the rest of this app session and
     /// hand back a freshly classified snapshot (issue #801). The allowance
     /// itself is an assertion by the user, not a parameter, and it can only
@@ -1702,6 +1772,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         spawned_at_ms,
         blocked,
         prompt_keys,
+        authoring_kind: record.authoring_kind,
         tab,
     }
 }
@@ -2505,6 +2576,8 @@ pub(crate) fn disconnected_snapshot(
             project_actions_reason: None,
             new_agent_reason: None,
             listing_options: false,
+            upgrade_offer: dot_agent_deck::daemon_upgrade::UpgradeOffer::Unknown,
+            disconnected_reason: None,
         },
         agents: Vec::new(),
         // Issue #887: nothing answered, so this daemon reported no revision.
@@ -2516,6 +2589,69 @@ pub(crate) fn disconnected_snapshot(
         observed: observed_fleet_decks(),
         all_decks: all_decks_applied(),
     }
+}
+
+/// What `desktop_start_daemon` resolves with (issue #1490): `outcome` is
+/// `started` or `already-running`, `host` the machine the daemon runs on as
+/// the user reads it, and `snapshot` the deck, now connected.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDaemonResultDto {
+    pub outcome: &'static str,
+    pub host: String,
+    pub snapshot: DesktopSnapshot,
+}
+
+/// What `desktop_start_daemon` rejects with (issue #1490): a bare sentence for
+/// every failure but a start that failed, which rejects with
+/// `{ message, failure, detail }` so the technical half — the spawn error, what
+/// ssh printed — reaches a disclosure instead of being dropped (PR #1623
+/// review). `desktop/src/lib/actionError.ts`'s `StartDaemonError` is the
+/// webview's half. Serialize-only, like [`DesktopActionError`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum DesktopStartDaemonError {
+    Message(String),
+    Failed(DesktopStartFailure),
+}
+
+impl From<String> for DesktopStartDaemonError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+/// A start that failed — see [`DesktopStartDaemonError`]. Every string
+/// through [`safe_message`]: the detail can quote what a remote printed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStartFailure {
+    pub message: String,
+    pub failure: dot_agent_deck::daemon_start::StartFailure,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl DesktopStartFailure {
+    pub(crate) fn new(problem: &dot_agent_deck::daemon_start::StartProblem) -> Self {
+        Self {
+            message: safe_message(&problem.message),
+            failure: problem.failure,
+            detail: problem.detail.as_deref().map(safe_message),
+        }
+    }
+}
+
+/// [`disconnected_snapshot`], carrying why the deck is not connected and the
+/// control that earns (issue #1490).
+pub(crate) fn disconnected_snapshot_because(
+    endpoint: &Endpoint,
+    error: impl AsRef<str>,
+    reason: &dot_agent_deck::daemon_start::DisconnectedReason,
+) -> DesktopSnapshot {
+    let mut snapshot = disconnected_snapshot(endpoint, error);
+    snapshot.connection.disconnected_reason = Some(DisconnectedReasonDto::new(endpoint, reason));
+    snapshot
 }
 
 pub(crate) fn validate_agent_id(agent_id: &str) -> Result<(), String> {
@@ -3244,6 +3380,7 @@ mod tests {
             rows: 32,
             cols: 120,
             live: Some(SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: SessionStatus::Working,
                 agent_type: Some(AgentType::Codex),
@@ -3266,6 +3403,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -3809,6 +3947,22 @@ mod tests {
         assert!(value.get("lastActivityMs").is_none());
     }
 
+    /// Issue #1496: the authoring kind the daemon recorded reaches the webview
+    /// as `authoringKind`, in the daemon's kebab-case spelling the dashboard's
+    /// kind filter matches on, and an agent with none carries no key at all.
+    #[test]
+    fn agent_mapping_surfaces_the_recorded_authoring_kind() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("authoringKind").is_none(), "{value}");
+
+        for kind in AuthoringKind::ALL {
+            let mut record = fixture_record();
+            record.authoring_kind = Some(kind);
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["authoringKind"], kind.as_str());
+        }
+    }
+
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are
     /// missing from the JSON the webview receives rather than present and null,
     /// so `agent.lastUserPrompt` is `undefined` there and absence survives the
@@ -4040,13 +4194,17 @@ mod tests {
         );
     }
 
+    /// PRD #1487 M5: Replace daemon is `desktop_upgrade_daemon` on the local
+    /// deck now, so the action it used to be is gone — refused at decode
+    /// rather than quietly running the old stop-and-respawn path.
     #[test]
-    fn restart_daemon_action_has_no_force_field() {
-        let action: DesktopAction = serde_json::from_value(serde_json::json!({
-            "type": "restart_daemon"
-        }))
-        .unwrap();
-        assert!(matches!(action, DesktopAction::RestartDaemon));
+    fn restart_daemon_is_no_longer_an_action() {
+        assert!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({
+                "type": "restart_daemon"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4620,6 +4778,32 @@ mod tests {
                 "showAgentProfiles": true,
                 "showAgentDetails": false,
             })
+        );
+    }
+
+    /// PR #1623 review: a failed start rejects with its failure kind and its
+    /// technical detail beside the sentence, every string scrubbed; any other
+    /// rejection stays the bare string every `catch` already reads.
+    #[test]
+    fn a_failed_start_rejects_with_its_detail() {
+        use dot_agent_deck::daemon_start::{StartFailure, StartProblem};
+        let failed = DesktopStartDaemonError::Failed(DesktopStartFailure::new(&StartProblem {
+            failure: StartFailure::StartFailed,
+            message: "Could not start the daemon on this machine.".into(),
+            detail: Some("spawn: \u{7}No such file or directory".into()),
+        }));
+        assert_eq!(
+            serde_json::to_value(&failed).unwrap(),
+            serde_json::json!({
+                "message": "Could not start the daemon on this machine.",
+                "failure": "start-failed",
+                "detail": "spawn: No such file or directory",
+            })
+        );
+        let plain = DesktopStartDaemonError::from("not observed".to_string());
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!("not observed")
         );
     }
 }

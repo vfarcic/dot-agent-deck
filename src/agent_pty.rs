@@ -592,9 +592,13 @@ pub enum TabMembership {
         /// instance token is what makes each tab its own routing group.
         ///
         /// `Option<String>` with `#[serde(default, skip_serializing_if)]` so
-        /// older peers round-trip cleanly: a client predating this field
-        /// sends nothing and the daemon falls back to the `(name, cwd)`
-        /// identity, exactly the pre-#140 behaviour.
+        /// the wire shape is unchanged for older peers. Issue #463: a daemon
+        /// no longer serves an orchestration start whose membership omits it
+        /// — such a client predates v0.35.0 and is no longer supported — and
+        /// refuses it with
+        /// [`crate::daemon_protocol::START_ERR_ORCHESTRATION_ID_REQUIRED`]
+        /// rather than falling back to the `(name, cwd)` identity, which
+        /// cannot tell two tabs of one orchestration in one directory apart.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         orchestration_id: Option<String>,
     },
@@ -1021,6 +1025,16 @@ pub struct ConfiguredLaunch {
     pub agent_type: Option<AgentType>,
     /// The `SHELL` wrapper-choice override its spawn carried, if any.
     pub shell: Option<String>,
+}
+
+impl AgentPtyError {
+    /// Whether this is a restart's admission freeze refusing the spawn
+    /// ([`ADMISSION_FROZEN_REASON`]) — a refusal that says "not now", not
+    /// "this cannot start". An unattended caller (a scheduled fire) defers on
+    /// it instead of recording a failure (PRD #1487 re-check, reviewer R3).
+    pub fn is_admission_frozen(&self) -> bool {
+        matches!(self, Self::Spawn(reason) if reason == ADMISSION_FROZEN_REASON)
+    }
 }
 
 /// How to spawn an agent.
@@ -3300,6 +3314,13 @@ pub struct RunningAgent {
     /// while the agent is not blocked. Per record, so a respawn — a new record —
     /// starts unblocked.
     pub quota_block: Option<u64>,
+    /// Issue #1496: the authoring kind this agent was started as — a
+    /// dispatcher, a schedule or a schedule-issues agent — set by the
+    /// `StartAgent` handler once it has accepted such a start
+    /// ([`AgentPtyRegistry::set_authoring_kind`]). `None` for every other
+    /// agent. Per record, so a respawn — a new record with a new prompt —
+    /// starts without one.
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -3632,6 +3653,22 @@ pub struct AgentRecord {
     /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_context_path: Option<String>,
+    /// Issue #1496: the authoring kind this agent was started as — a
+    /// dispatcher, a schedule or a schedule-issues agent — copied from
+    /// [`RunningAgent::authoring_kind`]. A client reads it to say what kind of
+    /// agent a dashboard card is, which it cannot tell from anything else on
+    /// the record: an authoring agent is an ordinary dashboard pane.
+    ///
+    /// `None` for every other agent, and from a daemon predating this field,
+    /// whose authoring agents a client then shows as single agents. Additive
+    /// optional, so no `PROTOCOL_VERSION` bump — same basis as `crashed` and
+    /// `orchestrator_context_path`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_authoring_kind"
+    )]
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 impl AgentRecord {
@@ -3692,6 +3729,23 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
 /// `skip_serializing_if`.
 fn is_zero_u16(v: &u16) -> bool {
     *v == 0
+}
+
+/// Issue #1496: [`AgentRecord::authoring_kind`] reads a kind this build does
+/// not know as `None` rather than failing. [`crate::authoring_seeds::AuthoringKind`]
+/// refuses an unknown name on purpose — a start must not proceed on a kind the
+/// daemon cannot compose — but on a record that refusal would fail a whole
+/// `ListAgents` reply from a newer daemon over one card's label. An unknown
+/// kind is shown as a single agent, which is what a daemon predating the field
+/// gives.
+fn lenient_authoring_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::authoring_seeds::AuthoringKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Issue #424 F1: what this daemon's guarded sends have put into one pane and
@@ -5153,6 +5207,59 @@ impl std::io::Write for PaneWriter {
     }
 }
 
+/// Why a spawn is refused while a restart holds its reservation
+/// ([`AgentPtyRegistry::freeze_admission`]).
+pub const ADMISSION_FROZEN_REASON: &str =
+    "the daemon is restarting; start the agent again once it is back";
+
+/// Which admission rule a spawn is under. A fresh spawn is refused while a
+/// restart holds its reservation; a respawn already counted in flight is not,
+/// because the reservation waits for it ([`AgentPtyRegistry::freeze_admission`]).
+/// Only the respawn path can hold a [`RespawnTicket`], so only it can name the
+/// exemption.
+#[derive(Clone, Copy)]
+enum Admission<'a> {
+    Fresh,
+    /// Holding the ticket is the proof the respawn is counted in flight.
+    Respawn {
+        _ticket: &'a RespawnTicket<'a>,
+    },
+}
+
+impl Admission<'_> {
+    fn is_admitted_respawn(self) -> bool {
+        matches!(self, Self::Respawn { .. })
+    }
+}
+
+/// A restart's hold on agent admission ([`AgentPtyRegistry::freeze_admission`]).
+/// Dropping it lets agents start again — the restart answered without
+/// restarting, or could not deliver its acceptance. [`Self::keep`] leaves
+/// admission refused for good, for an accepted restart whose drain follows.
+#[must_use = "dropping the reservation re-admits agents at once"]
+pub struct AdmissionFreeze<'a> {
+    registry: &'a AgentPtyRegistry,
+    release_on_drop: bool,
+}
+
+impl AdmissionFreeze<'_> {
+    /// The restart was accepted: admission stays refused until the daemon
+    /// exits.
+    pub fn keep(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for AdmissionFreeze<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.registry
+                .admission_frozen
+                .store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 /// See [`AgentPtyRegistry::pause_next_echo_watch_for_test`].
 #[cfg(test)]
 type EchoWatchPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
@@ -5215,6 +5322,14 @@ pub struct AgentPtyRegistry {
     /// the original shutdown for ownership of each `Child`. Read by
     /// [`shutdown_all_graceful`]; a second call returns immediately.
     shutting_down: AtomicBool,
+    /// PRD #1487 audit A2: set while a `restart-daemon` request holds its
+    /// reservation — from the moment it snapshots what a restart would stop
+    /// until it either answers without restarting (cleared) or is accepted
+    /// (left set; the shutdown latch follows). Every spawn checks it beside
+    /// [`Self::shutting_down`], at entry and again under the lock that
+    /// publishes the agent, so no agent can join the registry after the
+    /// snapshot the client confirmed. See [`Self::freeze_admission`].
+    admission_frozen: AtomicBool,
     /// PRD #127 M2.2 (deliver-on-idle) + issue #424 F1: what each pane's input
     /// box is holding — the user-keystroke clock the scheduler's reuse path
     /// debounces on, and the record of what THIS daemon's guarded sends put
@@ -5352,6 +5467,63 @@ pub struct AgentPtyRegistry {
     /// [`Self::pause_next_echo_watch_for_test`].
     #[cfg(test)]
     echo_watch_pause: EchoWatchPause,
+    /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
+    /// child is forked and waits, before it takes the publishing lock — see
+    /// [`Self::pause_next_publish_for_test`].
+    #[cfg(test)]
+    publish_pause: PublishPause,
+    /// PRD #1487 re-check R2: woken whenever the last respawn in its
+    /// remove→replace window finishes (`RegistryInner::respawns_in_flight`
+    /// reaches zero), which is what [`Self::freeze_admission`] waits on.
+    respawns_settled: Notify,
+    /// PRD #1487 re-check R2 test seam: when set, the next respawn reports
+    /// that it has lifted the old record out and waits there, before the old
+    /// child is terminated — see [`Self::pause_next_respawn_for_test`].
+    #[cfg(test)]
+    respawn_pause: RespawnPause,
+}
+
+/// See [`AgentPtyRegistry::pause_next_publish_for_test`].
+#[cfg(test)]
+type PublishPause = Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>;
+
+/// See [`AgentPtyRegistry::pause_next_respawn_for_test`].
+#[cfg(test)]
+type RespawnPause = Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>;
+
+/// How long [`AgentPtyRegistry::freeze_admission`] waits for respawns already
+/// in their remove→replace window. A respawn spends at most
+/// [`AGENT_TERMINATE_GRACE`] on the old child plus a fork/exec, so this is
+/// several times what a healthy one takes; past it the restart is refused
+/// rather than left waiting on a respawn that is stuck.
+pub const RESPAWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// [`AgentPtyRegistry::freeze_admission`] gave up waiting for a respawn
+/// already in its remove→replace window; the reservation was released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RespawnsInFlight;
+
+/// A respawn admitted into its remove→replace window (PRD #1487 re-check R2).
+/// Counted in `RegistryInner::respawns_in_flight` from the lock hold that
+/// lifts the old record out until the replacement is published (or the
+/// respawn fails); dropping it un-counts it and, at zero, wakes a waiting
+/// [`AgentPtyRegistry::freeze_admission`].
+struct RespawnTicket<'a> {
+    registry: &'a AgentPtyRegistry,
+}
+
+impl Drop for RespawnTicket<'_> {
+    fn drop(&mut self) {
+        let mut inner = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        inner.respawns_in_flight = inner.respawns_in_flight.saturating_sub(1);
+        if inner.respawns_in_flight == 0 {
+            self.registry.respawns_settled.notify_waiters();
+        }
+    }
 }
 
 /// PRD #1105 — the shortest gap between two focus passes, and so the bound on
@@ -6187,11 +6359,9 @@ pub struct OutstandingDelegation {
 /// PRD #126: the orchestration membership of the live agent on a pane, as
 /// [`AgentPtyRegistry::pane_orchestration`] reads it back out of the registry's
 /// `tab_membership`. Deliberately the raw membership fields rather than a
-/// [`crate::state::OrchestrationIdentity`]: the daemon folds
-/// `orchestration_cwd.or(StartAgent.cwd)` into that identity's `NameCwd` variant
-/// at `StartAgent` time, and re-deriving it here from the membership alone would
-/// invent a *different* cwd for the same pane and turn a healthy revalidation
-/// into a refusal. The comparison rules live in
+/// [`crate::state::OrchestrationIdentity`]: a membership may carry no token,
+/// which an identity cannot represent, and the comparison has to say what that
+/// means rather than have it decided here. The comparison rules live in
 /// [`crate::state::orchestration_still_matches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneOrchestration {
@@ -6520,6 +6690,12 @@ const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
 struct RegistryInner {
     next_id: u64,
+    /// PRD #1487 re-check R2: respawns between lifting their old record out
+    /// and publishing its replacement — see [`RespawnTicket`]. Their pane is
+    /// briefly in neither `agents` nor any spawn a restart could refuse, so a
+    /// restart's [admission freeze](AgentPtyRegistry::freeze_admission) waits
+    /// for this to reach zero before anyone snapshots the registry.
+    respawns_in_flight: usize,
     /// PRD #1105 — the client id carried by the most recent
     /// `focus-gained` request this daemon process accepted
     /// ([`AgentPtyRegistry::record_focus`]); `None` until one arrives.
@@ -7033,6 +7209,7 @@ impl AgentPtyRegistry {
         Self {
             inner: Mutex::new(RegistryInner {
                 next_id: 1,
+                respawns_in_flight: 0,
                 focused_client: None,
                 next_viewer_id: 1,
                 agents: HashMap::new(),
@@ -7051,6 +7228,7 @@ impl AgentPtyRegistry {
             detach_count: AtomicU64::new(0),
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
+            admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
             draft_defer_cap: crate::draft_deferral::draft_defer_cap_from_env(),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
@@ -7068,6 +7246,11 @@ impl AgentPtyRegistry {
             pending_deliveries: crate::delegate_retry::PendingDeliveries::default(),
             #[cfg(test)]
             echo_watch_pause: Mutex::new(None),
+            #[cfg(test)]
+            publish_pause: Mutex::new(None),
+            respawns_settled: Notify::new(),
+            #[cfg(test)]
+            respawn_pause: Mutex::new(None),
         }
     }
 
@@ -9467,10 +9650,15 @@ impl AgentPtyRegistry {
     /// Issue #542: `agent_id` has left the registry, so its launcher standing
     /// goes with it. Callers hold the registry lock, which is the order
     /// [`Self::note_launcher_handoff`] takes the two locks in.
+    ///
+    /// Tolerates a poisoned lock rather than panicking: it runs in the middle
+    /// of a respawn's removal, and a panic there would abandon the pane with
+    /// its record already lifted out (PRD #1487 final audit F3). Removing a
+    /// key is sound on a map a panicking holder left behind.
     fn forget_launcher_handoff(&self, agent_id: &str) {
         self.launcher_handoff_agents
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(agent_id);
     }
 
@@ -9518,6 +9706,20 @@ impl AgentPtyRegistry {
         let (reached_tx, reached_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         *self.echo_watch_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// PRD #1487 audit A2 test seam: park the next spawn after its child is
+    /// forked and before it takes the lock that publishes it. The first
+    /// receiver yields once the spawn is parked; sending on (or dropping) the
+    /// returned sender lets it go on.
+    #[cfg(test)]
+    pub(crate) fn pause_next_publish_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.publish_pause.lock().unwrap() = Some((reached_tx, release_rx));
         (reached_rx, release_tx)
     }
 
@@ -9905,7 +10107,7 @@ impl AgentPtyRegistry {
 
     /// Spawn a new agent and return its registry id.
     pub fn spawn_agent(self: &Arc<Self>, opts: SpawnOptions<'_>) -> Result<String, AgentPtyError> {
-        self.spawn_agent_with_dir(opts, None)
+        self.spawn_agent_with_dir(opts, None, Admission::Fresh)
     }
 
     /// [`Self::spawn_agent`], with the child started in the prepared start's
@@ -9923,7 +10125,7 @@ impl AgentPtyRegistry {
         opts: SpawnOptions<'_>,
         dir: &crate::project_resolve::VerifiedProjectDir,
     ) -> Result<String, AgentPtyError> {
-        self.spawn_agent_with_dir(opts, Some(dir))
+        self.spawn_agent_with_dir(opts, Some(dir), Admission::Fresh)
     }
 
     /// The verified directory a later generation of `pane` must start in, when
@@ -9986,6 +10188,7 @@ impl AgentPtyRegistry {
         self: &Arc<Self>,
         mut opts: SpawnOptions<'_>,
         dir: SpawnDir<'_>,
+        admission: Admission<'_>,
     ) -> Result<String, AgentPtyError> {
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard A — reject the spawn
         // immediately if the registry has already entered its shutdown
@@ -9998,6 +10201,14 @@ impl AgentPtyRegistry {
         // `inner.agents.insert` that publishes the new agent.
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+        // PRD #1487 audit A2: a restart's reservation refuses new agents too.
+        // Guard B re-checks it under the publishing lock. A respawn already in
+        // its remove→replace window is the one exception: the reservation
+        // waits for it to publish (re-check R2), so refusing it here would
+        // strand the pane it already emptied.
+        if self.admission_frozen.load(Ordering::SeqCst) && !admission.is_admitted_respawn() {
+            return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
         }
 
         // Capture the caller-supplied `DOT_AGENT_DECK_PANE_ID` *before*
@@ -10300,6 +10511,14 @@ impl AgentPtyRegistry {
         // would otherwise drop the `AgentPty` without killing the child
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
+        #[cfg(test)]
+        {
+            let pause = self.publish_pause.lock().unwrap().take();
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
         // PRD #745 M11: the child exists as of the line above, so this is the
         // instant to record — before the lock acquisition below, which can
         // block behind any other registry operation. An OBSERVATION of when the
@@ -10329,6 +10548,16 @@ impl AgentPtyRegistry {
         if self.shutting_down.load(Ordering::SeqCst) {
             reservation.abandon_locked(&mut inner);
             return Err(AgentPtyError::Spawn("registry is shutting down".into()));
+        }
+        // PRD #1487 audit A2: the same re-check for a restart's reservation,
+        // and atomic with the insert for the same reason. A spawn that was
+        // already forking when the reservation was taken lands here and is
+        // refused — its child killed by `guard` — so it cannot publish an
+        // agent the restart's snapshot did not name. An admitted respawn is
+        // exempt for the reason Guard A gives: the reservation is still waiting
+        // on it, so whatever it publishes is in the snapshot.
+        if self.admission_frozen.load(Ordering::SeqCst) && !admission.is_admitted_respawn() {
+            return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
         }
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
@@ -10505,6 +10734,9 @@ impl AgentPtyRegistry {
             crashed: None,
             // Issue #714: a fresh agent has reported no quota block.
             quota_block: None,
+            // Issue #1496: set after the spawn, by the `StartAgent` handler
+            // that accepted an authoring start.
+            authoring_kind: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -12319,6 +12551,17 @@ impl AgentPtyRegistry {
             if inner.cleanup_holds.contains(pane_id_env) {
                 return Err(AgentPtyError::NotFound(pane_id_env.to_string()));
             }
+            // PRD #1487 re-check R2: a restart's reservation refuses a respawn
+            // HERE, before the old record is touched, rather than at the fresh
+            // spawn — which is after the old child was terminated, so a restart
+            // that then aborted would leave the pane's worker stopped and its
+            // record gone. Under the same lock hold as the removal, and the
+            // reservation is set under this lock too, so a respawn either sees
+            // the reservation and leaves the pane alone or is counted in flight
+            // below before the reservation's wait reads the count.
+            if self.admission_frozen.load(Ordering::SeqCst) {
+                return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
+            }
             let agent_id = inner
                 .agents
                 .iter()
@@ -12342,8 +12585,28 @@ impl AgentPtyRegistry {
             // still finishing cannot record into the successor's input box.
             self.forget_launcher_handoff(&agent_id);
             removed.pane_retired.store(true, Ordering::SeqCst);
+            // LAST in this lock hold, and nothing that can fail comes between
+            // it and the ticket below (PRD #1487 final audit F3): a panic after
+            // the increment and before the ticket exists would leak the count,
+            // and every later restart would wait it out and give up. The ticket
+            // cannot be built here instead, at the increment: its drop takes
+            // this same lock, so an unwind with the guard still held would
+            // deadlock on it.
+            inner.respawns_in_flight += 1;
             break (removed, verified_dir);
         };
+        // Counted in flight from the lock hold above until this function
+        // returns — the replacement published, or the respawn failed — so a
+        // restart's reservation waits for the pane to be refilled.
+        let in_flight = RespawnTicket { registry: self };
+        #[cfg(test)]
+        {
+            let pause = self.respawn_pause.lock().unwrap().take();
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
 
         let RunningAgent {
             child,
@@ -12417,6 +12680,9 @@ impl AgentPtyRegistry {
             // Issue #714: dropped — a respawned agent starts unblocked, and its
             // next quota failure reports afresh.
             quota_block: _,
+            // Issue #1496: dropped — the fresh child is started with the
+            // respawn's prompt, not the authoring seed the kind names.
+            authoring_kind: _,
             // The replacement gets a writer, and a PTY thread, of its own.
             pty_progress: _,
         } = removed;
@@ -12555,10 +12821,15 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type: respawn_agent_type,
         };
-        #[cfg(unix)]
-        let new_agent_id = self.spawn_agent_with_dir(opts, verified_dir.as_ref())?;
-        #[cfg(not(unix))]
-        let new_agent_id = self.spawn_agent(opts)?;
+        // Off Unix `verified_dir` is an uninhabited `None`, so this is the
+        // pathname spawn there.
+        let new_agent_id = self.spawn_agent_with_dir(
+            opts,
+            verified_dir.as_ref(),
+            Admission::Respawn {
+                _ticket: &in_flight,
+            },
+        )?;
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
         // card keeps the agent label the previous child taught us (`list_agents`
         // → `AgentRecord.agent_type`) instead of reverting to "No agent" until
@@ -14000,6 +14271,7 @@ impl AgentPtyRegistry {
             prompt_keys: None,
             crashed: agent.crashed,
             orchestrator_context_path: None,
+            authoring_kind: agent.authoring_kind,
         })
     }
 
@@ -14380,6 +14652,7 @@ impl AgentPtyRegistry {
                 // handler stamps it from `AppState`. See
                 // `AgentRecord::orchestrator_context_path`.
                 orchestrator_context_path: None,
+                authoring_kind: agent.authoring_kind,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -14737,9 +15010,28 @@ impl AgentPtyRegistry {
                 // Issue #868: synthetic test agent hasn't exited.
                 crashed: None,
                 quota_block: None,
+                authoring_kind: None,
             },
         );
         id
+    }
+
+    /// Issue #1496: record that agent `id` was started as `kind` — called by
+    /// the `StartAgent` handler once it has accepted an authoring start, and
+    /// echoed back on [`AgentRecord::authoring_kind`]. Returns
+    /// [`AgentPtyError::NotFound`] if the agent id is unknown.
+    pub fn set_authoring_kind(
+        &self,
+        id: &str,
+        kind: crate::authoring_seeds::AuthoringKind,
+    ) -> Result<(), AgentPtyError> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get_mut(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        agent.authoring_kind = Some(kind);
+        Ok(())
     }
 
     /// Update the per-agent display name and cwd captured in the registry
@@ -15416,6 +15708,110 @@ impl AgentPtyRegistry {
     /// `KIND_SHUTDOWN` arrival.
     pub fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// PRD #1487 audit A2: refuse every new agent until the returned
+    /// reservation is dropped (or [kept](AdmissionFreeze::keep)).
+    ///
+    /// The flag is set while holding the lock that publishes agents, so no
+    /// fresh agent can join the registry after it: an agent already published
+    /// is in it, and a spawn still forking is refused at its publishing check
+    /// (Guard B in `spawn_agent_with_dir`).
+    ///
+    /// A respawn is the one shape that does not fit that picture (re-check
+    /// R2), because it EMPTIES a pane before it refills it: between lifting the
+    /// old record out and publishing the replacement the pane is in nothing a
+    /// snapshot reads. So the same lock hold that sets the flag also stops
+    /// admitting respawns — one that arrives later is refused before it touches
+    /// the old record — and this then waits for the respawns already in that
+    /// window to publish. Only then is the registry final: what a caller reads
+    /// after this returns is the set its drain finds, give or take agents that
+    /// exit on their own. A respawn that does not settle within
+    /// [`RESPAWN_SETTLE_TIMEOUT`] makes this give up, release the reservation
+    /// and return [`RespawnsInFlight`], rather than leave a restart waiting on
+    /// it.
+    ///
+    /// Refused, not held: a start that lands while a restart is deciding fails
+    /// at once with a message saying the daemon is restarting, rather than
+    /// waiting on a decision that may take a client round trip.
+    pub async fn freeze_admission(&self) -> Result<AdmissionFreeze<'_>, RespawnsInFlight> {
+        self.freeze_admission_within(RESPAWN_SETTLE_TIMEOUT).await
+    }
+
+    /// [`Self::freeze_admission`] with its wait for respawns in flight bounded
+    /// by `settle` rather than [`RESPAWN_SETTLE_TIMEOUT`].
+    async fn freeze_admission_within(
+        &self,
+        settle: Duration,
+    ) -> Result<AdmissionFreeze<'_>, RespawnsInFlight> {
+        let freeze = {
+            let _publishing = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            self.admission_frozen.store(true, Ordering::SeqCst);
+            AdmissionFreeze {
+                registry: self,
+                release_on_drop: true,
+            }
+        };
+        let deadline = tokio::time::Instant::now() + settle;
+        loop {
+            // Registered before the count is read, so a respawn that settles in
+            // between cannot be missed.
+            let settled = self.respawns_settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            let in_flight = self
+                .inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .respawns_in_flight;
+            if in_flight == 0 {
+                return Ok(freeze);
+            }
+            if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                tracing::warn!(
+                    in_flight,
+                    "a restart's admission freeze gave up waiting for respawns in progress; \
+                     releasing it"
+                );
+                return Err(RespawnsInFlight);
+            }
+        }
+    }
+
+    /// PRD #1487 re-check R2 test seam: the next respawn reports (on the
+    /// returned receiver) that it has lifted its old record out — and so is
+    /// counted in flight — then waits for the returned sender before it
+    /// terminates the old child and spawns the replacement.
+    #[cfg(test)]
+    pub(crate) fn pause_next_respawn_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.respawn_pause.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Wait out a restart's admission freeze (PRD #1487 re-check, reviewer
+    /// R3): `true` once agents are admitted again — the restart was called off
+    /// — and `false` once the daemon is shutting down, after which nothing this
+    /// daemon starts would survive. A freeze kept by an accepted restart lasts
+    /// until the drain sets the shutdown latch, so this always resolves.
+    pub async fn wait_for_admission(&self) -> bool {
+        loop {
+            if self.is_shutting_down() {
+                return false;
+            }
+            if !self.is_admission_frozen() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Whether a restart's reservation currently refuses new agents.
+    pub fn is_admission_frozen(&self) -> bool {
+        self.admission_frozen.load(Ordering::SeqCst)
     }
 
     /// SIGKILL every agent in `agents` — the whole descendant tree of each —
@@ -20438,6 +20834,7 @@ mod spawn_tests {
             rows: 0,
             cols: 0,
             live: live_type.map(|agent_type| crate::state::SessionSnapshot {
+                output_set_status: false,
                 subagent_wait: None,
                 status: crate::state::SessionStatus::Working,
                 agent_type,
@@ -20455,6 +20852,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -20567,6 +20965,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -20620,6 +21019,92 @@ mod spawn_tests {
             round.orchestrator_context_path.as_deref(),
             Some("/p/.dot-agent-deck/x.md")
         );
+    }
+
+    /// Issue #1496: `authoring_kind` is additive optional — an older daemon's
+    /// record (no key) decodes as `None`, `None` puts no key on the wire, and a
+    /// kind round-trips in its kebab-case spelling. A kind this build does not
+    /// know, from a newer daemon, decodes as `None` rather than failing the
+    /// whole `ListAgents` reply.
+    #[test]
+    fn agent_record_authoring_kind_is_additive_optional() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let back: AgentRecord =
+            serde_json::from_str(r#"{"id": "1"}"#).expect("a record without the field must decode");
+        assert_eq!(back.authoring_kind, None);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(
+            wire.get("authoring_kind").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        for kind in AuthoringKind::ALL {
+            let record = AgentRecord {
+                authoring_kind: Some(kind),
+                ..back.clone()
+            };
+            let wire = serde_json::to_value(&record).unwrap();
+            assert_eq!(wire["authoring_kind"], kind.as_str());
+            let round: AgentRecord = serde_json::from_value(wire).unwrap();
+            assert_eq!(round.authoring_kind, Some(kind));
+        }
+
+        let newer: AgentRecord =
+            serde_json::from_str(r#"{"id": "1", "authoring_kind": "a-kind-from-later"}"#)
+                .expect("an unknown kind must not fail the record");
+        assert_eq!(newer.authoring_kind, None);
+        let null: AgentRecord = serde_json::from_str(r#"{"id": "1", "authoring_kind": null}"#)
+            .expect("an explicit null decodes");
+        assert_eq!(null.authoring_kind, None);
+    }
+
+    /// Issue #1496: the registry carries a kind set on an agent into its
+    /// record, and an agent nobody set one on carries none.
+    #[test]
+    fn set_authoring_kind_reaches_the_agent_record() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let plain = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let dispatcher = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        registry
+            .set_authoring_kind(&dispatcher, AuthoringKind::Dispatcher)
+            .unwrap();
+        assert!(matches!(
+            registry.set_authoring_kind("no-such-agent", AuthoringKind::Schedule),
+            Err(AgentPtyError::NotFound(_))
+        ));
+
+        let kind_of = |id: &str| {
+            registry
+                .agent_records()
+                .into_iter()
+                .find(|record| record.id == id)
+                .expect("live agent")
+                .authoring_kind
+        };
+        assert_eq!(kind_of(&plain), None);
+        assert_eq!(kind_of(&dispatcher), Some(AuthoringKind::Dispatcher));
+        assert_eq!(
+            registry
+                .agent_record_any(&dispatcher)
+                .unwrap()
+                .authoring_kind,
+            Some(AuthoringKind::Dispatcher)
+        );
+        registry.close_agent(&plain).unwrap();
+        registry.close_agent(&dispatcher).unwrap();
     }
 
     #[test]
@@ -21692,6 +22177,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -24433,6 +24919,35 @@ mod spawn_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_first_write_deadline_never_cancels_a_write_already_under_way() {
+        // Make the deadline cross AFTER accepted payload bytes rather than
+        // betting that echo-watch setup finishes within SUBMIT_DELAY / 2.
+        // Echo-watch setup uses the blocking pool, so the old 50ms allowance
+        // can expire before any bytes under load. Only this test's writer is delayed.
+        struct DeadlineCrossingWriter {
+            inner: Box<dyn std::io::Write + Send>,
+            deadline: Arc<Mutex<Option<Instant>>>,
+            crossed: bool,
+        }
+        impl std::io::Write for DeadlineCrossingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let deadline = self.deadline.lock().unwrap().expect("deadline armed");
+                if !self.crossed {
+                    assert!(
+                        Instant::now() < deadline,
+                        "setup must finish before the deadline"
+                    );
+                }
+                let written = self.inner.write(bytes)?;
+                if written > 0 && !self.crossed {
+                    self.crossed = true;
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
         const PANE: &str = "issue-544-mid-write";
         const TEXT: &str = "MIDWRITE-SENTINEL";
         const ATTEMPTS: usize = 5;
@@ -24447,13 +24962,30 @@ mod spawn_tests {
                     ..SpawnOptions::default()
                 })
                 .expect("spawn stand-in");
-
-            // No draft and a free writer, so everything up to the first byte
-            // normally takes well under a millisecond — and the deadline then
-            // falls inside the write's own `SUBMIT_DELAY`, after the payload
-            // and before the CR.
+            let deadline_slot = Arc::new(Mutex::new(None));
+            // Wrap the agent's own PTY writer: the first swap hands it back,
+            // the second installs it inside the deadline-crossing wrapper (and
+            // returns the placeholder sink, which is safe to drop).
+            let original = registry
+                .replace_agent_writer_for_test(&agent, Box::new(std::io::sink()))
+                .await;
+            let _placeholder = registry
+                .replace_agent_writer_for_test(
+                    &agent,
+                    Box::new(DeadlineCrossingWriter {
+                        inner: original,
+                        deadline: Arc::clone(&deadline_slot),
+                        crossed: false,
+                    }),
+                )
+                .await;
+            // Two seconds bound preparation; the writer itself makes the
+            // payload cross that deadline. This remains a completion test even
+            // if the machine is fast, without a 50ms scheduling assumption
+            // before the write.
             let started = Instant::now();
-            let deadline = started + SUBMIT_DELAY / 2;
+            let deadline = started + Duration::from_secs(2);
+            *deadline_slot.lock().unwrap() = Some(deadline);
             let sent = tokio::time::timeout(
                 Duration::from_secs(5),
                 registry.write_and_submit_guarded_first_write_within(
@@ -24468,9 +25000,8 @@ mod spawn_tests {
             .await
             .expect("bounded");
             match sent {
-                // Starved before the first byte (issue #1494's `cargo
-                // test-fast` at load ~40 on 16 cores): the precondition did
-                // not hold, so set it up again.
+                // Starved for the whole preparation window before the first
+                // byte: the precondition did not hold, so set it up again.
                 Err(AgentPtyError::DeadlineElapsed) if attempt < ATTEMPTS => {
                     eprintln!(
                         "attempt {attempt}: the deadline passed before the first byte; retrying"
@@ -25114,11 +25645,11 @@ mod spawn_tests {
         let reg = Arc::new(AgentPtyRegistry::new());
         // PRD #140: the record carries the daemon's routing identity, so the
         // fixture uses the same `Instance` token shape a current client stamps.
-        let orch = crate::state::OrchestrationIdentity::Instance {
+        let orch = crate::state::OrchestrationIdentity {
             id: "instance-1".to_string(),
             name: "orch".to_string(),
         };
-        let other_orch = crate::state::OrchestrationIdentity::Instance {
+        let other_orch = crate::state::OrchestrationIdentity {
             id: "instance-2".to_string(),
             name: "other".to_string(),
         };
@@ -27238,6 +27769,300 @@ mod spawn_tests {
             "signal independence must not be bought by dropping the reap — a \
              child that is signalled and never waited on is a zombie"
         );
+    }
+
+    /// [`AgentPtyRegistry::freeze_admission`] from a synchronous test, with no
+    /// respawn in flight to wait for.
+    fn freeze_now(registry: &AgentPtyRegistry) -> AdmissionFreeze<'_> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(registry.freeze_admission())
+            .expect("no respawn is in flight")
+    }
+
+    /// Scenario: a restart's reservation (PRD #1487 audit A2). A spawn whose
+    /// child is already forked when the reservation is taken cannot publish
+    /// afterwards — it is refused and its child killed — so the snapshot read
+    /// under the reservation is the whole registry. New spawns are refused
+    /// while it is held; dropping it re-admits them, and a kept reservation
+    /// keeps refusing.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_reservation_refuses_spawns_including_one_already_forking() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (reached, release) = registry.pause_next_publish_for_test();
+        let in_flight = {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                })
+            })
+        };
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the in-flight spawn forked its child");
+
+        let reservation = freeze_now(&registry);
+        assert!(registry.is_admission_frozen());
+        let snapshot = registry.agent_records();
+        assert!(snapshot.is_empty(), "nothing was published yet");
+        release.send(()).unwrap();
+        let refused = in_flight.join().unwrap();
+        match refused {
+            Err(AgentPtyError::Spawn(reason)) => assert_eq!(reason, ADMISSION_FROZEN_REASON),
+            other => panic!("the in-flight spawn published under a reservation: {other:?}"),
+        }
+        assert_eq!(
+            registry.agent_records().len(),
+            snapshot.len(),
+            "the registry is still exactly the snapshot"
+        );
+        assert!(
+            matches!(
+                registry.spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                }),
+                Err(AgentPtyError::Spawn(_))
+            ),
+            "a new spawn is refused while the reservation is held"
+        );
+
+        drop(reservation);
+        assert!(!registry.is_admission_frozen());
+        let admitted = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("a released reservation re-admits spawns");
+        assert_eq!(registry.agent_records().len(), 1);
+
+        freeze_now(&registry).keep();
+        assert!(registry.is_admission_frozen(), "a kept reservation stays");
+        assert!(
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    ..SpawnOptions::default()
+                })
+                .is_err()
+        );
+        let _ = registry.close_agent(&admitted);
+        registry.shutdown_all();
+    }
+
+    fn spawn_pane_worker(registry: &Arc<AgentPtyRegistry>, pane: &str) -> String {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("the worker starts")
+    }
+
+    fn live_agent_for_pane(registry: &AgentPtyRegistry, pane: &str) -> Option<String> {
+        registry
+            .agent_records()
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane))
+            .map(|r| r.id)
+    }
+
+    /// Scenario: while a restart holds its reservation, a `clear = true`
+    /// delegate tries to respawn a worker. The respawn is refused with "the
+    /// daemon is restarting" BEFORE it touches the worker, so the worker is
+    /// still the same live agent — and stays so when the restart aborts
+    /// (PRD #1487 re-check R2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frozen_respawn_is_refused_with_the_old_worker_alive() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worker = spawn_pane_worker(&registry, "frozen-pane");
+        let reservation = registry
+            .freeze_admission()
+            .await
+            .expect("nothing in flight");
+
+        match registry.respawn_agent_for_pane("frozen-pane", "cat").await {
+            Err(AgentPtyError::Spawn(reason)) => assert_eq!(reason, ADMISSION_FROZEN_REASON),
+            other => panic!("a respawn under a reservation must be refused: {other:?}"),
+        }
+        assert_eq!(
+            live_agent_for_pane(&registry, "frozen-pane"),
+            Some(worker.clone()),
+            "the refused respawn left the worker exactly as it was"
+        );
+
+        // The restart aborts (its acceptance could not be delivered).
+        drop(reservation);
+        assert_eq!(live_agent_for_pane(&registry, "frozen-pane"), Some(worker));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: a respawn has already lifted the worker's record out and is
+    /// terminating it when a restart takes its reservation. The reservation
+    /// waits for the respawn to publish the replacement instead of refusing
+    /// it, so the restart's snapshot names the pane's new worker; when the
+    /// restart then aborts — its acceptance undeliverable — the pane has a
+    /// live worker and agents may start again (PRD #1487 re-check R2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_respawn_in_its_window_is_waited_for_and_survives_an_aborted_restart() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn_pane_worker(&registry, "window-pane");
+        let (reached, release) = registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.respawn_agent_for_pane("window-pane", "cat").await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), reached)
+            .await
+            .expect("the respawn reached its window")
+            .unwrap();
+        assert_eq!(
+            live_agent_for_pane(&registry, "window-pane"),
+            None,
+            "mid-window the pane is in nothing a snapshot reads"
+        );
+
+        let freezing = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let reservation = registry.freeze_admission().await;
+                // The snapshot a restart would read under the reservation.
+                let snapshot = registry.agent_records();
+                // Its acceptance is undeliverable: the reservation is dropped.
+                drop(reservation.expect("the respawn settles in time"));
+                snapshot
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !freezing.is_finished(),
+            "the reservation must wait for the respawn in its window"
+        );
+        assert!(registry.is_admission_frozen());
+
+        release.send(()).unwrap();
+        let new = tokio::time::timeout(Duration::from_secs(30), respawn)
+            .await
+            .expect("the respawn finishes")
+            .unwrap()
+            .expect("an admitted respawn publishes its replacement under the reservation");
+        assert_ne!(new, old);
+        let snapshot = tokio::time::timeout(Duration::from_secs(30), freezing)
+            .await
+            .expect("the reservation completes once the respawn has published")
+            .unwrap();
+        assert!(
+            snapshot
+                .iter()
+                .any(|r| r.id == new && r.pane_id_env.as_deref() == Some("window-pane")),
+            "the snapshot names the pane's replacement: {snapshot:?}"
+        );
+
+        assert!(
+            !registry.is_admission_frozen(),
+            "the aborted restart released admission"
+        );
+        assert_eq!(
+            live_agent_for_pane(&registry, "window-pane"),
+            Some(new),
+            "the pane has a live worker after the aborted restart"
+        );
+        let started = spawn_pane_worker(&registry, "after-pane");
+        assert!(live_agent_for_pane(&registry, "after-pane") == Some(started));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: the launcher-handoff lock a respawn takes mid-removal has
+    /// been poisoned by a panic elsewhere. The respawn still completes, and it
+    /// leaves no respawn counted in flight, so a restart's reservation settles
+    /// at once instead of waiting out a count nothing will ever release
+    /// (PRD #1487 final audit F3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poisoned_lock_mid_respawn_leaks_no_in_flight_count() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let old = spawn_pane_worker(&registry, "poisoned-pane");
+        let poisoner = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.launcher_handoff_agents.lock().unwrap();
+            panic!("poison the launcher-handoff lock");
+        })
+        .join();
+        assert!(registry.launcher_handoff_agents.is_poisoned());
+
+        let respawned = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .respawn_agent_for_pane("poisoned-pane", "cat")
+                    .await
+            })
+            .await
+        };
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .respawns_in_flight,
+            0,
+            "the respawn's in-flight count was released"
+        );
+        let reservation = registry
+            .freeze_admission_within(Duration::from_millis(500))
+            .await;
+        assert!(
+            reservation.is_ok(),
+            "a restart's reservation settles: nothing is left counted in flight"
+        );
+        drop(reservation);
+        let new = respawned
+            .expect("the respawn did not panic")
+            .expect("and it published the replacement");
+        assert_ne!(new, old);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: a respawn that never leaves its window cannot hold a restart
+    /// forever: the reservation gives up after its wait, releases admission and
+    /// says so (PRD #1487 re-check R2).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_respawn_makes_the_reservation_give_up_and_release() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        spawn_pane_worker(&registry, "stuck-pane");
+        let (reached, release) = registry.pause_next_respawn_for_test();
+        let respawn = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.respawn_agent_for_pane("stuck-pane", "cat").await })
+        };
+        reached.await.unwrap();
+
+        let gave_up = registry
+            .freeze_admission_within(Duration::from_millis(300))
+            .await;
+        assert!(
+            matches!(gave_up, Err(RespawnsInFlight)),
+            "a reservation that cannot settle reports it"
+        );
+        assert!(!registry.is_admission_frozen(), "and releases admission");
+
+        release.send(()).unwrap();
+        respawn
+            .await
+            .unwrap()
+            .expect("the respawn completes afterwards");
+        assert!(live_agent_for_pane(&registry, "stuck-pane").is_some());
+        registry.shutdown_all();
     }
 
     /// Control for the wedged tests: with nothing wedged, the very same two

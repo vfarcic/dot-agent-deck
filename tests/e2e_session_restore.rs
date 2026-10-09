@@ -1629,6 +1629,7 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
             agent_type: AgentType::from_command(Some("sleep 600")),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("start legacy-mode agent over attach socket");
@@ -1671,5 +1672,123 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
     assert!(
         output.contains(warning),
         "the clean exit must print the daemon-mode warning to the terminal; output:\n{output}"
+    );
+}
+
+/// The orchestration start a client older than v0.35.0 sends: a membership
+/// with no per-tab `orchestration_id`.
+fn tokenless_orchestration_start(cwd: &str) -> AttachRequest {
+    AttachRequest::StartAgent {
+        command: Some("sleep 600".into()),
+        cwd: Some(cwd.to_string()),
+        rows: 24,
+        cols: 80,
+        env: vec![(
+            DOT_AGENT_DECK_PANE_ID.into(),
+            "tokenless-0123456789abcdef".into(),
+        )],
+        display_name: Some("old-orchestrator".into()),
+        tab_membership: Some(TabMembership::Orchestration {
+            name: "legacy-review".into(),
+            role_index: 0,
+            role_name: "orchestrator".into(),
+            is_start_role: true,
+            orchestration_cwd: Some(cwd.to_string()),
+            display_title: None,
+            orchestration_id: None,
+        }),
+        agent_type: AgentType::from_command(Some("sleep 600")),
+        seed: None,
+        authoring_kind: None,
+        client_seeded_kind: None,
+        remember_command: false,
+    }
+}
+
+/// Scenario: A daemon built from this branch refuses an orchestration start
+/// that carries no per-tab id, the shape only a client older than v0.35.0
+/// sends. Then a daemon that accepted one, as an older daemon did, is attached
+/// by a fresh real TUI: the agent shows as a dashboard card with no
+/// orchestration tab, and a clean detach prints the warning naming the
+/// orchestration.
+#[spec("session/restore/024")]
+#[test]
+fn restore_024_tokenless_orchestration_agent_becomes_dashboard_card() {
+    let project = common::harness_tempdir().expect("create project directory");
+    let cwd = std::fs::canonicalize(project.path())
+        .expect("canonicalize project directory")
+        .to_string_lossy()
+        .into_owned();
+
+    // The real binary's daemon refuses the start and runs nothing (issue #463).
+    let current = common::spawn_daemon_serve(None, "0");
+    let refused = current
+        .send_attach_request(&tokenless_orchestration_start(&cwd))
+        .expect("send token-less orchestration start");
+    assert!(
+        !refused.ok,
+        "a token-less orchestration start must be refused by this build's daemon"
+    );
+    let error = refused.error.unwrap_or_default();
+    assert!(
+        error.starts_with(dot_agent_deck::daemon_protocol::START_ERR_ORCHESTRATION_ID_REQUIRED)
+            && error.contains("v0.35.0"),
+        "the refusal must carry the stable prefix and name the cut-off; got: {error}"
+    );
+    current.wait_for_agent_count(0, Duration::from_secs(5));
+    drop(current);
+
+    // A daemon that serves it, standing in for one from before #463 that is
+    // still running an old client's orchestration agent.
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[("DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION", "1")],
+    );
+    let response = daemon
+        .send_attach_request(&tokenless_orchestration_start(&cwd))
+        .expect("start token-less orchestration agent over attach socket");
+    assert!(
+        response.ok,
+        "the seam daemon rejected the token-less agent: {:?}",
+        response.error
+    );
+    daemon.wait_for_agent_count(1, Duration::from_secs(10));
+
+    let mut deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+
+    deck.wait_until_grid(
+        "token-less orchestration agent is a dashboard card",
+        |grid| {
+            grid.lines()
+                .any(|line| line.contains("No agent · old-orchestrator"))
+                && grid
+                    .lines()
+                    .next()
+                    .is_some_and(|header| header.contains("dot-agent-deck — 1 agent(s)"))
+                && !grid.contains("legacy-review")
+        },
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("legacy-review"),
+        "a token-less orchestration agent must not rebuild an orchestration tab; grid:\n{grid}"
+    );
+
+    let output = detach_and_collect_output(&mut deck);
+    let warning = "Panes of orchestration(s) legacy-review were started by a client older than v0.35.0, which is no longer supported (#463), and were placed on the dashboard as plain panes.";
+    assert!(
+        output.contains(warning),
+        "the clean exit must print the token-less orchestration warning; output:\n{output}"
     );
 }

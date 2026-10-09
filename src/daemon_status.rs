@@ -238,11 +238,13 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
     fn snapshot(status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status,
             agent_type: None,

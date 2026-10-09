@@ -243,7 +243,10 @@ filter = 'test(delegate_015_real_opencode_worker_acts_on_clear_true_delegate)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
 # `/046`: the preflight (~60s), the delegate CLI (30s), the replacement's
-# record (20s) and the work-done report (240s): ~350s, so 7 x 60s.
+# record (20s) and the work-done report (240s): ~350s, so 7 x 60s. The test
+# pins its deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 480s, above this
+# window, or its daemon and agents would be reaped at the 300s harness default
+# before the window could be used (Qodo on PR #1523).
 [[profile.default.overrides]]
 filter = 'test(delegate_046_real_opencode_recovers_early_pointer_in_place)'
 slow-timeout = { period = "60s", terminate-after = 7 }
@@ -273,6 +276,17 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(dispatch_return_006_real_single_agent_reports_to_the_dispatcher)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# Issue #1616: `scheduler/dispatch/028` waits in five phases on a real
+# interactive Haiku — the first turn starting (90s), its output (90s), the card
+# settling Idle (120s), the follow-up's turn starting (60s) and its output
+# (90s) — about 450s plus the deck's start-up, past the default 3 x 60s kill
+# window, which would cost the delivery log and pane each phase prints on
+# failure (Greptile on PR #1618). Passing runs took 25-35s. The test pins its
+# deck's `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` to 600s, above this window.
+[[profile.default.overrides]]
+filter = 'test(dispatch_028_prompts_with_cr_line_breaks_submit_exactly_once_on_real_claude)'
+slow-timeout = { period = "60s", terminate-after = 9 }
 
 # `mode/live/003` runs two sequential real interactive Haiku turns on a
 # full-screen claude, one in each of two decks attached to the same daemon. Its
@@ -569,6 +583,30 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 [[profile.default.overrides]]
 filter = 'test(voice_phrase_fixtures_match_the_default_backend)'
 slow-timeout = { period = "60s", terminate-after = 8 }
+
+# `codex/worker/001` drives a REAL Codex orchestration worker through a
+# delegated task and its `work-done`. Alone it takes 26-110s; beside other
+# real-agent tests it was killed at the default 3 x 60s with no diagnostics (met
+# on PR #1523). Its window is 5 x 60s = 300s and NOT the ~407s its own waits
+# add up to, because 300s is the most it can use: the worker is spawned through
+# an in-process registry whose lifetime reaper reads the test process's own
+# `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, pinned to the 300s harness default
+# before `main` (`tests/common/child_lifetime_bound.rs`), so the wrapped Codex
+# is reaped at 300s whatever this says (Qodo on PR #1523). The filter tracks the
+# TEST FUNCTION name and must follow any rename.
+[[profile.default.overrides]]
+filter = 'test(codex_worker_001_real_worker_receives_delegate_and_signals_work_done)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Two real-agent turns plus readiness and bounded upgrade/reconnect waits can
+# exceed the default 180s kill window. Let the scenario report its own failed
+# phase and grid; this changes neither its assertion waits nor retry policy.
+# Its five sequential agent waits alone can take 600s (5 x AGENT_WAIT), so the
+# allowance is 840s, and the fixture daemon's lifetime (900s, in the test) is
+# longer than that, so the daemon outlives the test's own failure report.
+[[profile.default.overrides]]
+filter = 'test(remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts)'
+slow-timeout = { period = "60s", terminate-after = 14 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

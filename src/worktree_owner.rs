@@ -557,6 +557,94 @@ pub fn write_marker(
     Err(classify_write_failure(&path, message))
 }
 
+/// The file that marks a worktree the deck created for an agent it then never
+/// started — the issue-dispatch spawn was refused because the daemon is
+/// restarting — so that a FAILED removal of it stays recoverable (PRD #1487
+/// final audit F2).
+///
+/// Without it the leftover reads as "issue already claimed" to every later
+/// fire, with no agent in it to ever close and release it. It lives beside
+/// [`OWNER_MARKER_FILENAME`] in the worktree's own git metadata dir, for the
+/// same reasons: it leaves `git status` clean, and `git worktree remove`
+/// deletes it with the worktree, so it never outlives what it describes. On
+/// disk rather than in the daemon's memory because a restart that goes ahead
+/// leaves the leftover to the successor.
+pub const ABANDONED_SPAWN_FILENAME: &str = "dot-agent-deck-abandoned-spawn";
+
+/// The prefix of what [`mark_abandoned_spawn`] writes: which creator
+/// abandoned the worktree. The generation follows it.
+fn abandoned_spawn_prefix(creator: &Creator) -> String {
+    format!("{} {} ", creator.kind, creator.subject)
+}
+
+/// Hex characters in an abandoned-spawn generation: 16 bytes from the OS RNG.
+const GENERATION_HEX_LEN: usize = 32;
+
+/// A fresh, unique abandoned-spawn generation, or why none could be minted.
+fn mint_generation() -> Result<String, String> {
+    let mut bytes = [0u8; GENERATION_HEX_LEN / 2];
+    getrandom::fill(&mut bytes).map_err(|e| format!("OS randomness is unavailable: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Record that `creator` created `worktree_path` and never started an agent in
+/// it, so a later attempt by the same creator may remove it. Call it only for
+/// a worktree that attempt itself created: this is a claim on a deletion path.
+///
+/// The mark carries a generation minted here, unique to this one abandonment,
+/// which [`abandoned_spawn_generation`] hands back. A reclaimer that validated
+/// one generation and then re-reads the mark under the per-repository lock
+/// removes the worktree only if the generation is still the one it validated,
+/// so a worktree removed and re-created in between — even one abandoned again
+/// by the same creator — can never match a stale validation (PRD #1487, the
+/// F2 reclaim race). Returns the generation written.
+pub fn mark_abandoned_spawn(worktree_path: &Path, creator: &Creator) -> Result<String, String> {
+    let path = git_dir_of(worktree_path)
+        .ok_or_else(|| {
+            format!(
+                "could not resolve the git metadata dir of {}",
+                worktree_path.display()
+            )
+        })?
+        .join(ABANDONED_SPAWN_FILENAME);
+    let generation = mint_generation()?;
+    std::fs::write(
+        &path,
+        format!("{}{generation}\n", abandoned_spawn_prefix(creator)),
+    )
+    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(generation)
+}
+
+/// The generation of the abandonment `creator` recorded for `worktree_path`, if
+/// it is one `creator` created and abandoned before any agent ran in it: the
+/// deck's ownership marker is there ([`is_marked`]) AND the abandoned-spawn
+/// marker names exactly this creator, followed by a well-formed generation and
+/// the closing newline. Unlike the ownership gate this one compares the
+/// content, because "abandoned by THIS task for THIS issue" is the whole claim;
+/// a torn or foreign file fails the comparison and reads as not abandoned
+/// (`None`), which is the fail-safe direction.
+pub fn abandoned_spawn_generation(worktree_path: &Path, creator: &Creator) -> Option<String> {
+    let git_dir = git_dir_of(worktree_path)?;
+    if !reads_as_claim(&git_dir.join(OWNER_MARKER_FILENAME)) {
+        return None;
+    }
+    let body = std::fs::read_to_string(git_dir.join(ABANDONED_SPAWN_FILENAME)).ok()?;
+    let generation = body
+        .strip_prefix(&abandoned_spawn_prefix(creator))?
+        .strip_suffix('\n')?;
+    (generation.len() == GENERATION_HEX_LEN
+        && generation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then(|| generation.to_string())
+}
+
+/// Whether [`abandoned_spawn_generation`] finds an abandonment by `creator`.
+pub fn is_abandoned_spawn_of(worktree_path: &Path, creator: &Creator) -> bool {
+    abandoned_spawn_generation(worktree_path, creator).is_some()
+}
+
 /// [`write_marker`], made best-effort and non-blocking for the async creation
 /// path: a failure warns and is dropped, because the cost of a missing marker
 /// is one confirmation prompt at reclaim time and the cost of propagating it

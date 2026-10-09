@@ -291,12 +291,33 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     );
 }
 
+/// Issue #1493: the dashboard shows the Codex card as Idle, and only Idle, for
+/// six seconds — longer than the wrapper's quiet window and several of the
+/// daemon's shell-activity polls, either of which used to repaint it Working.
+fn assert_codex_card_holds_idle(deck: &TuiDeck, moment: &str) {
+    const BUSY: [&str; 4] = ["Thinking", "Working", "Needs Input", "Compacting"];
+    let shows_idle = |grid: &str| grid.contains("Idle") && BUSY.iter().all(|b| !grid.contains(b));
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), shows_idle),
+        "{moment}: the Codex card should read Idle:\n{}",
+        deck.snapshot_grid()
+    );
+    let left =
+        deck.wait_for_grid_predicate_within(Duration::from_secs(6), |grid| !shows_idle(grid));
+    assert!(
+        !left,
+        "{moment}: the Codex card left Idle with nothing happening:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Launch a real cheap-model Codex through a PATH launcher script and
-/// the normal wrapped pane seam, wait for its composer to paint, then type a
-/// directive that runs one shell command, press Enter, and confirm the composer
-/// emptied so the turn really started. With no global trust bypass or manual
-/// review, deck-installed hooks in the isolated home must show prompt/tool detail
-/// and Idle while Codex stays live.
+/// the normal wrapped pane seam, wait for its composer to paint, and check on the
+/// dashboard that the card reads Idle with no prompt sent. Then type a directive
+/// that runs one shell command, press Enter, and confirm the composer emptied so
+/// the turn really started. With no global trust bypass or manual review,
+/// deck-installed hooks in the isolated home must show prompt/tool detail and
+/// Idle while Codex stays live, and the card must stay Idle after the turn.
 #[spec("codex/hooks/001")]
 #[test]
 #[cfg(unix)]
@@ -402,6 +423,20 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             deck.snapshot_grid()
         );
     }
+
+    // Issue #1493: a freshly started Codex has done nothing yet, so its card
+    // must read Idle — it used to read Working from the moment it started.
+    // Checked on the dashboard and held for longer than the shell-activity
+    // monitor's poll, then back to the pane to type.
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert_codex_card_holds_idle(&deck, "started, no prompt sent yet");
+    deck.send_bytes(b"\x04");
+    assert!(
+        deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(15)),
+        "back on the Codex pane, its composer is not showing:\n{}",
+        deck.snapshot_grid()
+    );
 
     deck.send_keys(prompt.as_bytes());
     // Now that Codex owns the terminal in raw mode this genuinely observes its
@@ -556,6 +591,9 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         "the Codex card did not return to Idle at Stop-hook turn end:\n{}",
         deck.snapshot_grid()
     );
+    // Issue #1493: and it stays Idle while Codex redraws its finished turn —
+    // nothing may flip it back to Working.
+    assert_codex_card_holds_idle(&deck, "turn finished");
 
     let sentinel = deck.workdir().join(HOOK_SENTINEL_NAME);
     let sentinel_content = std::fs::read_to_string(&sentinel)

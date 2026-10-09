@@ -1224,6 +1224,14 @@ impl TuiDeck {
         for (k, v) in pinned {
             final_env.insert((*k).into(), (*v).into());
         }
+        // PRD #1487: `env_clear` above drops the test runner's own signal, so
+        // pin the agent-config containment contract explicitly — every config
+        // writer in the deck, its daemon and their children refuses a
+        // destination outside these roots. A `with_env` that moves HOME
+        // elsewhere is then refused at write time rather than trusted.
+        for (k, v) in config_containment_env() {
+            final_env.insert(k.into(), v);
+        }
         if builder.suppress_endpoint_overrides {
             final_env.remove("DOT_AGENT_DECK_SOCKET");
             final_env.remove("DOT_AGENT_DECK_ATTACH_SOCKET");
@@ -9050,6 +9058,31 @@ pub(crate) fn temp_space_problem(path: &Path) -> Option<String> {
 }
 
 /// Per-process root owning every temp dir this test process creates.
+/// The agent-config containment contract (PRD #1487) for an environment the
+/// harness builds from scratch: the marker, and as owned roots this process's
+/// harness root plus the places tests make scratch directories
+/// (`config_write_guard::default_test_roots`). A process the test runner starts
+/// is armed without this; a child started with `env_clear` is not, which is why
+/// every such environment here carries it.
+#[allow(dead_code)]
+pub(crate) fn config_containment_env() -> [(&'static str, String); 2] {
+    let roots = std::env::join_paths(
+        std::iter::once(harness_temp_root().to_path_buf())
+            .chain(dot_agent_deck::config_write_guard::default_test_roots()),
+    )
+    .expect("containment roots join as a PATH-style list");
+    [
+        (
+            dot_agent_deck::config_write_guard::MARKER_ENV,
+            "1".to_string(),
+        ),
+        (
+            dot_agent_deck::config_write_guard::ROOT_ENV,
+            roots.to_string_lossy().into_owned(),
+        ),
+    ]
+}
+
 pub(crate) fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
@@ -9355,6 +9388,10 @@ pub fn spawn_daemon_serve_with_env(
     // them.
     env.push(("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED".into(), "1".into()));
     env.push(("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS".into(), "300".into()));
+    // PRD #1487: the agent-config containment contract, as `TuiDeck` pins it.
+    for (k, v) in config_containment_env() {
+        env.push((k.into(), v));
+    }
     // PRD #127: the scheduler spawn primitive gates a fresh fire's prompt
     // delivery on the spawned agent's `SessionStart` (readiness), falling back
     // after a timeout for commands that emit no hook (bare `cat`, the recorder
@@ -10112,6 +10149,15 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
         }
     }
     count
+}
+
+/// Open a `SubscribeEvents` stream on an arbitrary daemon attach socket, for a
+/// test whose daemon is neither a `DaemonProc` nor the one its `TuiDeck`
+/// spawned. Open it before the event you wait for: nothing is replayed.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn subscribe_events_on(socket: &Path) -> EventSub {
+    EventSub::open(socket).expect("open SubscribeEvents stream")
 }
 
 /// Send one `AttachRequest` over a daemon attach socket and read back the

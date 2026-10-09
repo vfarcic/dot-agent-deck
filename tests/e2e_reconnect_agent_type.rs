@@ -51,6 +51,7 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("StartAgent over the attach socket");
@@ -147,6 +148,7 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("StartAgent over the attach socket");
@@ -290,6 +292,7 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
             agent_type: Some(AgentType::Pi),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("StartAgent ordinary pane over the real daemon attach socket");
@@ -366,6 +369,7 @@ fn live_019_a_reconnected_event_stream_catches_the_card_up() {
             agent_type: Some(AgentType::Pi),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("StartAgent ordinary pane over the real daemon attach socket");

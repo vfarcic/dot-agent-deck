@@ -1,13 +1,17 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleStop, Columns3, LayoutList, Layers, Maximize2, Network, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
-import { modeScopedKey } from "../lib/bridge";
+import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
+import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
+import { upgradeOffered } from "../lib/upgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
-import { CONNECT_ANYWAY_BODY, incompatibleRemedy } from "../lib/connectionRemedy";
+import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
+import { StartDaemonError } from "../lib/actionError";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
@@ -39,6 +43,8 @@ import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath
 export type OverviewAgent = Pick<
   AgentSession,
   "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
+  /* Issue #1496 — read by the dashboard filter, not rendered. */
+  | "agentType" | "daemonStatus" | "authoringKind"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -65,13 +71,16 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind } = agent;
   return {
     id,
     daemonId,
     displayName,
     cli,
     status,
+    agentType,
+    daemonStatus,
+    authoringKind,
     cwd,
     activeTool,
     activeToolDetail,
@@ -108,6 +117,22 @@ export function agentKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string 
  */
 export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string {
   return domIdentity(agentKey(agent));
+}
+
+/**
+ * Issue #1496 — a row's facts as the dashboard filter reads them. The daemon's
+ * own status word where there is one; in fixture mode, whose agents carry
+ * only the merged column value, the word that value stands for.
+ */
+const FIXTURE_DAEMON_STATUS: Partial<Record<AgentStatus, DesktopAgentDto["status"]>> = {
+  running: "working",
+  waiting: "waiting_for_input",
+  failed: "error",
+  blocked: "blocked",
+};
+
+export function overviewFilterFacts(agent: OverviewAgent): DashboardFilterFacts {
+  return { ...agent, status: agent.daemonStatus ?? FIXTURE_DAEMON_STATUS[agent.status] };
 }
 
 export type OverviewGroupKind = "orchestration" | "mode" | "standalone";
@@ -880,17 +905,34 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * agent is on, and merging the fleet before calling it would put two
    * machines' roles in one orchestration card.
    */
+  /**
+   * Issue #1496 — the window session's filter. It decides which rows each
+   * deck SHOWS (`sections`), and nothing else: `agents`, `groups` and
+   * `counts` stay the whole deck, so the header's instruments keep describing
+   * the whole fleet and a voice stop still finds an agent the filter hides.
+   */
+  const filter = useDashboardFilter();
+  const filtering = dashboardFilterActive(filter);
   const decks = useMemo(() => fleet.map((deck, at): FleetDeck => {
     const deckAgents = deck.agents.map(toOverviewAgent);
+    const groups = groupAgents(deckAgents);
+    const shown = filtering ? groupAgents(filterDashboardAgents(deckAgents, filter, overviewFilterFacts)) : groups;
     return {
       key: fleetMemberKey(deck.connection.deckId, at),
       snapshot: deck,
       agents: deckAgents,
-      groups: groupAgents(deckAgents),
+      groups,
+      /* Every group in its place, shown with its matching agents or, when
+         none match, as one line saying so — never dropped without a word. */
+      sections: groups.map((group) => {
+        const matching = shown.find((candidate) => candidate.key === group.key);
+        return matching ? { group: matching, matching: true } : { group, matching: false };
+      }),
+      shownCount: shown.reduce((total, group) => total + group.agents.length, 0),
       counts: countByStatus(deckAgents),
       connected: deck.connection.status === "connected",
     };
-  }), [fleet]);
+  }), [filter, filtering, fleet]);
   /**
    * The fleet aggregate, over CONNECTED decks only (PRD #742 M4).
    *
@@ -906,6 +948,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     const agents = visible.flatMap((deck) => deck.agents);
     return {
       agents,
+      shown: visible.reduce((total, deck) => total + deck.shownCount, 0),
       groups: visible.reduce((total, deck) => total + deck.groups.length, 0),
       counts: countByStatus(agents),
       decksUp: visible.length,
@@ -1127,6 +1170,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview" });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
+  const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1145,7 +1190,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const numberedAgents = useMemo(() => (
     !rowsShown
       ? undefined
-      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.groups.flatMap((group) => group.agents) : [])).slice(0, MAX_NUMBERED_ROWS)
+      /* Issue #1496 — the rows SHOWING, so a number names a row on screen. */
+      : decks.flatMap((deck) => (rendersAgentRows(deck.snapshot.connection) ? deck.sections.flatMap((section) => (section.matching ? section.group.agents : [])) : [])).slice(0, MAX_NUMBERED_ROWS)
   ), [decks, rowsShown]);
   const numberedEntries = useMemo(() => numberedAgents?.map((agent): VoiceNumberedEntryDto => ({
     kind: "agent",
@@ -1163,10 +1209,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const rowNumbers = useMemo(() => (
     voiceOn && numberedAgents ? new Map(numberedAgents.map((agent, at) => [agentKey(agent), at + 1])) : undefined
   ), [numberedAgents, voiceOn]);
+  /* The Upgrade dialog counts as a confirmation for voice and for the
+     dashboard's own keys: it asks whether to stop agents (PRD #1487 review). */
+  const confirmationOpen = confirm !== undefined || upgrade !== undefined;
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
      outside the dashboard's region (see `dashboardKeyScroll`). */
   useEffect(() => {
-    if (!rowsShown || confirm) return;
+    if (!rowsShown || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || modalOpen()) return;
       const target = event.target;
@@ -1181,12 +1230,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, rowsShown]);
+  }, [confirmationOpen, rowsShown]);
   /* The number keys, while the rows are numbered: a digit opens the row
      showing it, as saying it would. Nothing else on this screen takes a bare
      digit, and a field or terminal keeps its own. */
   useEffect(() => {
-    if (!rowNumbers || !numberedAgents || confirm) return;
+    if (!rowNumbers || !numberedAgents || confirmationOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       const number = numberKey(event);
       const agent = number === undefined ? undefined : numberedAgents[number - 1];
@@ -1196,8 +1245,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [confirm, numberedAgents, openAgent, rowNumbers]);
-  const confirmationOpen = confirm !== undefined;
+  }, [confirmationOpen, numberedAgents, openAgent, rowNumbers]);
   const confirmationChanged = useRef(onConfirmationChange);
   confirmationChanged.current = onConfirmationChange;
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
@@ -1303,6 +1351,67 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     });
   };
 
+  /**
+   * Issue #1490 — Start daemon on THIS deck's card, local or remote. The
+   * request names the deck it was pressed on, never the selection, and a
+   * rejection lands on that deck's note in the crate's own sentence, with its
+   * technical detail behind a disclosure.
+   *
+   * One error PER DECK (PR #1623 review): a failed start on one deck must not
+   * replace another's, and only that deck's own connection, Reconnect or
+   * Start clears it.
+   */
+  const [startErrors, setStartErrors] = useState<ReadonlyMap<string, StartErrorView>>(() => new Map());
+  const setStartError = (deckId: string | undefined, error: StartErrorView | undefined) => {
+    setStartErrors((current) => {
+      const key = startErrorKey(deckId);
+      if (error === undefined && !current.has(key)) return current;
+      const next = new Map(current);
+      if (error === undefined) next.delete(key);
+      else next.set(key, error);
+      return next;
+    });
+  };
+  const connectedStartErrorKeys = fleet
+    .filter((deck) => deck.connection.status === "connected" && startErrors.has(startErrorKey(deck.connection.deckId)))
+    .map((deck) => startErrorKey(deck.connection.deckId))
+    .join("\n");
+  useEffect(() => {
+    if (connectedStartErrorKeys === "") return;
+    const connected = new Set(connectedStartErrorKeys.split("\n"));
+    setStartErrors((current) => new Map([...current].filter(([key]) => !connected.has(key))));
+  }, [connectedStartErrorKeys]);
+  const requestStartDaemon = (target: ConnectionView) => {
+    const reason = target.disconnectedReason;
+    if (mode !== "live" || reason?.action !== "start-daemon") return;
+    const deckId = target.deckId;
+    setConfirm({
+      ...startDaemonConfirmCopy(reason.host),
+      label: "Start daemon",
+      busyLabel: "Starting…",
+      action: async () => {
+        setStartError(deckId, undefined);
+        try {
+          // The crate resolves once the deck is connected and emits its
+          // snapshot, so the card turns into the connected deck on its own.
+          await runtime.runAction({ type: "start_daemon", ...(deckId === undefined ? {} : { deckId }) });
+        } catch (cause) {
+          setStartError(deckId, {
+            message: cause instanceof Error ? cause.message : String(cause),
+            ...(cause instanceof StartDaemonError && cause.detail !== undefined ? { detail: cause.detail } : {}),
+          });
+        }
+      },
+    });
+  };
+
+  /* Issue #1496 — the daemons the filter can name, and the line stating it. */
+  const filterDaemons = useMemo(() => decks.flatMap((deck) => {
+    const id = deck.snapshot.connection.deckId;
+    return id === undefined ? [] : [{ id, label: filterDaemonName(deck.snapshot.connection) }];
+  }), [decks]);
+  const filterHeader = buildDashboardFilterHeader(filter, aggregate.shown, aggregate.agents.length, (id) => filterDaemons.find((daemon) => daemon.id === id)?.label ?? id);
+
   /*
     Named rather than returned directly, so the provider below can wrap it
     without re-indenting eighty lines of screen for one line of plumbing.
@@ -1338,10 +1447,31 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           <div className="top-actions">
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
+            <DashboardFilterControls filter={filter} daemons={filterDaemons} />
             <OverviewColumnPicker columns={columns} onChange={setColumns} />
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
         </header>
+
+        {/*
+          Issue #1496 — what the filter shows, on a line of its own: the counts
+          above keep describing the whole fleet, and this says how much of it
+          is on screen. Show all is here whenever any facet is set.
+        */}
+        {filterHeader.showAll && (
+          <div className="dashboard-filter-line" data-testid="dashboard-filter-line" role="status">
+            <span className="dashboard-filter-summary">{filterHeader.summary}</span>
+            <span className="dashboard-filter-chips">
+              {filterHeader.chips.map((chip) => (
+                <span className="dashboard-filter-chip" key={chip.facet}>
+                  <span>{displayText(chip.label, DISPLAY_LIMITS.name)}</span>
+                  <button type="button" aria-label={`Remove ${chip.noun} filter`} title={`Remove ${chip.noun} filter`} onClick={() => setDashboardFilter(removeDashboardFilterFacet(filter, chip.facet))}><X size={12} /></button>
+                </span>
+              ))}
+            </span>
+            <button type="button" className="button secondary compact" data-testid="dashboard-filter-show-all" onClick={() => VOICE_ACTIONS.clearDashboardFilter.run(voiceContext)}><RotateCcw size={13} /><span>Show all</span></button>
+          </div>
+        )}
 
         {mode === "fixture" && (
           <div className="fixture-bar">
@@ -1379,20 +1509,32 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               deck={deck}
               now={now}
               columns={columns}
+              filtering={filtering}
               fleetSize={decks.length}
               onOpenDeck={openDeck}
               onReconnect={() => {
                 setOverrideError(undefined);
+                setStartError(deck.snapshot.connection.deckId, undefined);
                 void runtime.reconnect();
               }}
+              onStartDaemon={mode === "live" && deck.snapshot.connection.disconnectedReason?.action === "start-daemon" ? () => requestStartDaemon(deck.snapshot.connection) : undefined}
+              startError={startErrors.get(startErrorKey(deck.snapshot.connection.deckId))}
               overrideError={overrideError && deck.snapshot.connection.deckId === overrideError.deckId ? overrideError.message : undefined}
               onConnectAnyway={mode === "live" && deck.snapshot.connection.buildStampMismatchOnly ? () => requestConnectAnyway(deck.snapshot.connection) : undefined}
+              /*
+                PRD #1487 D8/D9: Upgrade on THIS deck's card, offered only when
+                the crate says its daemon runs an older release than the app.
+              */
+              onUpgrade={runtime.upgradeDaemon && upgradeOffered(deck.snapshot.connection) && deck.snapshot.connection.deckId !== undefined
+                ? () => setUpgrade({ deckId: deck.snapshot.connection.deckId!, deckName: deckName(deck.snapshot.connection), kind: "upgrade", offer: deck.snapshot.connection.upgradeOffer })
+                : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
             />
           ))}
         </section>
       </main>
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
+      {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {newAgent && newAgentRuntime && (
         <NewAgentDialog
           runtime={newAgentRuntime}
@@ -1430,8 +1572,18 @@ interface FleetDeck {
   snapshot: DeckRuntimeState["snapshot"];
   agents: OverviewAgent[];
   groups: OverviewGroup[];
+  /** What the dashboard shows of {@link groups} under the filter (issue #1496). */
+  sections: OverviewSection[];
+  /** How many of {@link agents} the filter shows. */
+  shownCount: number;
   counts: { status: AgentStatus; count: number }[];
   connected: boolean;
+}
+
+/** One group as the filter leaves it: its matching agents, or a line saying none match. */
+interface OverviewSection {
+  group: OverviewGroup;
+  matching: boolean;
 }
 
 /**
@@ -1466,21 +1618,46 @@ function decksUpTitle(up: number, total: number): string {
  * nothing" and "we cannot see what this deck runs" are different statements and
  * only the first is a number.
  */
-function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
+/** Issue #1490 — one deck's failed Start daemon: the crate's sentence, and its technical detail. */
+interface StartErrorView {
+  message: string;
+  detail?: string;
+}
+
+/** The key a deck's start error is kept under: its id, or `""` for a deck that has not reported one. */
+function startErrorKey(deckId: string | undefined): string {
+  return deckId ?? "";
+}
+
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
+  /** Whether the dashboard filter is set (issue #1496). */
+  filtering: boolean;
   /** How many decks are on screen — the note density, and nothing else. */
   fleetSize: number;
   overrideError?: string;
+  /** Issue #1490 — why the last Start daemon on this deck failed. */
+  startError?: StartErrorView;
+  /** Issue #1490 — Start daemon on this deck. Absent unless its reason offers it. */
+  onStartDaemon?: () => void;
   /** Absent while the deck is hidden (issue #1198), which removes this group's Open deck buttons. */
   onOpenDeck?: () => void;
   onReconnect: () => void;
   onConnectAnyway?: () => void;
+  /** PRD #1487 — Upgrade this deck's daemon. Absent unless the crate offers it. */
+  onUpgrade?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
 }) {
   const connection = deck.snapshot.connection;
+  /*
+    An incompatible deck's note carries Upgrade beside Connect anyway, with the
+    sentence that explains it; every other state puts it on the header, so a
+    card never shows two.
+  */
+  const upgradeInNote = connection.status === "error" && connection.daemonDetected === true;
   const socketPath = connection.socketPath;
   const titleId = useId();
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
@@ -1580,22 +1757,27 @@ function DeckGroup({ deck, now, columns, fleetSize, overrideError, onOpenDeck, o
           neighbours read as counted — never as a deck running nothing.
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
+        {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={`Upgrade the daemon on ${deckName(connection)}`} title={connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 
       <div className="daemon-group-body">
         <DaemonBody
           agents={deck.agents}
-          groups={deck.groups}
+          sections={deck.sections}
+          filtering={filtering}
           now={now}
           columns={columns}
           connection={connection}
           message={daemonMessage}
           compactNote={fleetSize > 1}
           overrideError={overrideError}
+          startError={startError}
           onOpenDeck={onOpenDeck}
           onReconnect={onReconnect}
+          onStartDaemon={onStartDaemon}
           onConnectAnyway={onConnectAnyway}
+          onUpgrade={upgradeInNote ? onUpgrade : undefined}
           onNewAgent={onNewAgent}
         />
       </div>
@@ -1618,9 +1800,10 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, groups, now, columns, connection, message, compactNote, overrideError, onOpenDeck, onReconnect, onConnectAnyway, onNewAgent }: {
+function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
   agents: OverviewAgent[];
-  groups: OverviewGroup[];
+  sections: OverviewSection[];
+  filtering: boolean;
   /** The one instant every relative cell on this screen is measured against. */
   now: number;
   /** The chosen columns, in grid order — one list for every card. */
@@ -1635,11 +1818,17 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
    */
   compactNote?: boolean;
   overrideError?: string;
+  /** Issue #1490 — why the last Start daemon on this deck failed, in the crate's words, and its technical detail. */
+  startError?: StartErrorView;
   /** Absent while the deck is hidden (issue #1198): no Open deck button, and no sentence sending the user to it. */
   onOpenDeck?: () => void;
   onReconnect: () => void;
+  /** Issue #1490 — offered in place of Reconnect when the deck's reason says no daemon runs. */
+  onStartDaemon?: () => void;
   /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
   onConnectAnyway?: () => void;
+  /** PRD #1487 — Upgrade, in the incompatible note. Absent unless offered. */
+  onUpgrade?: () => void;
   /** The New agent flow on this deck (PRD #1223 M4) — what the first-run note offers. */
   onNewAgent?: () => void;
 }) {
@@ -1698,15 +1887,36 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
   }
 
   if (connection.status === "disconnected") {
+    /*
+      Issue #1490: ONE remedy, the one the deck's reason names — Start daemon
+      when no daemon runs there, Reconnect otherwise. A deck without a reason
+      (fixture data, an older snapshot) keeps Reconnect and the old hint.
+    */
+    const reason = connection.disconnectedReason;
+    const offersStart = reason?.action === "start-daemon" && onStartDaemon !== undefined;
     return (
       <OverviewNote className={noteClass} testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
-        <p>{message ?? DECK_STATE_FALLBACK.disconnected}</p>
-        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. {onOpenDeck ? "Start one from the Daemons screen, then reconnect." : "Start one, then reconnect."}</p>
+        <p>{reason ? displayText(reason.message, DISPLAY_LIMITS.message) : message ?? DECK_STATE_FALLBACK.disconnected}</p>
+        <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale.{reason ? "" : onOpenDeck ? " Start one from the Daemons screen, then reconnect." : " Start one, then reconnect."}</p>
+        {/*
+          PR #1623 review: the reason's sentence is the headline, and the
+          connection's own error stays visible — on the card's header line
+          (`daemon-state`), so the disclosure carries the details beside it.
+        */}
+        <ConnectionDetail detail={reason ? disconnectedDetails(connection, { message: false }) : undefined} />
         {/* Issue #1472: a deck that stopped answering during Connect anyway lands here, and the reason must land with it. */}
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
+        {startError && (
+          <div role="alert" data-testid="overview-start-error">
+            <p className="overview-note-hint">{startError.message}</p>
+            <ConnectionDetail detail={startError.detail} />
+          </div>
+        )}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
-          <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
+          {offersStart
+            ? <button className="button primary" data-testid="start-daemon" onClick={onStartDaemon}><Play size={14} /> Start daemon</button>
+            : <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>}
         </div>
       </OverviewNote>
     );
@@ -1741,17 +1951,28 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
             : `The daemon reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this app cannot show ${connection.runningAgentCount === 1 ? "it" : "them"} until the two match, so nothing is listed rather than guessed.`}
           {" "}
           {/* Names exactly the buttons rendered below, with what each does (CLAUDE.md rule 21). */}
-          {incompatibleRemedy(connection, { openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
+          {incompatibleRemedy(connection, { upgrade: Boolean(onUpgrade), openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
         </p>
         <ConnectionDetail detail={connection.detail} />
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
+          {onUpgrade && <button className="button primary" data-testid="overview-upgrade" onClick={onUpgrade}><CircleArrowUp size={14} /> Upgrade</button>}
           {onConnectAnyway && <button className="button primary" data-testid="overview-connect-anyway" onClick={onConnectAnyway}><ShieldAlert size={14} /> Connect anyway</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>
       </OverviewNote>
     );
+  }
+
+  /*
+    Issue #1496 — a daemon none of whose agents the filter shows is one line.
+    Before the first-run note, because a daemon with no agents is one the filter
+    shows none of: while filtering it reads like every other empty daemon. The
+    connection notes above stay first — they say why nothing can be listed.
+  */
+  if (filtering && !sections.some((section) => section.matching)) {
+    return <p className="overview-filter-empty" data-testid="overview-filter-empty">{filterDaemonName(connection)}: no matching agents</p>;
   }
 
   if (!agents.length) {
@@ -1796,9 +2017,114 @@ function DaemonBody({ agents, groups, now, columns, connection, message, compact
           {columns.map((column) => <span key={column}>{OVERVIEW_COLUMNS[column].legend}</span>)}
         </div>
         <div className="overview-groups">
-          {groups.map((group) => <OverviewGroupCard key={group.key} group={group} now={now} columns={columns} />)}
+          {sections.map(({ group, matching }) => (matching
+            ? <OverviewGroupCard key={group.key} group={group} now={now} columns={columns} />
+            : <p key={group.key} className="overview-filter-empty" data-testid={`overview-group-empty-${group.key}`}>{displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group))}: no matching agents</p>))}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Issue #1496 — a daemon as the dashboard filter names it: by the name it was
+ * given, where it has one, else as the dashboard's section heading names it.
+ */
+function filterDaemonName(connection: ConnectionView): string {
+  return connection.name ? displayIdentity(connection.name, DISPLAY_LIMITS.name, deckName(connection)) : deckName(connection);
+}
+
+/**
+ * Issue #1496 — the dashboard filter's controls in the header: a text box
+ * matched against each agent's name, role, orchestration, directory and last
+ * prompt, and a menu of the other four facets. Every change writes the window
+ * session's filter, which the dashboard and voice both read.
+ */
+function DashboardFilterControls({ filter, daemons }: { filter: DashboardFilter; daemons: { id: string; label: string }[] }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const toggle = <K extends "kinds" | "statuses" | "agentTypes" | "daemonIds">(facet: K, value: DashboardFilter[K][number]) => {
+    const values = filter[facet] as string[];
+    const next = values.includes(value) ? values.filter((entry) => entry !== value) : [...values, value];
+    setDashboardFilter({ ...filter, [facet]: next });
+  };
+  /* Dismissed the way the Columns menu is, for the reasons given there. */
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: Event) => {
+      if (event.target instanceof Node && root.current?.contains(event.target)) return;
+      setOpen(false);
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") dismiss(event);
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", dismissOnEscape, true);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", dismissOnEscape, true);
+    };
+  }, [open]);
+  const facets: { facet: "kinds" | "statuses" | "agentTypes" | "daemonIds"; title: string; options: readonly { id: string; label: string }[] }[] = [
+    { facet: "kinds", title: "Kind", options: DASHBOARD_KINDS },
+    { facet: "statuses", title: "Status", options: DASHBOARD_STATUSES },
+    { facet: "agentTypes", title: "Agent type", options: DASHBOARD_AGENT_TYPES },
+    { facet: "daemonIds", title: "Daemon", options: daemons },
+  ];
+  const chosen = filter.kinds.length + filter.statuses.length + filter.agentTypes.length + filter.daemonIds.length;
+  return (
+    <div
+      className="dashboard-filter overview-columns-picker"
+      ref={root}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !open) return;
+        setOpen(false);
+        event.stopPropagation();
+      }}
+    >
+      <input
+        type="text"
+        className="dashboard-filter-text"
+        data-testid="dashboard-filter-text"
+        aria-label="Filter agents"
+        placeholder="Filter agents"
+        maxLength={DASHBOARD_FILTER_TEXT_MAX}
+        value={filter.text}
+        onChange={(event) => setDashboardFilter({ ...filter, text: event.target.value })}
+      />
+      <button
+        className="button secondary compact"
+        data-testid="dashboard-filter-toggle"
+        aria-expanded={open}
+        aria-haspopup="true"
+        title="Show only agents of a kind, status, agent type or daemon"
+        onClick={() => setOpen((wasOpen) => !wasOpen)}
+      >
+        <Filter size={14} /><span>{chosen ? `Filter (${chosen})` : "Filter"}</span>
+      </button>
+      {open && (
+        <div className="overview-columns-menu dashboard-filter-menu" data-testid="dashboard-filter-menu" role="group" aria-label="Filter">
+          {facets.filter(({ options }) => options.length > 0).map(({ facet, title, options }) => (
+            <fieldset key={facet}>
+              <legend>{title}</legend>
+              {options.map((option) => (
+                <label key={option.id}>
+                  <input
+                    type="checkbox"
+                    data-testid={`dashboard-filter-${facet}-${domIdentity(option.id)}`}
+                    checked={(filter[facet] as string[]).includes(option.id)}
+                    onChange={() => toggle(facet, option.id as never)}
+                  />
+                  <span>{option.label}</span>
+                </label>
+              ))}
+            </fieldset>
+          ))}
+          <button type="button" className="overview-columns-reset" data-testid="dashboard-filter-clear" onClick={() => setDashboardFilter(clearDashboardFilter())}>
+            <RotateCcw size={12} /><span>Clear filter</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }
