@@ -407,8 +407,10 @@ fn install_impl(
     // install's retired-event hook is left in place by install, with two
     // exceptions (PRD #1497 audit F4, `remediate_retired_deck_handlers`): one
     // whose executable has no safe spelling is removed, and one in the legacy
-    // `DOT_AGENT_DECK_BIN` wrapper is rebuilt into the current form in place.
-    // Codex runs `SessionEnd`, so leaving either would leave it runnable.
+    // `DOT_AGENT_DECK_BIN` wrapper, or one whose executable needs quoting and
+    // is not spelled as the current command for it, is rebuilt into the
+    // current form in place. Codex runs `SessionEnd`, so leaving either would
+    // leave it runnable.
     // `uninstall_from` still clears every deck-signature command wide.
     //
     // Trust, for those two: a removal leaves the removed handler's trust record
@@ -440,7 +442,8 @@ fn install_impl(
                 arr,
                 command_is_deck_owned,
                 deck_command_executable,
-                expected_hook_command,
+                HOOK_COMMAND_SUFFIX,
+                HOOK_SHELL,
                 crate::agent_hook_config::EmptiedRule::KeepInterior,
             );
         }

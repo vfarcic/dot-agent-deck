@@ -117,10 +117,7 @@ fn build_command_for(
     shell: HookShell,
     windows_host: bool,
 ) -> String {
-    let windows_dialect = match shell {
-        HookShell::Native => windows_host,
-        HookShell::Posix => false,
-    };
+    let windows_dialect = shell.windows_dialect(windows_host);
     format!(
         "{} {suffix}",
         overridable_command_word(
@@ -128,6 +125,28 @@ fn build_command_for(
             windows_dialect,
         )
     )
+}
+
+impl HookShell {
+    /// Whether this shell reads a command in `cmd.exe`'s dialect on a host
+    /// that is (`windows_host`) or is not Windows.
+    fn windows_dialect(self, windows_host: bool) -> bool {
+        match self {
+            HookShell::Native => windows_host,
+            HookShell::Posix => false,
+        }
+    }
+}
+
+/// Whether [`build_command`] quotes `binary_path` for `shell` on this host:
+/// it holds a byte outside the dialect's safe set, so a spelling that leaves
+/// it unquoted (or quoted another way) may be split, expanded or run as more
+/// than one command.
+fn executable_needs_quoting(binary_path: &str, shell: HookShell) -> bool {
+    crate::platform::paths::native_shell_command_word(
+        binary_path,
+        shell.windows_dialect(cfg!(windows)),
+    ) != binary_path
 }
 
 /// What a POSIX-dialect hook command opens with — see
@@ -1232,14 +1251,21 @@ pub(crate) enum EmptiedRule {
 /// - **Its executable fails [`ensure_hook_path_is_shell_safe`]**: the handler
 ///   is removed. There is no safe spelling of that path to rebuild it with.
 /// - **It is in [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]'s form** around a safe
-///   executable: its `command` is rebuilt with `command_for_exe` (the adapter's
-///   own command for that executable) where it sits, every other key on the
-///   handler and its rule's `matcher` kept. That wrapper ran a relative
-///   [`crate::platform::paths::DOT_AGENT_DECK_BIN`] from `$PATH` or the working
-///   directory.
+///   executable: its `command` is rebuilt with [`build_command`] for `suffix`
+///   and `shell` (the adapter's own command for that executable) where it
+///   sits, every other key on the handler and its rule's `matcher` kept. That
+///   wrapper ran a relative [`crate::platform::paths::DOT_AGENT_DECK_BIN`]
+///   from `$PATH` or the working directory.
+/// - **Its executable needs quoting in `shell`'s dialect and its command is
+///   not byte for byte the one [`build_command`] writes for it**: rebuilt the
+///   same way. A historical spelling of such a path — unquoted around a `;`,
+///   or double-quoted around a `$( )` — runs whatever the path spells, and an
+///   executable whose path holds no such byte cannot be split that way.
 ///
-/// Every other handler is left exactly as it was, a safe sibling deck hook
-/// included, and so is every handler `is_deck` does not recognise.
+/// Every other handler is left exactly as it was, and so is every handler
+/// `is_deck` does not recognise: that includes a deck hook already in the
+/// current form, and one spelled another way around a path that needs no
+/// quoting.
 ///
 /// **Positions.** A rebuild moves nothing. A removal shifts only what follows
 /// the removed handler inside its own rule; a rule the removal empties is kept
@@ -1252,7 +1278,8 @@ pub(crate) fn remediate_retired_deck_handlers(
     rules: &mut Vec<Value>,
     is_deck: impl Fn(&str) -> bool,
     executable_of: impl Fn(&str) -> Option<String>,
-    command_for_exe: impl Fn(&str) -> String,
+    suffix: &str,
+    shell: HookShell,
     emptied: EmptiedRule,
 ) -> usize {
     enum Fix {
@@ -1268,9 +1295,13 @@ pub(crate) fn remediate_retired_deck_handlers(
             return Fix::Keep;
         };
         if ensure_hook_path_is_shell_safe(&exe).is_err() {
-            Fix::Remove
-        } else if command.starts_with(crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX) {
-            Fix::Rebuild(command_for_exe(&exe))
+            return Fix::Remove;
+        }
+        let canonical = build_command(&exe, suffix, shell);
+        if command.starts_with(crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX)
+            || (executable_needs_quoting(&exe, shell) && command != canonical)
+        {
+            Fix::Rebuild(canonical)
         } else {
             Fix::Keep
         }
@@ -2961,7 +2992,8 @@ mod tests {
             |command| {
                 command_executable(command, suffix).map(|exe| unquote_if_needed(exe).into_owned())
             },
-            |exe| format!("{exe} {suffix}"),
+            suffix,
+            HookShell::Native,
             EmptiedRule::KeepInterior,
         );
         if cfg!(windows) {
@@ -2972,10 +3004,124 @@ mod tests {
         assert_eq!(changed, 2);
         assert_eq!(
             rules,
-            vec![
-                json!({ "matcher": "m", "command": format!("/opt/deck/dot-agent-deck {suffix}") })
-            ]
+            vec![json!({
+                "matcher": "m",
+                "command": build_command("/opt/deck/dot-agent-deck", suffix, HookShell::Native)
+            })]
         );
+    }
+
+    /// Scenario: under an event the deck no longer installs, a sibling left
+    /// deck hooks naming live installs at paths holding shell syntax but no
+    /// backslash, in historical spellings a shell splits differently —
+    /// unquoted around a `;`, and double-quoted around a `$( )` — each of
+    /// which creates a marker file when run as written, plus a deck hook in a
+    /// non-current spelling (no override wrapper) around a path that needs no
+    /// quoting. For Codex and Devin, under both the explicit and the
+    /// automatic install, the two injectable hooks are rebuilt in place into
+    /// the current, quoted command for the same executable, the plain one is
+    /// left byte for byte, and running every command left under the retired
+    /// event with `/bin/sh` creates no marker. A rebuilt Codex command names a
+    /// binary the install did not, so the trust write does not grant it
+    /// (PRD #1497, retired-key follow-up to audit F1).
+    #[cfg(unix)]
+    #[test]
+    fn a_retired_key_sweep_rebuilds_injectable_deck_spellings() {
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let semicolon = live_deck_binary(&fixture.path().join("a; touch PWNED; #").join("bin"));
+        let substitution = live_deck_binary(&fixture.path().join("$(touch PWNED)").join("bin"));
+        let plain = live_deck_binary(&fixture.path().join("plain/bin"));
+        let installing = live_deck_binary(&fixture.path().join("installing/bin"));
+        assert_eq!(
+            crate::platform::paths::shell_quote_if_needed(&plain),
+            plain,
+            "the plain fixture path must need no quoting"
+        );
+        for agent in ["codex", "devin"] {
+            for automatic in [false, true] {
+                let home = fixture.path().join(format!("{agent}-{automatic}"));
+                std::fs::create_dir_all(&home).unwrap();
+                let retired = retired_event(agent);
+                let unquoted = format!("{semicolon} hook --agent {agent}");
+                let double_quoted = format!("\"{substitution}\" hook --agent {agent}");
+                let plain_command = format!("{plain} hook --agent {agent}");
+                assert_ne!(plain_command, current_deck_command(agent, &plain));
+
+                // The fixtures are real injections: each runs the marker.
+                for (idx, original) in [&unquoted, &double_quoted].into_iter().enumerate() {
+                    let control = home.join(format!("control-{idx}"));
+                    std::fs::create_dir_all(&control).unwrap();
+                    run_in_shell(original, &control);
+                    assert!(
+                        control.join("PWNED").exists(),
+                        "{agent}: the fixture must inject when run as written: {original}"
+                    );
+                }
+
+                let user = |command: &str| json!({ "type": "command", "command": command });
+                let seeded = json!({ "hooks": { retired: [
+                    { "hooks": [ user("echo user-a"), user(&unquoted) ] },
+                    { "matcher": "custom-matcher", "hooks": [ {
+                        "type": "command",
+                        "command": double_quoted,
+                        "timeout": 7
+                    } ] },
+                    { "hooks": [ user(&plain_command) ] }
+                ] } });
+                let config = home.join(config_name(agent));
+                std::fs::write(&config, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+
+                let named = if automatic {
+                    auto_install_config(agent, &home, &installing)
+                } else {
+                    install_config(agent, &home, &installing).expect("explicit install");
+                    None
+                };
+
+                let root: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+                let expected = json!([
+                    { "hooks": [
+                        user("echo user-a"),
+                        user(&current_deck_command(agent, &semicolon))
+                    ] },
+                    { "matcher": "custom-matcher", "hooks": [ {
+                        "type": "command",
+                        "command": current_deck_command(agent, &substitution),
+                        "timeout": 7
+                    } ] },
+                    { "hooks": [ user(&plain_command) ] }
+                ]);
+                assert_eq!(
+                    root["hooks"][retired], expected,
+                    "{agent}, automatic={automatic}"
+                );
+
+                let run = home.join("run");
+                std::fs::create_dir_all(&run).unwrap();
+                for rule in root["hooks"][retired].as_array().unwrap() {
+                    for handler in rule["hooks"].as_array().unwrap() {
+                        run_in_shell(handler["command"].as_str().unwrap(), &run);
+                    }
+                }
+                assert!(
+                    !run.join("PWNED").exists(),
+                    "{agent}, automatic={automatic}: a retired-key command injected"
+                );
+
+                if agent == "codex"
+                    && let Some(named) = named
+                {
+                    let granted = crate::codex_hooks_manage::expected_hook_command(&named);
+                    for sibling in [&semicolon, &substitution] {
+                        assert_ne!(
+                            granted,
+                            current_deck_command(agent, sibling),
+                            "the trust write must not grant a rebuilt sibling command"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Tester H1, at each installer: a refused install writes nothing, so the

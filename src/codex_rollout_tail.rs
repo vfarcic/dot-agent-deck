@@ -52,7 +52,10 @@
 //!   completion already written when retirement is decided is still read,
 //!   however much lies before it, while bytes appended after that moment are
 //!   not waited for. A line still being written at that moment — its newline
-//!   past the boundary — is the one record this gives up.
+//!   past the boundary — is the one record this gives up. A held file found
+//!   shorter than that length — truncated since, whether below or above the
+//!   point already read, including a truncation that cuts a read short — is
+//!   closed at once, with nothing more read from it.
 //!
 //!   The `Stop` and the arm of one turn come from separate hook processes, so
 //!   they may reach the daemon in either order. Each agent therefore keeps a
@@ -61,7 +64,12 @@
 //!   turn's arm starts that turn's drain when the arm comes, a repeated arm of
 //!   the watched turn changes nothing, and an arm of a turn already over
 //!   (completed, aborted, disarmed or retired) opens no new watch
-//!   (re-audit R3.2).
+//!   (re-audit R3.2). That reordering horizon is [`MAX_ENDED_TURNS`] ended
+//!   turns per agent: an arm arriving after more of that agent's turns have
+//!   ended than the record holds finds no record of its turn and is treated
+//!   as a new turn — it opens a watch nothing will drain, held at most until the
+//!   agent's next arm or its exit, and it replaces whatever watch the agent
+//!   then had, a newer turn's included. See [`MAX_ENDED_TURNS`].
 //!
 //!   A turn that never reaches a `Stop` and writes no record (a Codex that
 //!   crashed mid-turn) is bounded by the last of these alone: there is one
@@ -157,10 +165,19 @@ const MAX_PENDING: usize = 4096;
 /// next poll; this caps it regardless of what the strings carry.
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
-/// How many ended turns ([`EndedTurn`]) are remembered per agent. The
-/// out-of-order arrivals they exist for are a turn's `Stop` overtaking that
-/// same turn's arm, so the most recent few are enough; past it the oldest is
-/// forgotten, and an arm of that turn arriving later still is treated as new.
+/// How many ended turns ([`EndedTurn`]) are remembered per agent — the
+/// tailer's reordering horizon. The out-of-order arrivals they exist for are a
+/// turn's `Stop` overtaking that same turn's arm; past this many the oldest
+/// is forgotten.
+///
+/// An arm delayed past that horizon — behind this many later turn ends of the
+/// same agent — finds no record of its turn and is treated as a new turn: it
+/// opens a watch that no drain bounds, held (one file descriptor) at most until the
+/// agent's next arm or its exit, and it replaces the watch the agent had at
+/// that moment, which may be a newer turn's. That is accepted rather than
+/// ordered: it needs one arm of a sequential Codex session overtaken by four
+/// of that session's later turn ends, and its cost is the residual already
+/// accepted for a Codex that crashes before its `Stop`.
 pub const MAX_ENDED_TURNS: usize = 4;
 
 /// Bounds on the remembered refused paths, by count and by total bytes. Past
@@ -794,14 +811,16 @@ fn read_tailer(
         }
     };
     // A retiring watch reads only up to the length its file had when
-    // retirement was decided; a file truncated since has nothing left of it
-    // to read, so the caller retires it at once.
+    // retirement was decided. A file now shorter than that was truncated
+    // since, so the boundary can never be reached and what was meant to be
+    // read is at least partly gone: the watch is closed at once, wherever
+    // the new length falls relative to the read position (re-audit R3.1).
     let end = match tailer.retiring {
-        Some(_) if len < open.offset => {
+        Some(boundary) if len < boundary => {
             tailer.open = None;
             return (None, None);
         }
-        Some(boundary) => boundary.min(len),
+        Some(boundary) => boundary,
         None => len,
     };
     if tailer.retiring.is_none() && (len < open.offset || tailer.rewind) {
@@ -826,6 +845,11 @@ fn read_tailer(
         return (None, None);
     }
     open.offset += buf.len() as u64;
+    // A read that came back short of `want` hit the end of the file below the
+    // length just checked: the file was truncated between the check and the
+    // read. For a retiring watch that is the truncation above, so what was
+    // read is still fed to the watch and the file is then closed.
+    let shrank_while_retiring = tailer.retiring.is_some() && (buf.len() as u64) < want;
 
     let Some(watch) = tailer.watch.as_mut() else {
         return (None, None);
@@ -876,6 +900,8 @@ fn read_tailer(
     let reply = watch.take_reply();
     if ended {
         tailer.watch = None;
+        tailer.open = None;
+    } else if shrank_while_retiring {
         tailer.open = None;
     }
     (found, reply)
@@ -1772,6 +1798,60 @@ mod tests {
         assert_eq!(replies.len(), 1, "{replies:?}");
         assert_eq!(replies[0].reply.text, "Split across two reads.");
         assert!(!tailers.holds_file("p"));
+    }
+
+    /// PRD #1497 audit R3.1 follow-up: a held rollout truncated, while its
+    /// watch is retiring, to a length at or above what was already read but
+    /// below the length retirement was decided at, is closed on the next tick
+    /// — not held waiting for a boundary the file can no longer reach — with
+    /// no later arm, `Stop` or agent exit involved.
+    #[test]
+    fn a_retiring_rollout_truncated_short_of_its_boundary_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // How far past the read position the file is cut: above it, or
+        // exactly at it.
+        for past_offset in [MAX_READ_PER_TICK / 2, 0] {
+            let rollout = dir
+                .path()
+                .join(format!("rollout-2026-10-09T15-00-00-t{past_offset}.jsonl"));
+            append(&rollout, b"{\"type\":\"session_meta\"}\n");
+            let mut tailers = CodexRolloutTailers::default();
+            tailers.apply(arm("t", &rollout, Some("turn-1")));
+            assert!(tailers.tick(live).is_empty());
+            tailers.apply(stopped("t", "turn-1"));
+            let started = tailers.tailers["t"].stopped_at.unwrap();
+            append(&rollout, &filler(3 * 1024 * 1024));
+
+            // The drain runs out: retirement is decided at about 3 MiB, and
+            // this tick reads the first MiB of it.
+            let mut at = started + DRAIN_AFTER_STOP;
+            assert!(tailers.tick_at(at, live).is_empty());
+            let boundary = tailers.tailers["t"].retiring.expect("retirement decided");
+            let offset = offset_of(&tailers, "t");
+            assert!(offset < boundary);
+
+            let new_len = offset + past_offset;
+            assert!(new_len < boundary);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&rollout)
+                .unwrap()
+                .set_len(new_len)
+                .unwrap();
+
+            at += POLL_INTERVAL;
+            assert!(tailers.tick_at(at, live).is_empty());
+            assert!(
+                !tailers.holds_file("t"),
+                "past_offset={past_offset}: closed once the file is short of {boundary}"
+            );
+            assert!(!tailers.is_armed("t"));
+            assert!(tailers.take_replies().is_empty());
+
+            // The turn is over: a late arm of it opens nothing.
+            tailers.apply(arm("t", &rollout, Some("turn-1")));
+            assert!(!tailers.is_armed("t"));
+        }
     }
 
     /// PRD #1497 re-audit R3.2: a reply-less `Stop` that reaches the daemon

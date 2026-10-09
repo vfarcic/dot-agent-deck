@@ -12,11 +12,10 @@
 //! same report that would have carried the text. So each turn end a producer
 //! reports is published as one frame, and a subscriber never has to guess from
 //! the agent's status and a timer whether a turn ended without a reply.
-//! [`TurnReplyHub::publish`] defines the one de-duplication there is, and what
-//! it does not cover: it keeps a Codex turn reported by both its `Stop` hook
-//! and its rollout to one frame when both reports name the turn and nothing
-//! else is recorded for that agent between them. A subscriber that falls
-//! behind has its stream ended as lagged.
+//! [`TurnReplyHub::publish`] defines the one de-duplication there is, which
+//! can keep a Codex turn reported by both its `Stop` hook and its rollout to
+//! one frame; the conditions under which it does are stated there and only
+//! there. A subscriber that falls behind has its stream ended as lagged.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

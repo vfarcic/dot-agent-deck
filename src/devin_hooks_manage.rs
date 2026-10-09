@@ -345,8 +345,9 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
     // install's retired-event hook is left in place by install, with the two
     // exceptions the Codex writer applies (PRD #1497 audit F4,
     // `remediate_retired_deck_handlers`): one whose executable has no safe
-    // spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper
-    // is rebuilt into the current form in place. `uninstall_impl` still clears
+    // spelling is removed, and one in the legacy `DOT_AGENT_DECK_BIN` wrapper,
+    // or one whose executable needs quoting and is not spelled as the current
+    // command for it, is rebuilt into the current form in place. `uninstall_impl` still clears
     // every deck-signature command wide.
     //
     // An event key left empty IS dropped by this INSTALL sweep, while Codex's
@@ -366,7 +367,8 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
                 arr,
                 command_is_deck_owned,
                 deck_command_executable,
-                |exe| crate::agent_hook_config::build_command(exe, HOOK_COMMAND_SUFFIX, HOOK_SHELL),
+                HOOK_COMMAND_SUFFIX,
+                HOOK_SHELL,
                 crate::agent_hook_config::EmptiedRule::Drop,
             );
             if arr.is_empty() {
