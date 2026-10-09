@@ -1148,6 +1148,15 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // which events a NEWER daemon refuses, which a version number cannot
     // express.
     "318-hook-event-capability-token",
+    // Issue #463, at 10 without moving it -- the #555 shape. An orchestration
+    // `StartAgent` (or `StartPreparedAgent`) whose membership carries no per-tab
+    // `orchestration_id` used to be served, its pane routed on the legacy
+    // `(name, orchestration_cwd)` identity; a newer daemon refuses it with
+    // `START_ERR_ORCHESTRATION_ID_REQUIRED` before anything spawns. Only a client
+    // older than v0.35.0 sends that shape, and those are no longer supported.
+    // `orchestration_id` stays optional on the wire. What changed is which
+    // starts are refused, which a version number cannot express.
+    "463-orchestration-start-requires-instance-token",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1399,6 +1408,14 @@ pub const PROJECT_ERR_WRONG_START_VERB: &str = "wrong-start-verb";
 /// put the new-pane form back with its collision warning rather than reporting
 /// a generic pane-spawn failure; any other client just shows the sentence.
 pub const START_ERR_ORCHESTRATION_TITLE_IN_USE: &str = "orchestration-title-in-use";
+
+/// Issue #463: the stable prefix of the [`AttachRequest::StartAgent`] (and
+/// [`AttachRequest::StartPreparedAgent`]) refusal a start earns when it carries
+/// a [`TabMembership::Orchestration`] with no `orchestration_id`. Only a client
+/// predating v0.35.0 (PRD #140) sends that shape; such clients are no longer
+/// supported, and a daemon before #463 routed the pane on the legacy
+/// `(name, cwd)` tuple instead of refusing it.
+pub const START_ERR_ORCHESTRATION_ID_REQUIRED: &str = "orchestration-id-required";
 
 /// Issue #1396 item 2: the stable prefix of the [`AttachRequest::StartAgent`]
 /// refusal a start earns when its `cwd` is not a directory — it does not exist,
@@ -4005,59 +4022,64 @@ struct OrchestrationSpawnMeta {
     role_name: String,
     /// Whether this pane is the orchestrator (start) role.
     is_start_role: bool,
-    /// Round-11 auditor #C: the tab-wide cwd, the `NameCwd` disambiguator.
+    /// Round-11 auditor #C: the tab-wide cwd. No longer part of the routing
+    /// identity (issue #463), but still the directory the run-title check
+    /// scopes by.
     orchestration_cwd: Option<String>,
-    /// PRD #140: the per-tab instance token, when the client stamped one.
-    orchestration_id: Option<String>,
+    /// PRD #140: the per-tab instance token. Required since issue #463 — the
+    /// handler refuses a membership without one before this is built.
+    orchestration_id: String,
     /// Issue #555: the run title the client stamped, if any — what the
     /// daemon's uniqueness check resolves and records.
     display_title: Option<String>,
 }
 
 impl OrchestrationSpawnMeta {
-    /// The routing identity this pane registers under.
+    /// The routing identity this pane registers under: the per-tab instance
+    /// token (PRD #140 M2.0) plus the config name.
     ///
-    /// Round-11 auditor #C: scope the orchestration identity by
-    /// `(name, orchestration_cwd)` so two unnamed orchestrations in different
-    /// cwds (`~/a/foo` and `~/b/foo`, both resolving `name` to "foo") don't
-    /// collide. The `orchestration_cwd` is shared across every role pane in one
-    /// orchestration tab (round-9 #2: per-pane cwd may diverge, but the
-    /// orchestration's identity does not). Older clients that don't carry the
-    /// field fall back to `StartAgent.cwd` — preserves backwards compat at the
-    /// cost of re-opening the collision; `Some` vs `None` is detectable so this
-    /// is documented behavior, not a silent misroute.
+    /// Issue #463: a client predating the token used to fall back to the
+    /// round-11 `(name, orchestration_cwd)` tuple, which cannot tell two tabs
+    /// of one orchestration in one directory apart. Such a client is no longer
+    /// supported and its start is refused with
+    /// [`START_ERR_ORCHESTRATION_ID_REQUIRED`], so the token is always there.
     ///
-    /// PRD #140 M2.0: prefer the per-tab instance token when the client stamped
-    /// one. Two tabs of the same orchestration in the same directory produce
-    /// identical `(name, cwd)` pairs, so the tuple alone cannot tell their panes
-    /// apart and delegate / work-done cross-deliver between them (issue #140). A
-    /// client predating the token falls back to the round-11 tuple — same
-    /// routing behaviour as before, so old and new clients coexist on one daemon.
-    ///
-    /// Issue #555: computed BEFORE the spawn now (it used to be built after it),
+    /// Issue #555: computed BEFORE the spawn (it used to be built after it),
     /// because the run-title check that scopes by it has to run before the
     /// registry insert.
-    fn identity(&self, cwd: Option<&str>) -> crate::state::OrchestrationIdentity {
-        match &self.orchestration_id {
-            Some(id) => crate::state::OrchestrationIdentity::Instance {
-                id: id.clone(),
-                name: self.name.clone(),
-            },
-            None => crate::state::OrchestrationIdentity::NameCwd {
-                name: self.name.clone(),
-                cwd: self.orchestration_cwd(cwd),
-            },
+    fn identity(&self) -> crate::state::OrchestrationIdentity {
+        crate::state::OrchestrationIdentity {
+            id: self.orchestration_id.clone(),
+            name: self.name.clone(),
         }
     }
 
     /// The tab-wide orchestration cwd, falling back to `StartAgent.cwd` for a
-    /// client that sends none (see [`Self::identity`]).
+    /// client that sends none. The run-title check's directory.
     fn orchestration_cwd(&self, cwd: Option<&str>) -> String {
         self.orchestration_cwd
             .clone()
             .or_else(|| cwd.map(str::to_string))
             .unwrap_or_default()
     }
+}
+
+/// Issue #463 test seam: whether this daemon serves an orchestration start with
+/// no `orchestration_id` the way a daemon before #463 did, instead of refusing
+/// it. The only way an L2 test can put such a record in front of a real TUI —
+/// the state a current TUI meets when it reattaches to an older daemon still
+/// running an old client's orchestration — is a daemon that accepted the start.
+///
+/// `false` in every build without the `e2e` feature, whatever the environment
+/// says: `cfg!` folds the read away there, so no release binary can be told to
+/// serve the retired shape. Under `e2e` it is opt-in per process with
+/// `DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION=1`. A start it lets
+/// through registers no role (`OrchestrationSpawnMeta` needs the token), which
+/// is what such a pane looks like to the routing maps of a current daemon.
+fn serves_tokenless_orchestration_for_test() -> bool {
+    cfg!(feature = "e2e")
+        && std::env::var_os("DOT_AGENT_DECK_TEST_SERVE_TOKENLESS_ORCHESTRATION")
+            .is_some_and(|v| v == "1")
 }
 
 /// Issue #1445: [`AttachRequest::RecordOrchestratorContext`]'s handling — check
@@ -4898,6 +4920,40 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+            // Issue #463: an orchestration membership must carry the per-tab
+            // `orchestration_id`. Every client since v0.35.0 (PRD #140) stamps
+            // one; a pane without it used to be routed on the `(name, cwd)`
+            // tuple, which cannot keep two tabs of one orchestration in one
+            // directory apart. Clients that old are no longer supported
+            // (`docs/develop/versioning.md`), and the daemon ignores
+            // `client_version`, so it is this refusal — not a client-side check
+            // — that stops an older TUI from registering a pane under an
+            // identity it shares with a sibling tab. Refused before anything
+            // spawns, so nothing is started.
+            if let Some(TabMembership::Orchestration {
+                name,
+                orchestration_id: None,
+                ..
+            }) = tab_membership.as_ref()
+                && !serves_tokenless_orchestration_for_test()
+            {
+                info!(
+                    orchestration = %crate::config_validation::escape_id_for_log(name),
+                    "start-agent refused: the orchestration membership carries no \
+                     orchestration_id (a client predating v0.35.0)"
+                );
+                write_resp(
+                    &mut stream,
+                    &AttachResponse::err(format!(
+                        "{START_ERR_ORCHESTRATION_ID_REQUIRED}: the orchestration membership \
+                         carries no orchestration_id. This daemon no longer accepts \
+                         orchestration panes from clients older than v0.35.0; upgrade the \
+                         client to this daemon's version. Nothing was started."
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
 
             // PRD #819 audit follow-up: a token reaches this arm ONLY by having
             // arrived on `start-prepared-agent`, which the normalisation above
@@ -5098,22 +5154,23 @@ async fn handle_connection(
                 .map(|(_, v)| v.clone())
                 .filter(|v| is_valid_pane_id_env(v));
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
-            // the membership so the daemon can use it (not StartAgent.cwd)
-            // as the disambiguator in `pane_orchestration_map`. This keeps
-            // round-9 #2's "workers can have different per-pane cwds"
-            // contract intact — pane_cwd_map gets StartAgent.cwd
-            // per-pane, but pane_orchestration_map keys on the shared
-            // orchestration cwd from the TabMembership.
-            // PRD #140 M2.0: also pull the per-tab `orchestration_id` so the
-            // identity can key on it when present (see below).
+            // the membership — the shared orchestration cwd, not
+            // StartAgent.cwd, which may diverge per pane (round-9 #2). Since
+            // issue #463 it no longer keys `pane_orchestration_map`; the
+            // run-title check below scopes by it.
+            // PRD #140 M2.0: also pull the per-tab `orchestration_id`, which
+            // the identity keys on (see below).
             let orchestration_meta: Option<OrchestrationSpawnMeta> =
                 tab_membership.as_ref().and_then(|tm| match tm {
+                    // Issue #463: a token-less membership was refused above
+                    // (outside `serves_tokenless_orchestration_for_test`), and
+                    // one let through registers no role, as below.
                     TabMembership::Orchestration {
                         name,
                         role_name,
                         is_start_role,
                         orchestration_cwd,
-                        orchestration_id,
+                        orchestration_id: Some(orchestration_id),
                         display_title,
                         ..
                     } if !role_name.is_empty() => Some(OrchestrationSpawnMeta {
@@ -5208,7 +5265,7 @@ async fn handle_connection(
             let title_claim: Option<crate::state::OrchestrationIdentity> =
                 match (pane_id_env.as_deref(), orchestration_meta.as_ref()) {
                     (Some(_), Some(meta)) if membership_is_kept => {
-                        let identity = meta.identity(cwd_for_state.as_deref());
+                        let identity = meta.identity();
                         let orch_cwd = crate::state::orchestration_title_cwd_key(
                             &meta.orchestration_cwd(cwd_for_state.as_deref()),
                         )
@@ -5404,7 +5461,7 @@ async fn handle_connection(
                         // for why this must not be inlined again. The identity
                         // is the one the title check above scoped by
                         // (`OrchestrationSpawnMeta::identity`).
-                        let identity = meta.identity(cwd_for_state.as_deref());
+                        let identity = meta.identity();
                         let mut state = state.write().await;
                         state.register_orchestration_role(
                             pane_id,
@@ -7381,7 +7438,7 @@ mod tests {
                 .expect("date the file back");
         }
 
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: "a".to_string(),
             name: "loop".to_string(),
         };
@@ -9346,7 +9403,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             seed: None,
@@ -9372,7 +9429,7 @@ mod tests {
                         is_start_role: false,
                         orchestration_cwd: None,
                         display_title: None,
-                        orchestration_id: None,
+                        orchestration_id: Some("orch-test-0".to_string()),
                     })
                 );
             }
@@ -9397,7 +9454,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             agent_type: None,
             rows: 0,
@@ -11300,7 +11357,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: Some(cwd.clone()),
                 display_title: None,
-                orchestration_id: None,
+                orchestration_id: Some("orch-test-0".to_string()),
             }),
             ..start("cat -v", "role-1540")
         };

@@ -2612,10 +2612,8 @@ pub struct OrchestrationSurface {
     /// Optional user-facing tab title; `None` falls back to `name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
-    /// Issue #868: the PRD #140 per-tab `Instance` orchestration
-    /// id, when the producer has one — additive, so an older daemon's surface
-    /// (or a `NameCwd`-identity orchestration, which has no such token)
-    /// carries `None`. `TabManager::orchestration_tab_index_for` requires this
+    /// Issue #868: the PRD #140 per-tab orchestration id, when the producer
+    /// has one — additive, so an older daemon's surface carries `None`. `TabManager::orchestration_tab_index_for` requires this
     /// to match a candidate tab's own stored id whenever BOTH sides carry one,
     /// rather than falling back to the bare `(cwd, name)` tuple, which cannot
     /// tell two same-named same-cwd orchestration instances apart.

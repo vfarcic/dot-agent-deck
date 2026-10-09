@@ -179,10 +179,10 @@ pub enum Tab {
         /// always returns the full supervisory view. It is pure presentation —
         /// nothing about it reaches the daemon.
         zoomed: bool,
-        /// Issue #868: the PRD #140 per-tab `Instance`
+        /// Issue #868: the PRD #140 per-tab
         /// orchestration id this tab was opened under, when it has one —
-        /// `None` for a `NameCwd`-identity orchestration or a tab opened
-        /// before this field existed. [`TabManager::orchestration_tab_index_for`]
+        /// `None` for a tab opened without one (a test fixture, or a caller
+        /// that has no surface to read it from). [`TabManager::orchestration_tab_index_for`]
         /// requires this to match a candidate surface's own token whenever
         /// BOTH sides carry one, rather than falling back to the bare
         /// `(cwd, name)` tuple that cannot tell two same-named, same-cwd
@@ -1114,12 +1114,11 @@ impl TabManager {
         // (the pre-fix behaviour). The IDENTITY still derives from
         // `resolve_orchestration_name` below — this is title-only.
         display_title: Option<&str>,
-        // Issue #868: the PRD #140 per-tab `Instance`
+        // Issue #868: the PRD #140 per-tab
         // orchestration id this tab's role panes were hydrated/spawned under
         // -- `bucket.orchestration_id` at the hydration/reconnect call sites,
         // the daemon's `OrchestrationSurface.orchestration_id` at the live
-        // `pane spawn` call site, `None` for a token-less (`NameCwd`)
-        // orchestration or an older daemon. Stored on the built tab so
+        // `pane spawn` call site, `None` where the caller has neither. Stored on the built tab so
         // `Self::orchestration_tab_index_for` can match by instance instead
         // of the bare `(cwd, name)` tuple.
         orchestration_id: Option<&str>,
@@ -2057,9 +2056,9 @@ mod tests {
     fn dead_slot_pane_for_role_names_only_dead_slots() {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc);
-        let identity = crate::state::OrchestrationIdentity::NameCwd {
+        let identity = crate::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
             name: "team".into(),
-            cwd: "/work".into(),
         };
         let dead = crate::ui::dead_slot_pane_id(&identity, 1);
         let (idx, _) = tm
@@ -2089,9 +2088,9 @@ mod tests {
     fn forget_externally_closed_pane_removes_the_tab_with_its_last_live_pane() {
         let pc = Arc::new(MockPaneController::new());
         let mut tm = TabManager::new(pc);
-        let identity = crate::state::OrchestrationIdentity::NameCwd {
+        let identity = crate::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
             name: "team".into(),
-            cwd: "/work".into(),
         };
         let dead = crate::ui::dead_slot_pane_id(&identity, 1);
         let config = orch_config_4("team");
