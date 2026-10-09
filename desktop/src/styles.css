@@ -1026,6 +1026,19 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
+.upgrade-dialog { width: min(440px, 100%); }
+.upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }
+.upgrade-stages { list-style: none; margin: 12px auto 4px; padding: 0; max-width: 320px; display: grid; gap: 5px; text-align: left; font-size: 10.5px; }
+.upgrade-stages li { display: flex; align-items: center; gap: 7px; color: var(--muted); }
+.upgrade-stages li[data-state="active"] { color: var(--ink); font-weight: 600; }
+.upgrade-stages li[data-state="done"] { color: var(--ink); }
+.upgrade-stage-dot { width: 14px; height: 14px; display: inline-grid; place-items: center; }
+.upgrade-stage-dot::after { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
+.upgrade-stop-list { margin: 0 auto 12px; padding: 7px 10px 7px 24px; max-width: 360px; max-height: 180px; overflow: auto; text-align: left; font-size: 10px; line-height: 1.5; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); overflow-wrap: anywhere; }
+.upgrade-dialog [data-testid="upgrade-decision"] > div:last-child, .upgrade-dialog [data-testid="upgrade-outcome"] > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* The decision and outcome bodies are the dialog's last child, so `.confirm-dialog > div:last-child` (the button row rule) would lay their sentences, list and buttons out side by side. They stack; only their own last child is a button row. */
+.confirm-dialog.upgrade-dialog > div[data-testid="upgrade-decision"], .confirm-dialog.upgrade-dialog > div[data-testid="upgrade-outcome"] { display: block; }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step
@@ -1104,6 +1117,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-banner button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 3px; color: inherit; background: transparent; cursor: pointer; }
 .daemon-new-agent { flex: 0 0 auto; margin-left: auto; }
 .daemon-pips + .daemon-new-agent { margin-left: 0; }
+.daemon-upgrade { flex: 0 0 auto; margin-left: auto; }
+.daemon-pips + .daemon-upgrade { margin-left: 0; }
+.daemon-upgrade + .daemon-new-agent { margin-left: 0; }
 /* Lifted clear of the voice row (see `.voice-row`). It is z-index 120 and would
    otherwise sit on top of the report text, which is the same corner. The STACK
    is what is positioned (issue #1234): each undismissed cleanup warning is its

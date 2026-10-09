@@ -6,6 +6,7 @@ import { agentKey } from "./lib/agentKey";
 import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto } from "./lib/bridge";
 import { LaunchCleanupError } from "./lib/actionError";
+import type { UpgradeEvent, UpgradeOutcome } from "./lib/upgrade";
 import type { AgentSession, DaemonOrchestration, DaemonProject, DaemonResolvedProject, DeckRuntimeState, SendResult } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
@@ -67,6 +68,10 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     terminalData: {},
     clearError: vi.fn(),
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
+    // PRD #1487 M5: Upgrade and Replace daemon. A daemon that restarts with
+    // nothing running unless a test says otherwise.
+    upgradeDaemon: vi.fn(async () => ({ outcome: "restarted", fromVersion: "0.44.0", toVersion: "0.45.0", stopped: { agents: [], roles: [] } }) as UpgradeOutcome),
+    decideUpgrade: vi.fn(async () => undefined),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
@@ -1496,7 +1501,7 @@ describe("ControlDeck", () => {
     expect(screen.getByText("Local daemon stopped.")).toBeVisible();
   });
 
-  /** Scenario: Replaces an incompatible zero-agent daemon through an explicit confirmation. */
+  /** Scenario: Replaces an incompatible zero-agent daemon through an explicit confirmation, on the shared upgrade path. */
   it("replaces an incompatible zero-agent daemon through an explicit confirmation", async () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];
@@ -1510,18 +1515,133 @@ describe("ControlDeck", () => {
       daemonDetected: true,
       runningAgentCount: 0,
     };
-    const runAction = vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult);
-    const live = runtime({ mode: "live", snapshot: incompatible, runAction });
+    incompatible.connection.deckId = "deck-local";
+    const live = runtime({ mode: "live", snapshot: incompatible });
     render(<ControlDeck runtime={live} />);
 
     expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
     fireEvent.click(screen.getByTestId("replace-daemon"));
-    expect(live.runAction).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog")).toHaveTextContent("exact build bundled with this desktop app");
-    fireEvent.click(screen.getAllByRole("button", { name: "Replace daemon" }).at(-1)!);
+    expect(live.upgradeDaemon).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("starts the one that came with this app");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
 
-    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "restart_daemon" }));
-    expect(screen.getByText("Matching daemon started and reconnected.")).toBeVisible();
+    // PRD #1487 D10: the local deck, through the shared procedure — no
+    // `restart_daemon` action exists any more.
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledWith("deck-local", expect.any(Function)));
+    expect(live.runAction).not.toHaveBeenCalled();
+    expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("now runs 0.45.0");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon replaced");
+  });
+
+  /**
+   * PRD #1487 D10: Replace daemon is no longer withheld while agents run. The
+   * daemon names each one and the dialog asks; Keep current daemon stops
+   * nothing and says so.
+   */
+  /** Scenario: Offers Replace daemon while agents run, names them in the question, and keeps the daemon when told to. */
+  it("offers Replace daemon while agents run and asks before stopping them", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "deck-local",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      deckKind: "local",
+      message: "build mismatch",
+      daemonDetected: true,
+      runningAgentCount: 2,
+    };
+    const atStake = { agents: [{ id: "1", label: "coder", paneId: "4", cwd: "/work/app" }], roles: [{ paneId: "4", role: "coder", orchestration: "tdd", isOrchestrator: false }] };
+    const upgradeDaemon = vi.fn(async (deckId: string, onEvent: (event: UpgradeEvent) => void) => {
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "installing" } });
+      onEvent({ type: "progress", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", progress: { stage: "restarting" } });
+      onEvent({ type: "decision", deckId, attemptId: "attempt-1", upgradeId: "upgrade-1", questionId: 1, atStake, stale: false });
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { outcome: "installed-not-restarted", fromVersion: "0.44.0", installedVersion: "0.45.0", reason: { kind: "kept-by-user", atStake } } as UpgradeOutcome;
+    });
+    let release!: () => void;
+    const live = runtime({ mode: "live", snapshot: incompatible, upgradeDaemon });
+    render(<ControlDeck runtime={live} />);
+
+    expect(textOutsideDisclosures(screen.getByRole("alert"))).toMatch(/2 agents are running on it, and you are shown which before any is stopped/);
+    fireEvent.click(screen.getByTestId("replace-daemon"));
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+
+    const question = await screen.findByTestId("upgrade-decision");
+    expect(question).toHaveTextContent("stops 1 agent and 1 orchestration role");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Agent coder (pane 4, in /work/app)");
+    expect(within(question).getByTestId("upgrade-at-stake")).toHaveTextContent("Role coder of tdd, pane 4");
+    fireEvent.click(screen.getByTestId("upgrade-keep-current"));
+    expect(live.decideUpgrade).toHaveBeenCalledWith("upgrade-1", 1, "keep-current");
+    release();
+
+    const outcome = await screen.findByTestId("upgrade-outcome");
+    expect(outcome).toHaveAttribute("data-tone", "neutral");
+    expect(outcome).toHaveTextContent("as you chose");
+    expect(outcome).toHaveTextContent("Press Replace daemon again when they have finished.");
+    fireEvent.click(screen.getByTestId("upgrade-close"));
+    expect(screen.queryByTestId("upgrade-dialog")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: Offers Upgrade in the Daemons-screen banner for an older refused remote daemon, and runs it against that deck. */
+  it("offers Upgrade in the banner for an older refused remote daemon", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      deckId: "deck-remote",
+      socketPath: "dev@build-box",
+      deckKind: "remote",
+      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      message: "This daemon is older than this app.",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: true,
+      upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" },
+    };
+    const live = runtime({ mode: "live", snapshot: incompatible });
+    render(<ControlDeck runtime={live} />);
+
+    const banner = screen.getByRole("alert");
+    const buttons = within(banner).getAllByRole("button").map((button) => button.textContent?.trim() ?? "");
+    expect(buttons).toEqual(["Upgrade", "Connect anyway", "Reconnect"]);
+    expect(textOutsideDisclosures(banner)).toMatch(/Upgrade installs this app's version on that machine/);
+    // In the banner, so not on the top bar as well.
+    expect(screen.queryByTestId("upgrade-daemon")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("upgrade-daemon-banner"));
+    expect(screen.getByTestId("upgrade-confirm-body")).toHaveTextContent("installs 0.45.0 on dev@build-box (its daemon runs 0.44.0 now)");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    await waitFor(() => expect(live.upgradeDaemon).toHaveBeenCalledWith("deck-remote", expect.any(Function)));
+    expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("The daemon on dev@build-box now runs 0.45.0 (it was 0.44.0).");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Daemon upgraded");
+  });
+
+  /** Scenario: Offers Upgrade on the top bar for a connected remote daemon on an older release, and never for one at the app's release. */
+  it("offers Upgrade on the top bar only when the crate offers it", () => {
+    const connected = createFixtureSnapshot("connected");
+    connected.connection = {
+      status: "connected",
+      deckId: "deck-remote",
+      socketPath: "dev@build-box",
+      deckKind: "remote",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount: 4,
+      upgradeOffer: { kind: "offered", from: "0.44.0", to: "0.45.0" },
+    };
+    const { unmount } = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
+    expect(screen.getByTestId("upgrade-daemon")).toBeVisible();
+    unmount();
+
+    for (const upgradeOffer of [{ kind: "current" }, { kind: "daemon-newer", daemon: "0.46.0" }, { kind: "unknown" }] as const) {
+      const current = structuredClone(connected);
+      current.connection.upgradeOffer = upgradeOffer;
+      const view = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: current })} />);
+      expect(screen.queryByTestId("upgrade-daemon"), upgradeOffer.kind).not.toBeInTheDocument();
+      view.unmount();
+    }
   });
 
   /**
@@ -1550,12 +1670,12 @@ describe("ControlDeck", () => {
     const live = runtime({ mode: "live", snapshot: incompatible, runAction, reconnect });
     render(<ControlDeck runtime={live} />);
 
-    // Replacement stays refused: it is the one that would kill nine agents.
-    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
-    // And the banner says why it is not there, rather than leaving a gap.
+    // PRD #1487 D10: Replace is offered beside it now, and says it will ask
+    // before stopping the nine agents rather than being withheld.
+    expect(screen.getByTestId("replace-daemon")).toBeVisible();
     const banner = screen.getByRole("alert");
     expect(banner).toHaveTextContent("Incompatible daemon");
-    expect(textOutsideDisclosures(banner)).toMatch(/Replace daemon is not offered while 9 agents are running on this daemon/);
+    expect(textOutsideDisclosures(banner)).toMatch(/9 agents are running on it, and you are shown which before any is stopped/);
 
     fireEvent.click(screen.getByTestId("connect-anyway"));
     expect(runAction).not.toHaveBeenCalled();
@@ -1732,8 +1852,8 @@ describe("ControlDeck", () => {
     expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
   });
 
-  /** Scenario: Does not offer daemon replacement while an incompatible daemon reports live agents. */
-  it("does not offer daemon replacement while an incompatible daemon reports live agents", () => {
+  /** Scenario: Offers daemon replacement while an incompatible daemon reports live agents, since the replacement now asks first (PRD #1487 D10). */
+  it("offers daemon replacement while an incompatible daemon reports live agents", () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];
     incompatible.connection = {
@@ -1744,7 +1864,7 @@ describe("ControlDeck", () => {
     };
     render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
 
-    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+    expect(screen.getByTestId("replace-daemon")).toBeVisible();
     expect(screen.getByRole("button", { name: "Stop daemon" })).toBeEnabled();
   });
 

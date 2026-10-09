@@ -168,20 +168,31 @@
 # `close` closes a VIEW rather than a terminal pane — see the comment above that
 # row, because the two are one word apart in speech.
 
+# Issue #1495 — "select", "go to" and "switch to" open an agent too, and the
+# NOUN decides: "select dispatcher agent" is this row, "select build box daemon"
+# is `switch_deck`, which keeps "select" and "switch" (#1491). A model that
+# picks this row for a daemon is refused by the resolver, since no agent is
+# called the build box; one that picks `switch_deck` for an agent is refused
+# the same way by `deck_ref`. Neither runs the wrong thing.
 [[commands]]
 id          = "open_agent"
 description = """Open one agent's pane over the current screen, so the user can watch that one
-agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see or look at ONE
-named agent, or to see only that one ("everything except the tester") — including "open tester
-agent", the accessible name of a dashboard row's open control. The agent is named the way the screen shows it — a role like "tester" or
-"orchestrator", or a name the user gave it."""
+agent's terminal. Use when the user asks to focus on, enlarge, zoom, open, show, see, look at,
+select, go to or switch to ONE agent, or to see only that one ("everything except the tester") —
+including "open tester agent", the accessible name of a dashboard row's open control, and "select
+dispatcher agent". The agent may be named as the screen shows it (a role like "tester", or a name
+the user gave it), by anything `agents_on_screen` says about it — its mode, agent type,
+directory, orchestration, daemon or start order — or by what it was asked to do. Set `agent` to the
+user's own words ("dispatcher", "the Claude agent", "the newest agent", "the one fixing the
+scroll"), except for an agent named by what it is doing now (its status or its tool): for that
+one, its `label`."""
 invoke      = "openAgent"
 screens     = ["deck", "overview"]
 unavailable_hint = "opening an agent works from the Daemons screen or the agent dashboard"
 report      = "Opening {agent}."
 asks_to     = "open an agent's pane"
 try_saying  = "open {agent}"
-heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch", "except"]
+heard_as    = ["open", "show", "see", "focus", "enlarge", "zoom", "look", "watch", "except", "select", "go to", "switch to"]
 
   [[commands.params]]
   name = "agent"
@@ -744,7 +755,8 @@ description = """Clear the open agent's prompt: the app deletes everything typed
 nothing. A typing-mode command, answered by the app itself while typing mode is on, when the
 WHOLE utterance is "clear the prompt", "clear prompt", "clear it", "clear all", "clear everything"
 or "delete everything". Outside typing mode the app answers these by asking the user to turn
-typing mode on first."""
+typing mode on first. On any other screen, still pick THIS one for those words — never `none`:
+it cannot run there, and the app tells the user where it works."""
 invoke      = "clearAgentPrompt"
 screens     = ["agent"]
 unavailable_hint = "clearing a prompt works in an agent's pane, in typing mode"
@@ -919,6 +931,11 @@ report      = "Going up."
 asks_to     = "go up a directory"
 try_saying  = "go up"
 heard_as    = ["parent", "up", "back", "dot dot"]
+# "Go up" is this row in the New agent dialog and `scroll_up` on the dashboard,
+# and the two need exact complements (a parent on screen; the dialog closed).
+# A pick of either where it cannot run goes to the other only for a bare "go
+# up" — words naming a folder or a scroll keep it (`outcome::go_up_elsewhere`,
+# #1495; `scroll-up-go-up` was red on main).
 
 [[commands]]
 id          = "use_this_directory"
@@ -1538,7 +1555,8 @@ shut it down, end that agent, terminate the one that is stuck. Set `agent` the w
 does. It never stops anything by itself: the app shows the same confirmation the row's button shows
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
-"close the tester" close the VIEW (`close`) and stop nothing. Ending a whole orchestration is
+"close the tester" close the VIEW (`close`) and stop nothing — and "start" is its opposite: "start
+it" is never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"

@@ -54,10 +54,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use dot_agent_deck::daemon_client::{ClientError, DaemonClient};
+use dot_agent_deck::daemon_client::{ClientError, DaemonClient, GatedQuery, RestartDaemonRequest};
 use dot_agent_deck::daemon_protocol::{
     AttachResponse, CAP_LIST_PROJECTS, CAP_PREPARE_ORCHESTRATION, CAP_RESOLVE_PROJECT,
-    DAEMON_CAPABILITIES, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
+    CAP_RESTART_DAEMON, DAEMON_CAPABILITIES, KIND_REQ, PROTOCOL_VERSION, RestartSuccessor,
+    read_frame, write_resp,
 };
 use dot_agent_deck::event::{KnownProject, ProjectListing};
 use spec::spec;
@@ -91,6 +92,8 @@ enum CapabilityScript {
     /// serve loop turns into `malformed request: unknown variant …`
     /// (`src/daemon_protocol.rs:1782-1789`), the text nothing may branch on.
     Silent,
+    /// A peer with a present capability set that lacks only the restart verb.
+    WithoutRestart,
 }
 
 /// A protocol-faithful synthetic daemon on its own attach socket, which records
@@ -207,6 +210,15 @@ async fn handle_connection(
         // The pre-PRD-#819 shape: a well-formed handshake with no
         // `capabilities` key at all.
         ("hello", CapabilityScript::Silent) => AttachResponse::hello(PROTOCOL_VERSION),
+        ("hello", CapabilityScript::WithoutRestart) => {
+            let mut response = AttachResponse::hello(PROTOCOL_VERSION).with_capabilities();
+            response
+                .capabilities
+                .as_mut()
+                .unwrap()
+                .retain(|cap| cap != CAP_RESTART_DAEMON);
+            response
+        }
         (op, CapabilityScript::Advertising) if op == CAP_LIST_PROJECTS => {
             let mut resp = AttachResponse::ok();
             resp.projects = Some(ProjectListing {
@@ -234,14 +246,7 @@ async fn handle_connection(
         .expect("reply to scripted daemon request");
 }
 
-/// Scenario: Stand up a synthetic daemon on a real attach socket whose `Hello`
-/// omits `capabilities` — an older daemon, exactly — and call the real
-/// `DaemonClient::list_projects` / `resolve_project` / `prepare_orchestration`
-/// against it; all three must be withheld, and the daemon's own request log
-/// must show nothing but the one handshake, proving no verb reached the wire
-/// and its refusal text was never read. Then repeat against a second synthetic
-/// daemon that DOES advertise: the same `list_projects` proceeds, the op
-/// appears in that daemon's log, and the scripted listing comes back.
+/// Scenario: Call the production project helpers against a socket peer that omits capabilities and prove its request log contains only Hello, then verify an advertising peer answers list-projects. Call the production restart helper against both an omitted capability field and a present set lacking restart-daemon; both must return Unsupported and log only Hello frames.
 #[spec("lifecycle/handshake/008")]
 #[test]
 fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
@@ -374,4 +379,36 @@ fn handshake_008_absent_capabilities_withhold_project_verbs_before_the_wire() {
         vec!["hello".to_string(), CAP_LIST_PROJECTS.to_string()],
         "the advertised verb reached the wire exactly once, after one handshake"
     );
+
+    // Both older-peer shapes must withhold before sending. Repeating on the
+    // same handle also pins the restart helper's fresh-Hello-per-call contract.
+    let without_restart = ScriptedDaemon::spawn(CapabilityScript::WithoutRestart);
+    for peer in [&silent, &without_restart] {
+        let client = DaemonClient::new(peer.path().to_path_buf());
+        for _ in [0, 1] {
+            let before = peer.requests();
+            let result = runtime
+                .block_on(client.restart_daemon(RestartDaemonRequest {
+                    confirm: None,
+                    expected_version: None,
+                    successor: RestartSuccessor::Installed,
+                }))
+                .expect("missing restart capability is an outcome, not a transport error");
+            assert!(
+                matches!(result, GatedQuery::Unsupported),
+                "older peer must return Unsupported: {result:?}"
+            );
+            let mut expected = before;
+            expected.push("hello".into());
+            assert_eq!(
+                peer.requests(),
+                expected,
+                "restart helper must probe afresh and send no restart or stop frame"
+            );
+            assert!(
+                !peer.requests().iter().any(|op| op == CAP_RESTART_DAEMON),
+                "capability-absent restart reached the wire"
+            );
+        }
+    }
 }

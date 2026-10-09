@@ -243,6 +243,7 @@ mod tests {
 
     fn snapshot(status: SessionStatus) -> SessionSnapshot {
         SessionSnapshot {
+            output_set_status: false,
             subagent_wait: None,
             status,
             agent_type: None,

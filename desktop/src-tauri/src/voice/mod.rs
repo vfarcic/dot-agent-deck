@@ -115,6 +115,13 @@ pub struct VoiceDeck {
     /// resolved anyway for the New agent dialog is reported as unable to take
     /// the agent rather than as preselected.
     pub unavailable: Option<String>,
+    /// Whether the agents a spoken `agent_ref` resolves against are this
+    /// deck's (issue #1495) — the deck `get_snapshot` read them from, which is
+    /// the selected deck, and this machine's under All daemons. It is what lets
+    /// "the agent on build box" name the daemon an agent is on, and what refuses
+    /// it when the agents voice can reach are on another one. At most one deck
+    /// carries it; none does when that deck is not in the observed fleet.
+    pub holds_agents: bool,
 }
 
 impl VoiceDeck {
@@ -701,6 +708,96 @@ pub mod test_support {
             detail: detail.map(str::to_string),
         });
         agent
+    }
+
+    /// Issue #1495 — agents whose labels say nothing about what they are
+    /// doing, the way a dispatcher's own name does not say "dispatcher". Each
+    /// is told apart only by a fact the deck holds beside the label: its mode,
+    /// its agent type, its directory, its orchestration, its last prompt (read
+    /// on this machine) or
+    /// when it started.
+    ///
+    /// - **Mercury** runs in the `dispatcher` mode, in `dot-agent-deck`, and
+    ///   started first.
+    /// - **Juno** is the one Codex agent, in `billing`, and was last asked to
+    ///   fix the scroll.
+    /// - **Vega** is a second Claude Code agent beside Mercury, in
+    ///   `docs-site`, and started last — the newest.
+    /// - two OpenCode **reviewers**, one in the `prd-1487` run and one in the
+    ///   `docs-1502` run, so "the reviewer" alone is a tie and the run's name
+    ///   breaks it.
+    pub fn facets_fleet() -> Vec<DesktopAgent> {
+        const STARTED: i64 = 1_790_000_000_000;
+        let named = |id: &str, name: &str, agent_type: &str, cli: &str, cwd: &str| {
+            let mut agent = agent(id, Some(name), agent_type);
+            agent.cli_name = Some(cli.to_string());
+            agent.cwd = Some(cwd.to_string());
+            agent.status = "working".to_string();
+            agent
+        };
+        let mut mercury = named(
+            "agent-mercury",
+            "Mercury",
+            "claude_code",
+            "claude",
+            "/home/dev/code/dot-agent-deck",
+        );
+        mercury.tab = DesktopTab::Mode {
+            name: "dispatcher".to_string(),
+        };
+        mercury.status = "idle".to_string();
+        mercury.spawned_at_ms = Some(STARTED);
+        let mut juno = named(
+            "agent-juno",
+            "Juno",
+            "codex",
+            "codex",
+            "/home/dev/code/billing",
+        );
+        juno.last_user_prompt =
+            Some("Fix the scroll jump when the terminal pane resizes".to_string());
+        juno.spawned_at_ms = Some(STARTED + 60_000);
+        let mut vega = named(
+            "agent-vega",
+            "Vega",
+            "claude_code",
+            "claude",
+            "/home/dev/code/docs-site",
+        );
+        vega.last_user_prompt = Some("Rewrite the install guide for Windows".to_string());
+        vega.spawned_at_ms = Some(STARTED + 600_000);
+        let reviewer = |id: &str, run: &str, config: &str, title: &str, cwd: &str, at: i64| {
+            let mut agent = in_titled_orchestration(role_agent(id, "reviewer"), run, config, title);
+            agent.agent_type = "open_code".to_string();
+            agent.cli_name = Some("opencode".to_string());
+            agent.cwd = Some(cwd.to_string());
+            agent.spawned_at_ms = Some(at);
+            if let DesktopTab::Orchestration { cwd: run_cwd, .. } = &mut agent.tab {
+                *run_cwd = Some(cwd.to_string());
+            }
+            agent
+        };
+        vec![
+            mercury,
+            juno,
+            vega,
+            reviewer(
+                "agent-review-1487",
+                "orch-1487",
+                "prd-review",
+                "prd-1487",
+                "/home/dev/code/dot-agent-deck-prd-1487",
+                STARTED + 120_000,
+            ),
+            reviewer(
+                "agent-review-docs",
+                "orch-docs",
+                "docs-review",
+                "docs-1502",
+                "/home/dev/code/handbook",
+                STARTED + 180_000,
+            ),
+        ]
     }
 }
 
