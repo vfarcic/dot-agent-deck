@@ -56,6 +56,7 @@ const { bridge } = vi.hoisted(() => ({
     voiceStatus: vi.fn(),
     voiceCancel: vi.fn(async () => {}),
     onVoiceReadingConsentOff: vi.fn(async () => () => {}),
+    onVoiceReadingConsentOn: vi.fn(async () => () => {}),
     setShownTerminals: vi.fn(async () => {}),
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(async () => { throw new Error("unresolved"); }),

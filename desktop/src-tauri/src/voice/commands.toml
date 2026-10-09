@@ -810,46 +810,47 @@ heard_as_whole = [
   "scratch the last prompt", "delete that", "undo that",
 ]
 
-# PRD #1497 — the reading MODE: the app speaks a short summary of each turn the
-# open agent finishes, and its permission prompts and errors as they happen.
+# PRD #1497 — reading: while Settings → Voice → Reading is on, the app speaks a
+# short summary of each turn every agent on the deck being viewed finishes, and
+# their permission prompts and errors as they happen.
 #
-# Shaped like typing mode's pair: `heard_as_whole`, so only an utterance that IS
+# Decisions 1–2 of 2026-10-09: the Settings switch is reading's ONLY state, and
+# this pair flips it — from any screen, through the same save as Settings, so
+# turning it off ends reading and revokes what is in flight exactly as the
+# switch does. Hence no `screens`: reading is not tied to a pane. Shaped like
+# typing mode's pair otherwise: `heard_as_whole`, so only an utterance that IS
 # one of these phrases switches anything, and answered locally ahead of the
 # model in every mode (`outcome::reading_intercept`), so "reading on" said while
-# typing starts reading instead of being typed. No target param: the mode
-# targets the pane on screen and ends when that pane does (D11) — the panel owns
-# the state (`VoiceControlPanel.tsx`, `lib/reading.ts`). The Settings opt-in
-# (D4) is checked by the app when the mode starts, not here: a row cannot see a
-# setting, and the refusal is spoken.
+# typing turns reading on instead of being typed. No param: the panel owns the
+# switch's save (`VoiceControlPanel.tsx`, `lib/reading.ts`).
 [[commands]]
 id          = "reading_on"
-description = """Start reading mode for the open agent: from now on the app speaks a short summary
-of each turn that agent finishes, and its permission prompts and errors as they happen. Use only
-when the WHOLE utterance is "reading on", "start reading", "reading mode on" or "read to me". It
-reads nothing already on screen."""
+description = """Turn on reading, the Settings switch: from now on the app speaks a short summary of
+each turn every agent on this deck finishes, and their permission prompts and errors as they
+happen, on any screen. Use only when the WHOLE utterance is "reading on", "start reading",
+"reading mode on" or "read to me". It reads nothing already on screen."""
 invoke      = "startReading"
-screens     = ["agent"]
-unavailable_hint = "reading needs an agent's pane open — open one first"
+unavailable_hint = "turning reading on works anywhere"
 report      = "Reading on."
-asks_to     = "start reading the agent's turns aloud"
+asks_to     = "turn reading on"
 try_saying  = "reading on"
 heard_as_whole = ["reading on", "start reading", "reading mode on", "read to me"]
 
 [[commands]]
 id          = "reading_off"
-description = """Stop reading mode, so the app no longer speaks the open agent's turns. Use only
-when the WHOLE utterance is "reading off", "stop reading", "reading mode off" or "done reading"."""
+description = """Turn off reading, the Settings switch, so the app no longer speaks the agents' turns.
+Use only when the WHOLE utterance is "reading off", "stop reading", "reading mode off" or "done
+reading"."""
 invoke      = "stopReading"
-screens     = ["agent"]
-unavailable_hint = "reading is only on in an agent's pane"
+unavailable_hint = "turning reading off works anywhere"
 report      = "Reading off."
-asks_to     = "stop reading the agent's turns aloud"
+asks_to     = "turn reading off"
 try_saying  = "reading off"
 heard_as_whole = ["reading off", "stop reading", "reading mode off", "done reading"]
 
 # PRD #1497 D6/D8 — silence the app's own speech. Callable on every screen,
-# because speech can still be playing after the pane it was about has closed,
-# and D6 is that "stop" or "quiet" always works. While the app is speaking it is
+# because reading speaks on every screen, and D6 is that "stop" or "quiet"
+# always works. While the app is speaking it is
 # the ONLY thing an utterance can do (D8): the microphone can hear the app, and
 # the worst that echo may then cause is the app silencing itself. The bare
 # "stop" forms (`voice::dictation::TYPING_STOP_PHRASES`) mean this only while

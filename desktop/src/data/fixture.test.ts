@@ -310,13 +310,16 @@ describe("browser fixture reading rows (PRD #1497)", () => {
     }
   });
 
-  /** Scenario: "reading on" in an agent's pane dispatches the switch, even in typing mode; on the dashboard it is refused with the row's hint. */
-  it("switches reading in an agent's pane, in every mode", () => {
+  /** Scenario: "reading on" and "stop reading" dispatch the switch in an agent's pane in every mode, and on the dashboard and the deck as well (decision 2 of 2026-10-09). */
+  it("switches reading on every screen, in every mode", () => {
     for (const typing of [false, true]) {
       expect(resolveFixtureVoice("reading on", "agent", typing).outcome).toMatchObject({ kind: "dispatch", action: "reading_on", invoke: "startReading" });
       expect(resolveFixtureVoice("stop reading", "agent", typing).outcome).toMatchObject({ kind: "dispatch", action: "reading_off" });
     }
-    expect(resolveFixtureVoice("reading on", "overview").outcome).toMatchObject({ kind: "unavailable", action: "reading_on" });
+    for (const screen of ["overview", "deck"] as const) {
+      expect(resolveFixtureVoice("reading on", screen).outcome).toMatchObject({ kind: "dispatch", action: "reading_on" });
+      expect(resolveFixtureVoice("reading off", screen).outcome).toMatchObject({ kind: "dispatch", action: "reading_off" });
+    }
   });
 
   /** Scenario (D8): while the app is speaking, "stop" and "quiet" silence it and everything else is dropped; with reading on outside typing mode a bare "stop" silences it too. */

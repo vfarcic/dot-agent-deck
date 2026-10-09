@@ -1357,7 +1357,7 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     typingOnly: true,
   },
   {
-    // PRD #1497 — reading mode's switches and the way of silencing the app,
+    // PRD #1497 — reading's switches and the way of silencing the app,
     // `voice::dictation::READING_ON_PHRASES`, `READING_OFF_PHRASES` and
     // `QUIET_PHRASES`, answered ahead of everything by
     // {@link fixtureReadingIntercept} as `outcome::reading_intercept` answers
@@ -1365,16 +1365,17 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     phrases: ["reading on", "start reading", "reading mode on", "read to me"],
     action: "reading_on",
     invoke: "startReading",
-    screens: ["agent"],
-    unavailableHint: "reading needs an agent's pane open — open one first",
+    // Every screen (decision 2 of 2026-10-09): the switch is not tied to a pane.
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "turning reading on works anywhere",
     report: "Reading on.",
   },
   {
     phrases: ["reading off", "stop reading", "reading mode off", "done reading"],
     action: "reading_off",
     invoke: "stopReading",
-    screens: ["agent"],
-    unavailableHint: "reading is only on in an agent's pane",
+    screens: ["deck", "overview", "agent"],
+    unavailableHint: "turning reading off works anywhere",
     report: "Reading off.",
   },
   {

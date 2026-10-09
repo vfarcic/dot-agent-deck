@@ -1,6 +1,6 @@
 /**
- * PRD #1497 M5 — the voice surface's reading mode and speech queue, built once
- * per mount from the runtime's seams.
+ * PRD #1497 — the voice surface's reader and speech queue, built once per
+ * mount from the runtime's seams.
  *
  * Besides the two objects, this keeps the one fact D8 needs: whether the app
  * spoke at any point during the segment the microphone is recording now. The
@@ -11,8 +11,8 @@
  * recording of the app's own voice ends after the voice does.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ReadingMode, type ReadingTarget } from "../lib/reading";
+import { useEffect, useMemo, useRef } from "react";
+import { DeckReader } from "../lib/reading";
 import { SpeechQueue, providerVoice, systemVoice } from "../lib/speech";
 import type { DeckRuntimeState } from "../types";
 
@@ -20,10 +20,8 @@ import type { DeckRuntimeState } from "../types";
 export const READING_NOT_IN_THIS_RUNTIME = "Reading is not available: this app cannot read an agent's turns here.";
 
 export interface UseReadingMode {
-  mode: ReadingMode;
+  reader: DeckReader;
   queue: SpeechQueue;
-  /** The agent being read, for the indicator. */
-  reading: ReadingTarget | undefined;
   /** End the current recording segment: answers whether the app spoke during it, and starts the next. */
   takeSegment: () => boolean;
   /** The microphone opened afresh: a new segment starts now. */
@@ -31,78 +29,89 @@ export interface UseReadingMode {
 }
 
 export function useReadingMode(
-  runtime: Pick<DeckRuntimeState, "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff">,
-  onChange?: (target: ReadingTarget | undefined) => void,
+  runtime: Pick<DeckRuntimeState, "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff" | "onVoiceReadingConsentOn">,
+  openPane: () => { deckId: string; agentId: string } | undefined,
   onProblem?: (reason: string) => void,
+  onReadingProblem?: (sentence: string) => void,
 ): UseReadingMode {
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
+  const openPaneRef = useRef(openPane);
+  openPaneRef.current = openPane;
   const onProblemRef = useRef(onProblem);
   onProblemRef.current = onProblem;
-  const [reading, setReading] = useState<ReadingTarget>();
-  /* Settles once this window can hear another window's consent-off save
-     (below); reading starts only after it, and not at all if it rejects. */
+  const onReadingProblemRef = useRef(onReadingProblem);
+  onReadingProblemRef.current = onReadingProblem;
+  /* Settles once this window can hear a consent-off save (below); reading
+     starts only after it, and not at all if it rejects. */
   const listening = useRef<Promise<void> | undefined>(undefined);
 
-  const { mode, queue } = useMemo(() => {
+  const { reader, queue } = useMemo(() => {
     const speech = new SpeechQueue({
       plan: () => runtimeRef.current.voiceSpeechPlan?.() ?? Promise.resolve({ kind: "system" as const }),
       provider: providerVoice((text) => runtimeRef.current.voiceSpeechAudio?.(text) ?? Promise.reject(new Error("this app has no speech service"))),
       system: systemVoice(),
       onProblem: (reason) => onProblemRef.current?.(reason),
     });
-    const reader = new ReadingMode({
+    const deckReader = new DeckReader({
       start: async (target, onSentence) => {
         const start = runtimeRef.current.voiceReadingStart;
-        if (start === undefined) return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME };
-        // A rejection here is a start that failed: reading refuses, saying so.
-        await listening.current;
+        if (start === undefined) return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME, scope: "deck" as const };
+        /* A window that cannot hear the switch go off never reads, and that is
+           about every agent, so it is said once. A rejection of the start
+           itself is that one agent's failure, said as such. */
+        try {
+          await listening.current;
+        } catch {
+          return { kind: "unavailable" as const, sentence: READING_NOT_IN_THIS_RUNTIME, scope: "deck" as const };
+        }
         return start(target, onSentence);
       },
       stop: (session) => runtimeRef.current.voiceReadingStop?.(session) ?? Promise.resolve(),
       speech,
-      onChange: (target) => {
-        setReading(target);
-        onChangeRef.current?.(target);
-      },
+      openPane: () => openPaneRef.current(),
+      onProblem: (sentence) => onReadingProblemRef.current?.(sentence),
     });
-    return { mode: reader, queue: speech };
+    return { reader: deckReader, queue: speech };
   }, []);
 
   const spoke = useRef(false);
   useEffect(() => queue.subscribe((speaking) => {
     if (speaking) spoke.current = true;
   }), [queue]);
-  /* A save from any window that turned reading's opt-in off ends reading
-     here too — a drain or a start in progress included, which the Rust side
-     has no session for (PR #1617's fourth review). Reading waits for this
-     listener, and a window that could not install it never reads: it would
-     not hear consent go off (PR #1617's fifth review). */
+  /* A save from any window that turned reading's switch off ends reading
+     here too — a start in progress included, which the Rust side has no
+     session for (PR #1617's fourth review). Reading waits for this listener,
+     and a window that could not install it never reads: it would not hear
+     the switch go off (PR #1617's fifth review). A save that left it on
+     retries a start that read the document before that save reached it. */
   useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
+    const unsubscribe: Array<() => void> = [];
     let gone = false;
-    const subscribe = runtimeRef.current.onVoiceReadingConsentOff;
-    const installed = (subscribe?.(() => { void mode.consentOff(); }) ?? Promise.reject(new Error("no consent-off listener")))
-      .then((stop) => {
-        if (gone) stop();
-        else unsubscribe = stop;
-      });
+    const keep = (stop: () => void) => {
+      if (gone) stop();
+      else unsubscribe.push(stop);
+    };
+    const subscribeOff = runtimeRef.current.onVoiceReadingConsentOff;
+    const installed = (subscribeOff?.(() => { reader.consentOff(); }) ?? Promise.reject(new Error("no consent-off listener"))).then(keep);
     listening.current = installed;
     installed.catch(() => undefined);
+    const subscribeOn = runtimeRef.current.onVoiceReadingConsentOn;
+    if (subscribeOn !== undefined) {
+      // Asked inside a promise, so a seam that throws costs only the retry.
+      void Promise.resolve().then(() => subscribeOn(() => { reader.consentOn(); })).then(keep, () => undefined);
+    }
     return () => {
       gone = true;
-      unsubscribe?.();
+      for (const stop of unsubscribe) stop();
     };
-  }, [mode]);
-  // Unmounting ends the session and silences the app, without a sentence.
-  useEffect(() => () => { void mode.dispose(); }, [mode]);
+  }, [reader]);
+  // Unmounting stops every session and silences the app, without a sentence.
+  useEffect(() => () => { reader.dispose(); }, [reader]);
 
   return {
-    mode,
+    reader,
     queue,
-    reading,
     takeSegment: () => {
       const overlapped = spoke.current || queue.speaking;
       spoke.current = queue.speaking;

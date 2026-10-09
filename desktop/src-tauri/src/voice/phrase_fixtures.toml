@@ -952,12 +952,13 @@ screen = "agent"
 action = "voice_off"
 outcome = "dispatch"
 
-# PRD #1497 — the reading MODE's switches and the way of silencing the app's
-# speech. Like the dictation switches above, every one of these is
-# `heard_as_whole` and answered by the local fast path (`reading_intercept`)
-# before any model call, so these pin the whole pipeline's answer for the
-# phrasings users say, and the `screens` column through the unavailable pair.
-# `hush_reading` has no `screens`: speech can still be playing after its pane closed.
+# PRD #1497 — reading's switches and the way of silencing the app's speech.
+# Like the dictation switches above, every one of these is `heard_as_whole` and
+# answered by the local fast path (`reading_intercept`) before any model call,
+# so these pin the whole pipeline's answer for the phrasings users say. None of
+# the three has `screens` (decision 2 of 2026-10-09): "reading on" and "reading
+# off" flip the Settings switch from any screen, so each is pinned on the
+# overview and the deck as well as in an agent's pane.
 [[fixtures]]
 name = "reading-on"
 utterance = "reading on"
@@ -973,11 +974,18 @@ action = "reading_on"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "reading-on-unavailable"
+name = "reading-on-start-reading-on-the-overview"
 utterance = "start reading"
 screen = "overview"
 action = "reading_on"
-outcome = "unavailable"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-on-on-the-deck"
+utterance = "Reading on."
+screen = "deck"
+action = "reading_on"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "reading-off"
@@ -994,11 +1002,18 @@ action = "reading_off"
 outcome = "dispatch"
 
 [[fixtures]]
-name = "reading-off-unavailable"
+name = "reading-off-on-the-deck"
 utterance = "reading off"
 screen = "deck"
 action = "reading_off"
-outcome = "unavailable"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "reading-off-done-reading-on-the-overview"
+utterance = "done reading"
+screen = "overview"
+action = "reading_off"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "quiet-on-the-agent-screen"

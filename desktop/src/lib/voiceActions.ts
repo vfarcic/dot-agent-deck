@@ -228,13 +228,14 @@ export type VoiceActionContext = {
   clearAgentPrompt: (target: VoiceDispatchTarget) => void;
   scratchLastDictation: (target: VoiceDispatchTarget) => void;
   /**
-   * PRD #1497 — enter reading mode for the pane on screen: from then on the
-   * app speaks a short summary of each turn that agent finishes, and its
-   * permission prompts and errors. The voice surface's, because the mode and
-   * the speech queue are its own state, and the mode ends with the pane (D11).
+   * PRD #1497 decision 2 of 2026-10-09 — turn Settings → Voice → Reading on,
+   * from any screen: from then on the app speaks a short summary of each turn
+   * every agent on the deck being viewed finishes, and their permission
+   * prompts and errors. The voice surface's, because it reads and speaks, and
+   * it saves the switch through the same save as Settings.
    */
-  startReading: (target: VoiceDispatchTarget) => void;
-  /** Leave reading mode. The voice surface's, for {@link startReading}'s reason. */
+  startReading: () => void;
+  /** Turn the Reading switch off. The voice surface's, for {@link startReading}'s reason. */
   stopReading: () => void;
   /** PRD #1497 D6 — silence the app's speech now and drop what is waiting.
    * Reading mode stays on. The voice surface's: the speech queue is its own. */
@@ -559,16 +560,16 @@ export const VOICE_ACTIONS = {
   },
 
   startReading: {
-    label: "Read the open agent's turns aloud until told to stop",
+    label: "Turn reading on: read every agent's turns aloud",
     voice: true,
     needs: ["startReading"],
-    /** Targets the pane on screen — the row declares no agent param and is
-        `screens = ["agent"]` — and ends when that pane does (PRD #1497 D11). */
-    run: (context: Pick<VoiceActionContext, "startReading">, target: VoiceDispatchTarget) => context.startReading(target),
+    /** No target: reading is the Settings switch, deck-wide, on every screen
+        (PRD #1497 decisions 1–3 of 2026-10-09). */
+    run: (context: Pick<VoiceActionContext, "startReading">) => context.startReading(),
   },
 
   stopReading: {
-    label: "Stop reading the open agent's turns aloud",
+    label: "Turn reading off",
     voice: true,
     needs: ["stopReading"],
     run: (context: Pick<VoiceActionContext, "stopReading">) => context.stopReading(),

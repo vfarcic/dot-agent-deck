@@ -1,13 +1,15 @@
-//! PRD #1497 M5 — reading mode's Rust half: from an agent's turn events to the
+//! PRD #1497 M5 — reading's Rust half: from an agent's turn events to the
 //! sentences the app speaks.
 //!
-//! Reading mode is turned on for the open agent's pane ("reading on"), and from
-//! then on the app speaks a short summary of each turn that agent finishes, and
-//! its permission prompts and errors as they happen. The webview owns the mode
-//! — which agent, when it ends — and the speech queue; this module owns what
-//! is said, and it runs Rust-side so **the agent's reply never enters the
-//! webview**: the reply goes from the turn event to the summary request and
-//! nowhere else, and only the finished sentence crosses the IPC boundary.
+//! While Settings → Voice → **Reading** is on (decisions 1–3 of 2026-10-09),
+//! the app speaks a short summary of each turn every agent on the deck being
+//! viewed finishes, and their permission prompts and errors as they happen.
+//! The webview owns which agents are read — one session per agent, started as
+//! agents appear and stopped as they go — and the speech queue; this module
+//! owns what is said for one agent, and it runs Rust-side so **the agent's
+//! reply never enters the webview**: the reply goes from the turn event to the
+//! summary request and nowhere else, and only the finished sentence crosses
+//! the IPC boundary.
 //!
 //! # Where turn events come from: [`TurnEventSource`]
 //!
@@ -26,6 +28,12 @@
 //! connections, in either order. [`coalesce`] holds one back for
 //! [`FAILURE_COALESCE_WINDOW`] so such a turn is announced once.
 //!
+//! A turn that ends with no reply never reaches the reply stream: the daemon
+//! publishes only replies with text in them. So the status stream's turn end
+//! (an `Idle` after the agent was seen working) is watched too, and a turn end
+//! that no reply arrives within [`NO_REPLY_HOLD`] of is announced as a turn
+//! with no reply to read (decision 7 of 2026-10-09).
+//!
 //! A source answers one subscription per [`ReadingTarget`] with a channel of
 //! [`TurnEvent`]s for that agent alone, from the moment of subscribing — never
 //! a backlog (D3). Dropping the receiver is the unsubscribe: a source's
@@ -33,8 +41,10 @@
 //!
 //! # What is said
 //!
-//! [`announce`] turns one event into one [`ReadingSentence`], always naming
-//! the agent (D10). A finished or failed turn is summarised through
+//! [`announce`] turns one event into one [`ReadingSentence`], said two ways:
+//! naming the agent, and without its name (decision 4 of 2026-10-09). The
+//! webview picks one at the moment it speaks it — the bare one when that
+//! agent's pane is open then. A finished or failed turn is summarised through
 //! [`super::summary`], which never fails (a deterministic fallback stands in
 //! for the model's sentence). A permission prompt and an error or quota block
 //! are announced at once, with a fixed sentence and **no model call**: the user
@@ -59,7 +69,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dot_agent_deck::daemon_client::{DaemonClient, GatedQuery};
+use dot_agent_deck::daemon_client::{ClientError, DaemonClient, GatedQuery};
 use dot_agent_deck::daemon_protocol::FinalReply;
 use dot_agent_deck::event::{AgentEvent, BroadcastMsg, EventType};
 use serde::Serialize;
@@ -72,29 +82,51 @@ use super::summary::{
     spoken_name,
 };
 
-/// Why "reading on" cannot start on a deck whose daemon predates the reply
-/// stream (it does not advertise `turn-replies`). A fragment, rendered into
-/// [`unavailable_sentence`].
+/// Why reading cannot start on a deck whose daemon predates the reply stream
+/// (it does not advertise `turn-replies`). A fragment, rendered into
+/// [`unavailable_sentence`]. About the deck, not one agent: the webview says
+/// it once for the deck.
 pub const DAEMON_TOO_OLD: &str =
     "this deck's daemon is too old to report finished turns. Update dot-agent-deck on that machine";
 
-/// Why "reading on" cannot start when the deck's daemon did not answer the
+/// Why reading cannot start when the deck's daemon did not answer the
 /// subscription. A fragment, rendered into [`unavailable_sentence`].
 pub const DAEMON_UNREACHABLE: &str = "the deck did not answer";
 
-/// Why "reading on" cannot start when the agent's deck left the app's decks
-/// while the subscription was being confirmed. A fragment, rendered into
-/// [`unavailable_sentence`].
-pub const DECK_CHANGED: &str = "the deck changed while reading was starting. Say reading on again";
+/// Why one agent cannot be read when its deck already serves as many reply
+/// streams as it allows. A fragment, rendered into [`unavailable_sentence`].
+/// About that agent only: the deck's other agents already being read go on.
+pub const TOO_MANY_READERS: &str = "this deck is already reporting as many agents' turns as it can";
 
-/// Why a "reading on" was not installed when a later one began before it
-/// answered. A fragment, rendered into [`unavailable_sentence`]; the webview
-/// has already moved on to the later start and does not speak it.
-pub const READING_RESTARTED: &str = "reading was turned on again";
+/// What a source answers when the deck no longer has the agent — it exited
+/// between being listed and being subscribed. Never spoken: the webview stops
+/// reading that agent, as when its events close.
+pub const AGENT_GONE: &str = "the agent is no longer on its deck";
+
+/// The daemon's refusals of `subscribe-turn-replies` that are about the one
+/// agent, as its error text spells them (`daemon_protocol`), and what each
+/// becomes here.
+const AGENT_REFUSALS: [(&str, &str); 2] = [
+    ("no such agent", AGENT_GONE),
+    ("too many subscriptions", TOO_MANY_READERS),
+];
+
+/// Why reading cannot start when the agent's deck left the app's decks while
+/// the subscription was being confirmed. A fragment, rendered into
+/// [`unavailable_sentence`].
+pub const DECK_CHANGED: &str = "the deck changed while reading was starting";
 
 /// How long after [`coalesce`] announced one half of a failed turn it absorbs
 /// the other, so the turn is announced once.
 pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
+
+/// How long [`coalesce`] waits, after the agent's turn ended on the status
+/// stream, for that turn's reply before it announces a turn with no reply to
+/// read — and how recent a reply must be for a turn end to count as answered
+/// by it. The two leave the daemon together (the reply is published just
+/// before the status is broadcast, from one hook line), so this only has to
+/// cover two local connections' delivery, as [`FAILED_REPLY_HOLD`] does.
+pub const NO_REPLY_HOLD: Duration = Duration::from_secs(2);
 
 /// How long [`coalesce`] holds a failed reply that arrived before its turn's
 /// block status, so a usage limit can still replace it. Both halves leave the
@@ -104,9 +136,11 @@ pub const FAILURE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
 /// leaves a wide margin while keeping the announcement prompt.
 pub const FAILED_REPLY_HOLD: Duration = Duration::from_secs(1);
 
-/// What "reading on" says while the Settings opt-in is off (D4), spoken.
+/// What a reading start answers while the Settings switch is off on disk —
+/// only in a race, since the webview starts sessions only while it shows the
+/// switch on, so it is not spoken.
 pub const READING_NOT_ENABLED: &str =
-    "Reading is turned off in Settings. Turn on Read turns aloud in Settings, Voice, first.";
+    "Reading is off. Say reading on, or turn on Reading in Settings, Voice.";
 
 /// The longest description of what a permission prompt wants that is spoken,
 /// in characters. A prompt names a tool and its input; the first words are
@@ -209,6 +243,15 @@ impl TurnEventSource for DaemonTurnEvents {
             let mut replies = match self.client.subscribe_turn_replies(&agent_id).await {
                 Ok(GatedQuery::Answered(replies)) => replies,
                 Ok(GatedQuery::Unsupported) => return Err(DAEMON_TOO_OLD.to_string()),
+                // The deck answered, and refused this one agent: that is about
+                // the agent, not the deck.
+                Err(ClientError::Server(message)) => {
+                    let refusal = AGENT_REFUSALS
+                        .iter()
+                        .find(|(said, _)| message.contains(said))
+                        .map_or(DAEMON_UNREACHABLE, |(_, reason)| reason);
+                    return Err(refusal.to_string());
+                }
                 Err(_) => return Err(DAEMON_UNREACHABLE.to_string()),
             };
             let (incoming_tx, incoming) = mpsc::channel(16);
@@ -230,8 +273,11 @@ impl TurnEventSource for DaemonTurnEvents {
                         let BroadcastMsg::Event(event) = message else {
                             continue;
                         };
-                        if let Some(status) = status_turn_event(&event, &agent_id)
-                            && status_tx.send(Incoming::Status(status)).await.is_err()
+                        let incoming = status_turn_event(&event, &agent_id)
+                            .map(Incoming::Status)
+                            .or_else(|| turn_progress(&event, &agent_id));
+                        if let Some(incoming) = incoming
+                            && status_tx.send(incoming).await.is_err()
                         {
                             return;
                         }
@@ -257,12 +303,16 @@ impl TurnEventSource for DaemonTurnEvents {
     }
 }
 
-/// What [`coalesce`] merges: a finished turn's reply, or a status the agent
-/// reported.
+/// What [`coalesce`] merges: a finished turn's reply, a status the agent
+/// reported, or where its turn is ([`turn_progress`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     Reply(FinalReply),
     Status(TurnEvent),
+    /// The agent is working on a turn.
+    Working,
+    /// The agent's turn ended (an `Idle`), with or without a reply.
+    TurnEnded,
 }
 
 /// The status event `event` means for reading the agent `agent_id`, or `None`.
@@ -308,6 +358,32 @@ pub fn status_turn_event(event: &AgentEvent, agent_id: &str) -> Option<TurnEvent
     }
 }
 
+/// Where the agent `agent_id`'s turn is, from a status `event`, or `None`:
+/// [`Incoming::Working`] for a sign of work (thinking, a tool, compacting, a
+/// subagent), [`Incoming::TurnEnded`] for an `Idle`. Only the agent's own
+/// reports: not an outside agent's unproven one, not the deck's own synthetic
+/// events, and not the terminal-output classifier's guesses.
+pub fn turn_progress(event: &AgentEvent, agent_id: &str) -> Option<Incoming> {
+    use dot_agent_deck::event::UNPROVEN_METADATA_KEY;
+    if event.agent_id.as_deref() != Some(agent_id)
+        || event.metadata.contains_key(UNPROVEN_METADATA_KEY)
+        || event.is_daemon_synthetic()
+        || event.is_wrapper_output_classified()
+    {
+        return None;
+    }
+    match event.event_type {
+        EventType::Thinking
+        | EventType::ToolStart
+        | EventType::ToolEnd
+        | EventType::Compacting
+        | EventType::SubagentStart
+        | EventType::SubagentStop => Some(Incoming::Working),
+        EventType::Idle => Some(Incoming::TurnEnded),
+        _ => None,
+    }
+}
+
 /// What a permission prompt asks to do: "Bash: cargo publish" from the tool and
 /// its detail, the prompt text an agent sent instead (OpenCode), or nothing.
 fn permission_wants(event: &AgentEvent) -> String {
@@ -339,6 +415,17 @@ fn permission_wants(event: &AgentEvent) -> String {
 /// The window is time, not turn identity: two distinct failed turns finishing
 /// within it are announced as one.
 ///
+/// # A turn with no reply
+///
+/// A [`Incoming::TurnEnded`] after an [`Incoming::Working`] is a turn that
+/// ended. When a reply arrived within [`NO_REPLY_HOLD`] before it, or arrives
+/// within [`NO_REPLY_HOLD`] after it, the reply is that turn's and is
+/// announced as usual; otherwise the turn is announced as finished with an
+/// empty reply, which is said as a turn with no reply to read. A turn end with
+/// no work seen before it (an agent settling at start, a second idle report
+/// for the same turn) is not a turn, and a block status ends the turn without
+/// one — it was announced already.
+///
 /// Everything else passes through in arrival order, a held reply first.
 pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<TurnEvent>) {
     use tokio::time::{Instant, sleep_until};
@@ -346,11 +433,21 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
     let mut held: Option<(String, Instant)> = None;
     // The failure last announced, and until when it absorbs the other half.
     let mut announced: Option<(Announced, Instant)> = None;
+    // Whether the agent was seen working since its last turn end.
+    let mut in_turn = false;
+    // When the last reply arrived.
+    let mut last_reply: Option<Instant> = None;
+    // A turn that ended with no reply yet, and until when its reply may come.
+    let mut no_reply_due: Option<Instant> = None;
     loop {
-        let next = match &held {
-            Some((_, until)) => tokio::select! {
+        let deadline = match (held.as_ref().map(|(_, until)| *until), no_reply_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let next = match deadline {
+            Some(until) => tokio::select! {
                 message = incoming.recv() => Some(message),
-                _ = sleep_until(*until) => None,
+                _ = sleep_until(until) => None,
                 _ = out.closed() => return,
             },
             None => tokio::select! {
@@ -372,15 +469,42 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                     *announced = Some((Announced::Reply, now + FAILURE_COALESCE_WINDOW));
                 }
             };
+        let no_reply = |due: &mut Option<Instant>, emit: &mut Vec<TurnEvent>, all: bool| {
+            if due.is_some_and(|until| all || until <= now) {
+                *due = None;
+                emit.push(TurnEvent::Finished {
+                    reply: String::new(),
+                });
+            }
+        };
+        if matches!(next, Some(Some(Incoming::Reply(_)))) {
+            // This reply answers the turn waiting for one, if any.
+            last_reply = Some(now);
+            no_reply_due = None;
+        }
         match next {
-            // The hold ran out with no status: announce the failed reply.
-            None => release_held(&mut held, &mut emit, &mut announced),
+            // A hold ran out: announce the failed reply with no status, and a
+            // turn whose reply never came.
+            None => {
+                if held.as_ref().is_some_and(|(_, until)| *until <= now) {
+                    release_held(&mut held, &mut emit, &mut announced);
+                }
+                no_reply(&mut no_reply_due, &mut emit, false);
+            }
             Some(None) => {
                 release_held(&mut held, &mut emit, &mut announced);
+                no_reply(&mut no_reply_due, &mut emit, true);
                 for event in emit {
                     let _ = out.send(event).await;
                 }
                 return;
+            }
+            Some(Some(Incoming::Working)) => in_turn = true,
+            Some(Some(Incoming::TurnEnded)) => {
+                let answered = last_reply.is_some_and(|at| now.duration_since(at) <= NO_REPLY_HOLD);
+                if std::mem::take(&mut in_turn) && !answered && no_reply_due.is_none() {
+                    no_reply_due = Some(now + NO_REPLY_HOLD);
+                }
             }
             Some(Some(Incoming::Reply(reply))) if reply.failed => {
                 if !matches!(recent, Some(Announced::Status(_))) {
@@ -393,6 +517,9 @@ pub async fn coalesce(mut incoming: mpsc::Receiver<Incoming>, out: mpsc::Sender<
                 emit.push(TurnEvent::Finished { reply: reply.text });
             }
             Some(Some(Incoming::Status(TurnEvent::Blocked { cause }))) => {
+                // The block is the turn's end, and it is announced.
+                in_turn = false;
+                no_reply_due = None;
                 match (held.is_some(), cause, recent) {
                     // The usage limit replaces the held failed reply.
                     (true, BlockCause::Quota, _) => {
@@ -451,8 +578,8 @@ pub fn agent_gap(agent_type: &str) -> Option<String> {
     None
 }
 
-/// What "reading on" says when reading cannot run, from a source's or
-/// [`agent_gap`]'s fragment.
+/// What is said when reading cannot run, from a source's or [`agent_gap`]'s
+/// fragment.
 pub fn unavailable_sentence(reason: &str) -> String {
     let reason = reason.trim().trim_end_matches('.');
     format!("Reading is not available: {reason}.")
@@ -468,16 +595,15 @@ pub enum ReadingSentenceKind {
     Permission,
     /// An error or quota block, announced at once.
     Blocked,
-    /// Reading ended on this side because its Settings opt-in was turned off.
-    /// Not a sentence to queue: the webview ends reading mode on it, cutting
-    /// off what it is saying and clearing the indicator and the queued speech,
-    /// and says "Reading off."
+    /// Reading ended on this side because its Settings switch was turned
+    /// off. Not a sentence to queue: the webview ends reading on it, cutting
+    /// off what it is saying and dropping the queued speech.
     Ended,
-    /// Reading ended because the agent's events ended — its reply stream
-    /// closed (the agent exited) or the deck went away — after everything
-    /// received was read. Not a sentence to queue either: the webview ends
-    /// reading mode and says "Reading off.", but lets the speech already
-    /// handed to it finish, so the last summary is heard.
+    /// This agent's events ended — its reply stream closed (the agent exited)
+    /// or the deck went away — after everything received was read. Not a
+    /// sentence to queue either: the webview stops reading this agent, and
+    /// lets the speech already handed to it finish, so the last summary is
+    /// heard.
     Closed,
 }
 
@@ -486,28 +612,38 @@ pub const READING_ENDED: &str = "Reading off.";
 
 /// The sentence that ends a reading session on this side.
 pub fn ended_sentence() -> ReadingSentence {
-    ReadingSentence {
-        kind: ReadingSentenceKind::Ended,
-        text: READING_ENDED.to_string(),
-    }
+    ReadingSentence::same(ReadingSentenceKind::Ended, READING_ENDED.to_string())
 }
 
 /// The sentence that ends a reading session whose events ended
 /// ([`ReadingSentenceKind::Closed`]).
 pub fn closed_sentence() -> ReadingSentence {
-    ReadingSentence {
-        kind: ReadingSentenceKind::Closed,
-        text: READING_ENDED.to_string(),
-    }
+    ReadingSentence::same(ReadingSentenceKind::Closed, READING_ENDED.to_string())
 }
 
 /// One sentence to speak, as the webview receives it — and the only thing
 /// about a turn that reaches it.
+///
+/// Said two ways (decision 4 of 2026-10-09): `text` names the agent, `bare`
+/// does not, and the webview speaks `bare` when, at the moment it is said,
+/// the agent's pane is the one open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadingSentence {
     pub kind: ReadingSentenceKind,
     pub text: String,
+    pub bare: String,
+}
+
+impl ReadingSentence {
+    /// A sentence said the same way whichever pane is open.
+    fn same(kind: ReadingSentenceKind, text: String) -> Self {
+        Self {
+            kind,
+            bare: text.clone(),
+            text,
+        }
+    }
 }
 
 /// The future a [`TurnSummariser`] returns: the summary, or `None` when
@@ -594,23 +730,66 @@ impl TurnSummariser for SettingsSummariser {
 /// The sentence for a permission prompt: "The coder is asking for permission:
 /// run cargo publish." `wants` is cut to one line and [`MAX_WANTS_CHARS`].
 pub fn permission_sentence(agent: &str, wants: &str) -> String {
-    let name = spoken_name(agent);
+    format!(
+        "{} is a{}",
+        spoken_name(agent),
+        &bare_permission_sentence(wants)[1..]
+    )
+}
+
+/// [`permission_sentence`] without the agent's name: "Asking for permission:
+/// run cargo publish."
+pub fn bare_permission_sentence(wants: &str) -> String {
     let wants = one_line(wants, MAX_WANTS_CHARS);
     let wants = wants.trim_end_matches(['.', ' ']);
     if wants.is_empty() {
-        format!("{name} is asking for permission.")
+        "Asking for permission.".to_string()
     } else {
-        format!("{name} is asking for permission: {wants}.")
+        format!("Asking for permission: {wants}.")
     }
 }
 
 /// The sentence for a block: "The coder stopped with an error." or "The coder
-/// hit a usage limit."
+/// hit a usage limit and stopped."
 pub fn blocked_sentence(agent: &str, cause: BlockCause) -> String {
     let name = spoken_name(agent);
     match cause {
         BlockCause::Error => format!("{name} stopped with an error."),
         BlockCause::Quota => format!("{name} hit a usage limit and stopped."),
+    }
+}
+
+/// [`blocked_sentence`] without the agent's name: "Stopped with an error."
+pub fn bare_blocked_sentence(cause: BlockCause) -> String {
+    match cause {
+        BlockCause::Error => "Stopped with an error.".to_string(),
+        BlockCause::Quota => "Hit a usage limit and stopped.".to_string(),
+    }
+}
+
+/// The sentence for an alert, both ways.
+fn alert_sentence(agent: &str, event: &TurnEvent) -> Option<ReadingSentence> {
+    Some(match event {
+        TurnEvent::Permission { wants } => ReadingSentence {
+            kind: ReadingSentenceKind::Permission,
+            text: permission_sentence(agent, wants),
+            bare: bare_permission_sentence(wants),
+        },
+        TurnEvent::Blocked { cause } => ReadingSentence {
+            kind: ReadingSentenceKind::Blocked,
+            text: blocked_sentence(agent, *cause),
+            bare: bare_blocked_sentence(*cause),
+        },
+        TurnEvent::Finished { .. } | TurnEvent::Failed { .. } => return None,
+    })
+}
+
+/// A turn's summary as the sentence to speak.
+fn turn_sentence(summary: Summary) -> ReadingSentence {
+    ReadingSentence {
+        kind: ReadingSentenceKind::Turn,
+        text: summary.text,
+        bare: summary.bare,
     }
 }
 
@@ -621,21 +800,13 @@ pub async fn announce(
     event: TurnEvent,
     summariser: &dyn TurnSummariser,
 ) -> Option<ReadingSentence> {
+    if let Some(alert) = alert_sentence(agent, &event) {
+        return Some(alert);
+    }
     let (kind, reply) = match event {
-        TurnEvent::Permission { wants } => {
-            return Some(ReadingSentence {
-                kind: ReadingSentenceKind::Permission,
-                text: permission_sentence(agent, &wants),
-            });
-        }
-        TurnEvent::Blocked { cause } => {
-            return Some(ReadingSentence {
-                kind: ReadingSentenceKind::Blocked,
-                text: blocked_sentence(agent, cause),
-            });
-        }
         TurnEvent::Finished { reply } => (TurnKind::Finished, reply),
         TurnEvent::Failed { reply } => (TurnKind::Failed, reply),
+        TurnEvent::Permission { .. } | TurnEvent::Blocked { .. } => return None,
     };
     let summary = summariser
         .summarise(TurnSummaryRequest {
@@ -644,10 +815,7 @@ pub async fn announce(
             reply: &reply,
         })
         .await?;
-    Some(ReadingSentence {
-        kind: ReadingSentenceKind::Turn,
-        text: summary.text,
-    })
+    Some(turn_sentence(summary))
 }
 
 /// Read `events` until they end or `sink` refuses a sentence.
@@ -765,16 +933,11 @@ pub async fn read_turns(
                         waiting = Some((TurnKind::Failed, reply));
                         continue;
                     }
-                    TurnEvent::Permission { wants } => ReadingSentence {
-                        kind: ReadingSentenceKind::Permission,
-                        text: permission_sentence(agent, &wants),
-                    },
-                    TurnEvent::Blocked { cause } => ReadingSentence {
-                        kind: ReadingSentenceKind::Blocked,
-                        text: blocked_sentence(agent, cause),
-                    },
+                    alert => alert_sentence(agent, &alert),
                 };
-                if !sink(sentence) {
+                if let Some(sentence) = sentence
+                    && !sink(sentence)
+                {
                     return;
                 }
             }
@@ -783,11 +946,7 @@ pub async fn read_turns(
                 return;
             }
             Next::Summary(Some(summary)) => {
-                let sentence = ReadingSentence {
-                    kind: ReadingSentenceKind::Turn,
-                    text: summary.text,
-                };
-                if !sink(sentence) {
+                if !sink(turn_sentence(summary)) {
                     return;
                 }
             }
@@ -839,6 +998,7 @@ mod tests {
             let text = format!("summary of {}", request.reply);
             Box::pin(async move {
                 Some(Summary {
+                    bare: format!("bare {text}"),
                     text,
                     fallback: None,
                 })
@@ -860,6 +1020,7 @@ mod tests {
         .expect("announced");
         assert_eq!(sentence.kind, ReadingSentenceKind::Turn);
         assert_eq!(sentence.text, "summary of All 42 tests pass.");
+        assert_eq!(sentence.bare, "bare summary of All 42 tests pass.");
         assert_eq!(
             *summariser.asked.lock().unwrap(),
             vec![(
@@ -903,6 +1064,7 @@ mod tests {
             permission.text,
             "The coder is asking for permission: run cargo publish."
         );
+        assert_eq!(permission.bare, "Asking for permission: run cargo publish.");
         let quota = announce(
             "coder",
             TurnEvent::Blocked {
@@ -914,6 +1076,7 @@ mod tests {
         .expect("announced");
         assert_eq!(quota.kind, ReadingSentenceKind::Blocked);
         assert_eq!(quota.text, "The coder hit a usage limit and stopped.");
+        assert_eq!(quota.bare, "Hit a usage limit and stopped.");
         let error = announce(
             "the reviewer",
             TurnEvent::Blocked {
@@ -924,6 +1087,7 @@ mod tests {
         .await
         .expect("announced");
         assert_eq!(error.text, "The reviewer stopped with an error.");
+        assert_eq!(error.bare, "Stopped with an error.");
         assert!(summariser.asked.lock().unwrap().is_empty());
     }
 
@@ -933,6 +1097,7 @@ mod tests {
             permission_sentence("coder", ""),
             "The coder is asking for permission."
         );
+        assert_eq!(bare_permission_sentence(""), "Asking for permission.");
         assert_eq!(
             permission_sentence("coder", "Bash:\n  cargo   publish.\n"),
             "The coder is asking for permission: Bash: cargo publish."
@@ -1097,6 +1262,158 @@ mod tests {
         merging.await.unwrap();
     }
 
+    fn finished(text: &str) -> Incoming {
+        Incoming::Reply(FinalReply {
+            turn_id: None,
+            text: text.to_string(),
+            failed: false,
+        })
+    }
+
+    /// Scenario (decision 7 of 2026-10-09): the agent works and its turn ends
+    /// with no reply on the reply stream; once [`NO_REPLY_HOLD`] passes, the
+    /// turn is announced as finished with an empty reply — which is said as a
+    /// turn with no reply to read.
+    #[tokio::test(start_paused = true)]
+    async fn voice_reading_a_turn_that_ends_with_no_reply_is_announced() {
+        let heard = coalesced(vec![
+            (Incoming::Working, SHORT),
+            (Incoming::TurnEnded, LONG),
+        ])
+        .await;
+        assert_eq!(
+            heard,
+            vec![TurnEvent::Finished {
+                reply: String::new()
+            }]
+        );
+    }
+
+    /// Scenario (decision 7): a turn end answered by its reply — the reply
+    /// arriving just before the status, as the daemon publishes them, or just
+    /// after it, over the other connection — is announced once, as that
+    /// reply; and a turn end arriving with the stream's close is still said.
+    #[tokio::test(start_paused = true)]
+    async fn voice_reading_a_turn_end_with_its_reply_in_either_order_is_one_turn() {
+        let one_turn = vec![TurnEvent::Finished {
+            reply: "done".to_string(),
+        }];
+        for script in [
+            vec![
+                (Incoming::Working, SHORT),
+                (finished("done"), SHORT),
+                (Incoming::TurnEnded, LONG),
+            ],
+            vec![
+                (Incoming::Working, SHORT),
+                (Incoming::TurnEnded, SHORT),
+                (finished("done"), LONG),
+            ],
+            // The status stream lagging: the reply before the work it ends.
+            vec![
+                (finished("done"), SHORT),
+                (Incoming::Working, SHORT),
+                (Incoming::TurnEnded, LONG),
+            ],
+        ] {
+            assert_eq!(coalesced(script.clone()).await, one_turn, "{script:?}");
+        }
+        let closing = coalesced(vec![
+            (Incoming::Working, SHORT),
+            (Incoming::TurnEnded, SHORT),
+        ])
+        .await;
+        assert_eq!(
+            closing,
+            vec![TurnEvent::Finished {
+                reply: String::new()
+            }]
+        );
+    }
+
+    /// Scenario (decision 7): a turn end with no work seen before it — the
+    /// agent settling at start, or a second idle report for the same turn —
+    /// is not a turn and is not announced; and a turn that ended in an error
+    /// is announced as the error only.
+    #[tokio::test(start_paused = true)]
+    async fn voice_reading_an_idle_that_ends_no_turn_is_not_announced() {
+        assert_eq!(
+            coalesced(vec![(Incoming::TurnEnded, LONG)]).await,
+            Vec::<TurnEvent>::new()
+        );
+        assert_eq!(
+            coalesced(vec![
+                (Incoming::Working, SHORT),
+                (finished("done"), SHORT),
+                (Incoming::TurnEnded, SHORT),
+                (Incoming::TurnEnded, LONG),
+            ])
+            .await,
+            vec![TurnEvent::Finished {
+                reply: "done".to_string()
+            }]
+        );
+        assert_eq!(
+            coalesced(vec![
+                (Incoming::Working, SHORT),
+                (blocked(BlockCause::Error), SHORT),
+                (Incoming::TurnEnded, LONG),
+            ])
+            .await,
+            vec![TurnEvent::Blocked {
+                cause: BlockCause::Error
+            }]
+        );
+    }
+
+    /// Scenario (decision 7): the status events that mark a turn's progress
+    /// are the agent's own work and its idle, and nothing synthesised for it
+    /// or guessed from its terminal output.
+    #[test]
+    fn voice_reading_turn_progress_is_the_agents_own_work_and_idle() {
+        use dot_agent_deck::event::{
+            UNPROVEN_METADATA_KEY, WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY,
+            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE,
+        };
+        for working in [
+            EventType::Thinking,
+            EventType::ToolStart,
+            EventType::ToolEnd,
+        ] {
+            assert_eq!(
+                turn_progress(&status("coder", working), "coder"),
+                Some(Incoming::Working)
+            );
+        }
+        assert_eq!(
+            turn_progress(&status("coder", EventType::Idle), "coder"),
+            Some(Incoming::TurnEnded)
+        );
+        assert_eq!(
+            turn_progress(&status("tester", EventType::Idle), "coder"),
+            None
+        );
+        assert_eq!(
+            turn_progress(&status("coder", EventType::ShellIdle), "coder"),
+            None
+        );
+        assert_eq!(
+            turn_progress(&status("coder", EventType::SessionStart), "coder"),
+            None
+        );
+        let mut unproven = status("coder", EventType::Idle);
+        unproven
+            .metadata
+            .insert(UNPROVEN_METADATA_KEY.to_string(), "1".to_string());
+        assert_eq!(turn_progress(&unproven, "coder"), None);
+        let mut guessed = status("coder", EventType::Idle);
+        guessed.metadata.insert(
+            WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
+            WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
+        );
+        assert_eq!(turn_progress(&guessed, "coder"), None);
+    }
+
     fn status(agent: &str, event_type: EventType) -> AgentEvent {
         AgentEvent {
             session_id: "s".to_string(),
@@ -1183,6 +1500,7 @@ mod tests {
         reply_frames: Vec<Vec<u8>>,
         status_frames: Vec<Vec<u8>>,
         end_replies: Option<&'static [u8]>,
+        refuse_replies: Option<&'static str>,
     ) -> tokio::task::JoinHandle<()> {
         use dot_agent_deck::daemon_protocol::{
             AttachResponse, KIND_EVENT, KIND_STREAM_END, PROTOCOL_VERSION, read_frame, write_frame,
@@ -1209,7 +1527,14 @@ mod tests {
                             let _ = write_resp(&mut stream, &hello).await;
                             return;
                         }
-                        Some("subscribe-turn-replies") => reply_frames,
+                        Some("subscribe-turn-replies") => {
+                            if let Some(refusal) = refuse_replies {
+                                let _ =
+                                    write_resp(&mut stream, &AttachResponse::err(refusal)).await;
+                                return;
+                            }
+                            reply_frames
+                        }
                         Some("subscribe-events") => status_frames,
                         _ => {
                             let _ = write_resp(&mut stream, &AttachResponse::err("unknown")).await;
@@ -1250,6 +1575,7 @@ mod tests {
             vec![],
             vec![],
             None,
+            None,
         )
         .await;
         let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
@@ -1260,6 +1586,42 @@ mod tests {
              Update dot-agent-deck on that machine."
         );
         deck.abort();
+    }
+
+    /// Scenario (decision 3 of 2026-10-09): the deck answers the reply
+    /// subscription by refusing that one agent — it exited a moment ago, or
+    /// the deck serves as many reply streams as it allows — and the source
+    /// says so about the agent, not as the deck not answering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reading_a_refusal_about_the_agent_is_not_about_the_deck() {
+        for (refusal, reason) in [
+            ("subscribe-turn-replies: no such agent", AGENT_GONE),
+            (
+                "subscribe-turn-replies: too many subscriptions",
+                TOO_MANY_READERS,
+            ),
+            ("subscribe-turn-replies: something else", DAEMON_UNREACHABLE),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("attach.sock");
+            let deck = fake_deck(
+                path.clone(),
+                vec![dot_agent_deck::daemon_protocol::CAP_TURN_REPLIES.to_string()],
+                vec![],
+                vec![],
+                None,
+                Some(refusal),
+            )
+            .await;
+            let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
+            assert_eq!(
+                source.subscribe(&target()).await.unwrap_err(),
+                reason,
+                "{refusal}"
+            );
+            deck.abort();
+        }
     }
 
     #[cfg(unix)]
@@ -1298,6 +1660,7 @@ mod tests {
                 .unwrap(),
                 serde_json::to_vec(&BroadcastMsg::Event(permission)).unwrap(),
             ],
+            None,
             None,
         )
         .await;
@@ -1361,6 +1724,7 @@ mod tests {
             vec![last],
             vec![],
             Some(TURN_REPLIES_END_AGENT_EXITED),
+            None,
         )
         .await;
         let source = DaemonTurnEvents::new(Arc::new(DaemonClient::new(path)));
@@ -1382,6 +1746,7 @@ mod tests {
                 ReadingSentence {
                     kind: ReadingSentenceKind::Turn,
                     text: "summary of last turn".to_string(),
+                    bare: "bare summary of last turn".to_string(),
                 },
                 closed_sentence(),
             ]
@@ -1479,6 +1844,7 @@ mod tests {
             Box::pin(async move {
                 self.release.notified().await;
                 Some(Summary {
+                    bare: format!("bare {text}"),
                     text,
                     fallback: None,
                 })
@@ -1938,6 +2304,7 @@ mod tests {
             summary,
             Some(Summary {
                 text: super::super::summary::fallback("tester", TurnKind::Finished),
+                bare: super::super::summary::bare_fallback(TurnKind::Finished),
                 fallback: Some(SummaryFailure::NotPermitted),
             }),
             "a request was attempted"
@@ -1959,18 +2326,18 @@ mod tests {
     }
 
     /// Scenario (PR #1617 review): the two ways a session ends on this side
-    /// reach the webview as two kinds — `ended` (the opt-in was turned off),
+    /// reach the webview as two kinds — `ended` (the switch was turned off),
     /// which cuts speech off, and `closed` (the agent's events ended), which
-    /// lets the last summary finish — both saying "Reading off.".
+    /// lets the last summary finish.
     #[test]
     fn voice_reading_the_two_ends_serialise_as_the_webview_reads_them() {
         assert_eq!(
             serde_json::to_value(ended_sentence()).unwrap(),
-            serde_json::json!({ "kind": "ended", "text": "Reading off." })
+            serde_json::json!({ "kind": "ended", "text": "Reading off.", "bare": "Reading off." })
         );
         assert_eq!(
             serde_json::to_value(closed_sentence()).unwrap(),
-            serde_json::json!({ "kind": "closed", "text": "Reading off." })
+            serde_json::json!({ "kind": "closed", "text": "Reading off.", "bare": "Reading off." })
         );
     }
 }

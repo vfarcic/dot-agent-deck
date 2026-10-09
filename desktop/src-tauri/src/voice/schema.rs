@@ -661,8 +661,8 @@ mod tests {
                 ("interrupt_agent".to_string(), false),
                 ("clear_prompt".to_string(), false),
                 ("scratch_that".to_string(), false),
-                ("reading_on".to_string(), false),
-                ("reading_off".to_string(), false),
+                ("reading_on".to_string(), true),
+                ("reading_off".to_string(), true),
                 ("hush_reading".to_string(), true),
                 ("open_new_agent".to_string(), false),
                 // `requires` a listing, and nothing is declared here (PRD #1223).
@@ -713,8 +713,8 @@ mod tests {
                 ("interrupt_agent".to_string(), false),
                 ("clear_prompt".to_string(), false),
                 ("scratch_that".to_string(), false),
-                ("reading_on".to_string(), false),
-                ("reading_off".to_string(), false),
+                ("reading_on".to_string(), true),
+                ("reading_off".to_string(), true),
                 ("hush_reading".to_string(), true),
                 ("open_new_agent".to_string(), true),
                 // `requires` a listing, and nothing is declared here (PRD #1223).

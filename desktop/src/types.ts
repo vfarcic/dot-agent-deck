@@ -1466,12 +1466,14 @@ export interface DeckRuntimeState {
   voiceSpeechPlan?: () => Promise<import("./lib/bridge").SpeechPlanDto>;
   /** PRD #1497 D9 — the Commands connection's speech audio for `text`. */
   voiceSpeechAudio?: (text: string) => Promise<ArrayBuffer>;
-  /** PRD #1497 M5 — start reading mode for one agent; see `DeckBridge.voiceReadingStart`. */
+  /** PRD #1497 M5 — start reading one agent; see `DeckBridge.voiceReadingStart`. */
   voiceReadingStart?: (target: import("./lib/reading").ReadingTarget, onSentence: (sentence: import("./lib/reading").ReadingSentenceDto) => void) => Promise<import("./lib/reading").ReadingStartDto>;
   /** PRD #1497 M5 — end a reading session. */
   voiceReadingStop?: (session: number) => Promise<void>;
-  /** PRD #1497 — a save from any window turned reading's opt-in off; see `DeckBridge.onVoiceReadingConsentOff`. */
+  /** PRD #1497 — a save from any window turned reading's switch off; see `DeckBridge.onVoiceReadingConsentOff`. */
   onVoiceReadingConsentOff?: (listener: () => void) => Promise<() => void>;
+  /** PRD #1497 — a save left reading's switch on; see `DeckBridge.onVoiceReadingConsentOn`. */
+  onVoiceReadingConsentOn?: (listener: () => void) => Promise<() => void>;
   /**
    * Scale the whole window, terminals included (PRD #744).
    *

@@ -284,8 +284,9 @@ level = 1.0
 | `endpoints.selection` | string | `"local"` | `"local"`, `"all"` (every daemon at once), or the `id` of a remote deck in `remotes.toml` |
 | `voice.activation` | string | `"toggle"` | `"toggle"` |
 | `voice.labels` | string | `"shared"` | `"shared"`, `"withheld"` |
-| `voice.reading` | string | `"off"` | `"off"`, `"on"` (allows [reading mode](desktop/voice.md#reading-mode)); an unrecognised value means `"off"` |
-| `voice.speech` | string | `"auto"` | `"auto"`, `"provider"`, `"system"`: where reading mode's voice comes from; an unrecognised value means `"auto"` |
+| `voice.reading` | string | `"off"` | `"off"`, `"on"` (turns [reading](desktop/voice.md#reading) on: the app reads your agents' turns aloud); an unrecognised value means `"off"` |
+| `voice.reading_notice` | string | `"pending"` | `"pending"`, `"shown"`: whether the app has said where replies go, which it does the first time reading is turned on; an unrecognised value means `"pending"` |
+| `voice.speech` | string | `"auto"` | `"auto"`, `"provider"`, `"system"`: where reading's voice comes from; an unrecognised value means `"auto"` |
 | `voice.transcription.backend` | string | `"local"` | `"local"` (no key; the endpoint must be on this machine), `"remote"` |
 | `voice.transcription.endpoint` | URL | `http://127.0.0.1:18000/v1/audio/transcriptions` for `local`, `https://api.openai.com/v1/audio/transcriptions` for `remote` | any URL; a `local` backend refuses one that is not a loopback address |
 | `voice.transcription.model` | string | `Systran/faster-whisper-tiny.en` for `local`, `whisper-1` for `remote` | |

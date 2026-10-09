@@ -11,9 +11,18 @@
  *
  * New speech for an agent that already has a sentence WAITING replaces that
  * sentence rather than queueing behind it, so a burst of events is heard as
- * its latest state instead of as a backlog. A sentence already being spoken is
- * left to finish. {@link SpeechQueue.interrupt} stops the current sentence at
- * once and drops everything waiting — what "stop" and "quiet" do.
+ * its latest state instead of as a backlog. Only that agent's: the queue is
+ * shared by every agent being read, and one agent's sentence never replaces
+ * another's. A sentence already being spoken is left to finish.
+ * {@link SpeechQueue.interrupt} stops the current sentence at once and drops
+ * everything waiting — what "stop" and "quiet" do.
+ *
+ * # Worded when it is said
+ *
+ * A sentence can be handed over as a function, called when the queue takes
+ * it up to say it: reading's sentence about an agent drops the agent's name
+ * when that agent's pane is open at that moment (decision 4 of 2026-10-09),
+ * and the moment it is queued may be long before.
  *
  * # "Is speaking" (D8)
  *
@@ -50,9 +59,12 @@ export interface SpeechQueueDeps {
   onProblem?: (reason: string) => void;
 }
 
+/** A sentence, or how to word it when it is said. */
+export type SpeechText = string | (() => string);
+
 interface Waiting {
   agent: string;
-  text: string;
+  text: SpeechText;
 }
 
 /** Said when the webview has no speech synthesis at all. */
@@ -104,16 +116,17 @@ export class SpeechQueue {
 
   /**
    * Speak `text` for `agent`. Replaces a sentence for the same agent that has
-   * not started yet; otherwise queues it.
+   * not started yet; otherwise queues it. A function is called when the
+   * sentence is taken up to be said, and its answer is what is said.
    */
-  say(agent: string, text: string): void {
-    const trimmed = text.trim();
-    if (trimmed === "") return;
-    const at = this.waiting.findIndex((entry) => entry.agent === agent);
+  say(agent: string, text: SpeechText): void {
+    const entry = typeof text === "string" ? text.trim() : text;
+    if (entry === "") return;
+    const at = this.waiting.findIndex((waiting) => waiting.agent === agent);
     if (at >= 0) {
-      this.waiting[at] = { agent, text: trimmed };
+      this.waiting[at] = { agent, text: entry };
     } else {
-      this.waiting.push({ agent, text: trimmed });
+      this.waiting.push({ agent, text: entry });
     }
     void this.pump();
   }
@@ -141,12 +154,14 @@ export class SpeechQueue {
     this.setActive(true);
     try {
       for (let next = this.waiting.shift(); next !== undefined; next = this.waiting.shift()) {
+        const text = (typeof next.text === "string" ? next.text : next.text()).trim();
+        if (text === "") continue;
         const controller = new AbortController();
         this.current = controller;
         try {
           // Raced against the abort so an interrupt ends the sentence here at
           // once, whatever the voice does about its own signal.
-          await Promise.race([this.speakOne(next.text, controller.signal), aborted(controller.signal)]);
+          await Promise.race([this.speakOne(text, controller.signal), aborted(controller.signal)]);
         } catch (error) {
           if (!controller.signal.aborted) this.deps.onProblem?.(reason(error));
         } finally {

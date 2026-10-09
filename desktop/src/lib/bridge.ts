@@ -449,10 +449,17 @@ export interface VoiceSettingsDto {
    */
   speech: string;
   /**
-   * Whether reading mode may be turned on at all (PRD #1497 D4): `off` (the
-   * default) or `on`. One of `VOICE_READING_CONSENT`.
+   * Whether reading is on (PRD #1497 D4; decision 1 of 2026-10-09: Settings →
+   * Voice → Reading, the only reading state, which "reading on" / "reading
+   * off" also flip): `off` (the default) or `on`. One of `VOICE_READING_CONSENT`.
    */
   reading: string;
+  /**
+   * Whether the one-time notice of where reading sends replies has been shown
+   * (decision 5 of 2026-10-09): `pending` (the default) or `shown`. One of
+   * `VOICE_READING_NOTICE`.
+   */
+  reading_notice: string;
 }
 
 /**
@@ -657,10 +664,17 @@ export const VOICE_LABEL_SHARING = ["shared", "withheld"] as const;
 export const VOICE_SPEECH_SOURCES = ["auto", "provider", "system"] as const;
 
 /**
- * Whether reading mode may be turned on (PRD #1497 D4). `off` is the default.
+ * Whether reading is on (PRD #1497 D4). `off` is the default.
  * Keep identical to `ReadingConsent::TOKENS` in `src-tauri/src/settings.rs`.
  */
 export const VOICE_READING_CONSENT = ["off", "on"] as const;
+
+/**
+ * Whether reading's one-time notice has been shown (decision 5 of 2026-10-09).
+ * `pending` is the default. Keep identical to `ReadingNotice::TOKENS` in
+ * `src-tauri/src/settings.rs`.
+ */
+export const VOICE_READING_NOTICE = ["pending", "shown"] as const;
 
 /**
  * The bounds and the default for the command stage's answer ceiling.
@@ -740,6 +754,7 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettingsDto = {
   labels: "shared",
   speech: "auto",
   reading: "off",
+  reading_notice: "pending",
 };
 
 /**
@@ -1293,6 +1308,8 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
     ?? DEFAULT_VOICE_SETTINGS.speech;
   const reading = VOICE_READING_CONSENT.find((candidate) => candidate === record.reading)
     ?? DEFAULT_VOICE_SETTINGS.reading;
+  const readingNotice = VOICE_READING_NOTICE.find((candidate) => candidate === record.reading_notice)
+    ?? DEFAULT_VOICE_SETTINGS.reading_notice;
   return {
     activation,
     intent: normalizeVoiceIntentStage(record.intent),
@@ -1300,6 +1317,7 @@ function normalizeVoiceSettings(value: unknown): VoiceSettingsDto | undefined {
     labels,
     speech,
     reading,
+    reading_notice: readingNotice,
   };
 }
 
@@ -1898,22 +1916,29 @@ export interface DeckBridge {
    */
   voiceSpeechAudio(text: string): Promise<ArrayBuffer>;
   /**
-   * PRD #1497 M5 — start reading mode for `target`
+   * PRD #1497 M5 — start reading one agent, `target`
    * (`desktop_voice_reading_start`): each finished turn's summary, and each
    * permission prompt or error, arrives on `onSentence` until
    * {@link voiceReadingStop}. The agent's reply stays Rust-side; only the
-   * sentence crosses. Answers a refusal sentence when the Settings opt-in is
-   * off or reading is not available for the agent.
+   * sentence crosses. Answers a refusal sentence when the Settings switch is
+   * off on disk or reading is not available for the agent or its deck. Many
+   * run at once: one per agent on the deck being read.
    */
   voiceReadingStart(target: import("./reading").ReadingTarget, onSentence: (sentence: import("./reading").ReadingSentenceDto) => void): Promise<import("./reading").ReadingStartDto>;
   /** End the reading session `voiceReadingStart` answered (`desktop_voice_reading_stop`). Idempotent. */
   voiceReadingStop(session: number): Promise<void>;
   /**
    * PRD #1497 — be told when a settings save, from any window of this app,
-   * turned reading's Settings opt-in off (`desktop://reading-consent-off`),
-   * so a drain this window holds is cut off too. Answers the unsubscribe.
+   * turned reading's Settings switch off (`desktop://reading-consent-off`),
+   * so a start in progress here is ended too. Answers the unsubscribe.
    */
   onVoiceReadingConsentOff(listener: () => void): Promise<() => void>;
+  /**
+   * PRD #1497 — be told when a settings save left the switch on and in force
+   * (`desktop://reading-consent-on`), so a start refused because it read the
+   * settings before that save reached the disk is tried again.
+   */
+  onVoiceReadingConsentOn(listener: () => void): Promise<() => void>;
   /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
@@ -2937,7 +2962,7 @@ class FixtureDeckBridge implements DeckBridge {
 
   /**
    * The preview has no daemon turn events, so reading starts — the indicator
-   * and the end conditions can be exercised — and never speaks a turn.
+   * and the switch can be exercised — and never speaks a turn.
    */
   async voiceReadingStart(): Promise<import("./reading").ReadingStartDto> {
     await Promise.resolve();
@@ -2951,6 +2976,12 @@ class FixtureDeckBridge implements DeckBridge {
 
   /** The preview has one window and saves nothing elsewhere, so this is never told. */
   async onVoiceReadingConsentOff(): Promise<() => void> {
+    await Promise.resolve();
+    return () => undefined;
+  }
+
+  /** The preview's starts never read a stale document, so this is never told. */
+  async onVoiceReadingConsentOn(): Promise<() => void> {
     await Promise.resolve();
     return () => undefined;
   }
@@ -4752,6 +4783,11 @@ export class TauriDeckBridge implements DeckBridge {
   async onVoiceReadingConsentOff(listener: () => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<null>("desktop://reading-consent-off", () => listener());
+  }
+
+  async onVoiceReadingConsentOn(listener: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<null>("desktop://reading-consent-on", () => listener());
   }
 
   /**

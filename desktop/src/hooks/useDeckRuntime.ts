@@ -411,12 +411,13 @@ export function useDeckRuntime(): DeckRuntimeState {
   const voiceStop = useCallback(() => bridge.voiceStop(), [bridge]);
   const voiceStatus = useCallback(() => bridge.voiceStatus(), [bridge]);
   const voiceCancel = useCallback(() => bridge.voiceCancel(), [bridge]);
-  // PRD #1497 — reading mode's speech and its turn sentences.
+  // PRD #1497 — reading's speech and its turn sentences.
   const voiceSpeechPlan = useCallback(() => bridge.voiceSpeechPlan(), [bridge]);
   const voiceSpeechAudio = useCallback((text: string) => bridge.voiceSpeechAudio(text), [bridge]);
   const voiceReadingStart = useCallback((target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => bridge.voiceReadingStart(target, onSentence), [bridge]);
   const voiceReadingStop = useCallback((session: number) => bridge.voiceReadingStop(session), [bridge]);
   const onVoiceReadingConsentOff = useCallback((listener: () => void) => bridge.onVoiceReadingConsentOff(listener), [bridge]);
+  const onVoiceReadingConsentOn = useCallback((listener: () => void) => bridge.onVoiceReadingConsentOn(listener), [bridge]);
 
   const sendTerminalInput = useCallback((target: AgentTarget, data: string, precondition?: () => boolean) => bridge.sendTerminalInput(target, data, precondition), [bridge]);
   const resizeTerminal = useCallback((target: AgentTarget, cols: number, rows: number) => bridge.resizeTerminal(target, cols, rows), [bridge]);
@@ -531,6 +532,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     voiceReadingStart,
     voiceReadingStop,
     onVoiceReadingConsentOff,
+    onVoiceReadingConsentOn,
     setZoom,
   };
 }

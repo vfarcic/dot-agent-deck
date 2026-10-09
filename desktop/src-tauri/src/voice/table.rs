@@ -1364,8 +1364,8 @@ mod tests {
                 ("scratch_that", "scratchLastDictation", vec!["agent"]),
                 // PRD #1497's reading pair targets the pane on screen, and
                 // `hush_reading` is callable everywhere: speech can outlive its pane.
-                ("reading_on", "startReading", vec!["agent"]),
-                ("reading_off", "stopReading", vec!["agent"]),
+                ("reading_on", "startReading", vec![]),
+                ("reading_off", "stopReading", vec![]),
                 ("hush_reading", "quietSpeech", vec![]),
                 // `overview` alone: the dialog lives there (PRD #1223).
                 ("open_new_agent", "openNewAgent", vec!["overview"]),
@@ -2349,11 +2349,20 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        // `hush_reading` (PRD #1497 D6): speech can still be playing after the pane it
-        // was about has closed, and "stop" or "quiet" always works.
+        // `reading_on` / `reading_off` (PRD #1497, decision 2 of 2026-10-09):
+        // they flip the Settings switch, which is not tied to a pane.
+        // `hush_reading` (D6): reading speaks on every screen, and "stop" or
+        // "quiet" always works.
         assert_eq!(
             everywhere,
-            vec!["close", "voice_off", "list_commands", "hush_reading"]
+            vec![
+                "close",
+                "voice_off",
+                "list_commands",
+                "reading_on",
+                "reading_off",
+                "hush_reading"
+            ]
         );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
@@ -2425,6 +2434,8 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
+                "reading_on",
+                "reading_off",
                 "hush_reading",
                 "next_page",
                 "previous_page"
@@ -2441,6 +2452,8 @@ mod tests {
                 "switch_deck",
                 "voice_off",
                 "list_commands",
+                "reading_on",
+                "reading_off",
                 "hush_reading",
                 "open_new_agent",
                 "next_page",

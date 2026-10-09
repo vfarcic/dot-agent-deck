@@ -115,8 +115,8 @@ const LABEL_SHARING_LABELS: Record<string, string> = {
 };
 
 /**
- * PRD #1497 D4 — the Read turns aloud row's options. "reading on" refuses
- * while it is Off, and its spoken refusal names this row.
+ * PRD #1497 — the Reading row's options: reading's only state (decision 1 of
+ * 2026-10-09), which "reading on" and "reading off" also flip.
  */
 const READING_CONSENT_LABELS: Record<string, string> = {
   off: "Off",
@@ -124,14 +124,15 @@ const READING_CONSENT_LABELS: Record<string, string> = {
 };
 
 /**
- * PRD #1497 D4 — what reading sends, shown under the switch. Each clause is
- * the code's: `voice::reading::read_turns` summarises a finished turn's final
- * reply through the Commands connection (`voice::summary::summarise_turn`),
- * and `desktop_voice_speech_audio` sends every spoken sentence — permission
- * prompts and errors included — to that connection's speech service when the
- * Speech source picks it.
+ * PRD #1497 D4 — what reading does and sends, shown under the switch. Each
+ * clause is the code's: the voice panel reads every agent on the deck being
+ * viewed while the switch is on (`DeckReader`), `voice::reading::read_turns`
+ * summarises a finished turn's final reply through the Commands connection
+ * (`voice::summary::summarise_turn`), and `desktop_voice_speech_audio` sends
+ * every spoken sentence — permission prompts and errors included — to that
+ * connection's speech service when the Speech source picks it.
  */
-export const READING_DISCLOSURE = "With reading on, saying “reading on” in an agent's pane makes the app speak a short summary of each turn that agent finishes. To write it, the agent's final reply for the turn is sent to the Commands connection above. Permission prompts and errors are announced without asking the model. When the voice comes from the provider, every sentence the app speaks — summaries, permission prompts (with up to 120 characters of what the agent wants to do) and error announcements — is sent to that provider's speech service; with this computer's voice, those sentences stay on this computer.";
+export const READING_DISCLOSURE = "While Reading is on, the app speaks a short summary of each turn every agent on the deck you are viewing finishes, on any screen, and their permission prompts and errors as they happen. Saying “reading on” or “reading off” also turns it on or off. To write a summary, the agent's final reply for the turn is sent to the Commands connection above. Permission prompts and errors are announced without asking the model. When the voice comes from the provider, every sentence the app speaks — summaries, permission prompts (with up to 120 characters of what the agent wants to do) and error announcements — is sent to that provider's speech service; with this computer's voice, those sentences stay on this computer.";
 
 /** PRD #1497 D9 — the Speech source picker's options. */
 const SPEECH_SOURCE_LABELS: Record<string, string> = {
@@ -408,11 +409,11 @@ export function VoicePanel({ settings, onSave, saveError }: SettingsPanelProps) 
         <SecretRow id="voice-intent" stage="intent" endpoint={voice.intent.endpoint} />
       )}
 
-      {/* PRD #1497 D4 — reading's opt-in, off by default, with what it sends
+      {/* PRD #1497 D4 — Reading, off by default, with what it does and sends
           beside it: an agent's replies leave the machine only once this is
           on. The same segmented shape as Names. */}
       <div className="settings-row">
-        <span className="settings-row-label" id={readingLabelId}>Read turns aloud</span>
+        <span className="settings-row-label" id={readingLabelId}>Reading</span>
         <div className="segmented" role="radiogroup" aria-labelledby={readingLabelId}>
           {VOICE_READING_CONSENT.map((token) => (
             <label key={token} className={token === voice.reading ? "is-selected" : ""}>

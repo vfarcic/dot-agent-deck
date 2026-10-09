@@ -115,8 +115,8 @@ desktopScenario("settings-voice", async (page) => {
   await expect(page.getByTestId("settings-panel-voice")).toBeVisible();
 });
 
-// PRD #1497 — reading mode's two Settings rows, below the fold of
-// settings-voice: Read turns aloud with its disclosure, and Speech source.
+// PRD #1497 — reading's two Settings rows, below the fold of settings-voice:
+// Reading with its disclosure, and Speech source.
 desktopScenario("settings-voice-reading", async (page) => {
   await page.goto("/?fixture=1&state=docs");
   await page.getByTestId("open-settings").click();
@@ -132,8 +132,8 @@ desktopScenario("settings-voice-reading", async (page) => {
 
 // PRD #1260 — typing mode, desktop-only (the TUI has no voice). The fixture's
 // scripted microphone says "type on" once the Voice button is pressed with the
-// Desktop implementation agent's pane open; the image shows the mode marked on
-// the pane's top edge and in the voice row, with Stop typing beside the button.
+// Desktop implementation agent's pane open; the image shows the mode marked at
+// the window's top edge and in the voice row, with Stop typing beside the button.
 desktopScenario("voice-typing-mode", async (page) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("dot-agent-deck.desktop-settings", JSON.stringify({
@@ -150,7 +150,7 @@ desktopScenario("voice-typing-mode", async (page) => {
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
   await page.getByTestId("voice-trigger").click();
-  await expect(page.getByTestId("agent-pane-dictating")).toHaveText("Typing to Desktop implementation");
+  await expect(page.getByTestId("voice-typing-indicator")).toHaveText("Typing to Desktop implementation");
   await expect(page.getByTestId("voice-dictating")).toBeVisible();
   await expect(page.getByTestId("voice-stop-typing")).toBeVisible();
 });

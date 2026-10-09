@@ -132,7 +132,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 29] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 30] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -373,6 +373,16 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 29] = [
          Same folding deserializer and same MAX_VOICE_TOKEN_BYTES bound as \
          its neighbours, so no text is representable",
     ),
+    (
+        "ReadingNotice",
+        FieldKind::Scalar,
+        "a closed enum serialised as one token: `pending` or `shown` — whether \
+         the one-time notice of where reading sends replies has been shown \
+         (PRD #1497, decision 5 of 2026-10-09). A record that a notice was \
+         shown, never the notice or anything it names. Same folding \
+         deserializer and same MAX_VOICE_TOKEN_BYTES bound as its neighbours, \
+         so no text is representable",
+    ),
     // PRD #802's provider work: the two stages stopped being one token each
     // and became a backend plus the coordinates it is reached at. The endpoint
     // and the model are the values that COULD have been `String`s — this list
@@ -530,7 +540,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 29] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 30] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -592,6 +602,9 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 29] = [
     // PRD #1497 D4: a closed token (`VOICE_READING_CONSENT`) — whether reading
     // may be turned on, never a reply or a summary.
     ("VoiceSettingsDto", "reading", "string"),
+    // PRD #1497, decision 5 of 2026-10-09: a closed token
+    // (`VOICE_READING_NOTICE`) — whether the notice was shown, never its text.
+    ("VoiceSettingsDto", "reading_notice", "string"),
     // PRD #802's provider work. One interface for both stages, because both
     // hold the same three values and a second copy would be a second place to
     // forget a field. Every one is a REFERENCE — which backend, where it is,

@@ -38,9 +38,11 @@ const MAX_REMEMBERED_TURNS: usize = 1024;
 const MAX_TURN_ID_BYTES: usize = 256;
 
 /// How many `subscribe-turn-replies` connections the daemon serves at once.
-/// Reading follows one agent per desktop window, so this is far above any
-/// legitimate use; a subscription past it is refused with nothing opened, and
-/// a slot is freed when its connection ends ([`TurnReplyReceiver`]).
+/// The desktop's reading opens one per agent on the deck it views (PRD #1497,
+/// decision 3 of 2026-10-09), so this also bounds how many of this daemon's
+/// agents all open windows can read at once; a subscription past it is
+/// refused with nothing opened, and a slot is freed when its connection ends
+/// ([`TurnReplyReceiver`]).
 pub const MAX_TURN_REPLY_SUBSCRIBERS: usize = 32;
 
 /// A turn reply as it appears on a hook-socket line, read leniently: a reply

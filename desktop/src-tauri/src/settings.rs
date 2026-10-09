@@ -392,9 +392,12 @@ pub struct VoiceSettings {
     /// Where reading mode's voice comes from (PRD #1497 D9). See
     /// [`SpeechSource`].
     pub speech: SpeechSource,
-    /// Whether reading mode may be turned on at all (PRD #1497 D4). See
-    /// [`ReadingConsent`].
+    /// Whether reading is on (PRD #1497 D4; decision 1 of 2026-10-09: the
+    /// only reading state). See [`ReadingConsent`].
     pub reading: ReadingConsent,
+    /// Whether the one-time notice of where reading sends replies has been
+    /// shown (decision 5 of 2026-10-09). See [`ReadingNotice`].
+    pub reading_notice: ReadingNotice,
 }
 
 /// The endpoint the keyless local speech container listens on.
@@ -1237,23 +1240,57 @@ impl VoiceToken for SpeechSource {
     }
 }
 
-/// Whether reading mode may be turned on (PRD #1497 D4).
+/// Whether reading is on (PRD #1497 D4) — Settings → Voice → **Reading**, and
+/// since decision 1 of 2026-10-09 the only reading state: "reading on" and
+/// "reading off" flip this same switch.
 ///
 /// Reading sends each finished turn's final reply to the Commands connection to
 /// be summarised — and every sentence it speaks, permission prompts and error
 /// announcements included, to the provider's speech service when that is the
-/// speech source — which is more than voice sends otherwise. So it is
-/// **Off** until the user turns it on in Settings → Voice, and "reading on"
-/// refuses while it is off. A token rather than a `bool` so the settings field
-/// stays a closed enum like its neighbours, which is the shape the settings
-/// scanner admits.
+/// speech source — which is more than voice sends otherwise. So it is **Off**
+/// until the user turns it on, and turning it on is the consent. A token rather
+/// than a `bool` so the settings field stays a closed enum like its neighbours,
+/// which is the shape the settings scanner admits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReadingConsent {
-    /// "reading on" refuses and points at Settings.
+    /// Nothing is read, and no reply is sent anywhere.
     #[default]
     Off,
-    /// "reading on" may start reading.
+    /// Every agent on the deck being viewed is read.
     On,
+}
+
+/// Whether the one-time notice of where reading sends replies has been shown
+/// (decision 5 of 2026-10-09): the first time Reading is turned on, by voice or
+/// in Settings, the app says and shows the Commands connection's host (or that
+/// replies stay on this machine), and then records it here so it is not said
+/// again. A token rather than a `bool` for [`ReadingConsent`]'s reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadingNotice {
+    /// Not shown yet.
+    #[default]
+    Pending,
+    /// Shown.
+    Shown,
+}
+
+impl VoiceToken for ReadingNotice {
+    const TOKENS: &'static [&'static str] = &["pending", "shown"];
+    const LABEL: &'static str = "a reading notice state";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Shown => "shown",
+        }
+    }
+
+    fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "shown" => Self::Shown,
+            _ => Self::default(),
+        }
+    }
 }
 
 impl VoiceToken for ReadingConsent {
@@ -1298,7 +1335,7 @@ macro_rules! voice_token_serde {
     )+};
 }
 
-// Six identical serde impls, written once. The macro generates NO struct and
+// Seven identical serde impls, written once. The macro generates NO struct and
 // NO field — see [`VoiceToken`] for why that boundary matters to the
 // linkage-check scanner that reads this file as text.
 voice_token_serde!(
@@ -1307,7 +1344,8 @@ voice_token_serde!(
     TranscriptionBackend,
     LabelSharing,
     SpeechSource,
-    ReadingConsent
+    ReadingConsent,
+    ReadingNotice
 );
 
 /// The whole settings document.
@@ -5004,6 +5042,8 @@ mod tests {
                 "speech": "auto",
                 // Absent too, so Off: reading is opt-in (PRD #1497 D4).
                 "reading": "off",
+                // Absent too, so the notice of where replies go is still due.
+                "reading_notice": "pending",
             })
         );
 
@@ -5819,6 +5859,13 @@ mod tests {
         );
         assert_eq!(ReadingConsent::default(), ReadingConsent::Off);
         round_trips::<ReadingConsent>();
+        assert_eq!(
+            <ReadingNotice as VoiceToken>::TOKENS,
+            ["pending", "shown"],
+            "keep this identical to VOICE_READING_NOTICE in desktop/src/lib/bridge.ts"
+        );
+        assert_eq!(ReadingNotice::default(), ReadingNotice::Pending);
+        round_trips::<ReadingNotice>();
     }
 
     /// The preset endpoints and models are duplicated in
@@ -8265,6 +8312,7 @@ forms it is.";
                 labels: LabelSharing::Withheld,
                 speech: SpeechSource::Provider,
                 reading: ReadingConsent::On,
+                reading_notice: ReadingNotice::Shown,
             }),
             ..DesktopSettings::default()
         }
@@ -9157,6 +9205,7 @@ activation = \"toggle\"
 labels = \"withheld\"
 speech = \"provider\"
 reading = \"on\"
+reading_notice = \"shown\"
 
 [voice.intent]
 backend = \"anthropic\"

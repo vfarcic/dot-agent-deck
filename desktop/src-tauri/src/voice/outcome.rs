@@ -13067,16 +13067,24 @@ mod tests {
         assert_eq!(dispatched(&typed), Some("dictate_to_agent"));
     }
 
-    /// Scenario: "reading on" on the overview, with no agent's pane open, is
-    /// refused with the row's hint naming the pane it needs.
+    /// Scenario (decision 2 of 2026-10-09): "reading on" and "reading off"
+    /// flip the Settings switch from every screen — the overview, the deck and
+    /// an agent's pane alike — with no agent's pane needed.
     #[tokio::test]
-    async fn voice_outcome_reading_on_needs_an_agents_pane() {
-        let outcome = reading_answer("reading on", Screen::Overview, false, NOT_READING).await;
-        assert!(
-            matches!(&outcome, VoiceOutcome::Unavailable { action, hint, .. }
-                if action == "reading_on" && hint.contains("agent's pane")),
-            "{outcome:?}"
-        );
+    async fn voice_outcome_reading_on_and_off_work_on_every_screen() {
+        for screen in [Screen::Overview, Screen::Deck, Screen::Agent] {
+            for (said, action, state) in [
+                ("reading on", "reading_on", NOT_READING),
+                ("reading off", "reading_off", READING),
+            ] {
+                let outcome = reading_answer(said, screen, false, state).await;
+                assert_eq!(
+                    dispatched(&outcome),
+                    Some(action),
+                    "{said:?} on {screen:?}: {outcome:?}"
+                );
+            }
+        }
     }
 
     /// Scenario: "quiet" silences the app's speech on any screen while

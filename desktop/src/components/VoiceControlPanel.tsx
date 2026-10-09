@@ -88,7 +88,7 @@ import { TerminalInputCancelled, type EndpointSettingsDto, type VoiceCommandDto,
 import { answerChoiceLocally, collidingChoiceEntry, VOICE_CHOICE_MAX, type VoiceChoiceAnswerDto } from "../lib/voiceChoice";
 import { answerNumberLocally, hasNumbered, numberedEntry, numberedOutcome, numberedParam, SECTION_NOUNS, type VoiceNumberAnswerDto, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionKind, type VoiceNumberRefDto } from "../lib/voiceNumbers";
 import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePages";
-import { READING_ALREADY_OFF, type ReadingTarget } from "../lib/reading";
+import { READING_ALREADY_OFF, READING_ALREADY_ON, READING_NOTICE_VOICE_KEY, readingNotice, type ReadingAgent } from "../lib/reading";
 import { useReadingMode } from "../hooks/useReadingMode";
 import type { VoicePaneAgent } from "../lib/promptKeys";
 import { desktopFeaturesOf, type DeckFleet, type DeckRuntimeState } from "../types";
@@ -866,7 +866,7 @@ export function dictationRefused(label: string, reason: string): string {
 }
 
 /** The voice half of the runtime, which a runtime may not have at all. */
-type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "answerVoiceNumber" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures" | "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff">;
+type Voice = Pick<DeckRuntimeState, "declareVoiceScreen" | "resolveVoice" | "answerVoiceChoice" | "answerVoiceNumber" | "voiceCommands" | "voiceStart" | "voiceStop" | "voiceStatus" | "voiceCancel" | "sendTerminalInput" | "desktopFeatures" | "voiceSpeechPlan" | "voiceSpeechAudio" | "voiceReadingStart" | "voiceReadingStop" | "onVoiceReadingConsentOff" | "onVoiceReadingConsentOn">;
 
 /** The command table's row for the deck, whose screen issue #1198 hides by default. */
 const OPEN_DECK_COMMAND = "open_deck";
@@ -1290,16 +1290,25 @@ interface VoiceControlPanelProps {
   /** PRD #1260 — told when the dictation mode starts or ends, so the host can
    * mark the pane it is typing into. */
   onDictationChange?: (target: Pending | undefined) => void;
-  /** PRD #1497 — told when reading mode starts or ends, so the host can mark
-   * the pane being read. */
-  onReadingChange?: (target: ReadingTarget | undefined) => void;
   /**
-   * PRD #1497 — reading's Settings opt-in as the settings on screen hold it
-   * (`"on"` or `"off"`). Turned off, reading ends here at once — a drain
-   * still being said included, which the Rust side has no session left to
-   * end. Absent, nothing is ended on its account.
+   * PRD #1497 — Settings → Voice → Reading, the only reading state (decision
+   * 1 of 2026-10-09), as the settings on screen hold it: whether it is on,
+   * whether its one-time notice was shown, and the Commands connection's
+   * endpoint the notice names. Absent, nothing is read.
    */
-  readingConsent?: string;
+  reading?: { on: boolean; noticeShown: boolean; endpoint: string };
+  /**
+   * PRD #1497 decision 3 — the agents reading reads while it is on: every
+   * agent on the deck being viewed.
+   */
+  readingAgents?: readonly ReadingAgent[];
+  /**
+   * PRD #1497 decision 2 — save the switch, through the same save as Settings.
+   * "reading on" and "reading off" call it.
+   */
+  onReadingSwitch?: (on: boolean) => void;
+  /** PRD #1497 decision 5 — record that the one-time notice was shown. */
+  onReadingNoticeShown?: () => void;
   /** PR #1451, round 3 — told when voice turns on or off, so the host can
    * share it with the lists that render differently while it is on. */
   onVoiceChange?: (on: boolean) => void;
@@ -1377,7 +1386,7 @@ function progressNote(indicator: VoiceIndicator, phase: VoicePhase): string | un
  * real state: a control with nothing behind it would be worse than its absence,
  * and it is the same reasoning the microphone itself gets one layer down.
  */
-export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, onReadingChange, readingConsent, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
+export function VoiceControlPanel({ runtime, screen, onDispatch, channel, directories, newAgent, newAgentInstance, endpoints, pane, fleet, selectedDeckId, confirmationOpen = false, onDictationChange, reading, readingAgents, onReadingSwitch, onReadingNoticeShown, onVoiceChange, agentIncarnations, numbered, pages, onChoiceChange, keyboard }: VoiceControlPanelProps) {
   /* Held in a ref so the resolve and the overlay read the host's latest getter
      without either callback being rebuilt when the host re-renders. */
   const directoriesRef = useRef(directories);
@@ -1410,17 +1419,29 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const heardContext = useRef<VoiceContext | undefined>(undefined);
   const { declareVoiceScreen, resolveVoice, answerVoiceChoice, answerVoiceNumber, voiceCommands, voiceStart, voiceStop, voiceStatus, voiceCancel, sendTerminalInput } = runtime;
-  /* PRD #1497 — reading mode and the speech queue it speaks through. A
-     sentence that could not be spoken is reported in the row. */
-  const reader = useReadingMode(runtime, onReadingChange, (reason) => setProblem(`Could not speak: ${reason}.`));
+  /* PRD #1497 — reading and the speech queue it speaks through. A sentence
+     that could not be spoken is reported in the row, and so is one about
+     reading itself (a deck that cannot be read). Which pane is open is asked
+     when a sentence is said, for its name (decision 4). */
+  const openPaneRef = useRef(pane);
+  openPaneRef.current = pane;
+  const reader = useReadingMode(
+    runtime,
+    () => {
+      const open = openPaneRef.current;
+      return open === undefined ? undefined : { deckId: open.deckId, agentId: open.agentId };
+    },
+    (reason) => setProblem(`Could not speak: ${reason}.`),
+    (sentence) => setProblem(sentence),
+  );
   /**
    * PRD #1497 D8 — whether the app spoke during the recording the utterance
    * being worked on came from. Set when a segment is taken, read when it is
    * declared: while it is true only "stop" and "quiet" are answered.
    */
   const overlappedRef = useRef(false);
-  /** PRD #1497 — reading mode and the app's speech, as declared with an utterance. */
-  const declaredReading = (): VoiceReadingStateDto => ({ reading: reader.mode.on, speaking: overlappedRef.current });
+  /** PRD #1497 — reading and the app's speech, as declared with an utterance. */
+  const declaredReading = (): VoiceReadingStateDto => ({ reading: reader.reader.on, speaking: overlappedRef.current });
   /* Issue #1198 — the list of what can be said leaves out the deck while the
      deck is hidden, even from its "elsewhere" half: it is not somewhere else,
      it is not there. The crate withholds the row from the model as well
@@ -3081,8 +3102,8 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PRD #1260 — voice off ends the dictation mode too, sending nothing. The
        report is the release's own, so the mode ends without a sentence. */
     setPanelState(IDLE);
-    /* PRD #1497 D11 — and reading, which says "Reading off." aloud. */
-    void reader.mode.voiceOff();
+    /* PRD #1497 — reading is NOT ended: it is the Settings switch, and only
+       the switch ends it (decision 1 of 2026-10-09). */
     /* The webview half of the same release. `voiceCancel` frees the DEVICE;
        this frees the pipeline behind it, which the device has no say over — a
        transcription or a resolution already handed to a backend arrives
@@ -3850,47 +3871,60 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     if (!endDictation()) setProblem(VOICE_NOT_DICTATING);
   }, [endDictation]);
   /**
-   * PRD #1497 — start reading mode for the pane on screen. Refused on a pane
-   * that is no longer the one on screen, like typing mode. The start itself is
-   * answered later (the Settings opt-in, whether this agent can be read), so a
-   * refusal replaces the row's "Reading on." when it arrives — and is spoken.
+   * PRD #1497 decision 3 — what reading reads, kept in step with the switch
+   * and the deck: every agent on the deck being viewed while the switch is
+   * on. The switch as first handed over (the settings as loaded) is not a
+   * change anyone made, so it says nothing; every later turn of it says
+   * "Reading on." or "Reading off.".
    */
-  const startReading = useCallback((target: VoiceDispatchTarget) => {
-    const shown = paneRef.current;
-    const label = target.agentLabel ?? shown?.label ?? target.agentId;
-    const lost = paneLost(target);
-    if (lost || !shown) {
-      reportRefused(lost?.code === "replaced" ? VOICE_PANE_REPLACED : `Reading did not start for ${label}: ${lost?.why ?? "its pane is not the one on screen"}.`);
+  const readingOn = reading?.on ?? false;
+  const readingKnown = reading !== undefined;
+  const readingSeen = useRef(false);
+  useEffect(() => {
+    if (!readingKnown) return;
+    reader.reader.update(readingOn, readingAgents ?? [], readingSeen.current);
+    readingSeen.current = true;
+  }, [reader.reader, readingAgents, readingKnown, readingOn]);
+  /**
+   * PRD #1497 decision 5 — the first time Reading is on, by voice or in
+   * Settings, the app says and shows where replies go, then records that it
+   * did so it is not said again.
+   */
+  const noticeDue = readingOn && reading !== undefined && !reading.noticeShown;
+  const noticeEndpoint = reading?.endpoint ?? "";
+  const noticeSaid = useRef(false);
+  const noticeShownRef = useRef(onReadingNoticeShown);
+  noticeShownRef.current = onReadingNoticeShown;
+  useEffect(() => {
+    if (!noticeDue || noticeSaid.current) return;
+    noticeSaid.current = true;
+    const notice = readingNotice(noticeEndpoint);
+    reader.queue.say(READING_NOTICE_VOICE_KEY, notice);
+    setProblem(notice);
+    noticeShownRef.current?.();
+  }, [noticeDue, noticeEndpoint, reader.queue]);
+  /**
+   * PRD #1497 decision 2 — "reading on": turn the Settings switch on, from any
+   * screen, through the same save as Settings. The reader says "Reading on."
+   * when the switch it is shown turns.
+   */
+  const startReading = useCallback(() => {
+    if (readingOn) {
+      reportRefused(READING_ALREADY_ON);
       return;
     }
-    void reader.mode.turnOn({ deckId: target.deckId, agentId: target.agentId, label }).then((started) => {
-      if (started.kind !== "refused") return;
-      setResult(undefined);
-      setProblem(started.sentence);
-    });
-  }, [paneLost, reader.mode, reportRefused]);
-  /** PRD #1497 — leave reading mode by voice; "Reading off." is spoken. */
+    onReadingSwitch?.(true);
+  }, [onReadingSwitch, readingOn, reportRefused]);
+  /** PRD #1497 decision 2 — "reading off": turn the switch off; the same save as Settings. */
   const stopReading = useCallback(() => {
-    if (!reader.mode.active) {
+    if (!readingOn) {
       reportRefused(READING_ALREADY_OFF);
       return;
     }
-    void reader.mode.turnOff();
-  }, [reader.mode, reportRefused]);
-  /* PRD #1497 — the Settings opt-in turned off ends reading, and cuts off
-     whatever of it is still being said, without waiting for the save. */
-  useEffect(() => {
-    if (readingConsent !== undefined && readingConsent !== "on") void reader.mode.consentOff();
-  }, [reader.mode, readingConsent]);
+    onReadingSwitch?.(false);
+  }, [onReadingSwitch, readingOn, reportRefused]);
   /** PRD #1497 D6 — "stop" / "quiet": silence the app. Reading stays on. */
-  const quietSpeech = useCallback(() => reader.mode.quiet(), [reader.mode]);
-  /* PRD #1497 D11 — reading ends when the pane on screen stops being the
-     agent it was turned on for: another agent's pane, or none. */
-  const shownDeckId = pane?.deckId;
-  const shownAgentId = pane?.agentId;
-  useEffect(() => {
-    void reader.mode.paneChanged(shownDeckId !== undefined && shownAgentId !== undefined ? { deckId: shownDeckId, agentId: shownAgentId } : undefined);
-  }, [reader.mode, shownAgentId, shownDeckId]);
+  const quietSpeech = useCallback(() => reader.reader.quiet(), [reader.reader]);
 
   /*
     PRD #802 — publish the members only this surface can serve, so a row naming
@@ -4050,6 +4084,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         {indicator === "off" ? <MicOff size={16} /> : <Mic size={16} />}
         <span>{INDICATOR_LABEL[indicator]}</span>
       </button>
+      {/*
+        PRD #1497 decision 6 — the mode indicators, typing and reading side by
+        side on ONE row. Reading is deck-wide and runs on every screen, so its
+        indicator has to be visible on every screen: the row is pinned to the
+        top edge of the window (over the open agent pane's top edge, where
+        typing's mark used to sit alone), and is a child of this row so it
+        shares the voice row's `VOICE_PEER_PROPS` exemption. It holds no
+        control, and lets every pointer event through to what is under it.
+      */}
+      {(dictatingLabel !== undefined || readingOn) && (
+        <div className="voice-indicators" data-testid="voice-indicators">
+          {dictatingLabel !== undefined && (
+            <p className="voice-indicator is-typing" data-testid="voice-typing-indicator">
+              {"Typing to "}
+              {dictatingLabel}
+            </p>
+          )}
+          {readingOn && <p className="voice-indicator is-reading" data-testid="voice-reading-indicator">Reading aloud</p>}
+        </div>
+      )}
       {/*
         PRD #1260 — the dictation mode's non-voice exit, shown only while the
         mode is on. It leaves voice listening and sends nothing.

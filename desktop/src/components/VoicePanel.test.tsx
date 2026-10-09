@@ -72,6 +72,7 @@ const BOTH_KEYED = {
     labels: "shared",
     speech: "auto",
     reading: "off",
+    reading_notice: "pending",
   },
 };
 
@@ -197,6 +198,7 @@ describe("VoicePanel", () => {
           labels: "shared",
           speech: "auto",
           reading: "off",
+          reading_notice: "pending",
         },
       }),
     );
@@ -668,14 +670,16 @@ describe("VoicePanel", () => {
   });
 });
 
-describe("VoicePanel reading mode settings (PRD #1497 D4, D9)", () => {
-  /** Scenario: Read turns aloud is Off by default with its privacy explanation beside it, and choosing On saves `reading = "on"` and nothing else. */
-  it("offers the reading opt-in, off by default, with what it sends", () => {
+describe("VoicePanel reading settings (PRD #1497 D4, D9)", () => {
+  /** Scenario (decision 1 of 2026-10-09): the switch is named Reading, Off by default, with what it does and sends beside it — including that "reading on" and "reading off" also switch it — and choosing On saves `reading = "on"` and nothing else. */
+  it("offers the Reading switch, off by default, with what it does and sends", () => {
     const { onSave } = renderPanel();
-    const group = screen.getByRole("radiogroup", { name: "Read turns aloud" });
+    const group = screen.getByRole("radiogroup", { name: "Reading" });
     expect(within(group).getByRole("radio", { name: "Off" })).toBeChecked();
     expect(screen.getByTestId("voice-reading-disclosure")).toHaveTextContent(READING_DISCLOSURE);
     expect(READING_DISCLOSURE).toMatch(/final reply .* sent to the Commands connection/);
+    expect(READING_DISCLOSURE).toMatch(/every agent on the deck you are viewing/);
+    expect(READING_DISCLOSURE).toMatch(/Saying “reading on” or “reading off” also turns it on or off/);
     expect(READING_DISCLOSURE).toMatch(/speech service/);
     // Audit A-B2: provider speech gets every sentence, the announcements included.
     expect(READING_DISCLOSURE).toMatch(/every sentence the app speaks .*permission prompts .*error announcements.* sent to that provider's speech service/);

@@ -74,6 +74,15 @@ The agent itself is never touched: no prompt is injected, nothing is written int
 - **D11: Reading ends with its pane (M1, 2026-10-07).** Reading is bound to the agent it was turned on for. Opening a different agent's pane, closing this one, "reading off" or "voice off" ends it, and the app says "Reading off". It never follows the user to another pane.
 - **D12: Not behind the experimental flag (M1, 2026-10-07, CLAUDE.md rule 9).** Reading ships visible by default; it stays opt-in through the Settings switch (D4). No `show_*` wrapper and no `graduate-*` follow-up.
 
+- **2026-10-09: D4, D10 and D11 revised by the maintainer's decisions 1–7 of that day.** Why: two overlapping controls (the Settings opt-in and a per-pane "reading on") were confusing, and reading every agent on the deck lets you hear a whole orchestration. What now holds, replacing D4, D10 and D11 where they conflict (the entries above are kept as they were decided):
+  1. **One state, the Settings switch.** **Read turns aloud** is renamed **Reading** (Off by default); turning it on is the consent, and there is no per-agent reading state.
+  2. **"reading on" / "reading off" flip that switch** from any screen, through the same save as Settings, so turning it off still ends sessions, revokes in-flight speech and summary requests, and emits `desktop://reading-consent-off`.
+  3. **Deck-wide.** While it is on, every agent on the deck being viewed is read, on any screen: one `SubscribeTurnReplies` stream per agent, added as agents appear, dropped as they exit, following a change of deck. Changing panes or screens no longer ends reading. An older daemon without `CAP_TURN_REPLIES` is reported once for the deck.
+  4. **Names (replaces D10).** A sentence about the agent whose pane is open when it is spoken drops the name ("Finished: …"); every other sentence names the agent. Decided when the sentence is spoken.
+  5. **A one-time notice** the first time Reading is turned on, naming where replies go (the Commands endpoint's host, or that they stay on this machine), recorded in `[voice] reading_notice`.
+  6. **One indicator row:** typing and reading side by side, visible on every screen.
+  7. **No silent turns:** a turn that ends with no reply is announced ("The coder finished; there was no reply to read.").
+
 ## Milestones
 
 - [x] **M1: Decisions recorded.** (2026-10-07: D8–D12.) The open questions below answered with the maintainer and written into this document, including the CLAUDE.md rule 9 experimental-flag question for this new voice surface.
