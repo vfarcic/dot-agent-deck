@@ -135,18 +135,25 @@ fn build_command_for(
 /// form.
 pub(crate) const BIN_OVERRIDE_PREFIX: &str = crate::platform::paths::HOOK_BIN_OVERRIDE_PREFIX;
 
-/// Refuse to write a hook command naming `binary_path` when no quoting of it
-/// is safe in every shell the command may be run by (PRD #1497, tester H1).
+/// Refuse to write a hook command naming `binary_path` when the deck's hook
+/// command quoting does not run it safely in every shell the command may be
+/// run by (PRD #1497, tester H1).
 ///
 /// On macOS and Linux the installed path is single-quoted when it needs
 /// quoting, with `'` spelled `'\''`. sh, bash and zsh read every byte inside
 /// single quotes literally, but fish reads `\'` and `\\` there as escapes, and
 /// Codex runs a hook through `$SHELL -lc`, so a fish login shell is a real
 /// reader: an install directory named `back\'; touch PWNED; #` made fish run
-/// `touch PWNED`. Quoting per shell is no answer, because the user's login
-/// shell can change after the install. A backslash is the only byte fish
-/// treats specially inside single quotes, so it is the only one refused; a
-/// path with spaces or `'` is still written, and every such shell runs it.
+/// `touch PWNED`. A backslash can be quoted for both (closing the quote and
+/// spelling it `\\` outside, as `'back'\\'slash'`), but this quoting does not do
+/// that, so these installers refuse such a path instead. A backslash is the
+/// only byte fish treats specially inside single quotes, so it is the only one
+/// refused; a path with spaces or `'` is still written, and every such shell
+/// runs it.
+///
+/// It guards the Claude Code, Codex and Devin shell hooks only. The OpenCode
+/// plugin and the Pi extension pass the path as an argument rather than through
+/// a shell, so they are not refused.
 ///
 /// Each installer calls this before it reads the agent's config, so a refused
 /// install leaves that config, and the deck entries an earlier install wrote
@@ -169,10 +176,10 @@ fn ensure_hook_path_is_shell_safe_for(binary_path: &str, windows_host: bool) -> 
         io::ErrorKind::InvalidInput,
         format!(
             "refusing to write hook commands for {binary_path:?}: the path contains a backslash, \
-             which fish reads as an escape even inside single quotes, so no quoting of it is safe \
-             in every shell an agent may run its hooks in (Codex uses your login shell). The \
-             existing hook entries are left unchanged. Install dot-agent-deck at a path without \
-             a backslash and install the hooks again."
+             and the way dot-agent-deck quotes its hook commands does not keep a backslash safe \
+             under fish, which reads it as an escape even inside single quotes (Codex runs hooks \
+             in your login shell). The existing hook entries are left unchanged. Install \
+             dot-agent-deck at a path without a backslash and install the hooks again."
         ),
     ))
 }
@@ -1356,7 +1363,9 @@ pub(crate) enum KeptDeckEntry {
     /// The installing binary's own: the ordinary refresh writes the same
     /// command, so there is nothing to keep apart from it.
     ThisBinary,
-    /// Another install's: written back verbatim, so it stays byte for byte.
+    /// Another install's: written back verbatim, so it stays byte for byte,
+    /// unless it carried the legacy override wrapper, which is rebuilt around
+    /// the same executable (see [`auto_install_kept_entry`]).
     Other { command: String, exe: String },
 }
 
@@ -1389,18 +1398,42 @@ impl KeptDeckEntry {
 
 /// For an [`InstallMode::Automatic`] install by `binary_path`: the first deck
 /// command in `rules` (walk order, nested handlers) that `is_own` accepts and
-/// whose executable is a live durable install ([`auto_install_keeps`]), or
-/// `None` when no deck entry there is.
+/// whose executable is a live durable install ([`auto_install_keeps`]) that the
+/// deck's hook command can name safely ([`ensure_hook_path_is_shell_safe`]),
+/// or `None` when no deck entry there is.
 ///
 /// The caller writes another install's command back instead of its own, so
-/// [`consolidate_deck_handlers_in_place`] keeps that entry where it sits, byte
-/// for byte, and still consolidates the other deck copies down to it. A dead or
-/// build-output entry ahead of it is overwritten in place with the kept command.
+/// [`consolidate_deck_handlers_in_place`] keeps that entry where it sits and
+/// still consolidates the other deck copies down to it. A dead or build-output
+/// entry ahead of it is overwritten in place with the kept command.
+///
+/// Two checks apply to another install's entry before it is kept, because
+/// keeping it also copies its command into every event array that has no deck
+/// entry of its own (PRD #1497 audit F1):
+///
+/// - **A sibling whose path holds a backslash is not kept.** It is passed over
+///   exactly as a dead pin is, so it is overwritten in place by the command the
+///   install does write: the next safe live sibling's, else the installing
+///   binary's own, which the caller has already checked. An older deck may have
+///   written it, and fish reads `\` inside its single quotes as an escape.
+/// - **A sibling written in [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]'s form is
+///   rebuilt**, through `command_for_exe` (the adapter's own command for an
+///   executable), around the same executable. That wrapper ran a relative
+///   [`crate::platform::paths::DOT_AGENT_DECK_BIN`] from `$PATH` or the working
+///   directory. The rebuilt command replaces the old one where it sits, so the
+///   entry's position and its rule's `matcher` are kept.
+///
+/// Every other form of another install's command is written back byte for
+/// byte, so two installs that each resolve to themselves do not rewrite the
+/// agent's config on every start.
+///
+/// [`LEGACY_HOOK_BIN_OVERRIDE_PREFIX`]: crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX
 pub(crate) fn auto_install_kept_entry(
     rules: &[Value],
     binary_path: &str,
     is_own: impl Fn(&str) -> bool,
     executable_of: impl Fn(&str) -> Option<String>,
+    command_for_exe: impl Fn(&str) -> String,
 ) -> Option<KeptDeckEntry> {
     let (command, exe) = rules
         .iter()
@@ -1411,10 +1444,16 @@ pub(crate) fn auto_install_kept_entry(
         .find_map(|command| {
             executable_of(command)
                 .filter(|exe| auto_install_keeps(exe))
+                .filter(|exe| ensure_hook_path_is_shell_safe(exe).is_ok())
                 .map(|exe| (command.to_string(), exe))
         })?;
     Some(if executables_match(&exe, binary_path) {
         KeptDeckEntry::ThisBinary
+    } else if command.starts_with(crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX) {
+        KeptDeckEntry::Other {
+            command: command_for_exe(&exe),
+            exe,
+        }
     } else {
         KeptDeckEntry::Other { command, exe }
     })
@@ -2367,6 +2406,200 @@ mod tests {
         }
         ensure_hook_path_is_shell_safe_for(r"C:\Program Files\deck\dot-agent-deck.exe", true)
             .expect("cmd.exe dialect: the separator is not refused");
+    }
+
+    /// A live, durable `dot-agent-deck` stand-in at `dir`, for the automatic
+    /// install's keep rule to recognise as another install.
+    #[cfg(unix)]
+    fn live_deck_binary(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let binary = dir.join("dot-agent-deck");
+        crate::test_isolation::write_script(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary.to_str().expect("utf-8 fixture path").to_string()
+    }
+
+    /// The current-form command each shell-hook adapter writes for `exe` on a
+    /// POSIX host.
+    #[cfg(unix)]
+    fn current_deck_command(agent: &str, exe: &str) -> String {
+        build_command_for(
+            exe,
+            &format!("hook --agent {agent}"),
+            HookShell::Posix,
+            false,
+        )
+    }
+
+    /// Seed `agent`'s config at `home` with one deck rule, `command`, in the
+    /// first event an install writes, placed after a user rule and carrying a
+    /// custom `matcher`, and with every other event the deck installs removed.
+    /// Returns the event the rule sits in and the events that were removed.
+    #[cfg(unix)]
+    fn seed_one_deck_rule(agent: &str, home: &Path, command: &str) -> (String, Vec<String>) {
+        let placeholder = live_deck_binary(&home.join("placeholder"));
+        install_config(agent, home, &placeholder).expect("control install");
+        let config = home.join(config_name(agent));
+        let mut root: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+        let hooks = root["hooks"].as_object_mut().expect("hooks object");
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        let (kept, removed) = events.split_first().expect("an install writes events");
+        for event in removed {
+            hooks.remove(event);
+        }
+        hooks.insert(
+            kept.clone(),
+            json!([
+                { "hooks": [ { "type": "command", "command": "echo user-hook" } ] },
+                {
+                    "matcher": "custom-matcher",
+                    "hooks": [ { "type": "command", "command": command } ]
+                }
+            ]),
+        );
+        std::fs::write(&config, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        (kept.clone(), removed.to_vec())
+    }
+
+    /// Every hook command in `agent`'s config at `home`, by event.
+    #[cfg(unix)]
+    fn commands_by_event(agent: &str, home: &Path) -> Vec<(String, String)> {
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(home.join(config_name(agent))).unwrap()).unwrap();
+        let mut found = Vec::new();
+        for (event, rules) in root["hooks"].as_object().expect("hooks object") {
+            for rule in rules.as_array().into_iter().flatten() {
+                for handler in rule["hooks"].as_array().into_iter().flatten() {
+                    if let Some(command) = handler["command"].as_str() {
+                        found.push((event.clone(), command.to_string()));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Scenario: an older deck left a hook for another, still-live install of
+    /// dot-agent-deck at a path whose name holds a backslash, in one event
+    /// only; the deck then starts from a safe path and installs its hooks
+    /// automatically. For Claude Code, Codex and Devin, that entry is
+    /// overwritten with the starting deck's own command where it sits, and no
+    /// event the install fills, the missing ones included, gets the unsafe
+    /// command (PRD #1497 audit F1, the H1 residual).
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_install_neither_keeps_nor_copies_an_unsafe_sibling_command() {
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let unsafe_sibling =
+            live_deck_binary(&fixture.path().join("back\\'; touch PWNED; #").join("bin"));
+        let installing = live_deck_binary(&fixture.path().join("safe/bin"));
+        for agent in ["claude-code", "codex", "devin"] {
+            let home = fixture.path().join(agent);
+            std::fs::create_dir_all(&home).unwrap();
+            let sibling_command = current_deck_command(agent, &unsafe_sibling);
+            let (event, missing) = seed_one_deck_rule(agent, &home, &sibling_command);
+
+            auto_install_config(agent, &home, &installing);
+
+            let own = current_deck_command(agent, &installing);
+            let commands = commands_by_event(agent, &home);
+            assert!(
+                commands
+                    .iter()
+                    .all(|(_, command)| !command.contains("back\\")),
+                "{agent}: the unsafe sibling's command must not survive: {commands:#?}"
+            );
+            for event in std::iter::once(&event).chain(&missing) {
+                let deck: Vec<&str> = commands
+                    .iter()
+                    .filter(|(e, command)| e == event && command != "echo user-hook")
+                    .map(|(_, command)| command.as_str())
+                    .collect();
+                assert_eq!(
+                    deck,
+                    [own.as_str()],
+                    "{agent}/{event}: one deck entry, the installing binary's safe current-form command"
+                );
+            }
+            let root: Value =
+                serde_json::from_slice(&std::fs::read(home.join(config_name(agent))).unwrap())
+                    .unwrap();
+            assert_eq!(
+                root["hooks"][&event][0]["hooks"][0]["command"], "echo user-hook",
+                "{agent}: the user's rule keeps its place"
+            );
+            assert_eq!(
+                root["hooks"][&event][1]["hooks"][0]["command"],
+                own.as_str(),
+                "{agent}: the unsafe entry is overwritten where it sat"
+            );
+        }
+        assert!(!fixture.path().join("PWNED").exists());
+    }
+
+    /// Scenario: an earlier PRD #1497 build left a hook for another,
+    /// still-live install of dot-agent-deck in the legacy override wrapper,
+    /// which ran a relative DOT_AGENT_DECK_BIN from the PATH or the working
+    /// directory, in one event only, after a user rule and under a custom
+    /// matcher; the deck then starts and installs its hooks automatically. For
+    /// Claude Code, Codex and Devin, that entry is rebuilt into the current
+    /// wrapper around the same sibling executable, at the same position and
+    /// with the same matcher, and every missing event gets that current-form
+    /// command rather than the legacy one (PRD #1497 audit F1, the H2
+    /// residual).
+    #[cfg(unix)]
+    #[test]
+    fn an_automatic_install_rebuilds_a_kept_sibling_legacy_wrapper() {
+        let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        let sibling = live_deck_binary(&fixture.path().join("sibling/bin"));
+        let installing = live_deck_binary(&fixture.path().join("installing/bin"));
+        for agent in ["claude-code", "codex", "devin"] {
+            let home = fixture.path().join(agent);
+            std::fs::create_dir_all(&home).unwrap();
+            let legacy_command = format!("{legacy}{sibling} hook --agent {agent}");
+            let (event, missing) = seed_one_deck_rule(agent, &home, &legacy_command);
+
+            auto_install_config(agent, &home, &installing);
+
+            let rebuilt = current_deck_command(agent, &sibling);
+            assert!(rebuilt.starts_with(BIN_OVERRIDE_PREFIX), "{rebuilt}");
+            let root: Value =
+                serde_json::from_slice(&std::fs::read(home.join(config_name(agent))).unwrap())
+                    .unwrap();
+            let rules = root["hooks"][&event].as_array().expect("event kept");
+            assert_eq!(rules.len(), 2, "{agent}: {rules:#?}");
+            assert_eq!(rules[0]["hooks"][0]["command"], "echo user-hook");
+            assert_eq!(
+                rules[1]["hooks"][0]["command"],
+                rebuilt.as_str(),
+                "{agent}: rebuilt around the same sibling executable, in place"
+            );
+            assert_eq!(
+                rules[1]["matcher"], "custom-matcher",
+                "{agent}: the kept rule's matcher is preserved"
+            );
+            let commands = commands_by_event(agent, &home);
+            assert!(
+                commands
+                    .iter()
+                    .all(|(_, command)| !command.starts_with(legacy)),
+                "{agent}: no legacy wrapper survives or is copied: {commands:#?}"
+            );
+            for event in &missing {
+                let deck: Vec<&str> = commands
+                    .iter()
+                    .filter(|(e, _)| e == event)
+                    .map(|(_, command)| command.as_str())
+                    .collect();
+                assert_eq!(
+                    deck,
+                    [rebuilt.as_str()],
+                    "{agent}/{event}: a missing event gets the kept sibling's current-form command"
+                );
+            }
+        }
     }
 
     /// Tester H1, at each installer: a refused install writes nothing, so the

@@ -2481,7 +2481,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### hooks/install/014 — An install from a deck path containing a backslash is refused and the settings are kept (PRD #1497).
 - **Layer:** as `hooks/install/007`, the deck run from a scratch copy in a directory named `back\'; touch PWNED; #` with no installed deck to prefer, so that path is the one the install would pin.
 - **Agent:** none.
-- **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, so no quoting of such a path is safe in every shell.
+- **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, and the deck's hook command quoting does not keep a backslash safe under fish, so the installers refuse such a path.
 - **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
 

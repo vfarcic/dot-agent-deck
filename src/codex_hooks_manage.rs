@@ -431,6 +431,7 @@ fn install_impl(
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             deck_command_executable,
+            expected_hook_command,
         )
     };
     let keeper = match mode {

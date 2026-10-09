@@ -594,19 +594,25 @@ const HOOK_COMMAND_SUFFIX: &str = "hook --agent claude-code";
 /// LEGACY `<path> hook` shape — see [`is_legacy_deck_rule`].
 const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Build a rule object in the new hooks format:
-/// `{ "hooks": [{"type": "command", "command": "..."}] }`
-/// For Notification, adds a matcher for permission_prompt.
-fn make_rule(binary_path: &str, hook_type: &str) -> Value {
+/// The deck's hook command for `binary_path`, as every rule [`make_rule`]
+/// builds carries it.
+fn hook_command(binary_path: &str) -> String {
     // PRD #1497: through the `DOT_AGENT_DECK_BIN` override wherever the hook
     // runs in a POSIX shell (`sh -c`, per Claude Code's hooks reference).
-    let command = format!(
+    format!(
         "{} {HOOK_COMMAND_SUFFIX}",
         crate::agent_hook_config::overridable_command_word(
             &shell_quote_if_needed(binary_path),
             cfg!(windows),
         )
-    );
+    )
+}
+
+/// Build a rule object in the new hooks format:
+/// `{ "hooks": [{"type": "command", "command": "..."}] }`
+/// For Notification, adds a matcher for permission_prompt.
+fn make_rule(binary_path: &str, hook_type: &str) -> Value {
+    let command = hook_command(binary_path);
     let command_obj = json!({
         "type": "command",
         "command": command
@@ -794,6 +800,7 @@ fn install_impl_in(
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             |cmd| current_format_executable(cmd).map(|exe| unquote_if_needed(exe).into_owned()),
+            hook_command,
         )
     };
     let keeper = match mode {

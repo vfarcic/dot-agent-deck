@@ -371,6 +371,7 @@ fn install_impl(root: &mut Value, command: &str, binary_path: &str, mode: Instal
             binary_path,
             |cmd| command_is_deck_install(cmd, binary_path),
             deck_command_executable,
+            |exe| crate::agent_hook_config::build_command(exe, HOOK_COMMAND_SUFFIX, HOOK_SHELL),
         )
     };
     let keeper = match mode {
