@@ -654,6 +654,16 @@ impl BuiltinOption {
             Self::Dispatcher => DISPATCHER_MODE_NAME,
         }
     }
+
+    /// Issue #1496: the daemon's name for this option's kind, which it records
+    /// on the agent so every client can say what kind of agent the card is.
+    fn authoring_kind(self) -> crate::authoring_seeds::AuthoringKind {
+        match self {
+            Self::Schedule => crate::authoring_seeds::AuthoringKind::Schedule,
+            Self::IssueDispatch => crate::authoring_seeds::AuthoringKind::ScheduleIssues,
+            Self::Dispatcher => crate::authoring_seeds::AuthoringKind::Dispatcher,
+        }
+    }
 }
 
 /// PRD #220: build the dispatcher seed — the prompt that teaches the agent the
@@ -6824,6 +6834,10 @@ pub struct NewPaneRequest {
     /// issue-dispatch authoring and the dispatcher — each of which is a
     /// dashboard card carrying its seed here.
     seed_prompt: Option<String>,
+    /// Issue #1496: the authoring kind of a built-in option's card, sent with
+    /// the start so the daemon records it on the agent. `None` for a plain
+    /// card and an orchestration.
+    authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 /// PRD #80: the single action layer. Every keyboard-only command and (from
@@ -10220,6 +10234,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
             command,
             orchestration_config: None,
             seed_prompt: Some(seed),
+            authoring_kind: Some(builtin.authoring_kind()),
         };
     }
     NewPaneRequest {
@@ -10228,6 +10243,7 @@ fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> New
         command: form.command.clone(),
         orchestration_config: form.selected_orchestration().cloned(),
         seed_prompt: None,
+        authoring_kind: None,
     }
 }
 
@@ -12033,6 +12049,9 @@ fn dispatch_action(
                             // so a deck that keeps the last command records
                             // it once it has accepted the start.
                             remember_command: true,
+                            // Issue #1496: a built-in option's card is an
+                            // authoring agent; the daemon records which.
+                            authoring_kind: req.authoring_kind,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -14137,6 +14156,7 @@ pub fn run_tui(
                     seed: None,
                     // Issue #1540: a restore is not a form submit.
                     remember_command: false,
+                    authoring_kind: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -25499,6 +25519,7 @@ mod tests {
                 command: String::new(),
                 orchestration_config: Some(cfg(name)),
                 seed_prompt: None,
+                authoring_kind: None,
             };
             let _ = dispatch_action(
                 Action::SpawnPane(Box::new(req)),
@@ -34957,6 +34978,34 @@ mod tests {
         );
     }
 
+    /// Issue #1496: each `Ctrl+n` authoring option sends the daemon its kind,
+    /// so the agent's record says what kind it is to every client, while a
+    /// plain card and an orchestration send none.
+    #[test]
+    fn each_authoring_option_names_its_kind_to_the_daemon() {
+        let dir = PathBuf::from("/tmp/picked repo");
+        let mut form = NewPaneFormState::new(dir, String::new(), String::new(), vec![]);
+        form.show_issue_dispatch = true;
+        form.show_dispatcher = true;
+        for (selection_index, kind) in [
+            (form.schedule_index(), AuthoringKind::Schedule),
+            (form.issue_dispatch_index(), AuthoringKind::ScheduleIssues),
+            (form.dispatcher_index(), AuthoringKind::Dispatcher),
+        ] {
+            form.selection_index = selection_index;
+            assert_eq!(
+                build_new_pane_request(&form, "claude").authoring_kind,
+                Some(kind)
+            );
+        }
+        form.selection_index = 0;
+        assert!(
+            form.selected_builtin().is_none(),
+            "precondition: a plain card"
+        );
+        assert_eq!(build_new_pane_request(&form, "claude").authoring_kind, None);
+    }
+
     #[test]
     fn manager_add_authoring_seed_is_blank_base_seed() {
         let seed = build_schedule_authoring_seed(None, std::path::Path::new("/tmp/picked"));
@@ -36281,6 +36330,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(config),
             seed_prompt: None,
+            authoring_kind: None,
         };
 
         let pc = Arc::new(CapturingPaneController::new());
@@ -36938,6 +36988,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(config),
             seed_prompt: None,
+            authoring_kind: None,
         };
         let controller = Arc::new(CapturingPaneController::new());
         let mut tab_manager = TabManager::new(controller.clone());
@@ -36998,6 +37049,7 @@ mod tests {
             command: "echo hi".to_string(),
             orchestration_config: None,
             seed_prompt: None,
+            authoring_kind: None,
         }
     }
 
@@ -42726,6 +42778,7 @@ mod tests {
             command: String::new(),
             orchestration_config: Some(lock_test_orch_config(name)),
             seed_prompt: None,
+            authoring_kind: None,
         };
         let _ = dispatch_action(
             Action::SpawnPane(Box::new(req)),
@@ -44306,6 +44359,7 @@ mod tests {
             cli_name: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
             prompt_keys: None,
         };
         crate::spawn::surface_attach_started_agent(&tx, &record, Some("claude"));

@@ -8743,6 +8743,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 

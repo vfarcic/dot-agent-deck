@@ -561,6 +561,16 @@ pub struct DesktopAgent {
     /// command with a reason in every one of those cases.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_keys: Option<DesktopPromptKeys>,
+    /// Issue #1496: the authoring kind this agent was started as —
+    /// `dispatcher`, `schedule` or `schedule-issues` — **as the daemon recorded
+    /// it** (`AgentRecord::authoring_kind`), whichever client started it. The
+    /// dashboard's kind filter reads it: an authoring agent is otherwise an
+    /// ordinary dashboard pane, with nothing in `tab` to tell it apart.
+    ///
+    /// Absent for every other agent and from a daemon predating the field,
+    /// whose authoring agents the webview then shows as single agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoring_kind: Option<AuthoringKind>,
     pub tab: DesktopTab,
 }
 
@@ -1762,6 +1772,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         spawned_at_ms,
         blocked,
         prompt_keys,
+        authoring_kind: record.authoring_kind,
         tab,
     }
 }
@@ -3392,6 +3403,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -3933,6 +3945,22 @@ mod tests {
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
         assert!(value.get("lastActivityMs").is_none());
+    }
+
+    /// Issue #1496: the authoring kind the daemon recorded reaches the webview
+    /// as `authoringKind`, in the daemon's kebab-case spelling the dashboard's
+    /// kind filter matches on, and an agent with none carries no key at all.
+    #[test]
+    fn agent_mapping_surfaces_the_recorded_authoring_kind() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("authoringKind").is_none(), "{value}");
+
+        for kind in AuthoringKind::ALL {
+            let mut record = fixture_record();
+            record.authoring_kind = Some(kind);
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["authoringKind"], kind.as_str());
+        }
     }
 
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are

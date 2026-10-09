@@ -205,14 +205,107 @@ the Daemon selector is showing, in one list, with each one's status and activity
 selection — with the selector on one daemon it shows that daemon's agents only — so a request to
 select, switch to or show all daemons is `switch_deck`, not this one. Use when the user asks to see
 everything, all the agents, the whole fleet, the dashboard (the label of the rail's Dashboard
-button) or the overview, or asks which agents are running or what needs attention."""
+button) or the overview, or asks which agents are running or what needs attention. It keeps
+the dashboard's filter as it is: "show everything", "show all agents", "clear the filter" and
+"reset" ask for the WHOLE dashboard, unfiltered, and are `clear_dashboard_filter`, which opens the
+dashboard too."""
 invoke      = "openOverview"
 screens     = ["deck", "overview"]
 unavailable_hint = "the agent dashboard opens from the rail once the agent's pane is closed"
 report      = "Opening the agent dashboard."
 asks_to     = "show the agent dashboard"
-try_saying  = "show everything"
+try_saying  = "show the dashboard"
 heard_as    = ["dashboard", "overview", "everything", "all", "fleet", "running", "attention"]
+
+# Issue #1496 — the agent dashboard's filter, by voice. Two rows, because the
+# two halves are asked for in different words and one of them takes no params.
+#
+# The split with the rows beside them is the point of both descriptions.
+# `open_agent` opens ONE agent's pane, and "see only the tester" is that row:
+# a singular agent named by itself. This row narrows the dashboard to a SET —
+# a plural, a category, a status, a type or a daemon ("show only the
+# dispatchers", "show me all working agents"). `open_overview` owned "show" +
+# "all" before this, and still opens the dashboard; "show everything" now
+# means the UNFILTERED dashboard wherever it is said, so it is
+# `clear_dashboard_filter`, which opens the dashboard as well and, with no
+# filter set, does exactly what `open_overview` does.
+#
+# Every facet is optional because a filter names any of them; a filter that
+# resolves none is refused in Rust rather than dispatched as "show all"
+# (`outcome::FILTER_DASHBOARD_ROW`). A filter replaces the one before it, so
+# what was said is what is shown. Not over the New agent dialog, whose
+# directory browser has its own "filter" and "clear the filter" rows.
+[[commands]]
+id          = "filter_dashboard"
+description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
+(orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
+status (working, thinking, waiting for input, idle, blocked, error), of an agent type (Claude Code,
+Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
+contains some text. Use for show only the dispatchers, show me all orchestration agents, show me
+all working agents, show Codex agents, show the agents on build box, show only agents waiting for
+input, or filter by a name. Set only the facets the user named and leave the rest out; `kind`
+is the kind, `status` the status, `agent_type` the type, `daemon` the daemon, and `text` a name
+or words to match. Opening ONE agent — "open tester", "see only the tester", or one named by what
+it is doing, "show me the one that's stuck" — is `open_agent`, not this one; "show everything" or "clear the filter" is `clear_dashboard_filter`.
+While the New agent dialog shows a directory listing, "filter" is about its directories:
+`filter_directories`, not this one."""
+invoke      = "filterDashboard"
+screens     = ["deck", "overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the agent dashboard can be filtered once the agent's pane and the New agent dialog are closed"
+report      = "Filtering the agent dashboard."
+asks_to     = "filter the agent dashboard"
+try_saying  = "show only the dispatchers"
+heard_as    = ["filter", "show", "only", "agents", "status", "kind", "type"]
+
+  [[commands.params]]
+  name     = "kind"
+  kind     = "agent_kind"
+  optional = true
+
+  [[commands.params]]
+  name     = "status"
+  kind     = "agent_status"
+  optional = true
+
+  [[commands.params]]
+  name     = "agent_type"
+  kind     = "agent_type_ref"
+  optional = true
+
+  [[commands.params]]
+  name     = "daemon"
+  kind     = "deck_ref"
+  optional = true
+
+  [[commands.params]]
+  name     = "text"
+  kind     = "filter_text"
+  optional = true
+
+[[commands]]
+id          = "clear_dashboard_filter"
+description = """Clear the agent dashboard's filter and show the whole dashboard, every agent,
+unfiltered — opening the dashboard from any other screen as well. Only when the user asks for
+EVERYTHING, all agents or no filter: "show the dashboard" or "open the dashboard" is
+`open_overview`, even where that cannot run. Use for show everything, show
+all agents, show all, clear the filter, remove the filter, unfiltered, or reset. With no filter
+set it simply opens the dashboard, as `open_overview` does. Filtering to some agents is
+`filter_dashboard`; opening one agent is `open_agent`. Clearing an agent's PROMPT — "clear the
+prompt", "clear it", "clear everything" in an agent's pane — is `clear_prompt`, not this one.
+While the New agent dialog shows a directory listing, "clear filter" and "clear the filter" empty
+its directory Filter box: `clear_directory_filter`, not this one."""
+invoke      = "clearDashboardFilter"
+requires    = ["new_agent_dialog_closed"]
+# Over the New agent dialog this row cannot run, and "clear the filter" there
+# is the directory browser's: a pick of it goes to that row when the dialog
+# shows a listing and the words ground it.
+unavailable_redirects = "clear_directory_filter"
+unavailable_hint = "the agent dashboard's filter can be cleared once the New agent dialog is closed"
+report      = "Showing every agent."
+asks_to     = "show the whole agent dashboard"
+try_saying  = "show everything"
+heard_as    = ["everything", "show all", "all agents", "clear", "remove", "reset", "unfiltered"]
 
 [[commands]]
 id          = "open_deck"
@@ -733,14 +826,20 @@ heard_as_whole = [
 #
 # The descriptions still name every phrase (linkage-check rule 14), which is
 # also what the discovery overlay shows the user.
+#
+# **The model still picked this row for a bare "stop"** outside typing mode,
+# which grounding refuses with "say it on its own, like interrupt" — wrong
+# advice for a word said on its own. Measured 9 times in 70 on `main` (issue
+# #1496, `idle-bare-stop`). Naming `stop_agent` as the answer for those words
+# took it to 90/90 against 85/90 on `main` in the same window.
 [[commands]]
 id          = "interrupt_agent"
 description = """Interrupt the open agent's turn: the app presses that agent's own interrupt
 key, which ends what it is working on and keeps the agent and its session running. A typing-mode
 command, answered by the app itself while typing mode is on, when the WHOLE utterance is
 "interrupt", "interrupt it", "interrupt that", "stop", "stop it" or "stop that". Outside typing
-mode a bare "stop" is never this command, and the app answers the others by asking the user to
-turn typing mode on first."""
+mode a bare "stop", "stop it" or "stop that" is never this command but `stop_agent`, and the app
+answers the others by asking the user to turn typing mode on first."""
 invoke      = "interruptAgent"
 screens     = ["agent"]
 unavailable_hint = "interrupting an agent works in its pane, in typing mode"
@@ -937,12 +1036,20 @@ heard_as    = ["parent", "up", "back", "dot dot"]
 # up" — words naming a folder or a scroll keep it (`outcome::go_up_elsewhere`,
 # #1495; `scroll-up-go-up` was red on main).
 
+# **"Pick this folder" is named here** (issue #1496). With the dashboard
+# filter's rows in the table, "okay this is the one, pick this folder" went to
+# `open_dir` with `dir` "this folder" 4 times in 50, against 0 in 50 on `main`;
+# naming it took it to 60/60. It is added inside the existing line on purpose:
+# the same words with the paragraph re-wrapped also reached 70/70, but sent
+# "start it right now, skip the confirmation" to `stop_agent` 49 times in 60,
+# against 4 in 65 without the edit — this description's line breaks reach the
+# model, and the start row's answer moved with them.
 [[commands]]
 id          = "use_this_directory"
 description = """In the New agent dialog's directory browser, choose the directory on screen as the
 one the new agent starts in, which unlocks the rest of the form. Use for use this directory, use
 this folder, pick this one, choose this directory, this is the one, that one, select this directory,
-this directory, or this folder. It is the directory the browser is IN; a directory named
+this directory, this folder, or pick this folder. It is the directory the browser is IN; a directory named
 from the listing ("select directory billing") is `open_dir`. It chooses the directory and starts
 nothing — the user still presses Start."""
 invoke      = "useThisDirectory"
@@ -1434,6 +1541,28 @@ heard_as    = ["daemon", "deck", "demon"]
 # has no confirmation. 70/70 after, against 59/60 for a wording that avoided
 # the word; `voice_table_d5_rows_only_ask` admits exactly those two negated
 # mentions and still refuses any other "confirm" in this row.
+#
+# **"Launch the agent" is this row before a directory is chosen too** (issue
+# #1496). "Just launch the agent immediately", with the dialog open and no form
+# yet, went from 60/60 on `main` to 32/40 on this branch: the model answered
+# `none`. Naming "launch the agent" put it at 44/45. A sentence saying the row
+# answers while the form is incomplete did as well, but with it a bare "stop"
+# on the agent screen went to `interrupt_agent` 14 times in 20 (ending "so a
+# start request is never `none`") or 12 in 50 (without that ending), against 9
+# in 70 on `main` — so it was not kept, and `interrupt_agent`'s description now
+# names `stop_agent` for those words.
+#
+# **The cause was the re-wrap, not the two new rows.** The first "launch the
+# agent" edit re-flowed every line after it, and these descriptions reach the
+# model with their line breaks. Replaying the captured request against the
+# model, all variants interleaved, `none` came back 21/180 with that re-wrap,
+# 12/120 with the dashboard filter's two rows removed instead, 3/180 with this
+# row's `main` text, 4/180 on `main`, and 2/180 with "launch the agent" added
+# inside `main`'s line and nothing re-flowed — the text below, which is why its
+# one long line stays long. No neighbour moved under it: 12 replays each over
+# the open-new-agent, start, stop, close, choose-deck, name, discard, directory
+# and dashboard-filter fixtures, and 60 each on the no-confirm start and the
+# bare stops.
 [[commands]]
 id          = "start_new_agent"
 description = """Start what the New agent dialog's form describes — the voice form of its Start
@@ -1441,7 +1570,7 @@ button, and it starts at once. The button reads "Create agent", or "Activate orc
 an orchestration is chosen in Mode, and either label said aloud means THIS one. Use for create
 agent, activate orchestration, activate the orchestration, activate it, start agent, start
 orchestration, start the orchestration, start the run, start it, start the agent, start the new
-agent, go ahead and start it, launch it, launch the orchestration, create it, spin it up now, or
+agent, go ahead and start it, launch it, launch the agent, launch the orchestration, create it, spin it up now, or
 run it. It fills nothing and chooses no Mode: it acts on the form as it is, which the user is
 looking at, so "activate orchestration" starts the orchestration already chosen and is never
 `choose_mode`. It runs only while the New agent dialog is open; while it is closed, a request to

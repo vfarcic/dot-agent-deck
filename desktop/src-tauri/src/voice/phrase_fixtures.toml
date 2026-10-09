@@ -253,10 +253,27 @@ action = "open_agent"
 outcome = "unavailable"
 
 [[fixtures]]
-name = "open-overview-everything"
-utterance = "show me everything"
+name = "open-overview-the-agent-dashboard"
+utterance = "show me the agent dashboard"
 screen = "deck"
 action = "open_overview"
+outcome = "dispatch"
+
+# Issue #1496 — "everything" means the WHOLE dashboard, unfiltered, which is
+# `clear_dashboard_filter`; with no filter set it opens the dashboard exactly
+# as `open_overview` did, from any screen.
+[[fixtures]]
+name = "clear-dashboard-filter-show-me-everything"
+utterance = "show me everything"
+screen = "deck"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "clear-dashboard-filter-over-an-agent-pane"
+utterance = "show me everything"
+screen = "agent"
+action = "clear_dashboard_filter"
 outcome = "dispatch"
 
 [[fixtures]]
@@ -275,7 +292,7 @@ outcome = "dispatch"
 
 [[fixtures]]
 name = "open-overview-unavailable"
-utterance = "show me everything"
+utterance = "show me the dashboard"
 # The agent screen: the one rail offers Overview on the deck and the overview
 # alike (#1197), and it is inert only behind an agent's modal pane.
 screen = "agent"
@@ -1619,6 +1636,10 @@ name = "filter-directories-clear"
 utterance = "clear filter"
 screen = "overview"
 listing = true
+# The dialog declared too, as the app always does while its listing shows
+# (`NewAgentDialog`'s `newAgent` slot): issue #1496's `clear_dashboard_filter`
+# is withheld there, and a pick of it is redirected to this row.
+dialog = true
 action = "clear_directory_filter"
 outcome = "dispatch"
 
@@ -2283,3 +2304,113 @@ screen = "overview"
 dialog = true
 action = "scroll_down"
 outcome = "unavailable"
+
+# Issue #1496 — the agent dashboard's filter. Each phrase from the issue
+# narrows the dashboard to a SET of agents with the facet it names, and the
+# clear phrases show the whole dashboard from any screen. The controls: one
+# agent named alone still opens its pane, and "show the dashboard" still opens
+# the dashboard without touching the filter.
+[[fixtures]]
+name = "dashboard-filter-orchestration-agents"
+utterance = "show me all orchestration agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_kind = "orchestration"
+
+[[fixtures]]
+name = "dashboard-filter-only-the-dispatchers"
+utterance = "show only the dispatchers"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_kind = "dispatcher"
+
+[[fixtures]]
+name = "dashboard-filter-working-agents"
+utterance = "show me all working agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "working"
+
+[[fixtures]]
+name = "dashboard-filter-codex-agents"
+utterance = "show Codex agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_agent_type = "codex"
+
+[[fixtures]]
+name = "dashboard-filter-agents-on-build-box"
+utterance = "show the agents on build box"
+screen = "deck"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_deck = "deck-build-box"
+
+[[fixtures]]
+name = "dashboard-filter-waiting-for-input"
+utterance = "show only agents waiting for input"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting_for_input"
+
+[[fixtures]]
+name = "dashboard-clear-show-everything"
+utterance = "show everything"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-show-everything-from-the-daemons-screen"
+utterance = "show everything"
+screen = "deck"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-show-all-agents"
+utterance = "show all agents"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-the-filter"
+utterance = "clear the filter"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-remove-the-filter"
+utterance = "remove the filter"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-clear-reset"
+utterance = "reset"
+screen = "overview"
+action = "clear_dashboard_filter"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dashboard-filter-control-see-only-the-tester"
+utterance = "see only the tester"
+screen = "overview"
+action = "open_agent"
+outcome = "dispatch"
+resolved_agent = "agent-tester"
+
+[[fixtures]]
+name = "dashboard-filter-control-show-the-dashboard"
+utterance = "show the dashboard"
+screen = "deck"
+action = "open_overview"
+outcome = "dispatch"

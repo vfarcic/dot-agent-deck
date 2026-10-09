@@ -367,10 +367,11 @@ pub use capture::{
 pub use choice::{ChoiceAnswer, ChoiceLive, MAX_CHOICES};
 pub use hold::VoiceHold;
 pub use outcome::{
-    ChoiceMatch, DeckRefMatch, DirRefMatch, ResolvedParam, SWITCH_DECK_ROW, VoiceDeckIdentity,
-    VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch, handle_utterance,
-    handle_utterance_with, handle_utterance_with_dictation, refuse_switch_beyond_selector,
-    resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref, resolve_mode_ref,
+    ChoiceMatch, DeckRefMatch, DirRefMatch, FILTER_DASHBOARD_ROW, ResolvedParam, SWITCH_DECK_ROW,
+    VoiceDeckIdentity, VoiceDeckSelection, VoiceOutcome, VoiceResult, address_deck_switch,
+    handle_utterance, handle_utterance_with, handle_utterance_with_dictation,
+    refuse_switch_beyond_selector, resolve_agent_type_ref, resolve_deck_ref, resolve_dir_ref,
+    resolve_mode_ref,
 };
 pub use remote::{Protocol, REMOTE_TIMEOUT, RemoteResolver};
 pub use resolver::{
@@ -630,6 +631,7 @@ pub mod test_support {
             last_activity_ms: None,
             spawned_at_ms: None,
             blocked: None,
+            authoring_kind: None,
             tab: DesktopTab::Dashboard,
         }
     }

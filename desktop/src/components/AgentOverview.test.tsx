@@ -40,12 +40,16 @@ import { DeckShell, DeckSurface } from "../App";
 import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
-import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
+import { filterDashboardAgents } from "../lib/dashboardFilter";
 import { DeckSelector } from "./DeckSelector";
 
 // Existing overview/deck navigation cases exercise the experimental surface.
 // Each shipped-default case below removes this query parameter explicitly.
-beforeEach(() => window.history.replaceState({}, "", "/?fixture=1&experimental=1"));
+beforeEach(() => {
+  window.history.replaceState({}, "", "/?fixture=1&experimental=1");
+  window.sessionStorage.clear();
+});
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -306,6 +310,126 @@ function renderOverviewWithStoredColumns(stored: string | undefined, overrides: 
   else window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, stored);
   return render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
 }
+
+describe("dashboard filter controls", () => {
+  beforeEach(() => window.localStorage.clear());
+
+  function filterFleet() {
+    const snapshot = createFixtureSnapshot("connected");
+    const seed = snapshot.agents[0];
+    snapshot.connection.name = "local-box";
+    snapshot.agents = [
+      { ...seed, id: "keep", displayName: "Keep sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "hide", displayName: "Hide sentinel", tab: { kind: "dashboard" } },
+      { ...seed, id: "role", displayName: "Review worker", tab: { kind: "orchestration", name: "Release review", orchestrationId: "review-run", roleName: "reviewer", roleIndex: 0, isStartRole: true } },
+    ];
+    const remote: DeckSnapshot = {
+      ...snapshot,
+      connection: { ...snapshot.connection, deckId: "filter-remote", name: "build-box", socketPath: "build@remote" },
+      agents: [{ ...seed, id: "remote", daemonId: "filter-remote", displayName: "Remote sentinel", tab: { kind: "dashboard" } }],
+    };
+    return { snapshot, fleet: [snapshot, remote] };
+  }
+
+  /// Scenario: enter a name in the shipped dashboard header, without experimental features enabled. Show all stays visible even with no matches and restores every agent in one click; fleet instrument counts retain their unfiltered meaning.
+  it("shows Show all for an active filter and restores the full fleet in one click", () => {
+    window.history.replaceState({}, "", "/?fixture=1");
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    const counts = screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(screen.getByText(/Showing 1 of 4 agents/)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-count-/).map((instrument) => instrument.textContent)).toEqual(counts);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "no-such-agent" } });
+    expect(screen.queryAllByTestId(/^overview-agent-/)).toHaveLength(0);
+    const showAll = screen.getByRole("button", { name: "Show all" });
+    expect(showAll).toBeVisible();
+    fireEvent.click(showAll);
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+  });
+
+  /// Scenario: select a name that excludes a whole daemon and an orchestration card. Both empty groups collapse to a visible no-matching-agents line instead of disappearing without explanation.
+  it("explains empty daemon and orchestration groups", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/build-box: no matching agents/i)).toBeVisible();
+    expect(screen.getByText(/Release review: no matching agents/i)).toBeVisible();
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
+  /// Scenario: type a space into the empty filter box, then a name after it. The box keeps the space as typed, every agent stays shown with no Show all until a name follows, and the name then matches with the space ignored.
+  it("keeps a leading space typed into the empty filter box", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    const box = screen.getByRole("textbox", { name: "Filter agents" });
+    fireEvent.change(box, { target: { value: " " } });
+    expect(box).toHaveValue(" ");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Show all" })).not.toBeInTheDocument();
+    fireEvent.change(box, { target: { value: " Keep sentinel" } });
+    expect(box).toHaveValue(" Keep sentinel");
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+  });
+
+  /// Scenario: filter a fleet in which one connected daemon has no agents at all. While the filter is active that daemon collapses to its "no matching agents" line like any other daemon the filter empties, instead of its first-run card; Show all brings the first-run card back.
+  it("collapses a connected daemon with no agents while filtering", () => {
+    const input = filterFleet();
+    const empty: DeckSnapshot = {
+      ...input.snapshot,
+      connection: { ...input.snapshot.connection, deckId: "filter-empty", name: "empty-box", socketPath: "empty@remote" },
+      agents: [],
+    };
+    renderOverviewWithStoredColumns(undefined, { ...input, fleet: [...input.fleet, empty] });
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getByText(/empty-box: no matching agents/i)).toBeVisible();
+    expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all" }));
+    expect(screen.getByTestId("overview-first-run")).toBeVisible();
+  });
+
+  /// Scenario: remove the active text facet with its own chip control. Its query empties and every previously hidden agent returns without using Show all.
+  it("removes the text facet through its chip", () => {
+    renderOverviewWithStoredColumns(undefined, filterFleet());
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Remove text filter" }));
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(4);
+    expect(screen.getByRole("textbox", { name: "Filter agents" })).toHaveValue("");
+  });
+
+  /// Scenario: hide the first row while voice numbers are visible and press 1. The first remaining visible row opens, even though it was not number 1 in the unfiltered fleet.
+  it("numbers and opens the filtered rows", () => {
+    const input = filterFleet();
+    const navigate = vi.fn();
+    render(<VoiceOn.Provider value={true}><AgentOverview runtime={runtime(input)} onNavigate={navigate} /></VoiceOn.Provider>);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Hide sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    const row = screen.getByTestId(`overview-agent-${agentDomKey(input.snapshot.agents[1])}`);
+    expect(row).toHaveTextContent("1");
+    fireEvent.keyDown(document.body, { key: "1" });
+    expect(navigate).toHaveBeenCalledWith({ kind: "agent", deckId: input.snapshot.agents[1].daemonId, agentId: "hide", from: "overview" });
+  });
+
+  /// Scenario: filter a fleet whose agent's last prompt carries a sentinel, first by the agent's name and then by the sentinel itself. The window session's stored filter holds the sentinel only once the user typed it as the filter text — the fleet's prompts are never copied there.
+  it("stores an agent's prompt only when the user typed it as the filter text", () => {
+    const prompt = "PROMPT-SENTINEL-1496";
+    const input = filterFleet();
+    input.snapshot.agents[0] = { ...input.snapshot.agents[0], lastUserPrompt: `Fix ${prompt} now` };
+    renderOverviewWithStoredColumns(undefined, input);
+    const stored = () => Array.from({ length: window.sessionStorage.length }, (_, at) => window.sessionStorage.getItem(window.sessionStorage.key(at) ?? "") ?? "").join("\n");
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: "Keep sentinel" } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain("Keep sentinel");
+    expect(stored()).not.toContain(prompt);
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter agents" }), { target: { value: prompt } });
+    expect(screen.getAllByTestId(/^overview-agent-/)).toHaveLength(1);
+    expect(stored()).toContain(prompt);
+  });
+});
 
 /** The legend's labels, which is the columns as a reader sees them named. */
 function legendLabels(): (string | null)[] {
@@ -1399,6 +1523,22 @@ describe("AgentOverview", () => {
     const { container } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: "unknown", tab: { kind: "dashboard" } }) });
     expect(document.querySelector(".overview-lease")).toBeNull();
     expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toContain("unknown");
+  });
+
+  /**
+   * Scenario (issue #1496): a dispatcher started by a current client arrives
+   * as an ordinary dashboard pane carrying the authoring kind the daemon
+   * recorded. The dashboard row keeps that kind, so the Dispatchers filter
+   * shows it and Single agents does not.
+   */
+  it("keeps the daemon's authoring kind on the row the dashboard filter reads", () => {
+    const [agent] = createFixtureSnapshot("crowded").agents;
+    const dispatcher = toOverviewAgent({ ...(agent as AgentSession), tab: { kind: "dashboard" }, authoringKind: "dispatcher" });
+    expect(dispatcher.authoringKind).toBe("dispatcher");
+    const only = (kind: "dispatcher" | "single") =>
+      filterDashboardAgents([dispatcher], { kinds: [kind], statuses: [], agentTypes: [], daemonIds: [], text: "" }, overviewFilterFacts);
+    expect(only("dispatcher")).toEqual([dispatcher]);
+    expect(only("single")).toEqual([]);
   });
 
   /**

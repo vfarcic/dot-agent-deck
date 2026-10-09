@@ -1307,6 +1307,20 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Issue #1496: the authoring kind the daemon recorded reaches the agent model
+   * unchanged, and absence as absence — what an ordinary agent and a daemon
+   * predating the field both produce. The dashboard's kind filter reads it.
+   */
+  it("carries the daemon's recorded authoring kind through unchanged, and absence as absence", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const reported = structuredClone(snapshot);
+    reported.agents[0].authoringKind = "schedule-issues";
+
+    expect(mapDesktopSnapshot(reported).agents[0]?.authoringKind).toBe("schedule-issues");
+    expect(mapDesktopSnapshot(structuredClone(snapshot)).agents[0]?.authoringKind).toBeUndefined();
+  });
+
+  /**
    * PRD #745 + issue #856. `cli` is the BINARY the agent runs, and it is the
    * DAEMON's answer carried through untouched — never the wire identity beside
    * it (rendering `agentType` printed `claude_code` and `open_code`, neither of
@@ -1801,6 +1815,9 @@ describe("FixtureDeckBridge scenarios", () => {
     expect(await bridge.newAgentOptions(FIXTURE_DAEMON_ID)).toMatchObject({ experimental: false });
     const started = await bridge.runAction({ type: "start_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, command: "claude", cwd: "/home/build/scratch", displayName: "scratch", authoringKind: "dispatcher" });
     expect(started.agentId).toBeDefined();
+    // Issue #1496: recorded on the agent, as the live daemon records it.
+    const remote = (await bridge.connect()).find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID);
+    expect(remote?.agents.find((agent) => agent.id === started.agentId)?.authoringKind).toBe("dispatcher");
     expect(await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID)).toMatchObject({ lastCommand: "claude" });
     await bridge.dispose();
 

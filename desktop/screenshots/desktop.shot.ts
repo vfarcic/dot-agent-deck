@@ -38,6 +38,21 @@ desktopScenario("dashboard-fleet", async (page) => {
   await expect(page.getByText("API implementation", { exact: true })).toBeVisible();
 });
 
+// Issue #1496 — desktop-only: the TUI's dashboard has no filter. The same two
+// daemons as `dashboard-fleet`, filtered to Working through the Filter menu.
+desktopScenario("dashboard-filter", async (page) => {
+  await overview(page, "docs-fleet");
+  await page.getByTestId("deck-selector-toggle").click();
+  await page.getByTestId("deck-selector-option-all").click();
+  await expect(page.getByTestId("daemon-group")).toHaveCount(2);
+  await page.getByTestId("dashboard-filter-toggle").click();
+  await page.getByTestId("dashboard-filter-statuses-working").check();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("dashboard-filter-menu")).toHaveCount(0);
+  await expect(page.getByTestId("dashboard-filter-line")).toContainText("Working");
+  await expect(page.getByRole("button", { name: "Show all" })).toBeVisible();
+});
+
 /** Select the fixture project's directory in the shared New agent form. */
 async function projectInNewAgent(page: Page): Promise<void> {
   await overview(page, "docs");

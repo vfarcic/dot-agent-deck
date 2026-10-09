@@ -798,6 +798,26 @@ pub struct StartAgentOptions {
     pub seed: Option<String>,
 }
 
+/// Issue #1496: which authoring kind a start names, and who seeds it — the
+/// two `start-agent` fields [`DaemonClient`]'s start methods fill. At most one
+/// is `Some`; the daemon refuses a start carrying both.
+#[derive(Debug, Clone, Copy, Default)]
+struct StartKind {
+    /// The daemon composes and delivers this kind's seed (PRD #1223 M7).
+    authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+    /// The caller delivers this kind's seed itself; the daemon records it.
+    client_seeded_kind: Option<crate::authoring_seeds::AuthoringKind>,
+}
+
+impl StartKind {
+    fn daemon_seeded(kind: crate::authoring_seeds::AuthoringKind) -> Self {
+        Self {
+            authoring_kind: Some(kind),
+            client_seeded_kind: None,
+        }
+    }
+}
+
 impl Default for StartAgentOptions {
     fn default() -> Self {
         Self {
@@ -1614,6 +1634,7 @@ impl DaemonClient {
                     prompt_keys: None,
                     crashed: None,
                     orchestrator_context_path: None,
+                    authoring_kind: None,
                 })
                 .collect(),
             schedule_revision,
@@ -1659,7 +1680,8 @@ impl DaemonClient {
     }
 
     pub async fn start_agent(&self, opts: StartAgentOptions) -> Result<String, ClientError> {
-        self.send_start_agent(opts, None, false).await
+        self.send_start_agent(opts, StartKind::default(), false)
+            .await
     }
 
     /// Issue #1540 — [`Self::start_agent`] for a start submitted from a **New
@@ -1694,9 +1716,33 @@ impl DaemonClient {
         &self,
         opts: StartAgentOptions,
     ) -> Result<FormStart, ClientError> {
+        self.start_client_seeded_form_agent(opts, None).await
+    }
+
+    /// Issue #1496 — [`Self::start_form_agent`] for a form start whose agent
+    /// is an authoring agent the CALLER seeds itself (the TUI's `schedule`,
+    /// `schedule: issues` and `dispatcher` options): the start carries `kind`
+    /// as `client_seeded_kind`, so the daemon records it on the agent's
+    /// [`crate::agent_pty::AgentRecord::authoring_kind`] and every client can
+    /// say what kind of agent it is. `None` is [`Self::start_form_agent`].
+    ///
+    /// Not gated: an older daemon drops the field and starts the agent as an
+    /// ordinary one, recording no kind, which is what it did before.
+    pub async fn start_client_seeded_form_agent(
+        &self,
+        opts: StartAgentOptions,
+        kind: Option<crate::authoring_seeds::AuthoringKind>,
+    ) -> Result<FormStart, ClientError> {
         let keeper = LastCommandKeeper::from_capabilities(&self.capabilities().await?);
         let agent_id = self
-            .send_start_agent(opts, None, keeper == LastCommandKeeper::Daemon)
+            .send_start_agent(
+                opts,
+                StartKind {
+                    authoring_kind: None,
+                    client_seeded_kind: kind,
+                },
+                keeper == LastCommandKeeper::Daemon,
+            )
             .await?;
         Ok(FormStart {
             agent_id,
@@ -1719,7 +1765,11 @@ impl DaemonClient {
         }
         let keeper = LastCommandKeeper::from_capabilities(&capabilities);
         let agent_id = self
-            .send_start_agent(opts, Some(kind), keeper == LastCommandKeeper::Daemon)
+            .send_start_agent(
+                opts,
+                StartKind::daemon_seeded(kind),
+                keeper == LastCommandKeeper::Daemon,
+            )
             .await?;
         Ok(GatedQuery::Answered(FormStart {
             agent_id,
@@ -1824,20 +1874,24 @@ impl DaemonClient {
         {
             return Ok(GatedQuery::Unsupported);
         }
-        self.send_start_agent(opts, Some(kind), false)
+        self.send_start_agent(opts, StartKind::daemon_seeded(kind), false)
             .await
             .map(GatedQuery::Answered)
     }
 
-    /// The one `start-agent` sender. `authoring_kind` is `Some` only from the
-    /// authoring starts, after their capability check, and `remember_command`
-    /// is `true` only from the form starts, after theirs.
+    /// The one `start-agent` sender. `kind.authoring_kind` is `Some` only from
+    /// the authoring starts, after their capability check, and
+    /// `remember_command` is `true` only from the form starts, after theirs.
     async fn send_start_agent(
         &self,
         opts: StartAgentOptions,
-        authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
+        kind: StartKind,
         remember_command: bool,
     ) -> Result<String, ClientError> {
+        let StartKind {
+            authoring_kind,
+            client_seeded_kind,
+        } = kind;
         let (mut rd, mut wr) = self.connect().await?;
         let req = AttachRequest::StartAgent {
             command: opts.command,
@@ -1850,6 +1904,7 @@ impl DaemonClient {
             agent_type: opts.agent_type,
             seed: opts.seed,
             authoring_kind,
+            client_seeded_kind,
             remember_command,
         };
         let resp = issue_command(&mut rd, &mut wr, &req).await?;
@@ -5669,6 +5724,105 @@ start = true
         registry.close_agent(&id).unwrap();
     }
 
+    /// Issue #1496, against the real dispatch: an accepted authoring start
+    /// leaves its kind on the agent's record as `ListAgents` answers it —
+    /// whether the daemon seeds it (`authoring_kind`, the desktop's start) or
+    /// the client does (`client_seeded_kind`, the TUI's) — while an ordinary
+    /// start carries none, and a start naming both kinds is refused with
+    /// nothing started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_authoring_start_records_its_kind_on_the_agent() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let (_dir, path, registry) = spawn_test_server().await;
+        let client = DaemonClient::new(path);
+        let start = |pane: &str| StartAgentOptions {
+            command: Some("cat".into()),
+            cwd: Some("/tmp".into()),
+            env: vec![(crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(), pane.into())],
+            ..StartAgentOptions::default()
+        };
+
+        let plain = client
+            .start_agent(start("plain-1496"))
+            .await
+            .expect("plain start");
+        let GatedQuery::Answered(daemon_seeded) = client
+            .start_authoring_agent(start("dispatcher-1496"), AuthoringKind::Dispatcher)
+            .await
+            .expect("authoring start")
+        else {
+            panic!("a daemon at this build advertises `authoring-kind`");
+        };
+        let client_seeded = client
+            .start_client_seeded_form_agent(
+                start("issues-1496"),
+                Some(AuthoringKind::ScheduleIssues),
+            )
+            .await
+            .expect("client-seeded form start")
+            .agent_id;
+        let unseeded_form = client
+            .start_client_seeded_form_agent(start("form-1496"), None)
+            .await
+            .expect("plain form start")
+            .agent_id;
+
+        let (mut rd, mut wr) = client.connect().await.expect("connect");
+        let both = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::StartAgent {
+                command: Some("cat".into()),
+                cwd: Some("/tmp".into()),
+                rows: 24,
+                cols: 80,
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.into(),
+                    "both-1496".into(),
+                )],
+                display_name: None,
+                tab_membership: None,
+                agent_type: None,
+                seed: None,
+                authoring_kind: Some(AuthoringKind::Schedule),
+                client_seeded_kind: Some(AuthoringKind::Schedule),
+                remember_command: false,
+            },
+        )
+        .await
+        .expect("the daemon answers");
+        assert!(!both.ok, "a start naming both kinds is refused");
+        assert!(
+            both.error
+                .as_deref()
+                .is_some_and(|error| error.contains("nothing was started")),
+            "{both:?}"
+        );
+
+        let kinds: std::collections::HashMap<String, Option<AuthoringKind>> = client
+            .list_agents()
+            .await
+            .expect("list agents")
+            .into_iter()
+            .map(|record| (record.id, record.authoring_kind))
+            .collect();
+        assert_eq!(
+            kinds.len(),
+            4,
+            "the refused start started nothing: {kinds:?}"
+        );
+        assert_eq!(kinds[&plain], None);
+        assert_eq!(kinds[&unseeded_form], None);
+        assert_eq!(kinds[&daemon_seeded], Some(AuthoringKind::Dispatcher));
+        assert_eq!(kinds[&client_seeded], Some(AuthoringKind::ScheduleIssues));
+
+        for id in kinds.keys() {
+            registry.close_agent(id).unwrap();
+        }
+    }
+
     /// PRD #1223 audit A2, against the real dispatch: an authoring start whose
     /// `cwd` carries a control byte is refused before anything spawns, while a
     /// plain start with the very same `cwd` keeps today's behaviour and starts.
@@ -6801,6 +6955,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut rec);
         let name = rec
@@ -6866,6 +7021,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut rec);
         assert!(rec.tab_membership.is_none(), "invalid name must be cleared");
@@ -6894,6 +7050,7 @@ start = true
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         sanitize_record_tab_membership(&mut ok);
         assert_eq!(
