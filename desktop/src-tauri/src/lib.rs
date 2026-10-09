@@ -4056,15 +4056,18 @@ async fn voice_settings_now() -> Result<crate::settings::VoiceSettings, String> 
 /// anything is sent ([`voice::speech::MAX_SPEECH_INPUT_CHARS`] after a byte
 /// bound that refuses an oversized IPC argument outright).
 ///
-/// Refused, with nothing sent, unless reading's Settings opt-in is on and the
-/// speech source resolves to the provider ([`voice::speech::provider_permitted`],
-/// checked against the settings as they are now, and again after the keychain
-/// read, immediately before the request, when they must also still name the
-/// connection the request was prepared for — [`voice::speech::permitted_on`]):
-/// the webview cannot use this to send arbitrary text to the provider outside
-/// reading mode's consent. A save while the request is in flight that turns
-/// the opt-in off or changes the connection cancels it
-/// ([`voice::speech::SpeechRevocation`]).
+/// Refused, with nothing sent, unless reading's Settings switch is on, its
+/// one-time notice has been shown — or `text` is that notice's exact words —
+/// and the speech source resolves to the provider
+/// ([`voice::speech::speech_permitted`], checked against the settings as they
+/// are now, and again after the keychain read, immediately before the
+/// request, when they must also still name the connection the request was
+/// prepared for — [`voice::speech::permitted_on`]): the webview cannot use
+/// this to send arbitrary text to the provider outside reading mode's consent,
+/// nor before the user was told where replies go (re-audit R1). A save while
+/// the request is in flight that no longer permits it — the switch off, the
+/// notice not shown for a sentence other than the notice, or another
+/// connection — cancels it ([`voice::speech::SpeechRevocation`]).
 ///
 /// Each of those answers is a [`voice::speech::SpeechError::Refused`], told
 /// apart from a failure so the webview never speaks a refused sentence with
@@ -4085,9 +4088,9 @@ async fn desktop_voice_speech_audio(
     // Registered before the first settings read, so every save from here on
     // is held against this request — one that lands before its connection
     // is known included (PR #1617's fourth review).
-    let ticket = voice_state.speech.register();
+    let ticket = voice_state.speech.register(&text);
     let settings = voice_settings_now().await.map_err(SpeechError::failed)?;
-    voice::speech::provider_permitted(&settings).map_err(SpeechError::refused)?;
+    voice::speech::speech_permitted(&settings, &text).map_err(SpeechError::refused)?;
     let intent = settings.intent;
     let revoked = voice_state.speech.prepared_for(ticket, intent.clone());
     let audio = voice::speech::unless_revoked(
@@ -4095,7 +4098,7 @@ async fn desktop_voice_speech_audio(
             &intent,
             Arc::new(KeychainSecretStore::new()),
             &text,
-            || async { voice::speech::permitted_on(&voice_settings_now().await?, &intent) },
+            || async { voice::speech::permitted_on(&voice_settings_now().await?, &intent, &text) },
         ),
         revoked,
     )
@@ -6451,7 +6454,7 @@ mod tests {
     }
 
     /// Scenario (PR #1617's third review): with reading on and a provider
-    /// speech request in flight, the user turns Read turns aloud off and the
+    /// speech request in flight, the user turns Reading off and the
     /// save's deck work (retargeting the selection against a daemon) is slow.
     /// The reading session ends and the speech request is cancelled before
     /// that deck work finishes, and the next save is not held behind it.
@@ -6462,7 +6465,7 @@ mod tests {
         let intent = crate::settings::IntentSettings::for_backend(
             crate::settings::IntentBackend::OpenaiCompatible,
         );
-        let mut revoked = Box::pin(voice_state.speech.revoked(intent.clone()));
+        let mut revoked = Box::pin(voice_state.speech.revoked(intent.clone(), "Finished."));
         let off = DesktopSettings {
             voice: Some(crate::settings::VoiceSettings {
                 intent,

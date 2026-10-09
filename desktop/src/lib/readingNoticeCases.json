@@ -1,0 +1,12 @@
+[
+  { "endpoint": "https://api.openai.com/v1/chat/completions", "notice": "Each finished turn's reply is sent to api.openai.com to be summarised." },
+  { "endpoint": "https://api.anthropic.com/v1/messages", "notice": "Each finished turn's reply is sent to api.anthropic.com to be summarised." },
+  { "endpoint": "https://API.Example.COM:8443/v1/chat/completions", "notice": "Each finished turn's reply is sent to api.example.com to be summarised." },
+  { "endpoint": "https://127.0.0.1.example.com/v1/chat/completions", "notice": "Each finished turn's reply is sent to 127.0.0.1.example.com to be summarised." },
+  { "endpoint": "http://127.0.0.1:11434/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." },
+  { "endpoint": "http://127.8.9.10:8080/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." },
+  { "endpoint": "http://localhost:8080/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." },
+  { "endpoint": "https://models.localhost/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." },
+  { "endpoint": "http://[::1]:8080/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." },
+  { "endpoint": "https://0.0.0.0:8080/v1/chat/completions", "notice": "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here." }
+]

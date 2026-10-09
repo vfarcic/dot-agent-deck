@@ -4,6 +4,7 @@ import {
   BUSY_RETRY_MS,
   CAPACITY_FREED_RETRY_MS,
   DeckReader,
+  EXITED_DRAIN_MS,
   isThisMachine,
   READING_OFF,
   READING_ON,
@@ -16,6 +17,7 @@ import {
   type ReadingStartDto,
   type ReadingTarget,
 } from "./reading";
+import noticeCases from "./readingNoticeCases.json";
 import { SpeechQueue, SpeechRefusedError, wordedNow, type SpeechText, type SpeechVoice } from "./speech";
 
 const TESTER: ReadingAgent = { deckId: "deck-local", agentId: "tester", label: "tester", incarnation: 1 };
@@ -498,6 +500,83 @@ describe("DeckReader with speech in flight", () => {
     expect(h.queue.speaking).toBe(true);
   });
 
+  /** Scenario (re-audit R2): the tester exits while its last turn is still being summarised, so the deck stops listing it BEFORE the summary and its `closed` arrive; the session is not stopped, the summary is said, and the `closed` ends it with nothing left waiting. */
+  it("still reads an exited agent's last summary that arrives after it left the deck", async () => {
+    const h = harness();
+    h.reader.update(true, [TESTER, CODER], false, ["deck-local"]);
+    await flush();
+    h.reader.update(true, [CODER], true, ["deck-local"]);
+    await flush();
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.waiting()).toEqual([EXITED_DRAIN_MS]);
+    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: all 42 tests pass." });
+    expect(h.said.at(-1)).toEqual([readingKey(TESTER), "The tester finished: all 42 tests pass."]);
+    h.sinks.get("tester")!({ kind: "closed", text: "" });
+    expect(h.reader.reading).toEqual([readingKey(CODER)]);
+    expect(h.waiting()).toEqual([]);
+    expect(h.stop).not.toHaveBeenCalled();
+    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: late." });
+    expect(h.said.map(([, text]) => text)).not.toContain("The tester finished: late.");
+  });
+
+  /** Scenario (re-audit R2): an exited agent's `closed` never comes; its session is stopped once EXITED_DRAIN_MS passes, and a sentence after that is not said. */
+  it("stops an exited agent's session whose close never comes", async () => {
+    const h = harness();
+    h.reader.update(true, [TESTER], false, ["deck-local"]);
+    await flush();
+    h.reader.update(true, [], true, ["deck-local"]);
+    await flush();
+    expect(h.stop).not.toHaveBeenCalled();
+    h.runTimers();
+    await flush();
+    expect(h.stop).toHaveBeenCalledWith(1);
+    h.sinks.get("tester")!({ kind: "turn", text: "The tester finished: too late." });
+    expect(h.said).toEqual([]);
+  });
+
+  /** Scenario (re-audit R2): an agent exits, and before its last summary arrives the user switches deck, or turns Reading off; either stops its session at once, and the summary is not said. */
+  it("stops an exited agent's session at once on a deck change or Reading off", async () => {
+    const moved = harness();
+    moved.reader.update(true, [TESTER], false, ["deck-local"]);
+    await flush();
+    moved.reader.update(true, [], true, ["deck-local"]);
+    moved.reader.update(true, [BUILDER], true, ["deck-build"]);
+    await flush();
+    expect(moved.stop).toHaveBeenCalledWith(1);
+    expect(moved.waiting()).toEqual([]);
+    moved.sinks.get("tester")!({ kind: "turn", text: "The tester finished: old deck." });
+    expect(moved.said.map(([, text]) => text)).not.toContain("The tester finished: old deck.");
+
+    const off = harness();
+    off.reader.update(true, [TESTER], false, ["deck-local"]);
+    await flush();
+    off.reader.update(true, [], true, ["deck-local"]);
+    off.reader.update(false, [], true, ["deck-local"]);
+    await flush();
+    expect(off.stop).toHaveBeenCalledWith(1);
+    expect(off.waiting()).toEqual([]);
+    off.sinks.get("tester")!({ kind: "turn", text: "The tester finished: after off." });
+    expect(off.said).toEqual([[READING_VOICE_KEY, READING_OFF]]);
+  });
+
+  /** Scenario (re-audit R2): an agent drops out of the deck's list and comes back before its session closed; it goes on being read in the same session, and no drain is left waiting. A replaced agent (a new incarnation under the same id) is not drained: its old session stops at once. */
+  it("keeps a session for an agent listed again, and does not drain a replaced one", async () => {
+    const h = harness();
+    h.reader.update(true, [TESTER], false, ["deck-local"]);
+    await flush();
+    h.reader.update(true, [], true, ["deck-local"]);
+    h.reader.update(true, [TESTER], true, ["deck-local"]);
+    await flush();
+    expect(h.waiting()).toEqual([]);
+    expect(h.started()).toEqual(["tester"]);
+    h.runTimers();
+    expect(h.stop).not.toHaveBeenCalled();
+    h.reader.update(true, [{ ...TESTER, incarnation: 9 }], true, ["deck-local"]);
+    await flush();
+    expect(h.stop).toHaveBeenCalledWith(1);
+    expect(h.started()).toEqual(["tester", "tester"]);
+  });
+
   /** Scenario (audit A7): the tester's summary is being said and the coder's waits when the user switches to another deck; the tester's is cut off, the coder's dropped unsaid, and the new deck's agent is read. A sentence about reading itself is kept. */
   it("drops the old deck's speech when the deck changes", async () => {
     const h = speaking();
@@ -556,5 +635,14 @@ describe("the one-time notice (decision 5 of 2026-10-09)", () => {
     expect(readingNotice("not a url")).toContain("Commands service");
     expect(isThisMachine("api.localhost")).toBe(true);
     expect(isThisMachine("127.0.0.1.example.com")).toBe(false);
+  });
+  /**
+   * Scenario (re-audit R1): the notice is word for word the one the Rust side
+   * lets reach the provider's speech before it is recorded as shown, for every
+   * endpoint in the table both sides are tested against.
+   */
+  it("matches the wording the speech command recognises", () => {
+    expect(noticeCases.length).toBeGreaterThan(0);
+    for (const { endpoint, notice } of noticeCases) expect(readingNotice(endpoint), endpoint).toBe(notice);
   });
 });

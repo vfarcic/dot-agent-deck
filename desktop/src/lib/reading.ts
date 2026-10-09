@@ -19,8 +19,10 @@
  * stops the old deck's sessions too, and also drops whatever the app still
  * had to say about that deck's agents, cutting off a sentence about one of
  * them mid-way (audit A7): the user is no longer looking at that deck. An
- * agent that exits on the deck being viewed is different: its last summary is
- * still heard. Changing panes or screens changes none of these, so it never
+ * agent that exits on the deck being viewed is different: its session runs on
+ * until its events close, for at most {@link EXITED_DRAIN_MS}, so a last
+ * summary still being made when the deck stops listing the agent is heard
+ * (re-audit R2). Changing panes or screens changes none of these, so it never
  * ends reading.
  *
  * # Starts that are refused for now
@@ -165,6 +167,14 @@ export const BUSY_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 6
 /** How long after one of this window's sessions on a deck ends its refused agents are asked again. */
 export const CAPACITY_FREED_RETRY_MS = 1_000;
 
+/**
+ * How long a session is kept after its agent left the deck being viewed, for
+ * its `closed` to arrive: the agent's last turn may still be being summarised
+ * (a summary gets 10 s on the Rust side) when the deck stops listing it
+ * (re-audit R2). Past this it is stopped like any other.
+ */
+export const EXITED_DRAIN_MS = 30_000;
+
 export interface DeckReaderDeps {
   /** Subscribe to one agent's turn events; each finished sentence arrives on `onSentence`. */
   start: (target: ReadingTarget, onSentence: (sentence: ReadingSentenceDto) => void) => Promise<ReadingStartDto>;
@@ -188,6 +198,12 @@ interface Session {
   target: ReadingAgent;
   /** Absent while the start is in progress. */
   session?: number;
+  /**
+   * Set while the agent is no longer listed on a deck still viewed: the
+   * session is kept for its `closed`, and this cancels the bound on that
+   * wait ({@link EXITED_DRAIN_MS}).
+   */
+  drain?: () => void;
 }
 
 interface DeckProblem {
@@ -335,6 +351,7 @@ export class DeckReader {
     this.deps.speech.interrupt();
     if (announce) this.deps.speech.say(READING_VOICE_KEY, READING_OFF);
     for (const session of ended) {
+      session.drain?.();
       if (session.session !== undefined) void this.deps.stop(session.session).catch(() => undefined);
     }
   }
@@ -351,8 +368,22 @@ export class DeckReader {
 
   private reconcile(): void {
     for (const [key, session] of [...this.sessions]) {
-      if (this.wanted.has(key)) continue;
+      if (this.wanted.has(key)) {
+        // Listed again before its session closed: read as before.
+        session.drain?.();
+        session.drain = undefined;
+        continue;
+      }
+      /* Gone from a deck still viewed: it exited, and its last summary may
+         still be on its way, so the session runs on to its `closed`, for at
+         most EXITED_DRAIN_MS (re-audit R2). A deck no longer viewed stops it
+         now. */
+      if (this.exited(session.target)) {
+        this.drain(key, session);
+        continue;
+      }
       this.sessions.delete(key);
+      session.drain?.();
       if (session.session !== undefined) this.release(session);
     }
     for (const set of [this.closed, this.refused, this.failed]) {
@@ -370,6 +401,32 @@ export class DeckReader {
       if (this.sessions.has(key) || this.closed.has(key) || this.refused.has(key) || this.failed.has(key) || this.busy.has(key) || this.deckProblems.has(agent.deckId)) continue;
       void this.startOne(key, agent);
     }
+  }
+
+  /**
+   * Whether `agent`, no longer listed, exited from a deck still being viewed:
+   * its deck is among the decks last told, and no other incarnation of it is
+   * listed — a replaced agent's old session would otherwise read the new
+   * one's turns as well. Without the decks being told, nothing is known to
+   * be viewed.
+   */
+  private exited(agent: ReadingAgent): boolean {
+    if (this.viewedDecks === undefined || !this.viewedDecks.has(agent.deckId)) return false;
+    for (const other of this.wanted.values()) {
+      if (other.deckId === agent.deckId && other.agentId === agent.agentId) return false;
+    }
+    return true;
+  }
+
+  /** Keep `session` for its `closed`, and stop it if that has not come within {@link EXITED_DRAIN_MS}. */
+  private drain(key: string, session: Session): void {
+    if (session.drain !== undefined) return;
+    session.drain = this.schedule(() => {
+      session.drain = undefined;
+      if (this.sessions.get(key) !== session) return;
+      this.sessions.delete(key);
+      if (session.session !== undefined) this.release(session);
+    }, EXITED_DRAIN_MS);
   }
 
   /** Stop a running session, and once it has stopped, ask its deck's refused agents again. */
@@ -495,7 +552,8 @@ export class DeckReader {
     if (sentence.kind === "closed") {
       // Nothing cut off: the last summary is already queued and is heard.
       this.sessions.delete(key);
-      this.closed.add(key);
+      record.drain?.();
+      if (this.wanted.has(key)) this.closed.add(key);
       this.capacityFreed(record.target.deckId);
       return;
     }

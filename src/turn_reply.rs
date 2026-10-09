@@ -10,9 +10,11 @@
 //! A turn that ended with nothing to read is published too, as a reply whose
 //! text is empty ([`crate::daemon_protocol::FinalReply::is_empty`]), from the
 //! same report that would have carried the text. So each turn end a producer
-//! reports reaches a subscriber as exactly one frame, in the order the turns
-//! ended, and a subscriber never has to guess from the agent's status and a
-//! timer whether a turn ended without a reply.
+//! reports is published as one frame, and a subscriber never has to guess from
+//! the agent's status and a timer whether a turn ended without a reply. A turn
+//! reported through two routes that both name its turn id is delivered once
+//! ([`TurnReplyHub::publish`]); a reply without a turn id is always delivered,
+//! and a subscriber that falls behind has its stream ended as lagged.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

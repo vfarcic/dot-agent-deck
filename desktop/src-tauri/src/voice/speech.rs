@@ -22,9 +22,10 @@
 //! The provider's speech is reading mode's, so it is gated on reading's
 //! Settings opt-in (PRD #1497 D4) as well as on the speech source: with the
 //! opt-in off, [`plan_for`] answers the system voice whatever the source, and
-//! [`provider_permitted`] — which the speech command checks before every
-//! request — refuses. A webview asking for audio directly gets the same
-//! refusal. The check is repeated after the keychain read against the
+//! [`speech_permitted`] — which the speech command checks before every
+//! request — refuses. Until reading's one-time notice is recorded as shown it
+//! also refuses every sentence but that notice (re-audit R1). A webview asking
+//! for audio directly gets the same refusal. The check is repeated after the keychain read against the
 //! connection the request was prepared for ([`permitted_on`]), and a save
 //! while the request is in flight cancels it when it no longer permits it
 //! ([`SpeechRevocation`]).
@@ -141,12 +142,13 @@ pub fn plan_for(settings: &VoiceSettings) -> SpeechPlan {
 }
 
 /// Why the provider's speech must not be asked for under the settings.
-pub const PROVIDER_SPEECH_NOT_PERMITTED: &str = "the provider's speech is used only while Read turns aloud is on and the speech source is \
+pub const PROVIDER_SPEECH_NOT_PERMITTED: &str = "the provider's speech is used only while Reading is on and the speech source is \
      the provider's";
 
-/// Whether a sentence may be sent to the provider's speech: reading's opt-in
-/// is on and [`plan_for`] names the provider. Checked before every request,
-/// whoever asks.
+/// Whether the provider's speech is the source under the settings at all:
+/// reading's switch is on and [`plan_for`] names the provider. The source a
+/// sentence is planned with; a request for one sentence's audio is checked
+/// with [`speech_permitted`], which also asks about the notice.
 pub fn provider_permitted(settings: &VoiceSettings) -> Result<(), String> {
     match plan_for(settings) {
         SpeechPlan::Provider { .. } => Ok(()),
@@ -154,18 +156,44 @@ pub fn provider_permitted(settings: &VoiceSettings) -> Result<(), String> {
     }
 }
 
+/// Why a sentence other than the notice is not sent to the provider while
+/// reading's one-time notice has not been shown.
+pub const READING_NOTICE_NOT_SHOWN: &str =
+    "the provider's speech says only where replies go until that notice has been shown";
+
+/// Whether `text` may be sent to the provider's speech under `settings`:
+/// [`provider_permitted`], and reading's one-time notice recorded as shown
+/// ([`VoiceSettings::reading_permitted`], audit A5) — except for the notice
+/// itself, which is what is said before it is recorded. The exception is the
+/// notice's exact words for the configured Commands connection
+/// ([`super::reading::reading_notice`]), so the webview cannot use it to send
+/// anything else (re-audit R1). Checked before every request, whoever asks.
+pub fn speech_permitted(settings: &VoiceSettings, text: &str) -> Result<(), String> {
+    provider_permitted(settings)?;
+    if settings.reading_permitted()
+        || text == super::reading::reading_notice(&settings.intent.endpoint)
+    {
+        return Ok(());
+    }
+    Err(READING_NOTICE_NOT_SHOWN.to_string())
+}
+
 /// Why a sentence prepared for one Commands connection is not sent once the
 /// settings name another.
 pub const SPEECH_CONNECTION_CHANGED: &str =
     "the Commands connection changed while the sentence was being prepared";
 
-/// [`provider_permitted`] under `settings`, and `settings` still name the
-/// connection the request was prepared for (`intent`): the key is read from
-/// one keychain slot for whichever connection is configured, so a sentence
-/// must not go to the old endpoint, possibly with the new connection's key,
-/// after the connection was changed (PR #1617's review).
-pub fn permitted_on(settings: &VoiceSettings, intent: &IntentSettings) -> Result<(), String> {
-    provider_permitted(settings)?;
+/// [`speech_permitted`] for `text` under `settings`, and `settings` still name
+/// the connection the request was prepared for (`intent`): the key is read
+/// from one keychain slot for whichever connection is configured, so a
+/// sentence must not go to the old endpoint, possibly with the new
+/// connection's key, after the connection was changed (PR #1617's review).
+pub fn permitted_on(
+    settings: &VoiceSettings,
+    intent: &IntentSettings,
+    text: &str,
+) -> Result<(), String> {
+    speech_permitted(settings, text)?;
     if !settings.intent.same_connection(intent) {
         return Err(SPEECH_CONNECTION_CHANGED.to_string());
     }
@@ -200,8 +228,9 @@ impl SpeechError {
 }
 
 /// The saves each request in flight is held to, so a save that turns
-/// reading's opt-in off, or changes the Commands connection, cancels a request
-/// that already passed its last check (PR #1617's review).
+/// reading's opt-in off, leaves its notice not shown for a sentence other than
+/// the notice (re-audit R1), or changes the Commands connection, cancels a
+/// request that already passed its last check (PR #1617's review).
 ///
 /// Each request registers when its command starts ([`Self::register`]),
 /// before it reads the settings at all, and every save walks the registry
@@ -231,6 +260,8 @@ struct Registry {
 
 struct InFlightSpeech {
     id: u64,
+    /// The sentence being fetched, which [`speech_permitted`] is asked about.
+    text: Arc<str>,
     prepared: Prepared,
     cancel: tokio::sync::oneshot::Sender<String>,
 }
@@ -267,10 +298,12 @@ impl SpeechRevocation {
                 continue;
             }
             let verdict = match &mut request.prepared {
-                Prepared::For(intent) => permitted_on(settings, intent),
-                Prepared::Unknown(seen) => provider_permitted(settings).inspect(|()| {
-                    seen.push(settings.clone());
-                }),
+                Prepared::For(intent) => permitted_on(settings, intent, &request.text),
+                Prepared::Unknown(seen) => {
+                    speech_permitted(settings, &request.text).inspect(|()| {
+                        seen.push(settings.clone());
+                    })
+                }
             };
             match verdict {
                 Ok(()) => registry.in_flight.push(request),
@@ -281,9 +314,10 @@ impl SpeechRevocation {
         }
     }
 
-    /// Register a request now — call it before the request's first settings
-    /// read — so every save from this moment on is held against it.
-    pub fn register(&self) -> SpeechTicket {
+    /// Register a request for `text` now — call it before the request's
+    /// first settings read — so every save from this moment on is held
+    /// against it.
+    pub fn register(&self, text: &str) -> SpeechTicket {
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
         let mut registry = self.registry();
         registry
@@ -293,6 +327,7 @@ impl SpeechRevocation {
         registry.next += 1;
         registry.in_flight.push(InFlightSpeech {
             id,
+            text: Arc::from(text),
             prepared: Prepared::Unknown(Vec::new()),
             cancel,
         });
@@ -315,10 +350,11 @@ impl SpeechRevocation {
             .iter()
             .position(|request| request.id == id)
         {
-            let refusal = match &registry.in_flight[at].prepared {
+            let request = &registry.in_flight[at];
+            let refusal = match &request.prepared {
                 Prepared::Unknown(seen) => seen
                     .iter()
-                    .find_map(|settings| permitted_on(settings, &intent).err()),
+                    .find_map(|settings| permitted_on(settings, &intent, &request.text).err()),
                 Prepared::For(_) => None,
             };
             match refusal {
@@ -341,8 +377,12 @@ impl SpeechRevocation {
     /// [`Self::register`] and [`Self::prepared_for`] at once, for a caller
     /// that already knows its connection: every save after this call is held
     /// against it.
-    pub fn revoked(&self, intent: IntentSettings) -> impl Future<Output = String> + Send + 'static {
-        let ticket = self.register();
+    pub fn revoked(
+        &self,
+        intent: IntentSettings,
+        text: &str,
+    ) -> impl Future<Output = String> + Send + 'static {
+        let ticket = self.register(text);
         self.prepared_for(ticket, intent)
     }
 
@@ -493,6 +533,7 @@ fn check_audio(
 mod tests {
     use super::*;
     use crate::secrets::MemorySecretStore;
+    use crate::settings::ReadingNotice;
 
     fn openai() -> IntentSettings {
         IntentSettings::for_backend(IntentBackend::OpenaiCompatible)
@@ -638,6 +679,7 @@ mod tests {
             intent,
             speech: source,
             reading,
+            reading_notice: ReadingNotice::Shown,
             ..VoiceSettings::default()
         }
     }
@@ -672,6 +714,122 @@ mod tests {
                 assert_eq!(plan_for(&settings), plan(source, &intent));
             }
         }
+    }
+
+    /// `voice`, with reading's one-time notice not yet recorded as shown.
+    fn notice_pending(source: SpeechSource, intent: IntentSettings) -> VoiceSettings {
+        VoiceSettings {
+            reading_notice: ReadingNotice::Pending,
+            ..voice(source, intent, ReadingConsent::On)
+        }
+    }
+
+    /// Scenario (re-audit R1): Reading is on with the provider's speech and
+    /// its one-time notice not yet shown. A request to speak an agent's reply
+    /// — or any text but the notice — is refused before anything is sent;
+    /// the notice's exact words for the configured connection are permitted,
+    /// and the notice for another connection is not. Once the notice is
+    /// shown, any sentence is permitted again, and with the switch off not
+    /// even the notice is.
+    #[tokio::test]
+    async fn voice_speech_before_the_notice_is_shown_only_the_notice_is_sent() {
+        let intent = openai_at("https://voice-speech.invalid/v1/chat/completions");
+        let notice = super::super::reading::reading_notice(&intent.endpoint);
+        let elsewhere = super::super::reading::reading_notice(
+            &ServiceUrl::parse("https://other.invalid/v1/chat/completions").expect("valid"),
+        );
+        for source in [SpeechSource::Auto, SpeechSource::Provider] {
+            let pending = notice_pending(source, intent.clone());
+            for text in ["Finished: all 42 tests pass.", "", elsewhere.as_str()] {
+                assert_eq!(
+                    speech_permitted(&pending, text),
+                    Err(READING_NOTICE_NOT_SHOWN.to_string()),
+                    "{source:?}: {text:?}"
+                );
+            }
+            assert_eq!(speech_permitted(&pending, &notice), Ok(()), "{source:?}");
+            assert_eq!(permitted_on(&pending, &intent, &notice), Ok(()));
+            assert_eq!(
+                speech_permitted(
+                    &voice(source, intent.clone(), ReadingConsent::On),
+                    "anything"
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                speech_permitted(&voice(source, intent.clone(), ReadingConsent::Off), &notice),
+                Err(PROVIDER_SPEECH_NOT_PERMITTED.to_string())
+            );
+        }
+
+        // Through the request itself: refused after the keychain read, with
+        // nothing sent (the endpoint is unroutable on purpose).
+        let secrets: Arc<dyn SecretStore> = Arc::new(RevokedWhileReading(Arc::new(
+            std::sync::atomic::AtomicBool::new(true),
+        )));
+        let pending = notice_pending(SpeechSource::Provider, intent.clone());
+        let reply = "Finished: the secret is 42.";
+        assert_eq!(
+            synthesise(&intent, secrets, reply, || async {
+                permitted_on(&pending, &intent, reply)
+            })
+            .await,
+            Err(SpeechError::refused(READING_NOTICE_NOT_SHOWN))
+        );
+    }
+
+    /// Scenario (re-audit R1): two provider speech requests are in flight —
+    /// the notice, and another sentence — when a save leaves the notice not
+    /// shown (Reading turned off and on again resets it). The other sentence
+    /// is cancelled with the notice-not-shown refusal; the notice is left to
+    /// finish, through that save and through the one recording it as shown.
+    #[tokio::test]
+    async fn voice_speech_a_save_leaving_the_notice_pending_cancels_all_but_the_notice() {
+        let intent = openai();
+        let notice = super::super::reading::reading_notice(&intent.endpoint);
+        let revocation = SpeechRevocation::default();
+        let reply_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notice_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reply = Box::pin(unless_revoked(
+            in_flight(&reply_dropped),
+            revocation.revoked(intent.clone(), "Finished: all tests pass."),
+        ));
+        let mut said = Box::pin(unless_revoked(
+            in_flight(&notice_dropped),
+            revocation.revoked(intent.clone(), &notice),
+        ));
+        assert_eq!(settle(&mut reply).await, None);
+        assert_eq!(settle(&mut said).await, None);
+        revocation.publish(&notice_pending(SpeechSource::Auto, intent.clone()));
+        assert_eq!(
+            settle(&mut reply).await,
+            Some(Err(SpeechError::refused(READING_NOTICE_NOT_SHOWN)))
+        );
+        drop(reply);
+        assert!(reply_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        revocation.publish(&voice(
+            SpeechSource::Auto,
+            intent.clone(),
+            ReadingConsent::On,
+        ));
+        assert_eq!(settle(&mut said).await, None, "the notice was cancelled");
+        assert!(!notice_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(revocation.pending(), 1);
+
+        // Registered before its connection is known: the pending-notice save
+        // is held against the sentence, and refuses it once it is known.
+        let revocation = SpeechRevocation::default();
+        let ticket = revocation.register("Finished.");
+        revocation.publish(&notice_pending(SpeechSource::Auto, intent.clone()));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut request = Box::pin(unless_revoked(
+            in_flight(&dropped),
+            revocation.prepared_for(ticket, intent.clone()),
+        ));
+        assert_eq!(
+            settle(&mut request).await,
+            Some(Err(SpeechError::refused(READING_NOTICE_NOT_SHOWN)))
+        );
     }
 
     async fn permitted() -> Result<(), String> {
@@ -802,10 +960,10 @@ mod tests {
             };
             voice(SpeechSource::Provider, intent, ReadingConsent::On)
         };
-        assert!(permitted_on(&settings_now(), &old).is_ok());
+        assert!(permitted_on(&settings_now(), &old, "hello").is_ok());
         assert_eq!(
             synthesise(&old, secrets, "hello", || async {
-                permitted_on(&settings_now(), &old)
+                permitted_on(&settings_now(), &old, "hello")
             })
             .await,
             Err(SpeechError::refused(SPEECH_CONNECTION_CHANGED))
@@ -818,7 +976,8 @@ mod tests {
         assert!(
             permitted_on(
                 &voice(SpeechSource::Provider, other_model, ReadingConsent::On),
-                &old
+                &old,
+                "hello"
             )
             .is_ok()
         );
@@ -866,7 +1025,7 @@ mod tests {
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut request = Box::pin(unless_revoked(
             in_flight(&dropped),
-            revocation.revoked(intent.clone()),
+            revocation.revoked(intent.clone(), "hello"),
         ));
         assert_eq!(settle(&mut request).await, None, "the request is pending");
         // A save that changes nothing that matters to it does not cancel it.
@@ -897,7 +1056,7 @@ mod tests {
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut request = Box::pin(unless_revoked(
             in_flight(&dropped),
-            revocation.revoked(intent.clone()),
+            revocation.revoked(intent.clone(), "hello"),
         ));
         assert_eq!(
             settle(&mut request).await,
@@ -946,7 +1105,7 @@ mod tests {
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut request = Box::pin(unless_revoked(
                 in_flight(&dropped),
-                revocation.revoked(intent.clone()),
+                revocation.revoked(intent.clone(), "hello"),
             ));
             assert_eq!(settle(&mut request).await, None, "{name}: pending");
             // Both saves before the request is polled again.
@@ -973,7 +1132,7 @@ mod tests {
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut request = Box::pin(unless_revoked(
             in_flight(&dropped),
-            revocation.revoked(intent.clone()),
+            revocation.revoked(intent.clone(), "hello"),
         ));
         let permitting = voice(SpeechSource::Provider, intent.clone(), ReadingConsent::On);
         revocation.publish(&permitting);
@@ -1010,7 +1169,7 @@ mod tests {
             ),
         ] {
             let revocation = SpeechRevocation::default();
-            let ticket = revocation.register();
+            let ticket = revocation.register("hello");
             revocation.publish(&first);
             revocation.publish(&voice(
                 SpeechSource::Auto,
@@ -1036,7 +1195,7 @@ mod tests {
         // Permitted by every save since it registered: left alone, and still
         // held against the saves after it knows its connection.
         let revocation = SpeechRevocation::default();
-        let ticket = revocation.register();
+        let ticket = revocation.register("hello");
         revocation.publish(&voice(
             SpeechSource::Provider,
             intent.clone(),
@@ -1064,7 +1223,7 @@ mod tests {
 
         // A ticket dropped before its connection was known is forgotten.
         let revocation = SpeechRevocation::default();
-        drop(revocation.register());
+        drop(revocation.register("hello"));
         assert_eq!(revocation.pending(), 0);
     }
 

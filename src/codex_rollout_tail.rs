@@ -24,9 +24,12 @@
 //!   Codex writes the failure before the daemon handles the hook. The pure
 //!   record classifier is [`crate::quota_signals::CodexTurnWatch`].
 //! * **Disarming.** On the watched turn's `task_complete` (with or without an
-//!   error), a Codex `Stop` naming that turn, or a newer arm. Disarming closes
-//!   the file and keeps only its path, so an idle Codex pane holds no file
-//!   descriptor; the next arm re-opens it, validating it again. A tailer is
+//!   error), a Codex `Stop` naming that turn and carrying its final reply, or
+//!   a newer arm. A `Stop` without the reply leaves the turn armed, since its
+//!   `task_complete` is then the only report of the reply (PRD #1497), so the
+//!   file stays open until that record is read or the next arm. Disarming
+//!   closes the file and keeps only its path, so a disarmed Codex pane holds
+//!   no file descriptor; the next arm re-opens it, validating it again. A tailer is
 //!   dropped when its agent is no longer the live owner of its pane, and the
 //!   whole set when the daemon's monitor task is aborted.
 //! * **Path safety**, checked every time a path is (re)opened
@@ -112,8 +115,9 @@ const MAX_REFUSED_BYTES: usize = 1024 * 1024;
 pub enum ArmCommand {
     /// A Codex event that named a rollout and/or a turn.
     Arm(ArmRequest),
-    /// A Codex `Stop` for `turn_id`: that turn ended normally. A watch for any
-    /// other turn is left armed.
+    /// A Codex `Stop` for `turn_id` that carried the turn's final reply: that
+    /// turn ended normally and its reply is reported. A watch for any other
+    /// turn is left armed.
     Disarm { agent_id: String, turn_id: String },
 }
 

@@ -2213,10 +2213,14 @@ fn publish_hook_turn_reply(
 /// Issue #714: queue the Codex rollout tailer's side of a Codex hook event
 /// (`crate::codex_rollout_tail`). `SessionStart` / `UserPromptSubmit` name the
 /// rollout and the turn to watch; a native `Stop` for the watched turn disarms
-/// it. Only for an event whose pane and agent name the pane's LIVE owner, so a
-/// payload can never make the daemon read a file on another pane's behalf. The
-/// file itself is opened and read by [`run_codex_rollout_monitor`], never here.
-fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
+/// it — but only a `Stop` whose hook `line` carried the turn's final reply
+/// ([`crate::turn_reply::reply_from_line`]). A `Stop` without one leaves the
+/// turn armed, so its `task_complete` is still read for the reply (PRD #1497
+/// re-audit R3) and disarms it then. Only for an event whose pane and agent
+/// name the pane's LIVE owner, so a payload can never make the daemon read a
+/// file on another pane's behalf. The file itself is opened and read by
+/// [`run_codex_rollout_monitor`], never here.
+fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent, line: &str) {
     use crate::codex_rollout_tail::{
         ArmCommand, ArmRequest, CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY,
     };
@@ -2240,6 +2244,11 @@ fn queue_codex_rollout_arm(registry: &AgentPtyRegistry, event: &AgentEvent) {
             let Some(turn_id) = turn_id else {
                 return;
             };
+            // The rollout is the turn's only report of its reply when the
+            // `Stop` carried none (`crate::hook::extract_codex_hook_turn_reply`).
+            if crate::turn_reply::reply_from_line(line).is_none() {
+                return;
+            }
             ArmCommand::Disarm {
                 agent_id: agent_id.to_string(),
                 turn_id,
@@ -4592,7 +4601,7 @@ async fn run_hook_loop_with_idle_timeout(
                             // An outside agent's rollout is not this daemon's to
                             // tail; the arm is for panes it spawned.
                             if !unproven {
-                                queue_codex_rollout_arm(&pty_registry, &event);
+                                queue_codex_rollout_arm(&pty_registry, &event, &line);
                             }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
@@ -5082,25 +5091,134 @@ mod hook_ingestion_tests {
                 .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), "t1".to_string());
             event
         };
-        queue_codex_rollout_arm(&registry, &prompt("someone-else"));
+        queue_codex_rollout_arm(&registry, &prompt("someone-else"), "");
         let mut classified = prompt(&owner);
         classified.metadata.insert(
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.to_string(),
             crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.to_string(),
         );
-        queue_codex_rollout_arm(&registry, &classified);
+        queue_codex_rollout_arm(&registry, &classified, "");
         assert!(registry.codex_rollout_arms().drain().is_empty());
 
-        queue_codex_rollout_arm(&registry, &prompt(&owner));
+        queue_codex_rollout_arm(&registry, &prompt(&owner), "");
         let mut stop = prompt(&owner);
         stop.event_type = crate::event::EventType::Idle;
-        queue_codex_rollout_arm(&registry, &stop);
+        queue_codex_rollout_arm(
+            &registry,
+            &stop,
+            r#"{"turn_reply":{"text":"All tests pass."}}"#,
+        );
         let queued = registry.codex_rollout_arms().drain();
         assert!(
             matches!(&queued[..], [ArmCommand::Arm(req), ArmCommand::Disarm { turn_id, .. }]
                 if req.turn_id.as_deref() == Some("t1") && turn_id == "t1"),
             "{queued:?}"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario (PRD #1497 re-audit R3): a Codex turn `t1` is armed, and its
+    /// `Stop` arrives naming `t1` but without `last_assistant_message`, BEFORE
+    /// Codex has written the turn's `task_complete`. The `Stop` queues no
+    /// disarm, so the next poll still reads the rollout and hands the turn's
+    /// reply once. A `Stop` that did carry the reply disarms the turn as
+    /// before, and its later `task_complete` hands nothing — the hook's frame
+    /// was the turn's one.
+    #[test]
+    fn codex_stop_without_a_reply_keeps_the_rollout_read_for_that_turn() {
+        use crate::codex_rollout_tail::{
+            CODEX_TRANSCRIPT_PATH_METADATA_KEY, CODEX_TURN_ID_METADATA_KEY, CodexRolloutTailers,
+        };
+        use std::io::Write as _;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "codex-r3".to_string(),
+                )]),
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T05-00-00-r3.jsonl");
+        let append = |text: &str| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&rollout)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        append("{\"type\":\"session_meta\"}\n");
+        let event = |event_type, turn: &str| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.agent_type = AgentType::Codex;
+            event.pane_id = Some("codex-r3".to_string());
+            event.agent_id = Some(owner.clone());
+            event.metadata.insert(
+                CODEX_TRANSCRIPT_PATH_METADATA_KEY.to_string(),
+                rollout.to_string_lossy().into_owned(),
+            );
+            event
+                .metadata
+                .insert(CODEX_TURN_ID_METADATA_KEY.to_string(), turn.to_string());
+            event
+        };
+        let complete = |turn: &str, text: &str| {
+            format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\",\"last_agent_message\":\"{text}\"}}}}\n"
+            )
+        };
+        let live = |pane: &str, agent: &str| registry.is_live_owner(pane, agent);
+        let mut tailers = CodexRolloutTailers::default();
+        let poll = |tailers: &mut CodexRolloutTailers| {
+            for command in registry.codex_rollout_arms().drain() {
+                tailers.apply(command);
+            }
+            tailers.tick(live);
+            tailers.take_replies()
+        };
+
+        // The Stop carries no reply: the turn stays armed through the next
+        // poll, which reads the task_complete Codex writes after it.
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Thinking, "t1"),
+            "",
+        );
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle, "t1"),
+            r#"{"event_type":"idle"}"#,
+        );
+        assert!(poll(&mut tailers).is_empty(), "nothing written yet");
+        append(&complete("t1", "All 42 tests pass."));
+        let replies = poll(&mut tailers);
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].reply.turn_id.as_deref(), Some("t1"));
+        assert_eq!(replies[0].reply.text, "All 42 tests pass.");
+        assert!(poll(&mut tailers).is_empty(), "handed once");
+
+        // The Stop carries the reply: the turn is disarmed, and its
+        // task_complete hands nothing more.
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Thinking, "t2"),
+            "",
+        );
+        queue_codex_rollout_arm(
+            &registry,
+            &event(crate::event::EventType::Idle, "t2"),
+            r#"{"event_type":"idle","turn_reply":{"text":"Done."}}"#,
+        );
+        assert!(poll(&mut tailers).is_empty());
+        append(&complete("t2", "Done."));
+        assert!(poll(&mut tailers).is_empty(), "a disarmed turn is not read");
+        assert!(!tailers.is_armed(&owner));
         registry.shutdown_all();
     }
 
@@ -5150,7 +5268,7 @@ mod hook_ingestion_tests {
         // The hook loop's order for a prompt: queue its arm, then apply it.
         let submit = |turn: &'static str| {
             let event = prompt(turn);
-            queue_codex_rollout_arm(&registry, &event);
+            queue_codex_rollout_arm(&registry, &event, "");
             ingest_event(&state, &event_tx, &registry, event)
         };
         let failure = || CodexTurnFailure {

@@ -529,6 +529,42 @@ pub enum ReadingSentenceKind {
     Closed,
 }
 
+/// The one-time notice the first time Reading is turned on (decision 5 of
+/// 2026-10-09): where each finished turn's reply goes — the Commands
+/// connection's host, or, for an endpoint on this machine, that it stays here.
+///
+/// The webview shows and says it (`readingNotice` in
+/// `desktop/src/lib/reading.ts`); this copy is what the speech command
+/// recognises as the notice, the one sentence it sends to the provider before
+/// the notice is recorded as shown ([`super::speech::speech_permitted`]). Both
+/// are held to `desktop/src/lib/readingNoticeCases.json`, so a wording changed
+/// on one side alone fails a test instead of silencing the notice.
+pub fn reading_notice(endpoint: &crate::model_service::ServiceUrl) -> String {
+    let host = endpoint.host();
+    if is_this_machine(&host) {
+        return "Each finished turn's reply stays on this machine: the Commands service that summarises it runs here.".to_string();
+    }
+    format!("Each finished turn's reply is sent to {host} to be summarised.")
+}
+
+/// Whether `host` (a URL's host) names this machine, as `isThisMachine` in
+/// `desktop/src/lib/reading.ts` decides it.
+fn is_this_machine(host: &str) -> bool {
+    let name = host.to_ascii_lowercase();
+    let name = name
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(&name);
+    if name == "localhost" || name.ends_with(".localhost") || name == "::1" || name == "0.0.0.0" {
+        return true;
+    }
+    let mut parts = name.split('.');
+    parts.next() == Some("127")
+        && parts.clone().count() == 3
+        && parts
+            .all(|part| (1..=3).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The text of the [`ReadingSentenceKind::Ended`] sentence.
 pub const READING_ENDED: &str = "Reading off.";
 
@@ -899,6 +935,28 @@ mod tests {
     use super::*;
     use crate::settings::{ReadingConsent, ReadingNotice};
     use std::sync::Mutex;
+
+    /// Scenario (re-audit R1): the notice the speech command recognises is,
+    /// word for word, the one the webview shows and says, for every endpoint
+    /// in the table both sides are tested against — a remote host by name,
+    /// and an endpoint on this machine as staying here.
+    #[test]
+    fn voice_reading_notice_matches_the_webview_wording() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            endpoint: String,
+            notice: String,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../../src/lib/readingNoticeCases.json"))
+                .expect("the shared notice cases parse");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let endpoint =
+                crate::model_service::ServiceUrl::parse(&case.endpoint).expect("a valid endpoint");
+            assert_eq!(reading_notice(&endpoint), case.notice, "{}", case.endpoint);
+        }
+    }
 
     /// A summariser that records what it was asked and answers with a fixed
     /// sentence built from the request.
