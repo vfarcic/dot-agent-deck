@@ -313,6 +313,7 @@ fn start_seed_agent(daemon: &DaemonProc, label: &str, cwd: &Path) {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("StartAgent over the attach socket");

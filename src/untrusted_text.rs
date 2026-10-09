@@ -240,6 +240,38 @@ pub fn sanitize_tool_text(raw: &str) -> String {
     clamp_including_marker(&strip_control_and_bidi(raw, false), MAX_TOOL_TEXT_BYTES)
 }
 
+/// Byte ceiling for one remote-supplied name shown by a daemon upgrade — an
+/// agent label, a pane id, a role or orchestration name, a version. Twice the
+/// daemon's own [`DISPLAY_NAME_MAX_LEN`], so no name a healthy daemon reports
+/// is ever cut.
+pub const REMOTE_NAME_MAX_BYTES: usize = 2 * DISPLAY_NAME_MAX_LEN;
+
+/// Byte ceiling for a remote-supplied working directory shown by an upgrade.
+pub const REMOTE_PATH_MAX_BYTES: usize = 1024;
+
+/// Byte ceiling for a remote-supplied sentence shown by an upgrade: a refusal
+/// message or a failure reason.
+pub const REMOTE_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// The DISPLAY copy of one remote-supplied value that has to stay on one line
+/// of a terminal (PRD #1487 audit A3): control and bidi characters stripped —
+/// newlines included, so the value cannot add lines of its own to a list the
+/// user is deciding on — then clamped to `max` bytes, the `…` cut marker
+/// included.
+///
+/// Display only. The restart confirmation a client sends back carries the
+/// original values, because the daemon compares identities, not renderings.
+pub fn display_line(raw: &str, max: usize) -> String {
+    clamp_including_marker(&strip_control_and_bidi(raw, false), max)
+}
+
+/// [`display_line`] for a remote-supplied sentence whose own line breaks are
+/// legitimate (a failure reason quoting a remote's stderr): newlines are kept,
+/// every other control and bidi character is stripped.
+pub fn display_message(raw: &str, max: usize) -> String {
+    clamp_including_marker(&strip_control_and_bidi(raw, true), max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

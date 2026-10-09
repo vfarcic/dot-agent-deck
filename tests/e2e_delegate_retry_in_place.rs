@@ -20,6 +20,7 @@ const WORKER: &str = r#"import os
 import select
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
@@ -27,7 +28,8 @@ with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 deadline = time.monotonic() + 3.5
 while time.monotonic() < deadline:
     readable, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
@@ -376,13 +378,15 @@ while True:
 const COMPOSER_WORKER: &str = r#"import os
 import sys
 import time
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW: see ACK_WORKER — a flush would drop input that beat a slow start.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 first_submit = None
 while True:
@@ -453,14 +457,17 @@ while True:
                         log.write(f'{(timestamp - accepted_at) / 1_000_000:.3f} {received_byte:02x}\n')
                     log.write('ACCEPT 0\n')
                 before_accept.clear()
-                if sys.argv[2] == 'claude':
-                    turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
-                        input=json.dumps({'hook_event_name': 'UserPromptSubmit',
-                            'session_id': f'ready-composer-{pid}',
-                            'prompt': line.decode('utf-8', 'replace')}),
-                        text=True, capture_output=True, timeout=5)
-                    if turn.returncode:
-                        raise SystemExit(turn.stderr)
+                # Both agents report the submitted turn through their native
+                # prompt hook. The wrapper's reading of a Codex pane's output is
+                # not evidence of a turn (issue #1493), so the line printed below
+                # cannot stand in for it.
+                turn = subprocess.run([sys.argv[1], 'hook', '--agent', hook_agent],
+                    input=json.dumps({'hook_event_name': 'UserPromptSubmit',
+                        'session_id': f'ready-composer-{pid}',
+                        'prompt': line.decode('utf-8', 'replace')}),
+                    text=True, capture_output=True, timeout=5)
+                if turn.returncode:
+                    raise SystemExit(turn.stderr)
                 with open('worker-accepted-pid.log', 'w', encoding='ascii') as log:
                     log.write(str(pid))
                 os.write(sys.stdout.fileno(), b'\r\nREADY_COMPOSER_SUBMITTED_1383\r\n')
@@ -475,13 +482,19 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import termios
 import tty
 
 pid = os.getpid()
 with open('worker-launches.log', 'a', encoding='ascii') as log:
     log.write(f'{pid}\n')
 fd = sys.stdin.fileno()
-tty.setraw(fd)
+# TCSANOW, not setraw's default TCSAFLUSH: this worker announces no readiness,
+# so on a slow start the pointer can arrive before this line runs, and a flush
+# would throw it away while its echo stays on screen. That is not the scenario
+# under test (delegate_042's worker models a swallowed pointer on purpose), and
+# it failed this test on a starved machine with only the Enter probes received.
+tty.setraw(fd, termios.TCSANOW)
 line = bytearray()
 while True:
     chunk = os.read(fd, 4096)

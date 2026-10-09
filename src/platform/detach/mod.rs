@@ -13,6 +13,6 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::spawn_daemon_serve_detached_with_exe;
+pub use unix::{spawn_daemon_serve_detached_with_exe, spawn_daemon_serve_detached_without_env};
 #[cfg(windows)]
-pub use windows::spawn_daemon_serve_detached_with_exe;
+pub use windows::{spawn_daemon_serve_detached_with_exe, spawn_daemon_serve_detached_without_env};

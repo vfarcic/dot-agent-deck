@@ -111,7 +111,7 @@ async fn fixture(coder_command: &str) -> Fixture {
 
     {
         let mut state = daemon.state.write().await;
-        let identity = OrchestrationIdentity::Instance {
+        let identity = OrchestrationIdentity {
             id: ORCHESTRATION_ID.to_string(),
             name: ORCHESTRATION.to_string(),
         };

@@ -169,6 +169,14 @@ pub enum SpawnError {
     /// available on the same value.
     #[error("refused to start the orchestration: {0}")]
     OrchestratorContext(crate::orchestrator_context::ContextPublishError),
+    /// PRD #1487 re-check, reviewer R3: a restart of the daemon holds its
+    /// admission freeze, so the agent was refused for now — not a failure of
+    /// this spawn. Nothing was left running (an orchestration rolled back what
+    /// it had started), and no `SpawnFailed` was raised: an unattended caller
+    /// defers instead — retrying if the restart is called off, and leaving the
+    /// work to the next fire of the successor daemon if it goes ahead.
+    #[error("failed to spawn agent: {}", crate::agent_pty::ADMISSION_FROZEN_REASON)]
+    DaemonRestarting,
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -262,7 +270,16 @@ pub struct RoleSpawn {
 pub enum SpawnTarget {
     /// A single-agent card. `command` is the schedule's command; `None` =
     /// `$SHELL` (resolved by the spawn path, mirroring the new-deck dialog).
-    SingleAgent { command: Option<String> },
+    ///
+    /// `inherited` (issue #1602) is `Some` when `command` is the command of the
+    /// pane that dispatched this unit, and says how that pane ran it. `None` —
+    /// all the scheduler and issue-dispatch paths ever pass — keeps the
+    /// single-agent policy: the type derived from the command, and `/bin/sh`
+    /// for a command line.
+    SingleAgent {
+        command: Option<String>,
+        inherited: Option<InheritedLaunch>,
+    },
     /// An orchestration tab rooted at the target dir.
     ///
     /// `config` is the CHOSEN orchestration's own config, carried through so the
@@ -275,6 +292,21 @@ pub enum SpawnTarget {
         roles: Vec<RoleSpawn>,
         config: Box<crate::project_config::OrchestrationConfig>,
     },
+}
+
+/// Issue #1602: how the pane a single unit copies its command from ran that
+/// command, so the unit runs it the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedLaunch {
+    /// The dispatcher's agent, when its spawn or its hooks said. `None` derives
+    /// it from the command.
+    pub agent_type: Option<AgentType>,
+    /// The `SHELL` wrapper-choice override the dispatcher's spawn carried.
+    /// `None` runs a command line under the daemon's default shell, as the
+    /// dispatcher's did, rather than under the `/bin/sh` a scheduled single
+    /// agent is pinned to — `source env.sh && claude` that works in the
+    /// dispatcher's bash must not fail in its unit's `sh`.
+    pub shell: Option<String>,
 }
 
 /// PRD #220: a caller's explicit choice of spawn shape, overriding what the
@@ -358,6 +390,7 @@ pub fn decide_target_with_override(
         None => Ok(decide_target(config, dir, schedule_command)),
         Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
             command: schedule_command.map(|c| c.to_string()),
+            inherited: None,
         }),
         Some(SpawnShapeOverride::Orchestration(None)) => {
             // THE default, resolved through the one shared rule
@@ -486,6 +519,7 @@ pub fn decide_target(
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
+        inherited: None,
     }
 }
 
@@ -604,7 +638,7 @@ pub async fn spawn(
 
     // 3. Spawn + deliver.
     match target {
-        SpawnTarget::SingleAgent { command } => {
+        SpawnTarget::SingleAgent { command, inherited } => {
             let pane_id = next_pane_id(&req.task_name, None);
             // PRD #127 C2: only pin the `-c` wrapper shell to a deterministic
             // `/bin/sh` when the command ACTUALLY needs shell-wrapping (it has
@@ -612,7 +646,19 @@ pub async fn spawn(
             // directly (no shell), and an omitted command falls back to the
             // daemon's `$SHELL` (mirrors the new-deck dialog) — in neither case
             // do we pin (or leak) a SHELL override.
-            let pin_sh = command.as_deref().is_some_and(command_needs_shell_wrap);
+            //
+            // Issue #1602: a command inherited from a dispatcher runs under the
+            // shell the dispatcher's ran under instead.
+            let (agent_type, shell) = match inherited {
+                Some(InheritedLaunch { agent_type, shell }) => (agent_type, shell),
+                None => (
+                    None,
+                    command
+                        .as_deref()
+                        .is_some_and(command_needs_shell_wrap)
+                        .then(|| crate::platform::shell::fixed_command_shell("/bin/sh")),
+                ),
+            };
             // PRD #127 readiness gate: SUBSCRIBE before spawning so a
             // fast-booting agent's `SessionStart` can't land on the broadcast
             // before our receiver attaches (mirrors
@@ -628,10 +674,11 @@ pub async fn spawn(
                 // A single-agent spawn has no role, so its card keeps the task
                 // name it always had.
                 None,
-                // …and no role config either, so nothing declares its agent:
-                // derive it from the command exactly as before (issue #308).
-                None,
-                pin_sh,
+                // …and no role config either. Only a dispatched unit carries a
+                // type (its dispatcher's, issue #1602); otherwise it is derived
+                // from the command exactly as before (issue #308).
+                agent_type.clone(),
+                shell,
                 notifier,
             )?;
             // Issue #454: a single-agent spawn registers NOTHING in the
@@ -667,9 +714,9 @@ pub async fn spawn(
                     &pane_id,
                     &req.working_dir,
                     command.as_deref(),
-                    // No role config on a single-agent spawn, so nothing to
-                    // declare (issue #308).
-                    None,
+                    // The same identity the registry was given above, so the
+                    // live card is badged as that agent from its first frame.
+                    agent_type,
                     Some(&req.task_name),
                     &id,
                 );
@@ -801,7 +848,7 @@ pub async fn spawn(
             // rule and `delegate_targets`' identity equality behaves identically
             // for both (PRD #140 M2.0). Minted once, before the loop, because
             // every role of one orchestration shares it.
-            let identity = crate::state::OrchestrationIdentity::Instance {
+            let identity = crate::state::OrchestrationIdentity {
                 id: orchestration_id.clone(),
                 name: name.clone(),
             };
@@ -875,7 +922,7 @@ pub async fn spawn(
                     // orchestration wraps and badges a declared launcher role
                     // identically to the TUI path.
                     role.agent_type.clone(),
-                    false,
+                    None,
                     notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
@@ -1226,16 +1273,22 @@ fn spawn_one(
     // `None` means "derive it from the command", which is what a single-agent
     // schedule (no role config, so nothing to declare) always passes.
     agent_type: Option<AgentType>,
-    pin_sh: bool,
+    // The `SHELL` wrapper-choice override for a command line (see
+    // [`pane_env`]); `None` leaves it to the daemon's default shell.
+    shell: Option<String>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
+    let mut env = pane_env(pane_id, false);
+    if let Some(shell) = shell {
+        env.push(("SHELL".to_string(), shell));
+    }
     let opts = SpawnOptions {
         command,
         cwd: Some(cwd),
         display_name: Some(display_name.unwrap_or(task_name)),
         rows: 24,
         cols: 80,
-        env: pane_env(pane_id, pin_sh),
+        env,
         tab_membership: membership,
         // PRD #127 finding #4: tag the daemon-side registry entry with the
         // agent type inferred from the command (e.g. `claude` → `ClaudeCode`),
@@ -1252,6 +1305,9 @@ fn spawn_one(
         agent_type: agent_type.or_else(|| AgentType::from_command(command)),
     };
     registry.spawn_agent(opts).map_err(|e| {
+        if e.is_admission_frozen() {
+            return SpawnError::DaemonRestarting;
+        }
         notifier.notify(NotifyEvent::SpawnFailed {
             task: task_name.to_string(),
             message: e.to_string(),
@@ -7210,7 +7266,8 @@ mod tests {
             decide_target_with_override(cfg.as_ref(), dir.path(), Some("mycmd"), Some(&over))
                 .expect("single always resolves"),
             SpawnTarget::SingleAgent {
-                command: Some("mycmd".to_string())
+                command: Some("mycmd".to_string()),
+                inherited: None,
             },
             "`single` must win over the dir's orchestrations AND carry the command"
         );
@@ -7223,7 +7280,8 @@ mod tests {
         assert_eq!(
             t,
             SpawnTarget::SingleAgent {
-                command: Some("claude".to_string())
+                command: Some("claude".to_string()),
+                inherited: None,
             }
         );
     }
@@ -7233,7 +7291,13 @@ mod tests {
         // `None` command flows through to the spawn path's `$SHELL` fallback.
         let dir = Path::new("/tmp/x");
         let t = decide_target(None, dir, None);
-        assert_eq!(t, SpawnTarget::SingleAgent { command: None });
+        assert_eq!(
+            t,
+            SpawnTarget::SingleAgent {
+                command: None,
+                inherited: None,
+            }
+        );
     }
 
     #[test]
@@ -7244,7 +7308,8 @@ mod tests {
         assert_eq!(
             t,
             SpawnTarget::SingleAgent {
-                command: Some("cat".to_string())
+                command: Some("cat".to_string()),
+                inherited: None,
             }
         );
     }
@@ -7416,7 +7481,8 @@ mod tests {
                 Some(&SpawnShapeOverride::SingleAgent)
             ),
             Ok(SpawnTarget::SingleAgent {
-                command: Some("claude".to_string())
+                command: Some("claude".to_string()),
+                inherited: None,
             })
         );
     }
@@ -7868,6 +7934,102 @@ mod tests {
         fn notify(&self, event: NotifyEvent) {
             self.0.lock().expect("notifier mutex").push(event);
         }
+    }
+
+    /// Scenario: a scheduled single-agent fire lands while a daemon restart
+    /// holds its admission freeze. The spawn comes back as "the daemon is
+    /// restarting" — not as a failed spawn: no `SpawnFailed` is announced and
+    /// nothing is started — and once the restart is called off the same fire
+    /// starts its agent (PRD #1487 re-check, reviewer R3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fire_refused_by_a_restart_is_deferred_not_failed() {
+        let dir = crate::test_temp::tempdir().expect("tempdir for the fire's cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let notifier = RecordingNotifier::default();
+        let request = || SpawnRequest {
+            task_name: "deferred-1487".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            command: Some("cat".to_string()),
+            prompt: "unused".to_string(),
+            resolved_target: Some(SpawnTarget::SingleAgent {
+                command: Some("cat".to_string()),
+                inherited: None,
+            }),
+            compose_orchestrator_context: None,
+        };
+
+        let reservation = registry
+            .freeze_admission()
+            .await
+            .expect("nothing in flight");
+        let err = match spawn(request(), &registry, &notifier, None, true, None).await {
+            Ok(_) => panic!("a spawn under a restart's reservation must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SpawnError::DaemonRestarting),
+            "the refusal is classified as a restart, not a failure: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("the daemon is restarting"),
+            "and still says why: {err}"
+        );
+        let seen = notifier.0.lock().expect("notifier mutex").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, NotifyEvent::SpawnFailed { .. })),
+            "a deferred fire is not announced as a failed spawn: {seen:?}"
+        );
+        assert!(registry.agent_records().is_empty(), "nothing was started");
+
+        // The restart is called off: the waiter says so, and the fire starts.
+        let waiter = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.wait_for_admission().await })
+        };
+        drop(reservation);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+                .await
+                .expect("the waiter resolves")
+                .unwrap(),
+            "a released freeze re-admits"
+        );
+        if spawn(request(), &registry, &notifier, None, true, None)
+            .await
+            .is_err()
+        {
+            panic!("the retried fire starts its agent");
+        }
+        assert_eq!(registry.agent_records().len(), 1);
+
+        // A restart that goes ahead: the waiter reports the daemon going down.
+        registry
+            .freeze_admission()
+            .await
+            .expect("nothing in flight")
+            .keep();
+        let waiter = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.wait_for_admission().await })
+        };
+        {
+            let registry = registry.clone();
+            tokio::task::spawn_blocking(move || {
+                registry.shutdown_all_graceful(std::time::Duration::from_millis(200))
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+                .await
+                .expect("the waiter resolves")
+                .unwrap(),
+            "an accepted restart leaves the fire to the successor"
+        );
     }
 
     /// Issue #1065: an orchestration whose coordinator context cannot be
@@ -8352,7 +8514,8 @@ mod tests {
     fn kind_of_target_reads_the_targets_shape() {
         assert_eq!(
             kind_of_target(&SpawnTarget::SingleAgent {
-                command: Some("cat".into())
+                command: Some("cat".into()),
+                inherited: None,
             }),
             SpawnKind::SingleAgent
         );
@@ -8580,6 +8743,7 @@ mod tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 

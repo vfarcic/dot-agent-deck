@@ -191,6 +191,14 @@ fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
 /// Backspaces on an already-empty field are harmless, so this is unconditional
 /// rather than a flag the caller has to get right.
 fn open_cat_caller_pane(deck: &TuiDeck) -> String {
+    open_caller_pane(deck, b"cat")
+}
+
+/// [`open_cat_caller_pane`] with the caller's Command chosen by the test. An
+/// empty `command` starts the caller with no command at all (the user's shell),
+/// which is the dispatcher a `--single` unit does NOT copy its command from
+/// (issue #1602): such a unit starts the deck's `default_command` instead.
+fn open_caller_pane(deck: &TuiDeck, command: &[u8]) -> String {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("┌ New Agent");
@@ -198,7 +206,7 @@ fn open_cat_caller_pane(deck: &TuiDeck) -> String {
     deck.send_keys(b"caller");
     deck.send_keys(b"\t");
     deck.send_keys(&[0x7f; 96]); // clear whatever the config seeded
-    deck.send_keys(b"cat");
+    deck.send_keys(command);
     let (col, row) = deck.wait_for_in_grid("[Submit]");
     deck.click(col, row);
     deck.wait_for_absence("[Submit]");
@@ -1885,7 +1893,11 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     )
     .expect("seed Claude onboarding and project trust");
 
-    let caller_pane = open_cat_caller_pane(&deck);
+    // Issue #1602: a `--single` unit runs its dispatcher's own command, so a
+    // `cat` caller would get a `cat` unit. A caller started with NO command (a
+    // shell) is the one whose units fall back to `default_command` — the
+    // wrapper above — which is the real agent this test needs to close.
+    let caller_pane = open_caller_pane(&deck, b"");
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))

@@ -132,6 +132,15 @@ impl fmt::Display for Screen {
 /// corrected is not there, so it is refused. Only surrounding quotes and a
 /// sentence's trailing full stop are dropped. Unlike filter text it is not
 /// lowercased, because a command line is case-sensitive.
+///
+/// [`ParamKind::AgentKind`] and [`ParamKind::AgentStatus`] are the agent
+/// dashboard filter's two closed sets (issue #1496): what kind of agent a row
+/// is (an orchestration role, a single agent, or one of the dispatcher,
+/// schedule and schedule: issues modes) and what it is doing (working,
+/// thinking, waiting for input, idle, blocked, error). They are this app's own
+/// vocabulary rather than names it observed, so they resolve against a fixed
+/// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
+/// form's resolves against the agent types the deck knows the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamKind {
@@ -144,10 +153,12 @@ pub enum ParamKind {
     SpokenPrefix,
     FilterText,
     CommandText,
+    AgentKind,
+    AgentStatus,
 }
 
 impl ParamKind {
-    pub const ALL: [ParamKind; 9] = [
+    pub const ALL: [ParamKind; 11] = [
         ParamKind::AgentRef,
         ParamKind::DeckRef,
         ParamKind::DirRef,
@@ -157,6 +168,8 @@ impl ParamKind {
         ParamKind::SpokenPrefix,
         ParamKind::FilterText,
         ParamKind::CommandText,
+        ParamKind::AgentKind,
+        ParamKind::AgentStatus,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -170,6 +183,8 @@ impl ParamKind {
             ParamKind::SpokenPrefix => "spoken_prefix",
             ParamKind::FilterText => "filter_text",
             ParamKind::CommandText => "command_text",
+            ParamKind::AgentKind => "agent_kind",
+            ParamKind::AgentStatus => "agent_status",
         }
     }
 
@@ -197,6 +212,9 @@ impl ParamKind {
             // The user's own words, verified against the transcript; nothing
             // observed is involved.
             ParamKind::SpokenPrefix | ParamKind::FilterText | ParamKind::CommandText => false,
+            // This app's own closed vocabulary (issue #1496), the same on
+            // every deck: nothing observed is involved.
+            ParamKind::AgentKind | ParamKind::AgentStatus => false,
         }
     }
 }
@@ -1338,6 +1356,14 @@ mod tests {
             vec![
                 ("open_agent", "openAgent", vec!["deck", "overview"]),
                 ("open_overview", "openOverview", vec!["deck", "overview"]),
+                (
+                    "filter_dashboard",
+                    "filterDashboard",
+                    vec!["deck", "overview"]
+                ),
+                // No screens: clearing the filter shows the whole dashboard
+                // from wherever it is said (issue #1496).
+                ("clear_dashboard_filter", "clearDashboardFilter", vec![]),
                 ("open_deck", "openDeck", vec!["deck", "overview"]),
                 // No screens: callable everywhere. `close` is here because the
                 // voice surface's own overlay can be up on any of the three and
@@ -2339,7 +2365,15 @@ mod tests {
             .filter(|row| Screen::ALL.iter().all(|&screen| row.callable_on(screen)))
             .map(|row| row.id.as_str())
             .collect();
-        assert_eq!(everywhere, vec!["close", "voice_off", "list_commands"]);
+        assert_eq!(
+            everywhere,
+            vec![
+                "clear_dashboard_filter",
+                "close",
+                "voice_off",
+                "list_commands"
+            ]
+        );
         // And every OTHER row still has both cases, which is what keeps the
         // not-here sentence reachable for the rows that can produce it.
         for row in super::table().rows() {
@@ -2404,6 +2438,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -2419,6 +2455,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -2442,6 +2480,7 @@ mod tests {
         assert_eq!(
             callable(Screen::Agent),
             vec![
+                "clear_dashboard_filter",
                 "close",
                 "voice_off",
                 "list_commands",
@@ -2453,6 +2492,51 @@ mod tests {
                 "clear_prompt",
                 "scratch_that"
             ]
+        );
+    }
+
+    /// Scenario: load the shipped dashboard filter rows. Their prompts explain
+    /// filtering a set versus opening one pane, and clearing is available from
+    /// every screen so returning to the whole dashboard is always one step.
+    #[test]
+    fn voice_table_dashboard_filter_rows_describe_the_navigation_split() {
+        let table = super::table();
+        let filter = table
+            .row("filter_dashboard")
+            .expect("missing filter_dashboard voice command");
+        let clear = table
+            .row("clear_dashboard_filter")
+            .expect("missing clear_dashboard_filter voice command");
+        assert_eq!(filter.invoke, "filterDashboard");
+        assert_eq!(clear.invoke, "clearDashboardFilter");
+        for row in [filter, clear] {
+            assert!(
+                row.description.to_lowercase().contains("filter"),
+                "{}: {}",
+                row.id,
+                row.description
+            );
+            assert!(
+                matches!(&row.grounding, ActionGrounding::HeardAs(words) if !words.is_empty()),
+                "{} needs grounded spoken vocabulary",
+                row.id
+            );
+        }
+        for screen in [Screen::Deck, Screen::Overview, Screen::Agent] {
+            assert!(
+                clear.callable(screen, None, None),
+                "clear the filter must work on {screen:?}"
+            );
+        }
+        assert!(filter.callable(Screen::Overview, None, None));
+        assert!(
+            filter.description.contains("open_agent"),
+            "explain the distinction from one-agent navigation"
+        );
+        let overview = table.row("open_overview").expect("overview row");
+        assert!(
+            overview.description.contains("clear_dashboard_filter"),
+            "explain which row owns show everything now"
         );
     }
 
@@ -2888,6 +2972,7 @@ mod tests {
         assert_eq!(
             redirecting,
             vec![
+                ("clear_dashboard_filter", "clear_directory_filter"),
                 ("switch_deck", "choose_deck"),
                 ("open_new_agent", "start_new_agent"),
                 ("start_new_agent", "open_new_agent"),

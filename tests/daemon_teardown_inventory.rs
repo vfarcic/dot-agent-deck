@@ -114,7 +114,7 @@ fn spawn_stand_in(registry: &Arc<AgentPtyRegistry>, pane: &str) {
 /// orchestration: role 0 is the orchestrator, the rest are workers.
 fn state_with_roles(panes: &[(&str, &str, bool)]) -> AppState {
     let mut state = AppState::default();
-    let identity = OrchestrationIdentity::Instance {
+    let identity = OrchestrationIdentity {
         id: "inst-1109".to_string(),
         name: "issue-work".to_string(),
     };

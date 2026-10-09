@@ -425,10 +425,12 @@ pub fn truncate_on_char_boundary(s: &str, max: usize) -> String {
 
 /// Normalize a prompt for comparison using EXACTLY the PTY encoder's contract.
 ///
-/// [`crate::pane_input::encode_pane_payload`] strips only trailing `\n`, `\r`,
-/// space and tab before the bytes reach the PTY, so that — and only that — is
+/// [`crate::pane_input::encode_pane_payload`] changes two things before the
+/// bytes reach the PTY: it writes every line break as LF (issue #1616), and it
+/// strips trailing `\n`, `\r`, space and tab. Those — and only those — are
 /// the difference between what we hand the encoder and what the agent submits
-/// and reports back.
+/// and reports back. This is the second; the callers apply the first,
+/// [`crate::pane_input::normalize_line_breaks`], before it.
 ///
 /// Reviewer finding B10: this used to be `str::trim`, which is both too wide and
 /// wrong on the wrong end. Too wide because `trim` also removes trailing Unicode
@@ -475,7 +477,8 @@ fn normalize_for_match(s: &str) -> &str {
 ///    precede the delimiter, and the comparison budget shrinks by what the
 ///    envelope spent. See [`paste_envelope_payload`].
 ///
-/// Both sides are normalized with [`normalize_for_match`], never `str::trim`.
+/// Both sides are normalized with [`crate::pane_input::normalize_line_breaks`]
+/// and then [`normalize_for_match`], never `str::trim`.
 ///
 /// # Accepted residual: the copy bound does not survive truncation (#526)
 ///
@@ -804,8 +807,12 @@ pub fn strip_paste_envelope_close(payload: &str) -> &str {
 /// answer the knowable/unknowable question differently. Same disjunction, same
 /// order, same short-circuit.
 pub fn classify_prompt_submission(expected: &str, reported: &str) -> Option<ConfirmedSubmission> {
-    let expected = normalize_for_match(expected);
-    let reported = normalize_for_match(reported);
+    // Issue #1616: line breaks first, on both sides — see
+    // [`crate::pane_input::normalize_line_breaks`].
+    let expected = crate::pane_input::normalize_line_breaks(expected);
+    let reported = crate::pane_input::normalize_line_breaks(reported);
+    let expected = normalize_for_match(&expected);
+    let reported = normalize_for_match(&reported);
     if let Some(confirmed) = classify_reported_text(expected, reported, USER_PROMPT_MAX_LEN) {
         return Some(confirmed);
     }
@@ -914,8 +921,10 @@ fn classify_reported_text(
 /// then, and because a delivery whose first payload was consumed by a launcher
 /// still writes one replacement.
 pub fn prompt_submission_accumulated(expected: &str, reported: &str) -> bool {
-    let expected = normalize_for_match(expected);
-    let reported = normalize_for_match(reported);
+    let expected = crate::pane_input::normalize_line_breaks(expected);
+    let reported = crate::pane_input::normalize_line_breaks(reported);
+    let expected = normalize_for_match(&expected);
+    let reported = normalize_for_match(&reported);
     if expected.is_empty() {
         // Nothing was written, so nothing can be evidence about it — and an
         // empty `expected` would make the repetition loop below degenerate.
@@ -2560,6 +2569,48 @@ mod tests {
             reported,
             truncate_on_char_boundary(&expected, USER_PROMPT_MAX_LEN)
         );
+    }
+
+    /// Issue #1616: the deck writes every line break as LF
+    /// ([`crate::pane_input::encode_pane_payload`]), so a prompt that arrived
+    /// with CRLF or a bare CR comes back from the agent with LF — measured on
+    /// Claude Code 2.1.294, which reports a CRLF paste as LF. Compared raw, the
+    /// two never matched: the delivery was retried, its payload typed into the
+    /// pane of an agent already working on it, and the delivery abandoned at
+    /// the deadline (`scheduler/dispatch/028`).
+    #[test]
+    fn a_prompt_with_crlf_or_cr_line_breaks_is_confirmed_by_its_lf_report() {
+        let reported = "Line one.\n\nLine two.";
+        for expected in [
+            "Line one.\r\n\r\nLine two.\r\n",
+            "Line one.\r\rLine two.\r",
+            "Line one.\u{2028}\u{2029}Line two.",
+        ] {
+            assert_eq!(
+                classify_prompt_submission(expected, reported),
+                Some(ConfirmedSubmission::SingleCopy),
+                "{expected:?}"
+            );
+            let envelope = format!(
+                "\n\n<pasted_content id=\"41b1\">\n{reported}\n</pasted_content id=\"41b1\">"
+            );
+            assert_eq!(
+                classify_prompt_submission(expected, &envelope),
+                Some(ConfirmedSubmission::PasteEnvelope),
+                "{expected:?}"
+            );
+        }
+        // The truncated form: the CRLF prompt runs past the hook's limit, and
+        // what the hook keeps is a prefix of the LF text the agent was given.
+        let long_lf = "a line of the task\n".repeat(20);
+        let long_crlf = long_lf.replace('\n', "\r\n");
+        let reported = truncate_on_char_boundary(&long_lf, USER_PROMPT_MAX_LEN);
+        assert!(prompt_submission_matches(&long_crlf, &reported));
+        // And a different prompt still does not confirm.
+        assert!(!prompt_submission_matches(
+            "Line one.\r\nLine three.",
+            "Line one.\nLine two."
+        ));
     }
 
     /// The envelope is a DELIMITED region, and that is the whole reason

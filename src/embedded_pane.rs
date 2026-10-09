@@ -1307,6 +1307,9 @@ impl EmbeddedPaneController {
         // `DaemonClient::start_form_agent`, so a deck that keeps the last
         // command records it once it has accepted the start.
         remember_command: bool,
+        // Issue #1496: the authoring kind of a form start the TUI seeds
+        // itself, recorded by the daemon on the agent.
+        authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so daemon-spawned agents see
         // DOT_AGENT_DECK_PANE_ID and can emit hook events back to this
@@ -1370,7 +1373,7 @@ impl EmbeddedPaneController {
                 let start = async {
                     if remember_command {
                         client_for_calls
-                            .start_form_agent(opts)
+                            .start_client_seeded_form_agent(opts, authoring_kind)
                             .await
                             .map(|form| form.agent_id)
                     } else {
@@ -3796,6 +3799,7 @@ impl PaneController for EmbeddedPaneController {
             opts.cols,
             opts.seed,
             opts.remember_command,
+            opts.authoring_kind,
         );
         result.map(|id| (id, resolved))
     }

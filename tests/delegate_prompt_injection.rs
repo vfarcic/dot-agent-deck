@@ -107,15 +107,15 @@ const OBSERVED_READINESS_DELIVERY_CEILING: Duration = Duration::from_secs(10);
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
+    previous: Vec<(String, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    fn set(values: &[(&'static str, &str)]) -> Self {
+    fn set(values: &[(&str, &str)]) -> Self {
         common::env_write::assert_no_tokio_runtime("EnvGuard::set");
         let mut previous = Vec::with_capacity(values.len());
         for (key, value) in values {
-            previous.push((*key, std::env::var_os(key)));
+            previous.push(((*key).to_string(), std::env::var_os(key)));
             // SAFETY: a stated residual — see `ENV_LOCK` for the threads that
             // exist here. The caller holds that lock for the guard's lifetime.
             unsafe { std::env::set_var(key, value) };
@@ -134,11 +134,11 @@ impl EnvGuard {
     /// has almost certainly left one behind, which would silently floor the very
     /// skip the caller is measuring.
     #[cfg(unix)]
-    fn unset(keys: &[&'static str]) -> Self {
+    fn unset(keys: &[&str]) -> Self {
         common::env_write::assert_no_tokio_runtime("EnvGuard::unset");
         let mut previous = Vec::with_capacity(keys.len());
         for key in keys {
-            previous.push((*key, std::env::var_os(key)));
+            previous.push(((*key).to_string(), std::env::var_os(key)));
             // SAFETY: as in `EnvGuard::set`.
             unsafe { std::env::remove_var(key) };
         }
@@ -315,6 +315,19 @@ async fn advance_and_run(duration: Duration) {
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
+    let owned_contents;
+    let contents = if path.file_name().is_some_and(|name| name == "codex") {
+        // Execute this check on the stand-in itself, including every respawn;
+        // checking only the parent SpawnOptions would miss lost inherited env.
+        owned_contents = contents.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\n[ -n \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\" ] || { echo FIXTURE-ROOT-MISSING >&2; exit 93; }\nfor value in \"$HOME\" \"$CODEX_HOME\" \"$XDG_CONFIG_HOME\"; do\ncase \"$value\" in \"$DOT_AGENT_DECK_TEST_CONFIG_ROOT\"/*) ;; *) echo FIXTURE-HOME-ESCAPE >&2; exit 93 ;; esac\ndone\n",
+            1,
+        );
+        owned_contents.as_str()
+    } else {
+        contents
+    };
     std::fs::write(path, contents).expect("write synthetic agent executable");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .expect("chmod synthetic agent executable");
@@ -331,6 +344,43 @@ fn path_with_built_deck(bin_dir: &std::path::Path) -> String {
         deck_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+/// Pin every agent-config destination in the initial spawn's saved environment;
+/// the registry carries this same environment into replacement/respawn launches.
+#[cfg(unix)]
+fn owned_wrapped_agent_env(
+    root: &std::path::Path,
+    mut env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let home = root.join("agent-home");
+    let codex = home.join(".codex");
+    let xdg = home.join(".config");
+    for dir in [&home, &codex, &xdg] {
+        std::fs::create_dir_all(dir).expect("create owned wrapped-agent home");
+    }
+    let installed = home.join(".local/bin/dot-agent-deck");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    write_executable(&installed, "#!/bin/sh\nexit 0\n");
+    for (key, path) in [
+        ("HOME", home.clone()),
+        ("CODEX_HOME", codex),
+        ("XDG_CONFIG_HOME", xdg),
+        ("CLAUDE_CONFIG_DIR", home.join(".claude")),
+        ("DEVIN_CONFIG_DIR", home.join(".config/devin")),
+        ("PI_CODING_AGENT_DIR", home.join(".pi/agent")),
+        (
+            "DOT_AGENT_DECK_STATE_DIR",
+            home.join(".local/state/dot-agent-deck"),
+        ),
+        ("DOT_AGENT_DECK_TEST_CONFIG_ROOT", root.to_path_buf()),
+    ] {
+        debug_assert!(path.starts_with(root), "{key} escaped the owned fixture");
+        env.retain(|(existing, _)| existing != key);
+        env.push((key.to_string(), path.display().to_string()));
+    }
+    env.push(("DOT_AGENT_DECK_TEST_CONFIG_WRITE".into(), "1".into()));
+    env
 }
 
 #[cfg(unix)]
@@ -630,9 +680,9 @@ async fn wait_for_replacement_agent(
 
 #[cfg(unix)]
 fn register_orchestration(state: &mut AppState, cwd: &str) {
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd.to_string(),
     };
     state
         .pane_role_map
@@ -745,9 +795,9 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     // StartAgent path records for a live orchestration tab: an
     // orchestrator pane (the only valid delegate source) and a worker
     // pane in the SAME orchestration.
-    let orchestration = OrchestrationIdentity::NameCwd {
+    let orchestration = OrchestrationIdentity {
+        id: "orch-test-0".to_string(),
         name: "test-orchestration".to_string(),
-        cwd: cwd_str.clone(),
     };
     let mut state = AppState::default();
     state
@@ -958,14 +1008,17 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped Codex stand-in");
@@ -1490,7 +1543,20 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         .build()
         .expect("build slow-readiness toggle runtime")
         .block_on(async {
-            let zero = run_slow_readiness_delegate(0).await;
+            // The control needs the zero-buffer pointer to land INSIDE the
+            // stub's 650 ms discard window. On a starved machine the delivery
+            // leg alone can outlast it (seen at load ~31 with I/O stalled 61%),
+            // and the pointer then arrives after the stub is ready — a fact
+            // about the machine, not the buffer. Up to three tries for it to
+            // land in the window; a stub whose window does not exist fails
+            // every one.
+            let mut zero = run_slow_readiness_delegate(0).await;
+            for _ in 1..3 {
+                if !snapshot_contains(&zero.snapshot, POINTER) {
+                    break;
+                }
+                zero = run_slow_readiness_delegate(0).await;
+            }
             assert!(
                 !snapshot_contains(&zero.snapshot, POINTER),
                 "the zero-buffer control unexpectedly delivered the pointer outside the stub's discard window; snapshot = {:?}",
@@ -1668,14 +1734,17 @@ async fn delegate_029_wrapped_worker_without_native_session_start_is_delivered_p
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped ready stand-in");
@@ -1982,14 +2051,17 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                (
-                    "DOT_AGENT_DECK_SOCKET".to_string(),
-                    daemon.hook_path.display().to_string(),
-                ),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    (
+                        "DOT_AGENT_DECK_SOCKET".to_string(),
+                        daemon.hook_path.display().to_string(),
+                    ),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped interface-fact stand-in");
@@ -2372,9 +2444,8 @@ async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_r
 /// The production value is `SESSION_START_WAIT_TIMEOUT` (30 s), and the only
 /// knob that brings the post-release buffer within a fast-tier test's reach is
 /// the scheduler's own `DOT_AGENT_DECK_SESSION_START_WAIT_MS`. Two seconds
-/// leaves the weak fact (~0.8 s after the banner: a 750 ms settle window plus
-/// the wrapper's 50 ms poll) more than a second of room to arrive first, which
-/// is what makes the release a release ON the weak fact rather than a timeout.
+/// is advanced only after the real wrapper's weak fact has arrived. Child
+/// startup and hook delivery therefore cannot spend this virtual budget.
 #[cfg(unix)]
 const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 
@@ -2392,16 +2463,11 @@ const REPRICE_FIXTURE_WAIT_MS: u64 = 2000;
 #[cfg(unix)]
 const REPRICE_FIXTURE_BUFFER_MS: u64 = 4000;
 
-/// Issue #724: the stand-in's cooked dwell for `scheduler/spawn/010`, in
-/// seconds as `sleep` spells it.
-///
-/// Sized so the strong fact lands inside the weak fact's buffer with room on
-/// both sides: the gate releases at ~`REPRICE_FIXTURE_WAIT_MS` (2 s), the strong
-/// fact arrives at ~3.55 s, and the weak buffer would end at ~6 s. So ~1.5 s of
-/// margin separates it from the release — the side where a miss makes the run
-/// vacuous, which the control checks — and ~2.5 s from the buffer's end.
+/// The stand-in stays cooked until the test has crossed the readiness wait
+/// and entered the weak fact's buffer. Only then may the real wrapper observe
+/// raw input. A file handshake replaces the old 3.5 s startup race.
 #[cfg(unix)]
-const REPRICE_FIXTURE_COOKED_DWELL: &str = "3.5";
+const REPRICE_ALLOW_RAW: &str = "reprice-allow-raw";
 
 /// The nonce-carrying banner `scheduler/spawn/010`'s stand-in paints.
 #[cfg(unix)]
@@ -2412,7 +2478,7 @@ const REPRICE_READY_BANNER: &str = "Ask Codex to do anything (reprice-5c1d)";
 #[cfg(unix)]
 const REPRICE_PROMPT: &str = "SCHEDREPRICEMARKER list the files";
 
-/// Scenario: Fire a scheduled single-agent Codex through the real spawn primitive, into a wrapped stand-in that paints its banner, stays in COOKED mode for 3.5 s and only then clears `ICANON`/`ECHO`, with the scheduler's readiness wait shortened to 2 s. The wait expires holding the wrapper's weak output-settled fact, so the gate releases on it and starts that fact's buffer; the strong raw-input fact then lands while that buffer is still running. Assert the prompt reaches the pane no sooner than a full buffer after the STRONG fact, not at the end of the buffer the weak fact started.
+/// Scenario: Fire a scheduled Codex stand-in through the real spawn primitive and wrapper, holding it in cooked mode until the wrapper's weak fact arrives and a paused clock crosses the readiness wait. Permit raw mode 300 ms into the weak buffer, then assert the prompt is absent at that buffer's original deadline and just before a full buffer from the real strong fact, and arrives after the repriced deadline.
 #[spec("scheduler/spawn/010")]
 #[test]
 #[cfg(unix)]
@@ -2432,7 +2498,7 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
     write_executable(
         &bin_dir.join("codex"),
         &format!(
-            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nsleep {REPRICE_FIXTURE_COOKED_DWELL}\nstty raw -echo\nexec cat\n"
+            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 1\nprintf '{REPRICE_READY_BANNER}\\r\\n'\nwhile [ ! -e {REPRICE_ALLOW_RAW} ]; do sleep 0.02; done\nstty raw -echo\nexec cat\n"
         ),
     );
     // The spawn primitive gives a scheduled pane no per-spawn environment of its
@@ -2446,8 +2512,16 @@ fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer() {
         (DELEGATE_READINESS_BUFFER_ENV, &buffer_ms),
         ("PATH", &path),
     ]);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+    // SpawnRequest has no per-child config environment. The outer test holds
+    // ENV_LOCK, so pin the ambient homes for this entire scheduled spawn run —
+    // set here, before the runtime exists, like every other guard (issue #1516).
+    let homes = owned_wrapped_agent_env(cwd.path(), Vec::new());
+    let values: Vec<(&str, &str)> = homes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let _homes = EnvGuard::set(&values);
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build re-pricing readiness runtime")
@@ -2462,6 +2536,7 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
 ) {
     let daemon = common::spawn_inprocess_daemon().await;
     let collector = EventCollector::start(&daemon.event_tx);
+    tokio::time::pause();
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
             task_name: "reprice".to_string(),
@@ -2474,16 +2549,14 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
         &daemon.registry,
         &SpawnTestNotifier,
         Some(&daemon.event_tx),
-        // Detached, so this returns once the delivery task is running and the
-        // readiness wait has (all but) begun. `returned` is the upper bound on
-        // when that wait started, which is what the release-ordering control
-        // below needs.
+        // Detached: the current-thread runtime runs the delivery task when the
+        // wall-clock poll below yields, without advancing the paused clock.
         true,
         Some(&daemon.state),
     )
     .await
     .expect("the scheduler spawn primitive must bring the wrapped Codex card up");
-    let returned = chrono::Utc::now();
+    let returned = tokio::time::Instant::now();
     let agent_id = handle.delivery_agent_id.clone();
     assert!(
         daemon.registry.agent_spawned_as_wrapper_host(&agent_id),
@@ -2491,74 +2564,78 @@ async fn spawn_010_strong_interface_fact_reprices_an_in_flight_weak_fact_buffer_
          wrap`, or its strong fact is priced as an ordinary one and nothing here is re-priced"
     );
 
-    let weak = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let strong = collector
-        .wait_for_interface_fact(
-            &agent_id,
-            Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
-            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
-        )
-        .await;
-    let wait = chrono::Duration::milliseconds(REPRICE_FIXTURE_WAIT_MS as i64);
-
-    // CONTROL 1: the weak fact arrived while the wait was still open, so the
-    // wait's expiry released the gate ON it and started its buffer. A weak fact
-    // that missed the wait would make this an unready timeout instead, which the
-    // scheduler writes with no buffer at all.
+    let has_fact = |origin: &str| {
+        collector
+            .interface_session_starts(&agent_id)
+            .iter()
+            .any(|event| {
+                event
+                    .metadata
+                    .get(SESSION_START_ORIGIN_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(origin)
+            })
+    };
+    // The real wrapper and hook socket use wall time. Keep yielding to the
+    // daemon without moving its readiness clock while they boot under load.
     assert!(
-        weak.timestamp < returned + wait,
-        "control: the weak fact was stamped {:?}, not inside the {REPRICE_FIXTURE_WAIT_MS} ms \
-         readiness wait that began by {returned:?}, so the gate did not release on it",
-        weak.timestamp
+        poll_until_after_time_advance(Duration::from_secs(30), || {
+            has_fact(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced its weak interface fact"
     );
-    // CONTROL 2, the one that keeps this from being vacuous: the strong fact
-    // came AFTER the release. Had it come inside the wait, the gate would have
-    // released on it directly and priced it from its own arrival with or
-    // without re-pricing, and the bound below would hold for the wrong reason.
-    // The wait began after `spawn` was called and, in ordinary scheduling,
-    // before it returned, so its expiry is at most `returned + wait`; the
-    // 250 ms is room for the delivery task's first poll.
+    assert_eq!(
+        tokio::time::Instant::now(),
+        returned,
+        "control: fixture startup must not spend the readiness wait"
+    );
+    advance_and_run(Duration::from_millis(REPRICE_FIXTURE_WAIT_MS) + TIMER_TICK_SLACK).await;
+    let prompt_seen = || {
+        snapshot_contains(
+            &daemon.registry.snapshot(&agent_id).unwrap_or_default(),
+            REPRICE_PROMPT.as_bytes(),
+        )
+    };
     assert!(
-        strong.timestamp > returned + wait + chrono::Duration::milliseconds(250),
-        "control: the strong fact was stamped {:?}, before the readiness wait that began by \
-         {returned:?} could have expired, so the gate released on it directly and this run \
-         says nothing about a buffer already in flight",
-        strong.timestamp
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "control: the prompt was written at release, so no weak buffer was in flight"
     );
-
-    let snapshot = wait_for_snapshot_needle(
-        &daemon.registry,
-        &agent_id,
-        REPRICE_PROMPT.as_bytes(),
-        HELD_POINTER_DELIVERY_CEILING,
+    assert!(
+        !has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
+        "control: the strong fact must not release the readiness wait directly"
+    );
+    let strong_at = Duration::from_millis(300);
+    advance_and_run(strong_at).await;
+    std::fs::write(cwd.path().join(REPRICE_ALLOW_RAW), "ready").unwrap();
+    assert!(
+        poll_until_after_time_advance(Duration::from_secs(10), || {
+            has_fact(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN)
+        })
+        .await,
+        "control: the real wrapper never announced raw input after permission"
+    );
+    // Cross the old weak-buffer deadline, leaving nearly 300 ms of the strong
+    // buffer unpaid. A scheduler that omits repricing writes here.
+    advance_and_run(
+        Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS) - strong_at + TIMER_TICK_SLACK * 10,
     )
     .await;
-    // Measured from the wrapper's own stamp on the strong event, which is at or
-    // before the daemon acted on it, so latency only pushes this UP — the same
-    // one-sided shape `orchestration/delegate/026` uses.
-    let held_from_strong = (chrono::Utc::now() - strong.timestamp)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
     assert!(
-        snapshot_contains(&snapshot, REPRICE_PROMPT.as_bytes()),
-        "the scheduled prompt never reached the pane within {HELD_POINTER_DELIVERY_CEILING:?} \
-         of the strong interface fact; snapshot = {:?}",
-        String::from_utf8_lossy(&snapshot)
+        !poll_until_after_time_advance(Duration::from_millis(500), prompt_seen).await,
+        "the scheduled prompt was written at the weak buffer's deadline instead of repricing \
+         from the real strong interface fact"
     );
+    advance_and_run(strong_at - TIMER_TICK_SLACK * 10 - Duration::from_millis(10)).await;
     assert!(
-        held_from_strong >= Duration::from_millis(REPRICE_FIXTURE_BUFFER_MS),
-        "the scheduled prompt landed {held_from_strong:?} after the wrapper's STRONG interface \
-         fact, short of the {REPRICE_FIXTURE_BUFFER_MS} ms buffer that fact is priced at. The \
-         gate had already released on the weak output-settled fact, and the buffer that fact \
-         started ran to its end although the strong fact landed inside it: a full-screen TUI \
-         that has just taken raw mode is still initialising and eats input, so the prompt was \
-         written into it on the weak fact's schedule (issue #724)"
+        !poll_until_after_time_advance(Duration::from_millis(300), prompt_seen).await,
+        "the scheduled prompt was written before the full strong interface buffer elapsed"
+    );
+    advance_and_run(Duration::from_millis(10) + TIMER_TICK_SLACK).await;
+    assert!(
+        poll_until_after_time_advance(HELD_POINTER_DELIVERY_CEILING, prompt_seen).await,
+        "the scheduled prompt never reached the pane after the repriced deadline; snapshot = {:?}",
+        String::from_utf8_lossy(&daemon.registry.snapshot(&agent_id).unwrap_or_default())
     );
     daemon.registry.shutdown_all();
 }
@@ -2627,10 +2704,13 @@ async fn delegate_039_strong_interface_fact_reprices_the_weak_fact_buffer_in_fli
         .spawn_agent(SpawnOptions {
             command: Some("codex"),
             cwd: Some(&cwd_str),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
-                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
-            ],
+            env: owned_wrapped_agent_env(
+                cwd.path(),
+                vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                    ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+                ],
+            ),
             ..SpawnOptions::default()
         })
         .expect("spawn initial wrapped worker");
@@ -3792,8 +3872,11 @@ impl SilentWorkerArm {
                 &self.event_tx,
             )
             .await;
+        // A precondition, so its wait returns the moment the pointer lands;
+        // 2 s was overrun twice on a starved box (I/O stalled) while the test
+        // passed 3/3 alone (met on PR #1523). Nothing here times the product.
         let delivered =
-            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(2)).await;
+            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(10)).await;
         assert!(
             delivered.windows(POINTER.len()).any(|w| w == POINTER),
             "silent-worker visibility control failed: the worker never received the delegate \
@@ -4286,11 +4369,13 @@ impl SilenceHarness {
             )
             .await;
         let armed = self.registry.pointer_delivery_epoch(WORKER_PANE);
+        // A precondition: returns as soon as the pointer lands. 2 s was overrun
+        // on a starved box while the test passed 3/3 alone (met on PR #1523).
         let delivered = wait_for_snapshot_needle(
             &self.registry,
             &self.worker_agent_id,
             POINTER,
-            Duration::from_secs(2),
+            Duration::from_secs(10),
         )
         .await;
         assert!(
