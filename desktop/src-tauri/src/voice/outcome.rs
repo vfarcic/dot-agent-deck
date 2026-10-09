@@ -1698,6 +1698,17 @@ fn resolve_param(
             .find(|agent| agent.id == id)
             .is_some_and(|agent| excluded_by_another(agent, &content, &said, agents))
     };
+    // Whether the agent `id`, reached by its last prompt alone
+    // ([`task_matches`]), is somewhere other than where the transcript says
+    // ([`placed_by_its_names`]).
+    let placed_by_its_prompt = |id: &str| {
+        let (said, content) = heard_reference();
+        let located = location_words(&word_sequence(&heard_facts));
+        agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .is_some_and(|agent| !placed_by_its_names(agent, &content, &said, &located))
+    };
     match spec.kind {
         // The fidelity guarantee (PRD #802 D6, rebuilt), and it is checked
         // HERE rather than trusted anywhere: the model marked a boundary in
@@ -1769,19 +1780,27 @@ fn resolve_param(
         {
             Err(Unmet::NoMatch)
         }
-        ParamKind::AgentRef => match resolve_agent_ref_on(spoken, agents, decks) {
+        ParamKind::AgentRef => match resolve_agent_ref_reading(spoken, agents, decks) {
             // The model may also drop a FACT the user named — "Codex" for
             // "open the Codex agent in docs-site" — so the agent its answer
             // reached is held to the transcript's facts too (Qodo on PR
             // #1529): a word of it that another agent's names account for,
             // and this one's do not, rules this one out.
-            AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
+            (AgentRefMatch::One { id, .. }, _) if heard_against(&id) => Err(Unmet::NoMatch),
+            // An answer no name or fact matched is read as a task, and the
+            // agent its last prompt reached is held to where the user said it
+            // is: "open the agent in the billing project" answered as
+            // "billing" does not reach an agent in docs-site last asked to
+            // "Fix billing" (issue #1496).
+            (AgentRefMatch::One { id, .. }, true) if placed_by_its_prompt(&id) => {
+                Err(Unmet::NoMatch)
+            }
             // Where the user's own words settle the reference without the
             // model — "the newest agent", or a bare "the agent" with several
             // here — they decide, whatever label the model answered with
             // (Qodo on PR #1529): recency is the agent that started last or
             // first, and a bare category is the numbered choice.
-            AgentRefMatch::One { id, label } => match settled_by_the_words(&heard_facts) {
+            (AgentRefMatch::One { id, label }, _) => match settled_by_the_words(&heard_facts) {
                 Some(AgentRefMatch::One { id, label }) => Ok(param(id, label)),
                 Some(AgentRefMatch::Ambiguous(candidates)) => Err(Unmet::Ambiguous(candidates)),
                 _ => Ok(param(id, label)),
@@ -1804,7 +1823,7 @@ fn resolve_param(
             // as "the one that's stuck" reaches nobody — no other agent is
             // there to account for "Codex", and that is not a reason to stop
             // the one that is not Codex.
-            AgentRefMatch::None => {
+            (AgentRefMatch::None, _) => {
                 let (said, content) = heard_reference();
                 let located = location_words(&word_sequence(&heard_facts));
                 let in_state: Vec<&DesktopAgent> =
@@ -1830,15 +1849,18 @@ fn resolve_param(
             // the transcript among the tied agents ONLY, so this can pick one
             // of the agents the model's words already reached and nothing
             // else; anything short of one agent keeps the tie, and the choice.
-            AgentRefMatch::Ambiguous(candidates) => {
+            (AgentRefMatch::Ambiguous(candidates), _) => {
                 let tied: Vec<DesktopAgent> = agents
                     .iter()
                     .filter(|agent| candidates.iter().any(|tied| tied.value == agent.id))
                     .cloned()
                     .collect();
-                match resolve_agent_ref_on(&heard_facts, &tied, decks) {
-                    AgentRefMatch::One { id, .. } if heard_against(&id) => Err(Unmet::NoMatch),
-                    AgentRefMatch::One { id, .. } => {
+                match resolve_agent_ref_reading(&heard_facts, &tied, decks) {
+                    (AgentRefMatch::One { id, .. }, _) if heard_against(&id) => Err(Unmet::NoMatch),
+                    (AgentRefMatch::One { id, .. }, true) if placed_by_its_prompt(&id) => {
+                        Err(Unmet::NoMatch)
+                    }
+                    (AgentRefMatch::One { id, .. }, _) => {
                         let label = agents
                             .iter()
                             .find(|agent| agent.id == id)
@@ -3113,9 +3135,20 @@ pub fn resolve_agent_ref_on(
     agents: &[DesktopAgent],
     decks: &[VoiceDeck],
 ) -> AgentRefMatch {
+    resolve_agent_ref_reading(spoken, agents, decks).0
+}
+
+/// [`resolve_agent_ref_on`], and whether its answer came from the task pass
+/// alone ([`task_matches`]) — no name or fact of the agents matched, so what
+/// reached them was their last prompt (issue #1496).
+fn resolve_agent_ref_reading(
+    spoken: &str,
+    agents: &[DesktopAgent],
+    decks: &[VoiceDeck],
+) -> (AgentRefMatch, bool) {
     let reference = normalize(spoken);
     if reference.is_empty() {
-        return AgentRefMatch::None;
+        return (AgentRefMatch::None, false);
     }
     let named_exactly = |names: Vec<String>| names.iter().any(|name| normalize(name) == reference);
     let shown: Vec<&DesktopAgent> = agents
@@ -3123,7 +3156,7 @@ pub fn resolve_agent_ref_on(
         .filter(|agent| named_exactly(spoken_names(agent)))
         .collect();
     if !shown.is_empty() {
-        return agent_ref_match(&shown, agents);
+        return (agent_ref_match(&shown, agents), false);
     }
     // Facets are spelled by [`spoken_text`], so the reference is too: the
     // model answers `work/api` the way it was shown it.
@@ -3143,14 +3176,14 @@ pub fn resolve_agent_ref_on(
         })
         .collect();
     if !known.is_empty() {
-        return agent_ref_match(&known, agents);
+        return (agent_ref_match(&known, agents), false);
     }
     // Spelled the way every name below is, so punctuation splits a reference
     // exactly where it splits a name ("deploy@build-box", "schedule: issues").
     let mut said = words(&normalize(&spoken_text(spoken)));
     let sequence = word_sequence(spoken);
     if names_another_daemon(&sequence, agents, decks, false) {
-        return AgentRefMatch::None;
+        return (AgentRefMatch::None, false);
     }
     let mut daemon_named = false;
     for name in decks
@@ -3170,6 +3203,7 @@ pub fn resolve_agent_ref_on(
         .filter(|word| !DECK_CATEGORY_WORDS.contains(&word.as_str()))
         .cloned()
         .collect();
+    let mut by_task = false;
     let pool: Vec<&DesktopAgent> = if content.is_empty() {
         let category = said
             .iter()
@@ -3182,15 +3216,17 @@ pub fn resolve_agent_ref_on(
     } else {
         let named = best_covered(&content, &said, agents);
         if named.is_empty() {
+            by_task = true;
             task_matches(&content, agents)
         } else {
             named
         }
     };
-    match recency {
+    let found = match recency {
         Some(recency) => agent_ref_match(&recency.pick(pool), agents),
         None => agent_ref_match(&pool, agents),
-    }
+    };
+    (found, by_task)
 }
 
 /// The fewest characters of a facet, quoted back cut short, that still name
@@ -3637,6 +3673,11 @@ const STATE_REFERENCE_CARRIERS: [&str; 28] = [
 /// billing" is not in it, so only the agent's own names account for such a
 /// word. (A word another agent's names account for has already ruled this
 /// one out, [`excluded_by_another`].)
+///
+/// So a task phrase whose word is also an agent type's name is refused even
+/// when the prompt matches — "the stuck one reviewing the code" does not
+/// reach a stuck Claude Code agent last asked to "Review the code" — which is
+/// the deliberate safe-side trade, not a defect.
 fn accounts_for_the_rest(
     agent: &DesktopAgent,
     content: &BTreeSet<String>,
@@ -3667,6 +3708,32 @@ fn accounts_for_the_rest(
                 && !located.contains(word)
                 && task.iter().any(|typed| same_stem(word, typed)))
     })
+}
+
+/// Whether `agent`'s own names account for every word the transcript says
+/// WHERE it is or which run it is in (`located`, [`location_words`]) —
+/// `content` and `said` as [`excluded_by_another`] takes them (issue #1496).
+///
+/// Asked of an agent its last prompt alone reached ([`task_matches`]): a
+/// place is never a task, so an agent in `docs-site` last asked to "Fix
+/// billing" is not "the agent in the billing project", whatever the model
+/// answered. The location nouns themselves ("project", "run") and filler are
+/// not places; every other located word is, and refusing it is the safe side
+/// ([`location_words`] over-reads on purpose).
+fn placed_by_its_names(
+    agent: &DesktopAgent,
+    content: &BTreeSet<String>,
+    said: &BTreeSet<String>,
+    located: &BTreeSet<String>,
+) -> bool {
+    let place: BTreeSet<String> = content
+        .intersection(located)
+        .filter(|word| !STATE_REFERENCE_CARRIERS.contains(&word.as_str()))
+        .filter(|word| !LOCATION_ARTICLES.contains(&word.as_str()))
+        .filter(|word| !TASK_FILLER_WORDS.contains(&word.as_str()))
+        .cloned()
+        .collect();
+    place.is_subset(&covered_by(agent, &place, said))
 }
 
 /// The nouns that introduce where an agent is, or the run it belongs to —
@@ -5682,6 +5749,59 @@ mod tests {
                 let resolver = StubResolver::new().answering(
                     &said,
                     IntentAnswer::new(row).with_param("agent", "the one that's stuck"),
+                );
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                        if action == row && params[0].value == "agent-vega"),
+                    "{said:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only agent is the Claude Code agent in `docs-site`, last
+    /// asked to "Fix the billing issue". The user opens or stops "the agent in
+    /// the billing project" and the model answers just "billing", which names
+    /// no agent and so is read as a task. Billing is where the user said the
+    /// agent is, and a prompt that mentions billing does not put this one
+    /// there, so nothing is opened or offered for stopping. Asked for as "the
+    /// one fixing the billing issue" — or with the place it really is in — the
+    /// same agent is still reached by its task.
+    #[tokio::test]
+    async fn voice_outcome_an_agent_found_by_its_task_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for place in [
+                "in the billing project",
+                "in the billing repo",
+                "from the billing folder",
+                "in project billing",
+                "in billing",
+            ] {
+                let said = format!("{verb} the agent {place}");
+                let resolver = StubResolver::new()
+                    .answering(&said, IntentAnswer::new(row).with_param("agent", "billing"));
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
+                );
+            }
+            for said in [
+                format!("{verb} the one fixing the billing issue"),
+                format!("{verb} the agent in the docs-site project fixing the billing issue"),
+            ] {
+                let resolver = StubResolver::new().answering(
+                    &said,
+                    IntentAnswer::new(row).with_param("agent", "the one fixing the billing issue"),
                 );
                 let outcome = run(&resolver, screen, &alone(), &said).await;
                 assert!(
