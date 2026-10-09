@@ -1888,7 +1888,14 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           // PR #1623 review: a failed start's technical detail — the spawn
           // error, what ssh printed — is said with its sentence, not dropped.
           const message = cause instanceof Error ? cause.message : String(cause);
-          setNotice(cause instanceof StartDaemonError && cause.detail !== undefined ? `${message} (${cause.detail})` : message);
+          const reported = cause instanceof StartDaemonError && cause.detail !== undefined ? `${message} (${cause.detail})` : message;
+          // `runAction` recorded the sentence alone as `runtime.error`, so once
+          // the detail is added the two no longer read alike and `dismissToast`
+          // would leave the error behind — the toast would come straight back.
+          // The notice is the full report of that same failure, so the shorter
+          // copy goes now (PR #1623 review).
+          if (reported !== message) runtime.clearError();
+          setNotice(reported);
         }
       },
     });

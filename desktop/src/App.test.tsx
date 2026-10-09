@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
@@ -2697,6 +2697,44 @@ describe("ControlDeck", () => {
     fireEvent.click(screen.getByLabelText("Dismiss message"));
 
     await waitFor(() => expect(screen.queryByText(message)).not.toBeInTheDocument());
+  });
+
+  /**
+   * Scenario: a start fails on the Daemons screen with technical detail, so the
+   * toast reads the sentence with the detail appended while `runAction` recorded
+   * the sentence alone, and the user clicks the X. The toast stays closed. It
+   * used to come straight back as the bare sentence (PR #1623 review): the two
+   * strings differed, so dismissing cleared the notice and kept the error.
+   *
+   * The fake records the error the way `useDeckRuntime`'s `runAction` does —
+   * the sentence alone, set before the rejection reaches the handler — since
+   * that recording is what the toast fell back to.
+   */
+  function DeckWithFailingStart({ failure }: { failure: Error }) {
+    const base = useMemo(() => runtime({ mode: "live", snapshot: disconnectedLive() }), []);
+    const [error, setError] = useState<string | undefined>();
+    const runAction = useCallback(async () => {
+      setError(failure.message);
+      throw failure;
+    }, [failure]);
+    return <ControlDeck runtime={{ ...base, error, clearError: () => setError(undefined), runAction }} />;
+  }
+
+  it("keeps a dismissed start failure with technical detail closed", async () => {
+    const { StartDaemonError } = await import("./lib/actionError");
+    const sentence = "Could not start the daemon on this machine.";
+    const detail = "spawn: No such file or directory";
+    render(<DeckWithFailingStart failure={new StartDaemonError(sentence, "start-failed", detail)} />);
+
+    fireEvent.click(screen.getByTestId("start-daemon"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Start daemon" }).at(-1)!);
+    expect(await screen.findByText(`${sentence} (${detail})`)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Dismiss message"));
+
+    await waitFor(() => expect(screen.queryByText(`${sentence} (${detail})`)).not.toBeInTheDocument());
+    expect(screen.queryByText(sentence)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Dismiss message")).not.toBeInTheDocument();
   });
 
   /**
