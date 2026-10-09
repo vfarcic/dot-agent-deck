@@ -8,28 +8,38 @@
 #
 #   bash bootstrap.sh                        # the box itself
 #   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>) and devbox install it
+#   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml
 #
 # Layers, each assuming the one before:
 #   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents)
 #   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
-#   4. PATH for non-interactive shells and systemd --user, so the deck daemon finds every agent
+#   4. PATH (and, with --use-vals, USE_VALS) for non-interactive shells and systemd --user,
+#      so the deck daemon finds every agent and every agent inherits the same environment
 #   5. agents (claude, opencode, codex, pi, devin), sem, dot-agent-deck, `hooks install`
 #   6. the optional repo
 #   7. which agents still need logging in
 #
 # Nothing secret is installed. Logging the agents in is left to the operator.
+#
+# --use-vals is for a box whose operator can read the secrets .env.vals.yaml
+# points at: it makes every devbox shell, and every agent the deck starts, run
+# that file through `vals`, which fails without access. It sticks: a re-run
+# without the flag keeps it while the marked block it wrote is in ~/.bashrc, and
+# deleting that block turns it off.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_URL=""
 REPO_DIR=""
+USE_VALS_FLAG=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO_URL="${2:?}"; shift 2 ;;
     --dir)  REPO_DIR="${2:?}"; shift 2 ;;
+    --use-vals) USE_VALS_FLAG=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -139,6 +149,28 @@ touch "$HOME/.bashrc"
 if ! grep -qF '# >>> dad-box PATH' "$HOME/.bashrc"; then
   { printf '%s\n\n' "$PATH_BLOCK"; cat "$HOME/.bashrc"; } > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
 fi
+# USE_VALS gets the same placement for the same reason: the daemon's environment
+# is every agent's, and devbox.json's init_hook loads .env.vals.yaml only when
+# it is set. The block sits right after the PATH block and is rewritten in place.
+if [ "$USE_VALS_FLAG" = 1 ] || grep -qF '# >>> dad-box USE_VALS' "$HOME/.bashrc"; then
+  USE_VALS_FLAG=1
+  VALS_BLOCK="$(cat <<'EOF'
+# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>
+export USE_VALS=true
+# <<< dad-box USE_VALS <<<
+EOF
+)"
+  # Drops any earlier copy of the block and the blank lines around it, then
+  # writes it back after the PATH block, so a re-run leaves the file unchanged.
+  awk -v block="$VALS_BLOCK" '
+    /^# >>> dad-box USE_VALS/ { skip = 1; next }
+    skip { if (/^# <<< dad-box USE_VALS/) skip = 0; next }
+    gap && /^$/ { next }
+    gap { print ""; gap = 0 }
+    { print }
+    /^# <<< dad-box PATH/ { print ""; print block; gap = 1 }
+  ' "$HOME/.bashrc" > "$HOME/.bashrc.dad-box" && mv "$HOME/.bashrc.dad-box" "$HOME/.bashrc"
+fi
 # shellcheck disable=SC2016  # written literally, expanded by the interactive shell
 grep -qF 'devbox global shellenv' "$HOME/.bashrc" || \
   printf '\n# dad-box: devbox global tools in interactive shells\neval "$(devbox global shellenv)"\n' >> "$HOME/.bashrc"
@@ -149,9 +181,13 @@ rm -f "$HOME/.config/environment.d/10-dad-box.conf"
 cat > "$HOME/.config/environment.d/999-dad-box.conf" <<'EOF'
 PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:${PATH}
 EOF
+[ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
+if [ "$USE_VALS_FLAG" = 1 ]; then
+  systemctl --user set-environment USE_VALS=true || echo "  warning: could not set USE_VALS in the running systemd --user manager (applies at next login)"
+fi
 # shellcheck source=/dev/null
 eval "$(sed -n '/# >>> dad-box PATH/,/# <<< dad-box PATH/p' "$HOME/.bashrc")"
 
