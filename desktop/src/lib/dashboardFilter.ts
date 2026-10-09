@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
-import type { AgentTab, AgentTypeId } from "../types";
-import { modeScopedKey, type DesktopAgentDto } from "./bridge";
+import type { AgentStatus, AgentTab, AgentTypeId } from "../types";
+import { modeScopedKey, statusFromDaemon, type DesktopAgentDto } from "./bridge";
 
 /**
  * Issue #1496 — the agent dashboard's filter: which agents it shows.
@@ -96,6 +96,27 @@ function kindOf(tab: AgentTab): DashboardKind | undefined {
   return DASHBOARD_KINDS.find((kind) => kind.mode === mode)?.id;
 }
 
+/** The filter status for each status column, for a daemon word the filter does not offer by name. */
+const COLUMN_FILTER_STATUS: Partial<Record<AgentStatus, DashboardStatus>> = {
+  running: "working",
+  waiting: "idle",
+  failed: "error",
+  blocked: "blocked",
+};
+
+/**
+ * The filter status an agent's status word counts as. A word the filter offers
+ * is itself, in any case; any other — `running` for an agent with no hook
+ * state yet, `compacting`, `unknown`, a word a newer daemon adds — counts as
+ * the status of the column the dashboard shows it in, so a filter never
+ * leaves out an agent its column shows.
+ */
+export function dashboardStatusOf(status: string | undefined): DashboardStatus | undefined {
+  if (status === undefined) return undefined;
+  const word = normalize(status);
+  return DASHBOARD_STATUSES.find((option) => option.id === word)?.id ?? COLUMN_FILTER_STATUS[statusFromDaemon(word)];
+}
+
 function normalize(text: string): string {
   return text.trim().toLowerCase();
 }
@@ -119,7 +140,10 @@ export function matchesDashboardFilter(agent: DashboardFilterFacts, filter: Dash
     const kind = kindOf(agent.tab);
     if (!kind || !filter.kinds.includes(kind)) return false;
   }
-  if (filter.statuses.length && !filter.statuses.some((status) => status === agent.status)) return false;
+  if (filter.statuses.length) {
+    const status = dashboardStatusOf(agent.status);
+    if (!status || !filter.statuses.includes(status)) return false;
+  }
   if (filter.agentTypes.length && !filter.agentTypes.some((agentType) => agentType === agent.agentType)) return false;
   if (filter.daemonIds.length && !filter.daemonIds.includes(agent.daemonId)) return false;
   const text = normalize(filter.text);

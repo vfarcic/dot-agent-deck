@@ -3,6 +3,7 @@ import type { DesktopAgentDto } from "./bridge";
 import {
   buildDashboardFilterHeader,
   clearDashboardFilter,
+  dashboardFilterFromParams,
   filterDashboardAgents,
   removeDashboardFilterFacet,
   type DashboardFilter,
@@ -120,5 +121,33 @@ describe("dashboard filter", () => {
     const before = structuredClone(active);
     expect(removeDashboardFilterFacet(active, facet)).toEqual({ ...active, [facet]: facet === "text" ? "" : [] });
     expect(active).toEqual(before);
+  });
+});
+
+describe("dashboard filter statuses follow the status columns", () => {
+  // A hookless agent reports `running`, and a compacting one `compacting`: the
+  // dashboard's status column shows both as Working, so the Working filter has
+  // to keep them. A word that is not one of the filter's own falls into the
+  // filter status of the column it is shown in.
+  const fleet: FilterAgent[] = [
+    agent("hookless", { status: "running" }),
+    agent("compacting", { status: "compacting" }),
+    agent("shouting", { status: "WORKING" as FilterAgent["status"] }),
+    agent("thinking", { status: "thinking" }),
+    agent("unknown", { status: "unknown" }),
+    agent("idle"),
+  ];
+
+  /// Scenario: filter a fleet holding a hookless `running` agent, a `compacting` one and an upper-case `WORKING` one by Working. All three are in the dashboard's Working column, so all three stay, and Thinking stays its own status.
+  it("keeps every agent the Working column shows under the Working filter", () => {
+    expect(ids(filter({ statuses: ["working"] }), fleet)).toEqual(["hookless", "compacting", "shouting"]);
+    expect(ids(filter({ statuses: ["thinking"] }), fleet)).toEqual(["thinking"]);
+    expect(ids(filter({ statuses: ["idle"] }), fleet)).toEqual(["unknown", "idle"]);
+  });
+
+  /// Scenario: say "show working agents", which reaches the dashboard as a `filter_dashboard` dispatch with `status` = `working`. The voice filter shows the same agents the Working column does.
+  it("agrees with the columns for a voice status param", () => {
+    const spoken = dashboardFilterFromParams([{ name: "status", value: "working" }]);
+    expect(ids(spoken, fleet)).toEqual(["hookless", "compacting", "shouting"]);
   });
 });

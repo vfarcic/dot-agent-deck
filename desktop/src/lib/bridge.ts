@@ -2014,7 +2014,8 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   unknown: "waiting",
 };
 
-function statusFromDaemon(status: string): AgentStatus {
+/** The status column a daemon status word is shown in. */
+export function statusFromDaemon(status: string): AgentStatus {
   return DAEMON_STATUS[status.toLowerCase()] ?? "waiting";
 }
 
