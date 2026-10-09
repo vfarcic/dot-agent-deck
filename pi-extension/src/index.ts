@@ -43,11 +43,12 @@ import {
 } from "./orchestrator.ts";
 
 /**
- * The deck CLI this pane shells: the absolute path the spawning deck exported
- * in `DOT_AGENT_DECK_EXE`, or the bare name for an older deck that did not
- * (issue #1385). Read once — the value is fixed for the life of the process.
+ * The deck CLI this pane shells: the operator's absolute `DOT_AGENT_DECK_BIN`
+ * (PRD #1497), else the absolute path the spawning deck exported in
+ * `DOT_AGENT_DECK_EXE`, or the bare name for an older deck that did not (issue
+ * #1385). Read once — the value is fixed for the life of the process.
  */
-const deckBin = resolveDeckBin(process.env);
+const deckBin = resolveDeckBin(process.env, process.platform);
 
 /**
  * Shell `dot-agent-deck <argv>` via Pi's exec helper, or with `stdin` written

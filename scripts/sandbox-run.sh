@@ -76,6 +76,13 @@ else
   [ -n "$bin" ] || die "no dot-agent-deck build under $checkout/target — nothing can talk to the sandbox daemon"
 fi
 [ -x "$bin" ] || die "no dot-agent-deck binary at $bin"
+# Absolute, because DOT_AGENT_DECK_BIN (below) is honoured only as an absolute
+# path; a relative value would be ignored and agents would report through the
+# installed release.
+case $bin in
+  /*) ;;
+  *) bin="$PWD/$bin" ;;
+esac
 
 # --- isolation ---------------------------------------------------------------
 #

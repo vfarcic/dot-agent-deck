@@ -2216,7 +2216,10 @@ fn publish_hook_turn_reply(
 /// it — but only a `Stop` whose hook `line` carried the turn's final reply
 /// ([`crate::turn_reply::reply_from_line`]). A `Stop` without one leaves the
 /// turn armed, so its `task_complete` is still read for the reply (PRD #1497
-/// re-audit R3) and disarms it then. Only for an event whose pane and agent
+/// re-audit R3) and disarms it then. A hook CLI older than PRD #1497 attaches
+/// no reply to any `Stop`, so under one every Codex turn is disarmed that way;
+/// `crate::codex_rollout_tail`'s module doc says what bounds a turn whose
+/// `task_complete` never comes. Only for an event whose pane and agent
 /// name the pane's LIVE owner, so a payload can never make the daemon read a
 /// file on another pane's behalf. The file itself is opened and read by
 /// [`run_codex_rollout_monitor`], never here.
@@ -5118,10 +5121,11 @@ mod hook_ingestion_tests {
     }
 
     /// Scenario (PRD #1497 re-audit R3): a Codex turn `t1` is armed, and its
-    /// `Stop` arrives naming `t1` but without `last_assistant_message`, BEFORE
+    /// `Stop` arrives naming `t1` but without a reply (no
+    /// `last_assistant_message`, or a hook CLI older than PRD #1497), BEFORE
     /// Codex has written the turn's `task_complete`. The `Stop` queues no
-    /// disarm, so the next poll still reads the rollout and hands the turn's
-    /// reply once. A `Stop` that did carry the reply disarms the turn as
+    /// disarm, so the next poll still reads the rollout, hands the turn's
+    /// reply once and disarms it. A `Stop` that did carry the reply disarms the turn as
     /// before, and its later `task_complete` hands nothing — the hook's frame
     /// was the turn's one.
     #[test]
@@ -5201,6 +5205,10 @@ mod hook_ingestion_tests {
         assert_eq!(replies.len(), 1, "{replies:?}");
         assert_eq!(replies[0].reply.turn_id.as_deref(), Some("t1"));
         assert_eq!(replies[0].reply.text, "All 42 tests pass.");
+        assert!(
+            !tailers.is_armed(&owner),
+            "the turn's task_complete disarms it"
+        );
         assert!(poll(&mut tailers).is_empty(), "handed once");
 
         // The Stop carries the reply: the turn is disarmed, and its

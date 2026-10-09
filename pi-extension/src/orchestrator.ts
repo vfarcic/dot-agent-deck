@@ -34,24 +34,46 @@ export const DECK_EXE_ENV = "DOT_AGENT_DECK_EXE";
  * #1497). The deck never sets it; the `task run-all` sandbox exports it so an
  * agent there reports through the build under test. MUST stay in sync with
  * that constant.
+ *
+ * It selects the executable the extension runs, so it is honoured only when it
+ * is an absolute path (see {@link isAbsoluteOverride}): a bare name would be
+ * looked up in Pi's `$PATH` and a relative path against its working directory,
+ * the exposure issue #536 removed.
  */
 export const DECK_BIN_OVERRIDE_ENV = "DOT_AGENT_DECK_BIN";
 
 /**
- * The CLI the extension shells: the operator's override from
- * {@link DECK_BIN_OVERRIDE_ENV} when one is set, else the deck's own absolute
- * path from {@link DECK_EXE_ENV} when the deck set one, otherwise the bare
- * {@link DECK_BIN} — so an older deck that sets nothing keeps working exactly
- * as before. The value is used verbatim (argv exec, no shell), so a path with
- * spaces needs no quoting. `env` is a parameter rather than `process.env` so
- * this module stays import- and global-free and unit-testable.
+ * Whether `value` is an absolute path on `platform` (a `process.platform`
+ * value), the only form {@link DECK_BIN_OVERRIDE_ENV} is honoured in. Checked
+ * verbatim, with no trimming, exactly as the deck's hook commands and its
+ * OpenCode plugin check it: `/…` off Windows; a drive-qualified `C:\…` or a
+ * UNC `\\…` on it.
  */
-export function resolveDeckBin(env: Readonly<Record<string, string | undefined>>): string {
-	for (const name of [DECK_BIN_OVERRIDE_ENV, DECK_EXE_ENV]) {
-		const value = env[name];
-		if (typeof value === "string" && value.trim().length > 0) {
-			return value;
-		}
+export function isAbsoluteOverride(value: string, platform: string): boolean {
+	return platform === "win32" ? /^([A-Za-z]:[\\/]|[\\/]{2})/.test(value) : value.startsWith("/");
+}
+
+/**
+ * The CLI the extension shells: the operator's override from
+ * {@link DECK_BIN_OVERRIDE_ENV} when it is an absolute path, else the deck's
+ * own absolute path from {@link DECK_EXE_ENV} when the deck set one, otherwise
+ * the bare {@link DECK_BIN} — so an older deck that sets nothing keeps working
+ * exactly as before. The value is used verbatim (argv exec, no shell), so a
+ * path with spaces needs no quoting. `env` and `platform` are parameters
+ * rather than `process.env` and `process.platform` so this module stays
+ * import- and global-free and unit-testable.
+ */
+export function resolveDeckBin(
+	env: Readonly<Record<string, string | undefined>>,
+	platform: string,
+): string {
+	const override = env[DECK_BIN_OVERRIDE_ENV];
+	if (typeof override === "string" && isAbsoluteOverride(override, platform)) {
+		return override;
+	}
+	const exe = env[DECK_EXE_ENV];
+	if (typeof exe === "string" && exe.trim().length > 0) {
+		return exe;
 	}
 	return DECK_BIN;
 }

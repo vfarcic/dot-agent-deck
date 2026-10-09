@@ -197,13 +197,19 @@ const ancestryLookups = new Map();
 let unsettledAncestryLookups = 0;
 let disposalGeneration = 0;
 
-// PRD #1497: DOT_AGENT_DECK_BIN, when set and non-empty, names the binary to
-// report through instead of BINARY_PATH (the `task run-all` sandbox sets it to
-// the build under test). Read per event, like the shell `${{VAR:-default}}` the
-// deck's other hook commands use.
+// PRD #1497: DOT_AGENT_DECK_BIN, when it is an absolute path, names the binary
+// to report through instead of BINARY_PATH (the `task run-all` sandbox sets it
+// to the build under test). Anything else — unset, empty, a bare name or a
+// relative path — is ignored, since execFileSync would resolve it through the
+// agent's PATH or working directory (issue #536). Used verbatim, not trimmed,
+// and read per event, like the deck's hook commands.
+const isAbsoluteOverride = (value) =>
+  process.platform === "win32"
+    ? /^([A-Za-z]:[\\/]|[\\/]{{2}})/.test(value)
+    : value.startsWith("/");
 const hookBinary = () => {{
   const override = process.env.DOT_AGENT_DECK_BIN;
-  return typeof override === "string" && override !== "" ? override : BINARY_PATH;
+  return typeof override === "string" && isAbsoluteOverride(override) ? override : BINARY_PATH;
 }};
 
 const sendEvent = (payload) => {{
@@ -2172,10 +2178,13 @@ pub(crate) mod tests {
     }
 
     /// PRD #1497: the plugin reports through the binary `DOT_AGENT_DECK_BIN`
-    /// names when that is set and non-empty, and through its pinned
-    /// `BINARY_PATH` otherwise. Loaded under Node with two recorder scripts,
-    /// one pinned and one named by the variable; each run sends one event and
-    /// exactly one recorder receives it.
+    /// names when that is an absolute path, and through its pinned
+    /// `BINARY_PATH` otherwise — unset, empty, whitespace, a bare name the
+    /// agent's `PATH` would resolve, or a path relative to its working
+    /// directory (tester H2). Loaded under Node with two recorder scripts, one
+    /// pinned and one named by the variable, the latter's directory on `PATH`
+    /// and as the working directory so a relative value would reach it; each
+    /// run sends one event and exactly one recorder receives it.
     #[cfg(unix)]
     #[test]
     fn plugin_reports_through_dot_agent_deck_bin_when_it_is_set() {
@@ -2227,9 +2236,16 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
                 .filter(|l| !l.trim().is_empty())
                 .count()
         };
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let run = |bin: Option<&str>| {
             let mut cmd = std::process::Command::new("node");
             cmd.arg(&driver)
+                .current_dir(dir.path())
+                .env("PATH", &path)
                 .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN);
             if let Some(bin) = bin {
                 cmd.env(crate::platform::paths::DOT_AGENT_DECK_BIN, bin);
@@ -2246,17 +2262,21 @@ await hooks.event({{ event: {{ type: "session.error", properties: {{ sessionID: 
         let per_run = lines(&pinned_out);
         assert!(per_run > 0, "the plugin reported nothing");
         assert_eq!(lines(&built_out), 0, "unset: only the pinned binary");
-        run(Some(""));
-        assert_eq!(
-            (lines(&pinned_out), lines(&built_out)),
-            (2 * per_run, 0),
-            "empty: the pinned binary"
-        );
+        let mut runs = 1;
+        for ignored in ["", "   ", "built", "./built"] {
+            run(Some(ignored));
+            runs += 1;
+            assert_eq!(
+                (lines(&pinned_out), lines(&built_out)),
+                (runs * per_run, 0),
+                "{ignored:?} is not absolute: the pinned binary"
+            );
+        }
         run(Some(&built.to_string_lossy()));
         assert_eq!(
             (lines(&pinned_out), lines(&built_out)),
-            (2 * per_run, per_run),
-            "set: only the named binary"
+            (runs * per_run, per_run),
+            "absolute: only the named binary"
         );
     }
 

@@ -535,6 +535,8 @@ fn install_to_reporting(
     mode: InstallMode,
 ) -> io::Result<(bool, String)> {
     let path = config_path(config_dir);
+    // Before the config is read, so a refusal leaves it as it was (PRD #1497).
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
     std::fs::create_dir_all(config_dir)?;

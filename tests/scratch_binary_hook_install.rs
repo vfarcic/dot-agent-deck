@@ -433,15 +433,17 @@ fn write_recording_stub(path: &Path) {
 /// Run `command` the way Claude Code runs a hook on Linux and macOS (`sh -c`,
 /// per its hooks reference), with a hook payload on stdin and
 /// `DOT_AGENT_DECK_BIN` set to `bin` or unset, and return what the stub that
-/// ran recorded.
-fn run_hook_command(command: &str, bin: Option<&Path>, out: &Path) -> String {
+/// ran recorded. `reach` is put on `PATH` and made the working directory, so a
+/// stub there is what a bare or relative `bin` would run if it were honoured.
+fn run_hook_command(command: &str, bin: Option<&Path>, out: &Path, reach: &Path) -> String {
     use std::io::Write as _;
     let _ = std::fs::remove_file(out);
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(command)
+        .current_dir(reach)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", format!("{}:/usr/bin:/bin", reach.display()))
         .env("OUT", out)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -468,9 +470,10 @@ fn run_hook_command(command: &str, bin: Option<&Path>, out: &Path) -> String {
 /// Scenario: Seed an install at `$HOME/.local/bin` and run `hooks install
 /// --agent claude-code` from a scratch copy. Every deck command must name the
 /// install behind the `DOT_AGENT_DECK_BIN` wrapper, and running one through
-/// `sh -c` must run the install when the variable is unset and the binary it
-/// names when it is set, with the hook's arguments and stdin intact (PRD
-/// #1497).
+/// `sh -c` must run the binary the variable names when it is an absolute path,
+/// and the install when it is unset, empty, a bare name on `PATH` or a path
+/// relative to the working directory, with the hook's arguments and stdin
+/// intact (PRD #1497).
 #[spec("hooks/install/011")]
 #[test]
 fn install_011_hook_commands_run_dot_agent_deck_bin_when_it_is_set() {
@@ -499,15 +502,24 @@ fn install_011_hook_commands_run_dot_agent_deck_bin_when_it_is_set() {
 
     let record = fixture.path().join("ran");
     let payload = r#"{"hook_event_name":"Stop"}"#;
+    let reach = built.parent().expect("the build's directory");
+    let installed_record = format!("{}|hook --agent claude-code|{payload}", durable_file_name());
     assert_eq!(
-        run_hook_command(deck[0], None, &record),
-        format!("{}|hook --agent claude-code|{payload}", durable_file_name()),
+        run_hook_command(deck[0], None, &record, reach),
+        installed_record,
         "unset, the hook must run the installed deck exactly as before"
     );
+    for ignored in ["", "built-deck", "./built-deck"] {
+        assert_eq!(
+            run_hook_command(deck[0], Some(Path::new(ignored)), &record, reach),
+            installed_record,
+            "{ignored:?} is not absolute, so the hook must run the installed deck"
+        );
+    }
     assert_eq!(
-        run_hook_command(deck[0], Some(&built), &record),
+        run_hook_command(deck[0], Some(&built), &record, reach),
         format!("built-deck|hook --agent claude-code|{payload}"),
-        "set, the hook must run the binary DOT_AGENT_DECK_BIN names"
+        "set to an absolute path, the hook must run the binary DOT_AGENT_DECK_BIN names"
     );
 }
 
@@ -602,4 +614,56 @@ fn install_013_uninstall_removes_both_the_plain_and_the_override_form() {
         vec![USER_HOOK.to_string()],
         "only the user's hook may remain after an uninstall"
     );
+}
+
+/// Scenario: Run `hooks install --agent claude-code` from a deck that lives in
+/// a directory named `back\'; touch PWNED; #`, with no installed deck to
+/// prefer, over a `settings.json` that already holds a deck entry. The install
+/// must exit non-zero naming the path and the backslash, and leave
+/// `settings.json` byte for byte as it was, because fish, which Codex may run
+/// a hook in, reads that backslash as an escape inside single quotes and would
+/// run `touch PWNED` (PRD #1497, tester H1).
+#[spec("hooks/install/014")]
+#[test]
+fn install_014_a_backslash_in_the_deck_path_is_refused_and_the_settings_kept() {
+    let fixture = Fixture::new();
+    let hostile = fixture
+        .path()
+        .join("opt")
+        .join("back\\'; touch PWNED; #")
+        .join("bin");
+    std::fs::create_dir_all(&hostile).expect("create the hostile bindir");
+    let deck = hostile.join(durable_file_name());
+    let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    if std::fs::hard_link(built, &deck).is_err() {
+        std::fs::copy(built, &deck).expect("copy the deck binary to the hostile path");
+    }
+    let settings = fixture.settings();
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&seeded_settings(&[(
+            "Stop",
+            plain_form(Path::new("/opt/earlier/dot-agent-deck")),
+        )]))
+        .expect("serialize"),
+    )
+    .expect("seed settings.json");
+    let before = std::fs::read(&settings).expect("read");
+
+    let out = fixture.run(&deck, &["hooks", "install", "--agent", "claude-code"]);
+    let report = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a backslash path must be refused:\n{report}"
+    );
+    assert!(
+        report.contains("backslash") && report.contains("PWNED"),
+        "the refusal must name the path and the reason:\n{report}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).expect("read"),
+        before,
+        "the refusal must leave the existing entries untouched"
+    );
+    assert!(!fixture.path().join("PWNED").exists());
 }

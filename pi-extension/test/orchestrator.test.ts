@@ -47,6 +47,7 @@ import {
 	REPORT_LEVELS,
 	reportArgvAt,
 	resolveDeckBin,
+	isAbsoluteOverride,
 	SEED_DELIVER_AS,
 	seedToDeliver,
 	spawnFailureMessage,
@@ -353,20 +354,20 @@ describe("issue #1385: which deck binary the extension shells", () => {
 	test("uses the absolute path the spawning deck exported, verbatim", () => {
 		assert.equal(DECK_EXE_ENV, "DOT_AGENT_DECK_EXE");
 		assert.equal(
-			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/home/me/.local/bin/dot-agent-deck" }),
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/home/me/.local/bin/dot-agent-deck" }, "linux"),
 			"/home/me/.local/bin/dot-agent-deck",
 		);
 		// argv exec, no shell: a path with spaces is passed unquoted.
 		assert.equal(
-			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/opt/my tools/dot-agent-deck" }),
+			resolveDeckBin({ DOT_AGENT_DECK_EXE: "/opt/my tools/dot-agent-deck" }, "linux"),
 			"/opt/my tools/dot-agent-deck",
 		);
 	});
 
 	test("falls back to the bare name when an older deck sets nothing", () => {
-		assert.equal(resolveDeckBin({}), DECK_BIN);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }), DECK_BIN);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }), DECK_BIN);
+		assert.equal(resolveDeckBin({}, "linux"), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "" }, "linux"), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_EXE: "   " }, "linux"), DECK_BIN);
 		assert.equal(DECK_BIN, "dot-agent-deck");
 	});
 
@@ -376,16 +377,39 @@ describe("issue #1385: which deck binary the extension shells", () => {
 			resolveDeckBin({
 				DOT_AGENT_DECK_BIN: "/src/target/debug/dot-agent-deck",
 				DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck",
-			}),
+			}, "linux"),
 			"/src/target/debug/dot-agent-deck",
 		);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/my build/dot-agent-deck" }), "/my build/dot-agent-deck");
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/my build/dot-agent-deck" }, "linux"), "/my build/dot-agent-deck");
 		// Empty or blank is unset, so the deck's own path (or the bare name) is used.
 		assert.equal(
-			resolveDeckBin({ DOT_AGENT_DECK_BIN: "", DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck" }),
+			resolveDeckBin({ DOT_AGENT_DECK_BIN: "", DOT_AGENT_DECK_EXE: "/opt/homebrew/bin/dot-agent-deck" }, "linux"),
 			"/opt/homebrew/bin/dot-agent-deck",
 		);
-		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "  " }), DECK_BIN);
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "  " }, "linux"), DECK_BIN);
+	});
+
+	test("PRD #1497 H2: a DOT_AGENT_DECK_BIN that is not absolute is ignored", () => {
+		const exe = "/opt/homebrew/bin/dot-agent-deck";
+		// A bare name would be looked up in Pi's PATH and a relative path
+		// against its cwd, so each falls back exactly as if it were unset.
+		for (const value of ["deck-hook", "./x", "target/debug/dot-agent-deck", " /abs/with-leading-space", "  "]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "linux"), exe, value);
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value }, "linux"), DECK_BIN, value);
+		}
+		assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: "/abs/deck", DOT_AGENT_DECK_EXE: exe }, "linux"), "/abs/deck");
+	});
+
+	test("PRD #1497 H2: absolute on Windows means drive-qualified or UNC", () => {
+		const exe = "C:\\deck\\dot-agent-deck.exe";
+		for (const value of ["C:\\build\\dot-agent-deck.exe", "d:/build/dot-agent-deck.exe", "\\\\server\\share\\deck.exe"]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "win32"), value, value);
+		}
+		for (const value of ["deck.exe", ".\\deck.exe", "\\deck.exe", "C:deck.exe", ""]) {
+			assert.equal(resolveDeckBin({ DOT_AGENT_DECK_BIN: value, DOT_AGENT_DECK_EXE: exe }, "win32"), exe, value);
+		}
+		assert.equal(isAbsoluteOverride("/abs", "linux"), true);
+		assert.equal(isAbsoluteOverride("C:\\abs", "linux"), false);
 	});
 
 	test("failure messages name the binary actually shelled", () => {

@@ -135,6 +135,48 @@ fn build_command_for(
 /// form.
 pub(crate) const BIN_OVERRIDE_PREFIX: &str = crate::platform::paths::HOOK_BIN_OVERRIDE_PREFIX;
 
+/// Refuse to write a hook command naming `binary_path` when no quoting of it
+/// is safe in every shell the command may be run by (PRD #1497, tester H1).
+///
+/// On macOS and Linux the installed path is single-quoted when it needs
+/// quoting, with `'` spelled `'\''`. sh, bash and zsh read every byte inside
+/// single quotes literally, but fish reads `\'` and `\\` there as escapes, and
+/// Codex runs a hook through `$SHELL -lc`, so a fish login shell is a real
+/// reader: an install directory named `back\'; touch PWNED; #` made fish run
+/// `touch PWNED`. Quoting per shell is no answer, because the user's login
+/// shell can change after the install. A backslash is the only byte fish
+/// treats specially inside single quotes, so it is the only one refused; a
+/// path with spaces or `'` is still written, and every such shell runs it.
+///
+/// Each installer calls this before it reads the agent's config, so a refused
+/// install leaves that config, and the deck entries an earlier install wrote
+/// in it, exactly as they were.
+///
+/// Not applied on Windows: Claude Code and Codex hand the command to `cmd.exe`
+/// there, which uses double quotes and for which `\` is the path separator,
+/// and the Devin config (always POSIX) is never read on Windows.
+pub(crate) fn ensure_hook_path_is_shell_safe(binary_path: &str) -> io::Result<()> {
+    ensure_hook_path_is_shell_safe_for(binary_path, cfg!(windows))
+}
+
+/// [`ensure_hook_path_is_shell_safe`] with the host as a parameter, so the
+/// Windows arm is asserted from any host.
+fn ensure_hook_path_is_shell_safe_for(binary_path: &str, windows_host: bool) -> io::Result<()> {
+    if windows_host || !binary_path.contains('\\') {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to write hook commands for {binary_path:?}: the path contains a backslash, \
+             which fish reads as an escape even inside single quotes, so no quoting of it is safe \
+             in every shell an agent may run its hooks in (Codex uses your login shell). The \
+             existing hook entries are left unchanged. Install dot-agent-deck at a path without \
+             a backslash and install the hooks again."
+        ),
+    ))
+}
+
 /// `quoted_exe` (already quoted for the dialect) as the command word of a hook
 /// command that honours [`crate::platform::paths::DOT_AGENT_DECK_BIN`]: wrapped in
 /// [`BIN_OVERRIDE_PREFIX`] for a POSIX shell, unchanged for `cmd.exe`, which
@@ -803,11 +845,21 @@ pub(crate) fn command_executable<'a>(command: &'a str, suffix: &str) -> Option<&
     let exe = command.trim_end().strip_suffix(suffix)?;
     let exe = exe.strip_suffix(' ')?;
     // PRD #1497: the override wrapper is the deck's own, and the installed
-    // executable is what follows it — both forms name the same install.
-    if exe == BIN_OVERRIDE_PREFIX.trim_end() {
-        return None;
+    // executable is what follows it — every form names the same install,
+    // including the wrapper an earlier build of that PRD wrote.
+    let mut exe = exe;
+    for prefix in [
+        BIN_OVERRIDE_PREFIX,
+        crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX,
+    ] {
+        if exe == prefix.trim_end() {
+            return None;
+        }
+        if let Some(rest) = exe.strip_prefix(prefix) {
+            exe = rest;
+            break;
+        }
     }
-    let exe = exe.strip_prefix(BIN_OVERRIDE_PREFIX).unwrap_or(exe);
     if exe.is_empty() { None } else { Some(exe) }
 }
 
@@ -2236,17 +2288,25 @@ mod tests {
     }
 
     /// PRD #1497: the wrapper reads the one variable the docs, the OpenCode
-    /// plugin and the Pi extension name, with the installed path as its
-    /// fallback.
+    /// plugin and the Pi extension name, honours it only when it is absolute,
+    /// and falls back to the installed path. The script is one single-quoted
+    /// literal holding neither `'` nor `\`, the bytes fish would read inside it.
     #[test]
     fn bin_override_prefix_reads_dot_agent_deck_bin_with_the_installed_fallback() {
         let var = crate::platform::paths::DOT_AGENT_DECK_BIN;
         assert!(
-            BIN_OVERRIDE_PREFIX.contains(&format!("\"${{{var}:-$0}}\"")),
+            BIN_OVERRIDE_PREFIX.contains(&format!(
+                "case \"${var}\" in /*) exec \"${var}\" \"$@\";; esac;"
+            )),
             "{BIN_OVERRIDE_PREFIX}"
         );
-        assert!(BIN_OVERRIDE_PREFIX.starts_with("/bin/sh -c 'exec "));
-        assert!(BIN_OVERRIDE_PREFIX.ends_with("\"$@\"' "));
+        assert!(BIN_OVERRIDE_PREFIX.starts_with("/bin/sh -c '"));
+        assert!(BIN_OVERRIDE_PREFIX.ends_with(" exec \"$0\" \"$@\"' "));
+        let script = BIN_OVERRIDE_PREFIX
+            .strip_prefix("/bin/sh -c '")
+            .and_then(|s| s.strip_suffix("' "))
+            .expect("one single-quoted script");
+        assert!(!script.contains('\'') && !script.contains('\\'), "{script}");
         assert_eq!(
             overridable_command_word("'/a b/dot-agent-deck'", true),
             "'/a b/dot-agent-deck'",
@@ -2260,28 +2320,100 @@ mod tests {
     /// uninstall remove either.
     #[test]
     fn command_executable_recovers_the_installed_path_from_either_form() {
+        let legacy = crate::platform::paths::LEGACY_HOOK_BIN_OVERRIDE_PREFIX;
         for exe in ["/abs/dot-agent-deck", "'/with space/dot-agent-deck'"] {
             let plain = format!("{exe} {CODEX}");
             let overridden = format!("{BIN_OVERRIDE_PREFIX}{exe} {CODEX}");
+            let earlier = format!("{legacy}{exe} {CODEX}");
             assert_eq!(command_executable(&plain, CODEX), Some(exe));
             assert_eq!(command_executable(&overridden, CODEX), Some(exe));
+            assert_eq!(
+                command_executable(&earlier, CODEX),
+                Some(exe),
+                "the wrapper an earlier PRD #1497 build wrote still names its install"
+            );
         }
-        assert_eq!(
-            command_executable(&format!("{BIN_OVERRIDE_PREFIX}{CODEX}"), CODEX),
-            None,
-            "the wrapper with no installed executable after it is not a command the deck writes"
+        for prefix in [BIN_OVERRIDE_PREFIX, legacy] {
+            assert_eq!(
+                command_executable(&format!("{prefix}{CODEX}"), CODEX),
+                None,
+                "the wrapper with no installed executable after it is not a command the deck writes"
+            );
+        }
+    }
+
+    /// Tester H1: a backslash in the installed path is refused, with the path
+    /// and the reason in the error, on every host but Windows; spaces and `'`
+    /// are not.
+    #[test]
+    fn a_backslash_in_the_installed_path_is_refused_off_windows() {
+        let hostile = "/x/back\\'; touch PWNED; #/dot-agent-deck";
+        let err = ensure_hook_path_is_shell_safe_for(hostile, false).expect_err("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let message = err.to_string();
+        assert!(message.contains(&format!("{hostile:?}")), "{message}");
+        assert!(
+            message.contains("backslash") && message.contains("fish"),
+            "{message}"
         );
+        assert!(message.contains("left unchanged"), "{message}");
+        for fine in [
+            "/abs/dot-agent-deck",
+            "/with space/dot-agent-deck",
+            "/it's mine/dot-agent-deck",
+            "/x/a'; touch PWNED; #/dot-agent-deck",
+        ] {
+            ensure_hook_path_is_shell_safe_for(fine, false).expect(fine);
+        }
+        ensure_hook_path_is_shell_safe_for(r"C:\Program Files\deck\dot-agent-deck.exe", true)
+            .expect("cmd.exe dialect: the separator is not refused");
+    }
+
+    /// Tester H1, at each installer: a refused install writes nothing, so the
+    /// config an earlier install wrote — its deck entries included — is left
+    /// byte for byte as it was.
+    #[cfg(unix)]
+    #[test]
+    fn every_installer_refuses_a_backslash_path_and_leaves_the_config_alone() {
+        let fixture = crate::test_temp::tempdir().expect("owned config fixture");
+        for agent in ["claude-code", "codex", "devin"] {
+            let home = fixture.path().join(agent);
+            std::fs::create_dir_all(&home).unwrap();
+            install_config(agent, &home, "/opt/deck/dot-agent-deck").expect("control install");
+            let config = home.join(config_name(agent));
+            let before = std::fs::read(&config).expect("control install wrote the config");
+            let err = install_config(agent, &home, "/opt/back\\slash/dot-agent-deck")
+                .expect_err("a backslash path must be refused");
+            assert!(err.to_string().contains("backslash"), "{agent}: {err}");
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                before,
+                "{agent}: the refusal must leave the existing entries untouched"
+            );
+        }
+        // Claude Code's startup install has its own entry point; it logs the
+        // refusal and writes nothing either.
+        let settings = fixture.path().join("claude-code").join("settings.json");
+        let before = std::fs::read(&settings).unwrap();
+        crate::hooks_manage::auto_install_to(&settings, || {
+            Ok("/opt/back\\slash/dot-agent-deck".to_string())
+        });
+        assert_eq!(std::fs::read(&settings).unwrap(), before);
     }
 
     /// PRD #1497, run rather than read: the written command runs the
-    /// `DOT_AGENT_DECK_BIN` binary when that is set and non-empty and the
-    /// installed one otherwise, with the hook's arguments and stdin intact,
-    /// under every outer shell an agent here hands the command to that this
-    /// machine has — `sh -c` (Claude Code, per its hooks reference) and
-    /// `$SHELL -lc` (Codex),
-    /// where `$SHELL` may be bash, zsh or fish. fish is the reason for the
-    /// `/bin/sh -c` wrapper: it rejects a bare `${VAR:-default}`. A shell that
-    /// is not installed is skipped and named.
+    /// `DOT_AGENT_DECK_BIN` binary when that is an absolute path and the
+    /// installed one otherwise — unset, empty, whitespace, a bare name on the
+    /// `PATH` or a path relative to the working directory (tester H2) — with
+    /// the hook's arguments and stdin intact, under every outer shell an agent
+    /// here hands the command to that this machine has — `sh -c` (Claude Code,
+    /// per its hooks reference) and `$SHELL -lc` (Codex), where `$SHELL` may be
+    /// bash, zsh or fish. fish is the reason for the `/bin/sh -c` wrapper: it
+    /// rejects a bare `${VAR:-default}`; and the installed path sits in a
+    /// directory whose name holds a space and a `'`, which every one of those
+    /// shells must still read as one word (tester H1 — a `\` is what fish would
+    /// not, and the installers refuse it). A shell that is not installed is
+    /// skipped and named.
     #[cfg(unix)]
     #[test]
     fn the_override_command_runs_the_override_else_the_installed_binary() {
@@ -2289,7 +2421,7 @@ mod tests {
         use std::process::{Command, Stdio};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let spaced = dir.path().join("my deck");
+        let spaced = dir.path().join("my deck's");
         std::fs::create_dir(&spaced).expect("mkdir");
         let write_stub = |name: &str| {
             let path = spaced.join(name);
@@ -2312,6 +2444,13 @@ mod tests {
             false,
         );
 
+        // `built` is reachable by bare name and by `./built`, so honouring a
+        // value that is not absolute would show up as the wrong stub running.
+        let mut path_with_built = std::ffi::OsString::from(&spaced);
+        path_with_built.push(":");
+        path_with_built.push(std::env::var_os("PATH").unwrap_or_default());
+        let installed_record = "installed|hook --agent devin|{\"payload\":1}";
+
         let mut ran_any = false;
         for shell in ["sh", "bash", "zsh", "fish"] {
             let run = |bin: Option<&str>| {
@@ -2319,6 +2458,8 @@ mod tests {
                 let mut cmd = Command::new(shell);
                 cmd.arg("-c")
                     .arg(&command)
+                    .current_dir(&spaced)
+                    .env("PATH", path_with_built.as_os_str())
                     .env("OUT", &out)
                     .env_remove(crate::platform::paths::DOT_AGENT_DECK_BIN)
                     .stdin(Stdio::piped())
@@ -2348,19 +2489,18 @@ mod tests {
                 continue;
             };
             ran_any = true;
-            assert_eq!(
-                unset, "installed|hook --agent devin|{\"payload\":1}",
-                "{shell}, unset"
-            );
-            assert_eq!(
-                run(Some("")).expect("ran"),
-                "installed|hook --agent devin|{\"payload\":1}",
-                "{shell}, set but empty"
-            );
+            assert_eq!(unset, installed_record, "{shell}, unset");
+            for ignored in ["", "  ", "built", "./built", " /bin/false"] {
+                assert_eq!(
+                    run(Some(ignored)).expect("ran"),
+                    installed_record,
+                    "{shell}, set to {ignored:?}, which is not absolute"
+                );
+            }
             assert_eq!(
                 run(Some(built.to_str().expect("utf-8"))).expect("ran"),
                 "built|hook --agent devin|{\"payload\":1}",
-                "{shell}, set to a path with a space in it"
+                "{shell}, set to an absolute path with a space and a ' in it"
             );
         }
         assert!(ran_any, "no shell at all could be spawned");

@@ -559,6 +559,8 @@ fn install_to_reporting(
     mode: InstallMode,
 ) -> std::io::Result<(bool, Vec<String>)> {
     let path = codex_home.join("hooks.json");
+    // Before the config is read, so a refusal leaves it as it was (PRD #1497).
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     // Before the directory, the backup and the temp file (PRD #1487).
     crate::config_write_guard::ensure_config_write_allowed(&path)?;
     std::fs::create_dir_all(codex_home)?;

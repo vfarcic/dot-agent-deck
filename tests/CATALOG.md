@@ -2457,10 +2457,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the Codex and Devin installers, which share the backup helper (`agent_hook_config::backup_malformed`, unit-covered there); the `.bak` the deck writes when the name is free (`hook_rule_identification_017`); the startup install's logged form of the same refusal.
 - **Platform coverage:** mac+linux.
 
-##### hooks/install/011 — Hook commands run the binary `DOT_AGENT_DECK_BIN` names when it is set, and the install otherwise (PRD #1497).
+##### hooks/install/011 — Hook commands run the binary `DOT_AGENT_DECK_BIN` names when it is an absolute path, and the install otherwise (PRD #1497).
 - **Layer:** as `hooks/install/007` (the REAL `dot-agent-deck hooks install --agent claude-code` CLI as a subprocess against an isolated `HOME`), then each written command run through `/bin/sh -c`, the way Claude Code runs a hook on Linux and macOS.
 - **Agent:** none (recording stubs stand in for the install at `$HOME/.local/bin/dot-agent-deck` and for a build at a path with a space in it).
-- **Asserts:** every deck command is the installed path behind `platform::paths::HOOK_BIN_OVERRIDE_PREFIX`; run with `DOT_AGENT_DECK_BIN` unset it executes the install, and with it set it executes the binary it names, each with `hook --agent claude-code` and the hook payload on stdin intact. This is what lets `task run-all`'s agents report through the build under test while every other session keeps the installed release.
+- **Asserts:** every deck command is the installed path behind `platform::paths::HOOK_BIN_OVERRIDE_PREFIX`; run with `DOT_AGENT_DECK_BIN` unset, empty, a bare name the build's directory on `PATH` would resolve, or a path relative to the build's directory as the working directory, it executes the install, and set to an absolute path it executes the binary it names, each with `hook --agent claude-code` and the hook payload on stdin intact. This is what lets `task run-all`'s agents report through the build under test while every other session keeps the installed release.
 - **Does not assert:** the Codex and Devin writers (`*_hooks_manage`'s `install_migrates_the_plain_form_and_uninstall_removes_both_forms`), the outer shells other than `sh` (`agent_hook_config`'s `the_override_command_runs_the_override_else_the_installed_binary` runs bash, zsh and fish where installed), the OpenCode plugin and Pi extension (their own unit tests), or a real Claude Code firing the hook.
 - **Platform coverage:** mac+linux.
 
@@ -2476,6 +2476,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** with one plain and one override-form deck command and a user hook seeded, the uninstall leaves only the user hook.
 - **Does not assert:** the Codex and Devin uninstallers (their `install_migrates_the_plain_form_and_uninstall_removes_both_forms` units).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/014 — An install from a deck path containing a backslash is refused and the settings are kept (PRD #1497).
+- **Layer:** as `hooks/install/007`, the deck run from a scratch copy in a directory named `back\'; touch PWNED; #` with no installed deck to prefer, so that path is the one the install would pin.
+- **Agent:** none.
+- **Asserts:** `hooks install --agent claude-code` exits non-zero with an error naming the path and the backslash, `settings.json` (seeded with an earlier deck entry and a user hook) is byte for byte as it was, and no `PWNED` file appears. fish, which Codex may run a hook in, reads a backslash inside single quotes as an escape, so no quoting of such a path is safe in every shell.
+- **Does not assert:** the Codex and Devin installers and the startup install, which make the same check (`agent_hook_config`'s `every_installer_refuses_a_backslash_path_and_leaves_the_config_alone`), or fish running a written command (`the_override_command_runs_the_override_else_the_installed_binary`, where fish is installed).
 - **Platform coverage:** mac+linux.
 
 ### Pane / agent lifecycle

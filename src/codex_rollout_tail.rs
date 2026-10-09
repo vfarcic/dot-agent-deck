@@ -27,11 +27,18 @@
 //!   error), a Codex `Stop` naming that turn and carrying its final reply, or
 //!   a newer arm. A `Stop` without the reply leaves the turn armed, since its
 //!   `task_complete` is then the only report of the reply (PRD #1497), so the
-//!   file stays open until that record is read or the next arm. Disarming
-//!   closes the file and keeps only its path, so a disarmed Codex pane holds
-//!   no file descriptor; the next arm re-opens it, validating it again. A tailer is
-//!   dropped when its agent is no longer the live owner of its pane, and the
-//!   whole set when the daemon's monitor task is aborted.
+//!   file stays open until that record is read or the next arm. That is every
+//!   `Stop` a hook CLI older than PRD #1497 sends, since it attaches no reply,
+//!   so under such a hook each turn is disarmed by its `task_complete`. A turn
+//!   whose `task_complete` never comes (an interrupted turn writes
+//!   `turn_aborted`; a crashed Codex writes nothing) stays armed until the
+//!   agent's next arm, a new rollout path, or the agent's exit: there is one
+//!   tailer per agent and one watch per tailer, so an idle agent holds at most
+//!   one open rollout. Disarming closes the file and keeps only its path, so a
+//!   disarmed Codex pane holds no file descriptor; the next arm re-opens it,
+//!   validating it again. A tailer is dropped when its agent is no longer the
+//!   live owner of its pane, and the whole set when the daemon's monitor task
+//!   is aborted.
 //! * **Path safety**, checked every time a path is (re)opened
 //!   ([`open_rollout`]): absolute, no `..`, canonicalizes, the canonical file
 //!   name is `rollout-*.jsonl`, opened read-only (Unix: non-blocking and without
@@ -1000,6 +1007,61 @@ mod tests {
                     .contains(&rollout.to_string_lossy().into_owned())
             );
         }
+    }
+
+    /// PRD #1497: since a Codex `Stop` without a reply no longer disarms its
+    /// turn — and a hook CLI older than this release attaches a reply to no
+    /// `Stop` at all — a watch can outlive its turn when no `task_complete`
+    /// ever comes (an interrupted turn writes `turn_aborted`; a crash writes
+    /// nothing). What bounds it: one tailer per agent, one watch per tailer,
+    /// replaced by the agent's next arm or by a new rollout path, and dropped
+    /// with the agent. So an idle agent holds at most one open rollout, and
+    /// none once it exits.
+    #[test]
+    fn a_watch_whose_task_complete_never_comes_is_bounded_per_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-2026-10-09T05-00-00-s.jsonl");
+        append(&rollout, b"{\"type\":\"session_meta\"}\n");
+        let open_files =
+            |t: &CodexRolloutTailers| t.tailers.values().filter(|t| t.open.is_some()).count();
+        let mut tailers = CodexRolloutTailers::default();
+
+        // An interrupted turn: no task_complete, so the watch stays armed.
+        tailers.apply(arm("s", &rollout, Some("turn-1")));
+        append(
+            &rollout,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        );
+        assert!(tailers.tick(live).is_empty());
+        assert!(tailers.take_replies().is_empty());
+        assert!(tailers.is_armed("s"));
+        assert_eq!(open_files(&tailers), 1);
+
+        // Many more turns that never complete: still one tailer, one file.
+        for turn in 2..200 {
+            tailers.apply(arm("s", &rollout, Some(&format!("turn-{turn}"))));
+            assert!(tailers.tick(live).is_empty());
+        }
+        assert_eq!(tailers.tailers.len(), 1);
+        assert_eq!(open_files(&tailers), 1);
+
+        // A new rollout (a new Codex session) replaces the tailer.
+        let rotated = dir.path().join("rollout-2026-10-09T06-00-00-s.jsonl");
+        append(&rotated, b"{\"type\":\"session_meta\"}\n");
+        tailers.apply(arm("s", &rotated, Some("turn-new")));
+        assert!(tailers.tick(live).is_empty());
+        assert_eq!(tailers.tailers.len(), 1);
+        assert_eq!(tailers.tailers["s"].path, rotated.to_string_lossy());
+        assert_eq!(open_files(&tailers), 1);
+
+        // The agent exits (or crashes): its tailer, file and watch go.
+        assert!(tailers.tick(|_, _| false).is_empty());
+        assert!(!tailers.has_tailer("s"));
+        assert_eq!(open_files(&tailers), 0);
     }
 
     /// Issue #714 (audit A1): the arm queue is bounded by total bytes as well

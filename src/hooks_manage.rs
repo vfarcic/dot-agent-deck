@@ -1192,6 +1192,10 @@ pub fn auto_install_to_gated(
             return;
         }
     };
+    if let Err(e) = crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path) {
+        tracing::warn!("auto-install: {e}");
+        return;
+    }
 
     let _guard = match lock_settings(path) {
         Ok(guard) => guard,
@@ -1274,6 +1278,9 @@ pub fn install() -> Result<(), String> {
 /// durable deck on it.
 pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
     let binary_path = resolve()?;
+    // Before the settings are read, so a refusal leaves them as they were.
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(&binary_path)
+        .map_err(|e| e.to_string())?;
     let (stop_failure, claude_version) = installed_claude_accepts_stop_failure();
 
     let path = settings_path();
@@ -1363,6 +1370,7 @@ pub fn install_to(path: &Path, binary_path: &str) -> io::Result<()> {
 /// [`install_to`], writing the version-gated `StopFailure` hook too when
 /// `stop_failure` is set (issue #714).
 pub fn install_to_gated(path: &Path, binary_path: &str, stop_failure: bool) -> io::Result<()> {
+    crate::agent_hook_config::ensure_hook_path_is_shell_safe(binary_path)?;
     let _guard = lock_settings_for_install(path)?;
     let mut settings = load_settings_or_refuse(path)?;
     let before = settings.clone();
