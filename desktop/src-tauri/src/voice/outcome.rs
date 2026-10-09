@@ -3781,7 +3781,7 @@ const LOCATION_NOUNS: [&str; 11] = [
     "run",
     "mode",
 ];
-const LOCATION_PREPOSITIONS: [&str; 5] = ["in", "inside", "within", "from", "under"];
+const LOCATION_PREPOSITIONS: [&str; 6] = ["in", "inside", "within", "from", "under", "at"];
 const LOCATION_ARTICLES: [&str; 7] = ["the", "a", "an", "this", "that", "my", "our"];
 
 /// The words of `sequence` (the transcript's words, in order) that say WHERE
@@ -3791,7 +3791,7 @@ const LOCATION_ARTICLES: [&str; 7] = ["the", "a", "an", "this", "that", "my", "o
 ///
 /// A word counts when it is:
 /// - between a location preposition ("in", "inside", "within", "from",
-///   "under") and a [`LOCATION_NOUNS`] noun at most four words later —
+///   "under", "at") and a [`LOCATION_NOUNS`] noun at most four words later —
 ///   "billing" in "in the billing project";
 /// - right before such a noun with no preposition — "the billing repo agent";
 /// - right after such a noun that only a preposition or an article precedes —
@@ -3800,8 +3800,9 @@ const LOCATION_ARTICLES: [&str; 7] = ["the", "a", "an", "this", "that", "my", "o
 ///   in "in billing" — since that is a place too.
 ///
 /// Over-reading costs a refusal (a task reference that happens to say "in
-/// the parser" is read as a place, and its prompt no longer accounts for
-/// it), never the wrong agent, which is the side to err on.
+/// the parser", or "looking at the billing bug", is read as a place, and its
+/// prompt no longer accounts for it), never the wrong agent, which is the
+/// side to err on.
 fn location_words(sequence: &[String]) -> BTreeSet<String> {
     let is =
         |list: &[&str], at: usize| sequence.get(at).is_some_and(|w| list.contains(&w.as_str()));
@@ -5945,6 +5946,46 @@ mod tests {
                     matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
                         if action == row && params[0].value == "agent-vega"),
                     "{said:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: the only agent is the Claude Code agent in `docs-site`, last
+    /// asked to "Fix the billing issue". The user opens or stops "the agent
+    /// at billing" (or "at the billing project") and the model answers just
+    /// "billing". "At" says where the agent is as "in" does, and this one is
+    /// in docs-site, so nothing is opened or offered for stopping. The same
+    /// holds when the model answers "the one that's stuck" for "the stuck
+    /// agent at billing".
+    #[tokio::test]
+    async fn voice_outcome_an_agent_said_to_be_at_a_place_is_not_placed_by_its_prompt() {
+        let alone = || {
+            let mut agent = stuck_fleet().remove(1);
+            agent.last_user_prompt = Some("Fix the billing issue".to_string());
+            vec![agent]
+        };
+        for (verb, row, screen) in [
+            ("open", "open_agent", Screen::Deck),
+            ("stop", "stop_agent", Screen::Overview),
+        ] {
+            for (said, spoken) in [
+                (format!("{verb} the agent at billing"), "billing"),
+                (
+                    format!("{verb} the agent at the billing project"),
+                    "billing",
+                ),
+                (
+                    format!("{verb} the stuck agent at billing"),
+                    "the one that's stuck",
+                ),
+            ] {
+                let resolver = StubResolver::new()
+                    .answering(&said, IntentAnswer::new(row).with_param("agent", spoken));
+                let outcome = run(&resolver, screen, &alone(), &said).await;
+                assert!(
+                    matches!(&outcome, VoiceOutcome::ParamUnresolved { .. }),
+                    "{said:?} must not reach the agent in docs-site: {outcome:?}"
                 );
             }
         }
