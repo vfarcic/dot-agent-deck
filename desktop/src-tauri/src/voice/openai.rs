@@ -301,6 +301,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",
@@ -412,14 +414,18 @@ mod tests {
             schema["properties"]["params"]["required"],
             // `deck` ahead of `prefix` since PRD #1195's `switch_deck` row,
             // which sits above the dictation pair in the table.
+            // The dashboard filter's facets (issue #1496) after `agent`.
             json!([
                 "agent",
+                "kind",
+                "status",
+                "agent_type",
+                "daemon",
+                "text",
                 "deck",
                 "prefix",
                 "dir",
-                "text",
                 "mode",
-                "agent_type",
                 "command",
                 "orchestration"
             ])

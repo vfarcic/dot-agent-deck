@@ -33,8 +33,8 @@ What you can do by voice, by screen:
 
 | Where | You can |
 | --- | --- |
-| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off |
-| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
+| Anywhere, including an agent's pane | Close what is open over the screen (a pane, Settings, a dialog); list the commands; turn [reading](#reading) on and off; silence the app's speech ("quiet"); turn voice off; [show the whole, unfiltered dashboard](#filtering-the-dashboard) |
+| Dashboard | Open Settings; switch which daemon the app shows, such as "switch daemon to build", or show them all with "select all daemons"; open an agent's pane; open New agent; [scroll the dashboard](#scrolling-the-dashboard); [filter the dashboard](#filtering-the-dashboard); stop an agent or close an orchestration (the app shows the same confirmation as the buttons, and nothing stops until you confirm by hand) |
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that) |
 
@@ -73,6 +73,26 @@ You can combine them, as in "the newest reviewer". A name the screen shows wins:
 If what you said fits more than one agent, for example "open the Claude agent" with two Claude Code agents running, the app lists them for you to choose from; see [When a command matches several things](#when-a-command-matches-several-things). "When it started" needs a daemon that reports when each agent started; if one of the agents you meant has no start time, the app lists them instead of guessing.
 
 Voice reaches the agents of the daemon the app shows. With **All daemons** selected, it reaches the agents on this machine; to name an agent on another daemon, switch to that daemon first, or say the agent's number on the dashboard (see [Choosing by number](#choosing-by-number)). Naming another daemon in a command for an agent, such as "the Codex agent on build box" while the agents voice can reach are on this machine, opens nothing, and the app says that no agent matches.
+
+## Filtering the dashboard
+
+To show only some agents on the [dashboard](dashboard.md#filter-the-dashboard), say which ones, from the dashboard or the Daemons screen:
+
+| You can filter by | For example |
+| --- | --- |
+| Kind | "show me all orchestration agents", "show only the dispatchers" |
+| Status | "show me all working agents", "show only agents waiting for input" |
+| Agent type | "show Codex agents" |
+| Daemon | "show the agents on build box" |
+| A name or other words | "filter by billing" |
+
+The app opens the dashboard with that filter set, exactly as if you had chosen it in the dashboard's filter, and says what it filtered by, for example *Filtering the agent dashboard. Status: Working.* A new filter replaces the one before it. A part the app did not catch is left out, and the app says so; when it catches none, the filter is left as it was.
+
+**Going back to everything is always one step.** Say "show everything", "show all agents", "clear the filter", "remove the filter" or "reset", from any screen: the filter is cleared and the whole dashboard is shown, opening it if you were somewhere else. With no filter set, "show everything" just opens the dashboard, as it always has. "Show the dashboard" opens the dashboard and keeps the filter as it is.
+
+Naming one agent still opens that agent: "open tester" and "see only the tester" open the tester's pane rather than filtering the dashboard.
+
+While the dashboard is filtered, the numbers count only the rows it shows, so "one" opens the first row on screen.
 
 ## Filtering directories
 

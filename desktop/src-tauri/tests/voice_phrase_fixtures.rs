@@ -153,6 +153,14 @@ struct PhraseFixture {
     /// The registry id an `agent_type_ref` param must resolve to.
     #[serde(default)]
     resolved_agent_type: Option<String>,
+    /// The dashboard filter's kind an `agent_kind` param must resolve to
+    /// (issue #1496).
+    #[serde(default)]
+    resolved_kind: Option<String>,
+    /// The dashboard filter's status an `agent_status` param must resolve to
+    /// (issue #1496).
+    #[serde(default)]
+    resolved_status: Option<String>,
     /// Whether the New agent dialog is open with NO live form (PRD #1223) —
     /// what a spoken "start it" meets before a directory is chosen.
     #[serde(default)]
@@ -584,7 +592,13 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 fixture.name
             );
         }
-        if let Some(expected) = fixture.resolved_agent_type.as_deref() {
+        // The dashboard filter's agent type (issue #1496) is any type the
+        // deck knows, so it needs no form.
+        if let Some(expected) = fixture
+            .resolved_agent_type
+            .as_deref()
+            .filter(|_| fixture.action != dot_agent_deck_desktop::voice::FILTER_DASHBOARD_ROW)
+        {
             assert!(
                 fixture.form
                     && form_choices
@@ -842,6 +856,18 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     }
                     None => true,
                 };
+                let kind_matches = match fixture.resolved_kind.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::AgentKind) == Some(expected)
+                    }
+                    None => true,
+                };
+                let status_matches = match fixture.resolved_status.as_deref() {
+                    Some(expected) => {
+                        resolved_of(&answer.outcome, ParamKind::AgentStatus) == Some(expected)
+                    }
+                    None => true,
+                };
                 let orchestration_matches = match fixture.resolved_orchestration.as_deref() {
                     Some(expected) => {
                         resolved_label(&answer.outcome, ParamKind::OrchestrationRef)
@@ -886,7 +912,9 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                 // Both are claims about the New agent dialog's deck, so neither
                 // applies to `switch_deck` (PRD #1195): the Daemon selector
                 // switches to a deck the dialog disables, and its report is
-                // "Showing <deck>." rather than a preselection. The first is
+                // "Showing <deck>." rather than a preselection. Nor to the
+                // dashboard filter (issue #1496), whose daemon is one to filter
+                // by and is reported as "Daemon: <deck>.". The first is
                 // scoped to the rows that append "Preselected daemon:" at all —
                 // an OPTIONAL `deck_ref` — which also stops it failing every
                 // `choose_deck` fixture, whose report is "Daemon: <deck>.".
@@ -894,13 +922,16 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     VoiceOutcome::Dispatch { action, .. } => table().row(action),
                     _ => None,
                 };
-                let preselects = dispatched.is_some_and(|row| {
-                    row.params
-                        .iter()
-                        .any(|param| param.kind == ParamKind::DeckRef && param.optional)
+                let for_new_agent = dispatched.is_none_or(|row| {
+                    row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW
+                        && row.id != dot_agent_deck_desktop::voice::FILTER_DASHBOARD_ROW
                 });
-                let for_new_agent = dispatched
-                    .is_none_or(|row| row.id != dot_agent_deck_desktop::voice::SWITCH_DECK_ROW);
+                let preselects = for_new_agent
+                    && dispatched.is_some_and(|row| {
+                        row.params
+                            .iter()
+                            .any(|param| param.kind == ParamKind::DeckRef && param.optional)
+                    });
                 let deck_eligible = !for_new_agent
                     || resolved_deck(&answer.outcome).is_none_or(|id| {
                         decks
@@ -947,6 +978,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                     && dir_matches
                     && mode_matches
                     && agent_type_matches
+                    && kind_matches
+                    && status_matches
                     && orchestration_matches
                     && prefix_matches
                     && filter_matches
@@ -962,12 +995,12 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         "{}expected action={} outcome={} resolved_agent={:?} resolved_deck={:?} \
                          resolved_dir={:?} resolved_mode={:?} resolved_agent_type={:?} \
                          resolved_orchestration={:?} dictate_prefix={:?} resolved_filter={:?} \
-                         resolved_command={:?} candidates={:?}, \
-                         got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
+                         resolved_command={:?} candidates={:?} resolved_kind={:?} \
+                         resolved_status={:?}, got action={:?} outcome={actual_outcome} resolved_agent={actual_agent:?} \
                          resolved_deck={:?} resolved_dir={:?} resolved_mode={:?} \
                          resolved_agent_type={:?} resolved_orchestration={:?} dictate_prefix={:?} \
-                         resolved_filter={:?} resolved_command={:?} candidates={:?} model_value={:?} \
-                         sentence={:?}",
+                         resolved_filter={:?} resolved_command={:?} candidates={:?} resolved_kind={:?} \
+                         resolved_status={:?} model_value={:?} sentence={:?}",
                         if !candidates_match {
                             "the tie does not offer the expected candidates; "
                         } else if !deck_named {
@@ -993,6 +1026,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         fixture.resolved_filter,
                         fixture.resolved_command,
                         fixture.candidates,
+                        fixture.resolved_kind,
+                        fixture.resolved_status,
                         actual_action,
                         resolved_deck(&answer.outcome),
                         resolved_dir(&answer.outcome),
@@ -1003,6 +1038,8 @@ async fn voice_phrase_fixtures_match_the_default_backend() {
                         resolved_of(&answer.outcome, ParamKind::FilterText),
                         resolved_of(&answer.outcome, ParamKind::CommandText),
                         offered_values(&answer.outcome),
+                        resolved_of(&answer.outcome, ParamKind::AgentKind),
+                        resolved_of(&answer.outcome, ParamKind::AgentStatus),
                         model_value(&answer.outcome),
                         // The app's own sentence, which says WHY a refusal
                         // refused — the kinds alone cannot tell a model's

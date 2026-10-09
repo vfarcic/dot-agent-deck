@@ -1190,7 +1190,9 @@ mod tests {
         assert_eq!(
             kinds,
             [
+                "agent_kind",
                 "agent_ref",
+                "agent_status",
                 "agent_type_ref",
                 "command_text",
                 "deck_ref",

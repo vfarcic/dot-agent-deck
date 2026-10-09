@@ -1629,6 +1629,7 @@ fn restore_023_legacy_mode_daemon_agent_becomes_dashboard_card() {
             agent_type: AgentType::from_command(Some("sleep 600")),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         })
         .expect("start legacy-mode agent over attach socket");
@@ -1699,6 +1700,7 @@ fn tokenless_orchestration_start(cwd: &str) -> AttachRequest {
         agent_type: AgentType::from_command(Some("sleep 600")),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     }
 }

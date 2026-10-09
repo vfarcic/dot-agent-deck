@@ -1,5 +1,6 @@
 import type { DeckView } from "../types";
 import type { VoiceDeckIdentityDto } from "./bridge";
+import { clearDashboardFilter, setDashboardFilter, type DashboardFilter } from "./dashboardFilter";
 
 /**
  * PRD #802 M2 — the frontend action registry, and the app's one dispatch seam
@@ -642,6 +643,33 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "navigate">) => context.navigate({ kind: "overview" }),
   },
 
+  /* Issue #1496 — the agent dashboard's filter. Both write the window
+     session's filter, which the dashboard reads, and open the dashboard, so
+     what was asked for is what is on screen wherever it was said. A filter
+     replaces the one before it. */
+  filterDashboard: {
+    label: "Filter the agent dashboard",
+    voice: true,
+    needs: ["navigate"],
+    run: (context: Pick<VoiceActionContext, "navigate">, target?: Pick<VoiceDispatchTarget, "dashboardFilter">) => {
+      setDashboardFilter(target?.dashboardFilter ?? clearDashboardFilter());
+      context.navigate({ kind: "overview" });
+    },
+  },
+
+  /* "show everything" means the unfiltered dashboard wherever it is said:
+     with no filter set this is exactly `openOverview`. The dashboard's Show
+     all button is this entry too. */
+  clearDashboardFilter: {
+    label: "Show the whole agent dashboard, unfiltered",
+    voice: true,
+    needs: ["navigate"],
+    run: (context: Pick<VoiceActionContext, "navigate">) => {
+      setDashboardFilter(clearDashboardFilter());
+      context.navigate({ kind: "overview" });
+    },
+  },
+
   /**
    * Voice-reachable, and the one row whose screen issue #1198 hides by
    * default: while the flag is off the crate offers it `callable: false`
@@ -1181,6 +1209,11 @@ export type VoiceDispatchTarget = AgentViewTarget & {
   modeId?: string;
   /** The agent entry an `agent_type_ref` resolved to — its registry id. */
   agentTypeId?: string;
+  /**
+   * The dashboard filter a `filter_dashboard` dispatch asks for, built from
+   * its resolved facets (issue #1496).
+   */
+  dashboardFilter?: DashboardFilter;
   /**
    * The New agent form the utterance was JUDGED against — its deck and chosen
    * directory as declared — or absent when no live form was declared. The

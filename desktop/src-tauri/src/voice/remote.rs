@@ -677,6 +677,8 @@ mod tests {
             vec![
                 "open_agent",
                 "open_overview",
+                "filter_dashboard",
+                "clear_dashboard_filter",
                 "open_deck",
                 "close",
                 "open_settings",

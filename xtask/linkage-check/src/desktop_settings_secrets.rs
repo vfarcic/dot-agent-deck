@@ -60,10 +60,12 @@
 //!
 //!    Its scope is `localStorage` in `.ts`/`.tsx` under `desktop/src`, and the
 //!    boundary is worth stating rather than implying: **`sessionStorage`,
-//!    IndexedDB, `document.cookie` and a `.js` file are outside it.** None of
-//!    the four appears under `desktop/src` today — checked, not assumed — so
-//!    this is a scope statement rather than a known hole; the moment one does,
-//!    it needs its own row here.
+//!    IndexedDB, `document.cookie` and a `.js` file are outside it.** One of
+//!    them now appears: issue #1496's dashboard filter keeps the window
+//!    session's filter in `sessionStorage`. Its key's literal is pinned in
+//!    [`PINNED_STORAGE_KEYS`] like the others, because the literal scan reads
+//!    every `dot-agent-deck.` literal whatever stores it, but its accesses are
+//!    not scanned the way `localStorage`'s are.
 //!
 //! It lives here rather than in vitest for the reason the palette guards do:
 //! these tests run under `cargo test-fast` (via `--workspace`, CLAUDE.md rule
@@ -664,7 +666,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 30] = [
 /// the role-order key moved to `ORCHESTRATION_STORAGE_KEY`. The old one stays
 /// pinned as `LEGACY_WORKFLOW_STORAGE_KEY` because `App.tsx` still reads it once,
 /// to migrate a saved order, and then removes it.
-const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
+const PINNED_STORAGE_KEYS: [(&str, &str, bool); 7] = [
     (
         "FIXTURE_SETTINGS_KEY",
         "dot-agent-deck.desktop-settings",
@@ -693,6 +695,16 @@ const PINNED_STORAGE_KEYS: [(&str, &str, bool); 6] = [
     (
         "STORAGE_KEY",
         "dot-agent-deck.desktop.agent-profiles.v1",
+        true,
+    ),
+    // Issue #1496 — `sessionStorage`, not `localStorage`: the dashboard
+    // filter lasts for the window session. It holds the selected facet ids
+    // and the search text the user supplied, by typing or by voice, and
+    // does not automatically serialize settings credentials or agent
+    // prompts — though text a user types can be anything.
+    (
+        "DASHBOARD_FILTER_STORAGE_KEY",
+        "dot-agent-deck.desktop.dashboard-filter.v1",
         true,
     ),
 ];

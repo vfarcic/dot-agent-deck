@@ -359,6 +359,7 @@ fn prompt_pane_input_046_a_pane_that_stops_reading_does_not_hang_its_send_or_sta
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )

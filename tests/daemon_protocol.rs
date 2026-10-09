@@ -191,6 +191,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -215,6 +216,7 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
             agent_type: Some(AgentType::Codex),
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -239,6 +241,7 @@ async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &st
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -442,6 +445,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -507,6 +511,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -595,6 +600,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 
@@ -708,6 +714,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::ClaudeCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 
@@ -739,6 +746,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         agent_type: Some(AgentType::OpenCode),
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
@@ -774,6 +782,7 @@ fn agent_record_round_trips_explicit_agent_type() {
         prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let json = serde_json::to_string(&rec).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -800,6 +809,7 @@ fn agent_record_omits_agent_type_when_none() {
         prompt_keys: None,
         crashed: None,
         orchestrator_context_path: None,
+        authoring_kind: None,
     };
     let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
     assert!(
@@ -925,6 +935,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
         AgentRecord {
             id: "9".into(),
@@ -941,6 +952,7 @@ fn running_agents_summary_from_records_uses_display_name_then_id() {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         },
     ];
     let summary = RunningAgentsSummary::from_records(&records);
@@ -1023,6 +1035,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 agent_type: None,
                 seed: None,
                 authoring_kind: None,
+                client_seeded_kind: None,
                 remember_command: false,
             },
         )
@@ -4533,6 +4546,7 @@ async fn start_agent_rejects_blank_command() {
             agent_type: None,
             seed: None,
             authoring_kind: None,
+            client_seeded_kind: None,
             remember_command: false,
         },
     )
@@ -5236,6 +5250,7 @@ async fn start_agent_refuses_a_cwd_that_is_not_a_directory() {
         agent_type: None,
         seed: None,
         authoring_kind: None,
+        client_seeded_kind: None,
         remember_command: false,
     };
 

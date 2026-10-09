@@ -24,6 +24,9 @@ export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped" | "blocked";
 
+/** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
+export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+
 /**
  * Issue #714: why an agent is `blocked` — the agent reported that its provider
  * refused it for an exhausted usage limit or credit pool. `detail` is the
@@ -691,6 +694,13 @@ export interface AgentSession {
   /** HONEST. */
   status: AgentStatus;
   /**
+   * HONEST. The daemon's own status word, before `status` merges Working
+   * with Thinking and Idle with Waiting for input — which the dashboard
+   * filter keeps apart (issue #1496). Absent in fixture mode, whose agents
+   * have only `status`.
+   */
+  daemonStatus?: DaemonAgentStatus;
+  /**
    * HONEST — the daemon's `lastUserPrompt`, else a restatement of `activeTool`,
    * else a placeholder saying the daemon reported neither.
    *
@@ -798,6 +808,13 @@ export interface AgentSession {
    * rule and forks only the wording.
    */
   spawnedAtMs?: number;
+  /**
+   * HONEST. Issue #1496 — the authoring kind the daemon recorded for this
+   * agent (`AgentRecord.authoring_kind`): a dispatcher, a schedule or a
+   * schedule-issues agent, which is otherwise an ordinary dashboard pane.
+   * Absent for every other agent and from a daemon predating the field.
+   */
+  authoringKind?: AuthoringKind;
   /** HONEST. Issue #714: present only while `status` is `"blocked"`. */
   blocked?: AgentBlocked;
   /** HONEST. */

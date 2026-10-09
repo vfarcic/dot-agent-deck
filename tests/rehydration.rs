@@ -3122,6 +3122,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                     prompt_keys: None,
                     crashed: None,
                     orchestrator_context_path: None,
+                    authoring_kind: None,
                 };
                 let resp = AttachResponse {
                     ok: true,

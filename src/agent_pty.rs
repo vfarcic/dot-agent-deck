@@ -3314,6 +3314,13 @@ pub struct RunningAgent {
     /// while the agent is not blocked. Per record, so a respawn — a new record —
     /// starts unblocked.
     pub quota_block: Option<u64>,
+    /// Issue #1496: the authoring kind this agent was started as — a
+    /// dispatcher, a schedule or a schedule-issues agent — set by the
+    /// `StartAgent` handler once it has accepted such a start
+    /// ([`AgentPtyRegistry::set_authoring_kind`]). `None` for every other
+    /// agent. Per record, so a respawn — a new record with a new prompt —
+    /// starts without one.
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -3646,6 +3653,22 @@ pub struct AgentRecord {
     /// `PROTOCOL_VERSION` bump — same basis as `live` and `crashed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_context_path: Option<String>,
+    /// Issue #1496: the authoring kind this agent was started as — a
+    /// dispatcher, a schedule or a schedule-issues agent — copied from
+    /// [`RunningAgent::authoring_kind`]. A client reads it to say what kind of
+    /// agent a dashboard card is, which it cannot tell from anything else on
+    /// the record: an authoring agent is an ordinary dashboard pane.
+    ///
+    /// `None` for every other agent, and from a daemon predating this field,
+    /// whose authoring agents a client then shows as single agents. Additive
+    /// optional, so no `PROTOCOL_VERSION` bump — same basis as `crashed` and
+    /// `orchestrator_context_path`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_authoring_kind"
+    )]
+    pub authoring_kind: Option<crate::authoring_seeds::AuthoringKind>,
 }
 
 impl AgentRecord {
@@ -3706,6 +3729,23 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
 /// `skip_serializing_if`.
 fn is_zero_u16(v: &u16) -> bool {
     *v == 0
+}
+
+/// Issue #1496: [`AgentRecord::authoring_kind`] reads a kind this build does
+/// not know as `None` rather than failing. [`crate::authoring_seeds::AuthoringKind`]
+/// refuses an unknown name on purpose — a start must not proceed on a kind the
+/// daemon cannot compose — but on a record that refusal would fail a whole
+/// `ListAgents` reply from a newer daemon over one card's label. An unknown
+/// kind is shown as a single agent, which is what a daemon predating the field
+/// gives.
+fn lenient_authoring_kind<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::authoring_seeds::AuthoringKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 /// Issue #424 F1: what this daemon's guarded sends have put into one pane and
@@ -10719,6 +10759,9 @@ impl AgentPtyRegistry {
             crashed: None,
             // Issue #714: a fresh agent has reported no quota block.
             quota_block: None,
+            // Issue #1496: set after the spawn, by the `StartAgent` handler
+            // that accepted an authoring start.
+            authoring_kind: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -12662,6 +12705,9 @@ impl AgentPtyRegistry {
             // Issue #714: dropped — a respawned agent starts unblocked, and its
             // next quota failure reports afresh.
             quota_block: _,
+            // Issue #1496: dropped — the fresh child is started with the
+            // respawn's prompt, not the authoring seed the kind names.
+            authoring_kind: _,
             // The replacement gets a writer, and a PTY thread, of its own.
             pty_progress: _,
         } = removed;
@@ -14250,6 +14296,7 @@ impl AgentPtyRegistry {
             prompt_keys: None,
             crashed: agent.crashed,
             orchestrator_context_path: None,
+            authoring_kind: agent.authoring_kind,
         })
     }
 
@@ -14630,6 +14677,7 @@ impl AgentPtyRegistry {
                 // handler stamps it from `AppState`. See
                 // `AgentRecord::orchestrator_context_path`.
                 orchestrator_context_path: None,
+                authoring_kind: agent.authoring_kind,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -14987,9 +15035,28 @@ impl AgentPtyRegistry {
                 // Issue #868: synthetic test agent hasn't exited.
                 crashed: None,
                 quota_block: None,
+                authoring_kind: None,
             },
         );
         id
+    }
+
+    /// Issue #1496: record that agent `id` was started as `kind` — called by
+    /// the `StartAgent` handler once it has accepted an authoring start, and
+    /// echoed back on [`AgentRecord::authoring_kind`]. Returns
+    /// [`AgentPtyError::NotFound`] if the agent id is unknown.
+    pub fn set_authoring_kind(
+        &self,
+        id: &str,
+        kind: crate::authoring_seeds::AuthoringKind,
+    ) -> Result<(), AgentPtyError> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get_mut(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        agent.authoring_kind = Some(kind);
+        Ok(())
     }
 
     /// Update the per-agent display name and cwd captured in the registry
@@ -20810,6 +20877,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         }
     }
 
@@ -20922,6 +20990,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -20975,6 +21044,92 @@ mod spawn_tests {
             round.orchestrator_context_path.as_deref(),
             Some("/p/.dot-agent-deck/x.md")
         );
+    }
+
+    /// Issue #1496: `authoring_kind` is additive optional — an older daemon's
+    /// record (no key) decodes as `None`, `None` puts no key on the wire, and a
+    /// kind round-trips in its kebab-case spelling. A kind this build does not
+    /// know, from a newer daemon, decodes as `None` rather than failing the
+    /// whole `ListAgents` reply.
+    #[test]
+    fn agent_record_authoring_kind_is_additive_optional() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let back: AgentRecord =
+            serde_json::from_str(r#"{"id": "1"}"#).expect("a record without the field must decode");
+        assert_eq!(back.authoring_kind, None);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(
+            wire.get("authoring_kind").is_none(),
+            "None must be omitted from the wire: {wire}"
+        );
+
+        for kind in AuthoringKind::ALL {
+            let record = AgentRecord {
+                authoring_kind: Some(kind),
+                ..back.clone()
+            };
+            let wire = serde_json::to_value(&record).unwrap();
+            assert_eq!(wire["authoring_kind"], kind.as_str());
+            let round: AgentRecord = serde_json::from_value(wire).unwrap();
+            assert_eq!(round.authoring_kind, Some(kind));
+        }
+
+        let newer: AgentRecord =
+            serde_json::from_str(r#"{"id": "1", "authoring_kind": "a-kind-from-later"}"#)
+                .expect("an unknown kind must not fail the record");
+        assert_eq!(newer.authoring_kind, None);
+        let null: AgentRecord = serde_json::from_str(r#"{"id": "1", "authoring_kind": null}"#)
+            .expect("an explicit null decodes");
+        assert_eq!(null.authoring_kind, None);
+    }
+
+    /// Issue #1496: the registry carries a kind set on an agent into its
+    /// record, and an agent nobody set one on carries none.
+    #[test]
+    fn set_authoring_kind_reaches_the_agent_record() {
+        use crate::authoring_seeds::AuthoringKind;
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let plain = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let dispatcher = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        registry
+            .set_authoring_kind(&dispatcher, AuthoringKind::Dispatcher)
+            .unwrap();
+        assert!(matches!(
+            registry.set_authoring_kind("no-such-agent", AuthoringKind::Schedule),
+            Err(AgentPtyError::NotFound(_))
+        ));
+
+        let kind_of = |id: &str| {
+            registry
+                .agent_records()
+                .into_iter()
+                .find(|record| record.id == id)
+                .expect("live agent")
+                .authoring_kind
+        };
+        assert_eq!(kind_of(&plain), None);
+        assert_eq!(kind_of(&dispatcher), Some(AuthoringKind::Dispatcher));
+        assert_eq!(
+            registry
+                .agent_record_any(&dispatcher)
+                .unwrap()
+                .authoring_kind,
+            Some(AuthoringKind::Dispatcher)
+        );
+        registry.close_agent(&plain).unwrap();
+        registry.close_agent(&dispatcher).unwrap();
     }
 
     #[test]
@@ -22047,6 +22202,7 @@ mod spawn_tests {
             prompt_keys: None,
             crashed: None,
             orchestrator_context_path: None,
+            authoring_kind: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
